@@ -10,6 +10,7 @@ let updateAvailable = false;
 const DEFAULT_SW_MESSAGE_TIMEOUT_MS = 3000;
 const DEFAULT_SW_ACTIVATION_TIMEOUT_MS = 30_000;
 const watchedRegistrations = new WeakSet();
+const watchedInstallingWorkers = new WeakSet();
 let controllerChangeListenerInstalled = false;
 const ARCHIVE_SCOPE_URL = new URL('./', import.meta.url).href;
 const SERVICE_WORKER_URL = new URL('./sw.js', import.meta.url).href;
@@ -228,24 +229,11 @@ function setupUpdateListener(reg) {
     watchedRegistrations.add(reg);
 
     reg.addEventListener('updatefound', () => {
-        const newWorker = reg.installing;
-
-        if (!newWorker) return;
-
-        newWorker.addEventListener('statechange', () => {
-            if (newWorker.state === 'installed') {
-                if (reg.active && reg.active !== newWorker) {
-                    // New version available
-                    console.log('[SW] Update available');
-                    updateAvailable = true;
-                    showUpdateNotification();
-                } else {
-                    // First install
-                    console.log('[SW] First install complete');
-                }
-            }
-        });
+        watchInstallingWorker(reg, reg.installing);
     });
+    // register() may return after updatefound has already fired. Inspect the
+    // current installing slot so that race cannot hide an available update.
+    watchInstallingWorker(reg, reg.installing);
 
     // Listen for controller change (after skipWaiting)
     if (!controllerChangeListenerInstalled) {
@@ -255,6 +243,31 @@ function setupUpdateListener(reg) {
         });
         controllerChangeListenerInstalled = true;
     }
+}
+
+function watchInstallingWorker(reg, newWorker) {
+    if (!newWorker || watchedInstallingWorkers.has(newWorker)) {
+        return;
+    }
+    watchedInstallingWorkers.add(newWorker);
+
+    const handleStateChange = () => {
+        if (newWorker.state === 'installed') {
+            newWorker.removeEventListener('statechange', handleStateChange);
+            if (reg.active && reg.active !== newWorker) {
+                console.log('[SW] Update available');
+                updateAvailable = true;
+                showUpdateNotification();
+            } else {
+                console.log('[SW] First install complete');
+            }
+        } else if (newWorker.state === 'redundant') {
+            newWorker.removeEventListener('statechange', handleStateChange);
+        }
+    };
+
+    newWorker.addEventListener('statechange', handleStateChange);
+    handleStateChange();
 }
 
 function noticeWaitingUpdate(reg) {

@@ -92,7 +92,8 @@ impl ExportEngine {
     }
 
     /// Build the export in a private sidecar, verify those exact bytes, and
-    /// only then atomically publish them at the requested output path.
+    /// only then publish them through the platform's verified replacement
+    /// protocol at the requested output path.
     ///
     /// The verifier is deliberately invoked after the destination transaction
     /// is committed and closed but before `replace_file_from_temp`. A failed
@@ -908,7 +909,19 @@ const EXPORT_PUBLISH_BACKUP_SCAN_LIMIT: usize = 65_536;
 
 struct ExportPublishGuard {
     final_path: PathBuf,
+    lock_path: PathBuf,
+    lock_identity: crate::franken_sync::FileIdentity,
     _lock_file: std::fs::File,
+}
+
+impl std::fmt::Debug for ExportPublishGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExportPublishGuard")
+            .field("final_path", &self.final_path)
+            .field("lock_path", &self.lock_path)
+            .finish_non_exhaustive()
+    }
 }
 
 struct ExportFileEvidence {
@@ -1066,6 +1079,8 @@ fn acquire_export_publish_guard(final_path: &Path) -> Result<ExportPublishGuard>
 
     Ok(ExportPublishGuard {
         final_path: final_path.to_path_buf(),
+        lock_path,
+        lock_identity,
         _lock_file: lock_file,
     })
 }
@@ -1079,6 +1094,70 @@ fn require_export_publish_guard(
             "Pages export publish guard for {} cannot authorize publication to {}",
             publish_guard.final_path.display(),
             final_path.display()
+        );
+    }
+    let held_identity = crate::franken_sync::FileIdentity::from_file(&publish_guard._lock_file)
+        .with_context(|| {
+            format!(
+                "failed re-identifying held Pages export publish lock {}",
+                publish_guard.lock_path.display()
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "filesystem stopped exposing a stable identity for held Pages export publish lock {}",
+                publish_guard.lock_path.display()
+            )
+        })?;
+    if held_identity != publish_guard.lock_identity {
+        bail!(
+            "held Pages export publish lock {} changed identity",
+            publish_guard.lock_path.display()
+        );
+    }
+    let path_metadata = std::fs::symlink_metadata(&publish_guard.lock_path).with_context(|| {
+        format!(
+            "failed re-inspecting Pages export publish lock {} before authorization",
+            publish_guard.lock_path.display()
+        )
+    })?;
+    if !path_metadata.file_type().is_file() {
+        bail!(
+            "Pages export publish lock {} is no longer a regular file; refused namespace mutation",
+            publish_guard.lock_path.display()
+        );
+    }
+    #[cfg(unix)]
+    if path_metadata.nlink() != 1 {
+        bail!(
+            "Pages export publish lock {} has {} hard links before authorization; refused namespace mutation",
+            publish_guard.lock_path.display(),
+            path_metadata.nlink()
+        );
+    }
+    let path_probe = std::fs::File::open(&publish_guard.lock_path).with_context(|| {
+        format!(
+            "failed re-opening Pages export publish lock {} before authorization",
+            publish_guard.lock_path.display()
+        )
+    })?;
+    let path_identity = crate::franken_sync::FileIdentity::from_file(&path_probe)
+        .with_context(|| {
+            format!(
+                "failed re-identifying Pages export publish lock {} before authorization",
+                publish_guard.lock_path.display()
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "filesystem stopped exposing a stable pathname identity for Pages export publish lock {}",
+                publish_guard.lock_path.display()
+            )
+        })?;
+    if path_identity != publish_guard.lock_identity {
+        bail!(
+            "Pages export publish lock {} was replaced after acquisition; refused namespace mutation",
+            publish_guard.lock_path.display()
         );
     }
     Ok(())
@@ -1481,7 +1560,9 @@ fn write_export_publish_journal(
     backup_path: &Path,
     prior: &ExportFileEvidence,
     candidate: &ExportFileEvidence,
+    publish_guard: &ExportPublishGuard,
 ) -> Result<ExportPublishJournal> {
+    require_export_publish_guard(final_path, publish_guard)?;
     let backup_file_name = backup_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -1501,7 +1582,8 @@ fn write_export_publish_journal(
         candidate_sha256: candidate.sha256.clone(),
     };
     validate_export_publish_journal(final_path, &journal)?;
-    let bytes = serde_json::to_vec(&journal).context("failed serializing Pages export publish journal")?;
+    let bytes = serde_json::to_vec(&journal)
+        .context("failed serializing Pages export publish journal")?;
     let journal_path = export_publish_recovery_journal_path(final_path);
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -1565,7 +1647,7 @@ fn write_export_publish_journal(
         })?;
     if path_identity != created_identity {
         bail!(
-            "Pages export publish journal {} changed identity while it was durably created; live and staged generations were preserved",
+            "Pages export publish journal {} changed identity while it was created; live and staged generations were preserved",
             journal_path.display()
         );
     }
@@ -1581,6 +1663,7 @@ fn write_export_publish_journal(
             journal_path.display()
         );
     }
+    require_export_publish_guard(final_path, publish_guard)?;
     Ok(journal)
 }
 
@@ -1588,7 +1671,9 @@ fn write_export_publish_journal(
 fn remove_export_publish_journal(
     final_path: &Path,
     expected_journal: &ExportPublishJournal,
+    publish_guard: &ExportPublishGuard,
 ) -> Result<()> {
+    require_export_publish_guard(final_path, publish_guard)?;
     let journal_path = export_publish_recovery_journal_path(final_path);
     let current_journal = read_export_publish_journal(final_path)?.ok_or_else(|| {
         anyhow::anyhow!(
@@ -1602,6 +1687,7 @@ fn remove_export_publish_journal(
             journal_path.display()
         );
     }
+    require_export_publish_guard(final_path, publish_guard)?;
     match std::fs::remove_file(&journal_path) {
         Ok(()) => sync_parent_directory(&journal_path).with_context(|| {
             format!(
@@ -1922,9 +2008,10 @@ fn reject_non_regular_existing_publish_destination(path: &Path) -> Result<()> {
     }
 }
 
-/// Recover only states authenticated by a durable journal. An unmarked file at
-/// any reserved backup spelling is never treated as cass-owned: it is
-/// preserved and reported for explicit operator resolution.
+/// Recover only states authenticated by a file-synced journal. Its namespace
+/// is also directory-synced where the platform exposes that operation. An
+/// unmarked file at any reserved backup spelling is never treated as
+/// cass-owned: it is preserved and reported for explicit operator resolution.
 #[cfg(any(windows, test))]
 fn recover_or_refuse_interrupted_export_publish(
     final_path: &Path,
@@ -1984,6 +2071,14 @@ fn recover_or_refuse_interrupted_export_publish(
 
     match (final_evidence, backup_evidence) {
         (None, Some(prior)) => {
+            if replacement_path_entry_exists(final_path)? {
+                bail!(
+                    "journaled Pages export backup {} was ready to restore, but live path {} was concurrently repopulated; preserved every entry and the journal",
+                    backup_path.display(),
+                    final_path.display()
+                );
+            }
+            require_export_publish_guard(final_path, publish_guard)?;
             std::fs::rename(&backup_path, final_path).with_context(|| {
                 format!(
                     "failed restoring journaled Pages export backup {} to missing live path {}; preserved the backup and journal",
@@ -2019,7 +2114,7 @@ fn recover_or_refuse_interrupted_export_publish(
                 export_publish_recovery_journal_path(final_path).display()
             );
             #[cfg(not(windows))]
-            remove_export_publish_journal(final_path, &journal)
+            remove_export_publish_journal(final_path, &journal, publish_guard)
         }
         (Some(live), Some(_prior)) => {
             if !evidence_matches(
@@ -2073,7 +2168,7 @@ fn recover_or_refuse_interrupted_export_publish(
                 export_publish_recovery_journal_path(final_path).display()
             );
             #[cfg(not(windows))]
-            remove_export_publish_journal(final_path, &journal)
+            remove_export_publish_journal(final_path, &journal, publish_guard)
         }
         (None, None) => bail!(
             "Pages export publish journal remains at {}, but both live {} and journaled backup {} are missing; preserved the journal",
@@ -2107,9 +2202,34 @@ fn replace_file_from_temp_via_backup(
             backup_path.display()
         );
     }
-    let journal =
-        write_export_publish_journal(final_path, &backup_path, &prior, &candidate)?;
+    let journal = write_export_publish_journal(
+        final_path,
+        &backup_path,
+        &prior,
+        &candidate,
+        publish_guard,
+    )?;
+    if replacement_path_entry_exists(&backup_path)? {
+        bail!(
+            "journaled Pages export backup path {} appeared before the prior generation could be parked; preserved it, the live generation, staged candidate, and journal without mutation",
+            backup_path.display()
+        );
+    }
+    let live_probe = inspect_export_regular_file(final_path, "prior Pages export")?;
+    if live_probe.identity != prior.identity
+        || !evidence_matches(
+            &live_probe,
+            journal.prior_size_bytes,
+            &journal.prior_sha256,
+        )
+    {
+        bail!(
+            "prior Pages export {} changed identity or content after its publish journal was created; preserved the live and staged generations and journal without mutation",
+            final_path.display()
+        );
+    }
 
+    require_export_publish_guard(final_path, publish_guard)?;
     std::fs::rename(final_path, &backup_path).with_context(|| {
         format!(
             "failed parking prior Pages export {} at journaled backup {}; staged candidate and journal were preserved",
@@ -2141,6 +2261,7 @@ fn replace_file_from_temp_via_backup(
         )
     })?;
 
+    require_export_publish_guard(final_path, publish_guard)?;
     match std::fs::rename(temp_path, final_path) {
         Ok(()) => {
             let published =
@@ -2198,6 +2319,18 @@ fn replace_file_from_temp_via_backup(
                     backup_path.display()
                 );
             }
+            if replacement_path_entry_exists(final_path)? {
+                *retain_temp_on_error = true;
+                bail!(
+                    "failed publishing staged Pages export {} at {}: {}; the live path was concurrently repopulated, so staged candidate {}, journaled prior generation {}, and current live entry were preserved",
+                    temp_path.display(),
+                    final_path.display(),
+                    publish_error,
+                    temp_path.display(),
+                    backup_path.display()
+                );
+            }
+            require_export_publish_guard(final_path, publish_guard)?;
             match std::fs::rename(&backup_path, final_path) {
                 Ok(()) => {
                     let restored =
@@ -2234,7 +2367,7 @@ fn replace_file_from_temp_via_backup(
                     ));
                     #[cfg(not(windows))]
                     {
-                        remove_export_publish_journal(final_path, &journal)?;
+                        remove_export_publish_journal(final_path, &journal, publish_guard)?;
                         Err(publish_error).with_context(|| {
                             format!(
                                 "failed publishing staged Pages export {} at {}; restored the prior generation",
@@ -2341,6 +2474,7 @@ fn remove_prior_export_backup_after_publish(
                 backup_path.display()
             );
         }
+        require_export_publish_guard(final_path, publish_guard)?;
         std::fs::remove_file(backup_path).with_context(|| {
             format!(
                 "new Pages export is live at {}, but the validated prior sensitive generation remains at {}",
@@ -2355,7 +2489,7 @@ fn remove_prior_export_backup_after_publish(
                 backup_path.display()
             )
         })?;
-        remove_export_publish_journal(final_path, journal)
+        remove_export_publish_journal(final_path, journal, publish_guard)
     }
 }
 
@@ -2384,6 +2518,7 @@ fn replace_file_from_temp(
                 publish_guard,
             );
         }
+        require_export_publish_guard(final_path, publish_guard)?;
         std::fs::rename(temp_path, final_path).with_context(|| {
             format!(
                 "failed renaming completed export {} into place at {}",
@@ -2407,11 +2542,16 @@ fn replace_file_from_temp(
                 "new Pages export is live at {}, but its first publication could not be durably synced",
                 final_path.display()
             )
-        })
+        })?;
+        bail!(
+            "new Pages export is live at {}, but Windows std cannot prove durable directory-entry publication; no prior generation existed to retain",
+            final_path.display()
+        )
     }
 
     #[cfg(not(windows))]
     {
+        require_export_publish_guard(final_path, publish_guard)?;
         std::fs::rename(temp_path, final_path).with_context(|| {
             format!(
                 "failed renaming completed export {} into place at {}",
@@ -2451,6 +2591,9 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
+// `std` exposes no safe directory-handle sync on Windows. Callers use this as
+// a sequencing point, then return a partial-success error while preserving the
+// journal/recoverable generation instead of claiming namespace durability.
 fn sync_parent_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
@@ -2570,10 +2713,17 @@ mod tests {
         final_path: &Path,
         backup_path: &Path,
         candidate_path: &Path,
+        publish_guard: &ExportPublishGuard,
     ) -> Result<()> {
         let prior = inspect_export_regular_file(backup_path, "test prior generation")?;
         let candidate = inspect_export_regular_file(candidate_path, "test candidate generation")?;
-        write_export_publish_journal(final_path, backup_path, &prior, &candidate)?;
+        write_export_publish_journal(
+            final_path,
+            backup_path,
+            &prior,
+            &candidate,
+            publish_guard,
+        )?;
         Ok(())
     }
 
@@ -3261,7 +3411,7 @@ mod tests {
         std::fs::write(&backup_path, b"prior generation")?;
         std::fs::write(&candidate_path, b"candidate generation")?;
         let guard = acquire_export_publish_guard(&final_path)?;
-        write_test_publish_journal(&final_path, &backup_path, &candidate_path)?;
+        write_test_publish_journal(&final_path, &backup_path, &candidate_path, &guard)?;
 
         let result = recover_or_refuse_interrupted_export_publish(&final_path, &guard);
         #[cfg(not(windows))]
@@ -3291,9 +3441,9 @@ mod tests {
         let candidate_path = temp_dir.path().join("candidate-evidence.db");
         std::fs::write(&backup_path, b"prior generation")?;
         std::fs::write(&candidate_path, b"candidate generation")?;
-        write_test_publish_journal(&final_path, &backup_path, &candidate_path)?;
-        std::fs::rename(&backup_path, &final_path)?;
         let guard = acquire_export_publish_guard(&final_path)?;
+        write_test_publish_journal(&final_path, &backup_path, &candidate_path, &guard)?;
+        std::fs::rename(&backup_path, &final_path)?;
 
         let result = recover_or_refuse_interrupted_export_publish(&final_path, &guard);
         #[cfg(not(windows))]
@@ -3323,7 +3473,7 @@ mod tests {
         std::fs::write(&final_path, b"candidate generation")?;
         std::fs::write(&backup_path, b"prior generation")?;
         let guard = acquire_export_publish_guard(&final_path)?;
-        write_test_publish_journal(&final_path, &backup_path, &final_path)?;
+        write_test_publish_journal(&final_path, &backup_path, &final_path, &guard)?;
 
         let result = recover_or_refuse_interrupted_export_publish(&final_path, &guard);
         #[cfg(not(windows))]
@@ -3361,7 +3511,7 @@ mod tests {
         std::fs::write(&backup_path, b"prior generation")?;
         std::fs::write(&candidate_path, b"candidate generation")?;
         let guard = acquire_export_publish_guard(&final_path)?;
-        write_test_publish_journal(&final_path, &backup_path, &candidate_path)?;
+        write_test_publish_journal(&final_path, &backup_path, &candidate_path, &guard)?;
         std::fs::write(&backup_path, b"changed generation")?;
 
         let error = recover_or_refuse_interrupted_export_publish(&final_path, &guard)
@@ -3388,7 +3538,7 @@ mod tests {
         std::fs::write(&candidate_path, b"candidate main")?;
         std::fs::write(&destination_sidecar, b"unbound destination companion")?;
         let guard = acquire_export_publish_guard(&final_path)?;
-        write_test_publish_journal(&final_path, &backup_path, &candidate_path)?;
+        write_test_publish_journal(&final_path, &backup_path, &candidate_path, &guard)?;
 
         let error = recover_or_refuse_interrupted_export_publish(&final_path, &guard)
             .expect_err("recovery must not mix a parked main with destination companions");
@@ -3450,6 +3600,27 @@ mod tests {
 
         assert!(format!("{error:#}").contains("already publishing"));
         assert_eq!(first_guard.final_path, final_path);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_publish_lock_invalidates_existing_guard() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let final_path = temp_dir.path().join("export.db");
+        let lock_path = export_publish_lock_path(&final_path);
+        let parked_lock_path = temp_dir.path().join("parked-publish.lock");
+        let first_guard = acquire_export_publish_guard(&final_path)?;
+        std::fs::rename(&lock_path, &parked_lock_path)?;
+        std::fs::write(&lock_path, b"replacement lock")?;
+        let second_guard = acquire_export_publish_guard(&final_path)?;
+
+        let error = require_export_publish_guard(&final_path, &first_guard)
+            .expect_err("a guard for a replaced lock pathname must not authorize mutation");
+
+        assert!(format!("{error:#}").contains("was replaced"));
+        require_export_publish_guard(&final_path, &second_guard)?;
+        assert!(parked_lock_path.is_file(), "original lock must be preserved");
         Ok(())
     }
 
@@ -3842,10 +4013,15 @@ mod tests {
         std::fs::write(&backup_path, b"prior generation")?;
         let prior = inspect_export_regular_file(&backup_path, "test prior generation")?;
         let candidate = inspect_export_regular_file(&final_path, "test live generation")?;
-        let journal =
-            write_export_publish_journal(&final_path, &backup_path, &prior, &candidate)?;
-        std::fs::write(&backup_path, b"changed prior generation")?;
         let guard = acquire_export_publish_guard(&final_path)?;
+        let journal = write_export_publish_journal(
+            &final_path,
+            &backup_path,
+            &prior,
+            &candidate,
+            &guard,
+        )?;
+        std::fs::write(&backup_path, b"changed prior generation")?;
 
         let error = remove_prior_export_backup_after_publish(
             &backup_path,
@@ -3884,16 +4060,20 @@ mod tests {
         std::fs::write(&backup_path, b"prior generation")?;
         let prior = inspect_export_regular_file(&backup_path, "test prior generation")?;
         let candidate = inspect_export_regular_file(&final_path, "test live generation")?;
-        let journal =
-            write_export_publish_journal(&final_path, &backup_path, &prior, &candidate)?;
+        let guard = acquire_export_publish_guard(&final_path)?;
+        let journal = write_export_publish_journal(
+            &final_path,
+            &backup_path,
+            &prior,
+            &candidate,
+            &guard,
+        )?;
         let mut changed_journal = serde_json::to_value(&journal)?;
         changed_journal["candidate_sha256"] = serde_json::Value::String("0".repeat(64));
         std::fs::write(
             export_publish_recovery_journal_path(&final_path),
             serde_json::to_vec(&changed_journal)?,
         )?;
-        let guard = acquire_export_publish_guard(&final_path)?;
-
         let error = remove_prior_export_backup_after_publish(
             &backup_path,
             &final_path,
@@ -3919,13 +4099,20 @@ mod tests {
         let guard = acquire_export_publish_guard(&final_path).expect("acquire publish guard");
 
         std::fs::write(&first_tmp, b"first").expect("write first temp");
-        replace_file_from_temp(
+        let first_result = replace_file_from_temp(
             &first_tmp,
             &final_path,
             &mut retain_temp_on_error,
             &guard,
-        )
-            .expect("initial replace");
+        );
+        #[cfg(not(windows))]
+        first_result.expect("initial replace");
+        #[cfg(windows)]
+        {
+            let error = first_result
+                .expect_err("Windows first publication must report namespace durability limits");
+            assert!(format!("{error:#}").contains("cannot prove durable directory-entry"));
+        }
         assert_eq!(
             std::fs::read(&final_path).expect("read first final"),
             b"first"

@@ -1017,6 +1017,196 @@ fn browser_storage_clear_reports_partial_failures_and_continues_cleanup() {
 }
 
 #[test]
+fn browser_storage_fallback_and_migration_preserve_logical_write_order() {
+    let script = r#"
+        class StorageMock {
+            constructor() {
+                this.data = new Map();
+                this.failedSetKeys = new Set();
+                this.failedRemoveKeys = new Set();
+            }
+
+            get length() {
+                return this.data.size;
+            }
+
+            key(index) {
+                return Array.from(this.data.keys())[index] ?? null;
+            }
+
+            getItem(key) {
+                return this.data.has(key) ? this.data.get(key) : null;
+            }
+
+            setItem(key, value) {
+                if (this.failedSetKeys.has(key)) {
+                    throw new Error(`injected set failure for ${key}`);
+                }
+                this.data.set(key, String(value));
+            }
+
+            removeItem(key) {
+                if (this.failedRemoveKeys.has(key)) {
+                    throw new Error(`injected remove failure for ${key}`);
+                }
+                this.data.delete(key);
+            }
+        }
+
+        const originalWindow = globalThis.window;
+        const originalLocalStorage = globalThis.localStorage;
+        const originalSessionStorage = globalThis.sessionStorage;
+        const originalNavigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+
+        globalThis.window = { location: { href: 'https://example.com/archive/index.html#/' } };
+        globalThis.localStorage = new StorageMock();
+        globalThis.sessionStorage = new StorageMock();
+        Object.defineProperty(globalThis, 'navigator', {
+            value: { storage: {} },
+            configurable: true,
+            writable: true,
+        });
+
+        try {
+            const {
+                StorageMode,
+                getArchiveScopeId,
+                getItem,
+                getStorageMode,
+                removeItem,
+                setItem,
+                setStorageMode,
+            } = await import('./src/pages_assets/storage.js');
+            const prefix = `cass-archive-${getArchiveScopeId()}-data-`;
+
+            for (const [mode, backend] of [
+                [StorageMode.SESSION, sessionStorage],
+                [StorageMode.LOCAL, localStorage],
+            ]) {
+                await setStorageMode(mode);
+                const key = `coherent-${mode}`;
+                const fullKey = `${prefix}${key}`;
+                backend.setItem(fullKey, JSON.stringify('old-persistent'));
+                backend.failedSetKeys.add(fullKey);
+
+                if (await setItem(key, 'new-fallback') !== false) {
+                    throw new Error(`${mode} failed overwrite must report fallback-only durability`);
+                }
+                if (await getItem(key) !== 'new-fallback') {
+                    throw new Error(`${mode} reads must prefer the newest failed-write fallback`);
+                }
+                if (backend.getItem(fullKey) !== JSON.stringify('old-persistent')) {
+                    throw new Error('the test must retain stale persistent bytes after the injected failure');
+                }
+
+                backend.failedSetKeys.delete(fullKey);
+                if (await setItem(key, 'persisted') !== true) {
+                    throw new Error(`${mode} retry must report persistent success`);
+                }
+                backend.setItem(fullKey, JSON.stringify('backend-after-success'));
+                if (await getItem(key) !== 'backend-after-success') {
+                    throw new Error(`${mode} successful writes must retire the memory fallback`);
+                }
+
+                backend.failedRemoveKeys.add(fullKey);
+                if (await removeItem(key) !== false) {
+                    throw new Error(`${mode} failed deletion must be reported to the caller`);
+                }
+                if (await getItem(key, 'missing') !== 'missing') {
+                    throw new Error(`${mode} failed deletion must hide stale physical bytes logically`);
+                }
+
+                backend.failedRemoveKeys.delete(fullKey);
+                if (await setItem(key, 'revived') !== true || await getItem(key) !== 'revived') {
+                    throw new Error(`${mode} successful write must retire a deletion tombstone`);
+                }
+            }
+
+            await setStorageMode(StorageMode.SESSION);
+            const overlayKey = 'migration-overlay';
+            const overlayFullKey = `${prefix}${overlayKey}`;
+            const staleTargetKey = `${prefix}stale-target-only`;
+            sessionStorage.setItem(overlayFullKey, JSON.stringify('stale-source'));
+            localStorage.setItem(overlayFullKey, JSON.stringify('stale-target'));
+            localStorage.setItem(staleTargetKey, JSON.stringify('must-disappear'));
+            sessionStorage.failedSetKeys.add(overlayFullKey);
+            if (await setItem(overlayKey, 'newest-logical') !== false) {
+                throw new Error('the migration fixture must create a memory fallback overlay');
+            }
+            sessionStorage.failedSetKeys.delete(overlayFullKey);
+
+            await setStorageMode(StorageMode.LOCAL, true);
+            if (
+                getStorageMode() !== StorageMode.LOCAL
+                || await getItem(overlayKey) !== 'newest-logical'
+                || localStorage.getItem(overlayFullKey) !== JSON.stringify('newest-logical')
+            ) {
+                throw new Error('migration must commit the newest logical overlay, not stale source bytes');
+            }
+            if (localStorage.getItem(staleTargetKey) !== null) {
+                throw new Error('migration must not expose destination-only stale data');
+            }
+
+            await setStorageMode(StorageMode.SESSION);
+            const deletedKey = 'migration-tombstone';
+            const deletedFullKey = `${prefix}${deletedKey}`;
+            sessionStorage.setItem(deletedFullKey, JSON.stringify('source-secret'));
+            localStorage.setItem(deletedFullKey, JSON.stringify('target-secret'));
+            sessionStorage.failedRemoveKeys.add(deletedFullKey);
+            if (await removeItem(deletedKey) !== false) {
+                throw new Error('the migration fixture must create a deletion tombstone');
+            }
+            sessionStorage.failedRemoveKeys.delete(deletedFullKey);
+            await setStorageMode(StorageMode.LOCAL, true);
+            if (localStorage.getItem(deletedFullKey) !== null || await getItem(deletedKey) !== null) {
+                throw new Error('migration must preserve a newer logical deletion');
+            }
+
+            await setStorageMode(StorageMode.SESSION);
+            const rejectedKey = 'migration-rejected';
+            const rejectedFullKey = `${prefix}${rejectedKey}`;
+            sessionStorage.setItem(rejectedFullKey, JSON.stringify('source-remains-authoritative'));
+            localStorage.removeItem(rejectedFullKey);
+            localStorage.failedSetKeys.add(rejectedFullKey);
+            let migrationRejected = false;
+            try {
+                await setStorageMode(StorageMode.LOCAL, true);
+            } catch {
+                migrationRejected = true;
+            }
+            if (!migrationRejected || getStorageMode() !== StorageMode.SESSION) {
+                throw new Error('an unverifiable destination write must not commit the new storage mode');
+            }
+            if (await getItem(rejectedKey) !== 'source-remains-authoritative') {
+                throw new Error('a rejected migration must leave the source logical state readable');
+            }
+        } finally {
+            globalThis.window = originalWindow;
+            globalThis.localStorage = originalLocalStorage;
+            globalThis.sessionStorage = originalSessionStorage;
+            if (originalNavigatorDescriptor) {
+                Object.defineProperty(globalThis, 'navigator', originalNavigatorDescriptor);
+            } else {
+                delete globalThis.navigator;
+            }
+        }
+    "#;
+
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("run browser storage fallback and migration assertions with node");
+
+    assert!(
+        output.status.success(),
+        "browser storage fallback and migration assertions failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn browser_opfs_cleanup_is_scope_bound_and_truthful() {
     let script = r#"
         class StorageMock {

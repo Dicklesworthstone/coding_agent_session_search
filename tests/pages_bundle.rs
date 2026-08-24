@@ -1678,8 +1678,28 @@ mod tests {
                     "Boolean(registration?.active || registration?.installing || registration?.waiting)"
                 )
                 && coi_detector_js.contains("registration?.active?.state === 'activated'")
-                && !coi_detector_js.contains("navigator.serviceWorker.getRegistration()"),
+                && coi_detector_js.contains("waitForExactServiceWorkerActivation(maxWaitMs)")
+                && coi_detector_js.contains("candidateWorker?.state === 'redundant'")
+                && coi_detector_js.contains("Math.min(100, remainingMs)")
+                && coi_detector_js.contains(
+                    "console.warn('[COI] Archive service worker is not active - degrading');"
+                )
+                && !coi_detector_js.contains("navigator.serviceWorker.getRegistration()")
+                && !coi_detector_js.contains("navigator.serviceWorker.ready"),
             "COI detection must not mistake a broader or workerless registration for this archive's active installation"
+        );
+
+        let installing_fallback = coi_detector_js
+            .split_once("case COI_STATE.SW_INSTALLING:")
+            .expect("SW_INSTALLING fallback")
+            .1
+            .split_once("return COI_STATE.DEGRADED;")
+            .expect("bounded SW_INSTALLING fallback")
+            .0;
+        assert!(
+            installing_fallback.contains("showDegradedModeWarning();")
+                && !installing_fallback.contains("showReloadRequiredUI("),
+            "an exact worker that remains inactive after the bounded wait must degrade instead of entering an ineffective auto-reload loop"
         );
     }
 
@@ -1807,6 +1827,9 @@ mod tests {
         assert!(
             sw_register_js.contains("noticeWaitingUpdate(registration);")
                 && sw_register_js.contains("if (!reg?.waiting || !reg.active)")
+                && sw_register_js.contains("watchInstallingWorker(reg, reg.installing);")
+                && sw_register_js.contains("const watchedInstallingWorkers = new WeakSet();")
+                && sw_register_js.contains("newWorker.state === 'installed'")
                 && sw_register_js.contains("return 'serviceWorker' in navigator && hasExactScope(registration);")
                 && sw_register_js.contains("&& registration.active?.state === 'activated';"),
             "pre-existing waiting updates and status getters should be scoped to the exact archive registration"

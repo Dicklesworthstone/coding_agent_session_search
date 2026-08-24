@@ -192,13 +192,17 @@ export class SessionManager {
      */
     async startSession(dek, rememberMe = false) {
         validateDek(dek);
-        const nextDek = this.dek === dek ? new Uint8Array(dek) : dek;
+        const copiedActiveDek = this.dek === dek;
+        const nextDek = copiedActiveDek ? new Uint8Array(dek) : dek;
         const expiry = calculateExpiry(Date.now(), this.duration);
 
         // Replacing a session must not leave the prior key or timers alive,
         // even if cleanup or persistence of the replacement later fails.
         this.clearActiveState();
         if (!this.clearStorage()) {
+            if (copiedActiveDek) {
+                nextDek.fill(0);
+            }
             throw new Error('Previous persisted session data could not be fully cleared');
         }
 
@@ -214,6 +218,9 @@ export class SessionManager {
                 writeAndVerify(storage, sessionKeys.EXPIRY, encodedExpiry);
                 writeAndVerify(storage, sessionKeys.TOKEN, encodedDek);
             } catch (error) {
+                if (copiedActiveDek) {
+                    nextDek.fill(0);
+                }
                 if (!this.clearStorage()) {
                     console.warn('[Session] Failed session start left persisted data that could not be fully cleared');
                 }
@@ -221,14 +228,33 @@ export class SessionManager {
             }
         }
 
+        if (!isUsableFutureExpiry(expiry, Date.now())) {
+            if (copiedActiveDek) {
+                nextDek.fill(0);
+            }
+            if (!this.clearStorage()) {
+                console.warn('[Session] Expired session start left persisted data that could not be fully cleared');
+            }
+            throw new Error('Session expired before it could be started');
+        }
+
+        try {
+            this.setTimers(expiry);
+        } catch (error) {
+            if (copiedActiveDek) {
+                nextDek.fill(0);
+            }
+            if (!this.clearStorage()) {
+                console.warn('[Session] Unschedulable session start left persisted data that could not be fully cleared');
+            }
+            throw new Error('Failed to schedule the new session expiry', { cause: error });
+        }
+
         // Publish active state only after persistent writes have committed.
-        this.dek = dek;
+        this.dek = nextDek;
         this.expiryTs = expiry;
         this.persistent = persistent;
         this.persistenceStorage = persistent ? storage : null;
-
-        // Set timers
-        this.setTimers(expiry);
 
         // Set up cleanup handlers
         this.setupCleanupHandlers();
@@ -331,22 +357,55 @@ export class SessionManager {
             return false;
         }
 
-        const extension = additionalMs || this.duration;
-        const storage = this.getStorage();
-
-        // Calculate new expiry
-        const sessionKeys = getScopedSessionKeys();
-        const currentExpiry = this.expiryTs || parseInt(storage.getItem(sessionKeys.EXPIRY) || '0', 10);
-        const newExpiry = Math.max(Date.now(), currentExpiry) + extension;
-        this.expiryTs = newExpiry;
-
-        // Update storage
-        if (this.persistent) {
-            storage.setItem(sessionKeys.EXPIRY, newExpiry.toString());
+        const extension = additionalMs ?? this.duration;
+        try {
+            validateDuration(extension, 'Session extension');
+        } catch (error) {
+            console.warn('[Session] Refusing invalid extension:', error);
+            return false;
         }
 
-        // Reset timers
-        this.setTimers(newExpiry);
+        const now = Date.now();
+        if (!isUsableFutureExpiry(this.expiryTs, now)) {
+            console.warn('[Session] Refusing to extend an expired or invalid session');
+            this.endSession();
+            this.onExpired();
+            return false;
+        }
+
+        let newExpiry;
+        try {
+            newExpiry = calculateExpiry(this.expiryTs, extension);
+            if (!isUsableFutureExpiry(newExpiry, now)) {
+                throw new RangeError('Extended session exceeds the safe timer horizon');
+            }
+        } catch (error) {
+            console.warn('[Session] Refusing unsafe extension:', error);
+            return false;
+        }
+
+        try {
+            // Persist to the backend that actually committed this session,
+            // then publish the new in-memory expiry and timer together.
+            if (this.persistent) {
+                if (!this.persistenceStorage) {
+                    throw new Error('Persistent session has no committed storage backend');
+                }
+                const sessionKeys = getScopedSessionKeys();
+                writeAndVerify(this.persistenceStorage, sessionKeys.EXPIRY, newExpiry.toString());
+            }
+
+            this.setTimers(newExpiry);
+        } catch (error) {
+            console.error('[Session] Failed to extend session:', error);
+            // A failed or unverifiable storage write has an ambiguous durable
+            // result. Fail closed rather than allowing memory and disk expiry
+            // state to diverge and resurrect a longer session on reload.
+            this.endSession();
+            return false;
+        }
+
+        this.expiryTs = newExpiry;
 
         console.log(`[Session] Extended to ${new Date(newExpiry).toISOString()}`);
         return true;
@@ -380,24 +439,25 @@ export class SessionManager {
      * Set expiry and warning timers
      */
     setTimers(expiry) {
+        const now = Date.now();
+        if (!isUsableFutureExpiry(expiry, now)) {
+            throw new RangeError('Cannot schedule an expired or unsafe session expiry');
+        }
+
         this.clearTimers();
+        const remaining = expiry - now;
 
-        const remaining = expiry - Date.now();
+        this.expiryTimeout = setTimeout(() => {
+            this.endSession();
+            this.onExpired();
+        }, remaining);
 
-        // Expiry timer
-        if (remaining > 0) {
-            this.expiryTimeout = setTimeout(() => {
-                this.endSession();
-                this.onExpired();
-            }, remaining);
-
-            // Warning timer
-            const warningTime = remaining - SESSION_CONFIG.WARNING_BEFORE_MS;
-            if (warningTime > 0) {
-                this.warningTimeout = setTimeout(() => {
-                    this.onWarning(SESSION_CONFIG.WARNING_BEFORE_MS);
-                }, warningTime);
-            }
+        // Warning timer
+        const warningTime = remaining - SESSION_CONFIG.WARNING_BEFORE_MS;
+        if (warningTime > 0) {
+            this.warningTimeout = setTimeout(() => {
+                this.onWarning(SESSION_CONFIG.WARNING_BEFORE_MS);
+            }, warningTime);
         }
     }
 
@@ -405,11 +465,11 @@ export class SessionManager {
      * Clear all timers
      */
     clearTimers() {
-        if (this.expiryTimeout) {
+        if (this.expiryTimeout !== null) {
             clearTimeout(this.expiryTimeout);
             this.expiryTimeout = null;
         }
-        if (this.warningTimeout) {
+        if (this.warningTimeout !== null) {
             clearTimeout(this.warningTimeout);
             this.warningTimeout = null;
         }
@@ -531,9 +591,11 @@ export class SessionManager {
      * Handle page unload
      */
     handleBeforeUnload() {
-        // Zeroize DEK on page unload for memory-only sessions
-        if (this.storage === SESSION_CONFIG.STORAGE_MEMORY && this.dek) {
-            this.dek.fill(0);
+        // Zeroize any session that was not actually committed to persistent
+        // storage, including configured session/local modes whose backend was
+        // unavailable or whose caller chose not to remember the session.
+        if (!this.persistent && this.dek) {
+            this.clearActiveState();
         }
     }
 }
@@ -546,7 +608,10 @@ export class SessionManager {
 export class ActivityMonitor {
     constructor(sessionManager, options = {}) {
         this.session = sessionManager;
-        this.idleTimeout = options.idleTimeout || SESSION_CONFIG.IDLE_TIMEOUT_MS;
+        this.idleTimeout = validateDuration(
+            options.idleTimeout ?? SESSION_CONFIG.IDLE_TIMEOUT_MS,
+            'Activity idle timeout'
+        );
         this.lastActivity = Date.now();
         this.enabled = false;
 
@@ -612,14 +677,14 @@ export class ActivityMonitor {
  */
 export function createSessionManager(options = {}) {
     const session = new SessionManager({
-        duration: options.duration || SESSION_CONFIG.DEFAULT_DURATION_MS,
-        storage: options.storage || SESSION_CONFIG.STORAGE_SESSION,
+        duration: options.duration ?? SESSION_CONFIG.DEFAULT_DURATION_MS,
+        storage: options.storage ?? SESSION_CONFIG.STORAGE_SESSION,
         onExpired: options.onExpired,
         onWarning: options.onWarning,
     });
 
     const activity = new ActivityMonitor(session, {
-        idleTimeout: options.idleTimeout || SESSION_CONFIG.IDLE_TIMEOUT_MS,
+        idleTimeout: options.idleTimeout ?? SESSION_CONFIG.IDLE_TIMEOUT_MS,
     });
 
     return { session, activity };

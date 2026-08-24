@@ -421,76 +421,173 @@ export async function removeItem(key) {
 async function migrateStorage(fromMode, toMode) {
     console.log('[Storage] Migrating from', fromMode, 'to', toMode);
 
-    // Get all keys from source
     const archiveDataPrefix = getArchiveDataPrefix();
-    const keys = [];
-    const values = new Map();
+    const values = snapshotLogicalEntries(fromMode, archiveDataPrefix);
 
-    switch (fromMode) {
-        case StorageMode.MEMORY:
-            for (const [key, value] of memoryStore) {
-                if (key.startsWith(archiveDataPrefix) && value !== MEMORY_TOMBSTONE) {
-                    keys.push(key);
-                    values.set(key, value);
-                }
-            }
-            break;
+    if (toMode === StorageMode.MEMORY) {
+        removeMapEntriesWithPrefix(memoryStore, archiveDataPrefix);
+        for (const [key, value] of values) {
+            memoryStore.set(key, value);
+        }
+    } else {
+        const targetStorage = getRequiredModeStorage(toMode);
+        replaceStorageEntries(targetStorage, archiveDataPrefix, values);
 
-        case StorageMode.SESSION:
-            {
-                const storage = tryGetSessionStorage();
-                if (!storage) {
-                    break;
-                }
-                for (let i = 0; i < storage.length; i++) {
-                    const key = storage.key(i);
-                    if (key && key.startsWith(archiveDataPrefix)) {
-                        keys.push(key);
-                        values.set(key, storage.getItem(key));
-                    }
-                }
-            }
-            break;
-
-        case StorageMode.LOCAL:
-            {
-                const storage = tryGetLocalStorage();
-                if (!storage) {
-                    break;
-                }
-                for (let i = 0; i < storage.length; i++) {
-                    const key = storage.key(i);
-                    if (key && key.startsWith(archiveDataPrefix)) {
-                        keys.push(key);
-                        values.set(key, storage.getItem(key));
-                    }
-                }
-            }
-            break;
-
+        // Every fallback entry is now represented exactly in the destination.
+        // Drop overlays only after destination verification, immediately before
+        // committing the new mode, so the old mode cannot expose stale bytes.
+        removeMapEntriesWithPrefix(memoryStore, archiveDataPrefix);
     }
 
-    // Write to destination
-    const oldMode = currentMode;
     currentMode = toMode;
+    console.log('[Storage] Migrated', values.size, 'items');
+}
+
+function getRequiredModeStorage(mode) {
+    const storage = mode === StorageMode.SESSION
+        ? tryGetSessionStorage()
+        : mode === StorageMode.LOCAL
+            ? tryGetLocalStorage()
+            : null;
+    if (!storage) {
+        throw new Error(`Storage backend is unavailable for migration target: ${mode}`);
+    }
+    return storage;
+}
+
+function snapshotStorageEntries(storage, prefix) {
+    const entries = new Map();
+    const entryCount = storage.length;
+    if (!Number.isSafeInteger(entryCount) || entryCount < 0) {
+        throw new Error('Browser storage reported an invalid entry count during migration');
+    }
+
+    for (let i = 0; i < entryCount; i++) {
+        const key = storage.key(i);
+        if (!key || !key.startsWith(prefix)) {
+            continue;
+        }
+        const value = storage.getItem(key);
+        if (value !== null) {
+            entries.set(key, value);
+        }
+    }
+    return entries;
+}
+
+function snapshotLogicalEntries(mode, prefix) {
+    const entries = mode === StorageMode.MEMORY
+        ? new Map()
+        : snapshotStorageEntries(getRequiredModeStorage(mode), prefix);
+
+    // Failed writes and deletes are newer logical operations than any bytes
+    // still present in Web Storage, so overlays must win in the snapshot.
+    for (const [key, value] of memoryStore) {
+        if (!key.startsWith(prefix)) {
+            continue;
+        }
+        if (value === MEMORY_TOMBSTONE) {
+            entries.delete(key);
+        } else {
+            entries.set(key, value);
+        }
+    }
+    return entries;
+}
+
+function storageEntriesEqual(left, right) {
+    if (left.size !== right.size) {
+        return false;
+    }
+    for (const [key, value] of left) {
+        if (right.get(key) !== value) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function restoreStorageEntries(storage, prefix, snapshot) {
+    let restored = true;
+    let current;
+    try {
+        current = snapshotStorageEntries(storage, prefix);
+    } catch (error) {
+        console.warn('[Storage] Could not inspect migration target during rollback:', error);
+        return false;
+    }
+
+    for (const key of current.keys()) {
+        if (snapshot.has(key)) {
+            continue;
+        }
+        try {
+            storage.removeItem(key);
+            if (storage.getItem(key) !== null) {
+                restored = false;
+            }
+        } catch (error) {
+            console.warn('[Storage] Could not remove migration residue during rollback:', error);
+            restored = false;
+        }
+    }
+
+    for (const [key, value] of snapshot) {
+        try {
+            storage.setItem(key, value);
+            if (storage.getItem(key) !== value) {
+                restored = false;
+            }
+        } catch (error) {
+            console.warn('[Storage] Could not restore migration target entry:', error);
+            restored = false;
+        }
+    }
 
     try {
-        for (const key of keys) {
-            const shortKey = key.slice(archiveDataPrefix.length);
-            const value = values.get(key);
-            if (value) {
-                try {
-                    await setItem(shortKey, JSON.parse(value));
-                } catch (e) {
-                    await setItem(shortKey, value);
-                }
+        restored = storageEntriesEqual(
+            snapshotStorageEntries(storage, prefix),
+            snapshot
+        ) && restored;
+    } catch (error) {
+        console.warn('[Storage] Could not verify migration rollback:', error);
+        restored = false;
+    }
+    return restored;
+}
+
+function replaceStorageEntries(storage, prefix, values) {
+    const previous = snapshotStorageEntries(storage, prefix);
+
+    try {
+        // Write the complete desired generation before removing stale entries.
+        for (const [key, value] of values) {
+            storage.setItem(key, value);
+            if (storage.getItem(key) !== value) {
+                throw new Error(`Migration write verification failed for ${key}`);
             }
         }
-    } finally {
-        currentMode = oldMode;
-    }
 
-    console.log('[Storage] Migrated', keys.length, 'items');
+        for (const key of previous.keys()) {
+            if (values.has(key)) {
+                continue;
+            }
+            storage.removeItem(key);
+            if (storage.getItem(key) !== null) {
+                throw new Error(`Migration delete verification failed for ${key}`);
+            }
+        }
+
+        if (!storageEntriesEqual(snapshotStorageEntries(storage, prefix), values)) {
+            throw new Error('Migration target verification failed');
+        }
+    } catch (error) {
+        const rolledBack = restoreStorageEntries(storage, prefix, previous);
+        const message = rolledBack
+            ? 'Storage migration failed; the destination was restored'
+            : 'Storage migration failed and the destination could not be fully restored';
+        throw new Error(message, { cause: error });
+    }
 }
 
 function removeMapEntriesWithPrefix(map, prefix) {

@@ -91,6 +91,56 @@ async function getCurrentServiceWorkerRegistration() {
     }
 }
 
+async function waitForExactServiceWorkerActivation(timeoutMs) {
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+        throw new RangeError('Service worker activation timeout must be non-negative');
+    }
+
+    const deadline = Date.now() + timeoutMs;
+    while (true) {
+        const registration = await getCurrentServiceWorkerRegistration();
+        if (registration?.active?.state === 'activated') {
+            return true;
+        }
+
+        const candidateWorker = registration?.installing
+            || registration?.waiting
+            || registration?.active;
+        if (candidateWorker?.state === 'redundant') {
+            return false;
+        }
+
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) {
+            return false;
+        }
+
+        // Registration is started independently by auth.js and may not have
+        // appeared yet. Poll at a bounded cadence, but also wake immediately
+        // for state/controller changes once an exact worker is observable.
+        await new Promise((resolve) => {
+            let settled = false;
+            let timerId = null;
+            const finish = () => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                if (timerId !== null) {
+                    clearTimeout(timerId);
+                }
+                candidateWorker?.removeEventListener('statechange', finish);
+                navigator.serviceWorker.removeEventListener('controllerchange', finish);
+                resolve();
+            };
+
+            candidateWorker?.addEventListener('statechange', finish);
+            navigator.serviceWorker.addEventListener('controllerchange', finish);
+            timerId = setTimeout(finish, Math.min(100, remainingMs));
+        });
+    }
+}
+
 /**
  * Check if we're cross-origin isolated
  * @returns {boolean}
@@ -456,26 +506,21 @@ export async function initCOIDetection({
     if (state === COI_STATE.SW_INSTALLING) {
         showInstallingUI(statusContainer);
 
-        // Wait for SW to become active
+        // Wait for this archive's exact registration to become active. The
+        // origin-global ready promise can resolve for a broader parent worker.
         if ('serviceWorker' in navigator) {
             try {
-                await Promise.race([
-                    navigator.serviceWorker.ready,
-                    new Promise((_, reject) =>
-                        setTimeout(() => reject(new Error('SW timeout')), maxWaitMs)
-                    ),
-                ]);
-
-                // Update step status
-                updateProgressStep('coi-step-sw', 'complete');
-                updateProgressStep('coi-step-headers', 'loading');
-
-                // Recheck state after SW is ready
+                const activated = await waitForExactServiceWorkerActivation(maxWaitMs);
+                if (activated) {
+                    updateProgressStep('coi-step-sw', 'complete');
+                    updateProgressStep('coi-step-headers', 'loading');
+                } else {
+                    console.warn('[COI] Exact archive service worker did not activate before timeout');
+                }
                 state = await getCOIState();
-                console.log('[COI] State after SW ready:', state);
+                console.log('[COI] State after exact worker wait:', state);
             } catch (error) {
-                console.warn('[COI] SW wait timeout or error:', error.message);
-                // Continue with current state
+                console.warn('[COI] Exact service worker wait failed:', error.message);
                 state = await getCOIState();
             }
         }
@@ -512,32 +557,14 @@ export async function initCOIDetection({
             break;
 
         case COI_STATE.SW_INSTALLING:
-            // Still installing after timeout - check if we should show reload or proceed
-            console.log('[COI] SW still installing - checking fallback');
-            if (!await hasServiceWorkerRegistration()) {
-                console.warn('[COI] No service worker registration found after waiting - degrading');
-                hideStatusUI(statusContainer);
-                showDegradedModeWarning();
-                if (onReady) onReady();
-                return COI_STATE.DEGRADED;
-            }
-            if (isSharedArrayBufferAvailable()) {
-                // Already have SAB somehow (maybe browser feature)
-                markSetupComplete();
-                hideStatusUI(statusContainer);
-                if (onReady) onReady();
-            } else {
-                // Show reload prompt as SW should be active soon
-                showReloadRequiredUI(statusContainer, {
-                    autoReload,
-                    countdownSeconds,
-                    onReload: () => console.log('[COI] Reloading...'),
-                });
-                if (authContainer) {
-                    authContainer.classList.add('hidden');
-                }
-            }
-            break;
+            // Reloading cannot activate a worker that failed or remained stuck
+            // during the bounded wait. Proceed without COI; the background
+            // registration may still make a later page load fully ready.
+            console.warn('[COI] Archive service worker is not active - degrading');
+            hideStatusUI(statusContainer);
+            showDegradedModeWarning();
+            if (onReady) onReady();
+            return COI_STATE.DEGRADED;
     }
 
     return state;
