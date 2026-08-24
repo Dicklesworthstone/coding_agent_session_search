@@ -141,6 +141,17 @@ impl UdsDaemonClient {
         Self::new(DaemonClientConfig::from_env())
     }
 
+    fn mark_unavailable(&self) {
+        self.available.store(false, Ordering::SeqCst);
+        *self.last_health_check.lock() = None;
+    }
+
+    fn install_connection(&self, stream: UnixStream) {
+        *self.connection.lock() = Some(stream);
+        *self.last_health_check.lock() = None;
+        self.available.store(true, Ordering::SeqCst);
+    }
+
     fn validate_embedder_id(&self, actual: &str) -> Result<(), DaemonError> {
         if let Some(expected) = self.config.expected_embedder_id.as_deref()
             && actual != expected
@@ -156,8 +167,7 @@ impl UdsDaemonClient {
     pub fn connect(&self) -> Result<(), DaemonError> {
         // Try to connect to existing daemon
         if let Ok(stream) = self.try_connect() {
-            *self.connection.lock() = Some(stream);
-            self.available.store(true, Ordering::SeqCst);
+            self.install_connection(stream);
             debug!(socket = %self.config.socket_path.display(), "Connected to existing daemon");
             return Ok(());
         }
@@ -171,8 +181,7 @@ impl UdsDaemonClient {
             for attempt in 0..10 {
                 std::thread::sleep(Duration::from_millis(100 * (attempt + 1)));
                 if let Ok(stream) = self.try_connect() {
-                    *self.connection.lock() = Some(stream);
-                    self.available.store(true, Ordering::SeqCst);
+                    self.install_connection(stream);
                     info!(
                         socket = %self.config.socket_path.display(),
                         attempts = attempt + 1,
@@ -343,7 +352,7 @@ impl UdsDaemonClient {
         drop(conn);
 
         // Reconnect
-        self.available.store(false, Ordering::SeqCst);
+        self.mark_unavailable();
         self.connect()?;
 
         let conn = self.connection.lock();
@@ -373,7 +382,7 @@ impl UdsDaemonClient {
         // Send request
         if let Err(e) = stream.write_all(&encoded) {
             *stream_guard = None;
-            self.available.store(false, Ordering::SeqCst);
+            self.mark_unavailable();
             return Err(DaemonError::Unavailable(format!(
                 "failed to send request: {}",
                 e
@@ -384,7 +393,7 @@ impl UdsDaemonClient {
         let mut len_buf = [0u8; 4];
         if let Err(e) = stream.read_exact(&mut len_buf) {
             *stream_guard = None;
-            self.available.store(false, Ordering::SeqCst);
+            self.mark_unavailable();
             if e.kind() == std::io::ErrorKind::TimedOut {
                 return Err(DaemonError::Timeout("response timeout".to_string()));
             } else {
@@ -400,6 +409,7 @@ impl UdsDaemonClient {
         const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
         if len > MAX_RESPONSE_SIZE {
             *stream_guard = None;
+            self.mark_unavailable();
             warn!(
                 response_size = len,
                 max_size = MAX_RESPONSE_SIZE,
@@ -415,7 +425,7 @@ impl UdsDaemonClient {
         let mut payload = vec![0u8; len];
         if let Err(e) = stream.read_exact(&mut payload) {
             *stream_guard = None;
-            self.available.store(false, Ordering::SeqCst);
+            self.mark_unavailable();
             if e.kind() == std::io::ErrorKind::TimedOut {
                 return Err(DaemonError::Timeout("response timeout".to_string()));
             } else {
@@ -426,20 +436,41 @@ impl UdsDaemonClient {
             }
         }
 
-        // Release connection lock before decoding
-        drop(stream_guard);
-
         // Decode response
-        let response: FramedMessage<Response> = decode_message(&payload)
-            .map_err(|e| DaemonError::Failed(format!("failed to decode response: {}", e)))?;
+        let response: FramedMessage<Response> = match decode_message(&payload) {
+            Ok(response) => response,
+            Err(error) => {
+                *stream_guard = None;
+                self.mark_unavailable();
+                return Err(DaemonError::Failed(format!(
+                    "failed to decode response: {error}"
+                )));
+            }
+        };
 
         // Check version compatibility
         if response.version != PROTOCOL_VERSION {
+            *stream_guard = None;
+            self.mark_unavailable();
             return Err(DaemonError::Failed(format!(
                 "protocol version mismatch: expected {}, got {}",
                 PROTOCOL_VERSION, response.version
             )));
         }
+
+        // A response for another request indicates a broken or incompatible
+        // peer. Close the stream so no later call can consume a frame from a
+        // protocol sequence we no longer trust.
+        if response.request_id != request_id {
+            let response_id = response.request_id;
+            *stream_guard = None;
+            self.mark_unavailable();
+            return Err(DaemonError::Failed(format!(
+                "response request ID mismatch: expected {request_id}, got {response_id}"
+            )));
+        }
+
+        drop(stream_guard);
 
         // Handle error responses
         match response.payload {
@@ -463,7 +494,7 @@ impl UdsDaemonClient {
     pub fn health(&self) -> Result<HealthStatus, DaemonError> {
         match self.send_request(Request::Health)? {
             Response::Health(status) => {
-                *self.last_health_check.lock() = Some(Instant::now());
+                *self.last_health_check.lock() = status.ready.then(Instant::now);
                 Ok(status)
             }
             other => Err(unexpected_response(other)),
@@ -474,7 +505,7 @@ impl UdsDaemonClient {
     pub fn shutdown(&self) -> Result<(), DaemonError> {
         match self.send_request(Request::Shutdown)? {
             Response::Shutdown { .. } => {
-                self.available.store(false, Ordering::SeqCst);
+                self.mark_unavailable();
                 *self.connection.lock() = None;
                 Ok(())
             }
@@ -547,7 +578,7 @@ impl DaemonClient for UdsDaemonClient {
         match self.health() {
             Ok(status) => status.ready,
             Err(_) => {
-                self.available.store(false, Ordering::SeqCst);
+                self.mark_unavailable();
                 false
             }
         }
@@ -892,6 +923,20 @@ pub fn try_connect_for_embedder(expected_embedder_id: &str) -> Option<Arc<UdsDae
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn test_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
+        std::io::Error::other(message.into()).into()
+    }
+
+    fn ensure(condition: bool, message: impl Into<String>) -> TestResult {
+        if condition {
+            Ok(())
+        } else {
+            Err(test_error(message))
+        }
+    }
+
     fn write_test_lock_metadata(path: &Path, generation: Option<u64>) {
         let metadata = DaemonRunLockMetadata {
             pid: std::process::id(),
@@ -1039,7 +1084,7 @@ mod tests {
             .file_name()
             .expect("default socket path has a filename")
             .to_string_lossy();
-        assert!(file_name.starts_with("semantic-daemon-"));
+        assert!(file_name.starts_with("cass-semantic-daemon-"));
         assert!(file_name.ends_with(".sock"));
     }
 
@@ -1069,6 +1114,173 @@ mod tests {
         assert!(matches!(error, DaemonError::InvalidInput(_)));
         assert!(error.to_string().contains("expected minilm-384"));
         assert!(error.to_string().contains("received hash-384"));
+    }
+
+    #[test]
+    fn response_request_id_mismatch_closes_the_untrusted_connection() -> TestResult {
+        let (client_stream, mut server_stream) = UnixStream::pair()?;
+        let client = UdsDaemonClient::new(DaemonClientConfig {
+            auto_spawn: false,
+            ..Default::default()
+        });
+        *client.connection.lock() = Some(client_stream);
+        client.available.store(true, Ordering::SeqCst);
+        *client.last_health_check.lock() = Some(Instant::now());
+
+        let server = std::thread::spawn(move || -> std::io::Result<()> {
+            let mut len = [0_u8; 4];
+            server_stream.read_exact(&mut len)?;
+            let mut payload = vec![0_u8; u32::from_be_bytes(len) as usize];
+            server_stream.read_exact(&mut payload)?;
+            decode_message::<Request>(&payload).map_err(std::io::Error::other)?;
+
+            let response = FramedMessage::new(
+                "different-request",
+                Response::Health(HealthStatus {
+                    uptime_secs: 1,
+                    version: PROTOCOL_VERSION,
+                    ready: true,
+                    memory_bytes: 0,
+                }),
+            );
+            let encoded = encode_message(&response).map_err(std::io::Error::other)?;
+            server_stream.write_all(&encoded)
+        });
+
+        let error = match client.health() {
+            Ok(_) => return Err(test_error("mismatched response request ID was accepted")),
+            Err(error) => error,
+        };
+        server
+            .join()
+            .map_err(|_| test_error("server thread panicked"))??;
+
+        let message = error.to_string();
+        ensure(
+            matches!(error, DaemonError::Failed(_)),
+            "request ID mismatch should be a daemon failure",
+        )?;
+        ensure(message.contains("expected cass-0"), "missing expected ID")?;
+        ensure(
+            message.contains("got different-request"),
+            "missing received ID",
+        )?;
+        ensure(
+            client.connection.lock().is_none(),
+            "untrusted connection was retained",
+        )?;
+        ensure(
+            !client.available.load(Ordering::SeqCst),
+            "untrusted connection remained available",
+        )?;
+        ensure(
+            client.last_health_check.lock().is_none(),
+            "cached health survived connection invalidation",
+        )
+    }
+
+    #[test]
+    fn oversized_response_clears_connection_and_cached_availability() -> TestResult {
+        const OVERSIZED_RESPONSE_LEN: u32 = 10 * 1024 * 1024 + 1;
+
+        let (client_stream, mut server_stream) = UnixStream::pair()?;
+        let client = UdsDaemonClient::new(DaemonClientConfig {
+            auto_spawn: false,
+            ..Default::default()
+        });
+        *client.connection.lock() = Some(client_stream);
+        client.available.store(true, Ordering::SeqCst);
+        *client.last_health_check.lock() = Some(Instant::now());
+
+        let server = std::thread::spawn(move || -> std::io::Result<()> {
+            let mut len = [0_u8; 4];
+            server_stream.read_exact(&mut len)?;
+            let mut payload = vec![0_u8; u32::from_be_bytes(len) as usize];
+            server_stream.read_exact(&mut payload)?;
+            server_stream.write_all(&OVERSIZED_RESPONSE_LEN.to_be_bytes())
+        });
+
+        let error = match client.health() {
+            Ok(_) => return Err(test_error("oversized response was accepted")),
+            Err(error) => error,
+        };
+        server
+            .join()
+            .map_err(|_| test_error("server thread panicked"))??;
+
+        ensure(
+            matches!(error, DaemonError::Failed(_)),
+            "oversized response should be a daemon failure",
+        )?;
+        ensure(
+            error.to_string().contains("response too large"),
+            "oversized response error lacked context",
+        )?;
+        ensure(
+            client.connection.lock().is_none(),
+            "oversized response connection was retained",
+        )?;
+        ensure(
+            !client.available.load(Ordering::SeqCst),
+            "oversized response connection remained available",
+        )?;
+        ensure(
+            client.last_health_check.lock().is_none(),
+            "cached health survived an oversized response",
+        )
+    }
+
+    #[test]
+    fn not_ready_health_is_never_cached_as_available() -> TestResult {
+        let (client_stream, mut server_stream) = UnixStream::pair()?;
+        let client = UdsDaemonClient::new(DaemonClientConfig {
+            auto_spawn: false,
+            ..Default::default()
+        });
+        *client.connection.lock() = Some(client_stream);
+        client.available.store(true, Ordering::SeqCst);
+
+        let server = std::thread::spawn(move || -> std::io::Result<()> {
+            for _ in 0..2 {
+                let mut len = [0_u8; 4];
+                server_stream.read_exact(&mut len)?;
+                let mut payload = vec![0_u8; u32::from_be_bytes(len) as usize];
+                server_stream.read_exact(&mut payload)?;
+                let request = decode_message::<Request>(&payload).map_err(std::io::Error::other)?;
+                let response = FramedMessage::new(
+                    request.request_id,
+                    Response::Health(HealthStatus {
+                        uptime_secs: 1,
+                        version: PROTOCOL_VERSION,
+                        ready: false,
+                        memory_bytes: 0,
+                    }),
+                );
+                let encoded = encode_message(&response).map_err(std::io::Error::other)?;
+                server_stream.write_all(&encoded)?;
+            }
+            Ok(())
+        });
+
+        ensure(
+            !client.is_available(),
+            "not-ready daemon reported available",
+        )?;
+        ensure(
+            client.last_health_check.lock().is_none(),
+            "not-ready health result was cached",
+        )?;
+        ensure(
+            !client.is_available(),
+            "second not-ready health check reported available",
+        )?;
+        server
+            .join()
+            .map_err(|_| test_error("server thread panicked"))??;
+        ensure(
+            client.last_health_check.lock().is_none(),
+            "not-ready health result was cached after repeated probes",
+        )
     }
 
     #[test]

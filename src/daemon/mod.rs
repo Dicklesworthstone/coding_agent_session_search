@@ -3,26 +3,22 @@
 //! This module provides a daemon server that keeps ML models resident in memory
 //! for fast inference. The daemon:
 //! - Listens on a Unix Domain Socket for requests
-//! - Shares the socket with xf (wire-compatible protocol)
-//! - First-come spawns, others connect
+//! - Uses a CASS-owned socket and versioned protocol
+//! - Allows CASS clients to connect to one shared warm process
 //! - Supports graceful fallback to direct inference
 //!
 //! ## Architecture
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────────┐
-//! │                    WIRE-COMPATIBLE DAEMONS                      │
+//! │                       CASS MODEL DAEMON                         │
 //! ├─────────────────────────────────────────────────────────────────┤
-//! │  xf (standalone)           cass (standalone)                   │
-//! │  ┌──────────────┐          ┌──────────────┐                    │
-//! │  │ xf binary    │          │ cass binary  │                    │
-//! │  │  └─ daemon   │          │  └─ daemon   │                    │
-//! │  └──────────────┘          └──────────────┘                    │
-//! │         │ Same socket path: $TMPDIR/semantic-daemon-$USER.sock │
-//! │         ▼                         ▼                            │
-//! │  ┌────────────────────────────────────────┐                    │
-//! │  │  Shared UDS Socket (first-come wins)   │                    │
-//! │  └────────────────────────────────────────┘                    │
+//! │  cass clients ──▶ $TMPDIR/cass-semantic-daemon-$USER.sock     │
+//! │                         │                                      │
+//! │                         ▼                                      │
+//! │               ┌────────────────────┐                           │
+//! │               │ warm model process │                           │
+//! │               └────────────────────┘                           │
 //! └─────────────────────────────────────────────────────────────────┘
 //! ```
 //!
