@@ -7402,6 +7402,8 @@ async fn execute_cli(
                             dry_run,
                             structured_format,
                             verbose,
+                            &secrets_allow,
+                            &secrets_deny,
                         )
                         .map_err(|e| CliError {
                             code: 9,
@@ -84898,6 +84900,20 @@ fn run_introspect(output_format: Option<RobotFormat>) -> CliResult<()> {
     Ok(())
 }
 
+fn staged_secret_scan_json(
+    scan: &crate::pages::secret_scan::StagedSecretScan,
+    approval_state: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "performed": true,
+        "complete": true,
+        "findings": scan.report.summary.total,
+        "has_critical": scan.report.summary.has_critical,
+        "approval_state": approval_state,
+        "artifact_sha256": scan.artifact_sha256,
+    })
+}
+
 /// Run export based on JSON config file.
 fn run_config_based_export(
     config: &crate::pages::config_input::PagesConfig,
@@ -84905,7 +84921,9 @@ fn run_config_based_export(
     db_path: &std::path::Path,
     dry_run: bool,
     output_format: Option<RobotFormat>,
-    _verbose: bool,
+    verbose: bool,
+    secrets_allow: &[String],
+    secrets_deny: &[String],
 ) -> anyhow::Result<()> {
     use chrono::DateTime;
     use rand::Rng;
@@ -84918,6 +84936,12 @@ fn run_config_based_export(
                 "status": "dry_run",
                 "output_dir": wizard_state.output_dir,
                 "config_valid": true,
+                "secret_scan": {
+                    "performed": false,
+                    "complete": false,
+                    "approval_state": "not_performed_dry_run",
+                    "artifact_sha256": null,
+                },
             });
             output_structured_value(result, fmt)?;
         } else {
@@ -84953,11 +84977,34 @@ fn run_config_based_export(
         path_mode: config.path_mode(),
     };
 
-    // Run export
+    // Run export and scan the exact committed staging database before it can
+    // be encrypted, bundled, or deployed. Non-interactive config exports are
+    // fail-closed: callers may suppress reviewed false positives with the
+    // existing allowlist inputs, but cannot silently approve live findings.
     let export_engine = crate::pages::export::ExportEngine::new(db_path, &export_db_path, filter);
 
     let running = Arc::new(AtomicBool::new(true));
-    let stats = export_engine.execute(|_current, _total| {}, Some(running))?;
+    let secret_scan_config = crate::pages::secret_scan::SecretScanConfig::from_inputs(
+        secrets_allow,
+        secrets_deny,
+    )?;
+    let (stats, staged_secret_scan) = export_engine.execute_verified(
+        |_current, _total| {},
+        Some(running),
+        |staged_db_path| {
+            let scan = crate::pages::secret_scan::scan_staged_export_database(
+                staged_db_path,
+                &secret_scan_config,
+            )?;
+            if scan.report.summary.total > 0 {
+                anyhow::bail!(
+                    "Staged export contains {} potential secret(s); config-driven exports fail closed. Review with `cass pages --scan-secrets` and use --secrets-allow only for confirmed false positives.",
+                    scan.report.summary.total
+                );
+            }
+            Ok(scan)
+        },
+    )?;
 
     let mut recovery_secret: Option<Vec<u8>> = None;
     let encryption_enabled = !wizard_state.no_encryption;
@@ -85094,6 +85141,7 @@ fn run_config_based_export(
                 "conversations": stats.conversations_processed,
                 "messages": stats.messages_processed,
             },
+            "secret_scan": staged_secret_scan_json(&staged_secret_scan, "clean"),
             "encryption": {
                 "enabled": encryption_enabled,
                 "generate_recovery": wizard_state.generate_recovery && encryption_enabled,
@@ -85113,6 +85161,13 @@ fn run_config_based_export(
         println!("  Private: {}", bundle_result.private_dir.display());
         println!("  Conversations: {}", stats.conversations_processed);
         println!("  Messages: {}", stats.messages_processed);
+        println!("  Secret scan: complete (clean)");
+        if verbose {
+            println!(
+                "  Scanned artifact SHA-256: {}",
+                staged_secret_scan.artifact_sha256
+            );
+        }
         if encryption_enabled {
             println!("  Encryption: enabled");
         } else {

@@ -491,6 +491,10 @@ const ICON_SPARKLES: &str = r#"<svg class="lucide-icon" xmlns="http://www.w3.org
 ///
 /// Maps agent identifiers to their visual styling class.
 pub fn agent_css_class(slug: &str) -> &'static str {
+    if super::filename::is_omp_agent_alias(slug) {
+        return "agent-aider";
+    }
+
     let slug = slug.trim().to_ascii_lowercase().replace('-', "_");
     match slug.as_str() {
         "claude_code" | "claude" => "agent-claude",
@@ -521,6 +525,10 @@ pub fn agent_css_class(slug: &str) -> &'static str {
 
 /// Get human-readable agent name.
 pub fn agent_display_name(slug: &str) -> &'static str {
+    if super::filename::is_omp_agent_alias(slug) {
+        return "Oh My Pi";
+    }
+
     let slug = slug.trim().to_ascii_lowercase().replace('-', "_");
     match slug.as_str() {
         "claude_code" | "claude" => "Claude",
@@ -1584,7 +1592,10 @@ mod tests {
         assert_eq!(agent_css_class("opencode"), "agent-codex");
         assert_eq!(agent_css_class("copilot-cli"), "agent-copilot");
         assert_eq!(agent_css_class("qwen"), "agent-codex");
-        assert_eq!(agent_css_class("omp"), "agent-aider");
+        for alias in ["omp", "Oh My Pi", "oh-my-pi", "oh_my_pi", "ohmypi"] {
+            assert_eq!(agent_css_class(alias), "agent-aider", "OMP alias {alias:?}");
+        }
+        assert_eq!(agent_css_class("oh_my_pipeline"), "agent-default");
         assert_eq!(agent_css_class("hermes"), "agent-hermes");
         assert_eq!(agent_css_class("goose"), "agent-goose");
         assert_eq!(agent_css_class("unknown"), "agent-default");
@@ -1598,7 +1609,14 @@ mod tests {
         assert_eq!(agent_display_name("copilot-cli"), "GitHub Copilot CLI");
         assert_eq!(agent_display_name("opencode"), "OpenCode");
         assert_eq!(agent_display_name("pi_agent"), "Pi Agent");
-        assert_eq!(agent_display_name("omp"), "Oh My Pi");
+        for alias in ["omp", "Oh My Pi", "oh-my-pi", "oh_my_pi", "ohmypi"] {
+            assert_eq!(
+                agent_display_name(alias),
+                "Oh My Pi",
+                "OMP alias {alias:?}"
+            );
+        }
+        assert_eq!(agent_display_name("oh_my_pipeline"), "AI Assistant");
         assert_eq!(agent_display_name("factory"), "Factory");
         assert_eq!(agent_display_name("openclaw"), "OpenClaw");
         assert_eq!(agent_display_name("clawdbot"), "ClawdBot");

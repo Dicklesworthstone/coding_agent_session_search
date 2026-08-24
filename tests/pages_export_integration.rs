@@ -732,6 +732,100 @@ fn export_engine_preserves_existing_output_on_cancelled_rerun() {
     assert_eq!(msg_count, 14);
 }
 
+#[test]
+fn export_engine_preserves_existing_output_when_staged_verifier_rejects() {
+    let tmp = TempDir::new().unwrap();
+    let source_path = tmp.path().join("source.db");
+    let output_path = tmp.path().join("export.db");
+
+    let src_conn = open_db(&source_path).unwrap();
+    create_source_db(&src_conn).unwrap();
+    insert_test_data(&src_conn).unwrap();
+    drop(src_conn);
+    std::fs::write(&output_path, b"previous approved generation").unwrap();
+
+    let filter = ExportFilter {
+        agents: None,
+        workspaces: None,
+        since: None,
+        until: None,
+        path_mode: PathMode::Full,
+    };
+    let engine = ExportEngine::new(&source_path, &output_path, filter);
+    let error = engine
+        .execute_verified(|_, _| {}, None, |_| -> anyhow::Result<()> {
+            anyhow::bail!("secret approval rejected staged generation")
+        })
+        .expect_err("rejected staged export must not publish");
+
+    assert!(error.to_string().contains("verification failed"));
+    assert_eq!(
+        std::fs::read(&output_path).unwrap(),
+        b"previous approved generation"
+    );
+}
+
+#[test]
+fn export_engine_reads_counts_messages_and_snippets_from_one_snapshot() {
+    let tmp = TempDir::new().unwrap();
+    let source_path = tmp.path().join("source.db");
+    let output_path = tmp.path().join("export.db");
+
+    let src_conn = open_db(&source_path).unwrap();
+    src_conn.execute("PRAGMA journal_mode = WAL;").unwrap();
+    create_source_db(&src_conn).unwrap();
+    insert_test_data(&src_conn).unwrap();
+    drop(src_conn);
+
+    let writer = open_db(&source_path).unwrap();
+    let inserted = std::cell::Cell::new(false);
+    let filter = ExportFilter {
+        agents: None,
+        workspaces: None,
+        since: None,
+        until: None,
+        path_mode: PathMode::Full,
+    };
+    let engine = ExportEngine::new(&source_path, &output_path, filter);
+    let stats = engine
+        .execute(
+            |current, _| {
+                if current == 1 && !inserted.replace(true) {
+                    writer
+                        .execute(
+                            "INSERT INTO messages (conversation_id, idx, role, content) VALUES (4, 99, 'user', 'concurrent append')",
+                        )
+                        .expect("concurrent writer should commit in WAL mode");
+                }
+            },
+            None,
+        )
+        .unwrap();
+
+    assert!(inserted.get(), "test mutation must execute");
+    assert_eq!(query_i64(&writer, "SELECT COUNT(*) FROM messages").unwrap(), 15);
+    assert_eq!(stats.messages_processed, 14);
+
+    let exported = open_db(&output_path).unwrap();
+    assert_eq!(query_i64(&exported, "SELECT COUNT(*) FROM messages").unwrap(), 14);
+    assert_eq!(
+        query_i64(
+            &exported,
+            "SELECT message_count FROM conversations WHERE id = 4"
+        )
+        .unwrap(),
+        5
+    );
+    assert_eq!(
+        query_i64(
+            &exported,
+            "SELECT COUNT(*) FROM messages WHERE conversation_id = 4"
+        )
+        .unwrap(),
+        5
+    );
+}
+
 // =============================================================================
 // FTS Verification Tests
 // =============================================================================

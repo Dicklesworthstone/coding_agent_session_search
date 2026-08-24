@@ -278,7 +278,8 @@ impl ExportEngine {
                     "SELECT c.id, COALESCE(a.slug, 'unknown') as agent, w.path as workspace, c.title, c.source_path, c.started_at, c.ended_at,
              (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count,
              c.metadata_json
-             {from_where}"
+             {from_where}
+             ORDER BY c.id"
                 );
 
                 let mut count_query = String::from("SELECT COUNT(*)");
@@ -835,6 +836,51 @@ pub fn run_pages_export(
         return Ok(());
     }
 
+    println!("Exporting to {:?}...", output_path);
+    let (stats, ()) = export_pages_database_verified(
+        db_path,
+        output_path,
+        agents,
+        workspaces,
+        since,
+        until,
+        path_mode,
+        |current, total| {
+            if total > 0 && current % 100 == 0 {
+                use std::io::Write;
+                print!("\rProcessed {}/{} conversations...", current, total);
+                std::io::stdout().flush().ok();
+            }
+        },
+        |_| Ok(()),
+    )?;
+    println!(
+        "\rExport complete! Processed {} conversations, {} messages.",
+        stats.conversations_processed, stats.messages_processed
+    );
+
+    Ok(())
+}
+
+/// Export a filtered Pages database and verify its private staged generation
+/// before the final output path is replaced.
+#[allow(clippy::too_many_arguments)]
+pub fn export_pages_database_verified<F, V, T>(
+    db_path: Option<PathBuf>,
+    output_path: PathBuf,
+    agents: Option<Vec<String>>,
+    workspaces: Option<Vec<String>>,
+    since: Option<String>,
+    until: Option<String>,
+    path_mode: PathMode,
+    progress: F,
+    verifier: V,
+) -> Result<(ExportStats, T)>
+where
+    F: Fn(usize, usize),
+    V: FnOnce(&Path) -> Result<T>,
+{
+
     let db_path = db_path.unwrap_or_else(crate::default_db_path);
 
     let since_dt = parse_export_time_arg("--since", since.as_deref())?;
@@ -861,24 +907,7 @@ pub fn run_pages_export(
     };
 
     let engine = ExportEngine::new(&db_path, &output_path, filter);
-
-    println!("Exporting to {:?}...", output_path);
-    let stats = engine.execute(
-        |current, total| {
-            if total > 0 && current % 100 == 0 {
-                use std::io::Write;
-                print!("\rProcessed {}/{} conversations...", current, total);
-                std::io::stdout().flush().ok();
-            }
-        },
-        None,
-    )?;
-    println!(
-        "\rExport complete! Processed {} conversations, {} messages.",
-        stats.conversations_processed, stats.messages_processed
-    );
-
-    Ok(())
+    engine.execute_verified(progress, None, verifier)
 }
 
 fn parse_export_time_arg(
