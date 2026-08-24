@@ -1006,13 +1006,17 @@ export async function getStorageStats() {
                     || LEGACY_OPFS_DB_FILES.includes(name);
                 if (name.startsWith(archiveDataPrefix) || isDatabaseResidue) {
                     stats.opfs.items++;
+                    if (isDatabaseResidue) {
+                        // Detection is independent of whether metadata reads
+                        // succeed; inaccessible residue must remain visible.
+                        stats.opfs.dbFiles.push(name);
+                    }
                     try {
                         const handle = await root.getFileHandle(name);
                         const file = await handle.getFile();
                         stats.opfs.bytes += file.size;
                         if (isDatabaseResidue) {
                             stats.opfs.dbBytes += file.size;
-                            stats.opfs.dbFiles.push(name);
                         }
                     } catch (e) {
                         // Ignore individual file errors

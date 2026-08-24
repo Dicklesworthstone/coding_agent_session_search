@@ -38,9 +38,48 @@ async function resolveRegistration() {
     return registration;
 }
 
+async function waitForExactRegistrationActivation(candidateRegistration) {
+    if (!hasExactScope(candidateRegistration)) {
+        throw new Error('Service worker registered with an unexpected scope');
+    }
+    if (candidateRegistration.active?.state === 'activated') {
+        return;
+    }
+
+    const candidateWorker = candidateRegistration.installing
+        || candidateRegistration.waiting
+        || candidateRegistration.active;
+    if (!candidateWorker) {
+        throw new Error('Archive service worker registration has no worker');
+    }
+
+    await new Promise((resolve, reject) => {
+        const finish = (error = null) => {
+            candidateWorker.removeEventListener('statechange', handleStateChange);
+            if (error) {
+                reject(error);
+            } else {
+                resolve();
+            }
+        };
+        const handleStateChange = () => {
+            if (candidateWorker.state === 'activated') {
+                finish();
+            } else if (candidateWorker.state === 'redundant') {
+                finish(new Error('Archive service worker installation failed'));
+            }
+        };
+
+        candidateWorker.addEventListener('statechange', handleStateChange);
+        handleStateChange();
+    });
+}
+
 async function postMessageWithReply(message, { timeoutMs = DEFAULT_SW_MESSAGE_TIMEOUT_MS } = {}) {
     const currentRegistration = await resolveRegistration();
-    const activeWorker = currentRegistration?.active;
+    const activeWorker = currentRegistration?.active?.state === 'activated'
+        ? currentRegistration.active
+        : null;
     if (!activeWorker) {
         return null;
     }
@@ -110,13 +149,10 @@ export async function registerServiceWorker() {
         setupUpdateListener(registration);
         noticeWaitingUpdate(registration);
 
-        // Wait for service worker to be ready
-        await navigator.serviceWorker.ready;
-        await resolveRegistration();
-        if (registration) {
-            setupUpdateListener(registration);
-            noticeWaitingUpdate(registration);
-        }
+        // Wait for this exact registration, not the global ready promise. The
+        // latter may resolve to a broader parent-scope worker.
+        await waitForExactRegistrationActivation(registration);
+        noticeWaitingUpdate(registration);
         console.log('[SW] Ready');
 
         // Check if we already have SharedArrayBuffer support
@@ -353,7 +389,7 @@ export const swStatus = {
     get isActive() {
         return 'serviceWorker' in navigator
             && hasExactScope(registration)
-            && registration.active !== null;
+            && registration.active?.state === 'activated';
     },
     get hasSharedArrayBuffer() {
         return hasSharedArrayBuffer();

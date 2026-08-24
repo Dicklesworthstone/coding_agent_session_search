@@ -1162,12 +1162,158 @@ fn browser_opfs_cleanup_is_scope_bound_and_truthful() {
 }
 
 #[test]
+fn browser_cache_and_registration_cleanup_are_scope_bound() {
+    let script = r#"
+        const originalWindow = globalThis.window;
+        const originalCaches = globalThis.caches;
+        const originalNavigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+
+        try {
+            const cacheNames = new Set();
+            const failedCacheNames = new Set();
+            const cacheDeleteAttempts = [];
+            const cacheApi = {
+                async keys() {
+                    return [...cacheNames];
+                },
+                async delete(name) {
+                    cacheDeleteAttempts.push(name);
+                    if (failedCacheNames.has(name)) {
+                        throw new Error(`injected cache delete failure for ${name}`);
+                    }
+                    return cacheNames.delete(name);
+                },
+            };
+            globalThis.window = {
+                location: { href: 'https://example.com/archive/index.html#/' },
+                caches: cacheApi,
+            };
+            globalThis.caches = cacheApi;
+
+            const registrations = [];
+            Object.defineProperty(globalThis, 'navigator', {
+                value: {
+                    serviceWorker: {
+                        async getRegistrations() {
+                            return [...registrations];
+                        },
+                    },
+                },
+                configurable: true,
+                writable: true,
+            });
+
+            const {
+                clearServiceWorkerCache,
+                getArchiveScopeId,
+                getArchiveScopeUrl,
+                unregisterServiceWorker,
+            } = await import('./src/pages_assets/storage.js');
+            const scopeId = getArchiveScopeId();
+            const otherScopeId = scopeId === 'deadbeef' ? 'feedface' : 'deadbeef';
+            const currentCacheV1 = `cass-archive-${scopeId}-v1`;
+            const currentCacheV2 = `cass-archive-${scopeId}-v2`;
+            const otherCache = `cass-archive-${otherScopeId}-v1`;
+            const unrelatedCache = 'unrelated-app-cache';
+            cacheNames.add(currentCacheV1);
+            cacheNames.add(currentCacheV2);
+            cacheNames.add(otherCache);
+            cacheNames.add(unrelatedCache);
+            failedCacheNames.add(currentCacheV1);
+
+            if (await clearServiceWorkerCache() !== false) {
+                throw new Error('cache cleanup must report a retained current-archive cache');
+            }
+            if (!cacheNames.has(currentCacheV1) || cacheNames.has(currentCacheV2)) {
+                throw new Error('cache cleanup must continue after one deletion rejects');
+            }
+            if (!cacheNames.has(otherCache) || !cacheNames.has(unrelatedCache)) {
+                throw new Error('scoped cache cleanup must preserve other archive and unrelated caches');
+            }
+
+            failedCacheNames.clear();
+            if (!await clearServiceWorkerCache() || cacheNames.has(currentCacheV1)) {
+                throw new Error('cache cleanup retry must remove the retained current cache');
+            }
+            if (!await clearServiceWorkerCache({ allArchives: true })) {
+                throw new Error('all-archive cache cleanup should remove remaining cass caches');
+            }
+            if (cacheNames.has(otherCache) || !cacheNames.has(unrelatedCache)) {
+                throw new Error('all-archive cache cleanup must preserve unrelated cache namespaces');
+            }
+
+            const currentScope = getArchiveScopeUrl();
+            let failCurrentUnregister = true;
+            let currentUnregisterAttempts = 0;
+            let unrelatedUnregisterAttempts = 0;
+            const currentRegistration = {
+                scope: currentScope,
+                async unregister() {
+                    currentUnregisterAttempts++;
+                    if (failCurrentUnregister) {
+                        throw new Error('injected unregister failure');
+                    }
+                    registrations.splice(registrations.indexOf(currentRegistration), 1);
+                    return true;
+                },
+            };
+            const unrelatedRegistration = {
+                scope: 'https://example.com/unrelated/',
+                async unregister() {
+                    unrelatedUnregisterAttempts++;
+                    registrations.splice(registrations.indexOf(unrelatedRegistration), 1);
+                    return true;
+                },
+            };
+            registrations.push(currentRegistration, unrelatedRegistration);
+
+            if (await unregisterServiceWorker() !== false || currentUnregisterAttempts !== 1) {
+                throw new Error('unregister must report an exact-scope registration that remains');
+            }
+            if (unrelatedUnregisterAttempts !== 0 || !registrations.includes(unrelatedRegistration)) {
+                throw new Error('unregister must never target an unrelated same-origin scope');
+            }
+
+            failCurrentUnregister = false;
+            if (!await unregisterServiceWorker() || registrations.includes(currentRegistration)) {
+                throw new Error('unregister retry must remove the exact archive registration');
+            }
+            if (unrelatedUnregisterAttempts !== 0 || !registrations.includes(unrelatedRegistration)) {
+                throw new Error('successful exact-scope unregister must preserve unrelated registrations');
+            }
+        } finally {
+            globalThis.window = originalWindow;
+            globalThis.caches = originalCaches;
+            if (originalNavigatorDescriptor) {
+                Object.defineProperty(globalThis, 'navigator', originalNavigatorDescriptor);
+            } else {
+                delete globalThis.navigator;
+            }
+        }
+    "#;
+
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("run scoped browser cache cleanup assertions with node");
+
+    assert!(
+        output.status.success(),
+        "scoped browser cache cleanup assertions failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn browser_session_teardown_survives_partial_storage_failures() {
     let script = r#"
         class StorageMock {
             constructor() {
                 this.data = new Map();
                 this.failedKeys = new Set();
+                this.failedSetKeys = new Set();
                 this.removeAttempts = [];
             }
 
@@ -1176,6 +1322,9 @@ fn browser_session_teardown_survives_partial_storage_failures() {
             }
 
             setItem(key, value) {
+                if (this.failedSetKeys.has(key)) {
+                    throw new Error(`injected set failure for ${key}`);
+                }
                 this.data.set(key, String(value));
             }
 
@@ -1258,6 +1407,23 @@ fn browser_session_teardown_survives_partial_storage_failures() {
             sessionStorage.failedKeys.clear();
             if (!manager.clearStorage() || sessionStorage.getItem(tokenKey) !== null) {
                 throw new Error('a successful retry must remove the retained session secret');
+            }
+
+            const failedStartManager = new SessionManager({
+                storage: SESSION_CONFIG.STORAGE_SESSION,
+            });
+            sessionStorage.failedSetKeys.add(expiryKey);
+            let startRejected = false;
+            try {
+                await failedStartManager.startSession(new Uint8Array([9, 8, 7, 6]), true);
+            } catch {
+                startRejected = true;
+            }
+            if (!startRejected || failedStartManager.isActive()) {
+                throw new Error('a partial persistent write must not publish an active session');
+            }
+            if (sessionStorage.getItem(tokenKey) !== null || sessionStorage.getItem(expiryKey) !== null) {
+                throw new Error('a failed session start must roll back partially persisted keys');
             }
         } finally {
             globalThis.window = originalWindow;

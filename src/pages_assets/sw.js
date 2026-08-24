@@ -96,12 +96,12 @@ function responseAllowsCaching(response) {
     const cacheDirectives = (response.headers.get('cache-control') || '')
         .split(',')
         .map((directive) => directive.trim().toLowerCase());
-    const forbidsStorage = cacheDirectives.some((directive) =>
-        directive === 'no-store'
-        || directive === 'no-cache'
-        || directive === 'private'
-        || directive.startsWith('private=')
-    );
+    const forbidsStorage = cacheDirectives.some((directive) => {
+        const directiveName = directive.split('=', 1)[0].trim();
+        return directiveName === 'no-store'
+            || directiveName === 'no-cache'
+            || directiveName === 'private';
+    });
     return response.status === 200 && !forbidsStorage;
 }
 
@@ -255,7 +255,7 @@ async function handleFetch(request, trackBackgroundTask = () => {}) {
         }
 
         // Try cache as fallback for navigation requests
-        if (request.mode === 'navigate') {
+        if (cacheEligible && request.mode === 'navigate') {
             try {
                 const cache = await getCurrentCache();
                 const indexUrl = new URL('./index.html', getCacheScopeUrl()).href;
@@ -373,18 +373,20 @@ self.addEventListener('message', (event) => {
 
         case 'CLEAR_CACHE': {
             const clearCacheTask = caches.keys()
-                .then((keys) => {
+                .then(async (keys) => {
                     const cachePrefix = getCachePrefix();
                     const targets = keys.filter((key) => key.startsWith(cachePrefix));
-                    return Promise.all(targets.map((key) => caches.delete(key))).then((results) => ({
-                        targets,
-                        cleared: results.every(Boolean),
-                    }));
-                })
-                .then(({ targets, cleared }) => {
-                    if (!cleared) {
-                        throw new Error('Some cache entries could not be deleted');
+                    await Promise.allSettled(targets.map((key) => caches.delete(key)));
+                    const remaining = (await caches.keys())
+                        .filter((key) => key.startsWith(cachePrefix));
+                    if (remaining.length > 0) {
+                        throw new Error(
+                            `Archive caches still present after cleanup: ${remaining.join(', ')}`
+                        );
                     }
+                    return targets;
+                })
+                .then((targets) => {
                     respond({
                         type: 'CACHE_CLEARED',
                         cleared: targets,
@@ -402,6 +404,10 @@ self.addEventListener('message', (event) => {
         }
 
         case 'SET_LOG_LEVEL':
+            if (!Number.isInteger(data.level) || !Object.values(LOG).includes(data.level)) {
+                rejectRequest('Invalid log level');
+                break;
+            }
             logLevel = data.level;
             log(LOG.INFO, 'Log level set to:', Object.keys(LOG).find(k => LOG[k] === logLevel));
             break;

@@ -30,6 +30,12 @@ let qrScannerTeardownPromise = null;
 let activeSessionExpiryTs = 0;
 let activeSessionExpiryTimerId = null;
 const MAX_BROWSER_DATABASE_SIZE = 512 * 1024 * 1024;
+const ARCHIVE_SCOPE_URL = new URL('./', import.meta.url);
+const CRYPTO_WORKER_URL = new URL('crypto_worker.js', ARCHIVE_SCOPE_URL).href;
+const QR_SCANNER_LIBRARY_URL = new URL(
+    'vendor/html5-qrcode.min.js',
+    ARCHIVE_SCOPE_URL
+).href;
 const LEGACY_SESSION_KEYS = {
     DEK: 'cass_session_dek',
     EXPIRY: 'cass_session_expiry',
@@ -189,7 +195,7 @@ function allocateWorkerRequestId() {
 }
 
 function initializeCryptoWorker() {
-    const nextWorker = new Worker('./crypto_worker.js');
+    const nextWorker = new Worker(CRYPTO_WORKER_URL);
     nextWorker.onmessage = handleWorkerMessage;
     nextWorker.onerror = handleWorkerError;
     worker = nextWorker;
@@ -319,20 +325,19 @@ function broadcastAuthLock(action = 'lock') {
 }
 
 function isCurrentWorkerMessage(type, requestId) {
-    if (requestId === null || requestId === undefined) {
-        return true;
-    }
+    const hasRequestId = requestId !== null && requestId !== undefined;
 
     switch (type) {
         case 'UNLOCK_SUCCESS':
         case 'UNLOCK_FAILED':
-            return requestId === activeUnlockRequestId;
+            return hasRequestId && requestId === activeUnlockRequestId;
         case 'DECRYPT_SUCCESS':
         case 'DECRYPT_FAILED':
         case 'DB_READY':
-            return requestId === activeDecryptRequestId;
+            return hasRequestId && requestId === activeDecryptRequestId;
         case 'PROGRESS':
-            return requestId === activeUnlockRequestId || requestId === activeDecryptRequestId;
+            return hasRequestId
+                && (requestId === activeUnlockRequestId || requestId === activeDecryptRequestId);
         default:
             return true;
     }
@@ -342,7 +347,7 @@ function isCurrentWorkerMessage(type, requestId) {
  * Load config.json from the archive
  */
 async function loadConfig() {
-    const response = await fetch('./config.json');
+    const response = await fetch(new URL('config.json', ARCHIVE_SCOPE_URL));
     if (!response.ok) {
         throw new Error(`Failed to load config: ${response.status}`);
     }
@@ -370,7 +375,7 @@ function getTofuKey() {
 async function displayFingerprint() {
     try {
         // Try to load integrity.json if it exists
-        const response = await fetch('./integrity.json');
+        const response = await fetch(new URL('integrity.json', ARCHIVE_SCOPE_URL));
         if (response.ok) {
             const integrity = await response.json();
             const fingerprint = await computeFingerprint(JSON.stringify(integrity));
@@ -822,7 +827,9 @@ function handleWorkerMessage(event) {
             break;
 
         case 'DECRYPT_SUCCESS':
-            handleDecryptSuccess(data);
+            void handleDecryptSuccess(data).catch((error) => {
+                void handleWorkerError(error);
+            });
             break;
 
         case 'DECRYPT_FAILED':
@@ -1124,7 +1131,7 @@ async function transitionToAppUnencrypted() {
 async function loadUnencryptedDatabase(initToken = activeAppInitToken) {
     const payloadPath = getUnencryptedPayloadPath();
     const expectedSize = getUnencryptedPayloadSize();
-    const response = await fetch(payloadPath);
+    const response = await fetch(new URL(payloadPath, ARCHIVE_SCOPE_URL));
     if (!response.ok) {
         throw new Error(`Failed to load database: ${response.status}`);
     }
@@ -1269,7 +1276,12 @@ function normalizeUnencryptedPayloadPath(rawPath) {
     if (trimmed.startsWith('/') || trimmed.startsWith('\\') || /^[A-Za-z]:[\\/]/.test(trimmed)) {
         throw new Error('Unencrypted payload path must be relative');
     }
-    if (trimmed.includes('?') || trimmed.includes('#') || trimmed.includes('\\')) {
+    if (
+        trimmed.includes('?')
+        || trimmed.includes('#')
+        || trimmed.includes('\\')
+        || trimmed.includes('%')
+    ) {
         throw new Error('Unencrypted payload path contains invalid characters');
     }
 
@@ -1402,7 +1414,7 @@ async function loadQrScannerLibrary() {
 
     qrLibraryLoadPromise = new Promise((resolve, reject) => {
         const script = document.createElement('script');
-        script.src = './vendor/html5-qrcode.min.js';
+        script.src = QR_SCANNER_LIBRARY_URL;
         script.onload = () => {
             qrLibraryLoadPromise = null;
             resolve();

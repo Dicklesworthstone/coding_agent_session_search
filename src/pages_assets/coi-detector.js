@@ -105,7 +105,7 @@ export function isCrossOriginIsolated() {
  */
 export async function isServiceWorkerActive() {
     const registration = await getCurrentServiceWorkerRegistration();
-    return registration?.active !== null && registration?.active !== undefined;
+    return registration?.active?.state === 'activated';
 }
 
 /**

@@ -1570,39 +1570,29 @@ mod tests {
         );
         assert!(
             settings_js.contains(
-                "showNotification('OPFS cache cleared', 'success');\n        await render();"
+                "showNotification('OPFS data cleared', 'success');\n        await render();"
             ),
-            "clear-OPFS should await the async settings rerender"
+            "legacy OPFS cleanup should await the async settings rerender"
         );
         assert!(
-            settings_js.contains("await render();\n    } catch (err) {\n        console.error('[Settings] Failed to refresh settings after OPFS toggle:', err);"),
-            "OPFS toggle rerender should be awaited and caught instead of becoming an unhandled promise rejection"
-        );
-        assert!(
-            settings_js.contains("showNotification('Failed to disable OPFS caching because cached files could not be fully cleared', 'error');\n                await render();"),
-            "the partial OPFS-clear path should also await the rerender before returning"
-        );
-        assert!(
-            settings_js.contains("await rerenderSettingsUI('storage mode cancellation');")
+            settings_js.contains(
+                "The active decrypted database is kept in memory only and is never"
+            )
+                && settings_js.contains("Legacy decrypted database files were detected in OPFS.")
+                && !settings_js.contains("opfs-toggle")
+                && !settings_js.contains("handleOPFSToggle")
+                && settings_js.contains("await rerenderSettingsUI('storage mode cancellation');")
                 && settings_js.contains("await rerenderSettingsUI('storage mode change failure');")
-                && settings_js.contains("await rerenderSettingsUI('OPFS enable cancellation');")
-                && settings_js.contains("await rerenderSettingsUI('OPFS enable failure');")
-                && settings_js.contains("await rerenderSettingsUI('OPFS disable failure');"),
-            "settings rollback paths should rerender the canonical UI after canceled or failed optimistic control changes"
+            "settings must describe OPFS as legacy plaintext residue, not expose it as an active cache mode"
         );
 
         let storage_js = include_str!("../src/pages_assets/storage.js");
         assert!(
-            storage_js.contains(
-                "console.warn('[Storage] OPFS→other migration not yet supported; data remains in OPFS');"
-            ),
-            "storage migration should warn truthfully when OPFS->other migration is intentionally unsupported"
-        );
-        assert!(
-            storage_js.contains(
-                "would require an async UX path with\n            // explicit progress/error handling"
-            ),
-            "storage migration warning should explain why OPFS->other migration is deferred"
+            storage_js.contains("const LEGACY_OPFS_MODE = 'opfs';")
+                && storage_js.contains("clearLegacyOpfsPreferences();")
+                && !storage_js.contains("StorageMode.OPFS")
+                && !storage_js.contains("case StorageMode.OPFS"),
+            "storage should retain cleanup for legacy OPFS preferences without treating OPFS as an active backend"
         );
 
         let viewer_js = include_str!("../src/pages_assets/viewer.js");
@@ -1679,6 +1669,7 @@ mod tests {
                 && coi_detector_js.contains(
                     "Boolean(registration?.active || registration?.installing || registration?.waiting)"
                 )
+                && coi_detector_js.contains("registration?.active?.state === 'activated'")
                 && !coi_detector_js.contains("navigator.serviceWorker.getRegistration()"),
             "COI detection must not mistake a broader or workerless registration for this archive's active installation"
         );
@@ -1717,7 +1708,7 @@ mod tests {
             "service worker cache writes must stay best-effort for the response while remaining bound to the FetchEvent lifetime"
         );
         assert!(
-            sw_js.contains("if (request.mode === 'navigate') {\n            try {")
+            sw_js.contains("if (cacheEligible && request.mode === 'navigate') {\n            try {")
                 && sw_js.contains("const cachedIndex = await cache.match(indexUrl);")
                 && sw_js.contains("log(LOG.WARN, 'Navigation cache fallback error:', cacheError);"),
             "navigation fallback should not crash if the Cache API itself fails during offline fallback"
@@ -1730,8 +1721,9 @@ mod tests {
                 && sw_js.contains("request.cache !== 'no-store'")
                 && sw_js.contains("responseAllowsCaching(response)")
                 && sw_js.contains("response.status === 200")
-                && sw_js.contains("directive === 'no-cache'")
-                && sw_js.contains("directive === 'private'")
+                && sw_js.contains("directiveName === 'no-store'")
+                && sw_js.contains("directiveName === 'no-cache'")
+                && sw_js.contains("directiveName === 'private'")
                 && !sw_js.contains("caches.match("),
             "runtime caching must stay inside the archive scope and must not fall through to stale or unrelated origin caches"
         );
@@ -1749,6 +1741,15 @@ mod tests {
                 && sw_js.contains("event.waitUntil(clearCacheTask);")
                 && sw_js.contains("const CACHE_VERSION = 'v6';"),
             "updates must wait for explicit user activation and every async message operation must extend its event lifetime"
+        );
+        assert!(
+            sw_js.contains("await Promise.allSettled(targets.map((key) => caches.delete(key)));")
+                && sw_js.contains("const remaining = (await caches.keys())")
+                && sw_js.contains("if (remaining.length > 0) {")
+                && sw_js.contains("!Number.isInteger(data.level)")
+                && sw_js.contains("!Object.values(LOG).includes(data.level)")
+                && sw_js.contains("rejectRequest('Invalid log level');"),
+            "cache cleanup must verify its postcondition and message-controlled log levels must be validated"
         );
     }
 
@@ -1774,10 +1775,16 @@ mod tests {
                 && sw_register_js.contains(
                     "navigator.serviceWorker.register(SERVICE_WORKER_URL, {\n            scope: ARCHIVE_SCOPE_URL,"
                 )
+                && sw_register_js.contains("await waitForExactRegistrationActivation(registration);")
+                && sw_register_js.contains("candidateWorker.state === 'activated'")
+                && sw_register_js.contains("candidateWorker.state === 'redundant'")
+                && !sw_register_js.contains("navigator.serviceWorker.ready")
                 && sw_register_js
                     .contains("const registrations = await navigator.serviceWorker.getRegistrations();")
                 && sw_register_js.contains("registrations.find(hasExactScope) || null")
-                && sw_register_js.contains("const activeWorker = currentRegistration?.active;")
+                && sw_register_js.contains(
+                    "const activeWorker = currentRegistration?.active?.state === 'activated'"
+                )
                 && sw_register_js.contains("activeWorker.postMessage(message, [channel.port2]);")
                 && !sw_register_js.contains("getRegistration(getCurrentScopeUrl())"),
             "registration RPC and unregister must resolve the exact archive scope instead of a broader longest-prefix registration"
@@ -1786,7 +1793,7 @@ mod tests {
             sw_register_js.contains("noticeWaitingUpdate(registration);")
                 && sw_register_js.contains("if (!reg?.waiting || !reg.active)")
                 && sw_register_js.contains("return 'serviceWorker' in navigator && hasExactScope(registration);")
-                && sw_register_js.contains("&& registration.active !== null;"),
+                && sw_register_js.contains("&& registration.active?.state === 'activated';"),
             "pre-existing waiting updates and status getters should be scoped to the exact archive registration"
         );
     }
@@ -2800,6 +2807,46 @@ mod tests {
                 }
                 if (!truncatedRejected) {
                     throw new Error('truncated response did not fail its exact-size check');
+                }
+            "#,
+        )
+    }
+
+    #[test]
+    fn unencrypted_payload_path_rejects_url_decoding_aliases() -> Result<()> {
+        run_node_module_assertions(
+            r#"
+                import fs from 'node:fs';
+                import vm from 'node:vm';
+
+                const source = fs.readFileSync('./src/pages_assets/auth.js', 'utf8');
+                const start = source.indexOf('function normalizeUnencryptedPayloadPath(');
+                const end = source.indexOf('\n/**\n * Handle lock button click', start);
+                if (start < 0 || end < 0) {
+                    throw new Error('could not isolate unencrypted payload path normalizer');
+                }
+                const context = {};
+                vm.createContext(context);
+                vm.runInContext(source.slice(start, end), context);
+
+                if (context.normalizeUnencryptedPayloadPath('payload/data.db') !== './payload/data.db') {
+                    throw new Error('ordinary generated payload path was rejected');
+                }
+                for (const encodedPath of [
+                    'payload/data%20copy.db',
+                    'payload/%64ata.db',
+                    'payload/%2e%2e/secret.db',
+                    'payload/data.db%3fignored',
+                ]) {
+                    let rejected = false;
+                    try {
+                        context.normalizeUnencryptedPayloadPath(encodedPath);
+                    } catch (error) {
+                        rejected = String(error.message).includes('invalid characters');
+                    }
+                    if (!rejected) {
+                        throw new Error(`URL-decoding alias was accepted: ${encodedPath}`);
+                    }
                 }
             "#,
         )

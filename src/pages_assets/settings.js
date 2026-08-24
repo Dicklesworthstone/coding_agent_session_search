@@ -131,7 +131,7 @@ export async function render() {
                             to remove any residue for this archive.
                         </p>
 
-                        ${(stats.opfs.dbBytes || 0) > 0 ? `
+                        ${stats.opfs.dbFiles.length > 0 ? `
                             <div class="settings-warning">
                                 <span class="warning-icon">⚠️</span>
                                 <span>Legacy decrypted database files were detected in OPFS.</span>
@@ -244,7 +244,7 @@ export async function render() {
                     </p>
                     <p class="settings-info">
                         <small>
-                            All data is encrypted with AES-256-GCM. Your password never leaves this browser.
+                            Encrypted archives use AES-256-GCM. Your password never leaves this browser.
                         </small>
                     </p>
                 </section>
@@ -486,7 +486,7 @@ async function handleClearAll() {
                 failedSteps.push('Service Worker cache');
             }
 
-            showNotification(`Archive data cleared and session locked, but ${failedSteps.join(' and ')} could not be fully cleared`, 'error');
+            showNotification(`Session locked, but ${failedSteps.join(' and ')} could not be fully cleared`, 'error');
             return;
         }
 
@@ -552,7 +552,7 @@ async function handleResetSession() {
                 failedSteps.push('Service Worker registration');
             }
 
-            showNotification(`Archive data cleared and session locked, but ${failedSteps.join(' and ')} could not be fully reset`, 'error');
+            showNotification(`Session locked, but ${failedSteps.join(' and ')} could not be fully reset`, 'error');
             return;
         }
 
