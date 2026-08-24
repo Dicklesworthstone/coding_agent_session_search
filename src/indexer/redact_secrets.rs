@@ -20,6 +20,69 @@ use regex::{Regex, RegexSet};
 /// Placeholder inserted where a secret was found.
 const REDACTED: &str = "[REDACTED]";
 
+/// Return whether a JSON object key names a credential-bearing field.
+///
+/// Plain-text patterns can only redact a value when its label and value are in
+/// the same string (for example, `password=...`). Structured metadata stores
+/// them as separate JSON nodes, so the object walker must use the key's
+/// semantics. Normalization deliberately accepts the common snake/kebab/camel
+/// spellings while using an exact allowlist to avoid broad false positives such
+/// as `keyframe`, `monkey`, or `token_count`.
+fn is_sensitive_json_field(key: &str) -> bool {
+    let normalized = key
+        .bytes()
+        .filter(|byte| byte.is_ascii_alphanumeric())
+        .map(|byte| char::from(byte.to_ascii_lowercase()))
+        .collect::<String>();
+
+    matches!(
+        normalized.as_str(),
+        "password"
+            | "passwd"
+            | "pwd"
+            | "passphrase"
+            | "pin"
+            | "apikey"
+            | "apisecret"
+            | "token"
+            | "authtoken"
+            | "accesstoken"
+            | "refreshtoken"
+            | "idtoken"
+            | "sessiontoken"
+            | "bearertoken"
+            | "secrettoken"
+            | "secret"
+            | "secretkey"
+            | "accesskey"
+            | "awsaccesskeyid"
+            | "awssecretaccesskey"
+            | "awssessiontoken"
+            | "awssecuritytoken"
+            | "clientsecret"
+            | "clienttoken"
+            | "credential"
+            | "credentials"
+            | "authorization"
+            | "privatekey"
+            | "privatekeypem"
+            | "databasepassword"
+            | "dbpassword"
+    )
+}
+
+fn redact_sensitive_json_value(
+    key: &str,
+    value: &serde_json::Value,
+    otherwise: impl FnOnce() -> serde_json::Value,
+) -> serde_json::Value {
+    if is_sensitive_json_field(key) && !value.is_null() {
+        serde_json::Value::String(REDACTED.to_owned())
+    } else {
+        otherwise()
+    }
+}
+
 /// A compiled secret-detection pattern.
 struct SecretPattern {
     pattern: &'static str,
@@ -187,6 +250,7 @@ fn insert_redacted_json_entry(
 /// Redact secrets from a JSON value, recursively walking strings.
 ///
 /// - String values are redacted in-place.
+/// - Values under credential-bearing object keys are replaced in full.
 /// - Arrays and objects are walked recursively.
 /// - Numbers, booleans, and null are left untouched.
 pub fn redact_json(value: &serde_json::Value) -> serde_json::Value {
@@ -203,11 +267,13 @@ pub fn redact_json(value: &serde_json::Value) -> serde_json::Value {
             let mut next_suffixes = HashMap::new();
             for (k, v) in obj {
                 let redacted_key = redact_text(k).into_owned();
+                let redacted_value =
+                    redact_sensitive_json_value(k, v, || redact_json(v));
                 insert_redacted_json_entry(
                     &mut new_obj,
                     &mut next_suffixes,
                     redacted_key,
-                    redact_json(v),
+                    redacted_value,
                 );
             }
             serde_json::Value::Object(new_obj)
@@ -570,11 +636,13 @@ impl MemoizingRedactor {
                 let mut next_suffixes = HashMap::new();
                 for (k, v) in obj {
                     let redacted_key = self.redact_text(k);
+                    let redacted_value =
+                        redact_sensitive_json_value(k, v, || self.redact_json(v));
                     insert_redacted_json_entry(
                         &mut new_obj,
                         &mut next_suffixes,
                         redacted_key,
-                        self.redact_json(v),
+                        redacted_value,
                     );
                 }
                 serde_json::Value::Object(new_obj)
@@ -838,6 +906,63 @@ mod tests {
             .all(|key| !key.contains("abcdefgh12345678"))
             .then_some(())
             .ok_or_else(|| "collision suffix leaked source-key bytes".to_owned())
+    }
+
+    #[test]
+    fn structured_credential_fields_redact_values_by_key_semantics() -> Result<(), String> {
+        let input = json!({
+            "password": "correct horse battery staple!", // ubs:ignore -- synthetic redaction fixture.
+            "API-Key": "abc.def$ghi", // ubs:ignore -- synthetic redaction fixture.
+            "aws_secret_access_key": "0123456789012345678901234567890123456789", // ubs:ignore -- synthetic redaction fixture.
+            "AWS_SESSION_TOKEN": "AQoEXAMPLE-session/value+=with.punctuation", // ubs:ignore -- synthetic redaction fixture.
+            "pin": 123456,
+            "credentials": {
+                "opaque": [true, 42, "not-pattern-shaped"]
+            },
+            "nested": {
+                "clientSecret": ["short", "values"],
+                "private_key_pem": {"body": "short"}
+            },
+            "null_password": null,
+            "keyframe": "animation-safe",
+            "monkey": "animal-safe",
+            "token_count": 2048,
+            "public_key": "ssh-ed25519 AAAATESTPUBLICMATERIAL",
+        });
+
+        let plain = redact_json(&input);
+        let memoized = MemoizingRedactor::with_capacity(32).redact_json(&input);
+        if plain != memoized {
+            return Err("plain and memoized key-aware JSON redaction diverged".to_owned());
+        }
+
+        for pointer in [
+            "/password",
+            "/API-Key",
+            "/aws_secret_access_key",
+            "/AWS_SESSION_TOKEN",
+            "/pin",
+            "/credentials",
+            "/nested/clientSecret",
+            "/nested/private_key_pem",
+        ] {
+            if plain.pointer(pointer) != Some(&json!(REDACTED)) {
+                return Err(format!("sensitive field was not fully redacted: {pointer}"));
+            }
+        }
+
+        for pointer in [
+            "/null_password",
+            "/keyframe",
+            "/monkey",
+            "/token_count",
+            "/public_key",
+        ] {
+            if plain.pointer(pointer) != input.pointer(pointer) {
+                return Err(format!("safe near-miss field changed: {pointer}"));
+            }
+        }
+        Ok(())
     }
 
     #[test]
