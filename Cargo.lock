@@ -796,7 +796,7 @@ dependencies = [
  "arrayvec",
  "assert_cmd",
  "asupersync",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "bloomfilter",
  "bytemuck",
@@ -1861,7 +1861,8 @@ dependencies = [
 [[package]]
 name = "franken-agent-detection"
 version = "0.2.1"
-source = "git+https://github.com/Dicklesworthstone/franken_agent_detection?rev=82424dc8571ef47215cac342696a36faabd07bca#82424dc8571ef47215cac342696a36faabd07bca"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b8e80a92cd67fa8cad05071c36947c0ecc45382eaa0823126467960d66d980a"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -7017,8 +7018,9 @@ dependencies = [
 
 [[package]]
 name = "tru"
-version = "0.2.3"
-source = "git+https://github.com/Dicklesworthstone/toon_rust?rev=d7185c78#d7185c7800d37810f0a29bd5fca2ee623f25819b"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11070d9b998793fc0aeb4a3ff3b3c0836a734eef17dc44df3a2216fea14385ae"
 dependencies = [
  "anyhow",
  "chrono",
