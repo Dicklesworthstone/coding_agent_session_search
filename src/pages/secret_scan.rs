@@ -785,8 +785,9 @@ fn redact_structured_metadata_contexts(findings: &mut [SecretFinding]) {
 /// `private_key` as authoritative even when their values are too short to
 /// satisfy a token regex. The post-hoc scanner must apply the same structural
 /// floor or it can return a false-clean report for historical rows. A field
-/// already covered by a denylist, built-in, or entropy detector is skipped so
-/// the structural floor does not inflate an existing finding.
+/// already covered by an equal-or-higher-severity text detector is skipped so
+/// the structural floor does not inflate an equivalent existing finding. A
+/// lower-severity heuristic must not suppress this high-severity floor.
 fn scan_sensitive_json_fields(
     value: &serde_json::Value,
     location: SecretLocation,
@@ -820,7 +821,12 @@ fn scan_sensitive_json_fields(
                 if crate::indexer::redact_secrets::is_sensitive_json_field(field) {
                     if !structured_value_contains_material(field_value)
                         || structured_value_is_fully_allowlisted(field_value, config)
-                        || structured_field_has_text_detector(field, field_value, config)
+                        || structured_field_has_equal_or_higher_text_detector(
+                            field,
+                            field_value,
+                            config,
+                            SecretSeverity::High,
+                        )
                     {
                         continue;
                     }
@@ -902,10 +908,11 @@ fn structured_value_is_fully_allowlisted(
     }
 }
 
-fn structured_field_has_text_detector(
+fn structured_field_has_equal_or_higher_text_detector(
     field: &str,
     value: &serde_json::Value,
     config: &SecretScanConfig,
+    structural_severity: SecretSeverity,
 ) -> bool {
     let Ok(field_text) = serde_json::to_string(field) else {
         return false;
@@ -925,27 +932,21 @@ fn structured_field_has_text_detector(
     text.push_str(&value_text);
     text.push('}');
 
-    if config
-        .denylist
-        .iter()
-        .any(|pattern| pattern.is_match(&text))
+    if SecretSeverity::Critical.rank() <= structural_severity.rank()
+        && config
+            .denylist
+            .iter()
+            .any(|pattern| pattern.is_match(&text))
     {
         return true;
     }
-    if BUILTIN_PATTERNS.iter().any(|pattern| {
-        pattern
-            .regex
-            .find_iter(&text)
-            .any(|matched| !is_allowlisted(matched.as_str(), config))
-    }) {
-        return true;
-    }
-    ENTROPY_BASE64_RE
-        .find_iter(&text)
-        .any(|matched| is_base64_entropy_secret(matched.as_str(), config, true))
-        || ENTROPY_HEX_RE
-            .find_iter(&text)
-            .any(|matched| is_hex_entropy_secret(matched.as_str(), config, true))
+    BUILTIN_PATTERNS.iter().any(|pattern| {
+        pattern.severity.rank() <= structural_severity.rank()
+            && pattern
+                .regex
+                .find_iter(&text)
+                .any(|matched| !is_allowlisted(matched.as_str(), config))
+    })
 }
 
 pub fn print_human_report(
@@ -1274,8 +1275,7 @@ fn push_finding(
     });
 }
 
-fn redact_token(token: &str) -> String {
-    let _ = token;
+fn redact_token(_token: &str) -> String {
     REDACTED_CONTEXT.to_string()
 }
 
@@ -2064,7 +2064,11 @@ mod tests {
             until_ts: None,
         };
         let (clause, params) = build_where_clause(&filters).unwrap();
-        assert!(clause.contains("a.slug IN"), "clause: {}", clause);
+        assert!(
+            clause.contains("COALESCE(a.slug, 'unknown') IN"),
+            "clause: {}",
+            clause
+        );
         assert_eq!(params.len(), 2);
     }
 
@@ -2431,7 +2435,6 @@ mod tests {
 
     #[test]
     fn scan_text_max_findings_truncates() {
-        // Use longer tokens (>8 chars) so each gets a unique redacted form for dedup
         let mut config =
             SecretScanConfig::from_inputs_with_env(&[], &["LONG_SECRET_\\d+".to_string()], false)
                 .unwrap();
@@ -2449,7 +2452,8 @@ mod tests {
         let mut seen = Vec::new();
         let mut truncated = false;
 
-        // Each match is >8 chars so redact_token produces unique output per token
+        // Distinct source spans remain distinct findings even though report
+        // redaction intentionally gives every match the same opaque form.
         let text =
             "LONG_SECRET_001 LONG_SECRET_002 LONG_SECRET_003 LONG_SECRET_004 LONG_SECRET_005";
         scan_text(

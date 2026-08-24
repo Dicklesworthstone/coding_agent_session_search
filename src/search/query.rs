@@ -14506,20 +14506,25 @@ mod tests {
                 content TEXT NOT NULL,
                 created_at INTEGER
              );
-             INSERT INTO sources(id, kind) VALUES('local', 'local');
+             INSERT INTO sources(id, kind) VALUES('remote-a', 'ssh');
              INSERT INTO agents(id, slug) VALUES(1, 'claude'), (2, 'codex');
+             INSERT INTO workspaces(id, path) VALUES(1, '/excluded'), (2, '/target');
              INSERT INTO conversations(
                 id, agent_id, workspace_id, source_id, origin_host, title, source_path
              ) VALUES
-                (1, 1, NULL, 'local', NULL, 'excluded', '/tmp/excluded.jsonl'),
-                (2, 2, NULL, 'local', NULL, 'target', '/tmp/target.jsonl');
+                (1, 1, 1, 'remote-a', 'dev@remote-a', 'excluded', '/tmp/excluded.jsonl'),
+                (2, 2, 2, NULL, NULL, 'target', '/tmp/target.jsonl');
              INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES
                 (1, 1, 0, 'needle in excluded row', 1),
-                (2, 2, 0, 'needle in target row', 2);",
+                (2, 2, 0, 'needle in target row', 50);",
         )?;
         let filters = SearchFilters {
             agents: HashSet::from(["codex".to_string()]),
-            ..SearchFilters::default()
+            workspaces: HashSet::from(["/target".to_string()]),
+            created_from: Some(40),
+            created_to: Some(60),
+            source_filter: SourceFilter::SourceId("LOCAL".to_string()),
+            session_paths: HashSet::from(["/tmp/target.jsonl".to_string()]),
         };
         let client = cass_layer_b_test_client(None);
 
@@ -14538,7 +14543,31 @@ mod tests {
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].agent, "codex");
+        assert_eq!(hits[0].workspace, "/target");
+        assert_eq!(hits[0].created_at, Some(50));
         assert_eq!(hits[0].source_path, "/tmp/target.jsonl");
+        assert_eq!(hits[0].source_id, "local");
+
+        let local_filters = SearchFilters {
+            source_filter: SourceFilter::Local,
+            ..SearchFilters::default()
+        };
+        let local_hits = client.search_sqlite_message_scan(
+            conn.connection(),
+            SqliteMessageScanRequest {
+                raw_query: "needle",
+                filters: &local_filters,
+                limit: 10,
+                offset: 0,
+                scan_limit: 1,
+                field_mask: FieldMask::FULL,
+                query_match_type: MatchType::Exact,
+            },
+        )?;
+        assert_eq!(local_hits.len(), 1);
+        assert_eq!(local_hits[0].source_path, "/tmp/target.jsonl");
+        assert_eq!(local_hits[0].source_id, "local");
+        assert_eq!(local_hits[0].origin_kind, "local");
         Ok(())
     }
 

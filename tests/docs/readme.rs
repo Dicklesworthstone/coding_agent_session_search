@@ -12,7 +12,6 @@ use coding_agent_search::pages::summary::{
     AgentSummaryItem, KeySlotSummary, KeySlotType, PrePublishSummary, ScanReportSummary,
 };
 use regex::Regex;
-use std::collections::HashMap;
 
 // =============================================================================
 // Test Helpers
@@ -56,7 +55,7 @@ fn create_test_summary(conversation_count: usize, agents: Vec<(&str, usize)>) ->
         }],
         secret_scan: ScanReportSummary {
             total_findings: 0,
-            by_severity: HashMap::new(),
+            by_severity: Default::default(),
             has_critical: false,
             truncated: false,
             status_message: "No secrets found".to_string(),
