@@ -50,6 +50,7 @@
     "cursor",
     "chatgpt",
     "pi_agent",
+    "omp",
     "factory",
     "openclaw",
     "antigravity",
@@ -2174,7 +2175,7 @@
     },
     {
       "name": "resume",
-      "description": "Resolve a session path into a ready-to-run resume command for its native harness (Claude Code, Codex, OpenCode, pi_agent, Gemini, Antigravity)",
+      "description": "Resolve a session path into a ready-to-run resume command for its native harness (Claude Code, Codex, OpenCode, Pi Agent, Oh My Pi, Gemini, Antigravity)",
       "arguments": [
         {
           "name": "path",
@@ -3449,7 +3450,28 @@
     },
     {
       "name": "PI_CODING_AGENT_DIR",
-      "description": "Override Pi Agent session discovery root."
+      "description": "Override the Pi-family agent directory; OMP ignores it while a named profile is active."
+    },
+    {
+      "name": "PI_CODING_AGENT_SESSION_DIR",
+      "description": "Override the OMP session directory exactly; resume plans preserve this root with --session-dir."
+    },
+    {
+      "name": "PI_CONFIG_DIR",
+      "default": ".omp",
+      "description": "Override the OMP config directory name beneath the user home."
+    },
+    {
+      "name": "OMP_PROFILE",
+      "description": "Select an isolated OMP profile; takes precedence over PI_PROFILE."
+    },
+    {
+      "name": "PI_PROFILE",
+      "description": "Legacy fallback for selecting an isolated OMP profile."
+    },
+    {
+      "name": "XDG_DATA_HOME",
+      "description": "Select the XDG data root, including OMP v18 session and profile stores."
     },
     {
       "name": "CODEX_HOME",

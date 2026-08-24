@@ -3,7 +3,7 @@ commands:
   (global) --verbose/-v  Enable debug logs (overrides auto-quiet)
   Tip: `--robot-docs=<topic>` is normalized to `robot-docs <topic>`; globals can appear before/after subcommands.
   cass search <query> [OPTIONS]
-    --agent A         Filter by agent (e.g. codex, claude_code, gemini, opencode, antigravity; run `cass capabilities --json | jq .connectors` for the full 23-connector inventory)
+    --agent A         Filter by agent (e.g. codex, claude_code, gemini, opencode, omp, antigravity; run `cass capabilities --json | jq .connectors` for the full 26-connector inventory)
     --workspace W     Filter by workspace path
     --limit N         Max results (default: 0 = no limit)
     --offset N        Pagination offset (default: 0)
