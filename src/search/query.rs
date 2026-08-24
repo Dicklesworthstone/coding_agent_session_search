@@ -107,23 +107,31 @@ impl SearchSqliteConnectionExt for SearchSqliteConnection {
 }
 
 #[cfg(test)]
-struct SearchSqliteFixture(SearchSqliteConnection);
+struct SearchSqliteFixture(Option<SearchSqliteConnection>);
 
 #[cfg(test)]
 impl SearchSqliteFixture {
     fn in_memory() -> Result<Self, crate::franken_sync::FrankenError> {
-        SearchSqliteConnection::open_sync(":memory:").map(Self)
+        SearchSqliteConnection::open_sync(":memory:").map(|conn| Self(Some(conn)))
     }
 
-    fn into_connection(self) -> SearchSqliteConnection {
+    fn into_connection(mut self) -> SearchSqliteConnection {
         self.0
+            .take()
+            .expect("search sqlite fixture connection must be present")
+    }
+
+    fn connection(&self) -> &SearchSqliteConnection {
+        self.0
+            .as_ref()
+            .expect("search sqlite fixture connection must be present")
     }
 
     fn execute(
         &self,
         sql: &str,
     ) -> Result<usize, crate::franken_sync::FrankenError> {
-        self.0.execute_sync(sql)
+        self.connection().execute_sync(sql)
     }
 
     fn execute_with_params(
@@ -131,11 +139,11 @@ impl SearchSqliteFixture {
         sql: &str,
         params: &[crate::franken_sync::SqliteValue],
     ) -> Result<usize, crate::franken_sync::FrankenError> {
-        self.0.execute_with_params_sync(sql, params)
+        self.connection().execute_with_params_sync(sql, params)
     }
 
     fn execute_batch(&self, sql: &str) -> Result<(), crate::franken_sync::FrankenError> {
-        self.0.execute_batch_sync(sql)
+        self.connection().execute_batch_sync(sql)
     }
 
     fn query_row_map<T, F>(
@@ -148,7 +156,7 @@ impl SearchSqliteFixture {
         F: FnOnce(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>,
     {
         let values = param_slice_to_values(params);
-        let row = self.0.query_row_with_params_sync(sql, &values)?;
+        let row = self.connection().query_row_with_params_sync(sql, &values)?;
         map(&row)
     }
 
@@ -158,7 +166,7 @@ impl SearchSqliteFixture {
         params: &[ParamValue],
     ) -> Result<usize, crate::franken_sync::FrankenError> {
         let values = param_slice_to_values(params);
-        self.0.execute_with_params_sync(sql, &values)
+        self.connection().execute_with_params_sync(sql, &values)
     }
 }
 
@@ -167,7 +175,18 @@ impl std::ops::Deref for SearchSqliteFixture {
     type Target = SearchSqliteConnection;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        self.connection()
+    }
+}
+
+#[cfg(test)]
+impl Drop for SearchSqliteFixture {
+    fn drop(&mut self) {
+        if let Some(mut conn) = self.0.take()
+            && let Err(error) = conn.close_without_checkpoint_sync()
+        {
+            tracing::warn!(%error, "failed to close search sqlite fixture owner");
+        }
     }
 }
 
@@ -2896,6 +2915,15 @@ impl Default for SearchClientOptions {
 
 impl Drop for SearchClient {
     fn drop(&mut self) {
+        let sqlite = match self.sqlite.get_mut() {
+            Ok(sqlite) => sqlite,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(mut conn) = sqlite.take()
+            && let Err(error) = conn.close_without_checkpoint_sync()
+        {
+            tracing::warn!(%error, "failed to close search sqlite owner");
+        }
         FEDERATED_SEARCH_READERS
             .write()
             .remove(&self.cache_namespace);
