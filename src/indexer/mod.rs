@@ -99,9 +99,15 @@ use crate::search::semantic_manifest::{
 #[cfg(test)]
 use std::iter::Peekable;
 
-/// Type alias for batch classification map: (ConnectorKind, Path) -> (ScanRoot, MinTS, MaxTS)
-type BatchClassificationMap =
-    HashMap<(ConnectorKind, PathBuf), (ScanRoot, Option<i64>, Option<i64>)>;
+/// Type alias for batch classification map:
+/// (ConnectorKind, SourceKind, SourceId, Host, Path) -> (ScanRoot, MinTS, MaxTS).
+///
+/// Provenance is part of the key because two configured sources may point at
+/// the same local mirror path while still representing distinct archives.
+type BatchClassificationMap = HashMap<
+    (ConnectorKind, SourceKind, String, Option<String>, PathBuf),
+    (ScanRoot, Option<i64>, Option<i64>),
+>;
 
 const LEXICAL_REBUILD_PACKET_VERSION: u32 = CONVERSATION_PACKET_VERSION;
 const CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
@@ -13038,6 +13044,11 @@ fn run_batch_index_with_connector_factories(
         since_ts,
         &connector_factories,
     )?);
+    let scan_progress_tick: Option<Arc<dyn Fn() + Send + Sync>> =
+        opts.progress.as_ref().map(|progress| {
+            let progress = Arc::clone(progress);
+            Arc::new(move || progress.tick_activity()) as Arc<dyn Fn() + Send + Sync>
+        });
 
     // Keep scan completion state with each connector so watermarks are only
     // advanced for connectors whose full scan scope completed successfully.
@@ -13052,6 +13063,12 @@ fn run_batch_index_with_connector_factories(
                 let mut is_discovered = false;
                 let mut scan_succeeded = true;
                 let mut scan_errors = Vec::new();
+                let with_scan_tick = |ctx: crate::connectors::ScanContext| {
+                    match &scan_progress_tick {
+                        Some(tick) => ctx.with_progress_tick(Arc::clone(tick)),
+                        None => ctx,
+                    }
+                };
 
                 if detect.detected {
                     // Update discovered agents count immediately when detected
@@ -13066,10 +13083,10 @@ fn run_batch_index_with_connector_factories(
                         .get(name)
                         .copied()
                         .unwrap_or(since_ts);
-                    let ctx = crate::connectors::ScanContext::local_default(
+                    let ctx = with_scan_tick(crate::connectors::ScanContext::local_default(
                         data_dir.clone(),
                         local_since_ts,
-                    );
+                    ));
                     let fallback_roots: Vec<ScanRoot> = detect
                         .root_paths
                         .iter()
@@ -13140,11 +13157,11 @@ fn run_batch_index_with_connector_factories(
                                 "configured scan root is using a full root scan so already-mirrored sessions can be promoted to canonical"
                             );
                         }
-                        let ctx = crate::connectors::ScanContext::with_roots(
+                        let ctx = with_scan_tick(crate::connectors::ScanContext::with_roots(
                             root.path.clone(),
                             vec![root.clone()],
                             root_since_ts,
-                        );
+                        ));
                         let mut ingest_diagnostics = capture_connector_sources_before_parse(
                             conn.as_ref(),
                             &ctx,
@@ -13445,17 +13462,6 @@ pub fn run_index(
 ) -> Result<()> {
     ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(false, Ordering::Relaxed);
     let _progress_reset = RunIndexProgressReset::new(opts.progress.clone());
-    // gh373/oeu5a: let connector-internal parse loops (which have no
-    // IndexingProgress handle) tick work-liveness for this run's stall
-    // watchdog. Weak: the sink must never extend the progress lifetime.
-    let _scan_activity_guard = opts.progress.as_ref().map(|progress| {
-        let weak = Arc::downgrade(progress);
-        crate::connectors::scan_activity::register(Box::new(move || {
-            if let Some(progress) = weak.upgrade() {
-                progress.tick_activity();
-            }
-        }))
-    });
     // Analytics tables are derived assets and can be rebuilt by doctor/rebuild
     // flows. Keep routine indexing focused on the canonical conversation store
     // and lexical assets; set CASS_INLINE_ANALYTICS_UPDATES=1 to restore the
@@ -25623,8 +25629,12 @@ fn classify_paths(
         {
             let ts = Some(i64::try_from(dur.as_millis()).unwrap_or(i64::MAX));
 
-            // Find ALL matching roots
-            let mut matched_root = false;
+            // A connector can report nested roots for one physical store (OMP
+            // profiles are the motivating example). Scanning every containing
+            // root derives different root-relative external IDs for the same
+            // transcript, so retain only the deepest root per connector and
+            // source provenance. Distinct sources remain distinct scans.
+            let mut matching_roots: Vec<(ConnectorKind, &ScanRoot)> = Vec::new();
             for (kind, root) in roots {
                 if let Some(hinted_kind) = hinted_kind
                     && *kind != hinted_kind
@@ -25632,31 +25642,52 @@ fn classify_paths(
                     continue;
                 }
                 if p.starts_with(&root.path) {
-                    matched_root = true;
-                    let scan_path = if prefer_explicit_paths {
-                        explicit_watch_once_scan_path(*kind, &p)
+                    if let Some(index) = matching_roots.iter().position(
+                        |(selected_kind, selected_root)| {
+                            *selected_kind == *kind && selected_root.origin == root.origin
+                        },
+                    ) {
+                        if root.path.components().count()
+                            > matching_roots[index].1.path.components().count()
+                        {
+                            matching_roots[index].1 = root;
+                        }
                     } else {
-                        root.path.clone()
-                    };
-                    let mut scan_root = root.clone();
-                    scan_root.path = scan_path.clone();
-                    let key = (*kind, scan_path);
-                    let entry = batch_map.entry(key).or_insert((scan_root, None, None));
-
-                    // Update MinTS (for scan window start)
-                    entry.1 = match (entry.1, ts) {
-                        (Some(prev), Some(cur)) => Some(prev.min(cur)),
-                        (None, Some(cur)) => Some(cur),
-                        _ => entry.1,
-                    };
-
-                    // Update MaxTS (for state high-water mark)
-                    entry.2 = match (entry.2, ts) {
-                        (Some(prev), Some(cur)) => Some(prev.max(cur)),
-                        (None, Some(cur)) => Some(cur),
-                        _ => entry.2,
-                    };
+                        matching_roots.push((*kind, root));
+                    }
                 }
+            }
+            let matched_root = !matching_roots.is_empty();
+            for (kind, root) in matching_roots {
+                let scan_path = if prefer_explicit_paths {
+                    explicit_watch_once_scan_path(kind, &p)
+                } else {
+                    root.path.clone()
+                };
+                let mut scan_root = root.clone();
+                scan_root.path = scan_path.clone();
+                let key = (
+                    kind,
+                    scan_root.origin.kind,
+                    scan_root.origin.source_id.clone(),
+                    scan_root.origin.host.clone(),
+                    scan_path,
+                );
+                let entry = batch_map.entry(key).or_insert((scan_root, None, None));
+
+                // Update MinTS (for scan window start)
+                entry.1 = match (entry.1, ts) {
+                    (Some(prev), Some(cur)) => Some(prev.min(cur)),
+                    (None, Some(cur)) => Some(cur),
+                    _ => entry.1,
+                };
+
+                // Update MaxTS (for state high-water mark)
+                entry.2 = match (entry.2, ts) {
+                    (Some(prev), Some(cur)) => Some(prev.max(cur)),
+                    (None, Some(cur)) => Some(cur),
+                    _ => entry.2,
+                };
             }
             if prefer_explicit_paths
                 && !matched_root
@@ -25665,7 +25696,13 @@ fn classify_paths(
                 let scan_path = explicit_watch_once_scan_path(hinted_kind, &p);
                 let scan_root = ScanRoot::local(scan_path.clone());
                 let entry = batch_map
-                    .entry((hinted_kind, scan_path))
+                    .entry((
+                        hinted_kind,
+                        scan_root.origin.kind,
+                        scan_root.origin.source_id.clone(),
+                        scan_root.origin.host.clone(),
+                        scan_path,
+                    ))
                     .or_insert((scan_root, None, None));
                 entry.1 = match (entry.1, ts) {
                     (Some(prev), Some(cur)) => Some(prev.min(cur)),
@@ -25683,7 +25720,7 @@ fn classify_paths(
 
     batch_map
         .into_iter()
-        .map(|((kind, _), (root, min_ts, max_ts))| (kind, root, min_ts, max_ts))
+        .map(|((kind, _, _, _, _), (root, min_ts, max_ts))| (kind, root, min_ts, max_ts))
         .collect()
 }
 
@@ -48284,6 +48321,60 @@ mod tests {
         for (_, _, mtime, _) in classified {
             assert!(mtime.is_some(), "mtime should be captured");
         }
+    }
+
+    #[test]
+    fn classify_paths_uses_deepest_root_per_connector_and_origin() {
+        let tmp = TempDir::new().unwrap();
+        let app_root = tmp.path().join("share/omp");
+        let profile_root = app_root.join("profiles/work");
+        let session = profile_root
+            .join("sessions/-projects-cass")
+            .join("2026-08-24T12-00-00_omp.jsonl");
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(&session, b"{}\n").unwrap();
+        let roots = vec![
+            (ConnectorKind::Omp, ScanRoot::local(app_root)),
+            (
+                ConnectorKind::Omp,
+                ScanRoot::local(profile_root.clone()),
+            ),
+        ];
+
+        let classified = classify_paths(vec![session], &roots, false);
+
+        assert_eq!(classified.len(), 1);
+        assert_eq!(classified[0].0, ConnectorKind::Omp);
+        assert_eq!(classified[0].1.path, profile_root);
+    }
+
+    #[test]
+    fn classify_paths_keeps_distinct_source_provenance_for_one_mirror_path() {
+        let tmp = TempDir::new().unwrap();
+        let mirror_root = tmp.path().join("shared-mirror");
+        let session = mirror_root.join("session.jsonl");
+        std::fs::create_dir_all(&mirror_root).unwrap();
+        std::fs::write(&session, b"{}\n").unwrap();
+        let roots = vec![
+            (
+                ConnectorKind::Omp,
+                ScanRoot::remote(mirror_root.clone(), Origin::remote("source-a"), None),
+            ),
+            (
+                ConnectorKind::Omp,
+                ScanRoot::remote(mirror_root, Origin::remote("source-b"), None),
+            ),
+        ];
+
+        let classified = classify_paths(vec![session], &roots, false);
+        let source_ids = classified
+            .iter()
+            .map(|(_, root, _, _)| root.origin.source_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = std::collections::BTreeSet::from(["source-a", "source-b"]);
+
+        assert_eq!(classified.len(), 2);
+        assert_eq!(source_ids, expected);
     }
 
     #[test]

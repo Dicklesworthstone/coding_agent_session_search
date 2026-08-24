@@ -13,6 +13,7 @@ use crate::franken_sync::{
 use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole, Snippet};
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Source, SourceKind};
 use anyhow::{Context, Result, anyhow, bail};
+use frankensqlite::AsyncConnection as FrankenAsyncConnection;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
@@ -62,62 +63,137 @@ pub enum LazyDbError {
 }
 
 // -------------------------------------------------------------------------
-// LazyFrankenDb — lazy wrapper around FrankenConnection
+// LazyFrankenDb — lazy wrapper around a dedicated-owner connection
 // -------------------------------------------------------------------------
 
-/// Wrapper around `FrankenConnection` that implements `Send`.
+/// Synchronous dispatch facade whose raw FrankenSQLite connection is born,
+/// used, closed, and dropped on one dedicated owner thread.
 ///
-/// `FrankenConnection` is `!Send` because it uses `Rc` internally.
-/// However, the `Rc` values are entirely self-contained within the Connection
-/// and are not shared externally.  When wrapped in a `Mutex`,
-/// exclusive access is guaranteed, making cross-thread transfer safe.
-pub struct SendFrankenConnection(FrankenConnection, i64, u64);
+/// Pinned fsqlite 0.3.x deliberately makes its raw `Connection` `!Send`: its
+/// internal `Rc<RefCell<_>>` state is thread-affine even when callers serialize
+/// access with a mutex. `AsyncConnection` is the supported cross-thread handle;
+/// these methods keep CASS's synchronous call shape while every engine command
+/// remains on that handle's owner worker.
+#[derive(Debug)]
+pub struct FrankenOwnerConnection(FrankenAsyncConnection);
 
-// Safety: Rc fields inside FrankenConnection are not cloned or shared externally.
-// The Mutex<Option<SendFrankenConnection>> ensures exclusive access.
-unsafe impl Send for SendFrankenConnection {}
-
-impl SendFrankenConnection {
-    pub(crate) fn new(conn: FrankenConnection) -> Self {
-        Self(
-            conn,
-            UNSET_INDEX_WRITER_CHECKPOINT_PAGES,
-            UNSET_INDEX_WRITER_BUSY_TIMEOUT_MS,
-        )
+impl FrankenOwnerConnection {
+    fn open(
+        path: impl Into<String>,
+    ) -> std::result::Result<Self, crate::franken_sync::FrankenError> {
+        FrankenAsyncConnection::open_sync(path).map(Self)
     }
 
-    pub(crate) fn new_with_index_writer_state(
-        conn: FrankenConnection,
-        checkpoint_pages: i64,
-        busy_timeout_ms: u64,
-    ) -> Self {
-        Self(conn, checkpoint_pages, busy_timeout_ms)
+    pub fn execute(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<usize, crate::franken_sync::FrankenError> {
+        self.0.execute_sync(sql)
     }
 
-    pub(crate) fn into_parts(self) -> (FrankenConnection, i64, u64) {
-        (self.0, self.1, self.2)
+    pub fn execute_with_params(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> std::result::Result<usize, crate::franken_sync::FrankenError> {
+        self.0.execute_with_params_sync(sql, params)
+    }
+
+    pub fn execute_batch(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<(), crate::franken_sync::FrankenError> {
+        self.0.execute_batch_sync(sql)
+    }
+
+    pub fn query(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<Vec<FrankenRow>, crate::franken_sync::FrankenError> {
+        self.0.query_sync(sql)
+    }
+
+    pub fn query_with_params(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> std::result::Result<Vec<FrankenRow>, crate::franken_sync::FrankenError> {
+        self.0.query_with_params_sync(sql, params)
+    }
+
+    pub fn query_row_with_params(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> std::result::Result<FrankenRow, crate::franken_sync::FrankenError> {
+        self.0.query_row_with_params_sync(sql, params)
+    }
+
+    pub fn query_row_map<T, F>(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+        map: F,
+    ) -> std::result::Result<T, crate::franken_sync::FrankenError>
+    where
+        F: FnOnce(&FrankenRow) -> std::result::Result<T, crate::franken_sync::FrankenError>,
+    {
+        let values = param_slice_to_values(params);
+        let row = self.0.query_row_with_params_sync(sql, &values)?;
+        map(&row)
+    }
+
+    pub fn query_map_collect<T, F>(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+        mut map: F,
+    ) -> std::result::Result<Vec<T>, crate::franken_sync::FrankenError>
+    where
+        F: FnMut(&FrankenRow) -> std::result::Result<T, crate::franken_sync::FrankenError>,
+    {
+        let values = param_slice_to_values(params);
+        let rows = self.0.query_with_params_sync(sql, &values)?;
+        rows.iter().map(&mut map).collect()
+    }
+
+    pub fn execute_compat(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+    ) -> std::result::Result<usize, crate::franken_sync::FrankenError> {
+        let values = param_slice_to_values(params);
+        self.0.execute_with_params_sync(sql, &values)
+    }
+
+    pub(crate) fn close_without_checkpoint_sync(
+        &mut self,
+    ) -> std::result::Result<(), Arc<crate::franken_sync::FrankenError>> {
+        self.0.close_without_checkpoint_sync()
+    }
+
+    fn close_best_effort_in_place(&mut self) {
+        if let Err(err) = self.close_without_checkpoint_sync() {
+            tracing::debug!(
+                error = %err,
+                "failed to close dedicated-owner frankensqlite connection without checkpoint"
+            );
+        }
     }
 }
 
-impl std::ops::Deref for SendFrankenConnection {
-    type Target = FrankenConnection;
-    fn deref(&self) -> &FrankenConnection {
-        &self.0
-    }
-}
-
-/// Lazy-opening wrapper for `FrankenConnection` (frankensqlite).
+/// Lazy-opening wrapper for a dedicated-owner FrankenSQLite connection.
 ///
 /// Constructing a `LazyFrankenDb` is cheap (no I/O).  The underlying
-/// `FrankenConnection` is opened on the first call to [`get`].
+/// raw connection is opened on its owner worker on the first call to [`get`].
 /// Subsequent calls return the cached connection.
 pub struct LazyFrankenDb {
     path: PathBuf,
-    conn: parking_lot::Mutex<Option<SendFrankenConnection>>,
+    conn: parking_lot::Mutex<Option<FrankenOwnerConnection>>,
 }
 
-/// RAII guard that dereferences to the inner `FrankenConnection`.
-pub struct LazyFrankenDbGuard<'a>(parking_lot::MutexGuard<'a, Option<SendFrankenConnection>>);
+/// RAII guard that dereferences to the dedicated-owner dispatch facade.
+pub struct LazyFrankenDbGuard<'a>(parking_lot::MutexGuard<'a, Option<FrankenOwnerConnection>>);
 
 impl std::fmt::Debug for LazyFrankenDbGuard<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -128,8 +204,8 @@ impl std::fmt::Debug for LazyFrankenDbGuard<'_> {
 }
 
 impl std::ops::Deref for LazyFrankenDbGuard<'_> {
-    type Target = FrankenConnection;
-    fn deref(&self) -> &FrankenConnection {
+    type Target = FrankenOwnerConnection;
+    fn deref(&self) -> &FrankenOwnerConnection {
         self.0
             .as_ref()
             .expect("LazyFrankenDb connection must be initialized before access")
@@ -173,8 +249,8 @@ impl LazyFrankenDb {
                 path: self.path.clone(),
                 source: crate::franken_sync::FrankenError::Internal(err.to_string()),
             })?;
-            let conn =
-                FrankenConnection::open(self.path.to_string_lossy().into_owned()).map_err(|e| {
+            let conn = FrankenOwnerConnection::open(self.path.to_string_lossy().into_owned())
+                .map_err(|e| {
                     LazyDbError::FrankenOpenFailed {
                         path: self.path.clone(),
                         source: e,
@@ -187,7 +263,7 @@ impl LazyFrankenDb {
                 reason = reason,
                 "lazily opened FrankenSQLite database"
             );
-            *guard = Some(SendFrankenConnection::new(conn));
+            *guard = Some(conn);
         }
         Ok(LazyFrankenDbGuard(guard))
     }
@@ -222,8 +298,11 @@ impl LazyFrankenDb {
                             return;
                         }
                     };
-                let _ =
-                    tx.send(FrankenConnection::open(path_owned).map(SendFrankenConnection::new));
+                if let Err(std::sync::mpsc::SendError(Ok(mut conn))) =
+                    tx.send(FrankenOwnerConnection::open(path_owned))
+                {
+                    conn.close_best_effort_in_place();
+                }
             });
             let conn = rx
                 .recv_timeout(timeout)
@@ -714,6 +793,85 @@ pub(crate) fn open_franken_raw_readonly_connection_with_timeout(
     }
 }
 
+/// Open a read-only FrankenSQLite connection whose raw engine remains on one
+/// dedicated owner thread for its entire lifetime.
+///
+/// This mirrors [`open_franken_raw_readonly_connection_with_timeout`]'s doctor
+/// lock, bounded contention retry, and one-shot dirty-WAL recovery contract,
+/// and retains the canonical storage opener's duplicate-FTS-schema repair. It
+/// returns the thread-safe dispatch handle required by shared search clients.
+/// The worker creates, uses, closes, and drops the `!Send` raw connection on
+/// that same worker thread.
+pub(crate) fn open_franken_async_readonly_connection_with_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> Result<FrankenAsyncConnection> {
+    if !path.exists() {
+        return Err(anyhow!("Database not found at {}", path.display()));
+    }
+
+    let path_str = path.to_string_lossy().to_string();
+    let deadline = Instant::now() + timeout;
+    let mut backoff = Duration::from_millis(4);
+    let mut wal_recovery_attempted = false;
+    let mut duplicate_fts_repair_attempted = false;
+    loop {
+        let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
+        match FrankenAsyncConnection::open_with_flags_sync(
+            &path_str,
+            FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .with_context(|| {
+            format!(
+                "opening dedicated-owner frankensqlite db readonly at {}",
+                path.display()
+            )
+        }) {
+            Ok(conn) => return Ok(conn),
+            Err(err) if retryable_franken_anyhow(&err) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(err);
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                sleep_with_franken_retry_backoff(
+                    &mut backoff,
+                    remaining,
+                    Duration::from_millis(128),
+                );
+            }
+            Err(err)
+                if !duplicate_fts_repair_attempted
+                    && format!("{err:#}").contains("conflicting virtual-table entries") =>
+            {
+                tracing::warn!(
+                    db = %path.display(),
+                    error = %err,
+                    "dedicated-owner readonly open found duplicate fts_messages schema rows; deduplicating through the sanctioned sqlite3 bridge"
+                );
+                dedupe_conflicting_fts_schema_rows_via_sqlite3(path)?;
+                duplicate_fts_repair_attempted = true;
+            }
+            Err(err)
+                if !wal_recovery_attempted && attempt_dirty_wal_recovery_checkpoint(path, &err) =>
+            {
+                wal_recovery_attempted = true;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Open the synchronous dedicated-owner facade used by non-async callers
+/// that must safely transfer a read handle between worker threads.
+pub(crate) fn open_franken_owner_readonly_connection_with_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> Result<FrankenOwnerConnection> {
+    open_franken_async_readonly_connection_with_timeout(path, timeout)
+        .map(FrankenOwnerConnection)
+}
+
 pub(crate) fn retryable_franken_error(err: &crate::franken_sync::FrankenError) -> bool {
     matches!(
         err,
@@ -867,7 +1025,7 @@ impl Drop for LazyFrankenDb {
         let Some(mut conn) = self.conn.get_mut().take() else {
             return;
         };
-        conn.0.close_best_effort_in_place();
+        conn.close_best_effort_in_place();
     }
 }
 
@@ -906,11 +1064,11 @@ impl Default for ConnectionManagerConfig {
 /// - Controlled creation of writer connections with token-based limits
 /// - RAII guards that auto-rollback uncommitted transactions on drop
 ///
-/// Thread-safe: reader connections are wrapped in Mutex (FrankenConnection is !Sync).
-/// Writer connections are created per-request (each thread gets its own).
+/// Thread-safe: reader handles dispatch to dedicated owner threads. Writer
+/// connections remain thread-affine and are created and consumed per request.
 pub struct FrankenConnectionManager {
     db_path: PathBuf,
-    readers: Vec<parking_lot::Mutex<SendFrankenConnection>>,
+    readers: Vec<parking_lot::Mutex<FrankenOwnerConnection>>,
     reader_idx: std::sync::atomic::AtomicUsize,
     /// Token-based writer limit: channel pre-filled with `max_writers` tokens.
     /// `recv()` = acquire slot, `send()` = release slot.
@@ -920,13 +1078,6 @@ pub struct FrankenConnectionManager {
     ),
     config: ConnectionManagerConfig,
 }
-
-// Safety: FrankenConnectionManager is Send+Sync because:
-// - readers wrapped in Mutex<SendFrankenConnection> (exclusive access)
-// - writer_tokens uses crossbeam (Send+Sync)
-// - db_path is PathBuf (Send+Sync)
-unsafe impl Send for FrankenConnectionManager {}
-unsafe impl Sync for FrankenConnectionManager {}
 
 impl FrankenConnectionManager {
     /// Create a new connection manager.
@@ -938,14 +1089,25 @@ impl FrankenConnectionManager {
         let path_str = db_path.to_string_lossy().to_string();
 
         let reader_count = config.reader_count.max(1);
-        let mut readers = Vec::with_capacity(reader_count);
+        let mut readers: Vec<parking_lot::Mutex<FrankenOwnerConnection>> =
+            Vec::with_capacity(reader_count);
         for _ in 0..reader_count {
-            let conn = FrankenConnection::open(&path_str)
-                .with_context(|| format!("opening reader connection at {}", db_path.display()))?;
+            let conn = match FrankenOwnerConnection::open(path_str.clone()) {
+                Ok(conn) => conn,
+                Err(source) => {
+                    for reader in &mut readers {
+                        reader.get_mut().close_best_effort_in_place();
+                    }
+                    return Err(anyhow::Error::from(source).context(format!(
+                        "opening reader connection at {}",
+                        db_path.display()
+                    )));
+                }
+            };
             // Apply read-tuned config (no migration, no write PRAGMAs)
             let _ = conn.execute("PRAGMA busy_timeout = 5000;"); // match writer config
             let _ = conn.execute("PRAGMA cache_size = -16384;"); // 16MB reader cache
-            readers.push(parking_lot::Mutex::new(SendFrankenConnection::new(conn)));
+            readers.push(parking_lot::Mutex::new(conn));
         }
 
         let max_writers = config.max_writers.max(1);
@@ -974,8 +1136,8 @@ impl FrankenConnectionManager {
     /// Get a reader connection (round-robin from the pool).
     ///
     /// Returns a mutex guard wrapping the connection. The guard prevents
-    /// concurrent access to the same connection (FrankenConnection is !Sync).
-    pub fn reader(&self) -> parking_lot::MutexGuard<'_, SendFrankenConnection> {
+    /// concurrent command streams through the same owner handle.
+    pub fn reader(&self) -> parking_lot::MutexGuard<'_, FrankenOwnerConnection> {
         let idx = self
             .reader_idx
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1068,7 +1230,7 @@ impl FrankenConnectionManager {
 impl Drop for FrankenConnectionManager {
     fn drop(&mut self) {
         for reader in &mut self.readers {
-            reader.get_mut().0.close_best_effort_in_place();
+            reader.get_mut().close_best_effort_in_place();
         }
     }
 }
@@ -1406,19 +1568,21 @@ fn fts_schema_tolerates_missing_shadow_metadata(sql: &str) -> bool {
         && !normalized.contains("message_id")
 }
 
-pub fn validate_fts_messages_integrity_for_connection(conn: &FrankenConnection) -> Result<()> {
-    let fts_schema_sql: Vec<String> = conn
-        .query_map_collect(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fts_messages'",
-            fparams![],
-            |row: &FrankenRow| row.get_typed::<String>(0),
-        )
+fn validate_fts_messages_integrity_with_queries(
+    query_strings: impl Fn(
+        &str,
+    ) -> std::result::Result<Vec<String>, crate::franken_sync::FrankenError>,
+    probe: impl Fn(&str) -> std::result::Result<(), crate::franken_sync::FrankenError>,
+) -> Result<()> {
+    let fts_schema_sql = query_strings(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fts_messages'",
+    )
         .with_context(|| "checking for fts_messages in sqlite_master")?;
     if fts_schema_sql.is_empty() {
         return Ok(());
     }
 
-    let probe_error = conn.query(FTS_MESSAGES_INTEGRITY_PROBE_SQL).err();
+    let probe_error = probe(FTS_MESSAGES_INTEGRITY_PROBE_SQL).err();
     if probe_error.is_none()
         && fts_schema_sql
             .iter()
@@ -1427,9 +1591,8 @@ pub fn validate_fts_messages_integrity_for_connection(conn: &FrankenConnection) 
         return Ok(());
     }
 
-    let present_shadow_tables: HashSet<String> = conn
-        .query_map_collect(
-            "SELECT name FROM sqlite_master
+    let present_shadow_tables: HashSet<String> = query_strings(
+        "SELECT name FROM sqlite_master
              WHERE type = 'table'
                AND name IN (
                  'fts_messages_config',
@@ -1438,9 +1601,7 @@ pub fn validate_fts_messages_integrity_for_connection(conn: &FrankenConnection) 
                  'fts_messages_docsize',
                  'fts_messages_idx'
                )",
-            fparams![],
-            |row: &FrankenRow| row.get_typed::<String>(0),
-        )
+    )
         .map(|rows| rows.into_iter().collect())
         .map_err(|err| {
             FtsMessagesIntegrityError::new(
@@ -1478,6 +1639,31 @@ pub fn validate_fts_messages_integrity_for_connection(conn: &FrankenConnection) 
         probe_error.map(|err| err.to_string()),
     )
     .into())
+}
+
+pub fn validate_fts_messages_integrity_for_connection(conn: &FrankenConnection) -> Result<()> {
+    validate_fts_messages_integrity_with_queries(
+        |sql| {
+            conn.query_map_collect(sql, fparams![], |row: &FrankenRow| {
+                row.get_typed::<String>(0)
+            })
+        },
+        |sql| conn.query(sql).map(|_| ()),
+    )
+}
+
+pub(crate) fn validate_fts_messages_integrity_for_async_connection(
+    conn: &FrankenAsyncConnection,
+) -> Result<()> {
+    validate_fts_messages_integrity_with_queries(
+        |sql| {
+            let rows = conn.query_sync(sql)?;
+            rows.iter()
+                .map(|row: &FrankenRow| row.get_typed::<String>(0))
+                .collect()
+        },
+        |sql| conn.query_sync(sql).map(|_| ()),
+    )
 }
 
 /// Remove historical duplicate `fts_messages` rows from `sqlite_master`,
@@ -4204,6 +4390,17 @@ fn close_franken_in_place_with_busy_retry(
     unreachable!("close retry loop returns on the final attempt")
 }
 
+/// Thread-affine storage owning the primary raw connection and any cached raw
+/// ephemeral writer. Moving it to another OS thread must remain a compile-time
+/// error; use [`FrankenOwnerConnection`] for cross-thread reads instead.
+///
+/// ```compile_fail
+/// use coding_agent_search::storage::sqlite::FrankenStorage;
+/// fn requires_send<T: Send>(_: T) {}
+/// fn raw_storage_must_not_cross_threads(storage: FrankenStorage) {
+///     requires_send(storage);
+/// }
+/// ```
 pub struct FrankenStorage {
     conn: FrankenConnection,
     db_path: PathBuf,
@@ -4230,8 +4427,42 @@ const FTS_MESSAGES_PRESENT_PRESENT: i8 = 2;
 
 enum CachedEphemeralWriter {
     Uninitialized,
-    Cached(Box<SendFrankenConnection>),
+    Cached(Box<CachedRawFrankenConnection>),
     InUse,
+}
+
+/// Thread-affine writer state cached only inside the owning `FrankenStorage`.
+///
+/// Unlike the public reader facade, this intentionally contains the raw
+/// `!Send` connection and has no manual auto-trait implementation. That makes
+/// moving a storage (and therefore a cached writer) across OS threads a
+/// compile-time error while preserving the inexpensive same-thread reuse path.
+struct CachedRawFrankenConnection {
+    conn: FrankenConnection,
+    index_writer_checkpoint_pages: i64,
+    index_writer_busy_timeout_ms: u64,
+}
+
+impl CachedRawFrankenConnection {
+    fn new(
+        conn: FrankenConnection,
+        index_writer_checkpoint_pages: i64,
+        index_writer_busy_timeout_ms: u64,
+    ) -> Self {
+        Self {
+            conn,
+            index_writer_checkpoint_pages,
+            index_writer_busy_timeout_ms,
+        }
+    }
+
+    fn into_parts(self) -> (FrankenConnection, i64, u64) {
+        (
+            self.conn,
+            self.index_writer_checkpoint_pages,
+            self.index_writer_busy_timeout_ms,
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -4636,7 +4867,7 @@ impl FrankenStorage {
             "cached ephemeral writer state should be in-use when releasing"
         );
         *cached = CachedEphemeralWriter::Cached(Box::new(
-            SendFrankenConnection::new_with_index_writer_state(
+            CachedRawFrankenConnection::new(
                 conn,
                 checkpoint_pages,
                 busy_timeout_ms,
@@ -4744,7 +4975,7 @@ impl FrankenStorage {
             std::mem::replace(cached, CachedEphemeralWriter::Uninitialized)
         {
             let mut conn = conn;
-            conn.0.close_best_effort_in_place();
+            conn.conn.close_best_effort_in_place();
         }
     }
 
@@ -4752,7 +4983,7 @@ impl FrankenStorage {
         let cached = self.cached_ephemeral_writer.get_mut();
         match std::mem::replace(cached, CachedEphemeralWriter::Uninitialized) {
             CachedEphemeralWriter::Cached(mut conn) => {
-                close_franken_in_place_with_busy_retry(&mut conn.0, false)
+                close_franken_in_place_with_busy_retry(&mut conn.conn, false)
                     .with_context(|| "closing cached frankensqlite writer without final checkpoint")
             }
             CachedEphemeralWriter::Uninitialized | CachedEphemeralWriter::InUse => Ok(()),
@@ -20023,6 +20254,17 @@ mod tests {
             "error should identify the active doctor mutation lock: {message}"
         );
 
+        let async_err = open_franken_async_readonly_connection_with_timeout(
+            &db_path,
+            Duration::from_millis(25),
+        )
+        .expect_err("active doctor mutation lock must also block dedicated-owner opens");
+        let async_message = async_err.to_string();
+        assert!(
+            async_message.contains("doctor mutation lock") && async_message.contains("active"),
+            "dedicated-owner error should identify the active doctor mutation lock: {async_message}"
+        );
+
         fs2::FileExt::unlock(&lock_file).unwrap();
     }
 
@@ -20059,6 +20301,15 @@ mod tests {
                     "doctor process must be able to run post-repair read probes under its own lock",
                 );
         drop(conn);
+
+        let mut async_conn = open_franken_async_readonly_connection_with_timeout(
+            &db_path,
+            Duration::from_millis(25),
+        )
+        .expect("doctor process must also be able to open a dedicated-owner read probe");
+        async_conn
+            .close_without_checkpoint_sync()
+            .expect("dedicated-owner doctor probe should close cleanly");
 
         fs2::FileExt::unlock(&lock_file).unwrap();
     }
@@ -21396,6 +21647,57 @@ mod tests {
         let count: i64 = rows.first().unwrap().get_typed(0).unwrap();
         assert_eq!(count, 3, "checkpointed rows must survive recovery");
         conn.close().unwrap();
+    }
+
+    #[test]
+    fn dedicated_owner_readonly_open_reads_nonempty_wal_without_mutating_it() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("dedicated-owner-dirty.db");
+        {
+            let mut conn =
+                crate::franken_sync::Connection::open(db_path.to_string_lossy().into_owned())
+                    .unwrap();
+            conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
+            conn.execute("INSERT INTO t (x) VALUES (1), (2), (3);")
+                .unwrap();
+            close_franken_in_place_with_busy_retry(&mut conn, false).unwrap();
+        }
+
+        let wal_path = database_sidecar_path(&db_path, "-wal");
+        let dirty_len = std::fs::symlink_metadata(&wal_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        assert!(
+            dirty_len > 32,
+            "precondition: dedicated-owner test requires unreplayed WAL frames (len={dirty_len})"
+        );
+
+        let mut conn = open_franken_async_readonly_connection_with_timeout(
+            &db_path,
+            Duration::from_secs(2),
+        )
+        .expect("dedicated-owner readonly open should read through the dirty WAL");
+        let rows = conn
+            .query_sync("SELECT COUNT(*) FROM t;")
+            .expect("dedicated owner should read committed rows through the WAL");
+        let count: i64 = rows
+            .first()
+            .expect("count query should return one row")
+            .get_typed(0)
+            .expect("count should be an integer");
+        assert_eq!(count, 3, "dirty-WAL reads must preserve committed rows");
+        conn.execute_sync("DELETE FROM t WHERE 1 = 0")
+            .expect_err("dedicated-owner readonly connection must refuse writes");
+        conn.close_without_checkpoint_sync()
+            .expect("dedicated-owner readonly close should join its worker");
+
+        let reopened_len = std::fs::symlink_metadata(&wal_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        assert_eq!(
+            reopened_len, dirty_len,
+            "successful readonly dispatch must not rewrite or checkpoint the dirty WAL"
+        );
     }
 
     #[test]
@@ -29962,6 +30264,101 @@ mod tests {
         assert_eq!(lazy.path(), path.as_path());
     }
 
+    #[test]
+    fn dedicated_owner_safe_handles_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<FrankenOwnerConnection>();
+        assert_send_sync::<LazyFrankenDb>();
+        assert_send_sync::<FrankenConnectionManager>();
+    }
+
+    #[test]
+    fn storage_source_forbids_manual_raw_connection_auto_trait_overrides() {
+        let storage_source = include_str!("sqlite.rs");
+        let lib_source = include_str!("../lib.rs");
+        let forbidden = [
+            ["unsafe impl ", "Send for"].concat(),
+            ["unsafe impl ", "Sync for"].concat(),
+            ["SendFranken", "Connection"].concat(),
+        ];
+
+        for source in [storage_source, lib_source] {
+            for fragment in &forbidden {
+                assert!(
+                    !source.contains(fragment),
+                    "thread-affine FrankenSQLite safety override reintroduced: {fragment}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dedicated_owner_lazy_and_manager_reads_cross_worker_boundaries() {
+        use crate::franken_sync::compat::RowExt as _;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("owner-thread-dispatch.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        storage
+            .raw()
+            .execute_batch(
+                "CREATE TABLE owner_thread_probe (value INTEGER NOT NULL);\
+                 INSERT INTO owner_thread_probe(value) VALUES (41), (1);",
+            )
+            .unwrap();
+        storage.close().unwrap();
+
+        let lazy = Arc::new(LazyFrankenDb::new(db_path.clone()));
+        let lazy_workers = (0..4)
+            .map(|_| {
+                let lazy = Arc::clone(&lazy);
+                std::thread::spawn(move || {
+                    let conn = lazy
+                        .get_with_timeout("cross-worker lazy read", Duration::from_secs(5))
+                        .unwrap();
+                    conn.query_row_map(
+                        "SELECT SUM(value) FROM owner_thread_probe",
+                        fparams![],
+                        |row| row.get_typed::<i64>(0),
+                    )
+                    .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in lazy_workers {
+            assert_eq!(worker.join().unwrap(), 42);
+        }
+
+        let manager = Arc::new(
+            FrankenConnectionManager::new(
+                &db_path,
+                ConnectionManagerConfig {
+                    reader_count: 2,
+                    max_writers: 1,
+                },
+            )
+            .unwrap(),
+        );
+        let manager_workers = (0..4)
+            .map(|_| {
+                let manager = Arc::clone(&manager);
+                std::thread::spawn(move || {
+                    let conn = manager.reader();
+                    conn.query_row_map(
+                        "SELECT SUM(value) FROM owner_thread_probe",
+                        fparams![],
+                        |row| row.get_typed::<i64>(0),
+                    )
+                    .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in manager_workers {
+            assert_eq!(worker.join().unwrap(), 42);
+        }
+    }
+
     // =========================================================================
     // Pricing / cost estimation tests (bead z9fse.10)
     // =========================================================================
@@ -30935,6 +31332,23 @@ mod tests {
         assert_eq!(duplicate_rows, 2);
         drop(conn);
 
+        let mut owner_reader = open_franken_async_readonly_connection_with_timeout(
+            &db_path,
+            Duration::from_secs(5),
+        )
+        .expect("dedicated-owner readonly open should repair duplicate FTS schema rows");
+        let message_rows = owner_reader
+            .query_sync("SELECT COUNT(*) FROM messages")
+            .expect("canonical messages must remain readable after schema-row dedupe");
+        assert_eq!(
+            message_rows[0].get_typed::<i64>(0).unwrap(),
+            1,
+            "dedupe must preserve canonical archive rows"
+        );
+        owner_reader
+            .close_without_checkpoint_sync()
+            .expect("dedicated-owner duplicate-schema probe should close cleanly");
+
         let reopened = FrankenStorage::open(&db_path).unwrap();
         assert_eq!(reopened.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
         let generation_rows: Vec<String> = reopened
@@ -31585,7 +31999,7 @@ mod tests {
             guard.mark_committed();
         }
 
-        // Verify via reader (returns MutexGuard<SendFrankenConnection>)
+        // Verify via a guard around the dedicated-owner reader handle.
         let reader_guard = mgr.reader();
         let rows = reader_guard.query("SELECT val FROM cm_test").unwrap();
         assert_eq!(rows.len(), 1);

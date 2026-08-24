@@ -9,7 +9,6 @@
 //! Run with:
 //!   cargo test --test docs
 
-use std::collections::HashMap;
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
@@ -282,7 +281,7 @@ fn test_help_html_valid() {
         }],
         secret_scan: ScanReportSummary {
             total_findings: 0,
-            by_severity: HashMap::new(),
+            by_severity: Default::default(),
             has_critical: false,
             truncated: false,
             status_message: "No secrets found".to_string(),
@@ -346,7 +345,7 @@ fn test_recovery_html_valid() {
         ],
         secret_scan: ScanReportSummary {
             total_findings: 0,
-            by_severity: HashMap::new(),
+            by_severity: Default::default(),
             has_critical: false,
             truncated: false,
             status_message: "No secrets found".to_string(),
@@ -406,7 +405,7 @@ fn test_security_doc_complete() {
         }],
         secret_scan: ScanReportSummary {
             total_findings: 0,
-            by_severity: HashMap::new(),
+            by_severity: Default::default(),
             has_critical: false,
             truncated: false,
             status_message: "No secrets found".to_string(),
