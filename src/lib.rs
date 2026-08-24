@@ -17045,6 +17045,23 @@ fn close_franken_cli_read_db(
     Ok(())
 }
 
+fn close_franken_cli_read_db_without_checkpoint(
+    mut conn: crate::franken_sync::Connection,
+    path: &Path,
+    reason: &str,
+) -> CliResult<()> {
+    if let Err(err) = conn.close_without_checkpoint_in_place() {
+        warn!(
+            error = %err,
+            db_path = %path.display(),
+            reason,
+            "checkpoint-free close failed for CLI read probe; falling back to best-effort owner-thread cleanup"
+        );
+        conn.close_best_effort_in_place();
+    }
+    Ok(())
+}
+
 fn fts_messages_integrity_cli_error(surface: &str, err: anyhow::Error) -> CliError {
     CliError {
         code: 5,
@@ -17291,7 +17308,11 @@ fn run_analytics_incidents(
                     Some(&scan_db_path),
                 )
             });
-        let _ = close_franken_cli_read_db(conn, &scan_db_path, "analytics incidents");
+        let _ = close_franken_cli_read_db_without_checkpoint(
+            conn,
+            &scan_db_path,
+            "analytics incidents",
+        );
         scan_result
     })
     .map_err(incident_scan_cli_error)?;
