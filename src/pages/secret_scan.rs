@@ -527,7 +527,7 @@ pub fn scan_database<P: AsRef<Path>>(
         }
     }
 
-    if !truncated && table_exists(&conn, "snippets") {
+    if !truncated && table_exists(&conn, "snippets")? {
         let (snip_where, snip_params) = build_where_clause(filters)?;
         let snip_high_watermark = table_max_id(&conn, "snippets")?;
         let snip_select = "SELECT s.id, s.snippet_text, m.id, m.idx, c.id, c.source_path, COALESCE(a.slug, 'unknown'), w.path\n             FROM snippets s\n             JOIN messages m ON s.message_id = m.id\n             JOIN conversations c ON m.conversation_id = c.id\n             LEFT JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id";
@@ -637,18 +637,18 @@ pub fn scan_database<P: AsRef<Path>>(
     })
 }
 
-fn table_exists(conn: &crate::franken_sync::Connection, table_name: &str) -> bool {
+fn table_exists(conn: &crate::franken_sync::Connection, table_name: &str) -> Result<bool> {
     if !table_name
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
     {
-        return false;
+        bail!("Invalid SQLite identifier while inspecting secret-scan schema");
     }
 
     let pragma = format!("PRAGMA table_info({table_name})");
     conn.query_map_collect(&pragma, params![], |row| row.get_typed::<String>(1))
         .map(|columns| !columns.is_empty())
-        .unwrap_or(false)
+        .with_context(|| format!("Failed to inspect {table_name} schema for secret scan"))
 }
 
 fn table_max_id(

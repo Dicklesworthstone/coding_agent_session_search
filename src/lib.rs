@@ -16865,7 +16865,7 @@ fn open_franken_cli_read_db_with_hard_timeout(
     path: PathBuf,
     reason: &str,
     timeout: Duration,
-) -> CliResult<crate::franken_sync::Connection> {
+) -> CliResult<crate::storage::sqlite::FrankenOwnerConnection> {
     let display_path = path.display().to_string();
     let reason = reason.to_string();
     if let Some(err) = sqlite_header_preflight_error(&path, &display_path, &reason) {
@@ -16875,13 +16875,65 @@ fn open_franken_cli_read_db_with_hard_timeout(
     let _open_worker = std::thread::spawn({
         let reason = reason.clone();
         move || {
-            let result = open_franken_cli_read_db(path, &reason, timeout)
-                .map(crate::storage::sqlite::SendFrankenConnection::new);
+            let result = open_franken_cli_owner_read_db(path, &reason, timeout);
             let _ = tx.send(result);
         }
     });
 
     receive_franken_cli_read_db_open_result_with_hard_timeout(rx, display_path, reason, timeout)
+}
+
+/// Open a read-only handle whose raw engine state never leaves its dedicated
+/// owner thread. This is the only handle the CLI hard-timeout lane may send
+/// between the open worker, probe worker, and caller.
+fn open_franken_cli_owner_read_db(
+    path: PathBuf,
+    reason: &str,
+    busy_timeout: Duration,
+) -> CliResult<crate::storage::sqlite::FrankenOwnerConnection> {
+    if !path.exists() {
+        return Err(CliError {
+            code: 3,
+            kind: CliErrorKind::MissingDb.kind_str(),
+            message: format!(
+                "Database not found at {}. Run 'cass index --full' first.",
+                path.display()
+            ),
+            hint: Some("Run 'cass index --full' to create the database.".into()),
+            retryable: true,
+        });
+    }
+
+    let conn = crate::storage::sqlite::open_franken_owner_readonly_connection_with_timeout(
+        &path,
+        busy_timeout,
+    )
+    .map_err(|err| {
+        let retryable = crate::storage::sqlite::retryable_franken_anyhow(&err);
+        let message = format!(
+            "Failed to open {reason} database at {}: dedicated-owner readonly open failed ({err})",
+            path.display()
+        );
+        if let Some(fts_err) =
+            crate::storage::sqlite::fts_messages_integrity_error_from_message(&message)
+        {
+            return fts_messages_integrity_cli_error(reason, fts_err.into());
+        }
+        CliError {
+            code: 9,
+            kind: CliErrorKind::DbOpen.kind_str(),
+            message,
+            hint: None,
+            retryable,
+        }
+    })?;
+
+    let timeout_ms = busy_timeout.as_millis().clamp(1, u128::from(u32::MAX));
+    let _ = conn.execute(&format!("PRAGMA busy_timeout = {timeout_ms};"));
+    let _ = conn.execute("PRAGMA query_only = 1;");
+    let _ = conn.execute("PRAGMA cache_size = -65536;");
+    let _ = conn.execute("PRAGMA foreign_keys = ON;");
+    Ok(conn)
 }
 
 fn sqlite_header_preflight_error(
@@ -16928,13 +16980,15 @@ fn sqlite_header_preflight_error(
 }
 
 fn receive_franken_cli_read_db_open_result_with_hard_timeout(
-    rx: std::sync::mpsc::Receiver<CliResult<crate::storage::sqlite::SendFrankenConnection>>,
+    rx: std::sync::mpsc::Receiver<
+        CliResult<crate::storage::sqlite::FrankenOwnerConnection>,
+    >,
     display_path: String,
     reason: String,
     timeout: Duration,
-) -> CliResult<crate::franken_sync::Connection> {
+) -> CliResult<crate::storage::sqlite::FrankenOwnerConnection> {
     match rx.recv_timeout(timeout) {
-        Ok(Ok(conn)) => Ok(conn.into_parts().0),
+        Ok(Ok(conn)) => Ok(conn),
         Ok(Err(err)) => Err(err),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(CliError {
             code: 9,
@@ -16956,6 +17010,22 @@ fn receive_franken_cli_read_db_open_result_with_hard_timeout(
             retryable: true,
         }),
     }
+}
+
+fn close_franken_cli_owner_read_db(
+    mut conn: crate::storage::sqlite::FrankenOwnerConnection,
+    path: &Path,
+    reason: &str,
+) -> CliResult<()> {
+    if let Err(err) = conn.close_without_checkpoint_sync() {
+        warn!(
+            error = %err,
+            db_path = %path.display(),
+            reason,
+            "dedicated-owner CLI read probe close failed; dropping the handle for owner-thread cleanup"
+        );
+    }
+    Ok(())
 }
 
 fn close_franken_cli_read_db(
@@ -17193,8 +17263,6 @@ fn run_analytics_incidents(
 
     let effective_db_path = analytics_db_path(&common.data_dir, db_path_override);
     let pointer_db_path = std::fs::canonicalize(&effective_db_path).unwrap_or(effective_db_path);
-    let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
-    let filter = analytics_query_filter(&conn, common)?;
     let caps = crate::incident_discovery::DiscoveryCaps {
         max_files: max_sessions,
         max_lines: max_messages,
@@ -17202,11 +17270,29 @@ fn run_analytics_incidents(
         budget_ms,
         max_evidence: crate::incident_discovery::DEFAULT_MAX_EVIDENCE,
     };
-    let scan_conn = crate::storage::sqlite::SendFrankenConnection::new(conn);
+    let scan_common = common.clone();
+    let scan_db_override = db_path_override.cloned();
     let scan_db_path = pointer_db_path.clone();
     let report = crate::incident_discovery::run_incident_scan_with_hard_timeout(caps, move || {
-        let conn = scan_conn.into_parts().0;
-        crate::incident_discovery::scan_incidents(&conn, &filter, caps, limit, Some(&scan_db_path))
+        // The raw connection is created inside the bounded scan worker and is
+        // never transferred out of it. A hard timeout may detach this worker,
+        // but the connection remains thread-affine until the scan returns and
+        // owner-thread cleanup runs here.
+        let conn = open_franken_analytics_db(&scan_common.data_dir, scan_db_override.as_ref())
+            .map_err(anyhow::Error::new)?;
+        let scan_result = analytics_query_filter(&conn, &scan_common)
+            .map_err(anyhow::Error::new)
+            .and_then(|filter| {
+                crate::incident_discovery::scan_incidents(
+                    &conn,
+                    &filter,
+                    caps,
+                    limit,
+                    Some(&scan_db_path),
+                )
+            });
+        let _ = close_franken_cli_read_db(conn, &scan_db_path, "analytics incidents");
+        scan_result
     })
     .map_err(incident_scan_cli_error)?;
     serde_json::to_value(report).map_err(|error| CliError {
@@ -32273,15 +32359,83 @@ fn doctor_anomaly_taxonomy_report() -> Vec<DoctorAnomalyTaxonomyEntry> {
         .collect()
 }
 
-fn doctor_database_integrity_probe(
-    conn: &crate::franken_sync::Connection,
+/// Minimal synchronous read surface shared by same-thread raw test fixtures
+/// and production dedicated-owner handles. The production hard-timeout path
+/// implements this only through `FrankenOwnerConnection`, so no raw engine
+/// value becomes reachable across workers.
+trait DoctorArchiveReadConnection {
+    fn doctor_query(
+        &self,
+        sql: &str,
+    ) -> Result<Vec<crate::franken_sync::Row>, crate::franken_sync::FrankenError>;
+
+    fn doctor_query_row_map<T, F>(
+        &self,
+        sql: &str,
+        params: &[crate::franken_sync::compat::ParamValue],
+        map: F,
+    ) -> Result<T, crate::franken_sync::FrankenError>
+    where
+        F: FnOnce(
+            &crate::franken_sync::Row,
+        ) -> Result<T, crate::franken_sync::FrankenError>;
+}
+
+impl DoctorArchiveReadConnection for crate::franken_sync::Connection {
+    fn doctor_query(
+        &self,
+        sql: &str,
+    ) -> Result<Vec<crate::franken_sync::Row>, crate::franken_sync::FrankenError> {
+        self.query(sql)
+    }
+
+    fn doctor_query_row_map<T, F>(
+        &self,
+        sql: &str,
+        params: &[crate::franken_sync::compat::ParamValue],
+        map: F,
+    ) -> Result<T, crate::franken_sync::FrankenError>
+    where
+        F: FnOnce(
+            &crate::franken_sync::Row,
+        ) -> Result<T, crate::franken_sync::FrankenError>,
+    {
+        self.query_row_map(sql, params, map)
+    }
+}
+
+impl DoctorArchiveReadConnection for crate::storage::sqlite::FrankenOwnerConnection {
+    fn doctor_query(
+        &self,
+        sql: &str,
+    ) -> Result<Vec<crate::franken_sync::Row>, crate::franken_sync::FrankenError> {
+        self.query(sql)
+    }
+
+    fn doctor_query_row_map<T, F>(
+        &self,
+        sql: &str,
+        params: &[crate::franken_sync::compat::ParamValue],
+        map: F,
+    ) -> Result<T, crate::franken_sync::FrankenError>
+    where
+        F: FnOnce(
+            &crate::franken_sync::Row,
+        ) -> Result<T, crate::franken_sync::FrankenError>,
+    {
+        self.query_row_map(sql, params, map)
+    }
+}
+
+fn doctor_database_integrity_probe<C: DoctorArchiveReadConnection>(
+    conn: &C,
     set_phase: impl Fn(&'static str),
 ) -> Result<DoctorDatabaseIntegrityProbe, String> {
-    use crate::franken_sync::compat::{ConnectionExt as _, RowExt as _};
+    use crate::franken_sync::compat::RowExt as _;
 
     set_phase("quick_check");
     let quick_check_status: String = conn
-        .query_row_map(
+        .doctor_query_row_map(
             "PRAGMA quick_check(1)",
             &[],
             |row: &crate::franken_sync::Row| row.get_typed(0),
@@ -32294,7 +32448,7 @@ fn doctor_database_integrity_probe(
         let integrity_sql =
             format!("PRAGMA integrity_check({DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT});");
         let rows = conn
-            .query(&integrity_sql)
+            .doctor_query(&integrity_sql)
             .map_err(|err| format!("running PRAGMA integrity_check: {err}"))?;
         let mut diagnostics = Vec::new();
         for row in rows {
@@ -76342,8 +76496,12 @@ enum DoctorFtsTableState {
     },
 }
 
-fn probe_doctor_fts_table(conn: &crate::franken_sync::Connection) -> DoctorFtsTableState {
-    if let Err(frankensqlite_error) = conn.query("SELECT rowid FROM fts_messages LIMIT 1;") {
+fn probe_doctor_fts_table<C: DoctorArchiveReadConnection>(
+    conn: &C,
+) -> DoctorFtsTableState {
+    if let Err(frankensqlite_error) =
+        conn.doctor_query("SELECT rowid FROM fts_messages LIMIT 1;")
+    {
         return DoctorFtsTableState::Missing {
             frankensqlite_error: frankensqlite_error.to_string(),
         };
@@ -76353,7 +76511,7 @@ fn probe_doctor_fts_table(conn: &crate::franken_sync::Connection) -> DoctorFtsTa
     // `index --full` then fails against. Compare the cheap docsize row count
     // to the canonical indexable count — the exact-intersection scan stays in
     // the repair path. A docsize count failure is itself a corruption signal.
-    let indexed_messages = match conn.query_row_map(
+    let indexed_messages = match conn.doctor_query_row_map(
         "SELECT COUNT(*) FROM fts_messages_docsize",
         &[] as &[crate::franken_sync::compat::ParamValue],
         |row| row.get_typed::<i64>(0),
@@ -76365,7 +76523,7 @@ fn probe_doctor_fts_table(conn: &crate::franken_sync::Connection) -> DoctorFtsTa
             };
         }
     };
-    let Ok(indexable_messages) = conn.query_row_map(
+    let Ok(indexable_messages) = conn.doctor_query_row_map(
         crate::storage::sqlite::FTS_INDEXABLE_MESSAGE_COUNT_SQL,
         &[] as &[crate::franken_sync::compat::ParamValue],
         |row| row.get_typed::<i64>(0),
@@ -79227,7 +79385,7 @@ fn doctor_deferred_integrity_never_implies_corruption_or_destructive_rebuild() {
 /// worker until process exit; process isolation or an upstream FrankenSQLite
 /// cancellation handle is required to remove that residual limitation.
 fn run_bounded_doctor_archive_db_probe(
-    conn: crate::franken_sync::Connection,
+    conn: crate::storage::sqlite::FrankenOwnerConnection,
     db_path: &Path,
     timeout: Duration,
 ) -> DoctorBoundedArchiveDbProbeOutcome {
@@ -79236,16 +79394,14 @@ fn run_bounded_doctor_archive_db_probe(
     let worker_phase = std::sync::Arc::clone(&phase);
     let worker_db_path = db_path.to_path_buf();
     let deep_integrity_skip_reason = doctor_franken_deep_integrity_skip_reason(db_path);
-    let conn = crate::storage::sqlite::SendFrankenConnection::new(conn);
     let _probe_worker = std::thread::spawn(move || {
-        use crate::franken_sync::compat::{ConnectionExt as _, RowExt as _};
+        use crate::franken_sync::compat::RowExt as _;
 
         let set_phase = |value: &'static str| {
             if let Ok(mut current) = worker_phase.lock() {
                 *current = value;
             }
         };
-        let (conn, _, _) = conn.into_parts();
         let conv_count: Option<i64> = conn
             .query_row_map(
                 "SELECT COUNT(*) FROM conversations",
@@ -79279,7 +79435,11 @@ fn run_bounded_doctor_archive_db_probe(
             }
         }
         set_phase("connection_close");
-        let _ = close_franken_cli_read_db(conn, &worker_db_path, "doctor database health");
+        let _ = close_franken_cli_owner_read_db(
+            conn,
+            &worker_db_path,
+            "doctor database health",
+        );
         let _ = tx.send(DoctorBoundedArchiveDbProbe {
             conv_count,
             msg_count,
@@ -81235,7 +81395,7 @@ pub(crate) fn run_doctor_impl(
                         Duration::from_secs(30),
                     ) {
                         Ok(conn) => {
-                            use crate::franken_sync::compat::{ConnectionExt as _, RowExt as _};
+                            use crate::franken_sync::compat::RowExt as _;
 
                             let conv_count: Option<i64> = conn
                                 .query_row_map(
@@ -81312,7 +81472,7 @@ pub(crate) fn run_doctor_impl(
                                     fix_applied: false,
                                 });
                             }
-                            let _ = close_franken_cli_read_db(
+                            let _ = close_franken_cli_owner_read_db(
                                 conn,
                                 &db_path,
                                 "doctor promoted candidate archive",
