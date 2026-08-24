@@ -4,3 +4,8 @@
 
 # Integrity fixtures embed byte sizes and hashes; keep checkout bytes stable.
 tests/fixtures/pages_verify/** text eol=lf
+
+# Preserve exact upstream sqlite-wasm distribution bytes. The generated files
+# intentionally contain trailing tabs/spaces, covered by pinned SHA-256 values.
+src/pages_assets/vendor/sqlite3.mjs whitespace=-trailing-space
+src/pages_assets/vendor/sqlite3-opfs-async-proxy.js whitespace=-trailing-space

@@ -104,6 +104,8 @@ impl ExportEngine {
         V: FnOnce(&Path) -> Result<T>,
     {
         let output_path = resolve_export_output_path(&self.source_db_path, &self.output_path)?;
+        #[cfg(windows)]
+        recover_or_refuse_interrupted_export_publish(&output_path)?;
 
         if output_path.exists() && output_path.is_dir() {
             bail!(
@@ -707,6 +709,24 @@ fn resolve_export_output_path(source_db_path: &Path, output_path: &Path) -> Resu
 }
 
 fn existing_regular_files_share_identity(first: &Path, second: &Path) -> Result<bool> {
+    if !std::fs::metadata(first)
+        .with_context(|| format!("Failed to inspect source identity probe {}", first.display()))?
+        .is_file()
+    {
+        return Ok(false);
+    }
+    if !std::fs::metadata(second)
+        .with_context(|| {
+            format!(
+                "Failed to inspect export output identity probe {}",
+                second.display()
+            )
+        })?
+        .is_file()
+    {
+        return Ok(false);
+    }
+
     let first_file = std::fs::File::open(first)
         .with_context(|| format!("Failed to open source identity probe {}", first.display()))?;
     if !first_file
@@ -864,30 +884,14 @@ fn derive_attachment_refs(extra_json: Option<&str>) -> Option<String> {
 }
 
 #[cfg(any(windows, test))]
-fn unique_replace_backup_path(path: &Path) -> PathBuf {
-    unique_atomic_sidecar_path(path, "bak", "pages_export.db")
-}
-
-#[cfg(any(windows, test))]
-fn unique_atomic_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) -> PathBuf {
-    static NEXT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let nonce = NEXT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+fn export_publish_recovery_backup_path(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(fallback_name);
-
-    path.with_file_name(format!(
-        ".{file_name}.{suffix}.{}.{}.{}",
-        std::process::id(),
-        timestamp,
-        nonce
-    ))
+        .unwrap_or_else(|| std::ffi::OsStr::new("pages_export.db"));
+    let mut backup_name = std::ffi::OsString::from(".");
+    backup_name.push(file_name);
+    backup_name.push(".pages-export-publish-in-progress.bak");
+    path.with_file_name(backup_name)
 }
 
 fn unpredictable_atomic_sidecar_path(
@@ -1150,21 +1154,32 @@ fn replace_file_from_temp_via_backup(
 
     match std::fs::rename(temp_path, final_path) {
         Ok(()) => {
-            let _ = std::fs::remove_file(&backup_path);
-            sync_parent_directory(final_path)?;
+            remove_prior_export_backup_after_publish(&backup_path, final_path)?;
+            sync_parent_directory(final_path).with_context(|| {
+                format!(
+                    "new Pages export is live at {}, but its replacement could not be durably synced",
+                    final_path.display()
+                )
+            })?;
             Ok(())
         }
         Err(second_err) => match std::fs::rename(&backup_path, final_path) {
             Ok(()) => {
                 let _ = std::fs::remove_file(temp_path);
-                sync_parent_directory(final_path)?;
-                bail!(
+                let replacement_error = anyhow::anyhow!(
                     "failed replacing {} with {}: first error: {}; second error: {}; restored original file",
                     final_path.display(),
                     temp_path.display(),
                     first_err,
                     second_err
                 );
+                match sync_parent_directory(final_path) {
+                    Ok(()) => Err(replacement_error),
+                    Err(sync_error) => Err(replacement_error.context(format!(
+                        "the prior Pages export was restored at {}, but the restoration could not be durably synced: {sync_error:#}",
+                        final_path.display()
+                    ))),
+                }
             }
             Err(restore_err) => {
                 *retain_temp_on_error = true;
@@ -1182,6 +1197,19 @@ fn replace_file_from_temp_via_backup(
     }
 }
 
+#[cfg(any(windows, test))]
+fn remove_prior_export_backup_after_publish(backup_path: &Path, final_path: &Path) -> Result<()> {
+    match std::fs::remove_file(backup_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(anyhow::Error::new(error).context(format!(
+            "new Pages export is live at {}, but the prior sensitive generation remains at {}",
+            final_path.display(),
+            backup_path.display()
+        ))),
+    }
+}
+
 fn replace_file_from_temp(
     temp_path: &Path,
     final_path: &Path,
@@ -1193,7 +1221,12 @@ fn replace_file_from_temp(
     {
         match std::fs::rename(temp_path, final_path) {
             Ok(()) => {
-                sync_parent_directory(final_path)?;
+                sync_parent_directory(final_path).with_context(|| {
+                    format!(
+                        "new Pages export is live at {}, but its first publication could not be durably synced",
+                        final_path.display()
+                    )
+                })?;
                 Ok(())
             }
             Err(first_err)
@@ -1238,7 +1271,12 @@ fn replace_file_from_temp(
                 final_path.display()
             )
         })?;
-        sync_parent_directory(final_path)
+        sync_parent_directory(final_path).with_context(|| {
+            format!(
+                "new Pages export is live at {}, but its publication could not be durably synced",
+                final_path.display()
+            )
+        })
     }
 }
 
@@ -2335,6 +2373,31 @@ mod tests {
             ));
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn completed_backup_publish_reports_retained_sensitive_generation() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let final_path = temp_dir.path().join("export.db");
+        let backup_path = temp_dir.path().join("export.db.backup");
+        std::fs::write(&final_path, b"new live generation")?;
+        std::fs::create_dir(&backup_path)?;
+
+        let error = remove_prior_export_backup_after_publish(&backup_path, &final_path)
+            .expect_err("an undeletable prior generation must not be silently ignored");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("new Pages export is live"),
+            "partial-success state was not reported: {message}"
+        );
+        assert!(
+            message.contains(&backup_path.display().to_string()),
+            "retained backup path was not reported: {message}"
+        );
+        assert_eq!(std::fs::read(final_path)?, b"new live generation");
+        assert!(backup_path.is_dir(), "failed cleanup target must be preserved");
         Ok(())
     }
 

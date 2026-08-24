@@ -550,7 +550,9 @@ pub(crate) fn invalidate_identity_stale_semantic_shards(
     embedder_id: &str,
 ) -> Result<usize> {
     let Some(mut manifest) = SemanticShardManifest::load(data_dir)
-        .map_err(|err| anyhow::anyhow!("loading semantic shard manifest for identity rebuild: {err}"))?
+        .map_err(|err| {
+            anyhow::anyhow!("loading semantic shard manifest for identity rebuild: {err}")
+        })?
     else {
         return Ok(0);
     };

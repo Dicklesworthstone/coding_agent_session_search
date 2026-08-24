@@ -8467,6 +8467,23 @@ impl FrankenStorage {
                 {
                     object.insert("source".into(), serde_json::Value::String("omp".into()));
                 }
+                // A named profile encoded in the transcript path is durable
+                // provenance, including for remote mirrors. Legacy Pi-owned
+                // rows predate first-class OMP profile tagging, and ordinary
+                // append merges intentionally do not replace conversation
+                // metadata, so recover this authoritative field during the
+                // identity migration itself.
+                if let Some(profile) = crate::connectors::omp::profile_from_session_path(
+                    Path::new(&legacy.source_path),
+                )
+                {
+                    if metadata.is_null() {
+                        metadata = serde_json::json!({});
+                    }
+                    if let Some(object) = metadata.as_object_mut() {
+                        object.insert("profile".into(), serde_json::Value::String(profile));
+                    }
+                }
                 metadata_updates.push((
                     legacy.id,
                     legacy.normalized_source_id.clone(),
@@ -29696,7 +29713,9 @@ mod tests {
             title: Some("Legacy OMP".into()),
             source_path: dir
                 .path()
-                .join("home/.omp/agent/sessions/-projects-cass/legacy-omp.jsonl"),
+                .join(
+                    "home/.omp/profiles/work/agent/sessions/-projects-cass/legacy-omp.jsonl",
+                ),
             started_at: Some(1_700_000_000_000),
             ended_at: Some(1_700_000_001_000),
             approx_tokens: None,
@@ -29766,6 +29785,10 @@ mod tests {
         assert_eq!(conversations.len(), 1);
         assert_eq!(conversations[0].agent_slug, "omp");
         assert_eq!(conversations[0].metadata_json["source"], "omp");
+        assert_eq!(
+            conversations[0].metadata_json["profile"], "work",
+            "the structural OMP profile must survive legacy Pi ownership and remote-safe migration"
+        );
         let omp_agent_id: i64 = storage.conn.query_row_map(
             "SELECT id FROM agents WHERE slug = 'omp'",
             fparams![],
@@ -30201,7 +30224,8 @@ mod tests {
                 fparams![source_id],
             )?;
         }
-        let shared_path = "/home/dev/.omp/agent/sessions/project/session.jsonl";
+        let shared_path =
+            "/home/dev/.omp/profiles/work/agent/sessions/project/session.jsonl";
         storage.conn.execute_compat(
             "INSERT INTO conversations(
                  agent_id, source_id, external_id, title, source_path, started_at
@@ -30237,6 +30261,18 @@ mod tests {
                 ("remote-a".to_string(), "omp".to_string()),
                 ("remote-b".to_string(), "omp".to_string()),
             ]
+        );
+        let remote_a_metadata: String = storage.conn.query_row_map(
+            "SELECT metadata_json
+             FROM conversations
+             WHERE source_id = 'remote-a' AND agent_id = ?1",
+            fparams![omp_agent_id],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&remote_a_metadata)?["profile"],
+            "work",
+            "path-derived profile provenance must survive a remote legacy migration"
         );
 
         let current_remote_a = Conversation {

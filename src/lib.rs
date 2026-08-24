@@ -98660,16 +98660,28 @@ fn flush_group(
     }
 }
 
+fn tool_result_content(msg: &html_export::Message) -> String {
+    let Some(output) = msg
+        .tool_call
+        .as_ref()
+        .and_then(|tool_call| tool_call.output.as_deref())
+        .filter(|output| !output.is_empty())
+    else {
+        return msg.content.clone();
+    };
+
+    if msg.content.trim().is_empty() {
+        output.to_string()
+    } else if msg.content == output {
+        msg.content.clone()
+    } else {
+        format!("{}\n\n{output}", msg.content)
+    }
+}
+
 fn standalone_tool_result_group(msg: &html_export::Message) -> html_export::MessageGroup {
     let mut primary = msg.clone();
-    if primary.content.trim().is_empty()
-        && let Some(output) = primary
-            .tool_call
-            .as_ref()
-            .and_then(|tool_call| tool_call.output.clone())
-    {
-        primary.content = output;
-    }
+    primary.content = tool_result_content(msg);
 
     if let Some(tool_call) = primary.tool_call.as_ref() {
         primary.author = Some(match tool_call.status {
@@ -98755,17 +98767,20 @@ pub fn group_messages_for_export(
             }
 
             MessageClassification::AssistantToolOnly => {
-                // Tool-only messages attach to current group or create tool-only group
-                if let Some(ref mut g) = current_group {
-                    // Attach to existing group
-                    if let Some(ref tc) = msg.tool_call {
-                        let corr_id = extract_correlation_id(msg, format);
-                        g.add_tool_call(tc.clone(), corr_id);
-                        g.update_end_timestamp(msg.timestamp.clone());
-                        trace!(tool_name = %tc.name, "Attached tool call to current group");
-                    }
-                } else {
-                    // Create a new tool-only group
+                // A tool-only assistant message may extend an assistant group
+                // or an existing tool-call-only group. It must never be folded
+                // into a user prompt or a standalone orphan-result group.
+                let can_attach = current_group.as_ref().is_some_and(|group| {
+                    matches!(
+                        group.group_type,
+                        html_export::MessageGroupType::Assistant
+                    ) || (matches!(
+                        group.group_type,
+                        html_export::MessageGroupType::ToolOnly
+                    ) && !group.tool_calls.is_empty())
+                });
+                if !can_attach {
+                    flush_group(&mut groups, &mut current_group);
                     let mut group = html_export::MessageGroup::tool_only(msg.clone());
                     if let Some(ref tc) = msg.tool_call {
                         let corr_id = extract_correlation_id(msg, format);
@@ -98773,6 +98788,13 @@ pub fn group_messages_for_export(
                     }
                     current_group = Some(group);
                     trace!("Created new tool-only group");
+                } else if let Some(ref mut group) = current_group
+                    && let Some(ref tc) = msg.tool_call
+                {
+                    let corr_id = extract_correlation_id(msg, format);
+                    group.add_tool_call(tc.clone(), corr_id);
+                    group.update_end_timestamp(msg.timestamp.clone());
+                    trace!(tool_name = %tc.name, "Attached tool call to current assistant group");
                 }
             }
 
@@ -98789,11 +98811,7 @@ pub fn group_messages_for_export(
                         .map(|tc| tc.name.clone())
                         .unwrap_or_else(|| "tool_result".to_string());
 
-                    let content = if let Some(ref tc) = msg.tool_call {
-                        tc.output.clone().unwrap_or_else(|| msg.content.clone())
-                    } else {
-                        msg.content.clone()
-                    };
+                    let content = tool_result_content(msg);
 
                     let status = msg
                         .tool_call
@@ -102304,6 +102322,74 @@ mod message_grouping_tests {
         assert_eq!(groups[1].group_type, MessageGroupType::ToolOnly);
         assert_eq!(groups[1].primary.content, "orphan result");
         assert_eq!(groups[1].primary.author.as_deref(), Some("Read result"));
+    }
+
+    #[test]
+    fn assistant_tool_only_message_never_attaches_to_user_prompt() {
+        let groups = group_messages_for_export(vec![
+            msg_user("Inspect the repository"),
+            msg_assistant_with_tool("", "Read", "src/lib.rs"),
+        ]);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].group_type, MessageGroupType::User);
+        assert!(
+            groups[0].tool_calls.is_empty(),
+            "assistant tool calls must not be attributed to the user"
+        );
+        assert_eq!(groups[1].group_type, MessageGroupType::ToolOnly);
+        assert_eq!(groups[1].tool_calls.len(), 1);
+        assert_eq!(groups[1].tool_calls[0].call.name, "Read");
+    }
+
+    #[test]
+    fn assistant_tool_only_message_never_attaches_to_orphan_result() {
+        let groups = group_messages_for_export(vec![
+            msg_tool_result("Read", "orphan output", ToolStatus::Success),
+            msg_assistant_with_tool("", "Bash", "pwd"),
+        ]);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].group_type, MessageGroupType::ToolOnly);
+        assert!(groups[0].tool_calls.is_empty());
+        assert_eq!(groups[0].primary.content, "orphan output");
+        assert_eq!(groups[1].group_type, MessageGroupType::ToolOnly);
+        assert_eq!(groups[1].tool_calls.len(), 1);
+        assert_eq!(groups[1].tool_calls[0].call.name, "Bash");
+    }
+
+    #[test]
+    fn orphan_tool_result_preserves_distinct_message_and_output_content() {
+        let mut result = msg_tool_result("Read", "actual output", ToolStatus::Success);
+        result.content = "provider result envelope".to_string();
+
+        let groups = group_messages_for_export(vec![result]);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].group_type, MessageGroupType::ToolOnly);
+        assert_eq!(
+            groups[0].primary.content,
+            "provider result envelope\n\nactual output"
+        );
+    }
+
+    #[test]
+    fn matched_tool_result_preserves_distinct_message_and_output_content() {
+        let call = msg_assistant_with_tool("Reading a file", "Read", "/expected");
+        let mut result = msg_tool_result("Read", "actual output", ToolStatus::Success);
+        result.content = "provider result envelope".to_string();
+
+        let groups = group_messages_for_export(vec![call, result]);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].tool_calls.len(), 1);
+        assert_eq!(
+            groups[0].tool_calls[0]
+                .result
+                .as_ref()
+                .map(|result| result.content.as_str()),
+            Some("provider result envelope\n\nactual output")
+        );
     }
 
     #[test]

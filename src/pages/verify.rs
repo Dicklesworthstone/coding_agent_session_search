@@ -29,6 +29,12 @@ const MAX_CHUNK_SIZE: u64 = 100 * 1024 * 1024; // 100 MB
 /// Maximum chunk_size config value (32 MiB)
 const MAX_CONFIG_CHUNK_SIZE: usize = 32 * 1024 * 1024;
 
+/// Browser runtime ceilings: the viewer holds plaintext plus a WASM copy and
+/// must not accept an archive that implies unbounded fetch/decompression work.
+const MAX_BROWSER_ARCHIVE_CHUNKS: usize = 4_096;
+const MAX_BROWSER_ARCHIVE_PLAINTEXT_SIZE: u64 = 512 * 1024 * 1024;
+const MAX_BROWSER_ARCHIVE_CIPHERTEXT_SIZE: u64 = 640 * 1024 * 1024;
+
 /// Integrity manifest schema understood by this verifier.
 const INTEGRITY_MANIFEST_VERSION: u8 = 1;
 
@@ -533,6 +539,24 @@ fn validate_encrypted_config(config: &EncryptionConfig) -> Vec<String> {
         errors.push(format!(
             "chunk_count {} exceeds the u32 nonce counter space",
             config.payload.chunk_count
+        ));
+    }
+    if config.payload.chunk_count > MAX_BROWSER_ARCHIVE_CHUNKS {
+        errors.push(format!(
+            "chunk_count {} exceeds browser runtime limit {}",
+            config.payload.chunk_count, MAX_BROWSER_ARCHIVE_CHUNKS
+        ));
+    }
+    if config.payload.total_plaintext_size > MAX_BROWSER_ARCHIVE_PLAINTEXT_SIZE {
+        errors.push(format!(
+            "total_plaintext_size {} exceeds browser runtime limit {}",
+            config.payload.total_plaintext_size, MAX_BROWSER_ARCHIVE_PLAINTEXT_SIZE
+        ));
+    }
+    if config.payload.total_compressed_size > MAX_BROWSER_ARCHIVE_CIPHERTEXT_SIZE {
+        errors.push(format!(
+            "total_compressed_size {} exceeds browser runtime limit {}",
+            config.payload.total_compressed_size, MAX_BROWSER_ARCHIVE_CIPHERTEXT_SIZE
         ));
     }
 
@@ -1750,6 +1774,33 @@ mod tests {
         assert_eq!(result.status, "valid");
         assert!(result.checks.required_files.passed);
         assert!(result.checks.config_schema.passed);
+    }
+
+    #[test]
+    fn verify_rejects_same_size_vendor_runtime_tampering() {
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+        copy_fixture("valid", &site_dir).unwrap();
+
+        let runtime_path = site_dir.join("vendor/fflate.js");
+        let mut runtime = fs::read(&runtime_path).unwrap();
+        runtime[0] ^= 0x01;
+        fs::write(runtime_path, runtime).unwrap();
+
+        let result = verify_bundle(&site_dir, false).unwrap();
+        assert_eq!(result.status, "invalid");
+        assert!(!result.checks.required_files.passed);
+        assert!(
+            result
+                .checks
+                .required_files
+                .details
+                .as_deref()
+                .is_some_and(|details| {
+                    details.contains("vendor/fflate.js") && details.contains("SHA-256")
+                })
+        );
+        assert!(!result.checks.integrity.passed);
     }
 
     #[test]

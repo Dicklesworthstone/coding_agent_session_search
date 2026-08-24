@@ -23,6 +23,9 @@ let lifecycleGeneration = 0;
 // exposes sqlite3_deserialize() but does not export these preprocessor macros.
 const SQLITE_DESERIALIZE_FREEONCLOSE = 0x01;
 const SQLITE_DESERIALIZE_READONLY = 0x04;
+// sqlite3_deserialize() may read a small distance beyond N while validating a
+// malformed image. SQLite's API contract recommends at least 20 spare bytes.
+const SQLITE_DESERIALIZE_PADDING = 20;
 
 /**
  * Initialize sqlite-wasm with decrypted database bytes
@@ -70,14 +73,23 @@ async function initializeDatabase(dbBytes, generation) {
     let sqliteOwnsBytes = false;
     try {
         candidateDb = new sqliteApi.oo1.DB();
-        wasmPtr = sqliteApi.wasm.allocFromTypedArray(dbBytes);
+        const allocationSize = dbBytes.byteLength + SQLITE_DESERIALIZE_PADDING;
+        wasmPtr = sqliteApi.wasm.alloc(allocationSize);
+        const wasmOffset = Number(wasmPtr);
+        const wasmHeap = sqliteApi.wasm.heap8u();
+        wasmHeap.set(dbBytes, wasmOffset);
+        wasmHeap.fill(
+            0,
+            wasmOffset + dbBytes.byteLength,
+            wasmOffset + allocationSize
+        );
         const flags = SQLITE_DESERIALIZE_FREEONCLOSE | SQLITE_DESERIALIZE_READONLY;
         const resultCode = sqliteApi.capi.sqlite3_deserialize(
             candidateDb.pointer,
             'main',
             wasmPtr,
             dbBytes.byteLength,
-            dbBytes.byteLength,
+            allocationSize,
             flags
         );
         // Once the C call returns, FREEONCLOSE makes SQLite responsible for

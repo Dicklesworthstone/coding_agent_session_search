@@ -2666,6 +2666,68 @@ mod tests {
     }
 
     #[test]
+    fn pinned_vendor_contract_matches_every_embedded_byte() {
+        for asset in PAGES_VENDOR_ASSETS {
+            validate_embedded_vendor_asset(asset)
+                .unwrap_or_else(|error| panic!("invalid vendor pin for {}: {error:#}", asset.path));
+        }
+
+        let manifest: serde_json::Value = serde_json::from_slice(
+            PAGES_VENDOR_ASSETS
+                .iter()
+                .find(|asset| asset.path == "vendor/manifest.json")
+                .expect("vendor manifest pin")
+                .bytes,
+        )
+        .expect("valid vendor manifest JSON");
+        let package_versions = manifest["packages"]
+            .as_array()
+            .expect("vendor package list")
+            .iter()
+            .map(|package| {
+                (
+                    package["name"].as_str().expect("package name"),
+                    package["version"].as_str().expect("package version"),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            package_versions.get("@sqlite.org/sqlite-wasm"),
+            Some(&"3.53.0-build1")
+        );
+        assert_eq!(package_versions.get("argon2-browser"), Some(&"1.18.0"));
+        assert_eq!(package_versions.get("fflate"), Some(&"0.8.3"));
+        assert_eq!(package_versions.get("html5-qrcode"), Some(&"2.3.8"));
+    }
+
+    #[test]
+    fn pinned_vendor_contract_rejects_hash_mutations() {
+        let mutated = PinnedVendorAsset {
+            path: "vendor/mutated.js",
+            bytes: b"mutated",
+            size: 7,
+            sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+        };
+        let error = validate_embedded_vendor_asset(&mutated).unwrap_err();
+        assert!(error.to_string().contains("SHA-256"));
+    }
+
+    #[test]
+    fn materialized_vendor_validation_rejects_same_size_tampering() {
+        let temp = TempDir::new().unwrap();
+        write_pinned_vendor_assets(temp.path()).unwrap();
+        validate_pinned_vendor_assets(temp.path()).unwrap();
+
+        let fflate_path = temp.path().join("vendor/fflate.js");
+        let mut mutated = fs::read(&fflate_path).unwrap();
+        mutated[0] ^= 0x01;
+        fs::write(fflate_path, mutated).unwrap();
+
+        let error = validate_pinned_vendor_assets(temp.path()).unwrap_err();
+        assert!(error.to_string().contains("SHA-256"));
+    }
+
+    #[test]
     fn test_collect_file_hashes() {
         let temp = TempDir::new().unwrap();
         let temp_path = temp.path();
