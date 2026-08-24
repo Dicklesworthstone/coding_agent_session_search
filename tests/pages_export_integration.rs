@@ -83,6 +83,17 @@ fn create_source_db(conn: &Connection) -> TestResult<()> {
             attachment_refs TEXT,
             FOREIGN KEY (conversation_id) REFERENCES conversations(id)
         );
+
+        CREATE TABLE IF NOT EXISTS snippets (
+            id INTEGER PRIMARY KEY,
+            message_id INTEGER NOT NULL,
+            file_path TEXT,
+            start_line INTEGER,
+            end_line INTEGER,
+            language TEXT,
+            snippet_text TEXT,
+            FOREIGN KEY (message_id) REFERENCES messages(id)
+        );
         "#,
     )?)
 }
@@ -175,6 +186,11 @@ fn insert_test_data(conn: &Connection) -> TestResult<()> {
             ],
         )?;
     }
+
+    conn.execute(
+        "INSERT INTO snippets (message_id, file_path, start_line, end_line, language, snippet_text)
+         VALUES (14, 'src/db.rs', 1, 2, 'rust', 'initial snapshot snippet')",
+    )?;
 
     Ok(())
 }
@@ -796,6 +812,12 @@ fn export_engine_reads_counts_messages_and_snippets_from_one_snapshot() {
                             "INSERT INTO messages (conversation_id, idx, role, content) VALUES (4, 99, 'user', 'concurrent append')",
                         )
                         .expect("concurrent writer should commit in WAL mode");
+                    writer
+                        .execute(
+                            "INSERT INTO snippets (message_id, file_path, start_line, end_line, language, snippet_text)
+                             VALUES (14, 'src/db.rs', 3, 4, 'rust', 'concurrent snippet append')",
+                        )
+                        .expect("concurrent snippet writer should commit in WAL mode");
                 }
             },
             None,
@@ -804,10 +826,12 @@ fn export_engine_reads_counts_messages_and_snippets_from_one_snapshot() {
 
     assert!(inserted.get(), "test mutation must execute");
     assert_eq!(query_i64(&writer, "SELECT COUNT(*) FROM messages").unwrap(), 15);
+    assert_eq!(query_i64(&writer, "SELECT COUNT(*) FROM snippets").unwrap(), 2);
     assert_eq!(stats.messages_processed, 14);
 
     let exported = open_db(&output_path).unwrap();
     assert_eq!(query_i64(&exported, "SELECT COUNT(*) FROM messages").unwrap(), 14);
+    assert_eq!(query_i64(&exported, "SELECT COUNT(*) FROM snippets").unwrap(), 1);
     assert_eq!(
         query_i64(
             &exported,

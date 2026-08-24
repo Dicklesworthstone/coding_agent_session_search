@@ -212,6 +212,10 @@ impl ProofArtifact {
                 run.artifact_age_ms.unwrap_or(0),
                 run.command
             ),
+            ProofStatus::PartialProof if run.exit_code.is_none() && !run.completed => format!(
+                "partial proof (incomplete run; missing process exit status): {}",
+                run.command
+            ),
             ProofStatus::PartialProof if run.exit_code.is_none() => format!(
                 "partial proof (missing process exit status): {}",
                 run.command
@@ -1407,6 +1411,21 @@ mod tests {
         assert_eq!(
             artifact.summary,
             "partial proof (missing process exit status): cargo test --lib"
+        );
+    }
+
+    #[test]
+    fn incomplete_run_with_missing_exit_reports_both_facts() {
+        let mut run = base_run();
+        run.exit_code = None;
+        run.assertions_ran = true;
+        run.completed = false;
+        let artifact = ProofArtifact::from_run(run);
+        assert_eq!(artifact.status, ProofStatus::PartialProof);
+        assert!(!artifact.is_trustworthy_pass());
+        assert_eq!(
+            artifact.summary,
+            "partial proof (incomplete run; missing process exit status): cargo test --lib"
         );
     }
 

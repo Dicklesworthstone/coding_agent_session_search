@@ -548,7 +548,7 @@ pub fn agent_slug(agent: &str) -> String {
         return "omp".to_string();
     }
 
-    match agent.to_lowercase().replace(['-', '_'], "").as_str() {
+    match agent.trim().to_lowercase().replace(['-', '_'], "").as_str() {
         "claudecode" | "claude" => "claude".to_string(),
         "cursor" | "cursorai" => "cursor".to_string(),
         "chatgpt" | "gpt" | "openai" => "chatgpt".to_string(),
@@ -998,7 +998,7 @@ mod tests {
         assert_eq!(agent_slug("ChatGPT"), "chatgpt");
         assert_eq!(agent_slug("gemini-cli"), "gemini");
         assert_eq!(agent_slug("github_copilot"), "copilot");
-        for alias in ["pi_agent", "pi-agent", "piagent", "pi"] {
+        for alias in ["pi_agent", "pi-agent", "piagent", "pi", "  PI Agent  "] {
             assert_eq!(agent_slug(alias), "pi_agent", "Pi Agent alias {alias:?}");
         }
         for alias in ["omp", "Oh My Pi", "oh-my-pi", "oh_my_pi", "ohmypi"] {
