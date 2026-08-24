@@ -29644,6 +29644,64 @@ mod tests {
 
     #[test]
     #[serial]
+    fn legacy_omp_reclassification_preserves_undecodable_metadata() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let _pi_sessions = set_env_var("PI_SESSIONS_DIR", "");
+        let _omp_sessions = set_env_var("PI_CODING_AGENT_SESSION_DIR", "");
+        let _shared_agent = set_env_var("PI_CODING_AGENT_DIR", "");
+        let _omp_archive = set_env_var("CASS_OMP_DATA_ROOT", "");
+        let _config_dir = set_env_var("PI_CONFIG_DIR", "");
+        let _profile = set_env_var("OMP_PROFILE", "");
+        let _legacy_profile = set_env_var("PI_PROFILE", "");
+        let _xdg = set_env_var("XDG_DATA_HOME", "");
+        let storage = SqliteStorage::open(dir.path().join("test.db"))?;
+        let pi_agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "pi_agent".into(),
+            name: "Pi Agent".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let source_path = dir
+            .path()
+            .join("home/.omp/agent/sessions/project/corrupt-metadata.jsonl");
+        let invalid_msgpack = vec![0xc1_u8];
+        storage.conn.execute_compat(
+            "INSERT INTO conversations(
+                 agent_id, source_id, external_id, title, source_path, started_at,
+                 metadata_bin
+             ) VALUES(?1, 'local', 'corrupt-metadata', 'Legacy OMP', ?2, 1000, ?3)",
+            fparams![
+                pi_agent_id,
+                source_path.to_string_lossy().as_ref(),
+                invalid_msgpack.as_slice()
+            ],
+        )?;
+
+        let error = storage
+            .reclassify_legacy_omp_conversations()
+            .expect_err("invalid metadata must stop the identity rewrite without data loss");
+        assert!(
+            error
+                .to_string()
+                .contains("decoding MessagePack metadata for legacy OMP conversation"),
+            "unexpected metadata diagnostic: {error:#}"
+        );
+        let (agent_slug, metadata_bin): (String, Vec<u8>) = storage.conn.query_row_map(
+            "SELECT a.slug, c.metadata_bin
+             FROM conversations c
+             JOIN agents a ON a.id = c.agent_id
+             WHERE c.external_id = 'corrupt-metadata'",
+            fparams![],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        )?;
+        assert_eq!(agent_slug, "pi_agent");
+        assert_eq!(metadata_bin, invalid_msgpack);
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
     fn legacy_omp_reclassification_preserves_distinct_remote_sources() -> anyhow::Result<()> {
         let dir = TempDir::new()?;
         let _pi_sessions = set_env_var("PI_SESSIONS_DIR", "");

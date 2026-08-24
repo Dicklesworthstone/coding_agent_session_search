@@ -944,10 +944,9 @@ fn export_engine_preserves_existing_output_when_staged_verifier_rejects() {
         .unwrap()
         .filter_map(Result::ok)
         .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".export.db.tmp.")
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(".export.db.tmp.") || name.starts_with(".export.db.builder.")
         })
         .collect();
     assert!(
@@ -1002,10 +1001,9 @@ fn export_engine_rejects_sidecar_created_by_staged_verifier() {
         .unwrap()
         .filter_map(Result::ok)
         .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".export.db.tmp.")
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(".export.db.tmp.") || name.starts_with(".export.db.builder.")
         })
         .collect();
     assert!(
