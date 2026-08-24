@@ -190,9 +190,10 @@ impl SemanticSignals {
             SearchRefinementLevel::LexicalOnly
         };
 
-        // Full hybrid only when the quality tier is ready; otherwise search
-        // serves correct lexical results while semantic catches up / is off.
-        let fallback_mode = if quality_tier_ready {
+        // Fallback describes whether semantic refinement is unavailable, not
+        // whether the highest-quality tier is ready. Either queryable tier can
+        // refine a search; only non-queryable verdicts are lexical-only.
+        let fallback_mode = if available {
             FallbackMode::None
         } else {
             FallbackMode::Lexical
@@ -442,7 +443,7 @@ mod tests {
         assert_eq!(r.reason, SemanticReadinessReason::FastTierReady);
         assert!(r.available);
         assert!(r.semantic_only_search_available);
-        assert_eq!(r.fallback_mode, FallbackMode::Lexical);
+        assert_eq!(r.fallback_mode, FallbackMode::None);
         assert_eq!(
             r.realized_refinement,
             SearchRefinementLevel::FastTierRefined
