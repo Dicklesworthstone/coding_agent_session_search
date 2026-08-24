@@ -16876,7 +16876,15 @@ fn open_franken_cli_read_db_with_hard_timeout(
         let reason = reason.clone();
         move || {
             let result = open_franken_cli_owner_read_db(path, &reason, timeout);
-            let _ = tx.send(result);
+            if let Err(std::sync::mpsc::SendError(Ok(mut conn))) = tx.send(result) {
+                if let Err(err) = conn.close_without_checkpoint_sync() {
+                    warn!(
+                        error = %err,
+                        reason = %reason,
+                        "hard-timeout CLI read open completed after its receiver exited; owner-thread cleanup failed"
+                    );
+                }
+            }
         }
     });
 

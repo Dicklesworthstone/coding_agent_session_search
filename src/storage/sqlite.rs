@@ -298,7 +298,11 @@ impl LazyFrankenDb {
                             return;
                         }
                     };
-                let _ = tx.send(FrankenOwnerConnection::open(path_owned));
+                if let Err(std::sync::mpsc::SendError(Ok(mut conn))) =
+                    tx.send(FrankenOwnerConnection::open(path_owned))
+                {
+                    conn.close_best_effort_in_place();
+                }
             });
             let conn = rx
                 .recv_timeout(timeout)
@@ -1085,10 +1089,21 @@ impl FrankenConnectionManager {
         let path_str = db_path.to_string_lossy().to_string();
 
         let reader_count = config.reader_count.max(1);
-        let mut readers = Vec::with_capacity(reader_count);
+        let mut readers: Vec<parking_lot::Mutex<FrankenOwnerConnection>> =
+            Vec::with_capacity(reader_count);
         for _ in 0..reader_count {
-            let conn = FrankenOwnerConnection::open(path_str.clone())
-                .with_context(|| format!("opening reader connection at {}", db_path.display()))?;
+            let conn = match FrankenOwnerConnection::open(path_str.clone()) {
+                Ok(conn) => conn,
+                Err(source) => {
+                    for reader in &mut readers {
+                        reader.get_mut().close_best_effort_in_place();
+                    }
+                    return Err(anyhow::Error::from(source).context(format!(
+                        "opening reader connection at {}",
+                        db_path.display()
+                    )));
+                }
+            };
             // Apply read-tuned config (no migration, no write PRAGMAs)
             let _ = conn.execute("PRAGMA busy_timeout = 5000;"); // match writer config
             let _ = conn.execute("PRAGMA cache_size = -16384;"); // 16MB reader cache
