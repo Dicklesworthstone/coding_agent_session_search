@@ -11,9 +11,9 @@ use console::{Term, style};
 use indicatif::{ProgressBar, ProgressStyle};
 use once_cell::sync::Lazy;
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -574,11 +574,20 @@ fn structured_metadata_scan_text(
     row_id: i64,
 ) -> Result<Option<String>> {
     if let Some(bytes) = binary.filter(|bytes| !bytes.is_empty()) {
-        let value = rmp_serde::from_slice::<serde_json::Value>(bytes).with_context(|| {
+        let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(bytes));
+        let value = serde_json::Value::deserialize(&mut deserializer).with_context(|| {
             format!(
                 "Failed to decode non-empty {binary_column} MessagePack for row {row_id}; refusing legacy JSON fallback"
             )
         })?;
+        let consumed = usize::try_from(deserializer.get_ref().position()).with_context(|| {
+            format!("Decoded {binary_column} position does not fit usize for row {row_id}")
+        })?;
+        if consumed != bytes.len() {
+            bail!(
+                "Non-empty {binary_column} for row {row_id} contains trailing bytes after its MessagePack value; refusing legacy JSON fallback"
+            );
+        }
         return serde_json::to_string(&value)
             .with_context(|| {
                 format!("Failed to serialize decoded {binary_column} value for row {row_id}")

@@ -29,6 +29,7 @@ use frankensearch::{
     },
     rrf_fuse as fs_rrf_fuse,
 };
+use frankensqlite::AsyncConnection as SearchSqliteConnection;
 use lru::LruCache;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
@@ -41,21 +42,131 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::franken_sync::Connection;
 #[cfg(test)]
 use crate::franken_sync::compat::OptionalExtension;
-use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt, Transaction, TransactionExt};
+use crate::franken_sync::compat::{ParamValue, RowExt, param_slice_to_values};
 #[cfg(test)]
 use crate::franken_sync::params;
 
-/// Wrapper around `crate::franken_sync::Connection` that implements `Send`.
+/// Row-mapping conveniences for the dedicated-owner search connection.
 ///
-/// `crate::franken_sync::Connection` is `!Send` because it uses `Rc` internally.
-/// However, the `Rc` values are entirely self-contained within the Connection
-/// and are not shared with any external references.  When wrapped in a `Mutex`
-/// (as in `SearchClient`), exclusive access is guaranteed, making cross-thread
-/// transfer safe.
-struct SendConnection(Connection);
+/// `AsyncConnection` intentionally exposes owned rows across its worker-thread
+/// boundary. Mapping them on the caller keeps application-specific conversion
+/// errors out of the worker protocol while preserving the former fallible row
+/// mapper semantics.
+trait SearchSqliteConnectionExt {
+    fn query_row_map<T, F>(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+        map: F,
+    ) -> Result<T, crate::franken_sync::FrankenError>
+    where
+        F: FnOnce(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>;
+
+    fn query_map_collect<T, F>(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+        map: F,
+    ) -> Result<Vec<T>, crate::franken_sync::FrankenError>
+    where
+        F: FnMut(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>;
+
+    fn execute_compat(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+    ) -> Result<usize, crate::franken_sync::FrankenError>;
+}
+
+impl SearchSqliteConnectionExt for SearchSqliteConnection {
+    fn query_row_map<T, F>(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+        map: F,
+    ) -> Result<T, crate::franken_sync::FrankenError>
+    where
+        F: FnOnce(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>,
+    {
+        let values = param_slice_to_values(params);
+        let row = self.query_row_with_params_sync(sql, &values)?;
+        map(&row)
+    }
+
+    fn query_map_collect<T, F>(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+        mut map: F,
+    ) -> Result<Vec<T>, crate::franken_sync::FrankenError>
+    where
+        F: FnMut(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>,
+    {
+        let values = param_slice_to_values(params);
+        let rows = self.query_with_params_sync(sql, &values)?;
+        rows.iter().map(&mut map).collect()
+    }
+
+    fn execute_compat(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+    ) -> Result<usize, crate::franken_sync::FrankenError> {
+        let values = param_slice_to_values(params);
+        self.execute_with_params_sync(sql, &values)
+    }
+}
+
+/// Read snapshot whose rollback obligation remains on the dedicated owner.
+///
+/// Search hydration deliberately takes an explicit transaction so related
+/// message and conversation queries observe one archive generation. The
+/// guard makes early-return/error paths rollback on the same worker that owns
+/// the connection.
+struct SearchReadTransaction<'conn> {
+    conn: &'conn SearchSqliteConnection,
+    active: bool,
+}
+
+impl<'conn> SearchReadTransaction<'conn> {
+    fn begin(conn: &'conn SearchSqliteConnection) -> Result<Self, crate::franken_sync::FrankenError> {
+        conn.begin_transaction_sync()?;
+        Ok(Self { conn, active: true })
+    }
+
+    fn query_map_collect<T, F>(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+        map: F,
+    ) -> Result<Vec<T>, crate::franken_sync::FrankenError>
+    where
+        F: FnMut(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>,
+    {
+        self.conn.query_map_collect(sql, params, map)
+    }
+
+    fn rollback(&mut self) -> Result<(), crate::franken_sync::FrankenError> {
+        self.conn.rollback_transaction_sync()?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for SearchReadTransaction<'_> {
+    fn drop(&mut self) {
+        if self.active
+            && let Err(error) = self.conn.rollback_transaction_sync()
+        {
+            tracing::warn!(
+                %error,
+                "failed to roll back search hydration read transaction"
+            );
+        }
+    }
+}
 
 type TantivyContentExactKey = (i64, i64);
 type TantivyContentFallbackKey = (String, String, i64);
@@ -121,25 +232,18 @@ const SQLITE_MESSAGE_SCAN_FALLBACK_LIMIT: usize = 30_000;
 const SEARCH_SQLITE_HYDRATION_CACHE_KIB: i64 = 4_096;
 const SEMANTIC_EXACT_CHUNK_OVERFETCH_MULTIPLIER: usize = 4;
 
-// Safety: Rc fields inside Connection are not cloned or shared externally.
-// The Mutex<Option<SendConnection>> in SearchClient ensures exclusive access.
-unsafe impl Send for SendConnection {}
-
-impl std::ops::Deref for SendConnection {
-    type Target = Connection;
-    fn deref(&self) -> &Connection {
-        &self.0
-    }
-}
-
-fn open_search_hydration_sqlite(path: &Path, timeout: Duration) -> Result<Connection> {
-    let conn =
-        crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout(path, timeout)?;
-    conn.execute("PRAGMA query_only = 1;")
+fn open_search_hydration_sqlite(
+    path: &Path,
+    timeout: Duration,
+) -> Result<SearchSqliteConnection> {
+    let conn = crate::storage::sqlite::open_franken_async_readonly_connection_with_timeout(
+        path, timeout,
+    )?;
+    conn.execute_sync("PRAGMA query_only = 1;")
         .with_context(|| "setting search hydration query_only")?;
-    conn.execute("PRAGMA busy_timeout = 5000;")
+    conn.execute_sync("PRAGMA busy_timeout = 5000;")
         .with_context(|| "setting search hydration busy_timeout")?;
-    conn.execute(&format!(
+    conn.execute_sync(&format!(
         "PRAGMA cache_size = -{SEARCH_SQLITE_HYDRATION_CACHE_KIB};"
     ))
     .with_context(|| "setting search hydration cache_size")?;
@@ -156,7 +260,7 @@ fn nfc_sanitize_query(raw: &str) -> String {
 }
 
 fn franken_query_map_collect_retry<T, F>(
-    conn: &Connection,
+    conn: &SearchSqliteConnection,
     sql: &str,
     params: &[ParamValue],
     map: F,
@@ -187,7 +291,7 @@ where
 }
 
 fn hydrate_message_content_by_conversation(
-    conn: &Connection,
+    conn: &SearchSqliteConnection,
     requests: &[TantivyContentExactKey],
 ) -> Result<HashMap<TantivyContentExactKey, String>> {
     if requests.is_empty() {
@@ -2704,7 +2808,7 @@ pub struct SearchClient {
         frankensearch::quill::QuillSearchIndex,
         crate::search::quill_bridge::QuillCassFields,
     )>,
-    sqlite: Mutex<Option<SendConnection>>,
+    sqlite: Mutex<Option<SearchSqliteConnection>>,
     sqlite_path: Option<PathBuf>,
     prefix_cache: Mutex<CacheShards>,
     reload_on_search: bool,
@@ -3757,7 +3861,9 @@ impl SearchClient {
         }))
     }
 
-    fn sqlite_guard(&self) -> Result<std::sync::MutexGuard<'_, Option<SendConnection>>> {
+    fn sqlite_guard(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Option<SearchSqliteConnection>>> {
         let mut guard = self
             .sqlite
             .lock()
@@ -3768,7 +3874,7 @@ impl SearchClient {
         {
             match open_search_hydration_sqlite(path, std::time::Duration::from_secs(1)) {
                 Ok(conn) => {
-                    *guard = Some(SendConnection(conn));
+                    *guard = Some(conn);
                 }
                 Err(err) => {
                     tracing::debug!(
@@ -5332,7 +5438,7 @@ impl SearchClient {
 
     fn hydrate_ranked_message_hits_in_transaction(
         &self,
-        transaction: &Transaction<'_>,
+        transaction: &SearchReadTransaction<'_>,
         results: &[RankedMessageHydrationCandidate],
         field_mask: FieldMask,
         match_type: MatchType,
@@ -5573,7 +5679,7 @@ impl SearchClient {
         let conn = sqlite_guard
             .as_ref()
             .ok_or_else(|| anyhow!("semantic search requires database connection"))?;
-        let mut transaction = conn.transaction()?;
+        let mut transaction = SearchReadTransaction::begin(conn)?;
         let hits = self.hydrate_ranked_message_hits_in_transaction(
             &transaction,
             &candidates,
@@ -6164,8 +6270,7 @@ impl SearchClient {
                     "CASS Layer-B projection requires a database connection"
                 ))
             })?;
-            let mut transaction = conn
-                .transaction()
+            let mut transaction = SearchReadTransaction::begin(conn)
                 .map_err(|error| CassLexicalLayerBError::Hydration(anyhow::Error::new(error)))?;
             let mut conversation_ids = indices_by_conversation.keys().copied().collect::<Vec<_>>();
             conversation_ids.sort_unstable();
@@ -7317,7 +7422,7 @@ impl SearchClient {
         Ok((combined_hits, total_count))
     }
 
-    fn sqlite_fts_uses_message_id_column(conn: &Connection) -> Result<bool> {
+    fn sqlite_fts_uses_message_id_column(conn: &SearchSqliteConnection) -> Result<bool> {
         let params: [ParamValue; 0] = [];
         let ddl_rows: Vec<String> = franken_query_map_collect_retry(
             conn,
@@ -7335,7 +7440,7 @@ impl SearchClient {
             .unwrap_or(false))
     }
 
-    fn sqlite_fts_match_mode(conn: &Connection) -> Result<SqliteFtsMatchMode> {
+    fn sqlite_fts_match_mode(conn: &SearchSqliteConnection) -> Result<SqliteFtsMatchMode> {
         let params = [ParamValue::from("__cass_fts_probe_no_match__")];
         match franken_query_map_collect_retry(
             conn,
@@ -7355,7 +7460,7 @@ impl SearchClient {
         }
     }
 
-    fn sqlite_fts5_rowid_projection_available(conn: &Connection) -> bool {
+    fn sqlite_fts5_rowid_projection_available(conn: &SearchSqliteConnection) -> bool {
         let params: [ParamValue; 0] = [];
         franken_query_map_collect_retry(
             conn,
@@ -7732,7 +7837,7 @@ impl SearchClient {
 
     fn search_sqlite_message_scan(
         &self,
-        conn: &Connection,
+        conn: &SearchSqliteConnection,
         request: SqliteMessageScanRequest<'_>,
     ) -> Result<Vec<SearchHit>> {
         let Some(scan_query) = Self::sqlite_message_scan_query(request.raw_query) else {
@@ -8285,7 +8390,7 @@ impl SearchClient {
 
     fn browse_by_date_sqlite(
         &self,
-        conn: &Connection,
+        conn: &SearchSqliteConnection,
         filters: SearchFilters,
         limit: usize,
         offset: usize,
