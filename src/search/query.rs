@@ -55,6 +55,16 @@ use crate::franken_sync::params;
 /// errors out of the worker protocol while preserving the former fallible row
 /// mapper semantics.
 trait SearchSqliteConnectionExt {
+    #[cfg(test)]
+    fn query_row_map<T, F>(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+        map: F,
+    ) -> Result<T, crate::franken_sync::FrankenError>
+    where
+        F: FnOnce(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>;
+
     fn query_map_collect<T, F>(
         &self,
         sql: &str,
@@ -63,10 +73,24 @@ trait SearchSqliteConnectionExt {
     ) -> Result<Vec<T>, crate::franken_sync::FrankenError>
     where
         F: FnMut(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>;
-
 }
 
 impl SearchSqliteConnectionExt for SearchSqliteConnection {
+    #[cfg(test)]
+    fn query_row_map<T, F>(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+        map: F,
+    ) -> Result<T, crate::franken_sync::FrankenError>
+    where
+        F: FnOnce(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>,
+    {
+        let values = param_slice_to_values(params);
+        let row = self.query_row_with_params_sync(sql, &values)?;
+        map(&row)
+    }
+
     fn query_map_collect<T, F>(
         &self,
         sql: &str,
@@ -80,7 +104,6 @@ impl SearchSqliteConnectionExt for SearchSqliteConnection {
         let rows = self.query_with_params_sync(sql, &values)?;
         rows.iter().map(&mut map).collect()
     }
-
 }
 
 #[cfg(test)]
@@ -13079,10 +13102,13 @@ mod tests {
                 .map_err(|_| anyhow!("cross-worker hydration worker panicked"))??;
         }
 
-        assert!(
-            client.sqlite_guard()?.is_some(),
-            "the shared client should retain one dedicated-owner connection"
-        );
+        let mut guard = client.sqlite_guard()?;
+        let mut conn = guard
+            .take()
+            .expect("the shared client should retain one dedicated-owner connection");
+        drop(guard);
+        conn.close_without_checkpoint_sync()
+            .map_err(|error| anyhow!("closing cross-worker sqlite owner: {error}"))?;
         Ok(())
     }
 

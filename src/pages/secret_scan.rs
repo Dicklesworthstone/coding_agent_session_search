@@ -23,6 +23,7 @@ const DEFAULT_ENTROPY_THRESHOLD: f64 = 4.0;
 const DEFAULT_ENTROPY_MIN_LEN: usize = 20;
 const DEFAULT_CONTEXT_BYTES: usize = 120;
 const DEFAULT_MAX_FINDINGS: usize = 500;
+const SCAN_PAGE_ROWS: usize = 128;
 const REDACTED_CONTEXT: &str = "[redacted]";
 const CUSTOM_DENYLIST_PATTERN_ID: &str = "custom_denylist";
 
@@ -326,129 +327,77 @@ pub fn scan_database<P: AsRef<Path>>(
         "NULL"
     };
     let (conv_where, conv_params) = build_where_clause(filters)?;
-    let conv_sql = format!(
-        "SELECT c.id, c.title, c.metadata_json, c.source_path, COALESCE(a.slug, 'unknown'), w.path, {metadata_bin_projection}\n         FROM conversations c\n         LEFT JOIN agents a ON c.agent_id = a.id\n         LEFT JOIN workspaces w ON c.workspace_id = w.id{}",
-        conv_where,
+    let conv_high_watermark = table_max_id(&conn, "conversations")?;
+    let conv_select = format!(
+        "SELECT c.id, c.title, c.metadata_json, c.source_path, COALESCE(a.slug, 'unknown'), w.path, {metadata_bin_projection}\n         FROM conversations c\n         LEFT JOIN agents a ON c.agent_id = a.id\n         LEFT JOIN workspaces w ON c.workspace_id = w.id"
     );
-    let conv_param_values = params_from_iter(conv_params);
-    let conv_rows = conn.query_with_params(&conv_sql, &conv_param_values)?;
-
-    for row in &conv_rows {
-        if running
+    let mut last_conv_id = None;
+    while !truncated
+        && !running
             .as_ref()
             .is_some_and(|flag| !flag.load(Ordering::Relaxed))
-        {
-            break;
-        }
-        let conv_id: i64 = row.get_typed(0)?;
-        let title: Option<String> = row.get_typed(1)?;
-        let metadata_json: Option<String> = row.get_typed(2)?;
-        let source_path: String = row.get_typed(3)?;
-        let agent_slug: String = row.get_typed(4)?;
-        let workspace_path: Option<String> = row.get_typed(5)?;
-        let metadata_bin: Option<Vec<u8>> = row.get_typed(6)?;
-
-        let ctx = ScanContext {
-            agent: Some(agent_slug),
-            workspace: workspace_path,
-            source_path: Some(source_path),
-            conversation_id: Some(conv_id),
-            message_id: None,
-            message_idx: None,
-        };
-
-        if let Some(title_text) = title {
-            scan_text(
-                &title_text,
-                SecretLocation::ConversationTitle,
-                &ctx,
-                config,
-                &mut findings,
-                &mut seen,
-                &mut truncated,
-            );
-        }
-        if let Some(meta) = structured_metadata_scan_text(
-            metadata_bin.as_deref(),
-            metadata_json.as_deref(),
-            "conversations.metadata_bin",
-            conv_id,
-        )? {
-            scan_text(
-                &meta,
-                SecretLocation::ConversationMetadata,
-                &ctx,
-                config,
-                &mut findings,
-                &mut seen,
-                &mut truncated,
-            );
-        }
-
-        if truncated {
-            break;
-        }
-
-        if let Some(pb) = progress {
-            pb.inc(1);
-        }
-    }
-
-    if !truncated {
-        let has_extra_bin = table_has_column(&conn, "messages", "extra_bin")?;
-        let extra_bin_projection = if has_extra_bin { "m.extra_bin" } else { "NULL" };
-        let (msg_where, msg_params) = build_where_clause(filters)?;
-        let msg_sql = format!(
-            "SELECT m.id, m.idx, m.content, m.extra_json, c.id, c.source_path, COALESCE(a.slug, 'unknown'), w.path, {extra_bin_projection}\n             FROM messages m\n             JOIN conversations c ON m.conversation_id = c.id\n             LEFT JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id{}",
-            msg_where,
+    {
+        let page_where = bounded_keyset_page_where(&conv_where, "c.id", last_conv_id);
+        let conv_sql = format!(
+            "{conv_select}{page_where} ORDER BY c.id LIMIT {SCAN_PAGE_ROWS}"
         );
-        let msg_param_values = params_from_iter(msg_params);
-        let msg_rows = conn.query_with_params(&msg_sql, &msg_param_values)?;
+        let mut page_params = conv_params.clone();
+        page_params.push(ParamValue::from(conv_high_watermark));
+        if let Some(last_id) = last_conv_id {
+            page_params.push(ParamValue::from(last_id));
+        }
+        let page_param_values = params_from_iter(page_params);
+        let conv_rows = conn.query_with_params(&conv_sql, &page_param_values)?;
+        if conv_rows.is_empty() {
+            break;
+        }
+        let page_len = conv_rows.len();
 
-        for row in &msg_rows {
+        for row in &conv_rows {
             if running
                 .as_ref()
                 .is_some_and(|flag| !flag.load(Ordering::Relaxed))
             {
                 break;
             }
-            let msg_id: i64 = row.get_typed(0)?;
-            let msg_idx: i64 = row.get_typed(1)?;
-            let content: String = row.get_typed(2)?;
-            let extra_json: Option<String> = row.get_typed(3)?;
-            let conv_id: i64 = row.get_typed(4)?;
-            let source_path: String = row.get_typed(5)?;
-            let agent_slug: String = row.get_typed(6)?;
-            let workspace_path: Option<String> = row.get_typed(7)?;
-            let extra_bin: Option<Vec<u8>> = row.get_typed(8)?;
+            let conv_id: i64 = row.get_typed(0)?;
+            let title: Option<String> = row.get_typed(1)?;
+            let metadata_json: Option<String> = row.get_typed(2)?;
+            let source_path: String = row.get_typed(3)?;
+            let agent_slug: String = row.get_typed(4)?;
+            let workspace_path: Option<String> = row.get_typed(5)?;
+            let metadata_bin: Option<Vec<u8>> = row.get_typed(6)?;
+            last_conv_id = Some(conv_id);
 
             let ctx = ScanContext {
                 agent: Some(agent_slug),
                 workspace: workspace_path,
                 source_path: Some(source_path),
                 conversation_id: Some(conv_id),
-                message_id: Some(msg_id),
-                message_idx: Some(msg_idx),
+                message_id: None,
+                message_idx: None,
             };
 
-            scan_text(
-                &content,
-                SecretLocation::MessageContent,
-                &ctx,
-                config,
-                &mut findings,
-                &mut seen,
-                &mut truncated,
-            );
-            if let Some(extra) = structured_metadata_scan_text(
-                extra_bin.as_deref(),
-                extra_json.as_deref(),
-                "messages.extra_bin",
-                msg_id,
+            if let Some(title_text) = title {
+                scan_text(
+                    &title_text,
+                    SecretLocation::ConversationTitle,
+                    &ctx,
+                    config,
+                    &mut findings,
+                    &mut seen,
+                    &mut truncated,
+                );
+            }
+            if let Some(meta) = structured_metadata_scan_text(
+                metadata_bin.as_deref(),
+                metadata_json.as_deref(),
+                "conversations.metadata_bin",
+                conv_id,
             )? {
                 scan_text(
-                    &extra,
-                    SecretLocation::MessageMetadata,
+                    &meta,
+                    SecretLocation::ConversationMetadata,
                     &ctx,
                     config,
                     &mut findings,
@@ -465,57 +414,196 @@ pub fn scan_database<P: AsRef<Path>>(
                 pb.inc(1);
             }
         }
+
+        if truncated
+            || running
+                .as_ref()
+                .is_some_and(|flag| !flag.load(Ordering::Relaxed))
+            || page_len < SCAN_PAGE_ROWS
+        {
+            break;
+        }
+    }
+
+    if !truncated {
+        let has_extra_bin = table_has_column(&conn, "messages", "extra_bin")?;
+        let extra_bin_projection = if has_extra_bin { "m.extra_bin" } else { "NULL" };
+        let (msg_where, msg_params) = build_where_clause(filters)?;
+        let msg_high_watermark = table_max_id(&conn, "messages")?;
+        let msg_select = format!(
+            "SELECT m.id, m.idx, m.content, m.extra_json, c.id, c.source_path, COALESCE(a.slug, 'unknown'), w.path, {extra_bin_projection}\n             FROM messages m\n             JOIN conversations c ON m.conversation_id = c.id\n             LEFT JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id"
+        );
+        let mut last_msg_id = None;
+        while !truncated
+            && !running
+                .as_ref()
+                .is_some_and(|flag| !flag.load(Ordering::Relaxed))
+        {
+            let page_where = bounded_keyset_page_where(&msg_where, "m.id", last_msg_id);
+            let msg_sql =
+                format!("{msg_select}{page_where} ORDER BY m.id LIMIT {SCAN_PAGE_ROWS}");
+            let mut page_params = msg_params.clone();
+            page_params.push(ParamValue::from(msg_high_watermark));
+            if let Some(last_id) = last_msg_id {
+                page_params.push(ParamValue::from(last_id));
+            }
+            let page_param_values = params_from_iter(page_params);
+            let msg_rows = conn.query_with_params(&msg_sql, &page_param_values)?;
+            if msg_rows.is_empty() {
+                break;
+            }
+            let page_len = msg_rows.len();
+
+            for row in &msg_rows {
+                if running
+                    .as_ref()
+                    .is_some_and(|flag| !flag.load(Ordering::Relaxed))
+                {
+                    break;
+                }
+                let msg_id: i64 = row.get_typed(0)?;
+                let msg_idx: i64 = row.get_typed(1)?;
+                let content: String = row.get_typed(2)?;
+                let extra_json: Option<String> = row.get_typed(3)?;
+                let conv_id: i64 = row.get_typed(4)?;
+                let source_path: String = row.get_typed(5)?;
+                let agent_slug: String = row.get_typed(6)?;
+                let workspace_path: Option<String> = row.get_typed(7)?;
+                let extra_bin: Option<Vec<u8>> = row.get_typed(8)?;
+                last_msg_id = Some(msg_id);
+
+                let ctx = ScanContext {
+                    agent: Some(agent_slug),
+                    workspace: workspace_path,
+                    source_path: Some(source_path),
+                    conversation_id: Some(conv_id),
+                    message_id: Some(msg_id),
+                    message_idx: Some(msg_idx),
+                };
+
+                scan_text(
+                    &content,
+                    SecretLocation::MessageContent,
+                    &ctx,
+                    config,
+                    &mut findings,
+                    &mut seen,
+                    &mut truncated,
+                );
+                if let Some(extra) = structured_metadata_scan_text(
+                    extra_bin.as_deref(),
+                    extra_json.as_deref(),
+                    "messages.extra_bin",
+                    msg_id,
+                )? {
+                    scan_text(
+                        &extra,
+                        SecretLocation::MessageMetadata,
+                        &ctx,
+                        config,
+                        &mut findings,
+                        &mut seen,
+                        &mut truncated,
+                    );
+                }
+
+                if truncated {
+                    break;
+                }
+
+                if let Some(pb) = progress {
+                    pb.inc(1);
+                }
+            }
+
+            if truncated
+                || running
+                    .as_ref()
+                    .is_some_and(|flag| !flag.load(Ordering::Relaxed))
+                || page_len < SCAN_PAGE_ROWS
+            {
+                break;
+            }
+        }
     }
 
     if !truncated && table_exists(&conn, "snippets") {
         let (snip_where, snip_params) = build_where_clause(filters)?;
-        let snip_sql = format!(
-            "SELECT s.snippet_text, m.id, m.idx, c.id, c.source_path, COALESCE(a.slug, 'unknown'), w.path\n             FROM snippets s\n             JOIN messages m ON s.message_id = m.id\n             JOIN conversations c ON m.conversation_id = c.id\n             LEFT JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id{}",
-            snip_where
-        );
-        let snip_param_values = params_from_iter(snip_params);
-        let snip_rows = conn.query_with_params(&snip_sql, &snip_param_values)?;
-
-        for row in &snip_rows {
-            if running
+        let snip_high_watermark = table_max_id(&conn, "snippets")?;
+        let snip_select = "SELECT s.id, s.snippet_text, m.id, m.idx, c.id, c.source_path, COALESCE(a.slug, 'unknown'), w.path\n             FROM snippets s\n             JOIN messages m ON s.message_id = m.id\n             JOIN conversations c ON m.conversation_id = c.id\n             LEFT JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id";
+        let mut last_snippet_id = None;
+        while !truncated
+            && !running
                 .as_ref()
                 .is_some_and(|flag| !flag.load(Ordering::Relaxed))
+        {
+            let page_where = bounded_keyset_page_where(&snip_where, "s.id", last_snippet_id);
+            let snip_sql =
+                format!("{snip_select}{page_where} ORDER BY s.id LIMIT {SCAN_PAGE_ROWS}");
+            let mut page_params = snip_params.clone();
+            page_params.push(ParamValue::from(snip_high_watermark));
+            if let Some(last_id) = last_snippet_id {
+                page_params.push(ParamValue::from(last_id));
+            }
+            let page_param_values = params_from_iter(page_params);
+            let snip_rows = conn.query_with_params(&snip_sql, &page_param_values)?;
+            if snip_rows.is_empty() {
+                break;
+            }
+            let page_len = snip_rows.len();
+
+            for row in &snip_rows {
+                if running
+                    .as_ref()
+                    .is_some_and(|flag| !flag.load(Ordering::Relaxed))
+                {
+                    break;
+                }
+                let snippet_id: i64 = row.get_typed(0)?;
+                let snippet_text: String = row.get_typed(1)?;
+                let msg_id: i64 = row.get_typed(2)?;
+                let msg_idx: i64 = row.get_typed(3)?;
+                let conv_id: i64 = row.get_typed(4)?;
+                let source_path: String = row.get_typed(5)?;
+                let agent_slug: String = row.get_typed(6)?;
+                let workspace_path: Option<String> = row.get_typed(7)?;
+                last_snippet_id = Some(snippet_id);
+
+                let ctx = ScanContext {
+                    agent: Some(agent_slug),
+                    workspace: workspace_path,
+                    source_path: Some(source_path),
+                    conversation_id: Some(conv_id),
+                    message_id: Some(msg_id),
+                    message_idx: Some(msg_idx),
+                };
+
+                scan_text(
+                    &snippet_text,
+                    SecretLocation::MessageSnippet,
+                    &ctx,
+                    config,
+                    &mut findings,
+                    &mut seen,
+                    &mut truncated,
+                );
+
+                if truncated {
+                    break;
+                }
+
+                if let Some(pb) = progress {
+                    pb.inc(1);
+                }
+            }
+
+            if truncated
+                || running
+                    .as_ref()
+                    .is_some_and(|flag| !flag.load(Ordering::Relaxed))
+                || page_len < SCAN_PAGE_ROWS
             {
                 break;
-            }
-            let snippet_text: String = row.get_typed(0)?;
-            let msg_id: i64 = row.get_typed(1)?;
-            let msg_idx: i64 = row.get_typed(2)?;
-            let conv_id: i64 = row.get_typed(3)?;
-            let source_path: String = row.get_typed(4)?;
-            let agent_slug: String = row.get_typed(5)?;
-            let workspace_path: Option<String> = row.get_typed(6)?;
-
-            let ctx = ScanContext {
-                agent: Some(agent_slug),
-                workspace: workspace_path,
-                source_path: Some(source_path),
-                conversation_id: Some(conv_id),
-                message_id: Some(msg_id),
-                message_idx: Some(msg_idx),
-            };
-
-            scan_text(
-                &snippet_text,
-                SecretLocation::MessageSnippet,
-                &ctx,
-                config,
-                &mut findings,
-                &mut seen,
-                &mut truncated,
-            );
-
-            if truncated {
-                break;
-            }
-
-            if let Some(pb) = progress {
-                pb.inc(1);
             }
         }
     }
@@ -561,6 +649,22 @@ fn table_exists(conn: &crate::franken_sync::Connection, table_name: &str) -> boo
     conn.query_map_collect(&pragma, params![], |row| row.get_typed::<String>(1))
         .map(|columns| !columns.is_empty())
         .unwrap_or(false)
+}
+
+fn table_max_id(
+    conn: &crate::franken_sync::Connection,
+    table_name: &str,
+) -> Result<Option<i64>> {
+    if !table_name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        bail!("Invalid SQLite identifier while paging secret-scan rows");
+    }
+
+    let sql = format!("SELECT MAX(id) FROM {table_name}");
+    conn.query_row_map(&sql, params![], |row| row.get_typed(0))
+        .with_context(|| format!("Failed to bound {table_name} secret-scan rows"))
 }
 
 fn table_has_column(
@@ -1192,6 +1296,18 @@ fn build_where_clause(filters: &SecretScanFilters) -> Result<(String, Vec<ParamV
     };
 
     Ok((where_clause, params))
+}
+
+fn bounded_keyset_page_where(base_where: &str, id_column: &str, last_id: Option<i64>) -> String {
+    let mut page_where = if base_where.is_empty() {
+        format!(" WHERE {id_column} <= ?")
+    } else {
+        format!("{base_where} AND {id_column} <= ?")
+    };
+    if last_id.is_some() {
+        page_where.push_str(&format!(" AND {id_column} > ?"));
+    }
+    page_where
 }
 
 fn parse_env_regex_list(var: &str) -> Result<Vec<String>> {

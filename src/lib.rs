@@ -78800,9 +78800,9 @@ mod cli_read_db_tests {
     }
 
     #[test]
-    fn extract_pi_agent_session_id_errors_when_no_header() {
+    fn extract_pi_family_session_id_errors_name_the_selected_harness() {
         // No filename fallback: headerless files must produce an error
-        // rather than a synthesized id that `omp --resume` would reject
+        // rather than a synthesized id that the native harness would reject
         // with a confusing runtime message.
         let temp = tempfile::tempdir().expect("tempdir");
         let f = temp.path().join("2026-04-09T00-00-00_stem-id.jsonl");
@@ -78811,20 +78811,33 @@ mod cli_read_db_tests {
             r#"{"type":"message","message":{"role":"user","content":"hi"}}"#,
         )
         .expect("write");
-        let err = extract_pi_agent_session_id(&f).expect_err("must fail without header");
-        assert_eq!(err.code, 5);
-        assert_eq!(err.kind, "session-id-not-found");
-        assert!(
-            err.hint
-                .as_deref()
-                .is_some_and(|h| h.contains("omp --resume")),
-            "hint should point at the manual invocation: {:?}",
-            err.hint
-        );
+        for (harness, expected_name, expected_command, forbidden_command) in [
+            (PiFamilyHarness::PiAgent, "Pi Agent", "pi --resume", "omp --resume"),
+            (PiFamilyHarness::Omp, "Oh My Pi (omp)", "omp --resume", "pi --resume"),
+        ] {
+            let err = extract_pi_family_session_id(&f, harness)
+                .expect_err("must fail without header");
+            assert_eq!(err.code, 5);
+            assert_eq!(err.kind, "session-id-not-found");
+            assert!(
+                err.message.contains(expected_name),
+                "error should name {expected_name}: {}",
+                err.message
+            );
+            let hint = err.hint.as_deref().expect("manual resume hint");
+            assert!(
+                hint.contains(expected_command),
+                "hint should name the selected harness: {hint}"
+            );
+            assert!(
+                !hint.contains(forbidden_command),
+                "hint must not recommend the other harness: {hint}"
+            );
+        }
     }
 
     #[test]
-    fn extract_pi_agent_session_id_prefers_sessionid_field_over_id() {
+    fn extract_pi_family_session_id_prefers_sessionid_field_over_id() {
         // When a single session-header line contains BOTH `sessionId`
         // and `id`, `sessionId` wins. The `sessionId` field is the
         // explicit Oh My Pi resume identifier (per issue #175) while
@@ -78842,12 +78855,12 @@ mod cli_read_db_tests {
             ),
         )
         .expect("write");
-        let id = extract_pi_agent_session_id(&f).expect("extract");
+        let id = extract_pi_family_session_id(&f, PiFamilyHarness::Omp).expect("extract");
         assert_eq!(id, "sid-wins");
     }
 
     #[test]
-    fn extract_pi_agent_session_id_uses_id_when_sessionid_absent() {
+    fn extract_pi_family_session_id_uses_id_when_sessionid_absent() {
         // A session-header line with only `id` (no `sessionId`) falls
         // back to `id`. This is the pi-mono format.
         let temp = tempfile::tempdir().expect("tempdir");
@@ -78858,20 +78871,58 @@ mod cli_read_db_tests {
 {"type":"message","timestamp":"2026-04-09T00:00:01Z","message":{"role":"user","content":"hi"}}"#,
         )
         .expect("write");
-        let id = extract_pi_agent_session_id(&f).expect("extract");
+        let id = extract_pi_family_session_id(&f, PiFamilyHarness::PiAgent).expect("extract");
         assert_eq!(id, "plain-id");
     }
 
     #[test]
-    fn extract_pi_agent_session_id_skips_leading_blank_lines() {
+    fn extract_pi_family_session_id_ignores_blank_sessionid() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let f = temp.path().join("2026-04-09T00-00-00_blank-id.jsonl");
+        std::fs::write(
+            &f,
+            r#"{"type":"session","id":"fallback-id","sessionId":"   "}"#,
+        )
+        .expect("write");
+
+        let id = extract_pi_family_session_id(&f, PiFamilyHarness::Omp).expect("extract");
+        assert_eq!(id, "fallback-id");
+    }
+
+    #[test]
+    fn extract_pi_family_session_id_skips_leading_non_session_ids_and_blank_lines() {
         // Blank lines should not consume the 16-line budget.
         let temp = tempfile::tempdir().expect("tempdir");
         let f = temp.path().join("2026-04-09T00-00-00_blank.jsonl");
         let header = r#"{"type":"session","id":"after-blanks"}"#;
-        let content = format!("\n\n\n{header}\n");
+        let content = format!(
+            "\n\n\n{}\n{}\n{header}\n",
+            r#"{"type":"message","sessionId":"wrong-message-id","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"title","sessionId":"wrong-title-id","title":"Title"}"#,
+        );
         std::fs::write(&f, content).expect("write");
-        let id = extract_pi_agent_session_id(&f).expect("extract");
+        let id = extract_pi_family_session_id(&f, PiFamilyHarness::Omp).expect("extract");
         assert_eq!(id, "after-blanks");
+    }
+
+    #[test]
+    fn extract_pi_family_session_id_rejects_non_session_sessionid() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let f = temp.path().join("2026-04-09T00-00-00_no-header.jsonl");
+        std::fs::write(
+            &f,
+            concat!(
+                r#"{"type":"message","sessionId":"wrong-message-id","message":{"role":"user","content":"hi"}}"#,
+                "\n",
+                r#"{"type":"title","sessionId":"wrong-title-id","title":"Title"}"#,
+                "\n",
+            ),
+        )
+        .expect("write");
+
+        let err = extract_pi_family_session_id(&f, PiFamilyHarness::Omp)
+            .expect_err("non-session records must not supply a resume id");
+        assert_eq!(err.kind, "session-id-not-found");
     }
 }
 
@@ -91312,6 +91363,42 @@ fn conversation_view_to_raw_messages(
         .collect()
 }
 
+/// Rehydrate Pi-family source events for HTML export when the canonical
+/// archive still has their per-message envelope. The normalized message text
+/// is deliberately flattened for search, so it cannot retain full tool
+/// arguments, correlation ids, or result status on its own.
+fn conversation_view_to_html_raw_messages(
+    view: &crate::ui::data::ConversationView,
+) -> Vec<serde_json::Value> {
+    let mut messages = conversation_view_to_raw_messages(view);
+    if !matches!(view.convo.agent_slug.as_str(), "pi_agent" | "omp") {
+        return messages;
+    }
+
+    for (raw_message, archived_message) in messages.iter_mut().zip(&view.messages) {
+        let Some(source_line) = crate::storage::sqlite::message_extra_to_source_jsonl_line(
+            &archived_message.extra_json,
+        ) else {
+            continue;
+        };
+        let Ok(source_event) = serde_json::from_str::<serde_json::Value>(&source_line) else {
+            tracing::warn!(
+                message_idx = archived_message.idx,
+                agent = %view.convo.agent_slug,
+                "pi-family HTML export could not decode the archived source event"
+            );
+            continue;
+        };
+        if source_event.get("type").and_then(serde_json::Value::as_str) == Some("message")
+            && source_event.get("message").is_some_and(serde_json::Value::is_object)
+        {
+            *raw_message = source_event;
+        }
+    }
+
+    messages
+}
+
 fn canonical_followup_source_id(source_id: Option<&str>) -> Option<String> {
     let trimmed = source_id?.trim();
     if trimmed.is_empty() {
@@ -95428,9 +95515,31 @@ fn extract_uuid_from_stem(stem: &str) -> Option<String> {
     None
 }
 
-/// Extract the Oh My Pi / pi-mono session id from a JSONL session file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PiFamilyHarness {
+    PiAgent,
+    Omp,
+}
+
+impl PiFamilyHarness {
+    const fn display_name(self) -> &'static str {
+        match self {
+            Self::PiAgent => "Pi Agent",
+            Self::Omp => "Oh My Pi (omp)",
+        }
+    }
+
+    const fn executable(self) -> &'static str {
+        match self {
+            Self::PiAgent => "pi",
+            Self::Omp => "omp",
+        }
+    }
+}
+
+/// Extract a Pi-family session id from a JSONL session file.
 ///
-/// Pi-agent session files begin with a `{"type":"session", ...}` header
+/// Pi-family session files begin with a `{"type":"session", ...}` header
 /// that contains `id` (and often `sessionId`). We scan up to the first
 /// 16 non-empty lines to find it, tolerating blank lines and leading
 /// metadata. Streams line-by-line so large session logs do not get
@@ -95440,14 +95549,15 @@ fn extract_uuid_from_stem(stem: &str) -> Option<String> {
 /// first line (e.g. a JSONL file with no newlines, or a single megabyte
 /// of garbage before the real content) cannot OOM the process. The
 /// session header is always well under this budget in practice.
-fn extract_pi_agent_session_id(path: &Path) -> CliResult<String> {
+fn extract_pi_family_session_id(path: &Path, harness: PiFamilyHarness) -> CliResult<String> {
     use std::io::{BufRead as _, Read as _};
     const MAX_SCAN_BYTES: u64 = 1024 * 1024; // 1 MiB
     let file = std::fs::File::open(path).map_err(|err| CliError {
         code: 4,
         kind: CliErrorKind::SessionFileUnreadable.kind_str(),
         message: format!(
-            "cannot open pi-agent session file {}: {err}",
+            "cannot open {} session file {}: {err}",
+            harness.display_name(),
             path.display()
         ),
         hint: None,
@@ -95467,7 +95577,8 @@ fn extract_pi_agent_session_id(path: &Path) -> CliResult<String> {
                 tracing::debug!(
                     path = %path.display(),
                     error = %err,
-                    "pi-agent: stopped reading after line I/O error"
+                    harness = harness.display_name(),
+                    "pi-family resume: stopped reading after line I/O error"
                 );
                 break;
             }
@@ -95484,33 +95595,47 @@ fn extract_pi_agent_session_id(path: &Path) -> CliResult<String> {
             Ok(v) => v,
             Err(_) => continue,
         };
-        // Prefer explicit `sessionId` but fall back to `id` on session-header lines.
-        if let Some(id) = value.get("sessionId").and_then(|v| v.as_str()) {
-            return Ok(id.to_string());
-        }
         let entry_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if entry_type == "session"
-            && let Some(id) = value.get("id").and_then(|v| v.as_str())
-        {
-            return Ok(id.to_string());
+        if entry_type == "session" {
+            // Both identifiers are valid only on the authoritative session
+            // header. Message/tool records may also carry a `sessionId`, but
+            // accepting one would produce a command for a different session.
+            if let Some(id) = value
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                return Ok(id.to_string());
+            }
+            if let Some(id) = value
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                return Ok(id.to_string());
+            }
         }
     }
     // Deliberately no filename fallback: pi-agent session ids come from
     // the in-file `{"type":"session","id":"..."}` header, not from the
     // filename. Synthesizing an id from the filename would produce a
-    // command that looks plausible but `omp --resume` would reject with
+    // command that looks plausible but the native harness would reject with
     // a confusing error. Fail explicitly so the user knows what's wrong.
     Err(CliError {
         code: 5,
         kind: CliErrorKind::SessionIdNotFound.kind_str(),
         message: format!(
-            "no session header found in pi-agent file {} (scanned first 16 non-empty lines)",
+            "no usable session id found in a session header in {} file {} (scanned first 16 non-empty lines)",
+            harness.display_name(),
             path.display()
         ),
-        hint: Some(
-            "Pi-agent session ids live in the `{\"type\":\"session\",\"id\":\"...\"}` header of the JSONL file. If the file is missing its header, invoke `omp --resume <id>` directly with the id you want."
-                .to_string(),
-        ),
+        hint: Some(format!(
+            "{} session ids live in the `{{\"type\":\"session\",\"id\":\"...\"}}` header of the JSONL file. If the file is missing its header, invoke `{} --resume <id>` directly with the id you want.",
+            harness.display_name(),
+            harness.executable(),
+        )),
         retryable: false,
     })
 }
@@ -95747,7 +95872,7 @@ fn resolve_resume_target(path: &Path, agent_override: Option<&str>) -> CliResult
             })
         }
         "pi_agent" => {
-            let id = extract_pi_agent_session_id(path)?;
+            let id = extract_pi_family_session_id(path, PiFamilyHarness::PiAgent)?;
             Ok(ResumeTarget {
                 agent: "pi_agent",
                 argv: vec!["pi".into(), "--resume".into(), id.clone()],
@@ -95756,7 +95881,7 @@ fn resolve_resume_target(path: &Path, agent_override: Option<&str>) -> CliResult
             })
         }
         "omp" => {
-            let id = extract_pi_agent_session_id(path)?;
+            let id = extract_pi_family_session_id(path, PiFamilyHarness::Omp)?;
             let mut argv = vec!["omp".to_string()];
             let profile = crate::connectors::omp::profile_from_session_path(path).or_else(|| {
                 crate::connectors::omp::configured_session_root(path)
@@ -96781,7 +96906,7 @@ fn run_export_html(
                         .workspace
                         .as_ref()
                         .map(|p| p.display().to_string());
-                    raw_messages = conversation_view_to_raw_messages(view);
+                    raw_messages = conversation_view_to_html_raw_messages(view);
                 } else {
                     emit_structured_error(&err);
                     return Err(err);
@@ -96798,7 +96923,7 @@ fn run_export_html(
             .workspace
             .as_ref()
             .map(|p| p.display().to_string());
-        raw_messages = conversation_view_to_raw_messages(view);
+        raw_messages = conversation_view_to_html_raw_messages(view);
     } else {
         // Detect agent from path
         let path_str = session_path.to_string_lossy();
@@ -96920,12 +97045,20 @@ fn run_export_html(
         }
     }
 
+    let pi_family_export = matches!(agent_name.as_deref(), Some("pi_agent" | "omp"));
+
     // --- Convert to renderer::Message format (filtering empty messages) ---
     let messages: Vec<Message> = raw_messages
         .iter()
         .enumerate()
         .flat_map(|(i, msg)| {
             let role = extract_role(msg);
+            if pi_family_export && !include_tools && role == "tool" {
+                // Pi-family tool results are standalone messages. Omitting
+                // them here makes `--include-tools=false` exclude both sides
+                // of the interaction while retaining assistant thinking/text.
+                return Vec::new();
+            }
             let ts = extract_message_timestamp(msg);
             let timestamp = ts
                 .and_then(|ts| chrono::Utc.timestamp_millis_opt(ts).single())
@@ -97079,7 +97212,10 @@ fn run_export_html(
                     tool_use_count += content
                         .iter()
                         .filter(|item| {
-                            item.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                            matches!(
+                                item.get("type").and_then(|t| t.as_str()),
+                                Some("tool_use" | "toolCall")
+                            )
                         })
                         .count();
                 }
@@ -97367,7 +97503,39 @@ fn stringify_tool_value(value: &serde_json::Value) -> String {
 /// Supports multiple formats:
 /// 1. Claude/Anthropic format: `content` array with `type: "tool_use"` or `type: "tool_result"` blocks
 /// 2. Cursor/generic format: `type: "tool"` at top level with `message.tool_name`, `message.tool_input`, `message.tool_output`
+/// 3. Pi-family format: camelCase `toolCall` blocks and `toolResult` messages
 fn extract_tool_calls(msg: &serde_json::Value) -> Vec<html_export::ToolCall> {
+    let inner = msg.get("message").unwrap_or(msg);
+    if inner.get("role").and_then(serde_json::Value::as_str) == Some("toolResult") {
+        let output = extract_text_content(msg);
+        let output = if output.is_empty() {
+            inner.get("content").map(stringify_tool_value)
+        } else {
+            Some(output)
+        };
+        let status = if inner
+            .get("isError")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            html_export::ToolStatus::Error
+        } else {
+            html_export::ToolStatus::Success
+        };
+        return vec![html_export::ToolCall {
+            name: inner
+                .get("toolName")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool_result")
+                .to_string(),
+            input: String::new(),
+            output,
+            status: Some(status),
+            correlation_id: extract_tool_correlation_id(inner)
+                .or_else(|| extract_tool_correlation_id(msg)),
+        }];
+    }
+
     // Format 2: Cursor/generic format - check for top-level type: "tool"
     if let Some(msg_type) = msg.get("type").and_then(|t| t.as_str())
         && msg_type == "tool"
@@ -97420,9 +97588,12 @@ fn extract_tool_calls(msg: &serde_json::Value) -> Vec<html_export::ToolCall> {
         for block in arr {
             if let Some(block_type) = block.get("type").and_then(|t| t.as_str()) {
                 match block_type {
-                    "tool_use" => {
+                    "tool_use" | "toolCall" => {
                         let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
-                        let input = block.get("input").map(stringify_tool_value);
+                        let input = block
+                            .get("input")
+                            .or_else(|| block.get("arguments"))
+                            .map(stringify_tool_value);
                         tool_calls.push(html_export::ToolCall {
                             name: name.to_string(),
                             input: input.unwrap_or_default(),
@@ -97457,6 +97628,8 @@ fn extract_tool_correlation_id(value: &serde_json::Value) -> Option<String> {
         .get("tool_use_id")
         .or_else(|| value.get("tool_call_id"))
         .or_else(|| value.get("call_id"))
+        .or_else(|| value.get("toolCallId"))
+        .or_else(|| value.get("callId"))
         .or_else(|| value.get("id"))
         .and_then(|id| id.as_str())
         .map(str::trim)
@@ -100189,6 +100362,204 @@ This should stay behind the indexed html export.
         )
         .expect("expand should prefer indexed conversation over unreadable backing file");
     }
+
+    #[test]
+    fn omp_html_export_preserves_direct_and_indexed_pi_wire_semantics() {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("agent_search.db");
+        let output_dir = tmp.path().join("html-out");
+        std::fs::create_dir_all(&output_dir).expect("create output dir");
+
+        let user_event = serde_json::json!({
+            "type": "message",
+            "timestamp": "2026-08-24T12:00:01Z",
+            "message": { "role": "user", "content": "OMPUSERSENTINEL" }
+        });
+        let assistant_event = serde_json::json!({
+            "type": "message",
+            "timestamp": "2026-08-24T12:00:02Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "thinking", "thinking": "OMPTHINKINGSENTINEL" },
+                    { "type": "text", "text": "OMPASSISTANTSENTINEL" },
+                    {
+                        "type": "toolCall",
+                        "id": "ompcall42",
+                        "name": "inspect_workspace",
+                        "arguments": { "file_path": "OMPARGUMENTSENTINEL" }
+                    }
+                ]
+            }
+        });
+        let result_event = serde_json::json!({
+            "type": "message",
+            "timestamp": "2026-08-24T12:00:03Z",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "ompcall42",
+                "toolName": "inspect_workspace",
+                "content": [{ "type": "text", "text": "OMPRESULTSENTINEL" }],
+                "isError": false
+            }
+        });
+
+        let direct_path = tmp
+            .path()
+            .join("direct/.omp/agent/sessions/project/2026-08-24T12-00-00_direct.jsonl");
+        std::fs::create_dir_all(direct_path.parent().expect("direct parent"))
+            .expect("create direct session dir");
+        let direct_jsonl = [
+            serde_json::json!({
+                "type": "session",
+                "id": "omp-direct",
+                "cwd": "/workspace/cass",
+                "timestamp": "2026-08-24T12:00:00Z"
+            }),
+            user_event.clone(),
+            assistant_event.clone(),
+            result_event.clone(),
+        ]
+        .into_iter()
+        .map(|event| event.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        std::fs::write(&direct_path, format!("{direct_jsonl}\n")).expect("write direct JSONL");
+
+        let indexed_path = tmp
+            .path()
+            .join("indexed/.omp/agent/sessions/project/2026-08-24T12-00-00_indexed.jsonl");
+        let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).expect("open db");
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "omp".to_string(),
+                name: "Oh My Pi".to_string(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .expect("ensure OMP agent");
+        storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &Conversation {
+                    id: None,
+                    agent_slug: "omp".to_string(),
+                    workspace: Some(PathBuf::from("/workspace/cass")),
+                    external_id: Some("omp-indexed".to_string()),
+                    title: Some("OMPUSERSENTINEL".to_string()),
+                    source_path: indexed_path.clone(),
+                    started_at: Some(1_787_572_800_000),
+                    ended_at: Some(1_787_572_803_000),
+                    approx_tokens: None,
+                    metadata_json: serde_json::json!({}),
+                    messages: vec![
+                        Message {
+                            id: None,
+                            idx: 0,
+                            role: MessageRole::User,
+                            author: None,
+                            created_at: Some(1_787_572_801_000),
+                            content: "OMPUSERSENTINEL".to_string(),
+                            extra_json: user_event,
+                            snippets: Vec::new(),
+                        },
+                        Message {
+                            id: None,
+                            idx: 1,
+                            role: MessageRole::Agent,
+                            author: None,
+                            created_at: Some(1_787_572_802_000),
+                            content: "[Thinking] OMPTHINKINGSENTINEL\nOMPASSISTANTSENTINEL\n[Tool: inspect_workspace] file_path=OMPARGUMENTSENTINEL".to_string(),
+                            extra_json: assistant_event,
+                            snippets: Vec::new(),
+                        },
+                        Message {
+                            id: None,
+                            idx: 2,
+                            role: MessageRole::Tool,
+                            author: None,
+                            created_at: Some(1_787_572_803_000),
+                            content: "OMPRESULTSENTINEL".to_string(),
+                            extra_json: result_event,
+                            snippets: Vec::new(),
+                        },
+                    ],
+                    source_id: crate::sources::provenance::LOCAL_SOURCE_ID.to_string(),
+                    origin_host: None,
+                },
+            )
+            .expect("insert indexed OMP conversation");
+        drop(storage);
+
+        let export = |path: &Path, filename: &str, include_tools: bool| {
+            run_export_html(
+                path,
+                Some(db_path.clone()),
+                None,
+                Some(output_dir.as_path()),
+                Some(filename),
+                false,
+                false,
+                include_tools,
+                true,
+                true,
+                false,
+                "system",
+                false,
+                false,
+                false,
+                Some(RobotFormat::Json),
+            )
+            .expect("export OMP HTML");
+            std::fs::read_to_string(output_dir.join(filename)).expect("read OMP HTML")
+        };
+
+        let direct_with_tools = export(&direct_path, "direct-with-tools.html", true);
+        let indexed_with_tools = export(&indexed_path, "indexed-with-tools.html", true);
+        let direct_without_tools = export(&direct_path, "direct-without-tools.html", false);
+        let indexed_without_tools = export(&indexed_path, "indexed-without-tools.html", false);
+
+        for html in [&direct_with_tools, &indexed_with_tools] {
+            for sentinel in [
+                "OMPUSERSENTINEL",
+                "OMPTHINKINGSENTINEL",
+                "OMPASSISTANTSENTINEL",
+                "inspect_workspace",
+                "OMPARGUMENTSENTINEL",
+                "OMPRESULTSENTINEL",
+            ] {
+                assert!(
+                    html.contains(sentinel),
+                    "tool-inclusive export should preserve {sentinel}"
+                );
+            }
+        }
+
+        for html in [&direct_without_tools, &indexed_without_tools] {
+            for sentinel in [
+                "OMPUSERSENTINEL",
+                "OMPTHINKINGSENTINEL",
+                "OMPASSISTANTSENTINEL",
+            ] {
+                assert!(
+                    html.contains(sentinel),
+                    "tool-free export should retain conversational content {sentinel}"
+                );
+            }
+            for omitted in [
+                "inspect_workspace",
+                "OMPARGUMENTSENTINEL",
+                "OMPRESULTSENTINEL",
+            ] {
+                assert!(
+                    !html.contains(omitted),
+                    "tool-free export must omit {omitted}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -100492,6 +100863,103 @@ mod message_grouping_tests {
                 .as_ref()
                 .map(|result| result.content.as_str()),
             Some("readme contents")
+        );
+    }
+
+    #[test]
+    fn omp_tool_call_and_result_preserve_thinking_arguments_and_correlation() {
+        let call_json = serde_json::json!({
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "thinking", "thinking": "OMPTHINKINGSENTINEL" },
+                    { "type": "text", "text": "OMPASSISTANTSENTINEL" },
+                    {
+                        "type": "toolCall",
+                        "id": "ompcall42",
+                        "name": "inspect_workspace",
+                        "arguments": { "file_path": "OMPARGUMENTSENTINEL" }
+                    }
+                ]
+            }
+        });
+        let result_json = serde_json::json!({
+            "type": "message",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "ompcall42",
+                "toolName": "inspect_workspace",
+                "content": [{ "type": "text", "text": "OMPRESULTSENTINEL" }],
+                "isError": false
+            }
+        });
+
+        assert_eq!(
+            extract_text_content_without_tool_blocks(&call_json),
+            "[Thinking] OMPTHINKINGSENTINEL\nOMPASSISTANTSENTINEL"
+        );
+        assert_eq!(extract_role(&result_json), "tool");
+
+        let call = extract_tool_calls(&call_json)
+            .into_iter()
+            .next()
+            .expect("OMP toolCall block");
+        assert_eq!(call.name, "inspect_workspace");
+        assert!(call.input.contains("OMPARGUMENTSENTINEL"));
+        assert_eq!(call.correlation_id.as_deref(), Some("ompcall42"));
+
+        let result = extract_tool_calls(&result_json)
+            .into_iter()
+            .next()
+            .expect("OMP toolResult message");
+        assert_eq!(result.name, "inspect_workspace");
+        assert_eq!(result.output.as_deref(), Some("OMPRESULTSENTINEL"));
+        assert_eq!(result.status, Some(ToolStatus::Success));
+        assert_eq!(result.correlation_id.as_deref(), Some("ompcall42"));
+
+        let error_result = extract_tool_calls(&serde_json::json!({
+            "type": "message",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "ompcall-error",
+                "toolName": "inspect_workspace",
+                "content": "OMPERRORSENTINEL",
+                "isError": true
+            }
+        }))
+        .into_iter()
+        .next()
+        .expect("OMP error toolResult message");
+        assert_eq!(error_result.output.as_deref(), Some("OMPERRORSENTINEL"));
+        assert_eq!(error_result.status, Some(ToolStatus::Error));
+
+        let groups = group_messages_for_export(vec![
+            Message {
+                role: "assistant".to_string(),
+                content: extract_text_content_without_tool_blocks(&call_json),
+                timestamp: None,
+                tool_call: Some(call),
+                index: Some(0),
+                author: None,
+            },
+            Message {
+                role: "tool".to_string(),
+                content: String::new(),
+                timestamp: None,
+                tool_call: Some(result),
+                index: Some(1),
+                author: None,
+            },
+        ]);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].tool_calls.len(), 1);
+        let paired = &groups[0].tool_calls[0];
+        assert_eq!(paired.correlation_id.as_deref(), Some("ompcall42"));
+        assert_eq!(
+            paired.result.as_ref().map(|result| result.content.as_str()),
+            Some("OMPRESULTSENTINEL")
         );
     }
 
@@ -101330,23 +101798,74 @@ fn extract_message_timestamp(msg: &serde_json::Value) -> Option<i64> {
         })
 }
 
+fn flatten_pi_family_text_content(content: &serde_json::Value) -> Option<String> {
+    let blocks = content.as_array()?;
+    if !blocks.iter().any(|block| {
+        matches!(
+            block.get("type").and_then(serde_json::Value::as_str),
+            Some("thinking" | "toolCall")
+        )
+    }) {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    for block in blocks {
+        let block_type = block.get("type").and_then(serde_json::Value::as_str);
+        let part = if let Some(text) = block.as_str() {
+            Some(text.to_string())
+        } else {
+            match block_type {
+                None | Some("text" | "input_text" | "output_text") => block
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                Some("thinking") => block
+                    .get("thinking")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|thinking| !thinking.is_empty())
+                    .map(|thinking| format!("[Thinking] {thinking}")),
+                // Tool data is rendered structurally only when the caller
+                // opted into `--include-tools`.
+                Some("toolCall") => None,
+                _ => None,
+            }
+        };
+        if let Some(part) = part.filter(|part| !part.is_empty()) {
+            parts.push(part);
+        }
+    }
+
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
 fn extract_text_content_without_tool_blocks(msg: &serde_json::Value) -> String {
     fn flatten_without_tool_blocks(content: &serde_json::Value) -> Option<String> {
         if let Some(s) = content.as_str() {
             return (!s.is_empty()).then(|| s.to_string());
         }
 
+        if let Some(text) = flatten_pi_family_text_content(content) {
+            return Some(text);
+        }
+
         let arr = content.as_array()?;
         let mut result = String::new();
         for item in arr {
             let item_type = item.get("type").and_then(|v| v.as_str());
-            if matches!(item_type, Some("tool_use" | "tool_result")) {
+            if matches!(
+                item_type,
+                Some("tool_use" | "tool_result" | "toolCall")
+            ) {
                 continue;
             }
 
             let part = if let Some(text) = item.as_str() {
                 Some(text.to_string())
-            } else if matches!(item_type, None | Some("text" | "input_text")) {
+            } else if matches!(
+                item_type,
+                None | Some("text" | "input_text" | "output_text")
+            ) {
                 item.get("text")
                     .and_then(|v| v.as_str())
                     .map(str::to_string)
@@ -101394,6 +101913,9 @@ fn extract_text_content(msg: &serde_json::Value) -> String {
     // It handles: direct strings, {"type": "text"}, {"type": "input_text"},
     // blocks with "text" but no "type", and tool_use blocks
     fn try_flatten(content: &serde_json::Value) -> Option<String> {
+        if let Some(result) = flatten_pi_family_text_content(content) {
+            return Some(result);
+        }
         let result = crate::connectors::flatten_content(content);
         if result.is_empty() {
             None
@@ -101425,23 +101947,30 @@ fn extract_text_content(msg: &serde_json::Value) -> String {
     String::new()
 }
 
+fn normalized_export_role(role: &str) -> &str {
+    match role {
+        "toolResult" | "tool_result" => "tool",
+        other => other,
+    }
+}
+
 /// Extract role from message (supports various formats)
 fn extract_role(msg: &serde_json::Value) -> String {
     // Try direct role
     if let Some(role) = msg.get("role").and_then(|r| r.as_str()) {
-        return role.to_string();
+        return normalized_export_role(role).to_string();
     }
     // Try nested message.role (Claude Code format)
     if let Some(inner) = msg.get("message")
         && let Some(role) = inner.get("role").and_then(|r| r.as_str())
     {
-        return role.to_string();
+        return normalized_export_role(role).to_string();
     }
     // Try nested payload.role (Codex format: {"type": "response_item", "payload": {"role": "user", ...}})
     if let Some(payload) = msg.get("payload")
         && let Some(role) = payload.get("role").and_then(|r| r.as_str())
     {
-        return role.to_string();
+        return normalized_export_role(role).to_string();
     }
     // Try type field (Claude Code also uses "type": "user" or "type": "assistant")
     if let Some(type_val) = msg.get("type").and_then(|t| t.as_str()) {

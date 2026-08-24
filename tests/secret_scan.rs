@@ -5,7 +5,8 @@ mod tests {
     use coding_agent_search::franken_sync::compat::ConnectionExt;
     use coding_agent_search::franken_sync::params as fparams;
     use coding_agent_search::pages::secret_scan::{
-        SecretScanConfig, SecretScanFilters, SecretScanReport, SecretSeverity, scan_database,
+        SecretLocation, SecretScanConfig, SecretScanFilters, SecretScanReport, SecretSeverity,
+        scan_database,
     };
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
@@ -928,6 +929,97 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("messages.extra_bin"), "{error:#}");
         assert!(message.contains("trailing bytes"), "{error:#}");
+        Ok(())
+    }
+
+    #[test]
+    fn keyset_pages_reach_later_conversations_messages_and_snippets() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("scan.db");
+        let conn = open_db(&db_path)?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
+            CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL);
+            CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER NOT NULL,
+                workspace_id INTEGER,
+                title TEXT,
+                source_path TEXT NOT NULL,
+                started_at INTEGER,
+                metadata_json TEXT
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                extra_json TEXT
+            );
+            CREATE TABLE snippets (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                snippet_text TEXT NOT NULL
+            );
+            INSERT INTO agents (id, slug) VALUES (1, 'codex');
+            INSERT INTO workspaces (id, path) VALUES (1, '/tmp/project');
+            BEGIN;
+            "#,
+        )?;
+
+        // The production scanner pages at 128 rows. Put each only finding on
+        // row 129 so every table must advance its keyset before detecting it.
+        for id in 1_i64..=129 {
+            let title = if id == 129 {
+                "PAGE_CONVERSATION_SECRET"
+            } else {
+                "safe title"
+            };
+            let content = if id == 129 {
+                "PAGE_MESSAGE_SECRET"
+            } else {
+                "safe content"
+            };
+            let snippet = if id == 129 {
+                "PAGE_SNIPPET_SECRET"
+            } else {
+                "safe snippet"
+            };
+            let source_path = format!("/tmp/project/session-{id}.jsonl");
+            conn.execute_compat(
+                "INSERT INTO conversations (id, agent_id, workspace_id, title, source_path, started_at, metadata_json) VALUES (?1, 1, 1, ?2, ?3, 1700000000000, '{}')",
+                fparams![id, title, source_path],
+            )?;
+            conn.execute_compat(
+                "INSERT INTO messages (id, conversation_id, idx, content, extra_json) VALUES (?1, ?1, 0, ?2, '{}')",
+                fparams![id, content],
+            )?;
+            conn.execute_compat(
+                "INSERT INTO snippets (id, message_id, snippet_text) VALUES (?1, ?1, ?2)",
+                fparams![id, snippet],
+            )?;
+        }
+        conn.execute("COMMIT")?;
+        drop(conn);
+
+        let denylist = vec!["PAGE_(?:CONVERSATION|MESSAGE|SNIPPET)_SECRET".to_string()];
+        let config = SecretScanConfig::from_inputs_with_env(&[], &denylist, false)?;
+        let report = scan_database(&db_path, &no_filters(), &config, None, None)?;
+
+        for location in [
+            SecretLocation::ConversationTitle,
+            SecretLocation::MessageContent,
+            SecretLocation::MessageSnippet,
+        ] {
+            assert!(
+                report
+                    .findings
+                    .iter()
+                    .any(|finding| finding.location == location),
+                "keyset paging missed {location:?}"
+            );
+        }
         Ok(())
     }
 

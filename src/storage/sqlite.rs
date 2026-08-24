@@ -20103,6 +20103,17 @@ mod tests {
             "error should identify the active doctor mutation lock: {message}"
         );
 
+        let async_err = open_franken_async_readonly_connection_with_timeout(
+            &db_path,
+            Duration::from_millis(25),
+        )
+        .expect_err("active doctor mutation lock must also block dedicated-owner opens");
+        let async_message = async_err.to_string();
+        assert!(
+            async_message.contains("doctor mutation lock") && async_message.contains("active"),
+            "dedicated-owner error should identify the active doctor mutation lock: {async_message}"
+        );
+
         fs2::FileExt::unlock(&lock_file).unwrap();
     }
 
@@ -20139,6 +20150,15 @@ mod tests {
                     "doctor process must be able to run post-repair read probes under its own lock",
                 );
         drop(conn);
+
+        let mut async_conn = open_franken_async_readonly_connection_with_timeout(
+            &db_path,
+            Duration::from_millis(25),
+        )
+        .expect("doctor process must also be able to open a dedicated-owner read probe");
+        async_conn
+            .close_without_checkpoint_sync()
+            .expect("dedicated-owner doctor probe should close cleanly");
 
         fs2::FileExt::unlock(&lock_file).unwrap();
     }
@@ -21476,6 +21496,57 @@ mod tests {
         let count: i64 = rows.first().unwrap().get_typed(0).unwrap();
         assert_eq!(count, 3, "checkpointed rows must survive recovery");
         conn.close().unwrap();
+    }
+
+    #[test]
+    fn dedicated_owner_readonly_open_reads_nonempty_wal_without_mutating_it() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("dedicated-owner-dirty.db");
+        {
+            let mut conn =
+                crate::franken_sync::Connection::open(db_path.to_string_lossy().into_owned())
+                    .unwrap();
+            conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
+            conn.execute("INSERT INTO t (x) VALUES (1), (2), (3);")
+                .unwrap();
+            close_franken_in_place_with_busy_retry(&mut conn, false).unwrap();
+        }
+
+        let wal_path = database_sidecar_path(&db_path, "-wal");
+        let dirty_len = std::fs::symlink_metadata(&wal_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        assert!(
+            dirty_len > 32,
+            "precondition: dedicated-owner test requires unreplayed WAL frames (len={dirty_len})"
+        );
+
+        let mut conn = open_franken_async_readonly_connection_with_timeout(
+            &db_path,
+            Duration::from_secs(2),
+        )
+        .expect("dedicated-owner readonly open should read through the dirty WAL");
+        let rows = conn
+            .query_sync("SELECT COUNT(*) FROM t;")
+            .expect("dedicated owner should read committed rows through the WAL");
+        let count: i64 = rows
+            .first()
+            .expect("count query should return one row")
+            .get_typed(0)
+            .expect("count should be an integer");
+        assert_eq!(count, 3, "dirty-WAL reads must preserve committed rows");
+        conn.execute_sync("DELETE FROM t WHERE 1 = 0")
+            .expect_err("dedicated-owner readonly connection must refuse writes");
+        conn.close_without_checkpoint_sync()
+            .expect("dedicated-owner readonly close should join its worker");
+
+        let reopened_len = std::fs::symlink_metadata(&wal_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        assert_eq!(
+            reopened_len, dirty_len,
+            "successful readonly dispatch must not rewrite or checkpoint the dirty WAL"
+        );
     }
 
     #[test]
