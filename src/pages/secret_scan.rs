@@ -310,6 +310,16 @@ impl FindingOccurrence {
     }
 }
 
+fn ensure_secret_scan_running(running: &Option<Arc<AtomicBool>>) -> Result<()> {
+    if running
+        .as_ref()
+        .is_some_and(|flag| !flag.load(Ordering::Relaxed))
+    {
+        bail!("Secret scan cancelled before completion");
+    }
+    Ok(())
+}
+
 pub fn scan_database<P: AsRef<Path>>(
     db_path: P,
     filters: &SecretScanFilters,
@@ -317,8 +327,13 @@ pub fn scan_database<P: AsRef<Path>>(
     running: Option<Arc<AtomicBool>>,
     progress: Option<&ProgressBar>,
 ) -> Result<SecretScanReport> {
+    // Cancellation must never be represented as a complete (and potentially
+    // false-clean) report. Check before opening the database as well as at
+    // every query/row boundary below, and return a distinct error on abort.
+    ensure_secret_scan_running(&running)?;
     let conn = super::open_existing_sqlite_db(db_path.as_ref())
         .context("Failed to open database for secret scan")?;
+    ensure_secret_scan_running(&running)?;
 
     let mut findings: Vec<SecretFinding> = Vec::new();
     let mut seen = Vec::new();
@@ -334,16 +349,14 @@ pub fn scan_database<P: AsRef<Path>>(
         "NULL"
     };
     let (conv_where, conv_params) = build_where_clause(filters)?;
+    ensure_secret_scan_running(&running)?;
     let conv_high_watermark = table_max_id(&conn, "conversations")?;
     let conv_select = format!(
         "SELECT c.id, c.title, c.metadata_json, c.source_path, COALESCE(a.slug, 'unknown'), w.path, {metadata_bin_projection}\n         FROM conversations c\n         LEFT JOIN agents a ON c.agent_id = a.id\n         LEFT JOIN workspaces w ON c.workspace_id = w.id"
     );
     let mut last_conv_id = None;
-    while !truncated
-        && !running
-            .as_ref()
-            .is_some_and(|flag| !flag.load(Ordering::Relaxed))
-    {
+    while !truncated {
+        ensure_secret_scan_running(&running)?;
         let page_where = bounded_keyset_page_where(&conv_where, "c.id", last_conv_id);
         let conv_sql = format!(
             "{conv_select}{page_where} ORDER BY c.id LIMIT {SCAN_PAGE_ROWS}"
@@ -361,12 +374,7 @@ pub fn scan_database<P: AsRef<Path>>(
         let page_len = conv_rows.len();
 
         for row in &conv_rows {
-            if running
-                .as_ref()
-                .is_some_and(|flag| !flag.load(Ordering::Relaxed))
-            {
-                break;
-            }
+            ensure_secret_scan_running(&running)?;
             let conv_id: i64 = row.get_typed(0)?;
             let title: Option<String> = row.get_typed(1)?;
             let metadata_json: Option<String> = row.get_typed(2)?;
@@ -435,30 +443,24 @@ pub fn scan_database<P: AsRef<Path>>(
             }
         }
 
-        if truncated
-            || running
-                .as_ref()
-                .is_some_and(|flag| !flag.load(Ordering::Relaxed))
-            || page_len < SCAN_PAGE_ROWS
-        {
+        if truncated || page_len < SCAN_PAGE_ROWS {
             break;
         }
     }
+    ensure_secret_scan_running(&running)?;
 
     if !truncated {
         let has_extra_bin = table_has_column(&conn, "messages", "extra_bin")?;
         let extra_bin_projection = if has_extra_bin { "m.extra_bin" } else { "NULL" };
         let (msg_where, msg_params) = build_where_clause(filters)?;
+        ensure_secret_scan_running(&running)?;
         let msg_high_watermark = table_max_id(&conn, "messages")?;
         let msg_select = format!(
             "SELECT m.id, m.idx, m.content, m.extra_json, c.id, c.source_path, COALESCE(a.slug, 'unknown'), w.path, {extra_bin_projection}\n             FROM messages m\n             JOIN conversations c ON m.conversation_id = c.id\n             LEFT JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id"
         );
         let mut last_msg_id = None;
-        while !truncated
-            && !running
-                .as_ref()
-                .is_some_and(|flag| !flag.load(Ordering::Relaxed))
-        {
+        while !truncated {
+            ensure_secret_scan_running(&running)?;
             let page_where = bounded_keyset_page_where(&msg_where, "m.id", last_msg_id);
             let msg_sql =
                 format!("{msg_select}{page_where} ORDER BY m.id LIMIT {SCAN_PAGE_ROWS}");
@@ -475,12 +477,7 @@ pub fn scan_database<P: AsRef<Path>>(
             let page_len = msg_rows.len();
 
             for row in &msg_rows {
-                if running
-                    .as_ref()
-                    .is_some_and(|flag| !flag.load(Ordering::Relaxed))
-                {
-                    break;
-                }
+                ensure_secret_scan_running(&running)?;
                 let msg_id: i64 = row.get_typed(0)?;
                 let msg_idx: i64 = row.get_typed(1)?;
                 let content: String = row.get_typed(2)?;
@@ -549,27 +546,21 @@ pub fn scan_database<P: AsRef<Path>>(
                 }
             }
 
-            if truncated
-                || running
-                    .as_ref()
-                    .is_some_and(|flag| !flag.load(Ordering::Relaxed))
-                || page_len < SCAN_PAGE_ROWS
-            {
+            if truncated || page_len < SCAN_PAGE_ROWS {
                 break;
             }
         }
     }
+    ensure_secret_scan_running(&running)?;
 
     if !truncated && table_exists(&conn, "snippets")? {
         let (snip_where, snip_params) = build_where_clause(filters)?;
+        ensure_secret_scan_running(&running)?;
         let snip_high_watermark = table_max_id(&conn, "snippets")?;
         let snip_select = "SELECT s.id, s.snippet_text, m.id, m.idx, c.id, c.source_path, COALESCE(a.slug, 'unknown'), w.path\n             FROM snippets s\n             JOIN messages m ON s.message_id = m.id\n             JOIN conversations c ON m.conversation_id = c.id\n             LEFT JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id";
         let mut last_snippet_id = None;
-        while !truncated
-            && !running
-                .as_ref()
-                .is_some_and(|flag| !flag.load(Ordering::Relaxed))
-        {
+        while !truncated {
+            ensure_secret_scan_running(&running)?;
             let page_where = bounded_keyset_page_where(&snip_where, "s.id", last_snippet_id);
             let snip_sql =
                 format!("{snip_select}{page_where} ORDER BY s.id LIMIT {SCAN_PAGE_ROWS}");
@@ -586,12 +577,7 @@ pub fn scan_database<P: AsRef<Path>>(
             let page_len = snip_rows.len();
 
             for row in &snip_rows {
-                if running
-                    .as_ref()
-                    .is_some_and(|flag| !flag.load(Ordering::Relaxed))
-                {
-                    break;
-                }
+                ensure_secret_scan_running(&running)?;
                 let snippet_id: i64 = row.get_typed(0)?;
                 let snippet_text: String = row.get_typed(1)?;
                 let msg_id: i64 = row.get_typed(2)?;
@@ -630,16 +616,12 @@ pub fn scan_database<P: AsRef<Path>>(
                 }
             }
 
-            if truncated
-                || running
-                    .as_ref()
-                    .is_some_and(|flag| !flag.load(Ordering::Relaxed))
-                || page_len < SCAN_PAGE_ROWS
-            {
+            if truncated || page_len < SCAN_PAGE_ROWS {
                 break;
             }
         }
     }
+    ensure_secret_scan_running(&running)?;
 
     findings.sort_by(|a, b| {
         a.severity
@@ -841,9 +823,9 @@ fn scan_sensitive_json_fields(
                         match_redacted: REDACTED_CONTEXT.to_string(),
                         context: REDACTED_METADATA_CONTEXT.to_string(),
                         location: location.clone(),
-                        agent: redact_report_provenance(&ctx.agent),
-                        workspace: redact_report_provenance(&ctx.workspace),
-                        source_path: redact_report_provenance(&ctx.source_path),
+                        agent: redact_report_provenance(&ctx.agent, config),
+                        workspace: redact_report_provenance(&ctx.workspace, config),
+                        source_path: redact_report_provenance(&ctx.source_path, config),
                         conversation_id: ctx.conversation_id,
                         message_id: ctx.message_id,
                         message_idx: ctx.message_idx,
@@ -954,18 +936,28 @@ pub fn print_human_report(
     report: &SecretScanReport,
     max_examples: usize,
 ) -> Result<()> {
+    write_human_report(term, report, max_examples)
+}
+
+fn write_human_report(
+    writer: &mut impl Write,
+    report: &SecretScanReport,
+    max_examples: usize,
+) -> Result<()> {
     let total = report.summary.total;
-    if total == 0 {
-        writeln!(term, "  {} No secrets detected", style("✓").green())?;
+    if total == 0 && !report.summary.truncated {
+        writeln!(writer, "  {} No secrets detected", style("✓").green())?;
         return Ok(());
     }
 
-    writeln!(
-        term,
-        "  {} {} potential secret(s) detected",
-        style("⚠").yellow(),
-        total
-    )?;
+    if total > 0 {
+        writeln!(
+            writer,
+            "  {} {} potential secret(s) detected",
+            style("⚠").yellow(),
+            total
+        )?;
+    }
 
     let mut severities = vec![
         SecretSeverity::Critical,
@@ -987,7 +979,7 @@ pub fn print_human_report(
             continue;
         }
         let label = severity.styled(severity.label());
-        writeln!(term, "  {}: {}", label, count)?;
+        writeln!(writer, "  {}: {}", label, count)?;
 
         for finding in report
             .findings
@@ -996,24 +988,28 @@ pub fn print_human_report(
             .take(max_examples)
         {
             writeln!(
-                term,
+                writer,
                 "    - {} in {} ({})",
                 finding.kind,
                 finding.location.label(),
                 finding.match_redacted
             )?;
             if !finding.context.is_empty() {
-                writeln!(term, "      {}", style(&finding.context).dim())?;
+                writeln!(writer, "      {}", style(&finding.context).dim())?;
             }
         }
         if count > max_examples {
-            writeln!(term, "      {}", style("…additional findings hidden").dim())?;
+            writeln!(
+                writer,
+                "      {}",
+                style("…additional findings hidden").dim()
+            )?;
         }
     }
 
     if report.summary.truncated {
         writeln!(
-            term,
+            writer,
             "  {} Results truncated (max findings reached)",
             style("⚠").yellow()
         )?;
@@ -1266,9 +1262,9 @@ fn push_finding(
         match_redacted,
         context,
         location: candidate.location,
-        agent: redact_report_provenance(&candidate.ctx.agent),
-        workspace: redact_report_provenance(&candidate.ctx.workspace),
-        source_path: redact_report_provenance(&candidate.ctx.source_path),
+        agent: redact_report_provenance(&candidate.ctx.agent, config),
+        workspace: redact_report_provenance(&candidate.ctx.workspace, config),
+        source_path: redact_report_provenance(&candidate.ctx.source_path, config),
         conversation_id: candidate.ctx.conversation_id,
         message_id: candidate.ctx.message_id,
         message_idx: candidate.ctx.message_idx,
@@ -1279,10 +1275,13 @@ fn redact_token(_token: &str) -> String {
     REDACTED_CONTEXT.to_string()
 }
 
-fn redact_report_provenance(value: &Option<String>) -> Option<String> {
-    value.as_deref().map(|text| {
-        crate::indexer::redact_secrets::redact_text(text).into_owned()
-    })
+fn redact_report_provenance(
+    value: &Option<String>,
+    config: &SecretScanConfig,
+) -> Option<String> {
+    value
+        .as_deref()
+        .map(|text| redact_report_slice(text, 0, text.len(), config, Vec::new()))
 }
 
 fn redact_context(
@@ -1315,37 +1314,55 @@ fn redact_context(
     // admission: every known secret span is masked, including allowlisted
     // spans and adjacent matches that are not the focal finding. Only ranges
     // intersecting this bounded window are retained in memory.
-    let mut local_redactions =
-        collect_context_redactions(text, config, ctx_start, ctx_end);
+    let mut local_redactions = Vec::with_capacity(1);
     // The focal match must be masked even if a future finding source is not
     // represented in `collect_context_redactions` yet.
     local_redactions.push(RedactionRange {
         start: safe_start,
         end: safe_end,
     });
-    let local_redactions = merge_redaction_ranges(local_redactions);
+    redact_report_slice(text, ctx_start, ctx_end, config, local_redactions)
+}
 
-    let mut snippet = String::with_capacity(ctx_end.saturating_sub(ctx_start));
-    let mut cursor = ctx_start;
-    for range in local_redactions {
-        let range_start = range.start.max(ctx_start);
-        let range_end = range.end.min(ctx_end);
+fn redact_report_slice(
+    text: &str,
+    slice_start: usize,
+    slice_end: usize,
+    config: &SecretScanConfig,
+    mut redactions: Vec<RedactionRange>,
+) -> String {
+    redactions.extend(collect_context_redactions(
+        text,
+        config,
+        slice_start,
+        slice_end,
+    ));
+    let redactions = merge_redaction_ranges(redactions);
+
+    let mut redacted = String::with_capacity(slice_end.saturating_sub(slice_start));
+    let mut cursor = slice_start;
+    for range in redactions {
+        let range_start = range.start.max(slice_start);
+        let range_end = range.end.min(slice_end);
+        if range_start >= range_end {
+            continue;
+        }
         if cursor < range_start {
-            snippet.push_str(&text[cursor..range_start]);
+            redacted.push_str(&text[cursor..range_start]);
         }
         if cursor < range_end {
-            snippet.push_str(REDACTED_CONTEXT);
+            redacted.push_str(REDACTED_CONTEXT);
             cursor = range_end;
         }
     }
-    if cursor < ctx_end {
-        snippet.push_str(&text[cursor..ctx_end]);
+    if cursor < slice_end {
+        redacted.push_str(&text[cursor..slice_end]);
     }
 
     // Defense in depth: the shared ingestion redactor is the canonical
-    // credential floor. The interval pass above additionally covers custom
-    // denylist and entropy matches, including secrets crossing context edges.
-    crate::indexer::redact_secrets::redact_text(&snippet).into_owned()
+    // credential floor. The interval pass additionally covers custom
+    // denylist and entropy matches, including secrets crossing slice edges.
+    crate::indexer::redact_secrets::redact_text(&redacted).into_owned()
 }
 
 fn collect_context_redactions(
@@ -1760,6 +1777,46 @@ mod tests {
 
         assert!(!result.contains(allowlisted), "allowlisted neighbor leaked");
         assert!(!result.contains(denied), "denylisted neighbor leaked");
+    }
+
+    #[test]
+    fn report_provenance_masks_custom_denylist_and_entropy_secrets() {
+        let denied = "INTERNAL_SECRET_ABC123XYZ789";
+        let entropy = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let value = Some(format!("/tmp/{denied}/safe.txt/{entropy}/session.jsonl"));
+        let config = SecretScanConfig::from_inputs_with_env(
+            &[],
+            &["INTERNAL_SECRET_[A-Z0-9]+".to_string()],
+            false,
+        )
+        .unwrap();
+
+        let redacted = redact_report_provenance(&value, &config).unwrap();
+        assert!(!redacted.contains(denied), "custom denylist value leaked");
+        assert!(!redacted.contains(entropy), "entropy secret leaked");
+        assert!(
+            redacted.matches(REDACTED_CONTEXT).count() >= 2,
+            "independent provenance secrets should be masked: {redacted}"
+        );
+    }
+
+    #[test]
+    fn truncated_zero_finding_report_is_not_presented_as_clean() {
+        let report = SecretScanReport {
+            summary: SecretScanSummary {
+                total: 0,
+                by_severity: BTreeMap::new(),
+                has_critical: false,
+                truncated: true,
+            },
+            findings: Vec::new(),
+        };
+        let mut output = Vec::new();
+
+        write_human_report(&mut output, &report, 3).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains("No secrets detected"), "{output}");
+        assert!(output.contains("Results truncated"), "{output}");
     }
 
     // =========================================================================

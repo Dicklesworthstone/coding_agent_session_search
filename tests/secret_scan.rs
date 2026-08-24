@@ -9,6 +9,8 @@ mod tests {
         scan_database,
     };
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
 
     fn severity_rank(s: SecretSeverity) -> u8 {
@@ -1854,6 +1856,24 @@ mod tests {
             None,
         );
         assert!(result.is_err(), "nonexistent DB should return error");
+    }
+
+    #[test]
+    fn pre_cancelled_scan_fails_before_database_probe() {
+        let running = Arc::new(AtomicBool::new(false));
+        let error = scan_database(
+            Path::new("/nonexistent/path/scan.db"),
+            &no_filters(),
+            &default_config(),
+            Some(running),
+            None,
+        )
+        .expect_err("a cancelled scan must not return a partial report");
+
+        assert!(
+            error.to_string().contains("Secret scan cancelled"),
+            "cancellation should win before any database probe: {error:#}"
+        );
     }
 
     #[test]

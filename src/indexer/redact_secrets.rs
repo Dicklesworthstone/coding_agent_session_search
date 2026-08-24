@@ -67,6 +67,7 @@ pub(crate) fn is_sensitive_json_field(key: &str) -> bool {
             | "setcookie"
             | "privatekey"
             | "privatekeypem"
+            | "secretkeybase"
             | "databaseurl"
             | "connectionstring"
     ) || normalized.ends_with("password")
@@ -76,6 +77,11 @@ pub(crate) fn is_sensitive_json_field(key: &str) -> bool {
         || normalized.ends_with("token")
         || normalized.ends_with("apikey")
         || normalized.ends_with("credential")
+        || normalized.ends_with("privatekey")
+        || normalized.ends_with("secretkey")
+        || normalized.ends_with("secretkeybase")
+        || normalized.ends_with("apikeys")
+        || normalized.ends_with("credentials")
 }
 
 fn redact_sensitive_json_value(
@@ -980,6 +986,11 @@ mod tests {
             "nested": {
                 "clientSecret": ["short", "values"],
                 "private_key_pem": {"body": "short"},
+                "sshPrivateKey": "opaque-short-key",
+                "client_secret_key": "opaque-short-key",
+                "rails_secret_key_base": "opaque-short-key",
+                "service_api_keys": ["opaque-short-key"],
+                "service_credentials": ["opaque-short-credential"],
                 "oauth_token": "opaque-short-value",
                 "service_password_hash": "not-pattern-shaped",
                 "cookie": "session=short",
@@ -989,6 +1000,8 @@ mod tests {
             "keyframe": "animation-safe",
             "monkey": "animal-safe",
             "token_count": 2048,
+            "private_key_count": 2,
+            "secret_key_enabled": true,
             "public_key": "ssh-ed25519 AAAATESTPUBLICMATERIAL",
         });
 
@@ -1007,6 +1020,11 @@ mod tests {
             "/credentials",
             "/nested/clientSecret",
             "/nested/private_key_pem",
+            "/nested/sshPrivateKey",
+            "/nested/client_secret_key",
+            "/nested/rails_secret_key_base",
+            "/nested/service_api_keys",
+            "/nested/service_credentials",
             "/nested/oauth_token",
             "/nested/service_password_hash",
             "/nested/cookie",
@@ -1022,6 +1040,8 @@ mod tests {
             "/keyframe",
             "/monkey",
             "/token_count",
+            "/private_key_count",
+            "/secret_key_enabled",
             "/public_key",
         ] {
             if plain.pointer(pointer) != input.pointer(pointer) {
