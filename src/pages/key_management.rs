@@ -17,8 +17,8 @@
 
 use crate::pages::attachments::reencrypt_blobs_into_dir;
 use crate::pages::encrypt::{
-    Argon2Params, EncryptionConfig, KdfAlgorithm, KeySlot, SlotType, load_config,
-    validate_supported_payload_format,
+    Argon2Params, EncryptionConfig, KdfAlgorithm, KeySlot, SlotType, decompress_archive_chunk,
+    load_config, max_archive_ciphertext_chunk_size, validate_supported_payload_format,
 };
 use crate::pages::qr::RecoverySecret;
 use aes_gcm::{
@@ -29,7 +29,7 @@ use anyhow::{Context, Result, bail};
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::prelude::*;
 use chrono::{DateTime, Utc};
-use flate2::{Compression, read::DeflateDecoder, write::DeflateEncoder};
+use flate2::{Compression, write::DeflateEncoder};
 use rand::Rng;
 use serde::Serialize;
 use std::fs::File;
@@ -87,6 +87,13 @@ fn ensure_can_write_archive_chunk(chunk_index: u32, chunk_size: usize) -> Result
             u32::MAX,
             max_encryptable_plaintext_bytes(chunk_size)
         );
+    }
+    Ok(())
+}
+
+fn validate_password_input(password: &str) -> Result<()> {
+    if password.is_empty() || password.trim().is_empty() {
+        bail!("Password cannot be empty or whitespace-only");
     }
     Ok(())
 }
@@ -172,6 +179,7 @@ pub fn key_add_password(
     current_password: &str,
     new_password: &str,
 ) -> Result<u8> {
+    validate_password_input(new_password)?;
     let archive_dir = super::resolve_site_dir(archive_dir)?;
     let config_path = archive_dir.join("config.json");
     let mut config = load_config(&archive_dir)?;
@@ -326,6 +334,7 @@ pub fn key_rotate(
     keep_recovery: bool,
     progress: impl Fn(f32),
 ) -> Result<RotateResult> {
+    validate_password_input(new_password)?;
     let archive_dir = super::resolve_site_dir(archive_dir)?;
     let config = load_config(&archive_dir)?;
     validate_supported_payload_format(&config)?;
@@ -361,7 +370,7 @@ pub fn key_rotate(
     copy_site_except_runtime_state(&archive_dir, &staged_site_dir)?;
 
     // 3. Re-encrypt payload with new DEK into the staged site
-    let chunk_count = encrypt_all_chunks(
+    let (chunk_count, total_compressed_size) = encrypt_all_chunks(
         &plaintext,
         &new_dek,
         &new_export_id,
@@ -412,7 +421,7 @@ pub fn key_rotate(
         payload: crate::pages::encrypt::PayloadMeta {
             chunk_size: config.payload.chunk_size,
             chunk_count,
-            total_compressed_size: 0, // Recalculated
+            total_compressed_size,
             total_plaintext_size: plaintext.len() as u64,
             files: (0..chunk_count)
                 .map(|i| format!("payload/chunk-{:05}.bin", i))
@@ -449,6 +458,7 @@ pub fn key_rotate(
 
 /// Unwrap DEK using password (tries all password slots)
 fn unwrap_dek_with_password(config: &EncryptionConfig, password: &str) -> Result<[u8; 32]> {
+    validate_password_input(password)?;
     let export_id = BASE64_STANDARD.decode(&config.export_id)?;
 
     for slot in &config.key_slots {
@@ -473,6 +483,7 @@ fn unwrap_dek_with_password(config: &EncryptionConfig, password: &str) -> Result
 
 /// Unwrap DEK and return which slot was used
 fn unwrap_dek_with_slot_id(config: &EncryptionConfig, password: &str) -> Result<(u8, [u8; 32])> {
+    validate_password_input(password)?;
     let export_id = BASE64_STANDARD.decode(&config.export_id)?;
 
     for slot in &config.key_slots {
@@ -607,6 +618,7 @@ fn create_password_slot(
     export_id_b64: &str,
     slot_id: u8,
 ) -> Result<KeySlot> {
+    validate_password_input(password)?;
     let export_id = BASE64_STANDARD.decode(export_id_b64)?;
 
     // Generate salt
@@ -640,6 +652,9 @@ fn create_recovery_slot(
     export_id_b64: &str,
     slot_id: u8,
 ) -> Result<KeySlot> {
+    if secret.is_empty() {
+        bail!("Recovery secret cannot be empty");
+    }
     let export_id = BASE64_STANDARD.decode(export_id_b64)?;
 
     // Generate salt
@@ -731,6 +746,8 @@ fn decrypt_all_chunks(
     })?;
 
     let mut plaintext = Vec::new();
+    let mut total_ciphertext_size = 0u64;
+    let mut total_plaintext_size = 0u64;
 
     if config.payload.chunk_count != config.payload.files.len() {
         bail!(
@@ -780,7 +797,22 @@ fn decrypt_all_chunks(
             );
         }
 
-        let ciphertext = std::fs::read(&canonical_chunk_path)?;
+        let max_ciphertext_size = max_archive_ciphertext_chunk_size(config.payload.chunk_size);
+        let chunk_file = File::open(&canonical_chunk_path)?;
+        let mut ciphertext = Vec::new();
+        chunk_file
+            .take(max_ciphertext_size.saturating_add(1))
+            .read_to_end(&mut ciphertext)?;
+        if ciphertext.len() as u64 > max_ciphertext_size {
+            bail!(
+                "Encrypted chunk {} exceeds the maximum size of {} bytes",
+                chunk_index,
+                max_ciphertext_size
+            );
+        }
+        total_ciphertext_size = total_ciphertext_size
+            .checked_add(ciphertext.len() as u64)
+            .context("Encrypted payload byte count overflowed u64")?;
 
         // Derive nonce
         let nonce = derive_chunk_nonce(&base_nonce, chunk_index as u32);
@@ -813,12 +845,27 @@ fn decrypt_all_chunks(
                 )
             })?;
 
-        // Decompress
-        let mut decoder = DeflateDecoder::new(&compressed[..]);
-        let mut chunk_plaintext = Vec::new();
-        decoder.read_to_end(&mut chunk_plaintext)?;
+        let chunk_plaintext =
+            decompress_archive_chunk(&compressed, config.payload.chunk_size, chunk_index)?;
+        total_plaintext_size = total_plaintext_size
+            .checked_add(chunk_plaintext.len() as u64)
+            .context("Decrypted payload byte count overflowed u64")?;
+        plaintext.extend_from_slice(&chunk_plaintext);
+    }
 
-        plaintext.extend(chunk_plaintext);
+    if total_ciphertext_size != config.payload.total_compressed_size {
+        bail!(
+            "Encrypted payload contains {} ciphertext bytes; config declares {}",
+            total_ciphertext_size,
+            config.payload.total_compressed_size
+        );
+    }
+    if total_plaintext_size != config.payload.total_plaintext_size {
+        bail!(
+            "Decrypted payload contains {} plaintext bytes; config declares {}",
+            total_plaintext_size,
+            config.payload.total_plaintext_size
+        );
     }
 
     progress(1.0);
@@ -834,7 +881,7 @@ fn encrypt_all_chunks(
     chunk_size: usize,
     payload_dir: &Path,
     progress: impl Fn(f32),
-) -> Result<usize> {
+) -> Result<(usize, u64)> {
     std::fs::create_dir_all(payload_dir)?;
 
     let cipher = Aes256Gcm::new_from_slice(dek).expect("Invalid key length");
@@ -844,6 +891,7 @@ fn encrypt_all_chunks(
     let total_chunks = plaintext.len().div_ceil(chunk_size);
     ensure_archive_chunk_count_fits_nonce_space(total_chunks as u64, chunk_size)?;
     let mut chunk_index = 0u32;
+    let mut total_ciphertext_size = 0u64;
 
     for (i, chunk) in plaintext.chunks(chunk_size).enumerate() {
         progress(i as f32 / total_chunks as f32);
@@ -879,6 +927,9 @@ fn encrypt_all_chunks(
         let chunk_path = payload_dir.join(&chunk_filename);
         let mut chunk_file = File::create(&chunk_path)?;
         chunk_file.write_all(&ciphertext)?;
+        total_ciphertext_size = total_ciphertext_size
+            .checked_add(ciphertext.len() as u64)
+            .context("Encrypted payload byte count overflowed u64")?;
 
         chunk_index = chunk_index.checked_add(1).ok_or_else(|| {
             anyhow::anyhow!(
@@ -890,7 +941,7 @@ fn encrypt_all_chunks(
     }
 
     progress(1.0);
-    Ok(chunk_index as usize)
+    Ok((chunk_index as usize, total_ciphertext_size))
 }
 
 /// Derive chunk nonce from base nonce and chunk index
@@ -1658,6 +1709,27 @@ mod tests {
     }
 
     #[test]
+    fn key_add_password_rejects_empty_and_whitespace_only_new_passwords() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+
+        for new_password in ["", "   ", "\t\n"] {
+            let err = key_add_password(&archive_dir, "test-password", new_password)
+                .expect_err("weak empty-equivalent password must not create a key slot");
+            assert!(
+                err.to_string().contains("empty or whitespace-only"),
+                "unexpected password validation error: {err:#}"
+            );
+        }
+
+        let config = load_config(&archive_dir).unwrap();
+        assert_eq!(
+            config.key_slots.len(),
+            1,
+            "rejected passwords must leave the archive config unchanged"
+        );
+    }
+
+    #[test]
     fn test_key_mutations_reject_unsupported_payload_compression() {
         let (_temp_dir, archive_dir) = setup_test_archive();
         key_add_password(&archive_dir, "test-password", "second-password").unwrap();
@@ -1820,6 +1892,10 @@ mod tests {
 
         // Old password should fail
         let config = load_config(&archive_dir).unwrap();
+        assert!(
+            config.payload.total_compressed_size > 0,
+            "rotated non-empty archives must record their ciphertext total"
+        );
         assert!(unwrap_dek_with_password(&config, "test-password").is_err());
 
         // New password should work and decrypt correctly

@@ -3507,6 +3507,23 @@ pub const CURRENT_SCHEMA_VERSION: i64 = 20;
 pub(crate) const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
 const LEGACY_OMP_RECLASSIFICATION_META_KEY: &str = "legacy_omp_reclassification_v2";
 const PREVIOUS_LEGACY_OMP_RECLASSIFICATION_META_KEY: &str = "legacy_omp_reclassification_v1";
+const SEMANTIC_FAST_IDENTITY_REBUILD_META_KEY: &str = "semantic_fast_identity_rebuild_v1";
+const SEMANTIC_QUALITY_IDENTITY_REBUILD_META_KEY: &str = "semantic_quality_identity_rebuild_v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SemanticIdentityTier {
+    Fast,
+    Quality,
+}
+
+impl SemanticIdentityTier {
+    const fn meta_key(self) -> &'static str {
+        match self {
+            Self::Fast => SEMANTIC_FAST_IDENTITY_REBUILD_META_KEY,
+            Self::Quality => SEMANTIC_QUALITY_IDENTITY_REBUILD_META_KEY,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LegacyOmpReclassificationResult {
@@ -8454,6 +8471,19 @@ impl FrankenStorage {
                 "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
                 fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY, pending_state.as_str()],
             )?;
+            // Semantic doc ids embed both the numeric agent id and a hash of
+            // source_id. Reclassification changes those filter identities in
+            // place without changing message rowids, so neither the semantic
+            // watermark nor the count/max-id DB fingerprint notices. Keep a
+            // durable fail-closed marker and remove the incremental watermark;
+            // a successful semantic republish clears the marker later.
+            for semantic_tier in [SemanticIdentityTier::Fast, SemanticIdentityTier::Quality] {
+                tx.execute_compat(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'required')",
+                    fparams![semantic_tier.meta_key()],
+                )?;
+            }
+            tx.execute("DELETE FROM meta WHERE key = 'last_embedded_message_id'")?;
             let now_ms = Self::now_millis();
             let mut normalized_sources = HashMap::new();
             for legacy in &legacy_conversations {
@@ -8534,10 +8564,22 @@ impl FrankenStorage {
         } else {
             // Bind a legacy/plain or older-context pending marker to the exact
             // ownership snapshot whose derived assets are about to rebuild.
-            self.conn.execute_compat(
+            // Older builds may already have committed the identity swap before
+            // crashing, so also invalidate semantic identity metadata on this
+            // zero-row recovery path.
+            let mut tx = self.conn.transaction()?;
+            tx.execute_compat(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
                 fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY, pending_state.as_str()],
             )?;
+            for semantic_tier in [SemanticIdentityTier::Fast, SemanticIdentityTier::Quality] {
+                tx.execute_compat(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'required')",
+                    fparams![semantic_tier.meta_key()],
+                )?;
+            }
+            tx.execute("DELETE FROM meta WHERE key = 'last_embedded_message_id'")?;
+            tx.commit()?;
         }
 
         self.rebuild_analytics()
@@ -13152,6 +13194,50 @@ impl FrankenStorage {
         self.conn.execute_compat(
             "INSERT OR REPLACE INTO meta(key, value) VALUES('last_embedded_message_id', ?1)",
             fparams![id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Whether semantic artifacts must be rebuilt because canonical filter
+    /// identity changed without advancing message rowids.
+    pub(crate) fn semantic_identity_rebuild_required(
+        &self,
+        tier: SemanticIdentityTier,
+    ) -> Result<bool> {
+        let state: Option<String> = self
+            .conn
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams![tier.meta_key()],
+                |row| row.get_typed(0),
+            )
+            .optional()?;
+        Ok(state.is_some_and(|value| value != "complete"))
+    }
+
+    /// Mark semantic filter identity stale until a full artifact publish has
+    /// durably completed.
+    #[cfg(test)]
+    pub(crate) fn mark_semantic_identity_rebuild_required(
+        &self,
+        tier: SemanticIdentityTier,
+    ) -> Result<()> {
+        self.conn.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'required')",
+            fparams![tier.meta_key()],
+        )?;
+        Ok(())
+    }
+
+    /// Acknowledge that the live semantic artifact was republished from the
+    /// current canonical agent/source identities.
+    pub(crate) fn complete_semantic_identity_rebuild(
+        &self,
+        tier: SemanticIdentityTier,
+    ) -> Result<()> {
+        self.conn.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'complete')",
+            fparams![tier.meta_key()],
         )?;
         Ok(())
     }
@@ -29498,6 +29584,13 @@ mod tests {
             |row| row.get_typed(0),
         )?;
         assert_eq!(legacy_metrics_slug, "pi_agent");
+        let legacy_message_id = storage
+            .max_message_id()?
+            .expect("legacy OMP fixture should contain one message");
+        storage.set_last_embedded_message_id(legacy_message_id)?;
+        for tier in [SemanticIdentityTier::Fast, SemanticIdentityTier::Quality] {
+            assert!(!storage.semantic_identity_rebuild_required(tier)?);
+        }
 
         assert_eq!(
             storage.reclassify_legacy_omp_conversations()?,
@@ -29506,6 +29599,17 @@ mod tests {
                 lexical_rebuild_required: true,
             }
         );
+        assert_eq!(
+            storage.get_last_embedded_message_id()?,
+            None,
+            "agent/source identity changes must invalidate the rowid-only semantic watermark"
+        );
+        for tier in [SemanticIdentityTier::Fast, SemanticIdentityTier::Quality] {
+            assert!(
+                storage.semantic_identity_rebuild_required(tier)?,
+                "each semantic tier must fail closed until its Pi-era doc ids are republished"
+            );
+        }
         assert_eq!(
             storage.reclassify_legacy_omp_conversations()?,
             LegacyOmpReclassificationResult {
@@ -29540,6 +29644,16 @@ mod tests {
         // transaction: the indexer calls this only after the canonical
         // SQLite-to-lexical publish succeeds.
         storage.complete_legacy_omp_reclassification()?;
+        assert!(storage.semantic_identity_rebuild_required(SemanticIdentityTier::Fast)?);
+        assert!(storage.semantic_identity_rebuild_required(SemanticIdentityTier::Quality)?);
+        storage.complete_semantic_identity_rebuild(SemanticIdentityTier::Fast)?;
+        assert!(!storage.semantic_identity_rebuild_required(SemanticIdentityTier::Fast)?);
+        assert!(
+            storage.semantic_identity_rebuild_required(SemanticIdentityTier::Quality)?,
+            "republishing the fast tier must not bless stale quality-tier doc ids"
+        );
+        storage.complete_semantic_identity_rebuild(SemanticIdentityTier::Quality)?;
+        assert!(!storage.semantic_identity_rebuild_required(SemanticIdentityTier::Quality)?);
         assert_eq!(
             storage.reclassify_legacy_omp_conversations()?,
             LegacyOmpReclassificationResult::default()
@@ -29554,6 +29668,10 @@ mod tests {
             .path()
             .join("backup/.omp/agent/sessions/-projects-cass/imported-legacy-omp.jsonl");
         storage.insert_conversations_batched(&[(pi_agent_id, None, &conversation)])?;
+        let imported_message_id = storage
+            .max_message_id()?
+            .expect("historical OMP fixture should contain messages");
+        storage.set_last_embedded_message_id(imported_message_id)?;
         assert_eq!(
             storage.reclassify_legacy_omp_conversations()?,
             LegacyOmpReclassificationResult::default(),
@@ -29566,6 +29684,9 @@ mod tests {
                 lexical_rebuild_required: true,
             }
         );
+        assert_eq!(storage.get_last_embedded_message_id()?, None);
+        assert!(storage.semantic_identity_rebuild_required(SemanticIdentityTier::Fast)?);
+        assert!(storage.semantic_identity_rebuild_required(SemanticIdentityTier::Quality)?);
         let conversations = storage.list_conversations(10, 0)?;
         assert_eq!(conversations.len(), 2);
         assert!(

@@ -1346,7 +1346,7 @@ pub enum Commands {
         include_skills: bool,
 
         /// Default theme (dark or light)
-        #[arg(long, default_value = "dark")]
+        #[arg(long, default_value = "dark", value_parser = ["dark", "light"])]
         theme: String,
 
         /// Validate without writing file
@@ -98169,6 +98169,7 @@ fn run_export_html(
         syntax_highlighting: true,
         include_search: true,
         include_theme_toggle: true,
+        default_theme: theme.to_string(),
         encrypt,
         print_styles: true,
         agent_name: agent_name.clone(),

@@ -1016,6 +1016,23 @@ fn refuse_stale_semantic_assets(
     availability_if_served: &SemanticAvailability,
     preference: crate::search::asset_state::SemanticPreference,
 ) -> Option<SemanticAvailability> {
+    match storage.semantic_identity_rebuild_required() {
+        Ok(true) => {
+            return Some(SemanticAvailability::IndexStale {
+                embedder_id: served_embedder_id.to_string(),
+                reason: "canonical agent/source identity changed; run 'cass index --semantic' to rebuild semantic filter metadata"
+                    .to_string(),
+            });
+        }
+        Ok(false) => {}
+        Err(err) => {
+            return Some(SemanticAvailability::LoadFailed {
+                context: format!(
+                    "checking canonical semantic identity invalidation marker: {err}"
+                ),
+            });
+        }
+    }
     let db_fingerprint = match crate::indexer::lexical_storage_fingerprint_for_storage(storage) {
         Ok(fingerprint) => fingerprint,
         Err(err) => {
@@ -1474,6 +1491,34 @@ mod tests {
                 .context
                 .is_some(),
             "manifest-less artifacts keep serving"
+        );
+
+        // Canonical identity rewrites (such as Pi -> OMP reclassification)
+        // do not change the count/max-id fingerprint. The durable storage
+        // marker must therefore override even the legacy manifest-less
+        // serving allowance until a semantic republish acknowledges it.
+        let storage = FrankenStorage::open(&db_path).expect("open identity marker fixture");
+        storage
+            .mark_semantic_identity_rebuild_required()
+            .expect("mark semantic identity stale");
+        drop(storage);
+        let identity_stale = load_hash_semantic_context(tmp.path(), &db_path);
+        assert!(identity_stale.context.is_none());
+        assert!(
+            identity_stale.availability.is_index_stale(),
+            "identity-invalidated semantic assets must fail closed: {:?}",
+            identity_stale.availability
+        );
+        let storage = FrankenStorage::open(&db_path).expect("reopen identity marker fixture");
+        storage
+            .complete_semantic_identity_rebuild()
+            .expect("complete semantic identity rebuild");
+        drop(storage);
+        assert!(
+            load_hash_semantic_context(tmp.path(), &db_path)
+                .context
+                .is_some(),
+            "an acknowledged semantic republish should restore manifest-less serving"
         );
 
         // A manifest record whose fingerprint belongs to some other database.
