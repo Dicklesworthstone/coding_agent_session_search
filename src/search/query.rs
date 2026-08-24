@@ -270,8 +270,14 @@ type SqliteFtsMessageRow = (
     Option<String>,
 );
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SqliteMessageScanTermPart {
+    text: String,
+    prefix: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum SqliteMessageScanOperand {
-    Terms(Vec<String>),
+    Terms(Vec<SqliteMessageScanTermPart>),
     Phrase(Vec<String>),
 }
 
@@ -7748,11 +7754,14 @@ impl SearchClient {
     }
 
     fn sqlite_message_scan_query(raw_query: &str) -> Option<SqliteMessageScanQuery> {
-        fn scan_parts(parts: Vec<String>) -> Vec<String> {
+        fn scan_parts(parts: Vec<String>) -> Vec<SqliteMessageScanTermPart> {
             parts
                 .into_iter()
-                .map(|part| part.trim_end_matches('*').to_lowercase())
-                .filter(|part| !part.is_empty())
+                .filter_map(|part| {
+                    let prefix = part.ends_with('*');
+                    let text = part.trim_end_matches('*').to_lowercase();
+                    (!text.is_empty()).then_some(SqliteMessageScanTermPart { text, prefix })
+                })
                 .collect()
         }
 
@@ -7887,28 +7896,27 @@ impl SearchClient {
         haystacks: &[String],
         scan_query: &SqliteMessageScanQuery,
     ) -> f32 {
-        let has_phrase = scan_query.groups.iter().flatten().any(|alternative| {
-            matches!(
-                &alternative.operand,
-                SqliteMessageScanOperand::Phrase(_)
-            )
-        });
-        let tokenized_haystacks = has_phrase.then(|| {
-            haystacks
-                .iter()
-                .map(|haystack| normalize_phrase_terms(haystack))
-                .collect::<Vec<_>>()
-        });
+        let tokenized_haystacks = haystacks
+            .iter()
+            .map(|haystack| normalize_phrase_terms(haystack))
+            .collect::<Vec<_>>();
 
         let operand_score = |operand: &SqliteMessageScanOperand| -> f32 {
             match operand {
                 SqliteMessageScanOperand::Terms(terms) => {
                     let mut score = 0.0;
                     for term in terms {
-                        let matches = haystacks
+                        let matches = tokenized_haystacks
                             .iter()
-                            .map(|haystack| haystack.matches(term).count())
-                            .sum::<usize>();
+                            .flatten()
+                            .filter(|token| {
+                                if term.prefix {
+                                    token.starts_with(term.text.as_str())
+                                } else {
+                                    token.as_str() == term.text
+                                }
+                            })
+                            .count();
                         if matches < 1 {
                             return 0.0;
                         }
@@ -7917,8 +7925,6 @@ impl SearchClient {
                     score
                 }
                 SqliteMessageScanOperand::Phrase(phrase) => tokenized_haystacks
-                    .as_deref()
-                    .unwrap_or_default()
                     .iter()
                     .map(|tokens| {
                         tokens
@@ -14269,6 +14275,29 @@ mod tests {
             score(&["alpha", "beta"], &phrase),
             0.0,
             "phrase must not bridge content and title"
+        );
+    }
+
+    #[test]
+    fn sqlite_message_scan_uses_token_exact_and_prefix_semantics() {
+        fn score(haystack: &str, query: &SqliteMessageScanQuery) -> f32 {
+            SearchClient::sqlite_message_scan_score(&[haystack.to_lowercase()], query)
+        }
+
+        let exact = SearchClient::sqlite_message_scan_query("row").expect("exact scan query");
+        assert!(score("one row", &exact) > 0.0);
+        assert_eq!(
+            score("one arrow", &exact),
+            0.0,
+            "an exact term must not match inside another token"
+        );
+
+        let prefix = SearchClient::sqlite_message_scan_query("foo*").expect("prefix scan query");
+        assert!(score("foobar", &prefix) > 0.0);
+        assert_eq!(
+            score("seafood", &prefix),
+            0.0,
+            "a prefix term must not degrade to an arbitrary substring"
         );
     }
 

@@ -796,9 +796,10 @@ pub(crate) fn open_franken_raw_readonly_connection_with_timeout(
 ///
 /// This mirrors [`open_franken_raw_readonly_connection_with_timeout`]'s doctor
 /// lock, bounded contention retry, and one-shot dirty-WAL recovery contract,
-/// but returns the thread-safe dispatch handle required by shared search
-/// clients. The worker creates, uses, closes, and drops the `!Send` raw
-/// connection on that same worker thread.
+/// and retains the canonical storage opener's duplicate-FTS-schema repair. It
+/// returns the thread-safe dispatch handle required by shared search clients.
+/// The worker creates, uses, closes, and drops the `!Send` raw connection on
+/// that same worker thread.
 pub(crate) fn open_franken_async_readonly_connection_with_timeout(
     path: &Path,
     timeout: Duration,
@@ -811,6 +812,7 @@ pub(crate) fn open_franken_async_readonly_connection_with_timeout(
     let deadline = Instant::now() + timeout;
     let mut backoff = Duration::from_millis(4);
     let mut wal_recovery_attempted = false;
+    let mut duplicate_fts_repair_attempted = false;
     loop {
         let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
         match FrankenAsyncConnection::open_with_flags_sync(
@@ -835,6 +837,18 @@ pub(crate) fn open_franken_async_readonly_connection_with_timeout(
                     remaining,
                     Duration::from_millis(128),
                 );
+            }
+            Err(err)
+                if !duplicate_fts_repair_attempted
+                    && format!("{err:#}").contains("conflicting virtual-table entries") =>
+            {
+                tracing::warn!(
+                    db = %path.display(),
+                    error = %err,
+                    "dedicated-owner readonly open found duplicate fts_messages schema rows; deduplicating through the sanctioned sqlite3 bridge"
+                );
+                dedupe_conflicting_fts_schema_rows_via_sqlite3(path)?;
+                duplicate_fts_repair_attempted = true;
             }
             Err(err)
                 if !wal_recovery_attempted && attempt_dirty_wal_recovery_checkpoint(path, &err) =>
@@ -31284,6 +31298,23 @@ mod tests {
             .unwrap();
         assert_eq!(duplicate_rows, 2);
         drop(conn);
+
+        let mut owner_reader = open_franken_async_readonly_connection_with_timeout(
+            &db_path,
+            Duration::from_secs(5),
+        )
+        .expect("dedicated-owner readonly open should repair duplicate FTS schema rows");
+        let message_rows = owner_reader
+            .query_sync("SELECT COUNT(*) FROM messages")
+            .expect("canonical messages must remain readable after schema-row dedupe");
+        assert_eq!(
+            message_rows[0].get_typed::<i64>(0).unwrap(),
+            1,
+            "dedupe must preserve canonical archive rows"
+        );
+        owner_reader
+            .close_without_checkpoint_sync()
+            .expect("dedicated-owner duplicate-schema probe should close cleanly");
 
         let reopened = FrankenStorage::open(&db_path).unwrap();
         assert_eq!(reopened.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);

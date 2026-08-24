@@ -363,21 +363,6 @@ fn local_omp_store_roots_from(
     roots
 }
 
-fn local_omp_store_roots() -> Vec<(PathBuf, Option<String>)> {
-    let config_name = dotenvy::var("PI_CONFIG_DIR")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| ".omp".to_string());
-    local_omp_store_roots_from(
-        dirs::home_dir().as_deref(),
-        nonempty_env_path("XDG_DATA_HOME").as_deref(),
-        nonempty_env_path("PI_CODING_AGENT_SESSION_DIR").as_deref(),
-        nonempty_env_path("CASS_OMP_DATA_ROOT").as_deref(),
-        &config_name,
-        active_profile_from_env(),
-    )
-}
-
 fn cass_omp_store_roots() -> Vec<(PathBuf, Option<String>)> {
     nonempty_env_path("CASS_OMP_DATA_ROOT")
         .as_deref()
