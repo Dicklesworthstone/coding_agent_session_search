@@ -33,6 +33,13 @@ struct BoundDaemonSocket {
     bind_path: PathBuf,
 }
 
+fn protocol_version_mismatch_message(actual_version: u32) -> String {
+    format!(
+        "protocol version mismatch: expected {}, got {}",
+        PROTOCOL_VERSION, actual_version
+    )
+}
+
 fn create_owner_only_dir_all(path: &Path) -> std::io::Result<()> {
     let mut builder = DirBuilder::new();
     builder.recursive(true);
@@ -628,10 +635,7 @@ impl ModelDaemon {
                             msg.request_id,
                             Response::Error(ErrorResponse {
                                 code: ErrorCode::VersionMismatch,
-                                message: format!(
-                                    "protocol version mismatch: expected {}, got {}",
-                                    PROTOCOL_VERSION, msg.version
-                                ),
+                                message: protocol_version_mismatch_message(msg.version),
                                 retryable: false,
                                 retry_after_ms: None,
                             }),
@@ -1028,51 +1032,72 @@ mod tests {
     }
 
     #[test]
-    fn incompatible_protocol_shutdown_is_rejected_without_side_effects() {
+    fn incompatible_protocol_shutdown_is_rejected_without_side_effects()
+    -> Result<(), Box<dyn std::error::Error>> {
         let config = DaemonConfig {
             request_timeout: Duration::from_secs(1),
             ..Default::default()
         };
         let models = ModelManager::new(&test_data_dir());
         let daemon = Arc::new(ModelDaemon::new(config, models));
-        let (server_stream, mut client_stream) = UnixStream::pair().expect("create socket pair");
+        let (server_stream, mut client_stream) = UnixStream::pair()?;
 
         let handler_daemon = Arc::clone(&daemon);
-        let handler =
-            std::thread::spawn(move || handler_daemon.handle_connection(server_stream));
+        let handler = std::thread::spawn(move || handler_daemon.handle_connection(server_stream));
 
         let request = FramedMessage {
             version: PROTOCOL_VERSION + 1,
             request_id: "future-shutdown".to_string(),
             payload: Request::Shutdown,
         };
-        client_stream
-            .write_all(&encode_message(&request).expect("encode request"))
-            .expect("write request");
+        let encoded = encode_message(&request)?;
+        client_stream.write_all(&encoded)?;
 
         let mut len = [0_u8; 4];
-        client_stream
-            .read_exact(&mut len)
-            .expect("read response length");
+        client_stream.read_exact(&mut len)?;
         let mut payload = vec![0_u8; u32::from_be_bytes(len) as usize];
-        client_stream
-            .read_exact(&mut payload)
-            .expect("read response payload");
-        let response = decode_message::<Response>(&payload).expect("decode response");
-
-        assert_eq!(response.version, PROTOCOL_VERSION);
-        assert_eq!(response.request_id, "future-shutdown");
-        let Response::Error(error) = response.payload else {
-            panic!("version mismatch must return an error response");
-        };
-        assert_eq!(error.code, ErrorCode::VersionMismatch);
-        assert!(!error.retryable);
-        assert!(error.message.contains("expected 1, got 2"));
-        assert!(!daemon.shutdown.load(Ordering::SeqCst));
-        assert_eq!(daemon.total_requests.load(Ordering::Relaxed), 0);
+        client_stream.read_exact(&mut payload)?;
+        let response = decode_message::<Response>(&payload)?;
 
         drop(client_stream);
-        assert!(handler.join().expect("handler thread").is_ok());
+        handler
+            .join()
+            .map_err(|_| std::io::Error::other("handler thread panicked"))??;
+
+        if response.version != PROTOCOL_VERSION {
+            return Err(std::io::Error::other("response used the wrong protocol version").into());
+        }
+        if response.request_id != "future-shutdown" {
+            return Err(std::io::Error::other("response used the wrong request ID").into());
+        }
+        let error = match response.payload {
+            Response::Error(error) => error,
+            _ => {
+                return Err(
+                    std::io::Error::other("version mismatch did not return an error").into(),
+                );
+            }
+        };
+        if error.code != ErrorCode::VersionMismatch || error.retryable {
+            return Err(std::io::Error::other("version mismatch error metadata was wrong").into());
+        }
+        let expected_message = format!(
+            "expected {}, got {}",
+            PROTOCOL_VERSION,
+            PROTOCOL_VERSION + 1
+        );
+        if !error.message.contains(&expected_message) {
+            return Err(std::io::Error::other("version mismatch error lacked context").into());
+        }
+        if daemon.shutdown.load(Ordering::SeqCst) {
+            return Err(std::io::Error::other("incompatible shutdown changed daemon state").into());
+        }
+        if daemon.total_requests.load(Ordering::Relaxed) != 0 {
+            return Err(
+                std::io::Error::other("incompatible request changed the request count").into(),
+            );
+        }
+        Ok(())
     }
 
     #[test]

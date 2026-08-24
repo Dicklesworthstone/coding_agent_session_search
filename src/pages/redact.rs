@@ -1,6 +1,7 @@
 use regex::Regex;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -476,6 +477,32 @@ pub fn redact_swarm_json_value(value: &Value) -> Value {
     redact_swarm_json_value_with_engine(&engine, value)
 }
 
+fn insert_redacted_swarm_entry(
+    object: &mut Map<String, Value>,
+    next_suffixes: &mut HashMap<String, usize>,
+    redacted_key: String,
+    value: Value,
+) {
+    if !object.contains_key(&redacted_key) {
+        object.insert(redacted_key, value);
+        return;
+    }
+
+    let next_suffix = next_suffixes.entry(redacted_key.clone()).or_insert(2);
+    let mut candidate = String::with_capacity(redacted_key.len() + 21);
+    loop {
+        candidate.clear();
+        candidate.push_str(&redacted_key);
+        candidate.push('#');
+        let _ = write!(&mut candidate, "{next_suffix}");
+        *next_suffix = next_suffix.saturating_add(1);
+        if !object.contains_key(&candidate) {
+            object.insert(candidate, value);
+            return;
+        }
+    }
+}
+
 fn redact_swarm_json_value_with_engine(engine: &RedactionEngine, value: &Value) -> Value {
     match value {
         Value::String(text) => Value::String(engine.redact_text(text).output),
@@ -485,17 +512,19 @@ fn redact_swarm_json_value_with_engine(engine: &RedactionEngine, value: &Value) 
                 .map(|item| redact_swarm_json_value_with_engine(engine, item))
                 .collect(),
         ),
-        Value::Object(object) => Value::Object(
-            object
-                .iter()
-                .map(|(key, value)| {
-                    (
-                        engine.redact_text(key).output,
-                        redact_swarm_json_value_with_engine(engine, value),
-                    )
-                })
-                .collect::<Map<_, _>>(),
-        ),
+        Value::Object(object) => {
+            let mut redacted = Map::with_capacity(object.len());
+            let mut next_suffixes = HashMap::new();
+            for (key, value) in object {
+                insert_redacted_swarm_entry(
+                    &mut redacted,
+                    &mut next_suffixes,
+                    engine.redact_text(key).output,
+                    redact_swarm_json_value_with_engine(engine, value),
+                );
+            }
+            Value::Object(redacted)
+        }
         Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
     }
 }
@@ -959,6 +988,36 @@ mod tests {
         assert!(serialized.contains("[REDACTED_PATH]"));
         assert!(serialized.contains("[SECRET_ENV_REDACTED]"));
         assert!(serialized.contains("pack://[REDACTED_PATH]#L44"));
+    }
+
+    #[test]
+    fn swarm_json_redaction_preserves_values_when_keys_collide() -> Result<(), String> {
+        let input = serde_json::json!({
+            "TOKEN=abcdefgh": "first", // ubs:ignore — synthetic collision fixture, not a credential.
+            "PASSWORD=ijklmnop": "second", // ubs:ignore — synthetic collision fixture, not a credential.
+            "[SECRET_ENV_REDACTED]#2": "preexisting",
+        });
+
+        let output = redact_swarm_json_value(&input);
+        let object = output
+            .as_object()
+            .ok_or_else(|| "redacted swarm JSON was not an object".to_owned())?;
+        if object.len() != 3 {
+            return Err("swarm redaction overwrote an object value".to_owned());
+        }
+        let mut values = object
+            .values()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        if values != ["first", "preexisting", "second"] {
+            return Err(format!("redacted swarm values changed: {values:?}"));
+        }
+        object
+            .keys()
+            .all(|key| !key.contains("abcdefgh") && !key.contains("ijklmnop"))
+            .then_some(())
+            .ok_or_else(|| "collision suffix leaked source-key bytes".to_owned())
     }
 
     #[test]

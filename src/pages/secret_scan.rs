@@ -173,7 +173,8 @@ static BUILTIN_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
         SecretPattern {
             id: "aws_access_key_id",
             severity: SecretSeverity::High,
-            regex: Regex::new(r"\bAKIA[0-9A-Z]{16}\b").expect("aws access key regex"),
+            regex: Regex::new(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")
+                .expect("aws access key regex"),
         },
         SecretPattern {
             id: "aws_secret_key",
@@ -211,7 +212,7 @@ static BUILTIN_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
             id: "private_key",
             severity: SecretSeverity::Critical,
             regex: Regex::new(
-                r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----",
+                r"-----BEGIN (?:RSA PRIVATE KEY|EC PRIVATE KEY|DSA PRIVATE KEY|OPENSSH PRIVATE KEY|PRIVATE KEY|ENCRYPTED PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----",
             )
             .expect("private key regex"),
         },
@@ -1203,13 +1204,24 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn builtin_patterns_aws_access_key_detected() {
-        let text = "Found key AKIAIOSFODNN7EXAMPLE in config";
+    fn builtin_patterns_aws_access_key_detected() -> Result<(), String> {
         let pattern = &BUILTIN_PATTERNS[0]; // aws_access_key_id
-        assert!(
-            pattern.regex.is_match(text),
-            "should detect AWS access key ID"
-        );
+        let cases = [
+            ("Found key AKIAIOSFODNN7EXAMPLE in config", true),
+            ("Found temporary key ASIAIOSFODNN7EXAMPLE in config", true),
+            ("ASIAIOSFODNN7EXAMPL", false),
+            ("asiaiosfodnn7example", false),
+        ];
+        match cases
+            .into_iter()
+            .find(|(input, expected)| pattern.regex.is_match(input) != *expected)
+        {
+            Some((input, expected)) => Err(format!(
+                "AWS access-key scanner returned {} for {input:?}, expected {expected}",
+                pattern.regex.is_match(input)
+            )),
+            None => Ok(()),
+        }
     }
 
     #[test]
@@ -1234,10 +1246,23 @@ mod tests {
     }
 
     #[test]
-    fn builtin_patterns_private_key_detected() {
-        let text = "-----BEGIN RSA PRIVATE KEY-----\nMIIE...";
+    fn builtin_patterns_private_key_detected() -> Result<(), String> {
         let pattern = &BUILTIN_PATTERNS[6]; // private_key
-        assert!(pattern.regex.is_match(text), "should detect private key");
+        for kind in [
+            "RSA PRIVATE KEY",
+            "EC PRIVATE KEY",
+            "DSA PRIVATE KEY",
+            "OPENSSH PRIVATE KEY",
+            "PRIVATE KEY",
+            "ENCRYPTED PRIVATE KEY",
+            "PGP PRIVATE KEY BLOCK",
+        ] {
+            let text = format!("-----BEGIN {kind}-----\nMIIE...");
+            if !pattern.regex.is_match(&text) {
+                return Err(format!("post-hoc scanner missed {kind}"));
+            }
+        }
+        Ok(())
     }
 
     #[test]

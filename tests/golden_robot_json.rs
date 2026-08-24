@@ -59,11 +59,23 @@ fn cass_cmd(test_home: &std::path::Path) -> Command {
         .env("GEMINI_HOME", gemini_home)
         .env("OPENCODE_STORAGE_ROOT", opencode_root)
         .env("CASS_AIDER_DATA_ROOT", aider_root)
+        // Never probe or connect to a daemon owned by the host running the
+        // golden suite. The default socket is user-global, while each golden
+        // must observe only its synthetic HOME.
+        .env("CASS_DAEMON_SOCKET", test_home.join("cass-daemon.sock"))
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
         // Keep resource-policy goldens stable across hosts; dynamic default
         // scaling is covered by responsiveness unit tests.
         .env("CASS_RESPONSIVENESS_MAX_INFLIGHT_BYTES", "536870912");
     cmd
+}
+
+/// Keep doctor fixtures independent of a repository that happens to contain
+/// the platform temp directory. RCH workers may place `tempfile` directories
+/// beneath the checkout; without this inner repository boundary, doctor sees
+/// the checkout's `.gitignore` as policy for the synthetic archive.
+fn isolate_doctor_fixture_from_parent_repo(test_home: &Path) -> io::Result<()> {
+    fs::create_dir(test_home.join(".git"))
 }
 
 fn seed_analytics_incidents_fixture(test_home: &Path) -> PathBuf {
@@ -815,11 +827,9 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
         .replace_all(&out, r#""slowest_operation": "[LIVE_OPERATION]""#)
         .to_string();
 
-    // 5b. The semantic daemon socket path derives from $TMPDIR and $USER
-    // ("$TMPDIR/cass-semantic-daemon-$USER.sock"), so its value is pure host
-    // environment — a golden regenerated on a different machine (or through
-    // rch) would otherwise freeze that host's temp dir into the contract.
-    // Keep the field, scrub the value.
+    // 5b. The semantic daemon socket path is host-local. `cass_cmd` pins it to
+    // the fixture, and scrubbing its value keeps the contract stable for any
+    // direct callers that do not use that helper.
     let socket_path_re = regex::Regex::new(r#""socket_path"\s*:\s*"[^"]*""#).unwrap();
     out = socket_path_re
         .replace_all(&out, r#""socket_path": "[DAEMON_SOCKET]""#)
@@ -1523,8 +1533,9 @@ fn diag_quarantine_json_matches_golden() {
 }
 
 #[test]
-fn doctor_quarantine_json_matches_golden() {
+fn doctor_quarantine_json_matches_golden() -> Result<(), Box<dyn Error>> {
     let test_home = tempfile::tempdir().expect("create temp home");
+    isolate_doctor_fixture_from_parent_repo(test_home.path())?;
     let data_dir = seed_diag_quarantine_fixture(test_home.path());
     let output = cass_cmd(test_home.path())
         .env("CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "1")
@@ -1549,6 +1560,7 @@ fn doctor_quarantine_json_matches_golden() {
     let canonical = serde_json::to_string_pretty(&parsed).expect("pretty-print JSON");
     let scrubbed = scrub_robot_json(&canonical, test_home.path());
     assert_golden("robot/doctor_quarantine.json.golden", &scrubbed);
+    Ok(())
 }
 
 #[test]
@@ -2262,14 +2274,16 @@ fn export_html_shape_matches_golden() {
 // of the pin; the shape-side lives in doctor_shape.json.golden
 // (bead q931h).
 #[test]
-fn doctor_json_matches_golden() {
+fn doctor_json_matches_golden() -> Result<(), Box<dyn Error>> {
     let test_home = tempfile::tempdir().expect("create temp home");
+    isolate_doctor_fixture_from_parent_repo(test_home.path())?;
     let scrubbed = capture_robot_json(
         test_home.path(),
         &["doctor", "--json"],
         ExpectStatus::ExitOk,
     );
     assert_golden("robot/doctor.json.golden", &scrubbed);
+    Ok(())
 }
 
 #[test]
@@ -2295,8 +2309,9 @@ fn status_shape_matches_golden() {
 }
 
 #[test]
-fn doctor_shape_matches_golden() {
+fn doctor_shape_matches_golden() -> Result<(), Box<dyn Error>> {
     let test_home = tempfile::tempdir().expect("create temp home");
+    isolate_doctor_fixture_from_parent_repo(test_home.path())?;
     let doctor = capture_robot_json_value(
         test_home.path(),
         &["doctor", "--json"],
@@ -2305,6 +2320,7 @@ fn doctor_shape_matches_golden() {
     let canonical =
         serde_json::to_string_pretty(&json_value_schema(&doctor)).expect("pretty-print JSON");
     assert_golden("robot/doctor_shape.json.golden", &canonical);
+    Ok(())
 }
 
 #[test]

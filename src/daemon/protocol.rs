@@ -505,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wire_compatibility_embed_response() -> TestResult {
+    fn test_embed_response_round_trip() -> TestResult {
         let msg = FramedMessage::new(
             "resp-embed",
             Response::Embed(EmbedResponse {
@@ -530,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wire_compatibility_rerank_response() -> TestResult {
+    fn test_rerank_response_round_trip() -> TestResult {
         let msg = FramedMessage::new(
             "resp-rerank",
             Response::Rerank(RerankResponse {

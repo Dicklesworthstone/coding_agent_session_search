@@ -46,7 +46,10 @@
     "open_error": null,
     "open_retryable": false,
     "counts_skipped": false,
-    "open_skipped": false
+    "open_skipped": false,
+    "integrity": "unknown",
+    "integrity_detail": null,
+    "integrity_hint": null
   },
   "pending": {
     "sessions": 0,

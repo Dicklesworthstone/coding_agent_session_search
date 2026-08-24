@@ -144,6 +144,15 @@
         },
         "open_skipped": {
           "type": "boolean"
+        },
+        "integrity": {
+          "type": "string"
+        },
+        "integrity_detail": {
+          "type": "null"
+        },
+        "integrity_hint": {
+          "type": "null"
         }
       }
     },

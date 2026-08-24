@@ -138,18 +138,16 @@ fn retry_transient_statement<T>(
     }
 }
 
-/// Classify the manual-transaction effect of a Connection-level statement.
-fn manual_txn_transition(sql: &str) -> Option<bool> {
-    let head = sql.trim_start().get(..12).unwrap_or(sql.trim_start());
-    let head = head.to_ascii_uppercase();
-    if head.starts_with("BEGIN") {
-        Some(true)
-    } else if head.starts_with("COMMIT") || head.starts_with("ROLLBACK") || head.starts_with("END")
-    {
-        Some(false)
-    } else {
-        None
-    }
+/// True when a single-statement execution is opening an explicit transaction.
+///
+/// `BEGIN` itself is not an autocommit statement, so it must never take the
+/// `BusySnapshot` retry path. All state after execution comes from the engine's
+/// authoritative `Connection::in_transaction()` flag rather than SQL text.
+fn starts_manual_transaction(sql: &str) -> bool {
+    sql.trim_start()
+        .split(|character: char| character.is_ascii_whitespace() || character == ';')
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("BEGIN"))
 }
 
 macro_rules! with_engine_retries {
@@ -175,10 +173,6 @@ macro_rules! with_engine_retries {
 /// blocking method signatures.
 pub struct Connection {
     inner: frankensqlite::Connection,
-    /// True while a caller-managed `BEGIN`-family transaction is open on this
-    /// connection. Tracked so autocommit-only `BusySnapshot` retries never
-    /// re-run a statement whose enclosing explicit transaction was aborted.
-    manual_txn: std::cell::Cell<bool>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -194,7 +188,6 @@ impl Connection {
     pub fn open(path: impl Into<String>) -> Result<Self, FrankenError> {
         Ok(Self {
             inner: drive(frankensqlite::Connection::open(path))?,
-            manual_txn: std::cell::Cell::new(false),
         })
     }
 
@@ -202,7 +195,6 @@ impl Connection {
     pub fn open_existing_schema_only(path: impl Into<String>) -> Result<Self, FrankenError> {
         Ok(Self {
             inner: drive(frankensqlite::Connection::open_existing_schema_only(path))?,
-            manual_txn: std::cell::Cell::new(false),
         })
     }
 
@@ -213,7 +205,6 @@ impl Connection {
     ) -> Result<Self, FrankenError> {
         Ok(Self {
             inner: drive(frankensqlite::Connection::open_existing_schema_only_deferred_fts5(path))?,
-            manual_txn: std::cell::Cell::new(false),
         })
     }
 
@@ -225,17 +216,10 @@ impl Connection {
 
     /// Execute a single SQL statement, returning the affected row count.
     pub fn execute(&self, sql: &str) -> Result<usize, FrankenError> {
-        let transition = manual_txn_transition(sql);
-        let allow_snapshot_retry = !self.manual_txn.get() && transition != Some(true);
-        let result = retry_transient_statement(allow_snapshot_retry, || {
+        let allow_snapshot_retry = !self.inner.in_transaction() && !starts_manual_transaction(sql);
+        retry_transient_statement(allow_snapshot_retry, || {
             with_engine_retries!(self.inner, sql, drive(self.inner.execute(sql)))
-        });
-        if result.is_ok()
-            && let Some(open) = transition
-        {
-            self.manual_txn.set(open);
-        }
-        result
+        })
     }
 
     /// Execute a single SQL statement with positional parameters.
@@ -244,7 +228,7 @@ impl Connection {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<usize, FrankenError> {
-        let allow_snapshot_retry = !self.manual_txn.get();
+        let allow_snapshot_retry = !self.inner.in_transaction() && !starts_manual_transaction(sql);
         retry_transient_statement(allow_snapshot_retry, || {
             with_engine_retries!(
                 self.inner,
@@ -261,7 +245,7 @@ impl Connection {
 
     /// Query, returning all rows.
     pub fn query(&self, sql: &str) -> Result<Vec<Row>, FrankenError> {
-        let allow_snapshot_retry = !self.manual_txn.get();
+        let allow_snapshot_retry = !self.inner.in_transaction();
         retry_transient_statement(allow_snapshot_retry, || {
             with_engine_retries!(self.inner, sql, drive(self.inner.query(sql)))
         })
@@ -273,7 +257,7 @@ impl Connection {
         sql: &str,
         params: &[SqliteValue],
     ) -> Result<Vec<Row>, FrankenError> {
-        let allow_snapshot_retry = !self.manual_txn.get();
+        let allow_snapshot_retry = !self.inner.in_transaction();
         retry_transient_statement(allow_snapshot_retry, || {
             with_engine_retries!(
                 self.inner,
@@ -443,7 +427,6 @@ pub mod compat {
     pub fn open_with_flags(path: &str, flags: OpenFlags) -> Result<Connection, FrankenError> {
         Ok(Connection {
             inner: drive(frankensqlite::compat::open_with_flags(path, flags))?,
-            manual_txn: std::cell::Cell::new(false),
         })
     }
 
@@ -699,5 +682,84 @@ pub mod migrate {
         pub fn run(&self, conn: &Connection) -> Result<MigrationResult, FrankenError> {
             drive(self.inner.run(conn.as_async()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn begin_classifier_accepts_supported_single_statement_spellings() -> Result<(), String> {
+        let cases = [
+            (" BEGIN IMMEDIATE TRANSACTION; ", true),
+            ("begin;", true),
+            ("BEGINNING", false),
+            ("COMMIT;", false),
+            ("ROLLBACK TO savepoint_name;", false),
+        ];
+        match cases
+            .into_iter()
+            .find(|(sql, expected)| starts_manual_transaction(sql) != *expected)
+        {
+            Some((sql, expected)) => Err(format!(
+                "BEGIN classifier returned {} for {sql:?}, expected {expected}",
+                starts_manual_transaction(sql)
+            )),
+            None => Ok(()),
+        }
+    }
+
+    #[test]
+    fn engine_transaction_state_covers_every_execution_surface()
+    -> Result<(), Box<dyn std::error::Error>> {
+        fn require(condition: bool, message: &'static str) -> Result<(), std::io::Error> {
+            condition
+                .then_some(())
+                .ok_or_else(|| std::io::Error::other(message))
+        }
+
+        let conn = Connection::open(":memory:")?;
+        require(
+            !conn.as_async().in_transaction(),
+            "new connection marked in transaction",
+        )?;
+
+        let invalid = conn.execute_batch("BEGIN INVALID;");
+        require(invalid.is_err(), "invalid BEGIN unexpectedly succeeded")?;
+        require(
+            !conn.as_async().in_transaction(),
+            "failed control statement changed bridge state",
+        )?;
+
+        conn.execute_batch("BEGIN IMMEDIATE TRANSACTION; CREATE TABLE batch_opened (id INTEGER);")?;
+        require(
+            conn.as_async().in_transaction(),
+            "multi-statement batch BEGIN was not observed",
+        )?;
+        conn.execute("SAVEPOINT bridge_state_test")?;
+        conn.execute("ROLLBACK TO bridge_state_test")?;
+        require(
+            conn.as_async().in_transaction(),
+            "ROLLBACK TO incorrectly closed the outer transaction",
+        )?;
+        conn.execute("RELEASE bridge_state_test")?;
+        conn.execute_batch("COMMIT;")?;
+        require(
+            !conn.as_async().in_transaction(),
+            "COMMIT left transaction marked open",
+        )?;
+
+        conn.execute_with_params("BEGIN;", &[])?;
+        require(
+            conn.as_async().in_transaction(),
+            "parameterized BEGIN was not observed",
+        )?;
+        conn.execute_with_params("ROLLBACK;", &[])?;
+        require(
+            !conn.as_async().in_transaction(),
+            "ROLLBACK left transaction marked open",
+        )?;
+        Ok(())
     }
 }
