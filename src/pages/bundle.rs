@@ -1064,12 +1064,7 @@ fn ensure_private_artifact_dir(private_dir: &Path) -> Result<()> {
             secure_private_artifact_dir(private_dir)
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(private_dir).with_context(|| {
-                format!(
-                    "Failed to create private artifact directory {}",
-                    private_dir.display()
-                )
-            })?;
+            create_private_artifact_dir(private_dir)?;
             ensure_private_artifact_dir(private_dir)
         }
         Err(err) => Err(err).with_context(|| {
@@ -1079,6 +1074,28 @@ fn ensure_private_artifact_dir(private_dir: &Path) -> Result<()> {
             )
         }),
     }
+}
+
+fn create_private_artifact_dir(private_dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(private_dir).with_context(|| {
+            format!(
+                "Failed to create owner-only private artifact directory {}",
+                private_dir.display()
+            )
+        })?;
+    }
+    #[cfg(not(unix))]
+    fs::create_dir_all(private_dir).with_context(|| {
+        format!(
+            "Failed to create private artifact directory {}",
+            private_dir.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn secure_private_artifact_dir(private_dir: &Path) -> Result<()> {

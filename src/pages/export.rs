@@ -9,6 +9,8 @@ use chrono::{DateTime, Utc};
 use clap::ValueEnum;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -131,6 +133,7 @@ impl ExportEngine {
             unique_atomic_sidecar_path(&self.output_path, "tmp", "pages_export.db");
         let mut retain_temp_on_replace_error = false;
         let result = (|| -> Result<(ExportStats, T)> {
+            create_staged_export_file(&temp_output_path)?;
             let output_path = temp_output_path.to_string_lossy().to_string();
             let dest =
                 Connection::open(&output_path).context("Failed to create output database")?;
@@ -769,6 +772,17 @@ fn cleanup_sqlite_temp_artifacts(path: &Path) -> Result<()> {
         }
     }
     first_error.map_or(Ok(()), Err)
+}
+
+fn create_staged_export_file(path: &Path) -> Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options
+        .open(path)
+        .with_context(|| format!("failed securely creating staged export {}", path.display()))?;
+    Ok(())
 }
 
 fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
@@ -1570,6 +1584,27 @@ mod tests {
             ));
         }
 
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn staged_export_file_is_exclusive_and_owner_only() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = TempDir::new()?;
+        let staged_path = temp_dir.path().join("export.tmp.db");
+        create_staged_export_file(&staged_path)?;
+
+        let mode = std::fs::metadata(&staged_path)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(anyhow::anyhow!("staged export mode was {mode:o}"));
+        }
+        if create_staged_export_file(&staged_path).is_ok() {
+            return Err(anyhow::anyhow!(
+                "exclusive staging unexpectedly reused an existing path"
+            ));
+        }
         Ok(())
     }
 

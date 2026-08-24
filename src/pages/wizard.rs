@@ -16,8 +16,8 @@ use crate::pages::confirmation::{
 };
 use crate::pages::deploy_cloudflare::{CloudflareConfig, CloudflareDeployer};
 use crate::pages::deploy_github::GitHubDeployer;
-use crate::pages::docs::{DocConfig, DocumentationGenerator};
-use crate::pages::encrypt::EncryptionEngine;
+use crate::pages::docs::{ArchiveMode, DocConfig, DocumentationGenerator};
+use crate::pages::encrypt::{EncryptionConfig, EncryptionEngine};
 use crate::pages::export::{ExportEngine, ExportFilter, PathMode};
 use crate::pages::password::{PasswordStrength, format_strength_inline, validate_password};
 use crate::pages::secret_scan::{
@@ -179,6 +179,24 @@ fn truncate_sample_title(title: &str) -> String {
         format!("{}...", &title[..title.floor_char_boundary(27)])
     } else {
         title.to_string()
+    }
+}
+
+fn documentation_summary(
+    summary: &PrePublishSummary,
+    encryption_config: Option<&EncryptionConfig>,
+) -> (PrePublishSummary, ArchiveMode) {
+    let mut summary = summary.clone();
+    match encryption_config {
+        Some(config) => {
+            summary.set_encryption_config(&config.key_slots);
+            (summary, ArchiveMode::Encrypted)
+        }
+        None => {
+            summary.encryption_config = None;
+            summary.key_slots.clear();
+            (summary, ArchiveMode::Unencrypted)
+        }
     }
 }
 
@@ -1689,7 +1707,7 @@ impl PagesWizard {
         }
 
         // Phase 2: Encryption (skip if no_encryption mode)
-        if self.no_encryption_mode {
+        let encryption_config = if self.no_encryption_mode {
             writeln!(term)?;
             writeln!(
                 term,
@@ -1716,6 +1734,7 @@ impl PagesWizard {
                 &config_path,
                 serde_json::to_string_pretty(&config)?.as_bytes(),
             )?;
+            None
         } else {
             let pb2 = ProgressBar::new_spinner();
             let spinner_style = ProgressStyle::default_spinner()
@@ -1751,10 +1770,12 @@ impl PagesWizard {
             }
 
             // Encrypt the database
-            enc_engine.encrypt_file(&export_db_path, &encrypted_dir, |_, _| {})?;
+            let encryption_config =
+                enc_engine.encrypt_file(&export_db_path, &encrypted_dir, |_, _| {})?;
 
             pb2.finish_with_message("✓ Encryption complete");
-        }
+            Some(encryption_config)
+        };
 
         // Phase 3: Build static site bundle
         let pb3 = ProgressBar::new_spinner();
@@ -1767,6 +1788,8 @@ impl PagesWizard {
 
         // Generate documentation
         let generated_docs = if let Some(ref summary) = self.state.last_summary {
+            let (documentation_summary, archive_mode) =
+                documentation_summary(summary, encryption_config.as_ref());
             // Determine target URL based on deployment target
             // Note: GitHub Pages URL requires the username which isn't known until deployment,
             // so we omit the URL for that target. The actual URL will be shown after deployment.
@@ -1784,9 +1807,10 @@ impl PagesWizard {
                 DocConfig::new().with_url(url)
             } else {
                 DocConfig::new()
-            };
+            }
+            .with_archive_mode(archive_mode);
 
-            let doc_generator = DocumentationGenerator::new(doc_config, summary.clone());
+            let doc_generator = DocumentationGenerator::new(doc_config, documentation_summary);
             doc_generator.generate_all()
         } else {
             Vec::new()
@@ -1952,9 +1976,16 @@ impl PagesWizard {
                 match deployer.check_prerequisites() {
                     Ok(prereqs) if prereqs.is_ready() => {
                         // Deploy with progress output
-                        match deployer.deploy(&site_dir, |_phase, msg| {
-                            let _ = writeln!(term, "    {} {}", style("•").dim(), msg);
-                        }) {
+                        match crate::pages::verify::with_verified_bundle_for_deployment(
+                            &site_dir,
+                            false,
+                            |verified_site_dir| {
+                                deployer.deploy(verified_site_dir, |_phase, msg| {
+                                    let _ =
+                                        writeln!(term, "    {} {}", style("•").dim(), msg);
+                                })
+                            },
+                        ) {
                             Ok(result) => {
                                 writeln!(term)?;
                                 writeln!(
@@ -1979,6 +2010,9 @@ impl PagesWizard {
                                     "To deploy manually, push the {} directory to a gh-pages branch.",
                                     site_dir.display()
                                 )?;
+                                return Err(e).context(
+                                    "GitHub Pages bundle verification or deployment failed",
+                                );
                             }
                         }
                     }
@@ -2042,9 +2076,16 @@ impl PagesWizard {
                 match deployer.check_prerequisites() {
                     Ok(prereqs) if prereqs.is_ready() => {
                         // Deploy with progress output
-                        match deployer.deploy(&site_dir, |_phase, msg| {
-                            let _ = writeln!(term, "    {} {}", style("•").dim(), msg);
-                        }) {
+                        match crate::pages::verify::with_verified_bundle_for_deployment(
+                            &site_dir,
+                            false,
+                            |verified_site_dir| {
+                                deployer.deploy(verified_site_dir, |_phase, msg| {
+                                    let _ =
+                                        writeln!(term, "    {} {}", style("•").dim(), msg);
+                                })
+                            },
+                        ) {
                             Ok(result) => {
                                 writeln!(term)?;
                                 writeln!(
@@ -2081,6 +2122,9 @@ impl PagesWizard {
                                     ))
                                     .dim()
                                 )?;
+                                return Err(e).context(
+                                    "Cloudflare Pages bundle verification or deployment failed",
+                                );
                             }
                         }
                     }
@@ -2202,6 +2246,61 @@ mod tests {
                 "warning": "UNENCRYPTED - All content is publicly readable"
             })
         );
+    }
+
+    #[test]
+    fn documentation_uses_key_slots_from_the_emitted_encryption_config() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = temp.path().join("export.db");
+        let encrypted_dir = temp.path().join("encrypted");
+        std::fs::write(&input, b"committed export bytes")?;
+
+        let mut engine = EncryptionEngine::new(1024)?;
+        engine.add_password_slot("correct horse battery staple")?;
+        engine.add_recovery_slot(&[7_u8; 32])?;
+        let emitted = engine.encrypt_file(&input, &encrypted_dir, |_, _| {})?;
+
+        let summary = PrePublishSummary {
+            total_conversations: 0,
+            total_messages: 0,
+            total_characters: 0,
+            estimated_size_bytes: 0,
+            earliest_timestamp: None,
+            latest_timestamp: None,
+            date_histogram: Vec::new(),
+            workspaces: Vec::new(),
+            agents: Vec::new(),
+            secret_scan: Default::default(),
+            encryption_config: None,
+            key_slots: Vec::new(),
+            generated_at: chrono::Utc::now(),
+        };
+
+        let (documented, mode) = documentation_summary(&summary, Some(&emitted));
+        assert_eq!(mode, ArchiveMode::Encrypted);
+        assert_eq!(documented.key_slots.len(), emitted.key_slots.len());
+        assert_eq!(documented.key_slots.len(), 2);
+        assert_eq!(
+            documented.key_slots[0].slot_type,
+            crate::pages::summary::KeySlotType::Password
+        );
+        assert_eq!(
+            documented.key_slots[1].slot_type,
+            crate::pages::summary::KeySlotType::Recovery
+        );
+        assert_eq!(
+            documented
+                .encryption_config
+                .as_ref()
+                .map(|config| config.key_slot_count),
+            Some(2)
+        );
+
+        let (unencrypted, mode) = documentation_summary(&documented, None);
+        assert_eq!(mode, ArchiveMode::Unencrypted);
+        assert!(unencrypted.key_slots.is_empty());
+        assert!(unencrypted.encryption_config.is_none());
+        Ok(())
     }
 
     // =========================

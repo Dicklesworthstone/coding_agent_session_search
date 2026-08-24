@@ -4,7 +4,7 @@
 //! The verifier confirms correct structure, config schema, payload integrity, and
 //! the absence of secrets in site/.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use base64::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -234,6 +234,48 @@ pub fn verify_bundle(path: &Path, verbose: bool) -> Result<VerifyResult> {
         warnings,
         site_size_bytes,
     })
+}
+
+/// Run a deployment action only after the exact site path it receives passes
+/// every Pages bundle verification check.
+///
+/// Keeping path resolution, verification, and action dispatch in one helper
+/// prevents callers from validating one directory and accidentally deploying a
+/// different one. The action is never invoked for an invalid bundle.
+pub fn with_verified_bundle_for_deployment<T>(
+    path: &Path,
+    verbose: bool,
+    action: impl FnOnce(&Path) -> Result<T>,
+) -> Result<T> {
+    let site_dir = super::resolve_site_dir(path)?;
+    let verification = verify_bundle(&site_dir, verbose)?;
+    if verification.status != "valid" {
+        let failed_checks = [
+            ("required_files", &verification.checks.required_files),
+            ("config_schema", &verification.checks.config_schema),
+            ("payload_manifest", &verification.checks.payload_manifest),
+            ("size_limits", &verification.checks.size_limits),
+            ("integrity", &verification.checks.integrity),
+            (
+                "no_secrets_in_site",
+                &verification.checks.no_secrets_in_site,
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, check)| !check.passed)
+        .map(|(name, check)| match check.details.as_deref() {
+            Some(details) => format!("{name}: {details}"),
+            None => name.to_string(),
+        })
+        .collect::<Vec<_>>();
+        bail!(
+            "Refusing to deploy invalid Pages bundle at {}: {}",
+            site_dir.display(),
+            failed_checks.join("; ")
+        );
+    }
+
+    action(&site_dir)
 }
 
 /// Check that all required files exist
@@ -1644,6 +1686,48 @@ mod tests {
         assert!(result.checks.config_schema.passed);
         assert!(result.checks.payload_manifest.passed);
         assert_eq!(result.status, "valid");
+    }
+
+    #[test]
+    fn verified_deployment_invokes_action_for_valid_exact_site() -> Result<()> {
+        let temp = TempDir::new()?;
+        let site_dir = temp.path().join("site");
+        copy_fixture("valid", &site_dir)?;
+        let invoked = std::cell::Cell::new(false);
+
+        let value = with_verified_bundle_for_deployment(temp.path(), false, |verified_site| {
+            invoked.set(true);
+            assert_eq!(verified_site, site_dir);
+            Ok(17_u8)
+        })?;
+
+        assert!(invoked.get());
+        assert_eq!(value, 17);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_bundle_never_reaches_deployment_action() -> Result<()> {
+        let temp = TempDir::new()?;
+        let site_dir = temp.path().join("site");
+        copy_fixture("valid", &site_dir)?;
+        fs::write(
+            site_dir.join("recovery-secret.txt"),
+            b"must never be deployed",
+        )?;
+        let invoked = std::cell::Cell::new(false);
+
+        let error = with_verified_bundle_for_deployment(&site_dir, false, |_| {
+            invoked.set(true);
+            Ok(())
+        })
+        .expect_err("a private recovery artifact must block deployment");
+
+        assert!(!invoked.get(), "invalid bundle reached deployment action");
+        let message = format!("{error:#}");
+        assert!(message.contains("Refusing to deploy invalid Pages bundle"));
+        assert!(message.contains("no_secrets_in_site"));
+        Ok(())
     }
 
     #[test]

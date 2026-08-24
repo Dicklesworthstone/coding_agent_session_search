@@ -20,6 +20,8 @@
 //!
 //! Each subcommand is driven in robot mode; stdout must be pure JSON.
 
+mod util;
+
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -27,6 +29,8 @@ use std::time::{Duration, Instant};
 use assert_cmd::cargo::cargo_bin;
 use serde_json::Value;
 use tempfile::TempDir;
+
+use util::timeout::spawn_with_timeout_or_diag;
 
 /// Generous per-surface wall-clock bound; only fires on a true hang.
 const SURFACE_BOUND: Duration = Duration::from_secs(60);
@@ -58,13 +62,17 @@ fn lessons_args(extra: &[&str]) -> Vec<String> {
 fn run_lessons(extra: &[&str]) -> Result<(Value, String, Duration), String> {
     let args = lessons_args(extra);
     let started = Instant::now();
-    let out = Command::new(cargo_bin("cass"))
+    let mut command = Command::new(cargo_bin("cass"));
+    command
         .args(&args)
         .env("NO_COLOR", "1")
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
-        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .output()
-        .map_err(|e| format!("spawn {extra:?}: {e}"))?;
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
+    let label = format!(
+        "lessons-fixture-{}",
+        extra.first().copied().unwrap_or("list")
+    );
+    let out = spawn_with_timeout_or_diag(command, &label, None, SURFACE_BOUND);
     let elapsed = started.elapsed();
     let code = out
         .status
@@ -85,14 +93,14 @@ fn run_lessons(extra: &[&str]) -> Result<(Value, String, Duration), String> {
 
 /// Run the real lessons surface in live mode from `repo`.
 fn run_live_lessons(repo: &std::path::Path) -> Result<(Value, String), String> {
-    let out = Command::new(cargo_bin("cass"))
+    let mut command = Command::new(cargo_bin("cass"));
+    command
         .args(["lessons", "list", "--status", "all", "--json"])
         .current_dir(repo)
         .env("NO_COLOR", "1")
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
-        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .output()
-        .map_err(|e| format!("spawn live lessons: {e}"))?;
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
+    let out = spawn_with_timeout_or_diag(command, "lessons-live", Some(repo), SURFACE_BOUND);
     if !out.status.success() {
         return Err(format!(
             "live lessons exited {:?}; stderr: {}",

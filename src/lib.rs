@@ -85230,9 +85230,14 @@ fn run_config_based_export(
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("GitHub deployment requires deployment.repo"))?;
             let deployer = crate::pages::deploy_github::GitHubDeployer::new(repo.clone());
-            Some(serde_json::to_value(
-                deployer.deploy(&bundle_result.site_dir, |_phase, _msg| {})?,
-            )?)
+            let deployed = crate::pages::verify::with_verified_bundle_for_deployment(
+                &bundle_result.site_dir,
+                false,
+                |verified_site_dir| {
+                    deployer.deploy(verified_site_dir, |_phase, _msg| {})
+                },
+            )?;
+            Some(serde_json::to_value(deployed)?)
         }
         crate::pages::wizard::DeployTarget::CloudflarePages => {
             let project_name = wizard_state
@@ -85261,9 +85266,14 @@ fn run_config_based_export(
                     api_token,
                 },
             );
-            Some(serde_json::to_value(
-                deployer.deploy(&bundle_result.site_dir, |_phase, _msg| {})?,
-            )?)
+            let deployed = crate::pages::verify::with_verified_bundle_for_deployment(
+                &bundle_result.site_dir,
+                false,
+                |verified_site_dir| {
+                    deployer.deploy(verified_site_dir, |_phase, _msg| {})
+                },
+            )?;
+            Some(serde_json::to_value(deployed)?)
         }
     };
 
