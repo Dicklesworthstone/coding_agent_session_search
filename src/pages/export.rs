@@ -1,4 +1,6 @@
-use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt, TransactionExt};
+use crate::franken_sync::compat::{
+    ConnectionExt, ParamValue, RowExt, Transaction, TransactionExt,
+};
 use crate::franken_sync::{Connection, Row as FrankenRow, params};
 use crate::ui::time_parser::parse_time_input;
 use anyhow::{Context, Result, bail};
@@ -59,6 +61,27 @@ impl ExportEngine {
     where
         F: Fn(usize, usize),
     {
+        self.execute_verified(progress, running, |_| Ok(()))
+            .map(|(stats, ())| stats)
+    }
+
+    /// Build the export in a private sidecar, verify those exact bytes, and
+    /// only then atomically publish them at the requested output path.
+    ///
+    /// The verifier is deliberately invoked after the destination transaction
+    /// is committed and closed but before `replace_file_from_temp`. A failed
+    /// verifier therefore leaves any prior output untouched and prevents an
+    /// unapproved generation from becoming visible.
+    pub fn execute_verified<F, V, T>(
+        &self,
+        progress: F,
+        running: Option<Arc<AtomicBool>>,
+        verifier: V,
+    ) -> Result<(ExportStats, T)>
+    where
+        F: Fn(usize, usize),
+        V: FnOnce(&Path) -> Result<T>,
+    {
         let src_canon = std::fs::canonicalize(&self.source_db_path)
             .unwrap_or_else(|_| self.source_db_path.clone());
         let out_canon =
@@ -110,7 +133,18 @@ impl ExportEngine {
             )
             .context("Failed to set destination database PRAGMAs")?;
 
-            let (processed, msg_processed) = {
+            // Every source row that contributes to one export must come from
+            // one SQLite generation. In particular, conversation counts and
+            // the later per-conversation message/snippet reads must not straddle
+            // concurrent indexing commits.
+            let mut src_tx = src
+                .transaction()
+                .context("Failed to start source database read snapshot")?;
+            let message_cols = table_columns_in_transaction(&src_tx, "messages")?;
+            let has_snippets_table = table_exists_in_transaction(&src_tx, "snippets");
+            let msg_query = build_message_export_query(&message_cols);
+
+            let export_result = (|| -> Result<(usize, usize)> {
                 let mut tx = dest.transaction()?;
 
                 // 3. Create Schema (Split into individual statements)
@@ -250,7 +284,7 @@ impl ExportEngine {
                 let mut count_query = String::from("SELECT COUNT(*)");
                 count_query.push_str(&from_where);
                 let total_convs: usize =
-                    src.query_row_map(&count_query, &params, |row: &FrankenRow| {
+                    src_tx.query_row_map(&count_query, &params, |row: &FrankenRow| {
                         row.get_typed::<i64>(0).map(|v| v as usize)
                     })?;
 
@@ -267,7 +301,7 @@ impl ExportEngine {
                     Option<String>,
                 );
                 let conv_rows: Vec<ConversationExportRow> =
-                    src.query_map_collect(&query, &params, |row: &FrankenRow| {
+                    src_tx.query_map_collect(&query, &params, |row: &FrankenRow| {
                         Ok((
                             row.get_typed::<i64>(0)?,
                             row.get_typed::<String>(1)?,
@@ -283,9 +317,6 @@ impl ExportEngine {
 
                 let mut processed = 0;
                 let mut msg_processed = 0;
-                let message_cols = table_columns(&src, "messages")?;
-                let has_snippets_table = table_exists(&src, "snippets");
-                let msg_query = build_message_export_query(&message_cols);
 
                 for (
                     id,
@@ -325,7 +356,7 @@ impl ExportEngine {
                 )?;
 
                     // Fetch messages for this conversation
-                    let msg_rows: Vec<MessageExportRow> = src.query_map_collect(
+                    let msg_rows: Vec<MessageExportRow> = src_tx.query_map_collect(
                         &msg_query,
                         crate::franken_sync::params![*id],
                         |row: &FrankenRow| {
@@ -389,7 +420,7 @@ impl ExportEngine {
 
                         // 5. Migrate Snippets for this message (bd-4x92)
                         let snip_rows: Vec<SnippetExportRow> = if has_snippets_table {
-                            src.query_map_collect(
+                            src_tx.query_map_collect(
                                 "SELECT file_path, start_line, end_line, language, snippet_text FROM snippets WHERE message_id = ?1",
                                 params![*source_message_id],
                                 |row: &FrankenRow| {
@@ -430,18 +461,37 @@ impl ExportEngine {
                 )?;
 
                 tx.commit()?;
-                (processed, msg_processed)
+                Ok((processed, msg_processed))
+            })();
+            let source_rollback_result = src_tx
+                .rollback()
+                .context("Failed to close source database read snapshot");
+            let (processed, msg_processed) = match (export_result, source_rollback_result) {
+                (Ok(stats), Ok(())) => stats,
+                (Err(export_error), Ok(())) => return Err(export_error),
+                (Ok(_), Err(rollback_error)) => return Err(rollback_error),
+                (Err(export_error), Err(rollback_error)) => {
+                    return Err(export_error.context(format!(
+                        "source read-snapshot rollback also failed: {rollback_error:#}"
+                    )));
+                }
             };
             drop(dest);
+
+            let verification = verifier(&temp_output_path)
+                .context("Staged Pages export verification failed")?;
 
             replace_attempted = true;
             replace_file_from_temp(&temp_output_path, &self.output_path)
                 .context("Failed to install completed export database")?;
 
-            Ok(ExportStats {
-                conversations_processed: processed,
-                messages_processed: msg_processed,
-            })
+            Ok((
+                ExportStats {
+                    conversations_processed: processed,
+                    messages_processed: msg_processed,
+                },
+                verification,
+            ))
         })();
 
         if result.is_err() && !replace_attempted {
@@ -494,7 +544,10 @@ type MessageExportRow = (
     Option<String>,
 );
 
-fn table_columns(conn: &Connection, table_name: &str) -> Result<Vec<String>> {
+fn table_columns_in_transaction(
+    conn: &Transaction<'_>,
+    table_name: &str,
+) -> Result<Vec<String>> {
     let pragma = format!("PRAGMA table_info({table_name})");
     conn.query_map_collect(&pragma, params![], |row: &FrankenRow| {
         row.get_typed::<String>(1)
@@ -502,7 +555,7 @@ fn table_columns(conn: &Connection, table_name: &str) -> Result<Vec<String>> {
     .context("Failed to inspect source table schema")
 }
 
-fn table_exists(conn: &Connection, table_name: &str) -> bool {
+fn table_exists_in_transaction(conn: &Transaction<'_>, table_name: &str) -> bool {
     if !table_name
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
@@ -510,7 +563,7 @@ fn table_exists(conn: &Connection, table_name: &str) -> bool {
         return false;
     }
 
-    table_columns(conn, table_name)
+    table_columns_in_transaction(conn, table_name)
         .map(|columns| !columns.is_empty())
         .unwrap_or(false)
 }

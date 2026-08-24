@@ -12,8 +12,9 @@ use indicatif::{ProgressBar, ProgressStyle};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -116,6 +117,13 @@ pub struct SecretScanSummary {
 pub struct SecretScanReport {
     pub summary: SecretScanSummary,
     pub findings: Vec<SecretFinding>,
+}
+
+/// Proof that a complete scan observed one immutable staged export artifact.
+#[derive(Debug, Clone)]
+pub struct StagedSecretScan {
+    pub report: SecretScanReport,
+    pub artifact_sha256: String,
 }
 
 #[derive(Debug, Clone)]
@@ -328,6 +336,56 @@ enum SecretScanCheckpoint {
     AfterSnippets,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretScanSchema {
+    Archive,
+    PagesExport,
+}
+
+impl SecretScanSchema {
+    fn detect(conn: &crate::franken_sync::Connection) -> Result<Self> {
+        let has_export_agent = table_has_column(conn, "conversations", "agent")?;
+        let has_export_workspace = table_has_column(conn, "conversations", "workspace")?;
+        if has_export_agent && has_export_workspace {
+            return Ok(Self::PagesExport);
+        }
+
+        let has_archive_agent = table_has_column(conn, "conversations", "agent_id")?;
+        let has_archive_workspace =
+            table_has_column(conn, "conversations", "workspace_id")?;
+        if has_archive_agent && has_archive_workspace {
+            return Ok(Self::Archive);
+        }
+
+        bail!(
+            "Unsupported secret-scan database schema: conversations must contain either agent/workspace export columns or agent_id/workspace_id archive columns"
+        )
+    }
+
+    fn agent_expression(self) -> &'static str {
+        match self {
+            Self::Archive => "COALESCE(a.slug, 'unknown')",
+            Self::PagesExport => "COALESCE(c.agent, 'unknown')",
+        }
+    }
+
+    fn workspace_expression(self) -> &'static str {
+        match self {
+            Self::Archive => "w.path",
+            Self::PagesExport => "c.workspace",
+        }
+    }
+
+    fn conversation_joins(self) -> &'static str {
+        match self {
+            Self::Archive => {
+                "\n             LEFT JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id"
+            }
+            Self::PagesExport => "",
+        }
+    }
+}
+
 fn ensure_secret_scan_running(
     cancellation_requested: &mut impl FnMut(SecretScanCheckpoint) -> bool,
     checkpoint: SecretScanCheckpoint,
@@ -352,6 +410,59 @@ pub fn scan_database<P: AsRef<Path>>(
     })
 }
 
+/// Scan an immutable Pages export and bind the report to its exact bytes.
+///
+/// The digest is checked on both sides of the scan. Any concurrent mutation or
+/// a finding-cap truncation is an error, never an approvable/clean result.
+pub fn scan_staged_export_database<P: AsRef<Path>>(
+    db_path: P,
+    config: &SecretScanConfig,
+) -> Result<StagedSecretScan> {
+    let db_path = db_path.as_ref();
+    let digest_before = sha256_file(db_path)?;
+    let filters = SecretScanFilters {
+        agents: None,
+        workspaces: None,
+        since_ts: None,
+        until_ts: None,
+    };
+    let report = scan_database(db_path, &filters, config, None, None)?;
+    let digest_after = sha256_file(db_path)?;
+
+    if digest_before != digest_after {
+        bail!(
+            "Staged Pages export changed while its secret scan was running; refusing approval"
+        );
+    }
+    if report.summary.truncated {
+        bail!(
+            "Staged Pages export secret scan reached its finding cap; refusing incomplete approval"
+        );
+    }
+
+    Ok(StagedSecretScan {
+        report,
+        artifact_sha256: digest_after,
+    })
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("Failed to open staged export {} for hashing", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("Failed to hash staged export {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
 fn scan_database_with_cancel_check<P: AsRef<Path>>(
     db_path: P,
     filters: &SecretScanFilters,
@@ -369,6 +480,7 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
     let conn = super::open_existing_sqlite_db(db_path.as_ref())
         .context("Failed to open database for secret scan")?;
     ensure_secret_scan_running(&mut cancellation_requested, SecretScanCheckpoint::AfterOpen)?;
+    let schema = SecretScanSchema::detect(&conn)?;
 
     let mut findings: Vec<SecretFinding> = Vec::new();
     let mut seen = Vec::new();
@@ -383,14 +495,21 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
     } else {
         "NULL"
     };
-    let (conv_where, conv_params) = build_where_clause(filters)?;
+    let (conv_where, conv_params) = build_where_clause_for_columns(
+        filters,
+        schema.agent_expression(),
+        schema.workspace_expression(),
+    )?;
     ensure_secret_scan_running(
         &mut cancellation_requested,
         SecretScanCheckpoint::BeforeConversationHighWatermark,
     )?;
     let conv_high_watermark = table_max_id(&conn, "conversations")?;
     let conv_select = format!(
-        "SELECT c.id, c.title, c.metadata_json, c.source_path, COALESCE(a.slug, 'unknown'), w.path, {metadata_bin_projection}\n         FROM conversations c\n         LEFT JOIN agents a ON c.agent_id = a.id\n         LEFT JOIN workspaces w ON c.workspace_id = w.id"
+        "SELECT c.id, c.title, c.metadata_json, c.source_path, {}, {}, {metadata_bin_projection}\n         FROM conversations c{}",
+        schema.agent_expression(),
+        schema.workspace_expression(),
+        schema.conversation_joins(),
     );
     let mut last_conv_id = None;
     while !truncated {
@@ -497,16 +616,25 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
     )?;
 
     if !truncated {
+        let has_extra_json = table_has_column(&conn, "messages", "extra_json")?;
+        let extra_json_projection = if has_extra_json { "m.extra_json" } else { "NULL" };
         let has_extra_bin = table_has_column(&conn, "messages", "extra_bin")?;
         let extra_bin_projection = if has_extra_bin { "m.extra_bin" } else { "NULL" };
-        let (msg_where, msg_params) = build_where_clause(filters)?;
+        let (msg_where, msg_params) = build_where_clause_for_columns(
+            filters,
+            schema.agent_expression(),
+            schema.workspace_expression(),
+        )?;
         ensure_secret_scan_running(
             &mut cancellation_requested,
             SecretScanCheckpoint::BeforeMessageHighWatermark,
         )?;
         let msg_high_watermark = table_max_id(&conn, "messages")?;
         let msg_select = format!(
-            "SELECT m.id, m.idx, m.content, m.extra_json, c.id, c.source_path, COALESCE(a.slug, 'unknown'), w.path, {extra_bin_projection}\n             FROM messages m\n             JOIN conversations c ON m.conversation_id = c.id\n             LEFT JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id"
+            "SELECT m.id, m.idx, m.content, {extra_json_projection}, c.id, c.source_path, {}, {}, {extra_bin_projection}\n             FROM messages m\n             JOIN conversations c ON m.conversation_id = c.id{}",
+            schema.agent_expression(),
+            schema.workspace_expression(),
+            schema.conversation_joins(),
         );
         let mut last_msg_id = None;
         while !truncated {
@@ -613,13 +741,22 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
     )?;
 
     if !truncated && table_exists(&conn, "snippets")? {
-        let (snip_where, snip_params) = build_where_clause(filters)?;
+        let (snip_where, snip_params) = build_where_clause_for_columns(
+            filters,
+            schema.agent_expression(),
+            schema.workspace_expression(),
+        )?;
         ensure_secret_scan_running(
             &mut cancellation_requested,
             SecretScanCheckpoint::BeforeSnippetHighWatermark,
         )?;
         let snip_high_watermark = table_max_id(&conn, "snippets")?;
-        let snip_select = "SELECT s.id, s.snippet_text, m.id, m.idx, c.id, c.source_path, COALESCE(a.slug, 'unknown'), w.path\n             FROM snippets s\n             JOIN messages m ON s.message_id = m.id\n             JOIN conversations c ON m.conversation_id = c.id\n             LEFT JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id";
+        let snip_select = format!(
+            "SELECT s.id, s.snippet_text, m.id, m.idx, c.id, c.source_path, {}, {}\n             FROM snippets s\n             JOIN messages m ON s.message_id = m.id\n             JOIN conversations c ON m.conversation_id = c.id{}",
+            schema.agent_expression(),
+            schema.workspace_expression(),
+            schema.conversation_joins(),
+        );
         let mut last_snippet_id = None;
         while !truncated {
             ensure_secret_scan_running(
@@ -1606,7 +1743,25 @@ fn is_fully_allowlisted(value: &str, config: &SecretScanConfig) -> bool {
     })
 }
 
+#[cfg(test)]
 fn build_where_clause(filters: &SecretScanFilters) -> Result<(String, Vec<ParamValue>)> {
+    build_where_clause_for_columns(filters, "COALESCE(a.slug, 'unknown')", "w.path")
+}
+
+fn build_where_clause_for_columns(
+    filters: &SecretScanFilters,
+    agent_expression: &str,
+    workspace_expression: &str,
+) -> Result<(String, Vec<ParamValue>)> {
+    for expression in [agent_expression, workspace_expression] {
+        if !expression.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(ch, '_' | '.' | '(' | ')' | ',' | '\'' | ' ')
+        }) {
+            bail!("Invalid SQLite expression while building secret-scan filters");
+        }
+    }
+
     let mut conditions: Vec<String> = Vec::new();
     let mut params: Vec<ParamValue> = Vec::new();
 
@@ -1616,7 +1771,7 @@ fn build_where_clause(filters: &SecretScanFilters) -> Result<(String, Vec<ParamV
         } else {
             let placeholders: Vec<&str> = agents.iter().map(|_| "?").collect();
             conditions.push(format!(
-                "COALESCE(a.slug, 'unknown') IN ({})",
+                "{agent_expression} IN ({})",
                 placeholders.join(", ")
             ));
             for agent in agents {
@@ -1630,7 +1785,10 @@ fn build_where_clause(filters: &SecretScanFilters) -> Result<(String, Vec<ParamV
             conditions.push("1=0".to_string());
         } else {
             let placeholders: Vec<&str> = workspaces.iter().map(|_| "?").collect();
-            conditions.push(format!("w.path IN ({})", placeholders.join(", ")));
+            conditions.push(format!(
+                "{workspace_expression} IN ({})",
+                placeholders.join(", ")
+            ));
             for ws in workspaces {
                 params.push(ParamValue::from(ws.to_string_lossy().to_string()));
             }
@@ -2011,6 +2169,74 @@ mod tests {
             error.to_string().contains("Invalid SQLite identifier"),
             "unexpected invalid-identifier diagnostic: {error:#}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn staged_export_scan_reads_flat_pages_schema_and_binds_digest() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db_path = temp.path().join("export.db");
+        let conn = crate::franken_sync::Connection::open(db_path.to_string_lossy().as_ref())?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent TEXT NOT NULL,
+                workspace TEXT,
+                title TEXT,
+                source_path TEXT NOT NULL,
+                started_at INTEGER,
+                ended_at INTEGER,
+                message_count INTEGER,
+                metadata_json TEXT
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at INTEGER,
+                updated_at INTEGER,
+                model TEXT,
+                attachment_refs TEXT
+            );
+            CREATE TABLE snippets (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                file_path TEXT,
+                start_line INTEGER,
+                end_line INTEGER,
+                language TEXT,
+                snippet_text TEXT
+            );
+            INSERT INTO conversations (
+                id, agent, workspace, title, source_path, started_at,
+                message_count, metadata_json
+            ) VALUES (
+                1, 'codex', '/tmp/project', 'safe title',
+                'session.jsonl', 1700000000000, 1, '{}'
+            );
+            INSERT INTO messages (
+                id, conversation_id, idx, role, content, created_at
+            ) VALUES (
+                7, 1, 0, 'user', 'credential AKIAIOSFODNN7EXAMPLE',
+                1700000000000
+            );
+            "#,
+        )?;
+        drop(conn);
+
+        let config = SecretScanConfig::from_inputs_with_env(&[], &[], false)?;
+        let attestation = scan_staged_export_database(&db_path, &config)?;
+
+        assert_eq!(attestation.artifact_sha256.len(), 64);
+        assert!(!attestation.report.summary.truncated);
+        assert_eq!(attestation.report.summary.total, 1);
+        let finding = &attestation.report.findings[0];
+        assert_eq!(finding.agent.as_deref(), Some("codex"));
+        assert_eq!(finding.workspace.as_deref(), Some("/tmp/project"));
+        assert_eq!(finding.message_id, Some(7));
         Ok(())
     }
 
