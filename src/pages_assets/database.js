@@ -6,11 +6,9 @@
  * The live database is a read-only in-memory deserialization. The official
  * sqlite-wasm OPFS VFS requires a dedicated worker because its synchronous VFS
  * bridge uses Atomics.wait(), while this module intentionally exposes
- * synchronous query helpers on the main thread. When OPFS is enabled, we cache
- * the validated decrypted bytes there but do not open them through OpfsDb.
+ * synchronous query helpers on the main thread. Until a bounded, export-bound
+ * OPFS reuse path exists, decrypted database bytes remain memory-only.
  */
-
-import { getArchiveOpfsDbFiles, getArchiveOpfsPrimaryDbName, isOpfsEnabled } from './storage.js';
 
 // Module state
 let sqlite3 = null;
@@ -26,6 +24,31 @@ const SQLITE_DESERIALIZE_READONLY = 0x04;
 // sqlite3_deserialize() may read a small distance beyond N while validating a
 // malformed image. SQLite's API contract recommends at least 20 spare bytes.
 const SQLITE_DESERIALIZE_PADDING = 20;
+// The viewer necessarily holds a JavaScript copy and a SQLite WASM copy. Keep
+// this guard inside the database module so every caller, encrypted or not, is
+// bounded even if config validation or a fetch-path check is bypassed.
+const MAX_BROWSER_DATABASE_SIZE = 512 * 1024 * 1024;
+const MAX_WASM32_ALLOCATION_SIZE = 0xFFFFFFFF;
+
+function checkedDatabaseAllocationSize(byteLength) {
+    if (!Number.isSafeInteger(byteLength) || byteLength <= 0) {
+        throw new TypeError('Database payload must have a positive safe-integer byte length');
+    }
+    if (byteLength > MAX_BROWSER_DATABASE_SIZE) {
+        throw new RangeError(
+            `Database payload exceeds the ${MAX_BROWSER_DATABASE_SIZE}-byte browser limit`
+        );
+    }
+
+    const allocationSize = byteLength + SQLITE_DESERIALIZE_PADDING;
+    if (
+        !Number.isSafeInteger(allocationSize)
+        || allocationSize > MAX_WASM32_ALLOCATION_SIZE
+    ) {
+        throw new RangeError('Database payload plus SQLite safety padding exceeds wasm32 limits');
+    }
+    return allocationSize;
+}
 
 /**
  * Initialize sqlite-wasm with decrypted database bytes
@@ -43,6 +66,7 @@ export async function initDatabase(dbBytes) {
     if (!(dbBytes instanceof Uint8Array) || dbBytes.byteLength === 0) {
         throw new TypeError('Database payload must be a non-empty Uint8Array');
     }
+    checkedDatabaseAllocationSize(dbBytes.byteLength);
 
     console.log('[DB] Initializing sqlite-wasm...');
     const generation = ++lifecycleGeneration;
@@ -73,7 +97,7 @@ async function initializeDatabase(dbBytes, generation) {
     let sqliteOwnsBytes = false;
     try {
         candidateDb = new sqliteApi.oo1.DB();
-        const allocationSize = dbBytes.byteLength + SQLITE_DESERIALIZE_PADDING;
+        const allocationSize = checkedDatabaseAllocationSize(dbBytes.byteLength);
         wasmPtr = sqliteApi.wasm.alloc(allocationSize);
         const wasmOffset = Number(wasmPtr);
         const wasmHeap = sqliteApi.wasm.heap8u();
@@ -96,16 +120,6 @@ async function initializeDatabase(dbBytes, generation) {
         // this allocation on both success and error. Do not double-free it.
         sqliteOwnsBytes = true;
         candidateDb.checkRc(resultCode);
-
-        if (isOpfsEnabled() && navigator.storage?.getDirectory) {
-            try {
-                await writeBytesToOPFS(dbBytes);
-                console.log('[DB] Cached decrypted database bytes in OPFS');
-            } catch (error) {
-                await cleanupArchiveOpfsDatabaseFiles();
-                console.warn('[DB] OPFS cache unavailable, continuing in memory:', error.message);
-            }
-        }
 
         if (generation !== lifecycleGeneration) {
             throw new Error('Database initialization was cancelled');
@@ -149,43 +163,6 @@ async function loadSqliteWasm() {
     } catch (error) {
         console.error('[DB] Failed to load sqlite-wasm:', error);
         throw new Error('SQLite runtime is unavailable or invalid.');
-    }
-}
-
-/**
- * Write database bytes to OPFS
- */
-async function writeBytesToOPFS(bytes) {
-    const root = await navigator.storage.getDirectory();
-    const handle = await root.getFileHandle(getArchiveOpfsPrimaryDbName(), { create: true });
-    const writable = await handle.createWritable();
-    try {
-        await writable.write(bytes);
-        await writable.close();
-    } catch (error) {
-        try {
-            await writable.abort();
-        } catch {
-            // The stream may already be closed or aborted.
-        }
-        throw error;
-    }
-}
-
-async function cleanupArchiveOpfsDatabaseFiles() {
-    try {
-        const root = await navigator.storage.getDirectory();
-        for (const name of getArchiveOpfsDbFiles()) {
-            try {
-                await root.removeEntry(name);
-            } catch (error) {
-                if (error?.name !== 'NotFoundError') {
-                    console.warn('[DB] Failed to clean up OPFS database file:', name, error);
-                }
-            }
-        }
-    } catch (error) {
-        console.warn('[DB] Failed to clean up OPFS database directory:', error);
     }
 }
 

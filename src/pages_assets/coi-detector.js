@@ -45,6 +45,10 @@ function getSetupCompleteKey() {
     }
 }
 
+function getArchiveScopeUrl() {
+    return new URL('./', window.location.href).href;
+}
+
 /**
  * Check if COI setup has been completed before
  * @returns {boolean}
@@ -85,7 +89,9 @@ async function getCurrentServiceWorkerRegistration() {
     }
 
     try {
-        return (await navigator.serviceWorker.getRegistration()) ?? null;
+        const expectedScope = getArchiveScopeUrl();
+        const registrations = await navigator.serviceWorker.getRegistrations();
+        return registrations.find((registration) => registration.scope === expectedScope) ?? null;
     } catch {
         return null;
     }
@@ -113,7 +119,8 @@ export async function isServiceWorkerActive() {
  * @returns {Promise<boolean>}
  */
 export async function hasServiceWorkerRegistration() {
-    return (await getCurrentServiceWorkerRegistration()) !== null;
+    const registration = await getCurrentServiceWorkerRegistration();
+    return Boolean(registration?.active || registration?.installing || registration?.waiting);
 }
 
 /**

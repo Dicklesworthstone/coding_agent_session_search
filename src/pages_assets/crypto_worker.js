@@ -294,29 +294,33 @@ async function deriveKekFromPassword(password, slot) {
 async function deriveKekFromRecovery(secretBytes, slot) {
     const salt = base64ToArray(slot.salt);
     const info = new TextEncoder().encode('cass-pages-kek-v2');
+    try {
+        // Import secret as HKDF key
+        const baseKey = await crypto.subtle.importKey(
+            'raw',
+            secretBytes,
+            'HKDF',
+            false,
+            ['deriveBits']
+        );
 
-    // Import secret as HKDF key
-    const baseKey = await crypto.subtle.importKey(
-        'raw',
-        secretBytes,
-        'HKDF',
-        false,
-        ['deriveBits']
-    );
+        // Derive KEK
+        const kekBits = await crypto.subtle.deriveBits(
+            {
+                name: 'HKDF',
+                hash: 'SHA-256',
+                salt,
+                info,
+            },
+            baseKey,
+            256
+        );
 
-    // Derive KEK
-    const kekBits = await crypto.subtle.deriveBits(
-        {
-            name: 'HKDF',
-            hash: 'SHA-256',
-            salt: salt,
-            info: info,
-        },
-        baseKey,
-        256
-    );
-
-    return new Uint8Array(kekBits);
+        return new Uint8Array(kekBits);
+    } finally {
+        salt.fill(0);
+        info.fill(0);
+    }
 }
 
 /**
@@ -326,33 +330,39 @@ async function unwrapDek(kek, slot, exportId) {
     const wrappedDek = base64ToArray(slot.wrapped_dek);
     const nonce = base64ToArray(slot.nonce);
     const exportIdBytes = base64ToArray(exportId);
-
-    // Build AAD: export_id || slot_id
     const aad = new Uint8Array(exportIdBytes.length + 1);
-    aad.set(exportIdBytes);
-    aad[exportIdBytes.length] = slot.id;
+    try {
+        // Build AAD: export_id || slot_id
+        aad.set(exportIdBytes);
+        aad[exportIdBytes.length] = slot.id;
 
-    // Import KEK
-    const kekKey = await crypto.subtle.importKey(
-        'raw',
-        kek,
-        { name: 'AES-GCM' },
-        false,
-        ['decrypt']
-    );
+        // Import KEK
+        const kekKey = await crypto.subtle.importKey(
+            'raw',
+            kek,
+            { name: 'AES-GCM' },
+            false,
+            ['decrypt']
+        );
 
-    // Unwrap DEK
-    const dekBytes = await crypto.subtle.decrypt(
-        {
-            name: 'AES-GCM',
-            iv: nonce,
-            additionalData: aad,
-        },
-        kekKey,
-        wrappedDek
-    );
+        // Unwrap DEK
+        const dekBytes = await crypto.subtle.decrypt(
+            {
+                name: 'AES-GCM',
+                iv: nonce,
+                additionalData: aad,
+            },
+            kekKey,
+            wrappedDek
+        );
 
-    return new Uint8Array(dekBytes);
+        return new Uint8Array(dekBytes);
+    } finally {
+        wrappedDek.fill(0);
+        nonce.fill(0);
+        exportIdBytes.fill(0);
+        aad.fill(0);
+    }
 }
 
 /**

@@ -683,6 +683,15 @@ fn validate_unencrypted_config(config: &UnencryptedConfig) -> Vec<String> {
         ));
     }
 
+    match config.payload.size_bytes {
+        None => errors.push("payload.size_bytes is required for bounded browser loading".to_string()),
+        Some(0) => errors.push("payload.size_bytes must be greater than zero".to_string()),
+        Some(size) if size > MAX_BROWSER_ARCHIVE_PLAINTEXT_SIZE => errors.push(format!(
+            "payload.size_bytes {size} exceeds browser runtime limit {MAX_BROWSER_ARCHIVE_PLAINTEXT_SIZE}"
+        )),
+        Some(_) => {}
+    }
+
     errors
 }
 
@@ -813,6 +822,15 @@ fn check_payload_manifest(site_dir: &Path) -> CheckResult {
                             errors.push(format!("{} must not be a symlink", unenc.payload.path));
                         } else if !file_type.is_file() {
                             errors.push(format!("{} must be a regular file", unenc.payload.path));
+                        } else if let Some(expected) = unenc.payload.size_bytes {
+                            if expected != meta.len() {
+                                errors.push(format!(
+                                    "{} size does not match payload.size_bytes (actual {}, declared {})",
+                                    unenc.payload.path,
+                                    meta.len(),
+                                    expected
+                                ));
+                            }
                         }
                     }
                     Err(_) => errors.push(format!("Missing payload file: {}", unenc.payload.path)),
@@ -1905,6 +1923,70 @@ mod tests {
         assert!(result.checks.config_schema.passed);
         assert!(result.checks.payload_manifest.passed);
         assert_eq!(result.status, "valid");
+    }
+
+    #[test]
+    fn unencrypted_payload_requires_a_bounded_exact_declared_size() {
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+        copy_fixture("unencrypted", &site_dir).unwrap();
+        let config_path = site_dir.join("config.json");
+        let original: Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+
+        let mut missing = original.clone();
+        missing["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("size_bytes");
+        fs::write(&config_path, serde_json::to_vec_pretty(&missing).unwrap()).unwrap();
+        let schema = check_config_schema(&site_dir);
+        assert!(
+            !schema.passed
+                && schema
+                    .details
+                    .as_deref()
+                    .is_some_and(|details| details.contains("size_bytes is required")),
+            "missing size metadata must fail before the browser fetches the database: {:?}",
+            schema.details
+        );
+
+        let mut oversized = original.clone();
+        oversized["payload"]["size_bytes"] =
+            Value::from(MAX_BROWSER_ARCHIVE_PLAINTEXT_SIZE + 1);
+        fs::write(
+            &config_path,
+            serde_json::to_vec_pretty(&oversized).unwrap(),
+        )
+        .unwrap();
+        let schema = check_config_schema(&site_dir);
+        assert!(
+            !schema.passed
+                && schema
+                    .details
+                    .as_deref()
+                    .is_some_and(|details| details.contains("browser runtime limit")),
+            "oversized unencrypted databases must be rejected: {:?}",
+            schema.details
+        );
+
+        let mut mismatched = original;
+        mismatched["payload"]["size_bytes"] = Value::from(18);
+        fs::write(
+            &config_path,
+            serde_json::to_vec_pretty(&mismatched).unwrap(),
+        )
+        .unwrap();
+        let manifest = check_payload_manifest(&site_dir);
+        assert!(
+            !manifest.passed
+                && manifest
+                    .details
+                    .as_deref()
+                    .is_some_and(|details| details.contains("size does not match")),
+            "payload bytes must exactly match their declaration: {:?}",
+            manifest.details
+        );
     }
 
     #[test]

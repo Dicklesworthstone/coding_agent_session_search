@@ -15,6 +15,10 @@ function getCurrentScopeUrl() {
     return new URL('./', window.location.href).href;
 }
 
+function hasExactScope(candidate) {
+    return candidate?.scope === getCurrentScopeUrl();
+}
+
 async function resolveRegistration() {
     if (!('serviceWorker' in navigator)) {
         registration = null;
@@ -22,7 +26,8 @@ async function resolveRegistration() {
     }
 
     try {
-        registration = await navigator.serviceWorker.getRegistration(getCurrentScopeUrl());
+        const registrations = await navigator.serviceWorker.getRegistrations();
+        registration = registrations.find(hasExactScope) || null;
     } catch (error) {
         console.warn('[SW] Failed to resolve registration:', error);
         registration = null;
@@ -32,8 +37,9 @@ async function resolveRegistration() {
 }
 
 async function postMessageWithReply(message, { timeoutMs = DEFAULT_SW_MESSAGE_TIMEOUT_MS } = {}) {
-    const controller = navigator?.serviceWorker?.controller;
-    if (!controller) {
+    const currentRegistration = await resolveRegistration();
+    const activeWorker = currentRegistration?.active;
+    if (!activeWorker) {
         return null;
     }
 
@@ -50,7 +56,7 @@ async function postMessageWithReply(message, { timeoutMs = DEFAULT_SW_MESSAGE_TI
         };
 
         try {
-            controller.postMessage(message, [channel.port2]);
+            activeWorker.postMessage(message, [channel.port2]);
         } catch (error) {
             clearTimeout(timeoutId);
             console.warn('[SW] Failed to post message to controller:', message.type, error);
@@ -100,10 +106,15 @@ export async function registerServiceWorker() {
 
         // Set up update listener
         setupUpdateListener(registration);
+        noticeWaitingUpdate(registration);
 
         // Wait for service worker to be ready
         await navigator.serviceWorker.ready;
         await resolveRegistration();
+        if (registration) {
+            setupUpdateListener(registration);
+            noticeWaitingUpdate(registration);
+        }
         console.log('[SW] Ready');
 
         // Check if we already have SharedArrayBuffer support
@@ -150,7 +161,7 @@ function setupUpdateListener(reg) {
 
         newWorker.addEventListener('statechange', () => {
             if (newWorker.state === 'installed') {
-                if (navigator.serviceWorker.controller) {
+                if (reg.active && reg.active !== newWorker) {
                     // New version available
                     console.log('[SW] Update available');
                     updateAvailable = true;
@@ -171,6 +182,15 @@ function setupUpdateListener(reg) {
         });
         controllerChangeListenerInstalled = true;
     }
+}
+
+function noticeWaitingUpdate(reg) {
+    if (!reg?.waiting || !reg.active) {
+        return;
+    }
+    console.log('[SW] Waiting update available');
+    updateAvailable = true;
+    showUpdateNotification();
 }
 
 /**
@@ -245,7 +265,7 @@ function showUpdateNotification() {
  * Apply pending update
  */
 export async function applyUpdate() {
-    const currentRegistration = registration ?? await resolveRegistration();
+    const currentRegistration = await resolveRegistration();
     if (currentRegistration?.waiting) {
         const waitForActivation = waitForControllerChange();
         // Tell waiting service worker to skip waiting
@@ -269,7 +289,7 @@ export function isUpdateAvailable() {
  * @returns {Promise<ServiceWorkerRegistration|null>}
  */
 export async function getRegistration() {
-    return registration ?? await resolveRegistration();
+    return resolveRegistration();
 }
 
 /**
@@ -281,7 +301,7 @@ export async function unregisterServiceWorker() {
         return true;
     }
 
-    const currentRegistration = registration ?? await resolveRegistration();
+    const currentRegistration = await resolveRegistration();
     if (!currentRegistration) {
         registration = null;
         return true;
@@ -326,12 +346,12 @@ export const swStatus = {
         return 'serviceWorker' in navigator;
     },
     get isRegistered() {
-        return 'serviceWorker' in navigator
-            && (registration !== null || navigator.serviceWorker.controller !== null);
+        return 'serviceWorker' in navigator && hasExactScope(registration);
     },
     get isActive() {
         return 'serviceWorker' in navigator
-            && navigator.serviceWorker.controller !== null;
+            && hasExactScope(registration)
+            && registration.active !== null;
     },
     get hasSharedArrayBuffer() {
         return hasSharedArrayBuffer();

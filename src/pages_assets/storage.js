@@ -661,56 +661,109 @@ function removeMapEntriesWithPrefix(map, prefix) {
 }
 
 function removeStorageEntriesWithPrefix(storage, prefix) {
-    const keys = [];
-    for (let i = 0; i < storage.length; i++) {
-        const key = storage.key(i);
-        if (key && key.startsWith(prefix)) {
-            keys.push(key);
-        }
-    }
-    keys.forEach((key) => storage.removeItem(key));
+    return removeStorageEntries(storage, (key) => key.startsWith(prefix));
 }
 
 function removeStorageEntries(storage, predicate) {
     const keys = [];
-    for (let i = 0; i < storage.length; i++) {
-        const key = storage.key(i);
-        if (key && predicate(key)) {
-            keys.push(key);
+    let cleared = true;
+    let entryCount;
+
+    try {
+        entryCount = storage.length;
+    } catch (error) {
+        console.warn('[Storage] Could not enumerate browser storage during clear:', error);
+        return false;
+    }
+    if (!Number.isSafeInteger(entryCount) || entryCount < 0) {
+        console.warn('[Storage] Browser storage reported an invalid entry count during clear');
+        return false;
+    }
+
+    for (let i = 0; i < entryCount; i++) {
+        try {
+            const key = storage.key(i);
+            if (key && predicate(key)) {
+                keys.push(key);
+            }
+        } catch (error) {
+            // Keep scanning the remaining slots. A single inaccessible entry
+            // must not prevent best-effort cleanup of every other key.
+            console.warn('[Storage] Could not inspect browser storage entry during clear:', error);
+            cleared = false;
         }
     }
-    keys.forEach((key) => storage.removeItem(key));
+
+    for (const key of keys) {
+        try {
+            storage.removeItem(key);
+            if (storage.getItem(key) !== null) {
+                cleared = false;
+            }
+        } catch (error) {
+            console.warn('[Storage] Could not remove browser storage entry during clear:', error);
+            cleared = false;
+        }
+    }
+
+    return cleared;
+}
+
+function removeStorageKeys(storage, keys) {
+    let cleared = true;
+
+    for (const key of keys) {
+        try {
+            storage.removeItem(key);
+            if (storage.getItem(key) !== null) {
+                cleared = false;
+            }
+        } catch (error) {
+            console.warn('[Storage] Could not remove browser storage key during clear:', error);
+            cleared = false;
+        }
+    }
+
+    return cleared;
 }
 
 function clearCurrentArchivePreferenceKeys(options = {}) {
     const { includeLegacy = false } = options;
-
-    try {
-        localStorage.removeItem(KEYS.MODE);
-        localStorage.removeItem(KEYS.OPFS_ENABLED);
-        localStorage.removeItem(KEYS.LAST_UNLOCK);
-        localStorage.removeItem(KEYS.DB_CACHED);
-        if (includeLegacy) {
-            Object.values(LEGACY_PREF_KEYS).forEach((key) => localStorage.removeItem(key));
-        }
-    } catch (e) {
-        // Ignore
+    const storage = tryGetLocalStorage();
+    if (!storage) {
+        return false;
     }
+
+    const keys = [KEYS.MODE, KEYS.OPFS_ENABLED, KEYS.LAST_UNLOCK, KEYS.DB_CACHED];
+    if (includeLegacy) {
+        keys.push(...Object.values(LEGACY_PREF_KEYS));
+    }
+
+    return removeStorageKeys(storage, new Set(keys));
 }
 
 function clearCurrentArchiveSessionState(currentSessionKeys, currentTofuKey) {
+    let cleared = true;
     const sessionStorageBackend = tryGetSessionStorage();
     if (sessionStorageBackend) {
-        removeStorageEntries(sessionStorageBackend, (key) => currentSessionKeys.has(key));
+        const sessionCleared = removeStorageKeys(sessionStorageBackend, currentSessionKeys);
+        cleared = sessionCleared && cleared;
+    } else {
+        cleared = false;
     }
 
     const localStorageBackend = tryGetLocalStorage();
     if (localStorageBackend) {
-        removeStorageEntries(localStorageBackend, (key) => (
-            currentSessionKeys.has(key)
-            || key === currentTofuKey
-        ));
+        const localCleared = removeStorageKeys(
+            localStorageBackend,
+            new Set([...currentSessionKeys, currentTofuKey])
+        );
+        cleared = localCleared && cleared;
+    } else {
+        cleared = false;
     }
+
+    return cleared;
 }
 
 /**
@@ -721,12 +774,11 @@ export async function clearCurrentStorage() {
     const archiveDataPrefix = getArchiveDataPrefix();
     const currentSessionKeys = getCurrentArchiveSessionKeys();
     const currentTofuKey = getCurrentArchiveTofuKey();
-    let cleared = true;
+    let cleared = clearCurrentArchiveSessionState(currentSessionKeys, currentTofuKey);
 
     // Writes in session/local modes can fall back to memoryStore if the browser
     // rejects storage access. Clear that archive-scoped fallback copy too.
     removeMapEntriesWithPrefix(memoryStore, archiveDataPrefix);
-    clearCurrentArchiveSessionState(currentSessionKeys, currentTofuKey);
 
     switch (currentMode) {
         case StorageMode.MEMORY:
@@ -736,7 +788,13 @@ export async function clearCurrentStorage() {
             {
                 const storage = tryGetSessionStorage();
                 if (storage) {
-                    removeStorageEntries(storage, (key) => key.startsWith(archiveDataPrefix));
+                    const storageCleared = removeStorageEntries(
+                        storage,
+                        (key) => key.startsWith(archiveDataPrefix)
+                    );
+                    cleared = storageCleared && cleared;
+                } else {
+                    cleared = false;
                 }
             }
             break;
@@ -745,13 +803,22 @@ export async function clearCurrentStorage() {
             {
                 const storage = tryGetLocalStorage();
                 if (storage) {
-                    removeStorageEntries(storage, (key) => key.startsWith(archiveDataPrefix));
+                    const storageCleared = removeStorageEntries(
+                        storage,
+                        (key) => key.startsWith(archiveDataPrefix)
+                    );
+                    cleared = storageCleared && cleared;
+                } else {
+                    cleared = false;
                 }
             }
             break;
 
         case StorageMode.OPFS:
-            cleared = await clearOPFS();
+            {
+                const opfsCleared = await clearOPFS();
+                cleared = opfsCleared && cleared;
+            }
             break;
     }
 
@@ -815,6 +882,8 @@ export async function clearAllStorage(options = {}) {
     const archiveDataPrefix = getArchiveDataPrefix();
     const currentSessionKeys = getCurrentArchiveSessionKeys();
     const currentTofuKey = getCurrentArchiveTofuKey();
+    let sessionCleared = true;
+    let localCleared = true;
 
     // Clear memory
     if (allArchives) {
@@ -823,47 +892,65 @@ export async function clearAllStorage(options = {}) {
         removeMapEntriesWithPrefix(memoryStore, archiveDataPrefix);
     }
 
-    // Clear sessionStorage
-    try {
+    // Clear sessionStorage. Treat an inaccessible backend as uncleared: data
+    // may still exist even though this document cannot currently inspect it.
+    const sessionStorageBackend = tryGetSessionStorage();
+    if (sessionStorageBackend) {
         if (allArchives) {
-            removeStorageEntries(sessionStorage, (key) =>
+            sessionCleared = removeStorageEntries(sessionStorageBackend, (key) =>
                 key.startsWith(STORAGE_PREFIX) || isArchiveSessionKey(key)
             );
         } else {
-            removeStorageEntries(sessionStorage, (key) =>
-                key.startsWith(archiveDataPrefix) || currentSessionKeys.has(key)
+            const archiveEntriesCleared = removeStorageEntries(
+                sessionStorageBackend,
+                (key) => key.startsWith(archiveDataPrefix)
             );
+            const sessionKeysCleared = removeStorageKeys(
+                sessionStorageBackend,
+                currentSessionKeys
+            );
+            sessionCleared = archiveEntriesCleared && sessionKeysCleared;
         }
-    } catch (e) {
-        // Ignore
+    } else {
+        sessionCleared = false;
     }
 
     // Clear localStorage
-    try {
+    const localStorageBackend = tryGetLocalStorage();
+    if (localStorageBackend) {
         if (allArchives) {
-            removeStorageEntries(localStorage, (key) =>
+            localCleared = removeStorageEntries(localStorageBackend, (key) =>
                 key.startsWith(STORAGE_PREFIX)
                 && (isArchiveDataEntryName(key) || isArchivePreferenceKey(key) || Object.values(LEGACY_PREF_KEYS).includes(key))
                 || isArchiveSessionKey(key)
                 || isArchiveTofuKey(key)
             );
         } else {
-            removeStorageEntries(localStorage, (key) =>
-                key.startsWith(archiveDataPrefix)
-                || currentSessionKeys.has(key)
-                || key === currentTofuKey
+            const archiveEntriesCleared = removeStorageEntries(
+                localStorageBackend,
+                (key) => key.startsWith(archiveDataPrefix)
             );
-            clearCurrentArchivePreferenceKeys({ includeLegacy: true });
+            const sessionKeysCleared = removeStorageKeys(
+                localStorageBackend,
+                new Set([...currentSessionKeys, currentTofuKey])
+            );
+            const preferencesCleared = clearCurrentArchivePreferenceKeys({ includeLegacy: true });
+            localCleared = archiveEntriesCleared && sessionKeysCleared && preferencesCleared;
         }
-    } catch (e) {
-        // Ignore
+    } else {
+        localCleared = false;
     }
 
     // Clear OPFS
     const opfsCleared = await clearOPFS({ allArchives });
 
-    console.log('[Storage] All storage cleared');
-    return opfsCleared;
+    const cleared = sessionCleared && localCleared && opfsCleared;
+    if (cleared) {
+        console.log('[Storage] All storage cleared');
+    } else {
+        console.warn('[Storage] Some storage could not be fully cleared');
+    }
+    return cleared;
 }
 
 /**

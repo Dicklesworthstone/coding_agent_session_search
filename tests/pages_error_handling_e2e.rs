@@ -20,6 +20,7 @@ use coding_agent_search::pages::errors::{
 };
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
@@ -895,6 +896,123 @@ fn browser_lock_terminates_in_flight_crypto_before_reinitializing() {
     assert!(
         clear_password_offset < persist_session_offset,
         "the plaintext password must not remain in the DOM for the unlocked session"
+    );
+}
+
+#[test]
+fn browser_storage_clear_reports_partial_failures_and_continues_cleanup() {
+    let script = r#"
+        class StorageMock {
+            constructor() {
+                this.data = new Map();
+                this.failedKeys = new Set();
+                this.removeAttempts = [];
+            }
+
+            get length() {
+                return this.data.size;
+            }
+
+            key(index) {
+                return Array.from(this.data.keys())[index] ?? null;
+            }
+
+            getItem(key) {
+                return this.data.has(key) ? this.data.get(key) : null;
+            }
+
+            setItem(key, value) {
+                this.data.set(key, String(value));
+            }
+
+            removeItem(key) {
+                this.removeAttempts.push(key);
+                if (this.failedKeys.has(key)) {
+                    throw new Error(`injected remove failure for ${key}`);
+                }
+                this.data.delete(key);
+            }
+        }
+
+        const originalWindow = globalThis.window;
+        const originalLocalStorage = globalThis.localStorage;
+        const originalSessionStorage = globalThis.sessionStorage;
+        const originalNavigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+
+        globalThis.window = { location: { href: 'https://example.com/archive/index.html#/' } };
+        globalThis.localStorage = new StorageMock();
+        globalThis.sessionStorage = new StorageMock();
+        Object.defineProperty(globalThis, 'navigator', {
+            value: { storage: {} },
+            configurable: true,
+            writable: true,
+        });
+
+        try {
+            const { clearAllStorage, getArchiveScopeId } = await import('./src/pages_assets/storage.js');
+            const scopeId = getArchiveScopeId();
+            const otherScopeId = scopeId === 'deadbeef' ? 'feedface' : 'deadbeef';
+            const failedSessionKey = `cass_session_dek_${scopeId}`;
+            const laterSessionKey = `cass_session_expiry_${scopeId}`;
+            const currentLocalKey = `cass-archive-${scopeId}-pref-storage-mode`;
+            const otherSessionKey = `cass_session_dek_${otherScopeId}`;
+            const otherLocalKey = `cass-archive-${otherScopeId}-pref-storage-mode`;
+
+            sessionStorage.setItem(failedSessionKey, 'secret');
+            sessionStorage.setItem(laterSessionKey, 'expiry');
+            sessionStorage.setItem(otherSessionKey, 'other');
+            localStorage.setItem(currentLocalKey, 'local');
+            localStorage.setItem(otherLocalKey, 'other');
+            sessionStorage.failedKeys.add(failedSessionKey);
+
+            const partialResult = await clearAllStorage();
+            if (partialResult !== false) {
+                throw new Error('clearAllStorage must report a failed browser-storage deletion');
+            }
+            if (sessionStorage.getItem(failedSessionKey) !== 'secret') {
+                throw new Error('the injected failed key should demonstrate that data can remain');
+            }
+            if (sessionStorage.getItem(laterSessionKey) !== null) {
+                throw new Error('cleanup must continue to later sessionStorage keys after one failure');
+            }
+            if (localStorage.getItem(currentLocalKey) !== null) {
+                throw new Error('cleanup must still attempt localStorage after a sessionStorage failure');
+            }
+            if (
+                sessionStorage.getItem(otherSessionKey) !== 'other'
+                || localStorage.getItem(otherLocalKey) !== 'other'
+            ) {
+                throw new Error('archive-scoped cleanup must preserve other archives');
+            }
+
+            sessionStorage.failedKeys.clear();
+            const retryResult = await clearAllStorage();
+            if (retryResult !== true || sessionStorage.getItem(failedSessionKey) !== null) {
+                throw new Error('a successful retry must remove the previously retained key');
+            }
+        } finally {
+            globalThis.window = originalWindow;
+            globalThis.localStorage = originalLocalStorage;
+            globalThis.sessionStorage = originalSessionStorage;
+            if (originalNavigatorDescriptor) {
+                Object.defineProperty(globalThis, 'navigator', originalNavigatorDescriptor);
+            } else {
+                delete globalThis.navigator;
+            }
+        }
+    "#;
+
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("run browser storage clear assertions with node");
+
+    assert!(
+        output.status.success(),
+        "browser storage clear assertions failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

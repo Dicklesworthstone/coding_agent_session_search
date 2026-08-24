@@ -408,8 +408,10 @@ impl BundleBuilder {
 
             // Write config.json to site/ (already has public params only)
             let site_config_path = site_dir.join("config.json");
-            let config_file = File::create(&site_config_path)?;
-            serde_json::to_writer_pretty(BufWriter::new(config_file), &archive_config)?;
+            let config_json = serde_json::to_vec_pretty(&archive_config)
+                .context("Failed to serialize public Pages config")?;
+            crate::pages::write_file_durably(&site_config_path, &config_json)
+                .context("Failed to write public Pages config")?;
 
             // Write site metadata
             let site_metadata = SiteMetadata {
@@ -420,8 +422,10 @@ impl BundleBuilder {
                 generator_version: env!("CARGO_PKG_VERSION").to_string(),
             };
             let site_json_path = site_dir.join("site.json");
-            let site_json_file = File::create(&site_json_path)?;
-            serde_json::to_writer_pretty(BufWriter::new(site_json_file), &site_metadata)?;
+            let site_json = serde_json::to_vec_pretty(&site_metadata)
+                .context("Failed to serialize Pages site metadata")?;
+            crate::pages::write_file_durably(&site_json_path, &site_json)
+                .context("Failed to write Pages site metadata")?;
 
             progress("static", "Writing static files...");
 
@@ -455,8 +459,10 @@ impl BundleBuilder {
             // Generate integrity.json for all files in site/
             let integrity_manifest = generate_integrity_manifest(&site_dir)?;
             let integrity_path = site_dir.join("integrity.json");
-            let integrity_file = File::create(&integrity_path)?;
-            serde_json::to_writer_pretty(BufWriter::new(integrity_file), &integrity_manifest)?;
+            let integrity_json = serde_json::to_vec_pretty(&integrity_manifest)
+                .context("Failed to serialize Pages integrity manifest")?;
+            crate::pages::write_file_durably(&integrity_path, &integrity_json)
+                .context("Failed to write Pages integrity manifest")?;
 
             // Compute integrity fingerprint (short hash for visual verification)
             let fingerprint = compute_fingerprint(&integrity_manifest);

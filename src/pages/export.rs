@@ -105,7 +105,16 @@ impl ExportEngine {
     {
         let output_path = resolve_export_output_path(&self.source_db_path, &self.output_path)?;
         #[cfg(windows)]
-        recover_or_refuse_interrupted_export_publish(&output_path)?;
+        let output_path = {
+            recover_or_refuse_interrupted_export_publish(&output_path)?;
+            // Recovery can make a formerly absent destination name an alias
+            // of the source (for example through a pre-existing hard link).
+            // Re-run the source-identity proof against the restored entry
+            // before opening either database.
+            resolve_export_output_path(&self.source_db_path, &output_path)?
+        };
+        #[cfg(windows)]
+        reject_non_regular_existing_publish_destination(&output_path)?;
 
         if output_path.exists() && output_path.is_dir() {
             bail!(
@@ -1133,6 +1142,97 @@ fn replacement_path_entry_exists(path: &Path) -> Result<bool> {
     }
 }
 
+/// The backup fallback can recover only an existing regular database file.
+/// Reject links and special filesystem entries before moving anything so a
+/// crash can never strand an entry that the recovery path must not trust.
+#[cfg(any(windows, test))]
+fn reject_non_regular_existing_publish_destination(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => {
+            bail!(
+                "existing Pages export destination {} is not a regular file; refused backup replacement without mutation",
+                path.display()
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed inspecting existing Pages export destination {}",
+                path.display()
+            )
+        }),
+    }
+}
+
+/// Resolve the only automatically recoverable state left by the Windows
+/// replacement fallback.
+///
+/// Windows cannot atomically rename a staged file over an existing file with
+/// `std::fs::rename`, so replacement temporarily parks the prior generation at
+/// a deterministic sidecar. If the process stops before installing the new
+/// generation, the missing live path plus that sidecar unambiguously means the
+/// prior generation must be restored. If both entries exist, publication may
+/// already have completed; preserve both generations and require an operator
+/// to resolve the ambiguous state instead of guessing which sensitive bytes to
+/// discard.
+#[cfg(any(windows, test))]
+fn recover_or_refuse_interrupted_export_publish(final_path: &Path) -> Result<()> {
+    let backup_path = export_publish_recovery_backup_path(final_path);
+    let backup_metadata = match std::fs::symlink_metadata(&backup_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed inspecting Pages export publish-recovery backup {}",
+                    backup_path.display()
+                )
+            });
+        }
+    };
+    if !backup_metadata.file_type().is_file() {
+        bail!(
+            "Pages export publish-recovery path {} is not a regular file; preserved it and refused to modify live path {}",
+            backup_path.display(),
+            final_path.display()
+        );
+    }
+    #[cfg(unix)]
+    if backup_metadata.nlink() != 1 {
+        bail!(
+            "Pages export publish-recovery backup {} has {} hard links; preserved it and refused to modify live path {} because exclusive pathname ownership is not provable",
+            backup_path.display(),
+            backup_metadata.nlink(),
+            final_path.display()
+        );
+    }
+
+    if replacement_path_entry_exists(final_path)? {
+        bail!(
+            "an interrupted Pages export publish left both live generation {} and prior generation {}; preserved both because publication completion is ambiguous",
+            final_path.display(),
+            backup_path.display()
+        );
+    }
+
+    reject_existing_sqlite_sidecars(&backup_path, "publish-recovery backup")?;
+    reject_existing_sqlite_sidecars(final_path, "interrupted publish destination")?;
+    std::fs::rename(&backup_path, final_path).with_context(|| {
+        format!(
+            "failed restoring interrupted Pages export backup {} to missing live path {}; preserved the backup for recovery",
+            backup_path.display(),
+            final_path.display()
+        )
+    })?;
+    sync_parent_directory(final_path).with_context(|| {
+        format!(
+            "the prior Pages export was restored at {}, but the recovery rename could not be durably synced",
+            final_path.display()
+        )
+    })
+}
+
 #[cfg(any(windows, test))]
 fn replace_file_from_temp_via_backup(
     temp_path: &Path,
@@ -1141,9 +1241,11 @@ fn replace_file_from_temp_via_backup(
     retain_temp_on_error: &mut bool,
 ) -> Result<()> {
     *retain_temp_on_error = false;
-    let backup_path = unique_replace_backup_path(final_path);
+    recover_or_refuse_interrupted_export_publish(final_path)?;
+    reject_non_regular_existing_publish_destination(final_path)?;
+    reject_existing_sqlite_sidecars(final_path, "destination before backup replacement")?;
+    let backup_path = export_publish_recovery_backup_path(final_path);
     std::fs::rename(final_path, &backup_path).with_context(|| {
-        let _ = std::fs::remove_file(temp_path);
         format!(
             "failed preparing backup {} before replacing {} after initial rename error: {}",
             backup_path.display(),
@@ -1151,13 +1253,27 @@ fn replace_file_from_temp_via_backup(
             first_err
         )
     })?;
+    sync_parent_directory(&backup_path).with_context(|| {
+        format!(
+            "prior Pages export was parked at {} and the staged candidate remains at {}, but the backup rename could not be durably synced",
+            backup_path.display(),
+            temp_path.display()
+        )
+    })?;
 
     match std::fs::rename(temp_path, final_path) {
         Ok(()) => {
+            sync_parent_directory(final_path).with_context(|| {
+                format!(
+                    "new Pages export is live at {} and the prior generation remains at {}, but the replacement could not be durably synced",
+                    final_path.display(),
+                    backup_path.display()
+                )
+            })?;
             remove_prior_export_backup_after_publish(&backup_path, final_path)?;
             sync_parent_directory(final_path).with_context(|| {
                 format!(
-                    "new Pages export is live at {}, but its replacement could not be durably synced",
+                    "new Pages export is live at {} and its prior-generation backup was removed, but the backup cleanup could not be durably synced",
                     final_path.display()
                 )
             })?;
@@ -1165,7 +1281,6 @@ fn replace_file_from_temp_via_backup(
         }
         Err(second_err) => match std::fs::rename(&backup_path, final_path) {
             Ok(()) => {
-                let _ = std::fs::remove_file(temp_path);
                 let replacement_error = anyhow::anyhow!(
                     "failed replacing {} with {}: first error: {}; second error: {}; restored original file",
                     final_path.display(),
@@ -1184,13 +1299,14 @@ fn replace_file_from_temp_via_backup(
             Err(restore_err) => {
                 *retain_temp_on_error = true;
                 bail!(
-                    "failed replacing {} with {}: first error: {}; second error: {}; restore error: {}; temp file retained at {}",
+                    "failed replacing {} with {}: first error: {}; second error: {}; restore error: {}; temp file retained at {}; prior generation retained at {}",
                     final_path.display(),
                     temp_path.display(),
                     first_err,
                     second_err,
                     restore_err,
-                    temp_path.display()
+                    temp_path.display(),
+                    backup_path.display()
                 );
             }
         },
@@ -1216,6 +1332,10 @@ fn replace_file_from_temp(
     retain_temp_on_error: &mut bool,
 ) -> Result<()> {
     *retain_temp_on_error = false;
+    #[cfg(windows)]
+    recover_or_refuse_interrupted_export_publish(final_path)?;
+    #[cfg(windows)]
+    reject_non_regular_existing_publish_destination(final_path)?;
     reject_existing_sqlite_sidecars(final_path, "destination")?;
     #[cfg(windows)]
     {
@@ -2003,19 +2123,152 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
-    fn unique_replace_backup_path_is_not_reused() -> Result<()> {
+    fn backup_replacement_rejects_existing_destination_symlink() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
         let temp_dir = TempDir::new()?;
         let final_path = temp_dir.path().join("export.db");
-        let first = unique_replace_backup_path(&final_path);
-        let second = unique_replace_backup_path(&final_path);
+        let target_path = temp_dir.path().join("target.db");
+        std::fs::write(&target_path, b"target generation")?;
+        symlink(&target_path, &final_path)?;
 
-        if first == second {
-            return Err(anyhow::anyhow!(
-                "export replacement backup path was reused: {}",
-                first.display()
-            ));
-        }
+        let error = reject_non_regular_existing_publish_destination(&final_path)
+            .expect_err("backup replacement must not move an untrusted link");
+
+        assert!(format!("{error:#}").contains("not a regular file"));
+        assert!(std::fs::symlink_metadata(&final_path)?.file_type().is_symlink());
+        assert_eq!(std::fs::read(&target_path)?, b"target generation");
+
+        Ok(())
+    }
+
+    #[test]
+    fn publish_recovery_backup_path_is_stable_and_reserved() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let final_path = temp_dir.path().join("export.db");
+        let first = export_publish_recovery_backup_path(&final_path);
+        let second = export_publish_recovery_backup_path(&final_path);
+
+        assert_eq!(first, second, "recovery path must survive process restart");
+        assert_eq!(
+            first.file_name().and_then(|name| name.to_str()),
+            Some(".export.db.pages-export-publish-in-progress.bak")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn interrupted_publish_restores_prior_generation_when_live_path_is_missing() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let final_path = temp_dir.path().join("export.db");
+        let backup_path = export_publish_recovery_backup_path(&final_path);
+        std::fs::write(&backup_path, b"prior generation")?;
+
+        recover_or_refuse_interrupted_export_publish(&final_path)?;
+
+        assert_eq!(std::fs::read(&final_path)?, b"prior generation");
+        assert!(
+            std::fs::symlink_metadata(&backup_path).is_err(),
+            "successful recovery must consume the parked backup entry"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn interrupted_publish_preserves_both_ambiguous_generations() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let final_path = temp_dir.path().join("export.db");
+        let backup_path = export_publish_recovery_backup_path(&final_path);
+        std::fs::write(&final_path, b"possibly new generation")?;
+        std::fs::write(&backup_path, b"prior generation")?;
+
+        let error = recover_or_refuse_interrupted_export_publish(&final_path)
+            .expect_err("both generations must be preserved for explicit resolution");
+        let message = format!("{error:#}");
+
+        assert!(message.contains(&final_path.display().to_string()));
+        assert!(message.contains(&backup_path.display().to_string()));
+        assert_eq!(std::fs::read(&final_path)?, b"possibly new generation");
+        assert_eq!(std::fs::read(&backup_path)?, b"prior generation");
+
+        Ok(())
+    }
+
+    #[test]
+    fn interrupted_publish_preserves_backup_with_sqlite_companion() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let final_path = temp_dir.path().join("export.db");
+        let backup_path = export_publish_recovery_backup_path(&final_path);
+        let backup_sidecar = sqlite_content_artifact_paths(&backup_path)
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("SQLite artifact family unexpectedly empty"))?;
+        std::fs::write(&backup_path, b"prior main")?;
+        std::fs::write(&backup_sidecar, b"prior companion")?;
+
+        let error = recover_or_refuse_interrupted_export_publish(&final_path)
+            .expect_err("main-only recovery must refuse a backup with companions");
+
+        assert!(format!("{error:#}").contains(&backup_sidecar.display().to_string()));
+        assert_eq!(std::fs::read(&backup_path)?, b"prior main");
+        assert_eq!(std::fs::read(&backup_sidecar)?, b"prior companion");
+        assert!(
+            std::fs::symlink_metadata(&final_path).is_err(),
+            "refused recovery must not create a live main file"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn interrupted_publish_preserves_backup_when_destination_companion_survives() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let final_path = temp_dir.path().join("export.db");
+        let backup_path = export_publish_recovery_backup_path(&final_path);
+        let destination_sidecar = sqlite_content_artifact_paths(&final_path)
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("SQLite artifact family unexpectedly empty"))?;
+        std::fs::write(&backup_path, b"prior main")?;
+        std::fs::write(&destination_sidecar, b"unbound destination companion")?;
+
+        let error = recover_or_refuse_interrupted_export_publish(&final_path)
+            .expect_err("recovery must not mix a parked main with destination companions");
+
+        assert!(format!("{error:#}").contains(&destination_sidecar.display().to_string()));
+        assert_eq!(std::fs::read(&backup_path)?, b"prior main");
+        assert_eq!(
+            std::fs::read(&destination_sidecar)?,
+            b"unbound destination companion"
+        );
+        assert!(std::fs::symlink_metadata(&final_path).is_err());
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_publish_preserves_unowned_recovery_symlink() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new()?;
+        let final_path = temp_dir.path().join("export.db");
+        let backup_path = export_publish_recovery_backup_path(&final_path);
+        let unowned_target = temp_dir.path().join("unowned.db");
+        std::fs::write(&unowned_target, b"unowned bytes")?;
+        symlink(&unowned_target, &backup_path)?;
+
+        let error = recover_or_refuse_interrupted_export_publish(&final_path)
+            .expect_err("a recovery symlink must never be followed or moved into place");
+
+        assert!(format!("{error:#}").contains("not a regular file"));
+        assert!(std::fs::symlink_metadata(&backup_path)?.file_type().is_symlink());
+        assert_eq!(std::fs::read(&unowned_target)?, b"unowned bytes");
+        assert!(std::fs::symlink_metadata(&final_path).is_err());
 
         Ok(())
     }
@@ -2372,6 +2625,10 @@ mod tests {
                 "successful replacement incorrectly requested temp retention"
             ));
         }
+        assert!(
+            std::fs::symlink_metadata(export_publish_recovery_backup_path(&final_path)).is_err(),
+            "successful replacement left its recovery backup behind"
+        );
 
         Ok(())
     }

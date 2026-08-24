@@ -8461,12 +8461,23 @@ impl FrankenStorage {
                 } else {
                     serde_json::Value::Null
                 };
-                if let Some(object) = metadata.as_object_mut()
-                    && object.get("source").and_then(serde_json::Value::as_str)
-                        == Some("pi_agent")
-                {
-                    object.insert("source".into(), serde_json::Value::String("omp".into()));
+                if metadata.is_null() {
+                    metadata = serde_json::json!({});
                 }
+                let object = metadata.as_object_mut().ok_or_else(|| {
+                    anyhow!(
+                        "legacy OMP conversation {} metadata must be an object or null",
+                        legacy.id
+                    )
+                })?;
+                // Provider identity comes from the ownership proof above, not
+                // from optional legacy metadata. Always make the canonical
+                // metadata agree with the migrated agent row, including when
+                // the old row stored NULL or omitted `source` entirely.
+                object.insert(
+                    "source".into(),
+                    serde_json::Value::String("omp".into()),
+                );
                 // A named profile encoded in the transcript path is durable
                 // provenance, including for remote mirrors. Legacy Pi-owned
                 // rows predate first-class OMP profile tagging, and ordinary
@@ -8477,12 +8488,7 @@ impl FrankenStorage {
                     Path::new(&legacy.source_path),
                 )
                 {
-                    if metadata.is_null() {
-                        metadata = serde_json::json!({});
-                    }
-                    if let Some(object) = metadata.as_object_mut() {
-                        object.insert("profile".into(), serde_json::Value::String(profile));
-                    }
+                    object.insert("profile".into(), serde_json::Value::String(profile));
                 }
                 metadata_updates.push((
                     legacy.id,
@@ -30273,6 +30279,11 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&remote_a_metadata)?["profile"],
             "work",
             "path-derived profile provenance must survive a remote legacy migration"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&remote_a_metadata)?["source"],
+            "omp",
+            "NULL legacy metadata must acquire the canonical provider identity"
         );
 
         let current_remote_a = Conversation {

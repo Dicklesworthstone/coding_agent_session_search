@@ -459,14 +459,18 @@ async function handleClearCurrentStorage() {
 
     try {
         const storageCleared = await clearCurrentStorage();
-        if (!storageCleared) {
-            showNotification('Failed to clear current storage', 'error');
+        if (mode === StorageMode.MEMORY && onSessionReset) {
+            onSessionReset('clear-current-storage');
+            if (storageCleared) {
+                showNotification('Current memory storage cleared and session locked', 'success');
+            } else {
+                showNotification('Memory cleared and session locked, but some browser storage could not be fully cleared', 'error');
+            }
             return;
         }
 
-        if (mode === StorageMode.MEMORY && onSessionReset) {
-            onSessionReset('clear-current-storage');
-            showNotification('Current memory storage cleared and session locked', 'success');
+        if (!storageCleared) {
+            showNotification('Failed to fully clear current storage', 'error');
             return;
         }
 

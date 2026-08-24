@@ -29,6 +29,7 @@ let qrLibraryLoadPromise = null;
 let qrScannerTeardownPromise = null;
 let activeSessionExpiryTs = 0;
 let activeSessionExpiryTimerId = null;
+const MAX_BROWSER_DATABASE_SIZE = 512 * 1024 * 1024;
 const LEGACY_SESSION_KEYS = {
     DEK: 'cass_session_dek',
     EXPIRY: 'cass_session_expiry',
@@ -1119,17 +1120,29 @@ async function transitionToAppUnencrypted() {
 
 async function loadUnencryptedDatabase(initToken = activeAppInitToken) {
     const payloadPath = getUnencryptedPayloadPath();
+    const expectedSize = getUnencryptedPayloadSize();
     const response = await fetch(payloadPath);
     if (!response.ok) {
         throw new Error(`Failed to load database: ${response.status}`);
     }
 
-    const dbBytes = new Uint8Array(await response.arrayBuffer());
+    const dbBytes = await readResponseBytesExact(
+        response,
+        expectedSize,
+        'Unencrypted database'
+    );
     if (!isCurrentAppInitToken(initToken)) {
+        dbBytes.fill(0);
         return false;
     }
-    const dbModule = await import('./database.js');
-    await dbModule.initDatabase(dbBytes);
+    let dbModule;
+    try {
+        dbModule = await import('./database.js');
+        await dbModule.initDatabase(dbBytes);
+    } finally {
+        // database.js takes its own stable copy before its first await.
+        dbBytes.fill(0);
+    }
     if (!isCurrentAppInitToken(initToken)) {
         await closeLiveDatabase();
         return false;
@@ -1143,6 +1156,101 @@ async function loadUnencryptedDatabase(initToken = activeAppInitToken) {
         },
     }));
     return true;
+}
+
+function getUnencryptedPayloadSize() {
+    const sizeBytes = config?.payload?.size_bytes;
+    if (!Number.isSafeInteger(sizeBytes) || sizeBytes <= 0) {
+        throw new Error('Unencrypted payload size_bytes must be a positive safe integer');
+    }
+    if (sizeBytes > MAX_BROWSER_DATABASE_SIZE) {
+        throw new Error(
+            `Unencrypted database exceeds the ${MAX_BROWSER_DATABASE_SIZE}-byte browser limit`
+        );
+    }
+    return sizeBytes;
+}
+
+async function readResponseBytesExact(response, expectedSize, label) {
+    if (!Number.isSafeInteger(expectedSize) || expectedSize <= 0) {
+        throw new Error(`${label} has an invalid expected size`);
+    }
+    if (expectedSize > MAX_BROWSER_DATABASE_SIZE) {
+        throw new Error(`${label} exceeds the ${MAX_BROWSER_DATABASE_SIZE}-byte browser limit`);
+    }
+
+    const contentLengthHeader = response.headers?.get?.('content-length');
+    if (contentLengthHeader !== null && contentLengthHeader !== undefined) {
+        if (!/^\d+$/.test(contentLengthHeader)) {
+            throw new Error(`${label} returned an invalid Content-Length header`);
+        }
+        const contentLength = Number(contentLengthHeader);
+        if (!Number.isSafeInteger(contentLength) || contentLength > MAX_BROWSER_DATABASE_SIZE) {
+            throw new Error(`${label} exceeds the ${MAX_BROWSER_DATABASE_SIZE}-byte browser limit`);
+        }
+        // Fetch transparently decodes content-encoded responses, so compare an
+        // identity response here and always compare the streamed body below.
+        const contentEncoding = response.headers?.get?.('content-encoding');
+        if (!contentEncoding && contentLength !== expectedSize) {
+            throw new Error(
+                `${label} size mismatch: received ${contentLength}, expected ${expectedSize}`
+            );
+        }
+    }
+
+    if (!response.body?.getReader) {
+        throw new Error(`${label} cannot be read safely without streaming response support`);
+    }
+
+    const reader = response.body.getReader();
+    const chunks = [];
+    let totalLength = 0;
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!(value instanceof Uint8Array)) {
+                throw new Error(`${label} returned an invalid response chunk`);
+            }
+            totalLength += value.byteLength;
+            if (
+                !Number.isSafeInteger(totalLength)
+                || totalLength > expectedSize
+                || totalLength > MAX_BROWSER_DATABASE_SIZE
+            ) {
+                value.fill(0);
+                throw new Error(
+                    `${label} exceeds its declared ${expectedSize}-byte size`
+                );
+            }
+            chunks.push(value);
+        }
+
+        if (totalLength !== expectedSize) {
+            throw new Error(
+                `${label} size mismatch: received ${totalLength}, expected ${expectedSize}`
+            );
+        }
+
+        const bytes = new Uint8Array(totalLength);
+        let offset = 0;
+        for (const chunk of chunks) {
+            bytes.set(chunk, offset);
+            offset += chunk.byteLength;
+        }
+        return bytes;
+    } catch (error) {
+        try {
+            await reader.cancel(error?.message || String(error));
+        } catch {
+            // The response stream may already be closed or errored.
+        }
+        throw error;
+    } finally {
+        for (const chunk of chunks) {
+            chunk.fill(0);
+        }
+    }
 }
 
 function getUnencryptedPayloadPath() {

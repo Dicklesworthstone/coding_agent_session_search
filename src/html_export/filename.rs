@@ -286,8 +286,9 @@ const INVALID_CHARS: &[char] = &[
 
 /// Reserved filenames on Windows.
 const RESERVED_NAMES: &[&str] = &[
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    "CON", "CONIN$", "CONOUT$", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4",
+    "COM5", "COM6", "COM7", "COM8", "COM9", "COM¹", "COM²", "COM³", "LPT1", "LPT2",
+    "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "LPT¹", "LPT²", "LPT³",
 ];
 
 /// Check if a filename is valid across platforms.
@@ -307,9 +308,7 @@ pub fn is_valid_filename(name: &str) -> bool {
     }
 
     // Check for reserved names (Windows)
-    let upper = name.to_ascii_uppercase();
-    let base_name = upper.split('.').next().unwrap_or(&upper);
-    if RESERVED_NAMES.contains(&base_name) {
+    if is_reserved_basename(name) {
         return false;
     }
 
@@ -865,6 +864,10 @@ mod tests {
         assert!(!is_valid_filename("file<name"));
         assert!(!is_valid_filename("invisible\u{0007}bell.html"));
         assert!(!is_valid_filename("CON")); // Reserved on Windows
+        assert!(!is_valid_filename("conin$.txt"));
+        assert!(!is_valid_filename("CONOUT$"));
+        assert!(!is_valid_filename("COM¹.log"));
+        assert!(!is_valid_filename("lpt³.tar.gz"));
         assert!(!is_valid_filename(".hidden")); // Leading dot
     }
 
@@ -1143,6 +1146,14 @@ mod tests {
         assert_eq!(
             unique_filename(dir, "bad<name>.HTML"),
             PathBuf::from("/exports/badname.html")
+        );
+        assert_eq!(
+            unique_filename(dir, "CONIN$.html"),
+            PathBuf::from("/exports/conin.html")
+        );
+        assert_eq!(
+            unique_filename(dir, "COM¹.html"),
+            PathBuf::from("/exports/com.html")
         );
         assert_eq!(
             unique_filename(dir, "../../"),

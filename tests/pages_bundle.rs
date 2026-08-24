@@ -1695,15 +1695,43 @@ mod tests {
     fn test_service_worker_fetch_keeps_network_success_when_cache_write_fails() {
         let sw_js = include_str!("../src/pages_assets/sw.js");
         assert!(
-            sw_js.contains("if (response.ok) {\n            try {")
-                && sw_js.contains("log(LOG.WARN, 'Cache open error:', cacheError);")
+            sw_js.contains("const cacheWrite = getCurrentCache()")
+                && sw_js.contains("log(LOG.WARN, 'Cache put error:', error);")
+                && sw_js.contains("trackBackgroundTask(cacheWrite);")
+                && sw_js.contains("Promise.all(backgroundTasks)")
                 && sw_js.contains("return addSecurityHeaders(response);"),
-            "service worker fetch handling should treat cache-write failures as best-effort and still return a successful network response"
+            "service worker cache writes must stay best-effort for the response while remaining bound to the FetchEvent lifetime"
         );
         assert!(
             sw_js.contains("if (request.mode === 'navigate') {\n            try {")
+                && sw_js.contains("const cachedIndex = await cache.match(indexUrl);")
                 && sw_js.contains("log(LOG.WARN, 'Navigation cache fallback error:', cacheError);"),
             "navigation fallback should not crash if the Cache API itself fails during offline fallback"
+        );
+        assert!(
+            sw_js.contains("const cacheEligible = isCacheEligibleRequest(request, url);")
+                && sw_js.contains("url.search === ''")
+                && sw_js.contains("!request.headers.has('authorization')")
+                && sw_js.contains("!request.headers.has('range')")
+                && sw_js.contains("request.cache !== 'no-store'")
+                && sw_js.contains("responseAllowsCaching(response)")
+                && !sw_js.contains("caches.match("),
+            "runtime caching must stay inside the archive scope and must not fall through to stale or unrelated origin caches"
+        );
+
+        let install_body = sw_js
+            .split_once("self.addEventListener('install'")
+            .expect("install handler")
+            .1
+            .split_once("self.addEventListener('activate'")
+            .expect("bounded install handler")
+            .0;
+        assert!(
+            !install_body.contains("self.skipWaiting()")
+                && sw_js.contains("event.waitUntil(skipWaitingTask);")
+                && sw_js.contains("event.waitUntil(clearCacheTask);")
+                && sw_js.contains("const CACHE_VERSION = 'v6';"),
+            "updates must wait for explicit user activation and every async message operation must extend its event lifetime"
         );
     }
 
@@ -1722,9 +1750,19 @@ mod tests {
             "service worker unregister should treat unsupported or already-unregistered states as successful no-ops"
         );
         assert!(
-            sw_register_js.contains("return 'serviceWorker' in navigator\n            && (registration !== null || navigator.serviceWorker.controller !== null);")
-                && sw_register_js.contains("return 'serviceWorker' in navigator\n            && navigator.serviceWorker.controller !== null;"),
-            "service worker status getters should guard navigator.serviceWorker access on unsupported browsers"
+            sw_register_js.contains("const registrations = await navigator.serviceWorker.getRegistrations();")
+                && sw_register_js.contains("registrations.find(hasExactScope) || null")
+                && sw_register_js.contains("const activeWorker = currentRegistration?.active;")
+                && sw_register_js.contains("activeWorker.postMessage(message, [channel.port2]);")
+                && !sw_register_js.contains("getRegistration(getCurrentScopeUrl())"),
+            "registration RPC and unregister must resolve the exact archive scope instead of a broader longest-prefix registration"
+        );
+        assert!(
+            sw_register_js.contains("noticeWaitingUpdate(registration);")
+                && sw_register_js.contains("if (!reg?.waiting || !reg.active)")
+                && sw_register_js.contains("return 'serviceWorker' in navigator && hasExactScope(registration);")
+                && sw_register_js.contains("&& registration.active !== null;"),
+            "pre-existing waiting updates and status getters should be scoped to the exact archive registration"
         );
     }
 
@@ -2549,6 +2587,15 @@ mod tests {
                     config.payload.total_plaintext_size = 1;
                 }, 'expected 1 chunks');
                 expectRejected(config => {
+                    config.payload.chunk_count = 4097;
+                }, 'browser limit is 4096');
+                expectRejected(config => {
+                    config.payload.total_plaintext_size = 512 * 1024 * 1024 + 1;
+                }, 'Archive plaintext exceeds');
+                expectRejected(config => {
+                    config.payload.total_compressed_size = 640 * 1024 * 1024 + 1;
+                }, 'Archive ciphertext exceeds');
+                expectRejected(config => {
                     config.payload.files = ['payload/../secret.bin'];
                     config.payload.chunk_count = 1;
                     config.payload.total_plaintext_size = 1;
@@ -2635,6 +2682,103 @@ mod tests {
     }
 
     #[test]
+    fn unencrypted_database_stream_enforces_exact_bound_and_zeroizes_chunks() -> Result<()> {
+        run_node_module_assertions(
+            r#"
+                import fs from 'node:fs';
+                import vm from 'node:vm';
+
+                const source = fs.readFileSync('./src/pages_assets/auth.js', 'utf8');
+                const start = source.indexOf('async function readResponseBytesExact(');
+                const end = source.indexOf('\nfunction getUnencryptedPayloadPath()', start);
+                if (start < 0 || end < 0) {
+                    throw new Error('could not isolate unencrypted response reader');
+                }
+                const code = `
+                    const MAX_BROWSER_DATABASE_SIZE = 512 * 1024 * 1024;
+                    ${source.slice(start, end)}
+                `;
+                const context = { Uint8Array };
+                vm.createContext(context);
+                vm.runInContext(code, context);
+
+                function responseFrom(chunks, headers = {}) {
+                    let offset = 0;
+                    let cancellations = 0;
+                    return {
+                        response: {
+                            headers: {
+                                get(name) { return headers[name.toLowerCase()] ?? null; },
+                            },
+                            body: {
+                                getReader() {
+                                    return {
+                                        async read() {
+                                            if (offset >= chunks.length) return { done: true };
+                                            return { done: false, value: chunks[offset++] };
+                                        },
+                                        async cancel() { cancellations += 1; },
+                                    };
+                                },
+                            },
+                        },
+                        cancellationCount() { return cancellations; },
+                    };
+                }
+
+                const first = new Uint8Array([1, 2]);
+                const second = new Uint8Array([3, 4]);
+                const exact = responseFrom([first, second], { 'content-length': '4' });
+                const bytes = await context.readResponseBytesExact(
+                    exact.response,
+                    4,
+                    'fixture database'
+                );
+                if (Buffer.from(bytes).toString('hex') !== '01020304') {
+                    throw new Error(`exact stream was reconstructed incorrectly: ${bytes}`);
+                }
+                if (first.some(Boolean) || second.some(Boolean)) {
+                    throw new Error('source response chunks were not zeroized after copying');
+                }
+
+                const oversizedChunk = new Uint8Array([9, 8, 7]);
+                const oversized = responseFrom([oversizedChunk]);
+                let oversizedRejected = false;
+                try {
+                    await context.readResponseBytesExact(
+                        oversized.response,
+                        2,
+                        'fixture database'
+                    );
+                } catch (error) {
+                    oversizedRejected = String(error.message).includes('declared 2-byte size');
+                }
+                if (!oversizedRejected || oversized.cancellationCount() !== 1) {
+                    throw new Error('oversized response did not reject and cancel its stream');
+                }
+                if (oversizedChunk.some(Boolean)) {
+                    throw new Error('rejected oversized response chunk was not zeroized');
+                }
+
+                const truncated = responseFrom([new Uint8Array([1, 2])]);
+                let truncatedRejected = false;
+                try {
+                    await context.readResponseBytesExact(
+                        truncated.response,
+                        3,
+                        'fixture database'
+                    );
+                } catch (error) {
+                    truncatedRejected = String(error.message).includes('received 2, expected 3');
+                }
+                if (!truncatedRejected) {
+                    throw new Error('truncated response did not fail its exact-size check');
+                }
+            "#,
+        )
+    }
+
+    #[test]
     fn crypto_worker_zeroizes_replaced_and_superseded_keys() -> Result<()> {
         run_node_module_assertions(
             r#"
@@ -2702,6 +2846,12 @@ mod tests {
         assert!(
             database_js.contains("SQLITE_DESERIALIZE_FREEONCLOSE")
                 && database_js.contains("SQLITE_DESERIALIZE_READONLY")
+                && database_js.contains("const SQLITE_DESERIALIZE_PADDING = 20;")
+                && database_js.contains("const MAX_BROWSER_DATABASE_SIZE = 512 * 1024 * 1024;")
+                && database_js.contains("const MAX_WASM32_ALLOCATION_SIZE = 0xFFFFFFFF;")
+                && database_js.contains("checkedDatabaseAllocationSize(dbBytes.byteLength)")
+                && database_js.contains("wasmHeap.fill(")
+                && database_js.contains("wasmOffset + allocationSize")
                 && database_js.contains("if (wasmPtr && !sqliteOwnsBytes)")
                 && database_js.contains("./vendor/sqlite3.mjs")
                 && database_js.contains("stmt.finalize();")
@@ -2724,7 +2874,51 @@ mod tests {
                 && !worker_js.contains("./vendor/sqlite3.js")
                 && !worker_js.contains("async function initDatabase(")
                 && !worker_js.contains("let config = null;")
+                && worker_js.contains("Recovery secret must contain at least 24 bytes")
+                && worker_js.contains("MAX_BROWSER_ARCHIVE_CHUNKS = 4096")
+                && worker_js.matches("await writer.abort(error);").count() == 1
         );
+
+        for unlock_function in ["handleUnlockPassword", "handleUnlockRecovery"] {
+            let signature = format!("async function {unlock_function}");
+            let function_body = worker_js
+                .split_once(signature.as_str())
+                .unwrap_or_else(|| panic!("missing {unlock_function}"))
+                .1
+                .split_once("\n}\n")
+                .unwrap_or_else(|| panic!("unbounded {unlock_function}"))
+                .0;
+            let derive_offset = function_body
+                .find("const kek = await deriveKekFrom")
+                .unwrap_or_else(|| panic!("missing KEK derivation in {unlock_function}"));
+            let unwrap_try_offset = function_body
+                .find("let unwrappedDek = null;\n            try {")
+                .unwrap_or_else(|| panic!("missing unwrap-only catch in {unlock_function}"));
+            assert!(
+                derive_offset < unwrap_try_offset
+                    && function_body.contains("if (error?.name !== 'OperationError')"),
+                "{unlock_function} must not relabel KDF/runtime failures as bad credentials"
+            );
+        }
+
+        let auth_js = include_str!("../src/pages_assets/auth.js");
+        assert!(
+            auth_js.contains("const expectedSize = getUnencryptedPayloadSize();")
+                && auth_js.contains("response.body.getReader()")
+                && auth_js.contains("totalLength > expectedSize")
+                && auth_js.contains("if (totalLength !== expectedSize)")
+                && auth_js.contains("dbBytes.fill(0);")
+                && !auth_js.contains("new Uint8Array(await response.arrayBuffer())"),
+            "unencrypted database loading must stream within its declared size and zero temporary plaintext bytes"
+        );
+
+        let attrs = include_str!("../.gitattributes");
+        assert!(attrs.contains(
+            "src/pages_assets/vendor/sqlite3.mjs whitespace=-trailing-space"
+        ));
+        assert!(attrs.contains(
+            "src/pages_assets/vendor/sqlite3-opfs-async-proxy.js whitespace=-trailing-space"
+        ));
 
         let sw_js = include_str!("../src/pages_assets/sw.js");
         for vendor_asset in EXPECTED_VENDOR_ASSETS {

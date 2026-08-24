@@ -29434,21 +29434,37 @@ fn toon_encode_options_from_env() -> toon::EncodeOptions {
 }
 
 fn output_structured_value(payload: serde_json::Value, format: RobotFormat) -> CliResult<()> {
+    let output_error = |action: &str, error: &dyn std::fmt::Display| CliError {
+        code: 9,
+        kind: CliErrorKind::EncodeJson.kind_str(),
+        message: format!("failed to {action} structured output: {error}"),
+        hint: None,
+        retryable: false,
+    };
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+
     match format {
         RobotFormat::Json => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&payload).unwrap_or_default()
-            );
+            serde_json::to_writer_pretty(&mut out, &payload)
+                .map_err(|error| output_error("encode JSON", &error))?;
+            writeln!(&mut out).map_err(|error| output_error("write JSON newline", &error))?;
         }
         RobotFormat::Jsonl | RobotFormat::Compact | RobotFormat::Sessions => {
-            println!("{}", serde_json::to_string(&payload).unwrap_or_default());
+            serde_json::to_writer(&mut out, &payload)
+                .map_err(|error| output_error("encode compact JSON", &error))?;
+            writeln!(&mut out)
+                .map_err(|error| output_error("write compact JSON newline", &error))?;
         }
         RobotFormat::Toon => {
             let toon_str = toon::encode(payload, Some(toon_encode_options_from_env()));
-            print!("{toon_str}");
+            out.write_all(toon_str.as_bytes())
+                .map_err(|error| output_error("write TOON", &error))?;
         }
     }
+
+    out.flush()
+        .map_err(|error| output_error("flush", &error))?;
     Ok(())
 }
 
@@ -85196,24 +85212,35 @@ fn run_introspect(output_format: Option<RobotFormat>) -> CliResult<()> {
     });
 
     if let Some(fmt) = structured_format {
-        use std::io::Write;
+        let output_error = |action: &str, error: &dyn std::fmt::Display| CliError {
+            code: 9,
+            kind: CliErrorKind::EncodeJson.kind_str(),
+            message: format!("failed to {action} introspection response: {error}"),
+            hint: None,
+            retryable: false,
+        };
 
-        let stdout = std::io::stdout();
-        let mut stdout = stdout.lock();
-        match fmt {
-            RobotFormat::Json => {
-                let _ = serde_json::to_writer_pretty(&mut stdout, &response);
-                let _ = writeln!(stdout);
-            }
-            RobotFormat::Jsonl | RobotFormat::Compact | RobotFormat::Sessions => {
-                let _ = serde_json::to_writer(&mut stdout, &response);
-                let _ = writeln!(stdout);
-            }
-            RobotFormat::Toon => {
-                let payload = serde_json::to_value(&response).unwrap_or_default();
-                return output_structured_value(payload, fmt);
-            }
+        if matches!(fmt, RobotFormat::Toon) {
+            let payload = serde_json::to_value(&response)
+                .map_err(|error| output_error("encode", &error))?;
+            return output_structured_value(payload, fmt);
         }
+
+        // Serialize the response struct directly so the frozen top-level field
+        // order remains unchanged; converting through serde_json::Value would
+        // reorder object keys when preserve_order is disabled.
+        let stdout = std::io::stdout();
+        let mut out = std::io::BufWriter::new(stdout.lock());
+        if matches!(fmt, RobotFormat::Json) {
+            serde_json::to_writer_pretty(&mut out, &response)
+                .map_err(|error| output_error("encode JSON", &error))?;
+        } else {
+            serde_json::to_writer(&mut out, &response)
+                .map_err(|error| output_error("encode compact JSON", &error))?;
+        }
+        writeln!(&mut out).map_err(|error| output_error("write newline for", &error))?;
+        out.flush()
+            .map_err(|error| output_error("flush", &error))?;
         return Ok(());
     }
 

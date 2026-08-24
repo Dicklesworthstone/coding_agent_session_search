@@ -5,7 +5,9 @@
  * offline caching, and proper resource management.
  */
 
-const CACHE_VERSION = 'v5';
+// Bump whenever any shipped archive asset or cache policy changes. A new name
+// keeps install from mutating the active generation entry-by-entry.
+const CACHE_VERSION = 'v6';
 const STATIC_ASSETS = [
     './',
     './index.html',
@@ -77,6 +79,24 @@ function getCachePrefix() {
     return `cass-archive-${hashScopeId(getCacheScopeUrl())}-`;
 }
 
+function isWithinArchiveScope(url) {
+    const scopeUrl = new URL(getCacheScopeUrl());
+    return url.origin === scopeUrl.origin && url.pathname.startsWith(scopeUrl.pathname);
+}
+
+function isCacheEligibleRequest(request, url) {
+    return isWithinArchiveScope(url)
+        && url.search === ''
+        && !request.headers.has('authorization')
+        && !request.headers.has('range')
+        && request.cache !== 'no-store';
+}
+
+function responseAllowsCaching(response) {
+    const cacheControl = response.headers.get('cache-control') || '';
+    return response.ok && !/(?:^|,)\s*no-store(?:\s*(?:,|$)|=)/i.test(cacheControl);
+}
+
 function log(level, ...args) {
     if (level <= logLevel) {
         const prefix = ['[SW]', new Date().toISOString()];
@@ -103,8 +123,6 @@ self.addEventListener('install', (event) => {
             })
             .then(() => {
                 log(LOG.INFO, 'Service worker installed');
-                // Skip waiting to activate immediately
-                return self.skipWaiting();
             })
             .catch((error) => {
                 log(LOG.ERROR, 'Installation failed:', error);
@@ -154,8 +172,9 @@ self.addEventListener('activate', (event) => {
 self.addEventListener('fetch', (event) => {
     const url = new URL(event.request.url);
 
-    // Only handle same-origin requests
-    if (url.origin !== self.location.origin) {
+    // A controlled archive page can fetch same-origin URLs outside the
+    // registration scope. Leave those unrelated requests entirely alone.
+    if (!isWithinArchiveScope(url)) {
         return;
     }
 
@@ -164,7 +183,17 @@ self.addEventListener('fetch', (event) => {
         return;
     }
 
-    event.respondWith(handleFetch(event.request));
+    const backgroundTasks = [];
+    const responsePromise = handleFetch(
+        event.request,
+        (task) => backgroundTasks.push(task)
+    );
+    event.respondWith(responsePromise);
+    // Keep the worker alive until any cache write scheduled by handleFetch()
+    // settles, without delaying the network response on large payload chunks.
+    event.waitUntil(
+        responsePromise.then(() => Promise.all(backgroundTasks)).then(() => undefined)
+    );
 });
 
 /**
@@ -172,25 +201,31 @@ self.addEventListener('fetch', (event) => {
  * This preserves offline support without letting old config/payload/viewer files
  * silently override newer archive content.
  */
-async function handleFetch(request) {
+async function handleFetch(request, trackBackgroundTask = () => {}) {
     const url = new URL(request.url);
     const cacheName = getCacheName();
+    const cacheEligible = isCacheEligibleRequest(request, url);
+    let cachePromise = null;
+    const getCurrentCache = () => {
+        cachePromise ||= caches.open(cacheName);
+        return cachePromise;
+    };
 
     // Network first so updated archive contents win when online.
     try {
         const response = await fetch(request);
 
         // Only cache successful responses
-        if (response.ok) {
-            try {
-                const cache = await caches.open(cacheName);
-                // Clone response for caching
-                cache.put(request, response.clone()).catch(e => {
-                    log(LOG.WARN, 'Cache put error:', e);
+        if (cacheEligible && responseAllowsCaching(response)) {
+            // Clone before returning the original response. Once the client
+            // starts consuming its body, a later clone would throw.
+            const responseForCache = response.clone();
+            const cacheWrite = getCurrentCache()
+                .then((cache) => cache.put(request, responseForCache))
+                .catch((error) => {
+                    log(LOG.WARN, 'Cache put error:', error);
                 });
-            } catch (cacheError) {
-                log(LOG.WARN, 'Cache open error:', cacheError);
-            }
+            trackBackgroundTask(cacheWrite);
         }
 
         return addSecurityHeaders(response);
@@ -199,10 +234,13 @@ async function handleFetch(request) {
 
         // Offline/cache fallback
         try {
-            const cached = await caches.match(request);
-            if (cached) {
-                log(LOG.INFO, 'Serving cached response after network failure:', url.pathname);
-                return addSecurityHeaders(cached.clone());
+            if (cacheEligible) {
+                const cache = await getCurrentCache();
+                const cached = await cache.match(request);
+                if (cached) {
+                    log(LOG.INFO, 'Serving cached response after network failure:', url.pathname);
+                    return addSecurityHeaders(cached.clone());
+                }
             }
         } catch (cacheError) {
             log(LOG.WARN, 'Cache fallback error:', cacheError);
@@ -211,7 +249,9 @@ async function handleFetch(request) {
         // Try cache as fallback for navigation requests
         if (request.mode === 'navigate') {
             try {
-                const cachedIndex = await caches.match('./index.html');
+                const cache = await getCurrentCache();
+                const indexUrl = new URL('./index.html', getCacheScopeUrl()).href;
+                const cachedIndex = await cache.match(indexUrl);
                 if (cachedIndex) {
                     log(LOG.INFO, 'Serving cached index.html for offline navigation');
                     return addSecurityHeaders(cachedIndex.clone());
@@ -307,9 +347,14 @@ self.addEventListener('message', (event) => {
     }
 
     switch (type) {
-        case 'SKIP_WAITING':
-            self.skipWaiting();
+        case 'SKIP_WAITING': {
+            const skipWaitingTask = self.skipWaiting().catch((error) => {
+                log(LOG.WARN, 'Failed to activate waiting worker:', error);
+                throw error;
+            });
+            event.waitUntil(skipWaitingTask);
             break;
+        }
 
         case 'GET_VERSION':
             respond({
@@ -318,8 +363,8 @@ self.addEventListener('message', (event) => {
             });
             break;
 
-        case 'CLEAR_CACHE':
-            caches.keys()
+        case 'CLEAR_CACHE': {
+            const clearCacheTask = caches.keys()
                 .then((keys) => {
                     const cachePrefix = getCachePrefix();
                     const targets = keys.filter((key) => key.startsWith(cachePrefix));
@@ -344,7 +389,9 @@ self.addEventListener('message', (event) => {
                         error: error?.message || String(error),
                     });
                 });
+            event.waitUntil(clearCacheTask);
             break;
+        }
 
         case 'SET_LOG_LEVEL':
             logLevel = data.level;
