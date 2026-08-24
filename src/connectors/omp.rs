@@ -497,10 +497,22 @@ fn has_omp_layout_marker(path: &Path) -> bool {
     has_dot_omp_layout_marker(path) || has_xdg_omp_layout_marker(path)
 }
 
-/// Preserve profile provenance for explicit roots that FAD cannot tag on its
-/// own (for example `~/.omp/profiles/work/agent/sessions`).
+/// Reconcile profile provenance for explicit roots that FAD cannot tag on its
+/// own (for example `~/.omp/profiles/work/agent/sessions`). A structural path
+/// profile is authoritative over a process-level fallback tag.
 fn fill_missing_profiles(conversations: &mut [NormalizedConversation]) {
     for conversation in conversations {
+        // The transcript path is the durable provenance source. An explicit
+        // fallback scan may have been seeded with the process's active profile,
+        // but that local launch setting must not override a named profile that
+        // is encoded in an XDG/config-layout path (and may belong to a mirror).
+        if let Some(profile) = profile_from_session_path(&conversation.source_path) {
+            if let Some(metadata) = conversation.metadata.as_object_mut() {
+                metadata.insert("profile".into(), serde_json::Value::String(profile));
+            }
+            continue;
+        }
+
         let profile_missing = conversation
             .metadata
             .get("profile")
@@ -519,6 +531,19 @@ fn fill_missing_profiles(conversations: &mut [NormalizedConversation]) {
             metadata.insert("profile".into(), serde_json::Value::String(profile));
         }
     }
+}
+
+fn direct_root_profile(root: &ScanRoot, active_profile: Option<&str>) -> Option<String> {
+    profile_from_session_path(&root.path).or_else(|| {
+        // A process-level profile describes this local OMP invocation. It says
+        // nothing about a transcript copied from another machine, so leaving a
+        // remote profile unknown is more truthful than stealing the local one.
+        if root.origin.is_remote() {
+            None
+        } else {
+            active_profile.map(str::to_string)
+        }
+    })
 }
 
 fn fad_recognizes_explicit_root(path: &Path) -> bool {
@@ -619,10 +644,15 @@ impl Connector for OmpConnector {
 
         let direct_roots = unrecognized_direct_session_roots(ctx, &ownership);
         if !direct_roots.is_empty() {
-            let profile = active_profile_from_env();
+            let active_profile = active_profile_from_env();
             let tagged_roots = direct_roots
                 .iter()
-                .map(|root| (root.path.clone(), profile.clone()))
+                .map(|root| {
+                    (
+                        root.path.clone(),
+                        direct_root_profile(root, active_profile.as_deref()),
+                    )
+                })
                 .collect::<Vec<_>>();
             let fallback = franken_agent_detection::connectors::pi_wire::scan_homes_tagged(
                 &tagged_roots,
@@ -670,6 +700,7 @@ impl Connector for OmpConnector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connectors::{Origin, Platform};
     use serde_json::json;
 
     fn write_session(store_root: &Path, id: &str) -> PathBuf {
@@ -801,6 +832,44 @@ mod tests {
             conversations
                 .iter()
                 .all(|conversation| conversation.agent_slug == "omp")
+        );
+    }
+
+    #[test]
+    fn structural_profile_replaces_a_conflicting_fallback_tag() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let profile_root = temp.path().join("share/omp/profiles/work");
+        write_session(&profile_root, "profile-authority");
+        let ctx = ScanContext::local_default(temp.path().join("cass-state"), None);
+        let mut conversations =
+            franken_agent_detection::connectors::pi_wire::scan_homes_tagged(
+                &[(profile_root, Some("other".to_string()))],
+                &ctx,
+                "omp",
+            )
+            .expect("scan deliberately mistagged profile root");
+        assert_eq!(conversations[0].metadata["profile"], "other");
+
+        fill_missing_profiles(&mut conversations);
+
+        assert_eq!(conversations[0].metadata["profile"], "work");
+    }
+
+    #[test]
+    fn direct_remote_root_never_inherits_the_local_active_profile() {
+        let remote = ScanRoot::remote(
+            PathBuf::from("/cass/remotes/build-host/mirror/custom-store"),
+            Origin::remote_with_host("build-host", "build-host.example"),
+            Some(Platform::Linux),
+        );
+        assert_eq!(direct_root_profile(&remote, Some("local-profile")), None);
+
+        let structural = ScanRoot::local(PathBuf::from(
+            "/home/dev/.local/share/omp/profiles/work/sessions",
+        ));
+        assert_eq!(
+            direct_root_profile(&structural, Some("local-profile")).as_deref(),
+            Some("work")
         );
     }
 
