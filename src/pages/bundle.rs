@@ -505,9 +505,20 @@ fn bundle_publish_marker_exists(bundle_dir: &Path) -> Result<bool> {
                     marker_path.display()
                 );
             }
-            let contents = fs::read(&marker_path).with_context(|| {
-                format!("failed reading bundle publish marker {}", marker_path.display())
-            })?;
+            let maximum_marker_bytes = u64::try_from(
+                BUNDLE_PUBLISH_MARKER_CONTENT.len().saturating_add(1),
+            )
+            .unwrap_or(u64::MAX);
+            let mut contents = Vec::with_capacity(BUNDLE_PUBLISH_MARKER_CONTENT.len());
+            File::open(&marker_path)
+                .with_context(|| {
+                    format!("failed opening bundle publish marker {}", marker_path.display())
+                })?
+                .take(maximum_marker_bytes)
+                .read_to_end(&mut contents)
+                .with_context(|| {
+                    format!("failed reading bundle publish marker {}", marker_path.display())
+                })?;
             if contents != BUNDLE_PUBLISH_MARKER_CONTENT {
                 bail!(
                     "bundle publish marker has unrecognized contents and will not be trusted: {}",
@@ -1018,6 +1029,7 @@ fn replace_dir_from_temp_via_recoverable_rename_pair(
     match fs::rename(temp_dir, final_dir) {
         Ok(()) => {
             if let Err(sync_error) = sync_parent_directory(final_dir) {
+                *retain_temp_on_error = true;
                 bail!(
                     "new bundle was moved into place at {}, but the publish could not be durably synced: {}; prior bundle containing private artifacts retained at {}",
                     final_dir.display(),
@@ -1025,7 +1037,13 @@ fn replace_dir_from_temp_via_recoverable_rename_pair(
                     backup_dir.display()
                 );
             }
-            cleanup_prior_bundle_after_publish(backup_dir, final_dir)
+            if let Err(cleanup_error) =
+                cleanup_prior_bundle_after_publish(backup_dir, final_dir)
+            {
+                *retain_temp_on_error = true;
+                return Err(cleanup_error);
+            }
+            Ok(())
         }
         Err(publish_error) => match fs::rename(backup_dir, final_dir) {
             Ok(()) => {
@@ -2996,7 +3014,7 @@ mod tests {
     }
 
     #[test]
-    fn test_recover_interrupted_bundle_publish_keeps_new_live_and_cleans_parked_old() {
+    fn test_recover_interrupted_fallback_publish_keeps_new_live_and_cleans_parked_old() {
         let temp = TempDir::new().unwrap();
         let final_dir = temp.path().join("bundle");
         let staged_dir = temp.path().join("bundle.staged");
@@ -3020,6 +3038,68 @@ mod tests {
         );
         assert!(!final_dir.join("private/old-private.txt").exists());
         assert!(!backup_dir.exists());
+    }
+
+    #[test]
+    fn test_recover_interrupted_atomic_publish_before_exchange_keeps_prior_live() {
+        let temp = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let staged_dir = temp.path().join("bundle.staged");
+        let exchange_dir = bundle_publish_in_progress_backup_path(&final_dir);
+
+        fs::create_dir_all(final_dir.join("private")).unwrap();
+        fs::write(final_dir.join("private/old-private.txt"), "old").unwrap();
+        fs::create_dir_all(staged_dir.join("private")).unwrap();
+        fs::write(staged_dir.join("private/new-private.txt"), "new").unwrap();
+        fs::write(
+            bundle_publish_marker_path(&staged_dir),
+            BUNDLE_PUBLISH_MARKER_CONTENT,
+        )
+        .unwrap();
+
+        // Failpoint state: NEW reached the deterministic exchange handle,
+        // but the process died before the atomic exchange committed.
+        fs::rename(&staged_dir, &exchange_dir).unwrap();
+
+        recover_interrupted_bundle_publish(&final_dir).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(final_dir.join("private/old-private.txt")).unwrap(),
+            "old"
+        );
+        assert!(!final_dir.join("private/new-private.txt").exists());
+        assert!(!exchange_dir.exists());
+        assert!(!bundle_publish_marker_path(&final_dir).exists());
+    }
+
+    #[test]
+    fn test_recover_interrupted_atomic_publish_immediately_after_exchange_keeps_new_live() {
+        let temp = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let exchange_dir = bundle_publish_in_progress_backup_path(&final_dir);
+
+        // Failpoint state immediately after exchange: NEW is live and carries
+        // the marker that moved with it; OLD is discoverable at the canonical
+        // exchange handle and carries no marker.
+        fs::create_dir_all(final_dir.join("private")).unwrap();
+        fs::write(final_dir.join("private/new-private.txt"), "new").unwrap();
+        fs::write(
+            bundle_publish_marker_path(&final_dir),
+            BUNDLE_PUBLISH_MARKER_CONTENT,
+        )
+        .unwrap();
+        fs::create_dir_all(exchange_dir.join("private")).unwrap();
+        fs::write(exchange_dir.join("private/old-private.txt"), "old").unwrap();
+
+        recover_interrupted_bundle_publish(&final_dir).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(final_dir.join("private/new-private.txt")).unwrap(),
+            "new"
+        );
+        assert!(!final_dir.join("private/old-private.txt").exists());
+        assert!(!exchange_dir.exists());
+        assert!(!bundle_publish_marker_path(&final_dir).exists());
     }
 
     #[test]

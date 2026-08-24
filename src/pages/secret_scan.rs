@@ -1,3 +1,4 @@
+use super::sqlite_artifact_paths;
 use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt, params_from_iter};
 use crate::franken_sync::params;
 use crate::indexer::redact_secrets::{
@@ -6,7 +7,6 @@ use crate::indexer::redact_secrets::{
     GENERIC_SECRET_ASSIGNMENT_PATTERN, GITHUB_TOKEN_PATTERN, JWT_PATTERN, OPENAI_API_KEY_PATTERN,
     PRIVATE_KEY_BLOCK_PATTERN, SLACK_TOKEN_PATTERN, STRIPE_KEY_PATTERN,
 };
-use super::{SQLITE_SIDECAR_SUFFIXES, sqlite_sidecar_path};
 use anyhow::{Context, Result, bail};
 use console::{Term, style};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -452,8 +452,7 @@ pub fn scan_staged_export_database<P: AsRef<Path>>(
 }
 
 fn ensure_staged_export_has_no_sidecars(db_path: &Path, phase: &str) -> Result<()> {
-    for suffix in SQLITE_SIDECAR_SUFFIXES {
-        let sidecar_path = sqlite_sidecar_path(db_path, suffix);
+    for sidecar_path in sqlite_artifact_paths(db_path) {
         match std::fs::symlink_metadata(&sidecar_path) {
             Ok(_) => {
                 bail!(
@@ -2429,10 +2428,12 @@ mod tests {
     #[test]
     fn staged_export_scan_rejects_unbound_sqlite_sidecars() -> Result<()> {
         let config = SecretScanConfig::from_inputs_with_env(&[], &[], false)?;
-        for suffix in SQLITE_SIDECAR_SUFFIXES {
+        let artifact_paths = sqlite_artifact_paths(Path::new("export.db"));
+        for relative_path in artifact_paths {
             let temp = tempfile::tempdir()?;
             let db_path = temp.path().join("export.db");
-            let sentinel_path = sqlite_sidecar_path(&db_path, suffix);
+            let sentinel_path = temp.path().join(relative_path);
+            let artifact_label = sentinel_path.display().to_string();
             std::fs::write(&db_path, b"main-file sentinel")?;
             std::fs::write(&sentinel_path, b"unbound sidecar sentinel")?;
 
@@ -2440,17 +2441,17 @@ mod tests {
                 .expect_err("a main-file digest must not attest an unbound SQLite sidecar");
             let diagnostic = format!("{error:#}");
             assert!(
-                diagnostic.contains(suffix),
-                "diagnostic omitted rejected suffix {suffix}: {diagnostic}"
+                diagnostic.contains(&artifact_label),
+                "diagnostic omitted rejected artifact {artifact_label}: {diagnostic}"
             );
             assert!(
                 diagnostic.contains("main-file-only artifact attestation"),
-                "unexpected error for {suffix}: {diagnostic}"
+                "unexpected error for {artifact_label}: {diagnostic}"
             );
             assert_eq!(
                 std::fs::read(&sentinel_path)?,
                 b"unbound sidecar sentinel",
-                "attestation rejection mutated sentinel {suffix}"
+                "attestation rejection mutated sentinel {artifact_label}"
             );
         }
         Ok(())

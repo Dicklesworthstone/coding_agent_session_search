@@ -34,22 +34,21 @@ pub mod summary;
 pub mod verify;
 pub mod wizard;
 
-/// Exact SQLite/FrankenSQLite artifact siblings that cannot accompany a
-/// main-file-only Pages export. Keep publication, staged cleanup, and exact
-/// secret-scan attestation on this one private source of truth.
-const SQLITE_SIDECAR_SUFFIXES: &[&str] = &[
+/// Content/recovery companions whose presence means a Pages SQLite export is
+/// not a self-contained main file. These are the finite companions emitted by
+/// the pinned FrankenSQLite 0.3.8 producer; publication must preserve and
+/// reject them rather than guessing that they are stale.
+const SQLITE_CONTENT_ARTIFACT_SUFFIXES: &[&str] = &[
     "-journal",
     "-wal",
     "-shm",
-    "-lock-shared",
-    "-lock-reserved",
-    "-lock-pending",
-    "-fsqlite-ns-gate",
-    "-fsqlite-ns-use",
+    "-wal-fec",
     "-wal-cert",
     "-wal-cert-head",
     ".fsqlite-migration-state",
 ];
+
+const SQLITE_LOCK_SUFFIXES: &[&str] = &["-lock-shared", "-lock-reserved", "-lock-pending"];
 
 fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     let mut file_name = path
@@ -58,6 +57,53 @@ fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
         .to_os_string();
     file_name.push(suffix);
     path.with_file_name(file_name)
+}
+
+/// Return every content/recovery path associated with `path`.
+///
+/// The WAL-FEC rewrite temporary is intentionally constructed with
+/// `Path::with_extension`, matching `fsqlite-vfs` 0.3.8. For `export.db` this
+/// is `export.wal-fec.tmp`, not `export.db-wal-fec.tmp`.
+fn sqlite_content_artifact_paths(path: &Path) -> Vec<PathBuf> {
+    let mut paths = SQLITE_CONTENT_ARTIFACT_SUFFIXES
+        .iter()
+        .map(|suffix| sqlite_sidecar_path(path, suffix))
+        .collect::<Vec<_>>();
+    paths.push(sqlite_sidecar_path(path, "-wal-fec").with_extension("wal-fec.tmp"));
+    paths
+}
+
+/// Return operational companions left by an explicitly closed FrankenSQLite
+/// writer. Windows creates its lock triplet for each read-write VFS artifact;
+/// pinned 0.3.8 steady-state coverage identifies the main file, WAL, and WAL
+/// certificate. Namespace gate/use files are scoped to the main database.
+fn sqlite_runtime_artifact_paths(path: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![
+        sqlite_sidecar_path(path, "-fsqlite-ns-gate"),
+        sqlite_sidecar_path(path, "-fsqlite-ns-use"),
+    ];
+    let lock_roots = [
+        path.to_path_buf(),
+        sqlite_sidecar_path(path, "-wal"),
+        sqlite_sidecar_path(path, "-wal-cert"),
+    ];
+    for root in lock_roots {
+        paths.extend(
+            SQLITE_LOCK_SUFFIXES
+                .iter()
+                .map(|suffix| sqlite_sidecar_path(&root, suffix)),
+        );
+    }
+    paths
+}
+
+/// Exact, finite Pages SQLite artifact family shared by publication cleanup
+/// and secret-scan attestation. Do not replace this with a prefix glob: nearby
+/// paths may belong to another process or generation.
+fn sqlite_artifact_paths(path: &Path) -> Vec<PathBuf> {
+    let mut paths = sqlite_content_artifact_paths(path);
+    paths.extend(sqlite_runtime_artifact_paths(path));
+    paths
 }
 
 fn ensure_real_directory(path: &Path, metadata: &Metadata, label: &str) -> Result<()> {

@@ -265,6 +265,13 @@ fn path_is_within(path: &Path, root: &Path) -> bool {
     {
         return canonical_path.starts_with(canonical_root);
     }
+
+    // Lexical fallback is needed for historical paths that no longer exist,
+    // but it must not bless a prefix that a parent traversal subsequently
+    // escapes. The structural classifier applies the same fail-closed rule.
+    if path_parts(path).is_none() || path_parts(root).is_none() {
+        return false;
+    }
     path.starts_with(root)
 }
 
@@ -573,7 +580,7 @@ pub(crate) fn configured_session_root(path: &Path) -> Option<PathBuf> {
         && let Some(agent_root) = nonempty_env_path("PI_CODING_AGENT_DIR")
     {
         let sessions = agent_root.join("sessions");
-        if path.starts_with(&sessions) {
+        if path_is_within(path, &sessions) {
             return Some(sessions);
         }
     }
@@ -585,19 +592,16 @@ pub(crate) fn configured_session_root(path: &Path) -> Option<PathBuf> {
 /// session paths. Callers must first establish that the path belongs to OMP.
 #[must_use]
 pub(crate) fn profile_from_session_path(path: &Path) -> Option<String> {
-    let parts = path
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>();
+    let parts = path_parts(path)?;
 
     for window in parts.windows(4) {
         if window[0] == "profiles" && window[2] == "agent" && window[3] == "sessions" {
-            return normalize_profile_name(window[1].as_ref());
+            return normalize_profile_name(&window[1]);
         }
     }
     for window in parts.windows(3) {
         if window[0] == "profiles" && window[2] == "sessions" {
-            return normalize_profile_name(window[1].as_ref());
+            return normalize_profile_name(&window[1]);
         }
     }
     None
@@ -939,6 +943,13 @@ mod tests {
         );
         assert_eq!(
             profile_from_session_path(Path::new(
+                r"C:\Users\dev\.omp\profiles\windows\agent\sessions\project\session.jsonl"
+            )),
+            Some("windows".to_string()),
+            "profile provenance must survive cross-platform archived paths"
+        );
+        assert_eq!(
+            profile_from_session_path(Path::new(
                 "/home/dev/.omp/profiles/con/agent/sessions/project/session.jsonl"
             )),
             None,
@@ -989,6 +1000,21 @@ mod tests {
                 path.display()
             );
         }
+
+        let omp_root = PathBuf::from("/srv/omp-sessions");
+        let omp_policy = ownership(None, Some(omp_root.clone()), None, Vec::new(), None);
+        assert_eq!(
+            omp_policy.owner(&omp_root.join("../pi-sessions/project/x.jsonl")),
+            PiFamilyOwner::Unknown,
+            "a missing historical path must not escape an explicit OMP root through lexical prefix matching"
+        );
+        let pi_root = PathBuf::from("/srv/pi-sessions");
+        let pi_policy = ownership(Some(pi_root.clone()), None, None, Vec::new(), None);
+        assert_eq!(
+            pi_policy.owner(&pi_root.join("../omp-sessions/project/x.jsonl")),
+            PiFamilyOwner::Unknown,
+            "a missing historical path must not escape an explicit Pi root through lexical prefix matching"
+        );
     }
 
     #[test]

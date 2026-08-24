@@ -1,10 +1,10 @@
+use super::{sqlite_artifact_paths, sqlite_content_artifact_paths, sqlite_runtime_artifact_paths};
 use crate::franken_sync::compat::{
     ConnectionExt, ParamValue, RowExt, Transaction, TransactionExt,
 };
 use crate::franken_sync::{Connection, Row as FrankenRow, params};
 use crate::pages::summary::ExclusionSet;
 use crate::ui::time_parser::parse_time_input;
-use super::{SQLITE_SIDECAR_SUFFIXES, sqlite_sidecar_path};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
@@ -758,8 +758,7 @@ fn unique_atomic_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) ->
 
 fn cleanup_sqlite_sidecars(path: &Path) -> Result<()> {
     let mut first_error = None;
-    for suffix in SQLITE_SIDECAR_SUFFIXES {
-        let artifact = sqlite_sidecar_path(path, suffix);
+    for artifact in sqlite_artifact_paths(path) {
         match std::fs::remove_file(&artifact) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -776,25 +775,15 @@ fn cleanup_sqlite_sidecars(path: &Path) -> Result<()> {
     first_error.map_or(Ok(()), Err)
 }
 
-const STAGED_CONTENT_SIDECAR_SUFFIXES: &[&str] = &[
-    "-journal",
-    "-wal",
-    "-shm",
-    "-wal-cert",
-    "-wal-cert-head",
-    ".fsqlite-migration-state",
-];
-
 fn finalize_staged_sqlite_sidecars(path: &Path) -> Result<()> {
-    // Rollback journals, WAL/SHM, FrankenSQLite's parallel-WAL commit
-    // certificates, and its durable migration marker can describe database
-    // state that does not belong to a standalone main file. Journal mode is
-    // DELETE for Pages exports, so any survivor is unexpected and must block
-    // publication rather than be discarded. Only the closed writer's lock and
-    // namespace sidecars are operational metadata that can be removed before
-    // main-file-only verification.
-    for suffix in STAGED_CONTENT_SIDECAR_SUFFIXES {
-        let sidecar = sqlite_sidecar_path(path, suffix);
+    // Rollback journals, WAL/SHM, FrankenSQLite's WAL-FEC recovery files,
+    // parallel-WAL commit certificates, and durable migration marker can
+    // describe database state that does not belong to a standalone main file.
+    // Journal mode is DELETE for Pages exports, so any survivor is unexpected
+    // and must block publication rather than be discarded. Only the explicitly
+    // closed writer's exact lock and namespace paths are operational metadata
+    // that can be removed before main-file-only verification.
+    for sidecar in sqlite_content_artifact_paths(path) {
         match std::fs::symlink_metadata(&sidecar) {
             Ok(_) => {
                 bail!(
@@ -815,12 +804,7 @@ fn finalize_staged_sqlite_sidecars(path: &Path) -> Result<()> {
     }
 
     let mut first_error = None;
-    for suffix in SQLITE_SIDECAR_SUFFIXES
-        .iter()
-        .copied()
-        .filter(|suffix| !STAGED_CONTENT_SIDECAR_SUFFIXES.contains(suffix))
-    {
-        let sidecar = sqlite_sidecar_path(path, suffix);
+    for sidecar in sqlite_runtime_artifact_paths(path) {
         match std::fs::remove_file(&sidecar) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -875,8 +859,7 @@ fn create_staged_export_file(path: &Path) -> Result<()> {
 /// readers observe a mixed or corrupt generation. The exporter cannot safely
 /// decide that an existing sidecar is stale, so preserve it and fail closed.
 fn reject_existing_sqlite_sidecars(path: &Path, artifact_label: &str) -> Result<()> {
-    for suffix in SQLITE_SIDECAR_SUFFIXES {
-        let sidecar = sqlite_sidecar_path(path, suffix);
+    for sidecar in sqlite_artifact_paths(path) {
         match std::fs::symlink_metadata(&sidecar) {
             Ok(_) => {
                 bail!(
@@ -1721,11 +1704,7 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let staged_path = temp_dir.path().join("export.tmp.db");
         let artifacts = std::iter::once(staged_path.clone())
-            .chain(
-                SQLITE_SIDECAR_SUFFIXES
-                    .iter()
-                    .map(|suffix| sqlite_sidecar_path(&staged_path, suffix)),
-            )
+            .chain(sqlite_artifact_paths(&staged_path))
             .collect::<Vec<_>>();
         for artifact in &artifacts {
             std::fs::write(artifact, b"staged bytes")?;
@@ -1746,10 +1725,11 @@ mod tests {
 
     #[test]
     fn staged_finalization_rejects_content_sidecars_without_mutating_them() -> Result<()> {
-        for suffix in STAGED_CONTENT_SIDECAR_SUFFIXES {
+        let content_paths = sqlite_content_artifact_paths(Path::new("export.tmp.db"));
+        for relative_path in content_paths {
             let temp_dir = TempDir::new()?;
             let staged_path = temp_dir.path().join("export.tmp.db");
-            let sentinel_path = sqlite_sidecar_path(&staged_path, suffix);
+            let sentinel_path = temp_dir.path().join(relative_path);
             std::fs::write(&staged_path, b"staged main")?;
             std::fs::write(&sentinel_path, b"content-bearing sentinel")?;
 
@@ -1764,12 +1744,14 @@ mod tests {
             }
             if std::fs::read(&staged_path)? != b"staged main" {
                 return Err(anyhow::anyhow!(
-                    "staged sidecar rejection mutated the main file for {suffix}"
+                    "staged sidecar rejection mutated the main file for {}",
+                    sentinel_path.display()
                 ));
             }
             if std::fs::read(&sentinel_path)? != b"content-bearing sentinel" {
                 return Err(anyhow::anyhow!(
-                    "staged sidecar rejection mutated the sidecar for {suffix}"
+                    "staged sidecar rejection mutated the sidecar {}",
+                    sentinel_path.display()
                 ));
             }
         }
@@ -1781,12 +1763,7 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let staged_path = temp_dir.path().join("export.tmp.db");
         std::fs::write(&staged_path, b"staged main")?;
-        let runtime_sidecars = SQLITE_SIDECAR_SUFFIXES
-            .iter()
-            .copied()
-            .filter(|suffix| !STAGED_CONTENT_SIDECAR_SUFFIXES.contains(suffix))
-            .map(|suffix| sqlite_sidecar_path(&staged_path, suffix))
-            .collect::<Vec<_>>();
+        let runtime_sidecars = sqlite_runtime_artifact_paths(&staged_path);
         for sidecar in &runtime_sidecars {
             std::fs::write(sidecar, b"closed runtime sentinel")?;
         }
@@ -1875,14 +1852,16 @@ mod tests {
 
     #[test]
     fn replacement_rejects_existing_sqlite_sidecars_without_mutating_artifacts() -> Result<()> {
-        for suffix in SQLITE_SIDECAR_SUFFIXES {
+        let artifact_paths = sqlite_artifact_paths(Path::new("export.db"));
+        for relative_path in artifact_paths {
             let temp_dir = TempDir::new()?;
             let final_path = temp_dir.path().join("export.db");
             let staged_path = temp_dir.path().join("export.tmp.db");
-            let sentinel_path = sqlite_sidecar_path(&final_path, suffix);
-            let old_generation = format!("old main for {suffix}");
-            let new_generation = format!("new main for {suffix}");
-            let sentinel = format!("sentinel sidecar for {suffix}");
+            let sentinel_path = temp_dir.path().join(relative_path);
+            let artifact_label = sentinel_path.display().to_string();
+            let old_generation = format!("old main for {artifact_label}");
+            let new_generation = format!("new main for {artifact_label}");
+            let sentinel = format!("sentinel sidecar for {artifact_label}");
 
             std::fs::write(&final_path, old_generation.as_bytes())?;
             std::fs::write(&staged_path, new_generation.as_bytes())?;
@@ -1905,17 +1884,17 @@ mod tests {
             }
             if std::fs::read(&final_path)? != old_generation.as_bytes() {
                 return Err(anyhow::anyhow!(
-                    "sidecar rejection mutated the prior main database for {suffix}"
+                    "sidecar rejection mutated the prior main database for {artifact_label}"
                 ));
             }
             if std::fs::read(&staged_path)? != new_generation.as_bytes() {
                 return Err(anyhow::anyhow!(
-                    "sidecar rejection consumed the staged database for {suffix}"
+                    "sidecar rejection consumed the staged database for {artifact_label}"
                 ));
             }
             if std::fs::read(&sentinel_path)? != sentinel.as_bytes() {
                 return Err(anyhow::anyhow!(
-                    "sidecar rejection mutated the sentinel artifact for {suffix}"
+                    "sidecar rejection mutated the sentinel artifact for {artifact_label}"
                 ));
             }
             if retain_temp_on_error {
