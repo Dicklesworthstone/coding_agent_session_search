@@ -72,6 +72,9 @@ const ALL_ARCHIVE_TOFU_KEY_RE = /^cass_fingerprint_v2_[0-9a-f]{8}$/;
 
 // In-memory storage (fallback and default)
 const memoryStore = new Map();
+// A failed persistent deletion must hide the stale backend value while still
+// reporting that physical cleanup failed.
+const MEMORY_TOMBSTONE = Symbol('cass-storage-deleted');
 
 // Current storage mode
 let currentMode = StorageMode.MEMORY;
@@ -275,35 +278,45 @@ export function isOPFSAvailable() {
  * Store a value
  * @param {string} key - Storage key
  * @param {*} value - Value to store (will be JSON serialized)
+ * @returns {Promise<boolean>} True when the selected backend accepted the write;
+ * false when the logical write is available only through the memory fallback
  */
 export async function setItem(key, value) {
     const fullKey = getArchiveDataKey(key);
     const serialized = JSON.stringify(value);
+    if (serialized === undefined) {
+        throw new TypeError('Storage value must be JSON-serializable');
+    }
 
     switch (currentMode) {
         case StorageMode.MEMORY:
             memoryStore.set(fullKey, serialized);
-            break;
+            return true;
 
         case StorageMode.SESSION:
             try {
                 sessionStorage.setItem(fullKey, serialized);
+                memoryStore.delete(fullKey);
+                return true;
             } catch (e) {
                 console.warn('[Storage] sessionStorage write failed:', e);
                 memoryStore.set(fullKey, serialized);
+                return false;
             }
-            break;
 
         case StorageMode.LOCAL:
             try {
                 localStorage.setItem(fullKey, serialized);
+                memoryStore.delete(fullKey);
+                return true;
             } catch (e) {
                 console.warn('[Storage] localStorage write failed:', e);
                 memoryStore.set(fullKey, serialized);
+                return false;
             }
-            break;
-
     }
+
+    return false;
 }
 
 /**
@@ -315,36 +328,36 @@ export async function getItem(key, defaultValue = null) {
     const fullKey = getArchiveDataKey(key);
     let serialized = null;
 
-    switch (currentMode) {
-        case StorageMode.MEMORY:
-            serialized = memoryStore.get(fullKey);
-            break;
+    // A failed persistent overwrite/delete is newer than whatever stale value
+    // remains in Web Storage. Consult the fallback first until a later
+    // successful persistent write removes it.
+    if (currentMode !== StorageMode.MEMORY && memoryStore.has(fullKey)) {
+        serialized = memoryStore.get(fullKey);
+    } else {
+        switch (currentMode) {
+            case StorageMode.MEMORY:
+                serialized = memoryStore.get(fullKey);
+                break;
 
-        case StorageMode.SESSION:
-            try {
-                serialized = sessionStorage.getItem(fullKey);
-                if (serialized === null) {
+            case StorageMode.SESSION:
+                try {
+                    serialized = sessionStorage.getItem(fullKey);
+                } catch (e) {
                     serialized = memoryStore.get(fullKey);
                 }
-            } catch (e) {
-                serialized = memoryStore.get(fullKey);
-            }
-            break;
+                break;
 
-        case StorageMode.LOCAL:
-            try {
-                serialized = localStorage.getItem(fullKey);
-                if (serialized === null) {
+            case StorageMode.LOCAL:
+                try {
+                    serialized = localStorage.getItem(fullKey);
+                } catch (e) {
                     serialized = memoryStore.get(fullKey);
                 }
-            } catch (e) {
-                serialized = memoryStore.get(fullKey);
-            }
-            break;
-
+                break;
+        }
     }
 
-    if (serialized === null || serialized === undefined) {
+    if (serialized === MEMORY_TOMBSTONE || serialized === null || serialized === undefined) {
         return defaultValue;
     }
 
@@ -358,6 +371,7 @@ export async function getItem(key, defaultValue = null) {
 /**
  * Remove a value
  * @param {string} key - Storage key
+ * @returns {Promise<boolean>} Whether the selected backend no longer contains the key
  */
 export async function removeItem(key) {
     const fullKey = getArchiveDataKey(key);
@@ -365,27 +379,40 @@ export async function removeItem(key) {
     switch (currentMode) {
         case StorageMode.MEMORY:
             memoryStore.delete(fullKey);
-            break;
+            return true;
 
         case StorageMode.SESSION:
             try {
                 sessionStorage.removeItem(fullKey);
+                if (sessionStorage.getItem(fullKey) !== null) {
+                    memoryStore.set(fullKey, MEMORY_TOMBSTONE);
+                    return false;
+                }
+                memoryStore.delete(fullKey);
+                return true;
             } catch (e) {
-                // Ignore
+                console.warn('[Storage] sessionStorage delete failed:', e);
+                memoryStore.set(fullKey, MEMORY_TOMBSTONE);
+                return false;
             }
-            memoryStore.delete(fullKey);
-            break;
 
         case StorageMode.LOCAL:
             try {
                 localStorage.removeItem(fullKey);
+                if (localStorage.getItem(fullKey) !== null) {
+                    memoryStore.set(fullKey, MEMORY_TOMBSTONE);
+                    return false;
+                }
+                memoryStore.delete(fullKey);
+                return true;
             } catch (e) {
-                // Ignore
+                console.warn('[Storage] localStorage delete failed:', e);
+                memoryStore.set(fullKey, MEMORY_TOMBSTONE);
+                return false;
             }
-            memoryStore.delete(fullKey);
-            break;
-
     }
+
+    return false;
 }
 
 /**
@@ -402,7 +429,7 @@ async function migrateStorage(fromMode, toMode) {
     switch (fromMode) {
         case StorageMode.MEMORY:
             for (const [key, value] of memoryStore) {
-                if (key.startsWith(archiveDataPrefix)) {
+                if (key.startsWith(archiveDataPrefix) && value !== MEMORY_TOMBSTONE) {
                     keys.push(key);
                     values.set(key, value);
                 }
@@ -963,7 +990,7 @@ export async function getStorageStats() {
 
     // Count memory items
     for (const [key, value] of memoryStore) {
-        if (key.startsWith(archiveDataPrefix)) {
+        if (key.startsWith(archiveDataPrefix) && value !== MEMORY_TOMBSTONE) {
             stats.memory.items++;
             stats.memory.bytes += key.length + (value?.length || 0);
         }

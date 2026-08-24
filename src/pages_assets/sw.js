@@ -7,7 +7,7 @@
 
 // Bump whenever any shipped archive asset or cache policy changes. A new name
 // keeps install from mutating the active generation entry-by-entry.
-const CACHE_VERSION = 'v6';
+const CACHE_VERSION = 'v7';
 const STATIC_ASSETS = [
     './',
     './index.html',

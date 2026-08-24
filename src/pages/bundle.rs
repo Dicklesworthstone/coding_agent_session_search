@@ -454,6 +454,9 @@ impl BundleBuilder {
                 fs::write(site_dir.join("README.md"), public_readme)?;
             }
 
+            validate_pinned_vendor_assets(&site_dir)
+                .context("Materialized Pages vendor runtime failed exact-byte validation")?;
+
             progress("integrity", "Generating integrity manifest...");
 
             // Generate integrity.json for all files in site/
@@ -2716,6 +2719,21 @@ mod tests {
         };
         let error = validate_embedded_vendor_asset(&mutated).unwrap_err();
         assert!(error.to_string().contains("SHA-256"));
+    }
+
+    #[test]
+    fn bundle_build_validates_materialized_vendor_before_integrity_publish() {
+        let source = include_str!("bundle.rs");
+        let validation = source
+            .find("validate_pinned_vendor_assets(&site_dir)")
+            .expect("materialized vendor validation in build path");
+        let integrity = source
+            .find("progress(\"integrity\", \"Generating integrity manifest...\")")
+            .expect("integrity generation step");
+        let publish = source
+            .find("replace_dir_from_temp(")
+            .expect("bundle publication step");
+        assert!(validation < integrity && integrity < publish);
     }
 
     #[test]

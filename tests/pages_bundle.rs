@@ -1747,7 +1747,7 @@ mod tests {
             !install_body.contains("self.skipWaiting()")
                 && sw_js.contains("event.waitUntil(skipWaitingTask);")
                 && sw_js.contains("event.waitUntil(clearCacheTask);")
-                && sw_js.contains("const CACHE_VERSION = 'v6';"),
+                && sw_js.contains("const CACHE_VERSION = 'v7';"),
             "updates must wait for explicit user activation and every async message operation must extend its event lifetime"
         );
         assert!(
@@ -1784,6 +1784,8 @@ mod tests {
                     "navigator.serviceWorker.register(SERVICE_WORKER_URL, {\n            scope: ARCHIVE_SCOPE_URL,"
                 )
                 && sw_register_js.contains("await waitForExactRegistrationActivation(registration);")
+                && sw_register_js.contains("DEFAULT_SW_ACTIVATION_TIMEOUT_MS = 30_000")
+                && sw_register_js.contains("Timed out waiting for archive service worker activation")
                 && sw_register_js.contains("candidateWorker.state === 'activated'")
                 && sw_register_js.contains("candidateWorker.state === 'redundant'")
                 && !sw_register_js.contains("navigator.serviceWorker.ready")
@@ -1794,6 +1796,11 @@ mod tests {
                     "const activeWorker = currentRegistration?.active?.state === 'activated'"
                 )
                 && sw_register_js.contains("activeWorker.postMessage(message, [channel.port2]);")
+                && sw_register_js.contains("channel.port1.close();")
+                && sw_register_js.contains("channel.port2.close();")
+                && sw_register_js.contains(
+                    "throw new Error('Failed to enumerate service worker registrations', { cause: error });"
+                )
                 && !sw_register_js.contains("getRegistration(getCurrentScopeUrl())"),
             "registration RPC and unregister must resolve the exact archive scope instead of a broader longest-prefix registration"
         );
@@ -1803,6 +1810,18 @@ mod tests {
                 && sw_register_js.contains("return 'serviceWorker' in navigator && hasExactScope(registration);")
                 && sw_register_js.contains("&& registration.active?.state === 'activated';"),
             "pre-existing waiting updates and status getters should be scoped to the exact archive registration"
+        );
+        assert!(
+            sw_register_js.contains("if (!currentRegistration?.waiting) {")
+                && sw_register_js.contains("const controllerChanged = await waitForActivation;")
+                && sw_register_js.contains("waitingWorker.state !== 'activated'")
+                && sw_register_js.contains("currentRegistration.active !== waitingWorker")
+                && sw_register_js.contains(
+                    "throw new Error('Archive update did not become the active controller; the page was not reloaded');"
+                )
+                && sw_register_js.find("waitingWorker.state !== 'activated'")
+                    < sw_register_js.find("window.location.reload();"),
+            "update application must not reload the old worker after an activation timeout"
         );
     }
 
@@ -2821,6 +2840,46 @@ mod tests {
     }
 
     #[test]
+    fn unencrypted_database_rejects_partial_http_responses() -> Result<()> {
+        run_node_module_assertions(
+            r#"
+                import fs from 'node:fs';
+                import vm from 'node:vm';
+
+                const source = fs.readFileSync('./src/pages_assets/auth.js', 'utf8');
+                const start = source.indexOf('async function loadUnencryptedDatabase(');
+                const end = source.indexOf('\nfunction getUnencryptedPayloadSize()', start);
+                if (start < 0 || end < 0) {
+                    throw new Error('could not isolate unencrypted database loader');
+                }
+                const code = `
+                    const activeAppInitToken = 1;
+                    const ARCHIVE_SCOPE_URL = new URL('https://example.test/archive/');
+                    function getUnencryptedPayloadPath() { return './payload/data.db'; }
+                    function getUnencryptedPayloadSize() { return 4; }
+                    ${source.slice(start, end)}
+                `;
+                const context = {
+                    URL,
+                    fetch: async () => ({ ok: true, status: 206 }),
+                };
+                vm.createContext(context);
+                vm.runInContext(code, context);
+
+                let rejected = false;
+                try {
+                    await context.loadUnencryptedDatabase(1);
+                } catch (error) {
+                    rejected = String(error.message).includes('206');
+                }
+                if (!rejected) {
+                    throw new Error('partial 206 database response was accepted as a complete archive');
+                }
+            "#,
+        )
+    }
+
+    #[test]
     fn unencrypted_payload_path_rejects_url_decoding_aliases() -> Result<()> {
         run_node_module_assertions(
             r#"
@@ -3011,6 +3070,7 @@ mod tests {
         let auth_js = include_str!("../src/pages_assets/auth.js");
         assert!(
             auth_js.contains("const expectedSize = getUnencryptedPayloadSize();")
+                && auth_js.contains("if (response.status !== 200) {")
                 && auth_js.contains("response.body.getReader()")
                 && auth_js.contains("bytes = new Uint8Array(expectedSize);")
                 && auth_js.contains("nextLength > expectedSize")

@@ -8,6 +8,7 @@
 let registration = null;
 let updateAvailable = false;
 const DEFAULT_SW_MESSAGE_TIMEOUT_MS = 3000;
+const DEFAULT_SW_ACTIVATION_TIMEOUT_MS = 30_000;
 const watchedRegistrations = new WeakSet();
 let controllerChangeListenerInstalled = false;
 const ARCHIVE_SCOPE_URL = new URL('./', import.meta.url).href;
@@ -33,12 +34,16 @@ async function resolveRegistration() {
     } catch (error) {
         console.warn('[SW] Failed to resolve registration:', error);
         registration = null;
+        throw new Error('Failed to enumerate service worker registrations', { cause: error });
     }
 
     return registration;
 }
 
-async function waitForExactRegistrationActivation(candidateRegistration) {
+async function waitForExactRegistrationActivation(
+    candidateRegistration,
+    { timeoutMs = DEFAULT_SW_ACTIVATION_TIMEOUT_MS } = {}
+) {
     if (!hasExactScope(candidateRegistration)) {
         throw new Error('Service worker registered with an unexpected scope');
     }
@@ -54,8 +59,17 @@ async function waitForExactRegistrationActivation(candidateRegistration) {
     }
 
     await new Promise((resolve, reject) => {
+        let settled = false;
+        let timeoutId = null;
         const finish = (error = null) => {
+            if (settled) {
+                return;
+            }
+            settled = true;
             candidateWorker.removeEventListener('statechange', handleStateChange);
+            if (timeoutId !== null) {
+                clearTimeout(timeoutId);
+            }
             if (error) {
                 reject(error);
             } else {
@@ -71,6 +85,9 @@ async function waitForExactRegistrationActivation(candidateRegistration) {
         };
 
         candidateWorker.addEventListener('statechange', handleStateChange);
+        timeoutId = setTimeout(() => {
+            finish(new Error('Timed out waiting for archive service worker activation'));
+        }, timeoutMs);
         handleStateChange();
     });
 }
@@ -86,22 +103,40 @@ async function postMessageWithReply(message, { timeoutMs = DEFAULT_SW_MESSAGE_TI
 
     return new Promise((resolve) => {
         const channel = new MessageChannel();
+        let settled = false;
+        const finish = (value) => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            clearTimeout(timeoutId);
+            channel.port1.onmessage = null;
+            try {
+                channel.port1.close();
+            } catch {
+                // The browser may already have detached the reply port.
+            }
+            try {
+                channel.port2.close();
+            } catch {
+                // Transferring the request port may make this local handle unusable.
+            }
+            resolve(value);
+        };
         const timeoutId = setTimeout(() => {
             console.warn('[SW] Timed out waiting for controller reply:', message.type);
-            resolve(null);
+            finish(null);
         }, timeoutMs);
 
         channel.port1.onmessage = (event) => {
-            clearTimeout(timeoutId);
-            resolve(event.data ?? null);
+            finish(event.data ?? null);
         };
 
         try {
             activeWorker.postMessage(message, [channel.port2]);
         } catch (error) {
-            clearTimeout(timeoutId);
             console.warn('[SW] Failed to post message to controller:', message.type, error);
-            resolve(null);
+            finish(null);
         }
     });
 }
@@ -109,19 +144,19 @@ async function postMessageWithReply(message, { timeoutMs = DEFAULT_SW_MESSAGE_TI
 function waitForControllerChange({ timeoutMs = DEFAULT_SW_MESSAGE_TIMEOUT_MS } = {}) {
     return new Promise((resolve) => {
         let settled = false;
-        const finish = () => {
+        const finish = (controllerChanged) => {
             if (settled) {
                 return;
             }
             settled = true;
             clearTimeout(timeoutId);
             navigator.serviceWorker.removeEventListener('controllerchange', handleControllerChange);
-            resolve();
+            resolve(controllerChanged);
         };
-        const handleControllerChange = () => finish();
+        const handleControllerChange = () => finish(true);
         const timeoutId = setTimeout(() => {
             console.warn('[SW] Timed out waiting for controller change');
-            finish();
+            finish(false);
         }, timeoutMs);
 
         navigator.serviceWorker.addEventListener('controllerchange', handleControllerChange);
@@ -304,12 +339,23 @@ function showUpdateNotification() {
  */
 export async function applyUpdate() {
     const currentRegistration = await resolveRegistration();
-    if (currentRegistration?.waiting) {
-        const waitForActivation = waitForControllerChange();
-        // Tell waiting service worker to skip waiting
-        currentRegistration.waiting.postMessage({ type: 'SKIP_WAITING' });
-        await waitForActivation;
+    if (!currentRegistration?.waiting) {
+        throw new Error('No waiting archive update is available');
     }
+
+    const waitingWorker = currentRegistration.waiting;
+    const waitForActivation = waitForControllerChange();
+    // Tell waiting service worker to skip waiting
+    waitingWorker.postMessage({ type: 'SKIP_WAITING' });
+    const controllerChanged = await waitForActivation;
+    if (
+        !controllerChanged
+        || waitingWorker.state !== 'activated'
+        || currentRegistration.active !== waitingWorker
+    ) {
+        throw new Error('Archive update did not become the active controller; the page was not reloaded');
+    }
+
     // Reload the page
     window.location.reload();
 }

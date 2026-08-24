@@ -29,6 +29,64 @@ export const SESSION_CONFIG = {
     KEY_STORAGE_PREF: 'cass_storage_pref',
 };
 
+const SESSION_DEK_BYTES = 32;
+// Browser timers use a signed 32-bit delay. Larger values may fire almost
+// immediately instead of enforcing the intended expiry.
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const VALID_STORAGE_MODES = new Set([
+    SESSION_CONFIG.STORAGE_MEMORY,
+    SESSION_CONFIG.STORAGE_SESSION,
+    SESSION_CONFIG.STORAGE_LOCAL,
+]);
+
+function validateDuration(value, label = 'Session duration') {
+    if (
+        !Number.isSafeInteger(value)
+        || value <= 0
+        || value > MAX_TIMER_DELAY_MS
+    ) {
+        throw new RangeError(`${label} must be a positive safe integer no greater than ${MAX_TIMER_DELAY_MS}`);
+    }
+    return value;
+}
+
+function calculateExpiry(now, duration) {
+    validateDuration(duration);
+    const expiry = now + duration;
+    if (!Number.isSafeInteger(expiry) || expiry <= now) {
+        throw new RangeError('Session expiry is outside the safe timestamp range');
+    }
+    return expiry;
+}
+
+function parseStoredExpiry(value) {
+    if (typeof value !== 'string' || !/^[1-9][0-9]*$/.test(value)) {
+        return null;
+    }
+    const expiry = Number(value);
+    return Number.isSafeInteger(expiry) ? expiry : null;
+}
+
+function isUsableFutureExpiry(expiry, now) {
+    return Number.isSafeInteger(expiry)
+        && expiry > now
+        && expiry - now <= MAX_TIMER_DELAY_MS;
+}
+
+function validateDek(dek) {
+    if (!(dek instanceof Uint8Array) || dek.byteLength !== SESSION_DEK_BYTES) {
+        throw new TypeError(`Session DEK must be exactly ${SESSION_DEK_BYTES} bytes`);
+    }
+    return dek;
+}
+
+function writeAndVerify(storage, key, value) {
+    storage.setItem(key, value);
+    if (storage.getItem(key) !== value) {
+        throw new Error(`Persistent session write verification failed for ${key}`);
+    }
+}
+
 function getScopedSessionKeys() {
     const scopeId = getArchiveScopeId();
     return {
@@ -103,14 +161,20 @@ class MemoryStorage {
  */
 export class SessionManager {
     constructor(options = {}) {
-        this.duration = options.duration || SESSION_CONFIG.DEFAULT_DURATION_MS;
-        this.storage = options.storage || SESSION_CONFIG.STORAGE_SESSION;
+        this.duration = validateDuration(
+            options.duration ?? SESSION_CONFIG.DEFAULT_DURATION_MS
+        );
+        this.storage = options.storage ?? SESSION_CONFIG.STORAGE_SESSION;
+        if (!VALID_STORAGE_MODES.has(this.storage)) {
+            throw new TypeError(`Unknown session storage mode: ${this.storage}`);
+        }
         this.onExpired = options.onExpired || (() => {});
         this.onWarning = options.onWarning || (() => {});
 
         this.dek = null;              // Current DEK (in memory)
         this.expiryTs = 0;            // Current session expiry timestamp
         this.persistent = false;      // Whether the session is persisted in storage
+        this.persistenceStorage = null; // Actual backend used for persisted state
         this.expiryTimeout = null;    // Expiry timer
         this.warningTimeout = null;   // Warning timer
         this.memoryStorage = new MemoryStorage();
@@ -127,22 +191,28 @@ export class SessionManager {
      * @param {boolean} rememberMe - Whether to persist the session
      */
     async startSession(dek, rememberMe = false) {
-        if (!(dek instanceof Uint8Array) || dek.byteLength === 0) {
-            throw new TypeError('Session DEK must be a non-empty Uint8Array');
-        }
+        validateDek(dek);
+        const nextDek = this.dek === dek ? new Uint8Array(dek) : dek;
+        const expiry = calculateExpiry(Date.now(), this.duration);
+
+        // Replacing a session must not leave the prior key or timers alive,
+        // even if cleanup or persistence of the replacement later fails.
+        this.clearActiveState();
         if (!this.clearStorage()) {
             throw new Error('Previous persisted session data could not be fully cleared');
         }
 
-        const expiry = Date.now() + this.duration;
-        const persistent = rememberMe && this.storage !== SESSION_CONFIG.STORAGE_MEMORY;
+        const storage = this.getStorage();
+        const persistent = rememberMe === true && storage !== this.memoryStorage;
 
         if (persistent) {
-            const storage = this.getStorage();
             const sessionKeys = getScopedSessionKeys();
             try {
-                storage.setItem(sessionKeys.TOKEN, encodeBytes(dek));
-                storage.setItem(sessionKeys.EXPIRY, expiry.toString());
+                const encodedDek = encodeBytes(nextDek);
+                const encodedExpiry = expiry.toString();
+                // Write expiry first and the token last as the commit marker.
+                writeAndVerify(storage, sessionKeys.EXPIRY, encodedExpiry);
+                writeAndVerify(storage, sessionKeys.TOKEN, encodedDek);
             } catch (error) {
                 if (!this.clearStorage()) {
                     console.warn('[Session] Failed session start left persisted data that could not be fully cleared');
@@ -155,6 +225,7 @@ export class SessionManager {
         this.dek = dek;
         this.expiryTs = expiry;
         this.persistent = persistent;
+        this.persistenceStorage = persistent ? storage : null;
 
         // Set timers
         this.setTimers(expiry);
@@ -170,36 +241,40 @@ export class SessionManager {
      * @returns {Uint8Array|null} The DEK if restored, null otherwise
      */
     async restoreSession() {
+        // A restore attempt supersedes any active in-memory session. Never let
+        // an old key survive a failed or successful replacement attempt.
+        this.clearActiveState();
         const storage = this.getStorage();
         const sessionKeys = getScopedSessionKeys();
-        const token = storage.getItem(sessionKeys.TOKEN);
-        const expiry = parseInt(
-            storage.getItem(sessionKeys.EXPIRY) || '0',
-            10
-        );
-
-        if (!token || Date.now() > expiry) {
-            console.log('[Session] No valid session to restore');
-            if (!this.clearStorage()) {
-                console.warn('[Session] Invalid persisted session data could not be fully cleared');
-            }
-            return null;
-        }
+        let restoredDek = null;
 
         try {
-            const dek = decodeBytes(token);
-            this.dek = dek;
+            const token = storage.getItem(sessionKeys.TOKEN);
+            const expiry = parseStoredExpiry(storage.getItem(sessionKeys.EXPIRY));
+            const now = Date.now();
+            if (!token || !isUsableFutureExpiry(expiry, now)) {
+                throw new Error('Persisted session has a missing or invalid expiry');
+            }
+
+            restoredDek = decodeBytes(token);
+            validateDek(restoredDek);
+            this.dek = restoredDek;
             this.expiryTs = expiry;
-            this.persistent = true;
+            this.persistent = storage !== this.memoryStorage;
+            this.persistenceStorage = this.persistent ? storage : null;
 
             // Reset timers with remaining time
             this.setTimers(expiry);
             this.setupCleanupHandlers();
 
             console.log(`[Session] Restored, expires at ${new Date(expiry).toISOString()}`);
-            return dek;
+            return restoredDek;
         } catch (error) {
             console.error('[Session] Failed to restore:', error);
+            if (restoredDek && this.dek !== restoredDek) {
+                restoredDek.fill(0);
+            }
+            this.clearActiveState();
             if (!this.clearStorage()) {
                 console.warn('[Session] Unrestorable persisted session data could not be fully cleared');
             }
@@ -213,17 +288,7 @@ export class SessionManager {
      */
     endSession() {
         console.log('[Session] Ending session');
-
-        // Clear DEK from memory (zeroize)
-        if (this.dek) {
-            this.dek.fill(0);
-            this.dek = null;
-        }
-
-        // Clear timers
-        this.clearTimers();
-        this.expiryTs = 0;
-        this.persistent = false;
+        this.clearActiveState();
 
         let storageCleared = false;
         try {
@@ -238,6 +303,21 @@ export class SessionManager {
             console.warn('[Session] Session ended, but persisted session data could not be fully cleared');
         }
         return storageCleared;
+    }
+
+    /**
+     * Clear in-memory session state without touching persistent keys.
+     */
+    clearActiveState() {
+        if (this.dek) {
+            this.dek.fill(0);
+            this.dek = null;
+        }
+        this.clearTimers();
+        this.expiryTs = 0;
+        this.persistent = false;
+        this.persistenceStorage = null;
+        this.removeCleanupHandlers();
     }
 
     /**

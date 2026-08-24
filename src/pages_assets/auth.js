@@ -1132,7 +1132,7 @@ async function loadUnencryptedDatabase(initToken = activeAppInitToken) {
     const payloadPath = getUnencryptedPayloadPath();
     const expectedSize = getUnencryptedPayloadSize();
     const response = await fetch(new URL(payloadPath, ARCHIVE_SCOPE_URL));
-    if (!response.ok) {
+    if (response.status !== 200) {
         throw new Error(`Failed to load database: ${response.status}`);
     }
 
