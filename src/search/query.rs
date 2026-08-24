@@ -1817,12 +1817,13 @@ fn normalized_search_source_id_sql_expr(
 
 /// SQL twin of [`normalized_search_hit_origin_kind`]: the normalized origin
 /// kind (`local` / `remote` / other lowercase kind) of a conversation row,
-/// from its `sources.kind` with the same `source_id` fallback the hit
-/// derivation uses. Lets the SQLite lane's `--source local|remote` select by
-/// kind instead of by `source_id == 'local'` (bead 5bf29).
+/// from its `sources.kind` with the same `source_id` / `origin_host` fallback
+/// the hit derivation uses. Lets the SQLite lane's `--source local|remote`
+/// select by kind instead of by `source_id == 'local'` (bead 5bf29).
 fn normalized_search_origin_kind_sql_expr(
     source_id_column: &str,
     origin_kind_column: &str,
+    origin_host_column: &str,
 ) -> String {
     format!(
         "CASE \
@@ -1830,7 +1831,9 @@ fn normalized_search_origin_kind_sql_expr(
             WHEN LOWER(TRIM(COALESCE({origin_kind_column}, ''))) IN ('ssh', 'remote') THEN 'remote' \
             WHEN TRIM(COALESCE({origin_kind_column}, '')) != '' THEN LOWER(TRIM({origin_kind_column})) \
             WHEN LOWER(TRIM(COALESCE({source_id_column}, ''))) = '{local}' THEN '{local}' \
-            ELSE 'remote' \
+            WHEN TRIM(COALESCE({source_id_column}, '')) != '' THEN 'remote' \
+            WHEN TRIM(COALESCE({origin_host_column}, '')) != '' THEN 'remote' \
+            ELSE '{local}' \
          END",
         local = crate::sources::provenance::LOCAL_SOURCE_ID,
     )
@@ -8046,15 +8049,16 @@ impl SearchClient {
             }
         }
         if let Some(created_from) = filters.created_from {
-            sql.push_str(" AND m.created_at >= ?");
+            sql.push_str(" AND CAST(m.created_at AS INTEGER) >= ?");
             params.push(ParamValue::from(created_from));
         }
         if let Some(created_to) = filters.created_to {
-            sql.push_str(" AND m.created_at <= ?");
+            sql.push_str(" AND CAST(m.created_at AS INTEGER) <= ?");
             params.push(ParamValue::from(created_to));
         }
 
-        let origin_kind_sql = normalized_search_origin_kind_sql_expr("c.source_id", "s.kind");
+        let origin_kind_sql =
+            normalized_search_origin_kind_sql_expr("c.source_id", "s.kind", "c.origin_host");
         match &filters.source_filter {
             SourceFilter::All => {}
             SourceFilter::Local => sql.push_str(&format!(
@@ -8701,7 +8705,8 @@ impl SearchClient {
 
         // Apply source filter. `local`/`remote` select by origin *kind*
         // (bead 5bf29); only `SourceId` matches the normalized id.
-        let origin_kind_sql = normalized_search_origin_kind_sql_expr("c.source_id", "s.kind");
+        let origin_kind_sql =
+            normalized_search_origin_kind_sql_expr("c.source_id", "s.kind", "c.origin_host");
         match &filters.source_filter {
             SourceFilter::All => {}
             SourceFilter::Local => sql.push_str(&format!(
@@ -14445,9 +14450,9 @@ mod tests {
         for predicate in [
             "COALESCE(a.slug, '') IN (?)",
             "COALESCE(w.path, '') IN (?)",
-            "m.created_at >= ?",
-            "m.created_at <= ?",
-            "c.origin_host",
+            "CAST(m.created_at AS INTEGER) >= ?",
+            "CAST(m.created_at AS INTEGER) <= ?",
+            "END = ?",
             "COALESCE(c.source_path, '') IN (?)",
         ] {
             let predicate_pos = sql.find(predicate).expect("source-scan filter predicate");
@@ -14474,8 +14479,8 @@ mod tests {
             },
             7,
         );
-        assert!(local_sql.contains("= 'local'"));
-        assert!(remote_sql.contains("!= 'local'"));
+        assert!(local_sql.contains("END = 'local'"));
+        assert!(remote_sql.contains("END != 'local'"));
     }
 
     #[test]

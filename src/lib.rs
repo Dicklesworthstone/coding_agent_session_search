@@ -14021,18 +14021,7 @@ fn swarm_failure_pattern_session_hit(key: &str, hit: &serde_json::Value) -> serd
 }
 
 fn swarm_failure_pattern_redact_value(value: &serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::String(text) => {
-            serde_json::json!(crate::pages::redact::redact_swarm_text(text))
-        }
-        serde_json::Value::Array(values) => serde_json::Value::Array(
-            values
-                .iter()
-                .map(swarm_failure_pattern_redact_value)
-                .collect(),
-        ),
-        _ => value.clone(),
-    }
+    crate::pages::redact::redact_swarm_json_value(value)
 }
 
 #[derive(Clone)]
@@ -16139,6 +16128,26 @@ fn swarm_signed_age_seconds(ts: &str) -> Option<i64> {
 mod swarm_status_cli_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn failure_pattern_redaction_handles_nested_structured_credentials() {
+        let provider_token = ["ghp_", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"].concat();
+        let mut nested = serde_json::Map::new();
+        nested.insert("pin".to_string(), json!(1234));
+        nested.insert("credentials".to_string(), json!({"value": "short"}));
+        nested.insert("keyframe".to_string(), json!(7));
+        nested.insert(
+            "message".to_string(),
+            json!(format!("provider rejected {provider_token}")),
+        );
+
+        let redacted = swarm_failure_pattern_redact_value(&json!([{"nested": nested}]));
+        let serialized = serde_json::to_string(&redacted).expect("serialize redacted value");
+        assert!(!serialized.contains(&provider_token));
+        assert_eq!(redacted[0]["nested"]["pin"], "[REDACTED]");
+        assert_eq!(redacted[0]["nested"]["credentials"], "[REDACTED]");
+        assert_eq!(redacted[0]["nested"]["keyframe"], 7);
+    }
 
     #[test]
     fn swarm_evidence_preserves_provider_proofs_and_gaps() {
@@ -50287,6 +50296,11 @@ fn doctor_support_bundle_root(data_dir: &Path) -> PathBuf {
 }
 
 fn doctor_support_bundle_redact_text(text: &str, data_dir: &Path) -> String {
+    let locally_redacted = doctor_support_bundle_redact_local_text(text, data_dir);
+    crate::pages::redact::redact_swarm_text(&locally_redacted)
+}
+
+fn doctor_support_bundle_redact_local_text(text: &str, data_dir: &Path) -> String {
     let mut redacted = doctor_redacted_text(text, data_dir);
     if let Ok(home) = dotenvy::var("HOME")
         && !home.is_empty()
@@ -50310,6 +50324,18 @@ fn doctor_support_bundle_redact_value(
     value: serde_json::Value,
     data_dir: &Path,
 ) -> serde_json::Value {
+    let locally_redacted = doctor_support_bundle_redact_local_value(value, data_dir);
+    crate::pages::redact::redact_swarm_json_value(&locally_redacted)
+}
+
+/// Apply support-bundle-specific path and sentinel substitutions before the
+/// canonical structured secret policy. Keys are serialized output too, and
+/// two distinct source keys can collapse to one redacted spelling, so preserve
+/// both entries with the shared collision-safe insertion helper.
+fn doctor_support_bundle_redact_local_value(
+    value: serde_json::Value,
+    data_dir: &Path,
+) -> serde_json::Value {
     match value {
         serde_json::Value::String(text) => {
             serde_json::Value::String(doctor_support_bundle_redact_text(&text, data_dir))
@@ -50317,15 +50343,71 @@ fn doctor_support_bundle_redact_value(
         serde_json::Value::Array(items) => serde_json::Value::Array(
             items
                 .into_iter()
-                .map(|item| doctor_support_bundle_redact_value(item, data_dir))
+                .map(|item| doctor_support_bundle_redact_local_value(item, data_dir))
                 .collect(),
         ),
-        serde_json::Value::Object(map) => serde_json::Value::Object(
-            map.into_iter()
-                .map(|(key, value)| (key, doctor_support_bundle_redact_value(value, data_dir)))
-                .collect(),
-        ),
+        serde_json::Value::Object(map) => {
+            let mut redacted = serde_json::Map::with_capacity(map.len());
+            let mut next_suffixes = HashMap::new();
+            for (key, value) in map {
+                crate::indexer::redact_secrets::insert_redacted_json_entry(
+                    &mut redacted,
+                    &mut next_suffixes,
+                    doctor_support_bundle_redact_local_text(&key, data_dir),
+                    doctor_support_bundle_redact_local_value(value, data_dir),
+                );
+            }
+            serde_json::Value::Object(redacted)
+        }
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod doctor_support_bundle_redaction_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn structured_redaction_scrubs_keys_values_and_preserves_collisions() {
+        let data_dir = Path::new("/tmp/private-cass-data");
+        let github_token = ["ghp_", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij"].concat();
+        let openai_token = ["sk-", "ABCDEFGHIJKLMNOPQRSTUVWXYZ123456"].concat();
+
+        let mut nested = serde_json::Map::new();
+        nested.insert("pin".to_string(), json!(1234));
+        nested.insert("credentials".to_string(), json!({"value": "short"}));
+        nested.insert("keyframe".to_string(), json!(7));
+        nested.insert("token_count".to_string(), json!(9));
+        nested.insert(github_token.clone(), json!("first"));
+        nested.insert(openai_token.clone(), json!("second"));
+        nested.insert(
+            "message".to_string(),
+            json!(format!(
+                "failure at {}/doctor with {github_token}",
+                data_dir.display()
+            )),
+        );
+
+        let redacted = doctor_support_bundle_redact_value(
+            json!({"nested": serde_json::Value::Object(nested)}),
+            data_dir,
+        );
+        let serialized = serde_json::to_string(&redacted).expect("serialize redacted bundle");
+        assert!(!serialized.contains(&github_token));
+        assert!(!serialized.contains(&openai_token));
+        assert!(!serialized.contains(&data_dir.display().to_string()));
+        assert_eq!(redacted["nested"]["pin"], "[REDACTED]");
+        assert_eq!(redacted["nested"]["credentials"], "[REDACTED]");
+        assert_eq!(redacted["nested"]["keyframe"], 7);
+        assert_eq!(redacted["nested"]["token_count"], 9);
+        assert_eq!(
+            redacted["nested"]
+                .as_object()
+                .expect("redacted nested object")
+                .len(),
+            7
+        );
     }
 }
 

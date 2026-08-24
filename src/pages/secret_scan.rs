@@ -12,7 +12,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,9 +25,10 @@ const DEFAULT_CONTEXT_BYTES: usize = 120;
 const DEFAULT_MAX_FINDINGS: usize = 500;
 const SCAN_PAGE_ROWS: usize = 128;
 const REDACTED_CONTEXT: &str = "[redacted]";
+const REDACTED_METADATA_CONTEXT: &str = "structured metadata: [redacted]";
 const CUSTOM_DENYLIST_PATTERN_ID: &str = "custom_denylist";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SecretSeverity {
     Critical,
@@ -106,7 +107,7 @@ pub struct SecretFinding {
 #[derive(Debug, Clone, Serialize)]
 pub struct SecretScanSummary {
     pub total: usize,
-    pub by_severity: HashMap<SecretSeverity, usize>,
+    pub by_severity: BTreeMap<SecretSeverity, usize>,
     pub has_critical: bool,
     pub truncated: bool,
 }
@@ -294,6 +295,7 @@ struct FindingOccurrence {
     location: SecretLocation,
     start: usize,
     end: usize,
+    finding_index: usize,
 }
 
 impl FindingOccurrence {
@@ -398,8 +400,10 @@ pub fn scan_database<P: AsRef<Path>>(
                 metadata_bin.as_deref(),
                 metadata_json.as_deref(),
                 "conversations.metadata_bin",
+                "conversations.metadata_json",
                 conv_id,
             )? {
+                let first_metadata_finding = findings.len();
                 scan_text(
                     &meta.text,
                     SecretLocation::ConversationMetadata,
@@ -409,6 +413,7 @@ pub fn scan_database<P: AsRef<Path>>(
                     &mut seen,
                     &mut truncated,
                 );
+                redact_structured_metadata_contexts(&mut findings[first_metadata_finding..]);
                 if let Some(value) = meta.value.as_ref() {
                     scan_sensitive_json_fields(
                         value,
@@ -509,8 +514,10 @@ pub fn scan_database<P: AsRef<Path>>(
                     extra_bin.as_deref(),
                     extra_json.as_deref(),
                     "messages.extra_bin",
+                    "messages.extra_json",
                     msg_id,
                 )? {
+                    let first_metadata_finding = findings.len();
                     scan_text(
                         &extra.text,
                         SecretLocation::MessageMetadata,
@@ -520,6 +527,7 @@ pub fn scan_database<P: AsRef<Path>>(
                         &mut seen,
                         &mut truncated,
                     );
+                    redact_structured_metadata_contexts(&mut findings[first_metadata_finding..]);
                     if let Some(value) = extra.value.as_ref() {
                         scan_sensitive_json_fields(
                             value,
@@ -640,7 +648,7 @@ pub fn scan_database<P: AsRef<Path>>(
             .then_with(|| a.kind.cmp(&b.kind))
     });
 
-    let mut by_severity: HashMap<SecretSeverity, usize> = HashMap::new();
+    let mut by_severity: BTreeMap<SecretSeverity, usize> = BTreeMap::new();
     for finding in &findings {
         *by_severity.entry(finding.severity).or_insert(0) += 1;
     }
@@ -723,6 +731,7 @@ fn structured_metadata_scan_text(
     binary: Option<&[u8]>,
     legacy_json: Option<&str>,
     binary_column: &str,
+    legacy_column: &str,
     row_id: i64,
 ) -> Result<Option<StructuredMetadataScan>> {
     if let Some(bytes) = binary.filter(|bytes| !bytes.is_empty()) {
@@ -750,10 +759,24 @@ fn structured_metadata_scan_text(
             }));
     }
 
-    Ok(legacy_json.map(|text| StructuredMetadataScan {
+    let Some(text) = legacy_json.filter(|text| !text.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let value = serde_json::from_str(text).with_context(|| {
+        format!(
+            "Failed to decode non-empty {legacy_column} JSON for row {row_id}; refusing a text-only scan that could miss credential-bearing fields"
+        )
+    })?;
+    Ok(Some(StructuredMetadataScan {
         text: text.to_owned(),
-        value: serde_json::from_str(text).ok(),
+        value: Some(value),
     }))
+}
+
+fn redact_structured_metadata_contexts(findings: &mut [SecretFinding]) {
+    for finding in findings {
+        finding.context = REDACTED_METADATA_CONTEXT.to_string();
+    }
 }
 
 /// Report credential-bearing structured fields that text patterns cannot see.
@@ -810,11 +833,11 @@ fn scan_sensitive_json_fields(
                         kind: "sensitive_metadata_field".to_string(),
                         pattern: "sensitive_json_field".to_string(),
                         match_redacted: REDACTED_CONTEXT.to_string(),
-                        context: "credential-bearing metadata field: [redacted]".to_string(),
+                        context: REDACTED_METADATA_CONTEXT.to_string(),
                         location: location.clone(),
-                        agent: ctx.agent.clone(),
-                        workspace: ctx.workspace.clone(),
-                        source_path: ctx.source_path.clone(),
+                        agent: redact_report_provenance(&ctx.agent),
+                        workspace: redact_report_provenance(&ctx.workspace),
+                        source_path: redact_report_provenance(&ctx.source_path),
                         conversation_id: ctx.conversation_id,
                         message_id: ctx.message_id,
                         message_idx: ctx.message_idx,
@@ -864,7 +887,7 @@ fn structured_value_is_fully_allowlisted(
         serde_json::Value::String(text) => {
             text.trim().is_empty()
                 || text.trim().eq_ignore_ascii_case(REDACTED_CONTEXT)
-                || is_allowlisted(text, config)
+                || is_fully_allowlisted(text.trim(), config)
         }
         serde_json::Value::Array(values) => values
             .iter()
@@ -874,8 +897,8 @@ fn structured_value_is_fully_allowlisted(
             .values()
             .filter(|value| structured_value_contains_material(value))
             .all(|value| structured_value_is_fully_allowlisted(value, config)),
-        serde_json::Value::Bool(value) => is_allowlisted(&value.to_string(), config),
-        serde_json::Value::Number(value) => is_allowlisted(&value.to_string(), config),
+        serde_json::Value::Bool(value) => is_fully_allowlisted(&value.to_string(), config),
+        serde_json::Value::Number(value) => is_fully_allowlisted(&value.to_string(), config),
     }
 }
 
@@ -1069,18 +1092,9 @@ fn scan_text(
         return;
     }
 
-    // Context is a report surface, so it has a stronger rule than finding
-    // admission: every known secret span is masked, including allowlisted
-    // spans and adjacent matches that are not the focal finding.
-    let context_redactions = collect_context_redactions(text, config);
-
     // Denylist first (always critical)
     for deny in &config.denylist {
         for mat in deny.find_iter(text) {
-            if findings.len() >= config.max_findings {
-                *truncated = true;
-                return;
-            }
             push_finding(
                 findings,
                 seen,
@@ -1095,18 +1109,17 @@ fn scan_text(
                     ctx,
                 },
                 config,
-                &context_redactions,
+                truncated,
             );
+            if *truncated {
+                return;
+            }
         }
     }
 
     // Built-in patterns
     for pattern in BUILTIN_PATTERNS.iter() {
         for mat in pattern.regex.find_iter(text) {
-            if findings.len() >= config.max_findings {
-                *truncated = true;
-                return;
-            }
             let matched = &text[mat.start()..mat.end()];
             if is_allowlisted(matched, config) {
                 continue;
@@ -1125,17 +1138,16 @@ fn scan_text(
                     ctx,
                 },
                 config,
-                &context_redactions,
+                truncated,
             );
+            if *truncated {
+                return;
+            }
         }
     }
 
     // Entropy-based detection
     for mat in ENTROPY_BASE64_RE.find_iter(text) {
-        if findings.len() >= config.max_findings {
-            *truncated = true;
-            return;
-        }
         let candidate = &text[mat.start()..mat.end()];
         if is_base64_entropy_secret(candidate, config, true) {
             push_finding(
@@ -1152,16 +1164,15 @@ fn scan_text(
                     ctx,
                 },
                 config,
-                &context_redactions,
+                truncated,
             );
+            if *truncated {
+                return;
+            }
         }
     }
 
     for mat in ENTROPY_HEX_RE.find_iter(text) {
-        if findings.len() >= config.max_findings {
-            *truncated = true;
-            return;
-        }
         let candidate = &text[mat.start()..mat.end()];
         if is_hex_entropy_secret(candidate, config, true) {
             push_finding(
@@ -1178,8 +1189,11 @@ fn scan_text(
                     ctx,
                 },
                 config,
-                &context_redactions,
+                truncated,
             );
+            if *truncated {
+                return;
+            }
         }
     }
 }
@@ -1189,8 +1203,40 @@ fn push_finding(
     seen: &mut Vec<FindingOccurrence>,
     candidate: FindingCandidate<'_>,
     config: &SecretScanConfig,
-    context_redactions: &[RedactionRange],
+    truncated: &mut bool,
 ) {
+    if let Some(occurrence) = seen
+        .iter_mut()
+        .find(|occurrence| occurrence.overlaps(&candidate))
+    {
+        let Some(existing) = findings.get_mut(occurrence.finding_index) else {
+            return;
+        };
+        if candidate.severity.rank() < existing.severity.rank() {
+            existing.severity = candidate.severity;
+            existing.kind = candidate.kind.to_string();
+            existing.pattern = candidate.pattern.to_string();
+            existing.match_redacted = redact_token(
+                &candidate.text[candidate.start..candidate.end],
+            );
+            existing.context = redact_context(
+                candidate.text,
+                candidate.start,
+                candidate.end,
+                config.context_bytes,
+                config,
+            );
+            occurrence.start = occurrence.start.min(candidate.start);
+            occurrence.end = occurrence.end.max(candidate.end);
+        }
+        return;
+    }
+
+    if findings.len() >= config.max_findings {
+        *truncated = true;
+        return;
+    }
+
     let match_text = &candidate.text[candidate.start..candidate.end];
     let match_redacted = redact_token(match_text);
     let context = redact_context(
@@ -1198,15 +1244,9 @@ fn push_finding(
         candidate.start,
         candidate.end,
         config.context_bytes,
-        context_redactions,
+        config,
     );
-
-    if seen
-        .iter()
-        .any(|occurrence| occurrence.overlaps(&candidate))
-    {
-        return;
-    }
+    let finding_index = findings.len();
     seen.push(FindingOccurrence {
         source_path: candidate.ctx.source_path.clone(),
         conversation_id: candidate.ctx.conversation_id,
@@ -1215,6 +1255,7 @@ fn push_finding(
         location: candidate.location.clone(),
         start: candidate.start,
         end: candidate.end,
+        finding_index,
     });
 
     findings.push(SecretFinding {
@@ -1224,9 +1265,9 @@ fn push_finding(
         match_redacted,
         context,
         location: candidate.location,
-        agent: candidate.ctx.agent.clone(),
-        workspace: candidate.ctx.workspace.clone(),
-        source_path: candidate.ctx.source_path.clone(),
+        agent: redact_report_provenance(&candidate.ctx.agent),
+        workspace: redact_report_provenance(&candidate.ctx.workspace),
+        source_path: redact_report_provenance(&candidate.ctx.source_path),
         conversation_id: candidate.ctx.conversation_id,
         message_id: candidate.ctx.message_id,
         message_idx: candidate.ctx.message_idx,
@@ -1234,21 +1275,14 @@ fn push_finding(
 }
 
 fn redact_token(token: &str) -> String {
-    let chars: Vec<char> = token.chars().collect();
-    let len = chars.len();
-    if len <= 8 {
-        return "[redacted]".to_string();
-    }
-    let prefix: String = chars.iter().take(2).collect();
-    let suffix: String = chars
-        .iter()
-        .rev()
-        .take(2)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("{}…{} (len {})", prefix, suffix, len)
+    let _ = token;
+    REDACTED_CONTEXT.to_string()
+}
+
+fn redact_report_provenance(value: &Option<String>) -> Option<String> {
+    value.as_deref().map(|text| {
+        crate::indexer::redact_secrets::redact_text(text).into_owned()
+    })
 }
 
 fn redact_context(
@@ -1256,7 +1290,7 @@ fn redact_context(
     start: usize,
     end: usize,
     window: usize,
-    redactions: &[RedactionRange],
+    config: &SecretScanConfig,
 ) -> String {
     if text.is_empty() || start >= end || start >= text.len() {
         return String::new();
@@ -1277,11 +1311,12 @@ fn redact_context(
         return String::new();
     }
 
-    let mut local_redactions = redactions
-        .iter()
-        .copied()
-        .filter(|range| range.start < ctx_end && range.end > ctx_start)
-        .collect::<Vec<_>>();
+    // Context is a report surface, so it has a stronger rule than finding
+    // admission: every known secret span is masked, including allowlisted
+    // spans and adjacent matches that are not the focal finding. Only ranges
+    // intersecting this bounded window are retained in memory.
+    let mut local_redactions =
+        collect_context_redactions(text, config, ctx_start, ctx_end);
     // The focal match must be masked even if a future finding source is not
     // represented in `collect_context_redactions` yet.
     local_redactions.push(RedactionRange {
@@ -1313,26 +1348,48 @@ fn redact_context(
     crate::indexer::redact_secrets::redact_text(&snippet).into_owned()
 }
 
-fn collect_context_redactions(text: &str, config: &SecretScanConfig) -> Vec<RedactionRange> {
+fn collect_context_redactions(
+    text: &str,
+    config: &SecretScanConfig,
+    context_start: usize,
+    context_end: usize,
+) -> Vec<RedactionRange> {
+    if context_start >= context_end || context_start >= text.len() {
+        return Vec::new();
+    }
     let mut ranges = Vec::new();
 
     for deny in &config.denylist {
-        ranges.extend(deny.find_iter(text).map(|mat| RedactionRange {
-            start: mat.start(),
-            end: mat.end(),
-        }));
+        ranges.extend(
+            deny.find_iter(text)
+                .take_while(|mat| mat.start() < context_end)
+                .filter(|mat| mat.start() < mat.end() && mat.end() > context_start)
+                .map(|mat| RedactionRange {
+                    start: mat.start(),
+                    end: mat.end(),
+                }),
+        );
     }
 
     for pattern in BUILTIN_PATTERNS.iter() {
-        ranges.extend(pattern.regex.find_iter(text).map(|mat| RedactionRange {
-            start: mat.start(),
-            end: mat.end(),
-        }));
+        ranges.extend(
+            pattern
+                .regex
+                .find_iter(text)
+                .take_while(|mat| mat.start() < context_end)
+                .filter(|mat| mat.start() < mat.end() && mat.end() > context_start)
+                .map(|mat| RedactionRange {
+                    start: mat.start(),
+                    end: mat.end(),
+                }),
+        );
     }
 
     ranges.extend(
         ENTROPY_BASE64_RE
             .find_iter(text)
+            .take_while(|mat| mat.start() < context_end)
+            .filter(|mat| mat.start() < mat.end() && mat.end() > context_start)
             .filter(|mat| is_base64_entropy_secret(mat.as_str(), config, false))
             .map(|mat| RedactionRange {
                 start: mat.start(),
@@ -1342,6 +1399,8 @@ fn collect_context_redactions(text: &str, config: &SecretScanConfig) -> Vec<Reda
     ranges.extend(
         ENTROPY_HEX_RE
             .find_iter(text)
+            .take_while(|mat| mat.start() < context_end)
+            .filter(|mat| mat.start() < mat.end() && mat.end() > context_start)
             .filter(|mat| is_hex_entropy_secret(mat.as_str(), config, false))
             .map(|mat| RedactionRange {
                 start: mat.start(),
@@ -1451,6 +1510,14 @@ fn is_allowlisted(matched: &str, config: &SecretScanConfig) -> bool {
     false
 }
 
+fn is_fully_allowlisted(value: &str, config: &SecretScanConfig) -> bool {
+    config.allowlist.iter().any(|allow| {
+        allow
+            .find(value)
+            .is_some_and(|matched| matched.start() == 0 && matched.end() == value.len())
+    })
+}
+
 fn build_where_clause(filters: &SecretScanFilters) -> Result<(String, Vec<ParamValue>)> {
     let mut conditions: Vec<String> = Vec::new();
     let mut params: Vec<ParamValue> = Vec::new();
@@ -1460,7 +1527,10 @@ fn build_where_clause(filters: &SecretScanFilters) -> Result<(String, Vec<ParamV
             conditions.push("1=0".to_string());
         } else {
             let placeholders: Vec<&str> = agents.iter().map(|_| "?").collect();
-            conditions.push(format!("a.slug IN ({})", placeholders.join(", ")));
+            conditions.push(format!(
+                "COALESCE(a.slug, 'unknown') IN ({})",
+                placeholders.join(", ")
+            ));
             for agent in agents {
                 params.push(ParamValue::from(agent.as_str()));
             }
@@ -1539,8 +1609,7 @@ mod tests {
     fn redact_context_for_test(text: &str, start: usize, end: usize, window: usize) -> String {
         let config = SecretScanConfig::from_inputs_with_env(&[], &[], false)
             .expect("construct test secret-scan config");
-        let redactions = collect_context_redactions(text, &config);
-        redact_context(text, start, end, window, &redactions)
+        redact_context(text, start, end, window, &config)
     }
 
     // =========================================================================
@@ -1589,27 +1658,17 @@ mod tests {
     }
 
     #[test]
-    fn redact_token_long_shows_prefix_suffix_len() {
+    fn redact_token_long_is_fully_opaque() {
         let result = redact_token("sk-abcdefghijklmnop");
-        assert!(
-            result.starts_with("sk"),
-            "should start with first 2 chars: {}",
-            result
-        );
-        assert!(
-            result.contains("op"),
-            "should end with last 2 chars: {}",
-            result
-        );
-        assert!(result.contains("len 19"), "should show length: {}", result);
+        assert_eq!(result, REDACTED_CONTEXT);
+        assert!(!result.contains("sk"));
+        assert!(!result.contains("op"));
     }
 
     #[test]
-    fn redact_token_nine_chars_shows_format() {
+    fn redact_token_nine_chars_is_fully_opaque() {
         let result = redact_token("123456789");
-        assert!(result.starts_with("12"), "{}", result);
-        assert!(result.contains("89"), "{}", result);
-        assert!(result.contains("len 9"), "{}", result);
+        assert_eq!(result, REDACTED_CONTEXT);
     }
 
     // =========================================================================
@@ -1690,14 +1749,13 @@ mod tests {
             false,
         )
         .expect("construct test secret-scan config");
-        let redactions = collect_context_redactions(&text, &config);
         let start = text.find(focal).expect("focal fixture offset");
         let result = redact_context(
             &text,
             start,
             start + focal.len(),
             text.len() * 2,
-            &redactions,
+            &config,
         );
 
         assert!(!result.contains(allowlisted), "allowlisted neighbor leaked");
@@ -1726,6 +1784,18 @@ mod tests {
     fn is_allowlisted_empty_list_returns_false() {
         let config = SecretScanConfig::from_inputs_with_env(&[], &[], false).unwrap();
         assert!(!is_allowlisted("anything", &config));
+    }
+
+    #[test]
+    fn structured_allowlist_requires_a_full_scalar_match() {
+        let config = SecretScanConfig::from_inputs_with_env(
+            &["SAFE".to_string()],
+            &[],
+            false,
+        )
+        .unwrap();
+        assert!(is_fully_allowlisted("SAFE", &config));
+        assert!(!is_fully_allowlisted("SAFE-real-secret", &config));
     }
 
     // =========================================================================
@@ -1928,6 +1998,26 @@ mod tests {
         assert_eq!(SecretSeverity::High.label(), "high");
         assert_eq!(SecretSeverity::Medium.label(), "medium");
         assert_eq!(SecretSeverity::Low.label(), "low");
+    }
+
+    #[test]
+    fn severity_summary_serializes_in_stable_rank_order() {
+        let mut by_severity = BTreeMap::new();
+        by_severity.insert(SecretSeverity::Low, 1);
+        by_severity.insert(SecretSeverity::Critical, 1);
+        by_severity.insert(SecretSeverity::Medium, 1);
+        by_severity.insert(SecretSeverity::High, 1);
+        let encoded = serde_json::to_string(&SecretScanSummary {
+            total: 4,
+            by_severity,
+            has_critical: true,
+            truncated: false,
+        })
+        .unwrap();
+
+        let positions = ["critical", "high", "medium", "low"]
+            .map(|label| encoded.find(label).expect("serialized severity label"));
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{encoded}");
     }
 
     // =========================================================================
@@ -2282,6 +2372,61 @@ mod tests {
 
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].kind, "github_pat");
+    }
+
+    #[test]
+    fn overlapping_later_detector_upgrades_to_highest_severity_at_capacity() {
+        let mut config = SecretScanConfig::from_inputs_with_env(&[], &[], false).unwrap();
+        config.max_findings = 1;
+        let ctx = ScanContext {
+            agent: None,
+            workspace: None,
+            source_path: Some("fixture.jsonl".to_string()),
+            conversation_id: Some(1),
+            message_id: Some(1),
+            message_idx: Some(0),
+        };
+        let mut findings = Vec::new();
+        let mut seen = Vec::new();
+        let mut truncated = false;
+
+        scan_text(
+            r#"authorization="Bearer abcdefgh12345678""#,
+            SecretLocation::MessageContent,
+            &ctx,
+            &config,
+            &mut findings,
+            &mut seen,
+            &mut truncated,
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].kind, "bearer_token");
+        assert_eq!(findings[0].severity, SecretSeverity::High);
+        assert!(!truncated, "an overlapping upgrade must not consume capacity");
+    }
+
+    #[test]
+    fn context_range_storage_excludes_matches_outside_the_window() {
+        let config = SecretScanConfig::from_inputs_with_env(
+            &[],
+            &[r"SECRET[0-9]{4}".to_string()],
+            false,
+        )
+        .unwrap();
+        let text = (0..1_000)
+            .map(|index| format!("SECRET{index:04} "))
+            .collect::<String>();
+        let focal = text.find("SECRET0500").unwrap();
+        let ranges = collect_context_redactions(
+            &text,
+            &config,
+            focal.saturating_sub(1),
+            focal + "SECRET0500".len() + 1,
+        );
+
+        assert_eq!(ranges.len(), 1, "only the bounded context span is retained");
+        assert_eq!(ranges[0].start, focal);
     }
 
     #[test]
