@@ -1631,6 +1631,10 @@ fn search_sessions_from_reports_filter_resolution_and_suppresses_query_suggestio
     )
     .expect("write good session list");
     let filtered = run_search(Some(&good_list));
+    assert!(
+        filtered.get("sessions_filter").is_some(),
+        "payload missing sessions_filter with --sessions-from supplied: {filtered}"
+    );
     assert_eq!(filtered["sessions_filter"]["requested"], 1);
     assert_eq!(filtered["sessions_filter"]["matched"], 1);
     assert!(

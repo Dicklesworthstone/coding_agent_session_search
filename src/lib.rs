@@ -29216,8 +29216,6 @@ fn trust_value_for_hit(
     serde_json::to_value(assess_trust(&signals)).unwrap_or(serde_json::Value::Null)
 }
 
-/// Output search results in robot-friendly format
-#[allow(clippy::too_many_arguments, unused_variables)]
 /// GH#414: resolution of a `--sessions-from` filter against the index.
 #[derive(Debug, Clone, Copy)]
 struct SessionsFilterStats {
@@ -29237,6 +29235,8 @@ impl SessionsFilterStats {
     }
 }
 
+/// Output search results in robot-friendly format
+#[allow(clippy::too_many_arguments, unused_variables)]
 fn output_robot_results(
     query: &str,
     limit: usize,
@@ -29338,6 +29338,9 @@ fn output_robot_results(
         && result.suggestions.is_empty()
         && explanation.is_none()
         && !timed_out
+        // GH#414: --sessions-from responses carry the sessions_filter block,
+        // which only the general payload builder emits.
+        && sessions_filter.is_none()
     {
         use serde::ser::{SerializeMap, SerializeSeq};
         use serde::{Serialize, Serializer};
@@ -29443,6 +29446,9 @@ fn output_robot_results(
         && result.suggestions.is_empty()
         && explanation.is_none()
         && !timed_out
+        // GH#414: --sessions-from responses carry the sessions_filter block,
+        // which only the general payload builder emits.
+        && sessions_filter.is_none()
     {
         use serde::ser::{SerializeMap, SerializeSeq};
         use serde::{Serialize, Serializer};
