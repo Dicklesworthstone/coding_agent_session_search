@@ -29789,9 +29789,7 @@ fn output_robot_results(
             // GH#414: report how the --sessions-from filter resolved, so a
             // filter selecting zero indexed sessions is distinguishable from
             // a genuine miss. `matched: null` means undetermined, not zero.
-            if let (Some(stats), serde_json::Value::Object(map)) =
-                (sessions_filter, &mut payload)
-            {
+            if let (Some(stats), serde_json::Value::Object(map)) = (sessions_filter, &mut payload) {
                 map.insert(
                     "sessions_filter".to_string(),
                     serde_json::json!({
@@ -30158,9 +30156,7 @@ fn output_robot_results(
             // GH#414: report how the --sessions-from filter resolved, so a
             // filter selecting zero indexed sessions is distinguishable from
             // a genuine miss. `matched: null` means undetermined, not zero.
-            if let (Some(stats), serde_json::Value::Object(map)) =
-                (sessions_filter, &mut payload)
-            {
+            if let (Some(stats), serde_json::Value::Object(map)) = (sessions_filter, &mut payload) {
                 map.insert(
                     "sessions_filter".to_string(),
                     serde_json::json!({
@@ -30331,9 +30327,7 @@ fn output_robot_results(
             // GH#414: report how the --sessions-from filter resolved, so a
             // filter selecting zero indexed sessions is distinguishable from
             // a genuine miss. `matched: null` means undetermined, not zero.
-            if let (Some(stats), serde_json::Value::Object(map)) =
-                (sessions_filter, &mut payload)
-            {
+            if let (Some(stats), serde_json::Value::Object(map)) = (sessions_filter, &mut payload) {
                 map.insert(
                     "sessions_filter".to_string(),
                     serde_json::json!({
