@@ -29024,7 +29024,20 @@ mod tests {
             source_id: LOCAL_SOURCE_ID.into(),
             origin_host: None,
         };
-        storage.insert_conversation_tree(pi_agent_id, None, &conversation)?;
+        storage.insert_conversations_batched(&[(pi_agent_id, None, &conversation)])?;
+
+        let legacy_token_agent_id: i64 = storage.conn.query_row_map(
+            "SELECT agent_id FROM token_usage LIMIT 1",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(legacy_token_agent_id, pi_agent_id);
+        let legacy_metrics_slug: String = storage.conn.query_row_map(
+            "SELECT agent_slug FROM message_metrics LIMIT 1",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(legacy_metrics_slug, "pi_agent");
 
         assert_eq!(
             storage.reclassify_legacy_omp_conversations()?,

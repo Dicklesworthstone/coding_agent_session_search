@@ -81,6 +81,11 @@
       "found": false
     },
     {
+      "name": "omp",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
       "name": "factory",
       "path": "(not detected)",
       "found": false

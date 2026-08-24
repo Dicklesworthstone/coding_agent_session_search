@@ -2554,7 +2554,7 @@
     },
     {
       "name": "resume",
-      "description": "Resolve a session path into a ready-to-run resume command for its native harness (Claude Code, Codex, OpenCode, pi_agent, Gemini, Antigravity)",
+      "description": "Resolve a session path into a ready-to-run resume command for its native harness (Claude Code, Codex, OpenCode, Pi Agent, Oh My Pi, Gemini, Antigravity)",
       "arguments": [
         {
           "name": "path",

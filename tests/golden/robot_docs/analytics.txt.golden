@@ -64,7 +64,7 @@ analytics:
   data.by_api_tokens._meta.source_table: string  ('token_daily_stats' | 'token_usage')
     Usually token_daily_stats; token_usage when filters require raw provenance recovery.
   Models only available for connectors that report model names
-    (claude_code, codex, pi_agent, factory, opencode, cursor).
+    (claude_code, codex, pi_agent, omp, factory, opencode, cursor).
 
 ### analytics incidents
   Read-only; keyset-scans canonical archive rows newest-id-first.
