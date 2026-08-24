@@ -11564,6 +11564,16 @@ impl StreamingByteLimiter {
             .bytes_in_flight
     }
 
+    /// Whether any thread is currently parked inside [`Self::acquire_with_wait`].
+    ///
+    /// Relaxed staleness is fine for the GH#413 starvation-flush poll: a
+    /// waiter that registers just after a load is observed on the sink's next
+    /// 250 ms tick, and a stale `true` merely causes one extra (harmless)
+    /// flush of a non-empty pending batch.
+    fn has_active_waiters(&self) -> bool {
+        self.active_waiter_count.load(Ordering::Relaxed) > 0
+    }
+
     fn update_max_bytes_in_flight(&self, max_bytes_in_flight: usize) {
         // [coding_agent_session_search-wxsy8] Acquire the same state
         // lock that `acquire_with_wait` uses for its predicate
@@ -21614,6 +21624,48 @@ fn rebuild_tantivy_from_db_with_options(
                                 pending_batch_message_bytes,
                             ),
                         );
+                        // GH#413: the sink retains the byte reservations of
+                        // every packet in `pending_batch` until a flush, but
+                        // the only flush triggers were conversation COUNT and
+                        // planned-shard boundaries — never bytes. A page of
+                        // few-but-huge conversations can therefore park a
+                        // page-prep worker on `acquire_with_wait` while the
+                        // bytes it needs sit here in an idle sink, and the
+                        // pipeline deadlocks: the worker holds the ordered
+                        // reservation turn, so no later page can reserve, so
+                        // this channel stays empty forever. Break the cycle at
+                        // the only safe point — when the sink is starved (its
+                        // channel is empty) AND someone is parked on the byte
+                        // budget, flush the pending batch, releasing its
+                        // reservations. Batching efficiency is preserved: an
+                        // idle tick with no budget waiter never force-flushes.
+                        if !pending_batch.is_empty()
+                            && pipeline_rx.is_empty()
+                            && lexical_rebuild_flow_limiter.has_active_waiters()
+                        {
+                            tracing::info!(
+                                pending_conversations = pending_batch.len(),
+                                pending_message_bytes = pending_batch_message_bytes,
+                                inflight_message_bytes =
+                                    lexical_rebuild_flow_limiter.bytes_in_flight(),
+                                "lexical rebuild sink starved while a page-prep worker waits for byte budget; flushing pending batch to release its reservations (GH#413)"
+                            );
+                            flush_streamed_lexical_rebuild_batch(
+                                &mut pending_batch,
+                                &mut pending_batch_message_count,
+                                &mut pending_batch_message_bytes,
+                                Some(lexical_rebuild_flow_limiter.as_ref()),
+                                lexical_rebuild_worker_pool.as_deref(),
+                                &mut t_index,
+                                &mut indexed_docs,
+                                &mut messages_since_commit,
+                                &mut message_bytes_since_commit,
+                                &mut current_batch_conversation_limit,
+                                batch_conversation_limit,
+                                page_size,
+                                perf_profile.as_mut(),
+                            )?;
+                        }
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                         return Err(anyhow::anyhow!(
@@ -34418,6 +34470,67 @@ mod tests {
             guard.release_now();
         }
         assert_eq!(limiter.bytes_in_flight(), 0);
+    }
+
+    /// GH#413 deadlock geometry: the sink retains a pending batch's byte
+    /// reservations while idle, a page-prep worker holding the ordered
+    /// reservation turn parks in `acquire_with_wait`, and — because the turn
+    /// blocks every later page — nothing can ever refill the sink's channel.
+    /// The starvation flush breaks the cycle by releasing the sink's retained
+    /// bytes. This pins the two properties that fix depends on:
+    /// `has_active_waiters` observes the parked acquirer from another thread,
+    /// and `release` wakes it so the (budget-capped) acquisition completes.
+    #[test]
+    fn gh413_sink_release_unparks_budget_waiter_holding_the_reservation_turn() {
+        use std::sync::atomic::AtomicBool;
+
+        let limiter = Arc::new(StreamingByteLimiter::new(100));
+        assert!(!limiter.has_active_waiters());
+        // The idle sink retains 80 of the 100-byte budget in its pending batch.
+        let sink_retained = limiter.acquire(80).unwrap();
+        assert_eq!(sink_retained, 80);
+
+        // A page-prep worker needs 50: the capped request fits the budget but
+        // not the free space, so it parks.
+        let acquired = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let limiter = Arc::clone(&limiter);
+            let acquired = Arc::clone(&acquired);
+            thread::spawn(move || {
+                let (reservation, _wait, waited) = limiter
+                    .acquire_with_wait(50)
+                    .expect("limiter stays open for the whole test");
+                acquired.store(true, Ordering::SeqCst);
+                assert!(waited, "the worker must have parked before acquiring");
+                assert_eq!(reservation, 50);
+                limiter.release(reservation);
+            })
+        };
+
+        // The sink's starvation poll must be able to observe the parked
+        // worker from this thread.
+        let observed = (0..500).any(|_| {
+            limiter.has_active_waiters() || {
+                thread::sleep(Duration::from_millis(10));
+                false
+            }
+        });
+        assert!(
+            observed,
+            "has_active_waiters must observe the parked worker"
+        );
+        assert!(
+            !acquired.load(Ordering::SeqCst),
+            "the worker cannot acquire while the sink retains the budget"
+        );
+
+        // The starvation flush releases the retained bytes; the parked worker
+        // wakes and completes.
+        limiter.release(sink_retained);
+        worker.join().expect("worker thread");
+        assert!(acquired.load(Ordering::SeqCst));
+        assert_eq!(limiter.bytes_in_flight(), 0);
+        assert!(!limiter.has_active_waiters());
     }
 
     #[test]
