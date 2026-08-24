@@ -234,9 +234,31 @@ fn has_pi_agent_layout_marker(path: &Path) -> bool {
 }
 
 fn has_sanitized_omp_mirror_marker(path: &Path) -> bool {
-    path_parts(path)
+    let parts = path_parts(path);
+    if parts
         .iter()
         .any(|part| part.starts_with(".omp_") || part.starts_with(".local_share_omp_"))
+    {
+        return true;
+    }
+
+    // `sources sync` preserves a configured remote path in the mirror
+    // container name. A tilde path starts with the provider marker, while an
+    // absolute path retains its leading components, for example:
+    //
+    //   ~/.omp/agent/sessions       -> .omp_agent_sessions_<hash>
+    //   /home/u/.omp/agent/sessions -> home_u_.omp_agent_sessions_<hash>
+    //
+    // Only trust the embedded absolute-path marker in the actual
+    // `remotes/<source>/mirror/<safe-name>` slot. Treating the same substring
+    // as an OMP signal in an arbitrary local directory would steal Pi-family
+    // logs merely because an unrelated ancestor happened to contain `.omp`.
+    parts.windows(4).any(|window| {
+        window[0] == "remotes"
+            && window[2] == "mirror"
+            && (window[3].contains("_.omp_")
+                || window[3].contains("_.local_share_omp_"))
+    })
 }
 
 fn has_xdg_omp_layout_marker(path: &Path) -> bool {

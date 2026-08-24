@@ -164,10 +164,6 @@ impl FrankenOwnerConnection {
         self.0.execute_with_params_sync(sql, &values)
     }
 
-    fn close_sync(&mut self) -> std::result::Result<(), Arc<crate::franken_sync::FrankenError>> {
-        self.0.close_sync()
-    }
-
     pub(crate) fn close_without_checkpoint_sync(
         &mut self,
     ) -> std::result::Result<(), Arc<crate::franken_sync::FrankenError>> {
@@ -175,10 +171,10 @@ impl FrankenOwnerConnection {
     }
 
     fn close_best_effort_in_place(&mut self) {
-        if let Err(err) = self.close_sync() {
+        if let Err(err) = self.close_without_checkpoint_sync() {
             tracing::debug!(
                 error = %err,
-                "failed to close dedicated-owner frankensqlite connection"
+                "failed to close dedicated-owner frankensqlite connection without checkpoint"
             );
         }
     }

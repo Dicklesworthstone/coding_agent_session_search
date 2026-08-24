@@ -7,6 +7,7 @@ use coding_agent_search::connectors::{
     Connector, Origin, Platform, ScanContext, ScanRoot, extract_tokens_for_agent,
     get_connector_factories, omp::OmpConnector,
 };
+use coding_agent_search::sources::sync::path_to_safe_dirname;
 use serde_json::json;
 
 fn write_omp_session(agent_root: &Path, id: &str, title: &str) -> PathBuf {
@@ -182,23 +183,44 @@ fn explicit_xdg_omp_root_is_never_parsed_as_pi_agent() {
 #[test]
 fn sanitized_remote_omp_roots_keep_provider_identity() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let default_mirror = temp.path().join(".omp_agent_sessions_01234567");
-    let xdg_mirror = temp.path().join(".local_share_omp_89abcdef");
-    write_omp_session(
-        &default_mirror,
-        "omp-sanitized-default",
-        "Sanitized default mirror",
-    );
-    write_omp_session(
-        &xdg_mirror.join("omp"),
-        "omp-sanitized-xdg",
-        "Sanitized XDG mirror",
-    );
+    let mirror = temp.path().join("cass/remotes/build-host/mirror");
+    fs::create_dir_all(&mirror).expect("create production-shaped mirror root");
 
-    for (root, expected_title) in [
-        (default_mirror, "Sanitized default mirror"),
-        (xdg_mirror, "Sanitized XDG mirror"),
-    ] {
+    let cases = [
+        (
+            "~/.omp/agent/sessions",
+            false,
+            "omp-sanitized-default-tilde",
+            "Sanitized default tilde mirror",
+        ),
+        (
+            "/home/dev/.omp/agent/sessions",
+            false,
+            "omp-sanitized-default-absolute",
+            "Sanitized default absolute mirror",
+        ),
+        (
+            "~/.local/share/omp",
+            true,
+            "omp-sanitized-xdg-tilde",
+            "Sanitized XDG tilde mirror",
+        ),
+        (
+            "/home/dev/.local/share/omp",
+            true,
+            "omp-sanitized-xdg-absolute",
+            "Sanitized XDG absolute mirror",
+        ),
+    ];
+
+    for (remote_path, includes_leaf_dir, id, title) in cases {
+        let root = mirror.join(path_to_safe_dirname(remote_path));
+        let store_root = if includes_leaf_dir {
+            root.join("omp")
+        } else {
+            root.clone()
+        };
+        write_omp_session(&store_root, id, title);
         let ctx = ScanContext::with_roots(
             temp.path().join("cass-state"),
             vec![ScanRoot::remote(
@@ -216,9 +238,29 @@ fn sanitized_remote_omp_roots_keep_provider_identity() {
             .expect("apply Pi boundary to sanitized OMP mirror root");
 
         assert_eq!(omp_conversations.len(), 1);
-        assert_eq!(omp_conversations[0].title.as_deref(), Some(expected_title));
+        assert_eq!(omp_conversations[0].title.as_deref(), Some(title));
         assert!(pi_conversations.is_empty());
     }
+
+    let absolute_safe_name = path_to_safe_dirname("/home/dev/.omp/agent/sessions");
+    let non_mirror_root = temp.path().join("ordinary-cache").join(absolute_safe_name);
+    write_omp_session(
+        &non_mirror_root,
+        "not-a-mirror",
+        "Non-mirror sanitized lookalike",
+    );
+    let non_mirror_ctx = ScanContext::with_roots(
+        temp.path().join("cass-state"),
+        vec![ScanRoot::local(non_mirror_root)],
+        None,
+    );
+    assert!(
+        runtime_connector("omp")
+            .scan(&non_mirror_ctx)
+            .expect("apply OMP ownership boundary to non-mirror lookalike")
+            .is_empty(),
+        "an embedded sanitized marker outside remotes/<source>/mirror must not claim OMP ownership"
+    );
 }
 
 #[test]

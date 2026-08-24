@@ -980,8 +980,10 @@ impl QueryExplanation {
 
         // Extract terms, phrases, and operators
         let mut parsed = ParsedQuery::default();
-        let mut has_explicit_operator = false;
         let mut next_negated = false;
+        let mut saw_operand = false;
+        let mut explicit_binary_since_operand = false;
+        let mut uses_implicit_and = false;
 
         for token in &tokens {
             match token {
@@ -1014,6 +1016,11 @@ impl QueryExplanation {
                         negated: next_negated,
                         subterms,
                     });
+                    if saw_operand && !explicit_binary_since_operand {
+                        uses_implicit_and = true;
+                    }
+                    saw_operand = true;
+                    explicit_binary_since_operand = false;
                     next_negated = false;
                 }
                 FsCassQueryToken::Phrase(p) => {
@@ -1024,30 +1031,34 @@ impl QueryExplanation {
                         .collect();
                     if !parts.is_empty() {
                         parsed.phrases.push(parts.join(" "));
+                        if saw_operand && !explicit_binary_since_operand {
+                            uses_implicit_and = true;
+                        }
+                        saw_operand = true;
+                        explicit_binary_since_operand = false;
                     }
                     next_negated = false;
                 }
                 FsCassQueryToken::And => {
                     parsed.operators.push("AND".to_string());
-                    has_explicit_operator = true;
+                    explicit_binary_since_operand = saw_operand;
                 }
                 FsCassQueryToken::Or => {
                     parsed.operators.push("OR".to_string());
-                    has_explicit_operator = true;
+                    explicit_binary_since_operand = saw_operand;
                 }
                 FsCassQueryToken::Not => {
                     parsed.operators.push("NOT".to_string());
-                    has_explicit_operator = true;
                     next_negated = true;
                 }
             }
         }
 
-        // Every adjacent query operand is implicitly conjoined, including
-        // quoted phrases. Counting only bare terms made explanations for
-        // `foo "bar baz"` and `"foo bar" "baz qux"` disagree with execution.
-        let operand_count = parsed.terms.len().saturating_add(parsed.phrases.len());
-        parsed.implicit_and = !has_explicit_operator && operand_count > 1;
+        // Every pair of adjacent operands is implicitly conjoined, including
+        // quoted phrases and a unary-NOT operand. Track adjacency directly:
+        // a query can contain both an explicit connector and a later implicit
+        // one (`foo AND bar baz`).
+        parsed.implicit_and = uses_implicit_and;
 
         // Determine query type
         let query_type = Self::classify_query(&parsed, filters, &sanitized);
@@ -7963,7 +7974,11 @@ impl SearchClient {
         // A negative-only query has no positive relevance contribution, but
         // its complement matches still need a non-zero sentinel so the caller
         // does not discard them. Mixed-query negative clauses stay score-neutral.
-        if score > 0.0 { score } else { 1.0 }
+        if score > 0.0 {
+            score
+        } else {
+            1.0
+        }
     }
 
     fn sqlite_message_scan_query_sql(field_mask: FieldMask) -> String {
@@ -19883,6 +19898,21 @@ mod tests {
 
         let one_phrase = QueryExplanation::analyze("\"foo bar\"", &SearchFilters::default());
         assert!(!one_phrase.parsed.implicit_and);
+
+        let mixed_connectors =
+            QueryExplanation::analyze("foo AND bar baz", &SearchFilters::default());
+        assert!(mixed_connectors.parsed.implicit_and);
+
+        let implicit_before_not =
+            QueryExplanation::analyze("foo NOT bar", &SearchFilters::default());
+        assert!(implicit_before_not.parsed.implicit_and);
+
+        let explicit_before_not =
+            QueryExplanation::analyze("foo AND NOT bar", &SearchFilters::default());
+        assert!(!explicit_before_not.parsed.implicit_and);
+
+        let explicit_or = QueryExplanation::analyze("foo OR bar", &SearchFilters::default());
+        assert!(!explicit_or.parsed.implicit_and);
     }
 
     #[test]
