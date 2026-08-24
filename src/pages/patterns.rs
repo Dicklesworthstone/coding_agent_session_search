@@ -55,8 +55,8 @@ pub static AWS_ACCESS_KEY: PatternDef = PatternDef {
     id: "aws_access_key",
     name: "AWS Access Key ID",
     category: PatternCategory::ApiKeys,
-    description: "AWS access key identifiers (AKIA...)",
-    pattern: r"\bAKIA[0-9A-Z]{16}\b",
+    description: "AWS long-lived and temporary access key identifiers (AKIA... / ASIA...)",
+    pattern: r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
     replacement: "[AWS_KEY_REDACTED]",
 };
 
@@ -118,12 +118,31 @@ pub static BEARER_TOKEN: PatternDef = PatternDef {
 // Private Keys
 // ============================================================================
 
+const SSH_PRIVATE_KEY_PATTERN: &str = concat!(
+    r"(?s)(?:",
+    r"-----BEGIN RSA PRIVATE KEY-----.*?(?:-----END RSA PRIVATE KEY-----|\z)|", // ubs:ignore — public key-block regex, not embedded credentials.
+    r"-----BEGIN EC PRIVATE KEY-----.*?(?:-----END EC PRIVATE KEY-----|\z)|",
+    r"-----BEGIN DSA PRIVATE KEY-----.*?(?:-----END DSA PRIVATE KEY-----|\z)|",
+    r"-----BEGIN OPENSSH PRIVATE KEY-----.*?(?:-----END OPENSSH PRIVATE KEY-----|\z)",
+    r")",
+);
+
+const PEM_PRIVATE_KEY_PATTERN: &str = concat!(
+    r"(?s)(?:",
+    r"-----BEGIN PRIVATE KEY-----.*?(?:-----END PRIVATE KEY-----|\z)|",
+    r"-----BEGIN ENCRYPTED PRIVATE KEY-----.*?(?:-----END ENCRYPTED PRIVATE KEY-----|\z)",
+    r")",
+);
+
+const PGP_PRIVATE_KEY_PATTERN: &str =
+    r"(?s)-----BEGIN PGP PRIVATE KEY BLOCK-----.*?(?:-----END PGP PRIVATE KEY BLOCK-----|\z)";
+
 pub static SSH_PRIVATE_KEY: PatternDef = PatternDef {
     id: "ssh_private_key",
     name: "SSH Private Key",
     category: PatternCategory::PrivateKeys,
-    description: "SSH and OpenSSH private key headers",
-    pattern: r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----",
+    description: "Complete or truncated SSH and OpenSSH private key blocks",
+    pattern: SSH_PRIVATE_KEY_PATTERN,
     replacement: "[PRIVATE_KEY_REDACTED]",
 };
 
@@ -131,8 +150,8 @@ pub static PEM_PRIVATE_KEY: PatternDef = PatternDef {
     id: "pem_private_key",
     name: "PEM Private Key",
     category: PatternCategory::PrivateKeys,
-    description: "PEM-encoded private keys",
-    pattern: r"-----BEGIN (?:ENCRYPTED )?PRIVATE KEY-----",
+    description: "Complete or truncated PKCS#8 private key blocks",
+    pattern: PEM_PRIVATE_KEY_PATTERN,
     replacement: "[PRIVATE_KEY_REDACTED]",
 };
 
@@ -140,8 +159,8 @@ pub static PGP_PRIVATE_KEY: PatternDef = PatternDef {
     id: "pgp_private_key",
     name: "PGP Private Key",
     category: PatternCategory::PrivateKeys,
-    description: "PGP/GPG private key blocks",
-    pattern: r"-----BEGIN PGP PRIVATE KEY BLOCK-----",
+    description: "Complete or truncated PGP/GPG private key blocks",
+    pattern: PGP_PRIVATE_KEY_PATTERN,
     replacement: "[PGP_KEY_REDACTED]",
 };
 
@@ -464,10 +483,25 @@ mod tests {
     }
 
     #[test]
-    fn test_pattern_matches_aws_key() {
-        let pattern = Regex::new(AWS_ACCESS_KEY.pattern).unwrap();
-        assert!(pattern.is_match("Found key AKIAIOSFODNN7EXAMPLE in config"));
-        assert!(!pattern.is_match("Not a key"));
+    fn test_pattern_matches_aws_key() -> Result<(), String> {
+        let pattern = Regex::new(AWS_ACCESS_KEY.pattern).map_err(|error| error.to_string())?;
+        let cases = [
+            ("Found key AKIAIOSFODNN7EXAMPLE in config", true),
+            ("Temporary key ASIAIOSFODNN7EXAMPLE in config", true),
+            ("ASIAIOSFODNN7EXAMPL", false),
+            ("asiaiosfodnn7example", false),
+            ("Not a key", false),
+        ];
+        match cases
+            .into_iter()
+            .find(|(input, expected)| pattern.is_match(input) != *expected)
+        {
+            Some((input, expected)) => Err(format!(
+                "AWS access-key matcher returned {} for {input:?}, expected {expected}",
+                pattern.is_match(input)
+            )),
+            None => Ok(()),
+        }
     }
 
     #[test]
@@ -503,10 +537,49 @@ mod tests {
     }
 
     #[test]
-    fn test_pattern_matches_private_key() {
-        let pattern = Regex::new(SSH_PRIVATE_KEY.pattern).unwrap();
-        assert!(pattern.is_match("-----BEGIN RSA PRIVATE KEY-----"));
-        assert!(pattern.is_match("-----BEGIN OPENSSH PRIVATE KEY-----"));
-        assert!(pattern.is_match("-----BEGIN PRIVATE KEY-----"));
+    fn test_private_key_patterns_redact_entire_block() -> Result<(), String> {
+        let cases = [
+            (
+                &SSH_PRIVATE_KEY,
+                "before\n-----BEGIN RSA PRIVATE KEY-----\nFIRST_SECRET\n-----END EC PRIVATE KEY-----\nSECOND_SECRET\n-----END RSA PRIVATE KEY-----\nafter", // ubs:ignore — synthetic malformed-key fixture verifies fail-closed redaction.
+                "before\n[PRIVATE_KEY_REDACTED]\nafter",
+            ),
+            (
+                &SSH_PRIVATE_KEY,
+                "-----BEGIN OPENSSH PRIVATE KEY-----\nTRUNCATED_SECRET",
+                "[PRIVATE_KEY_REDACTED]",
+            ),
+            (
+                &PEM_PRIVATE_KEY,
+                "-----BEGIN PRIVATE KEY-----\nPKCS8_SECRET\n-----END PRIVATE KEY-----",
+                "[PRIVATE_KEY_REDACTED]",
+            ),
+            (
+                &PEM_PRIVATE_KEY,
+                "-----BEGIN ENCRYPTED PRIVATE KEY-----\nTRUNCATED_SECRET",
+                "[PRIVATE_KEY_REDACTED]",
+            ),
+            (
+                &PGP_PRIVATE_KEY,
+                "-----BEGIN PGP PRIVATE KEY BLOCK-----\nPGP_SECRET\n-----END PGP PRIVATE KEY BLOCK-----",
+                "[PGP_KEY_REDACTED]",
+            ),
+        ];
+
+        for (definition, input, expected) in cases {
+            let pattern = definition
+                .to_custom_pattern()
+                .ok_or_else(|| format!("{} pattern did not compile", definition.name))?;
+            let actual = pattern
+                .pattern
+                .replace_all(input, pattern.replacement.as_str());
+            if actual != expected {
+                return Err(format!(
+                    "{} left private-key bytes visible: {actual}",
+                    definition.name
+                ));
+            }
+        }
+        Ok(())
     }
 }

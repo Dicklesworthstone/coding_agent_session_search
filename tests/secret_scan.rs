@@ -172,6 +172,10 @@ mod tests {
         fixture(&["AKIA", "IOSFODNN7EXAMPLE"])
     }
 
+    fn aws_temporary_access_fixture() -> String {
+        fixture(&["ASIA", "IOSFODNN7EXAMPLE"])
+    }
+
     fn aws_s_fixture() -> String {
         fixture(&["wJalr", "XUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"])
     }
@@ -192,6 +196,10 @@ mod tests {
 
     fn private_block_fixture(kind: &str, body: &str) -> String {
         format!("-----BEGIN {kind} PRIVATE KEY-----\n{body}")
+    }
+
+    fn pgp_private_block_fixture(body: &str) -> String {
+        format!("-----BEGIN {} PRIVATE KEY {}-----\n{body}", "PGP", "BLOCK")
     }
 
     fn database_url_fixture(scheme: &str, userinfo: &str, host: &str, path: &str) -> String {
@@ -305,16 +313,23 @@ mod tests {
     fn detects_aws_access_key_id() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
-        let content = format!("credentials: {}", aws_access_fixture());
+        let content = format!(
+            "permanent credentials: {}; temporary credentials: {}",
+            aws_access_fixture(),
+            aws_temporary_access_fixture()
+        );
         setup_db(&db_path, &content)?;
 
         let report = scan(&db_path)?;
-        assert!(
-            report
-                .findings
-                .iter()
-                .any(|f| f.kind == "aws_access_key_id"),
-            "should detect AWS access key ID pattern"
+        let access_key_findings = report
+            .findings
+            .iter()
+            .filter(|finding| finding.kind == "aws_access_key_id")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            access_key_findings.len(),
+            2,
+            "should detect both AKIA and ASIA access key IDs"
         );
         let finding = report
             .findings
@@ -459,6 +474,20 @@ mod tests {
         assert!(
             report.findings.iter().any(|f| f.kind == "private_key"),
             "should detect encrypted private key header"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn detects_pgp_private_key_block_header() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("scan.db");
+        setup_db(&db_path, &pgp_private_block_fixture("xcLYBF..."))?;
+
+        let report = scan(&db_path)?;
+        assert!(
+            report.findings.iter().any(|f| f.kind == "private_key"),
+            "should detect PGP private key block header"
         );
         Ok(())
     }

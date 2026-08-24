@@ -11,6 +11,8 @@
 //! See also: `pages::secret_scan` (post-hoc scanning of existing data).
 
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::fmt::Write as _;
 
 use once_cell::sync::Lazy;
 use regex::{Regex, RegexSet};
@@ -24,13 +26,27 @@ struct SecretPattern {
     regex: Regex,
 }
 
+const PRIVATE_KEY_BLOCK_PATTERN: &str = concat!(
+    r"(?s)(?:",
+    r"-----BEGIN RSA PRIVATE KEY-----.*?(?:-----END RSA PRIVATE KEY-----|\z)|", // ubs:ignore — public key-block regex, not embedded credentials.
+    r"-----BEGIN EC PRIVATE KEY-----.*?(?:-----END EC PRIVATE KEY-----|\z)|", // ubs:ignore — public key-block regex, not embedded credentials.
+    r"-----BEGIN DSA PRIVATE KEY-----.*?(?:-----END DSA PRIVATE KEY-----|\z)|", // ubs:ignore — public key-block regex, not embedded credentials.
+    r"-----BEGIN OPENSSH PRIVATE KEY-----.*?(?:-----END OPENSSH PRIVATE KEY-----|\z)|", // ubs:ignore — public key-block regex, not embedded credentials.
+    r"-----BEGIN PRIVATE KEY-----.*?(?:-----END PRIVATE KEY-----|\z)|", // ubs:ignore — public key-block regex, not embedded credentials.
+    r"-----BEGIN ENCRYPTED PRIVATE KEY-----.*?(?:-----END ENCRYPTED PRIVATE KEY-----|\z)|", // ubs:ignore — public key-block regex, not embedded credentials.
+    r"-----BEGIN PGP PRIVATE KEY BLOCK-----.*?(?:-----END PGP PRIVATE KEY BLOCK-----|\z)", // ubs:ignore — public key-block regex, not embedded credentials.
+    r")",
+);
+
 /// All built-in patterns, compiled once on first use.
 static SECRET_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
     vec![
-        // AWS Access Key ID (always starts with AKIA)
+        // AWS access key IDs: AKIA for long-lived IAM credentials and ASIA
+        // for temporary STS credentials.
         SecretPattern {
-            pattern: r"\bAKIA[0-9A-Z]{16}\b",
-            regex: Regex::new(r"\bAKIA[0-9A-Z]{16}\b").expect("aws access key regex"),
+            pattern: r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
+            regex: Regex::new(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")
+                .expect("aws access key regex"),
         },
         // AWS Secret Key in assignment context
         SecretPattern {
@@ -66,11 +82,12 @@ static SECRET_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
             regex: Regex::new(r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b")
                 .expect("jwt regex"),
         },
-        // PEM private keys
+        // PEM/OpenSSH/PGP private-key blocks. Match through the corresponding
+        // footer, or through end-of-input for a truncated paste. Redacting
+        // only the header leaves the encoded private key searchable.
         SecretPattern {
-            pattern: r"-----BEGIN (?:RSA|EC|DSA|OPENSSH|PGP) PRIVATE KEY-----",
-            regex: Regex::new(r"-----BEGIN (?:RSA|EC|DSA|OPENSSH|PGP) PRIVATE KEY-----")
-                .expect("private key regex"),
+            pattern: PRIVATE_KEY_BLOCK_PATTERN,
+            regex: Regex::new(PRIVATE_KEY_BLOCK_PATTERN).expect("private key block regex"),
         },
         // Database connection URLs with credentials
         SecretPattern {
@@ -137,6 +154,36 @@ fn apply_replacements<'a>(input: &'a str, matches: &regex::SetMatches) -> Cow<'a
     output
 }
 
+/// Insert a redacted JSON object entry without discarding an earlier value
+/// whose distinct source key redacted to the same placeholder. Generated
+/// suffixes contain only public punctuation/digits, so collision handling
+/// never reintroduces source-key bytes.
+fn insert_redacted_json_entry(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    next_suffixes: &mut HashMap<String, usize>,
+    redacted_key: String,
+    value: serde_json::Value,
+) {
+    if !object.contains_key(&redacted_key) {
+        object.insert(redacted_key, value);
+        return;
+    }
+
+    let next_suffix = next_suffixes.entry(redacted_key.clone()).or_insert(2);
+    let mut candidate = String::with_capacity(redacted_key.len() + 21);
+    loop {
+        candidate.clear();
+        candidate.push_str(&redacted_key);
+        candidate.push('#');
+        let _ = write!(&mut candidate, "{next_suffix}");
+        *next_suffix = next_suffix.saturating_add(1);
+        if !object.contains_key(&candidate) {
+            object.insert(candidate, value);
+            return;
+        }
+    }
+}
+
 /// Redact secrets from a JSON value, recursively walking strings.
 ///
 /// - String values are redacted in-place.
@@ -152,10 +199,16 @@ pub fn redact_json(value: &serde_json::Value) -> serde_json::Value {
             serde_json::Value::Array(arr.iter().map(redact_json).collect())
         }
         serde_json::Value::Object(obj) => {
-            let mut new_obj = serde_json::Map::new();
+            let mut new_obj = serde_json::Map::with_capacity(obj.len());
+            let mut next_suffixes = HashMap::new();
             for (k, v) in obj {
                 let redacted_key = redact_text(k).into_owned();
-                new_obj.insert(redacted_key, redact_json(v));
+                insert_redacted_json_entry(
+                    &mut new_obj,
+                    &mut next_suffixes,
+                    redacted_key,
+                    redact_json(v),
+                );
             }
             serde_json::Value::Object(new_obj)
         }
@@ -514,9 +567,15 @@ impl MemoizingRedactor {
             }
             serde_json::Value::Object(obj) => {
                 let mut new_obj = serde_json::Map::with_capacity(obj.len());
+                let mut next_suffixes = HashMap::new();
                 for (k, v) in obj {
                     let redacted_key = self.redact_text(k);
-                    new_obj.insert(redacted_key, self.redact_json(v));
+                    insert_redacted_json_entry(
+                        &mut new_obj,
+                        &mut next_suffixes,
+                        redacted_key,
+                        self.redact_json(v),
+                    );
                 }
                 serde_json::Value::Object(new_obj)
             }
@@ -612,17 +671,62 @@ mod tests {
     }
 
     #[test]
-    fn redacts_aws_access_key() {
-        let input = "AKIAIOSFODNN7EXAMPLE";
-        let output = redact_text(input);
-        assert_eq!(output, "[REDACTED]");
+    fn redacts_aws_access_key() -> Result<(), String> {
+        for input in ["AKIAIOSFODNN7EXAMPLE", "ASIAIOSFODNN7EXAMPLE"] {
+            if redact_text(input) != "[REDACTED]" {
+                return Err(format!("access-key prefix was not redacted in {input}"));
+            }
+        }
+        for near_miss in ["ASIAIOSFODNN7EXAMPL", "asiaiosfodnn7example"] {
+            if redact_text(near_miss) != near_miss {
+                return Err(format!("near-miss access key was redacted: {near_miss}"));
+            }
+        }
+        Ok(())
     }
 
     #[test]
-    fn redacts_private_key_header() {
+    fn redacts_private_key_header() -> Result<(), String> {
         let input = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAK...";
         let output = redact_text(input);
-        assert!(output.starts_with("[REDACTED]"));
+        (output == "[REDACTED]" && !output.contains("MIIEowIBAAK"))
+            .then_some(())
+            .ok_or_else(|| format!("truncated private-key body remained visible: {output}"))
+    }
+
+    #[test]
+    fn redacts_complete_and_truncated_private_key_bodies() -> Result<(), String> {
+        fn require(condition: bool, message: &'static str) -> Result<(), String> {
+            condition.then_some(()).ok_or_else(|| message.to_owned())
+        }
+
+        let complete = "before\n-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----\nafter";
+        require(
+            redact_text(complete) == "before\n[REDACTED]\nafter",
+            "complete PKCS#8 key was not fully redacted",
+        )?;
+
+        let encrypted = "-----BEGIN ENCRYPTED PRIVATE KEY-----\nENCRYPTEDSECRETBODY\n-----END ENCRYPTED PRIVATE KEY-----";
+        require(
+            redact_text(encrypted) == "[REDACTED]",
+            "encrypted private key was not fully redacted",
+        )?;
+
+        let truncated = "prefix\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA";
+        let output = redact_text(truncated);
+        require(
+            output == "prefix\n[REDACTED]" && !output.contains("b3BlbnNzaC1rZXktdjE"),
+            "truncated OpenSSH private key was not fully redacted",
+        )?;
+
+        let mismatched_footer = "-----BEGIN RSA PRIVATE KEY-----\nFIRST_SECRET_HALF\n-----END EC PRIVATE KEY-----\nSECOND_SECRET_HALF\n-----END RSA PRIVATE KEY-----\nafter"; // ubs:ignore — synthetic malformed-key fixture verifies fail-closed redaction.
+        let output = redact_text(mismatched_footer);
+        require(
+            output == "[REDACTED]\nafter"
+                && !output.contains("FIRST_SECRET_HALF")
+                && !output.contains("SECOND_SECRET_HALF"),
+            "mismatched footer terminated private-key redaction early",
+        )
     }
 
     #[test]
@@ -698,6 +802,42 @@ mod tests {
         assert_eq!(output["outer"]["inner"], json!("[REDACTED]"));
         assert_eq!(output["array"][0], json!("safe"));
         assert_eq!(output["array"][1], json!("[REDACTED]"));
+    }
+
+    #[test]
+    fn redacted_json_key_collisions_preserve_every_value_without_leaking_keys() -> Result<(), String>
+    {
+        let input = json!({
+            "api_key=abcdefgh12345678": "first", // ubs:ignore — synthetic collision fixture, not a credential.
+            "password=abcdefgh12345678": "second", // ubs:ignore — synthetic collision fixture, not a credential.
+            "[REDACTED]#2": "preexisting",
+        });
+
+        let plain = redact_json(&input);
+        let memoized = MemoizingRedactor::with_capacity(8).redact_json(&input);
+        if plain != memoized {
+            return Err("plain and memoized JSON walkers disagreed".to_owned());
+        }
+
+        let object = plain
+            .as_object()
+            .ok_or_else(|| "redacted JSON was not an object".to_owned())?;
+        if object.len() != 3 {
+            return Err("redaction overwrote an object value".to_owned());
+        }
+        let mut values = object
+            .values()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        if values != ["first", "preexisting", "second"] {
+            return Err(format!("redacted object values changed: {values:?}"));
+        }
+        object
+            .keys()
+            .all(|key| !key.contains("abcdefgh12345678"))
+            .then_some(())
+            .ok_or_else(|| "collision suffix leaked source-key bytes".to_owned())
     }
 
     #[test]
