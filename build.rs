@@ -109,8 +109,8 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "franken-agent-detection",
         manifest_package_field: None,
         expected_git: "https://github.com/Dicklesworthstone/franken_agent_detection",
-        expected_rev: "17f28ad8fbea9181134d63e109a310ea7bf31997",
-        expected_version: "0.1.10",
+        expected_rev: "82424dc8571ef47215cac342696a36faabd07bca",
+        expected_version: "0.2.1",
         expected_features: &[
             "chatgpt",
             "connectors",
@@ -163,7 +163,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // surface. The latter keeps CASS schema-v8 access independent from
         // FrankenSearch's swappable generic lexical backend (cass #308,
         // bd-8nqz.5).
-        expected_rev: "46a3aefce1aa658fa98f27f0b3676f073160e15c",
+        expected_rev: "22859f74056c31fd3a713bacecd4a1f22f0cf82d",
         expected_version: "0.3.2",
         // cass #308: the ort/ONNX `fastembed` stack was removed; semantic
         // embedding + reranking are now pure-Rust via frankensearch's `native`
