@@ -468,8 +468,12 @@ fn unique_bundle_dir(path: &Path, suffix: &str) -> Result<PathBuf> {
     unique_bundle_sidecar_path(path, suffix, "pages_bundle")
 }
 
-fn unique_bundle_backup_dir(path: &Path) -> Result<PathBuf> {
-    unique_bundle_sidecar_path(path, "bak", "pages_bundle")
+fn bundle_publish_in_progress_backup_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("pages_bundle");
+    path.with_file_name(format!(".{file_name}.publish-in-progress.bak"))
 }
 
 fn unique_bundle_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) -> Result<PathBuf> {
@@ -494,28 +498,30 @@ fn bundle_sidecar_random_nonce() -> Result<u128> {
 }
 
 fn ensure_replaceable_bundle_output_dir(path: &Path) -> Result<bool> {
-    ensure_existing_parent_ancestors_are_real_dirs(path, "bundle output path")?;
+    ensure_bundle_directory_entry(path, "bundle output path")
+}
+
+fn ensure_bundle_directory_entry(path: &Path, label: &str) -> Result<bool> {
+    ensure_existing_parent_ancestors_are_real_dirs(path, label)?;
 
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             let file_type = metadata.file_type();
             if file_type.is_symlink() {
-                bail!(
-                    "bundle output path must not be a symlink: {}",
-                    path.display()
-                );
+                bail!("{label} must not be a symlink: {}", path.display());
             }
             if !file_type.is_dir() {
                 bail!(
-                    "bundle output path points to a file, expected a directory: {}",
+                    "{label} points to a file, expected a directory: {}",
                     path.display()
                 );
             }
             Ok(true)
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(err)
-            .with_context(|| format!("failed inspecting bundle output path {}", path.display())),
+        Err(err) => {
+            Err(err).with_context(|| format!("failed inspecting {label} {}", path.display()))
+        }
     }
 }
 
@@ -580,6 +586,11 @@ fn replace_dir_from_temp(
     retain_temp_on_error: &mut bool,
 ) -> Result<()> {
     *retain_temp_on_error = false;
+    if !ensure_bundle_directory_entry(temp_dir, "staged bundle path")? {
+        bail!("staged bundle path does not exist: {}", temp_dir.display());
+    }
+
+    recover_interrupted_bundle_publish(final_dir)?;
     if !ensure_replaceable_bundle_output_dir(final_dir)? {
         fs::rename(temp_dir, final_dir).with_context(|| {
             format!(
@@ -588,45 +599,236 @@ fn replace_dir_from_temp(
                 final_dir.display()
             )
         })?;
-        sync_parent_directory(final_dir)?;
+        sync_parent_directory(final_dir).with_context(|| {
+            format!(
+                "completed bundle is live at {}, but its first publication could not be durably synced",
+                final_dir.display()
+            )
+        })?;
         return Ok(());
     }
 
-    let backup_dir = unique_bundle_backup_dir(final_dir)?;
-    fs::rename(final_dir, &backup_dir).with_context(|| {
+    let backup_dir = bundle_publish_in_progress_backup_path(final_dir);
+
+    #[cfg(target_os = "linux")]
+    {
+        match crate::indexer::atomic_exchange_paths(final_dir, temp_dir) {
+            Ok(()) => {
+                return finish_linux_atomic_bundle_exchange(
+                    temp_dir,
+                    final_dir,
+                    &backup_dir,
+                    retain_temp_on_error,
+                );
+            }
+            Err(exchange_error)
+                if crate::indexer::linux_atomic_exchange_is_unsupported(&exchange_error) =>
+            {
+                tracing::info!(
+                    live_bundle_path = %final_dir.display(),
+                    staged_bundle_path = %temp_dir.display(),
+                    "renameat2(RENAME_EXCHANGE) is unsupported for the Pages bundle output; using recoverable rename-pair publication"
+                );
+            }
+            Err(exchange_error) => {
+                return Err(exchange_error).with_context(|| {
+                    format!(
+                        "failed atomically exchanging staged bundle {} with live bundle {}",
+                        temp_dir.display(),
+                        final_dir.display()
+                    )
+                });
+            }
+        }
+    }
+
+    replace_dir_from_temp_via_recoverable_rename_pair(
+        temp_dir,
+        final_dir,
+        &backup_dir,
+        retain_temp_on_error,
+    )
+}
+
+fn recover_interrupted_bundle_publish(final_dir: &Path) -> Result<()> {
+    let backup_dir = bundle_publish_in_progress_backup_path(final_dir);
+    if !ensure_bundle_directory_entry(&backup_dir, "bundle publish recovery backup")? {
+        return Ok(());
+    }
+
+    if ensure_replaceable_bundle_output_dir(final_dir)? {
+        cleanup_prior_bundle_after_publish(&backup_dir, final_dir)?;
+        return Ok(());
+    }
+
+    fs::rename(&backup_dir, final_dir).with_context(|| {
         format!(
-            "failed preparing backup {} before replacing {}",
+            "failed restoring the only prior live bundle from interrupted-publish backup {} to {}",
             backup_dir.display(),
             final_dir.display()
         )
     })?;
+    sync_parent_directory(final_dir).with_context(|| {
+        format!(
+            "restored the prior live bundle at {} from {}, but could not durably sync the recovery",
+            final_dir.display(),
+            backup_dir.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn cleanup_prior_bundle_after_publish(backup_dir: &Path, final_dir: &Path) -> Result<()> {
+    cleanup_prior_bundle_after_publish_with(backup_dir, final_dir, fs::remove_dir_all)
+}
+
+fn cleanup_prior_bundle_after_publish_with<F>(
+    backup_dir: &Path,
+    final_dir: &Path,
+    remove_dir: F,
+) -> Result<()>
+where
+    F: FnOnce(&Path) -> std::io::Result<()>,
+{
+    if !ensure_bundle_directory_entry(backup_dir, "prior bundle cleanup path")? {
+        bail!(
+            "new bundle is live at {}, but the prior bundle cleanup path disappeared before removal: {}",
+            final_dir.display(),
+            backup_dir.display()
+        );
+    }
+    remove_dir(backup_dir).with_context(|| {
+        format!(
+            "new bundle is live at {}, but failed to remove the prior bundle containing private artifacts retained at {}",
+            final_dir.display(),
+            backup_dir.display()
+        )
+    })?;
+    sync_parent_directory(final_dir).with_context(|| {
+        format!(
+            "removed the prior bundle after publishing {}, but could not durably sync its parent directory",
+            final_dir.display()
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn finish_linux_atomic_bundle_exchange(
+    prior_bundle_at_staged_path: &Path,
+    final_dir: &Path,
+    backup_dir: &Path,
+    retain_temp_on_error: &mut bool,
+) -> Result<()> {
+    if let Err(sync_error) = sync_parent_directory(final_dir) {
+        *retain_temp_on_error = true;
+        bail!(
+            "new bundle is live at {} after atomic exchange, but the parent directory sync failed: {}; prior bundle containing private artifacts retained at {}",
+            final_dir.display(),
+            sync_error,
+            prior_bundle_at_staged_path.display()
+        );
+    }
+
+    if let Err(park_error) = fs::rename(prior_bundle_at_staged_path, backup_dir) {
+        *retain_temp_on_error = true;
+        bail!(
+            "new bundle is live at {}, but failed to move the prior bundle into deterministic recovery storage {}: {}; prior bundle containing private artifacts retained at {}",
+            final_dir.display(),
+            backup_dir.display(),
+            park_error,
+            prior_bundle_at_staged_path.display()
+        );
+    }
+    if let Err(sync_error) = sync_parent_directory(final_dir) {
+        bail!(
+            "new bundle is live at {}, but could not durably record the prior bundle recovery path after atomic exchange: {}; prior bundle containing private artifacts retained at {}",
+            final_dir.display(),
+            sync_error,
+            backup_dir.display()
+        );
+    }
+
+    cleanup_prior_bundle_after_publish(backup_dir, final_dir)
+}
+
+fn replace_dir_from_temp_via_recoverable_rename_pair(
+    temp_dir: &Path,
+    final_dir: &Path,
+    backup_dir: &Path,
+    retain_temp_on_error: &mut bool,
+) -> Result<()> {
+    fs::rename(final_dir, backup_dir).with_context(|| {
+        format!(
+            "failed parking live bundle {} at deterministic recovery path {}",
+            final_dir.display(),
+            backup_dir.display()
+        )
+    })?;
+
+    if let Err(park_sync_error) = sync_parent_directory(final_dir) {
+        return match fs::rename(backup_dir, final_dir) {
+            Ok(()) => {
+                sync_parent_directory(final_dir).with_context(|| {
+                    format!(
+                        "failed syncing recovery after restoring prior live bundle at {}",
+                        final_dir.display()
+                    )
+                })?;
+                Err(park_sync_error).with_context(|| {
+                    format!(
+                        "failed durably parking the prior live bundle at {}; restored it at {}",
+                        backup_dir.display(),
+                        final_dir.display()
+                    )
+                })
+            }
+            Err(restore_error) => {
+                *retain_temp_on_error = true;
+                bail!(
+                    "failed durably parking the prior live bundle at {}: {}; restore to {} also failed: {}; prior bundle retained at {} and staged bundle retained at {}",
+                    backup_dir.display(),
+                    park_sync_error,
+                    final_dir.display(),
+                    restore_error,
+                    backup_dir.display(),
+                    temp_dir.display()
+                )
+            }
+        };
+    }
 
     match fs::rename(temp_dir, final_dir) {
         Ok(()) => {
-            sync_parent_directory(final_dir)?;
-            let _ = fs::remove_dir_all(&backup_dir);
-            sync_parent_directory(final_dir)?;
-            Ok(())
-        }
-        Err(second_err) => match fs::rename(&backup_dir, final_dir) {
-            Ok(()) => {
-                let _ = fs::remove_dir_all(temp_dir);
-                sync_parent_directory(final_dir)?;
+            if let Err(sync_error) = sync_parent_directory(final_dir) {
                 bail!(
-                    "failed replacing {} with {}: {}; restored original bundle",
+                    "new bundle was moved into place at {}, but the publish could not be durably synced: {}; prior bundle containing private artifacts retained at {}",
                     final_dir.display(),
-                    temp_dir.display(),
-                    second_err
+                    sync_error,
+                    backup_dir.display()
                 );
             }
-            Err(restore_err) => {
+            cleanup_prior_bundle_after_publish(backup_dir, final_dir)
+        }
+        Err(publish_error) => match fs::rename(backup_dir, final_dir) {
+            Ok(()) => {
+                sync_parent_directory(final_dir)?;
+                Err(publish_error).with_context(|| {
+                    format!(
+                        "failed publishing staged bundle {} at {}; restored the prior live bundle",
+                        temp_dir.display(),
+                        final_dir.display()
+                    )
+                })
+            }
+            Err(restore_error) => {
                 *retain_temp_on_error = true;
                 bail!(
-                    "failed replacing {} with {}: {}; restore error: {}; temp bundle retained at {}",
-                    final_dir.display(),
+                    "failed publishing staged bundle {} at {}: {}; restore also failed: {}; prior bundle retained at {} and staged bundle retained at {}",
                     temp_dir.display(),
-                    second_err,
-                    restore_err,
+                    final_dir.display(),
+                    publish_error,
+                    restore_error,
+                    backup_dir.display(),
                     temp_dir.display()
                 );
             }
@@ -2512,14 +2714,213 @@ mod tests {
         assert!(!staged_dir.exists());
         assert!(final_dir.join("site/new.txt").exists());
         assert!(!final_dir.join("site/old.txt").exists());
-        let sidecars = fs::read_dir(temp.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
         assert!(
-            !sidecars.iter().any(|name| name.contains(".bundle.bak.")),
-            "backup sidecar should be cleaned up, found: {sidecars:?}"
+            !bundle_publish_in_progress_backup_path(&final_dir).exists(),
+            "deterministic recovery sidecar should be cleaned up"
         );
+    }
+
+    #[test]
+    fn test_replace_dir_from_temp_preserves_first_publish_behavior() {
+        let temp = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let staged_dir = temp.path().join("bundle.staged");
+
+        fs::create_dir_all(staged_dir.join("site")).unwrap();
+        fs::write(staged_dir.join("site/new.txt"), "new").unwrap();
+
+        let mut retain_temp_on_error = false;
+        replace_dir_from_temp(
+            &staged_dir,
+            &final_dir,
+            &mut retain_temp_on_error,
+        )
+        .unwrap();
+
+        assert!(!retain_temp_on_error);
+        assert!(!staged_dir.exists());
+        assert_eq!(
+            fs::read_to_string(final_dir.join("site/new.txt")).unwrap(),
+            "new"
+        );
+        assert!(!bundle_publish_in_progress_backup_path(&final_dir).exists());
+    }
+
+    #[test]
+    fn test_recover_interrupted_bundle_publish_restores_parked_only_live_bundle() {
+        let temp = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let staged_dir = temp.path().join("bundle.staged");
+        let backup_dir = bundle_publish_in_progress_backup_path(&final_dir);
+
+        fs::create_dir_all(final_dir.join("private")).unwrap();
+        fs::write(final_dir.join("private/old-secret.txt"), "old").unwrap();
+        fs::create_dir_all(staged_dir.join("private")).unwrap();
+        fs::write(staged_dir.join("private/new-secret.txt"), "new").unwrap();
+
+        // Failpoint state: the fallback publisher durably parked OLD, then
+        // the process died before installing NEW at the live handle.
+        fs::rename(&final_dir, &backup_dir).unwrap();
+        assert!(!final_dir.exists());
+
+        recover_interrupted_bundle_publish(&final_dir).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(final_dir.join("private/old-secret.txt")).unwrap(),
+            "old"
+        );
+        assert!(!backup_dir.exists());
+        assert_eq!(
+            fs::read_to_string(staged_dir.join("private/new-secret.txt")).unwrap(),
+            "new",
+            "recovery must not consume the next staged candidate"
+        );
+    }
+
+    #[test]
+    fn test_recover_interrupted_bundle_publish_keeps_new_live_and_cleans_parked_old() {
+        let temp = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let staged_dir = temp.path().join("bundle.staged");
+        let backup_dir = bundle_publish_in_progress_backup_path(&final_dir);
+
+        fs::create_dir_all(final_dir.join("private")).unwrap();
+        fs::write(final_dir.join("private/old-secret.txt"), "old").unwrap();
+        fs::create_dir_all(staged_dir.join("private")).unwrap();
+        fs::write(staged_dir.join("private/new-secret.txt"), "new").unwrap();
+
+        // Failpoint state: OLD was parked and NEW reached the live handle,
+        // then the process died before removing OLD.
+        fs::rename(&final_dir, &backup_dir).unwrap();
+        fs::rename(&staged_dir, &final_dir).unwrap();
+
+        recover_interrupted_bundle_publish(&final_dir).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(final_dir.join("private/new-secret.txt")).unwrap(),
+            "new"
+        );
+        assert!(!final_dir.join("private/old-secret.txt").exists());
+        assert!(!backup_dir.exists());
+    }
+
+    #[test]
+    fn test_recoverable_rename_pair_replaces_and_cleans_prior_bundle() {
+        let temp = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let staged_dir = temp.path().join("bundle.staged");
+        let backup_dir = bundle_publish_in_progress_backup_path(&final_dir);
+
+        fs::create_dir_all(final_dir.join("site")).unwrap();
+        fs::write(final_dir.join("site/old.txt"), "old").unwrap();
+        fs::create_dir_all(staged_dir.join("site")).unwrap();
+        fs::write(staged_dir.join("site/new.txt"), "new").unwrap();
+
+        let mut retain_temp_on_error = false;
+        replace_dir_from_temp_via_recoverable_rename_pair(
+            &staged_dir,
+            &final_dir,
+            &backup_dir,
+            &mut retain_temp_on_error,
+        )
+        .unwrap();
+
+        assert!(!retain_temp_on_error);
+        assert_eq!(
+            fs::read_to_string(final_dir.join("site/new.txt")).unwrap(),
+            "new"
+        );
+        assert!(!backup_dir.exists());
+    }
+
+    #[test]
+    fn test_prior_private_bundle_cleanup_failure_names_every_retained_path() {
+        let temp = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let backup_dir = bundle_publish_in_progress_backup_path(&final_dir);
+        fs::create_dir_all(final_dir.join("site")).unwrap();
+        fs::create_dir_all(backup_dir.join("private")).unwrap();
+        fs::write(backup_dir.join("private/recovery-secret.txt"), "secret").unwrap();
+
+        let error = cleanup_prior_bundle_after_publish_with(
+            &backup_dir,
+            &final_dir,
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected cleanup denial",
+                ))
+            },
+        )
+        .expect_err("cleanup failure must fail the publication result");
+        let message = format!("{error:#}");
+
+        assert!(message.contains(&final_dir.display().to_string()));
+        assert!(message.contains(&backup_dir.display().to_string()));
+        assert!(message.contains("injected cleanup denial"));
+        assert!(message.contains("private artifacts retained"));
+        assert!(backup_dir.join("private/recovery-secret.txt").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_recover_interrupted_bundle_publish_rejects_symlinked_backup() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let backup_dir = bundle_publish_in_progress_backup_path(&final_dir);
+        fs::create_dir_all(outside.path().join("private")).unwrap();
+        fs::write(outside.path().join("private/secret.txt"), "secret").unwrap();
+        symlink(outside.path(), &backup_dir).unwrap();
+
+        let error = recover_interrupted_bundle_publish(&final_dir)
+            .expect_err("a symlinked recovery backup must fail closed");
+
+        assert!(error.to_string().contains("must not be a symlink"));
+        assert!(error.to_string().contains(&backup_dir.display().to_string()));
+        assert_eq!(
+            fs::read_to_string(outside.path().join("private/secret.txt")).unwrap(),
+            "secret"
+        );
+        assert!(!final_dir.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_replace_dir_from_temp_rejects_symlinked_staging_tree() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let staged_dir = temp.path().join("bundle.staged");
+        fs::create_dir_all(final_dir.join("site")).unwrap();
+        fs::write(final_dir.join("site/old.txt"), "old").unwrap();
+        fs::create_dir_all(outside.path().join("site")).unwrap();
+        fs::write(outside.path().join("site/new.txt"), "new").unwrap();
+        symlink(outside.path(), &staged_dir).unwrap();
+
+        let mut retain_temp_on_error = false;
+        let error = replace_dir_from_temp(
+            &staged_dir,
+            &final_dir,
+            &mut retain_temp_on_error,
+        )
+        .expect_err("a symlinked staged bundle must fail closed");
+
+        assert!(error.to_string().contains("must not be a symlink"));
+        assert!(error.to_string().contains(&staged_dir.display().to_string()));
+        assert_eq!(
+            fs::read_to_string(final_dir.join("site/old.txt")).unwrap(),
+            "old"
+        );
+        assert_eq!(
+            fs::read_to_string(outside.path().join("site/new.txt")).unwrap(),
+            "new"
+        );
+        assert!(!retain_temp_on_error);
     }
 
     #[test]

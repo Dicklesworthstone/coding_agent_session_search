@@ -4,6 +4,7 @@ use crate::franken_sync::compat::{
 use crate::franken_sync::{Connection, Row as FrankenRow, params};
 use crate::pages::summary::ExclusionSet;
 use crate::ui::time_parser::parse_time_input;
+use super::{SQLITE_SIDECAR_SUFFIXES, sqlite_sidecar_path};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
@@ -536,6 +537,8 @@ impl ExportEngine {
                 }
             };
             drop(dest);
+            cleanup_sqlite_sidecars(&temp_output_path)
+                .context("Failed to finalize staged Pages export as one SQLite main file")?;
 
             let verification = verifier(&temp_output_path)
                 .context("Staged Pages export verification failed")?;
@@ -750,27 +753,10 @@ fn unique_atomic_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) ->
     ))
 }
 
-const SQLITE_SIDECAR_SUFFIXES: &[&str] = &[
-    "-journal",
-    "-wal",
-    "-shm",
-    "-lock-shared",
-    "-lock-reserved",
-    "-lock-pending",
-    "-fsqlite-ns-gate",
-    "-fsqlite-ns-use",
-    "-wal-cert",
-    "-wal-cert-head",
-];
-
-fn cleanup_sqlite_temp_artifacts(path: &Path) -> Result<()> {
+fn cleanup_sqlite_sidecars(path: &Path) -> Result<()> {
     let mut first_error = None;
-    let artifacts = std::iter::once(path.to_path_buf()).chain(
-        SQLITE_SIDECAR_SUFFIXES
-            .iter()
-            .map(|suffix| sidecar_path(path, suffix)),
-    );
-    for artifact in artifacts {
+    for suffix in SQLITE_SIDECAR_SUFFIXES {
+        let artifact = sqlite_sidecar_path(path, suffix);
         match std::fs::remove_file(&artifact) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -787,6 +773,25 @@ fn cleanup_sqlite_temp_artifacts(path: &Path) -> Result<()> {
     first_error.map_or(Ok(()), Err)
 }
 
+fn cleanup_sqlite_temp_artifacts(path: &Path) -> Result<()> {
+    let main_result = match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(anyhow::Error::new(err).context(format!(
+            "failed removing staged SQLite artifact {}",
+            path.display()
+        ))),
+    };
+    let sidecar_result = cleanup_sqlite_sidecars(path);
+    match (main_result, sidecar_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(main_error), Err(sidecar_error)) => Err(main_error.context(format!(
+            "staged SQLite sidecar cleanup also failed: {sidecar_error:#}"
+        ))),
+    }
+}
+
 fn create_staged_export_file(path: &Path) -> Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -798,15 +803,6 @@ fn create_staged_export_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
-    let mut file_name = path
-        .file_name()
-        .unwrap_or_else(|| std::ffi::OsStr::new("pages_export.db"))
-        .to_os_string();
-    file_name.push(suffix);
-    path.with_file_name(file_name)
-}
-
 /// Refuse to publish one SQLite main file over an existing artifact family.
 ///
 /// A WAL, shared-memory file, or rollback journal beside `final_path` may
@@ -816,7 +812,7 @@ fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
 /// decide that an existing sidecar is stale, so preserve it and fail closed.
 fn reject_existing_final_sqlite_sidecars(final_path: &Path) -> Result<()> {
     for suffix in SQLITE_SIDECAR_SUFFIXES {
-        let sidecar = sidecar_path(final_path, suffix);
+        let sidecar = sqlite_sidecar_path(final_path, suffix);
         match std::fs::symlink_metadata(&sidecar) {
             Ok(_) => {
                 bail!(
@@ -1663,7 +1659,7 @@ mod tests {
             .chain(
                 SQLITE_SIDECAR_SUFFIXES
                     .iter()
-                    .map(|suffix| sidecar_path(&staged_path, suffix)),
+                    .map(|suffix| sqlite_sidecar_path(&staged_path, suffix)),
             )
             .collect::<Vec<_>>();
         for artifact in &artifacts {
@@ -1753,7 +1749,7 @@ mod tests {
             let temp_dir = TempDir::new()?;
             let final_path = temp_dir.path().join("export.db");
             let staged_path = temp_dir.path().join("export.tmp.db");
-            let sentinel_path = sidecar_path(&final_path, suffix);
+            let sentinel_path = sqlite_sidecar_path(&final_path, suffix);
             let old_generation = format!("old main for {suffix}");
             let new_generation = format!("new main for {suffix}");
             let sentinel = format!("sentinel sidecar for {suffix}");

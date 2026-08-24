@@ -8221,10 +8221,13 @@ impl FrankenStorage {
     ///
     /// Older detector releases scanned OMP config roots and configured remote
     /// mirrors through the Pi Agent connector. FAD 0.2 gives OMP a dedicated
-    /// identity; this versioned upgrade uses the same structural classifier as
-    /// live ownership before connector watermarks are planned, so the first OMP scan merges
-    /// into the existing canonical rows instead of creating a second copy
-    /// under another agent id. Analytics are derived from canonical messages
+    /// identity; this versioned upgrade snapshots the same conservative
+    /// ownership policy as live discovery before connector watermarks are
+    /// planned. Durable canonical/conventional-XDG/remote-mirror evidence and
+    /// currently resolved provider-qualified roots therefore merge the first
+    /// OMP scan into the existing row instead of creating a second copy under
+    /// another agent id. Historical custom-XDG paths with no current provider
+    /// evidence remain Pi-owned. Analytics are derived from canonical messages
     /// and rebuilt after the identity swap.
     pub fn reclassify_legacy_omp_conversations(&self) -> Result<LegacyOmpReclassificationResult> {
         self.reclassify_legacy_omp_conversations_inner(false)
@@ -8375,7 +8378,7 @@ impl FrankenStorage {
             let mut tx = self.conn.transaction()?;
             tx.execute_compat(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
-                fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY, pending_state],
+                fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY, pending_state.as_str()],
             )?;
             for (conversation_id, metadata_json) in metadata_updates {
                 tx.execute_compat(
@@ -8431,7 +8434,7 @@ impl FrankenStorage {
         } else if !assets_were_pending {
             self.conn.execute_compat(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
-                fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY, complete_state],
+                fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY, complete_state.as_str()],
             )?;
             return Ok(LegacyOmpReclassificationResult::default());
         } else {
@@ -8439,7 +8442,7 @@ impl FrankenStorage {
             // ownership snapshot whose derived assets are about to rebuild.
             self.conn.execute_compat(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
-                fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY, pending_state],
+                fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY, pending_state.as_str()],
             )?;
         }
 
@@ -8485,7 +8488,7 @@ impl FrankenStorage {
         let complete_state = format!("complete:{context}");
         self.conn.execute_compat(
             "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
-            fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY, complete_state],
+            fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY, complete_state.as_str()],
         )?;
         Ok(())
     }
@@ -29471,6 +29474,40 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn legacy_omp_plain_complete_marker_is_stale() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let _pi_sessions = set_env_var("PI_SESSIONS_DIR", "");
+        let _omp_sessions = set_env_var("PI_CODING_AGENT_SESSION_DIR", "");
+        let _shared_agent = set_env_var("PI_CODING_AGENT_DIR", "");
+        let _omp_archive = set_env_var("CASS_OMP_DATA_ROOT", "");
+        let _config_dir = set_env_var("PI_CONFIG_DIR", "");
+        let _profile = set_env_var("OMP_PROFILE", "");
+        let _legacy_profile = set_env_var("PI_PROFILE", "");
+        let _xdg = set_env_var("XDG_DATA_HOME", "");
+        let storage = SqliteStorage::open(dir.path().join("test.db"))?;
+        storage.conn.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'complete')",
+            fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
+        )?;
+
+        assert_eq!(
+            storage.reclassify_legacy_omp_conversations()?,
+            LegacyOmpReclassificationResult::default()
+        );
+        let rebound: String = storage.conn.query_row_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
+            |row| row.get_typed(0),
+        )?;
+        assert!(
+            rebound.starts_with("complete:") && rebound.len() > "complete:".len(),
+            "a context-free complete marker must not survive the versioned ownership check: {rebound:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn legacy_remote_omp_reclassification_rejects_non_mirror_lookalikes() -> anyhow::Result<()> {
         let dir = TempDir::new()?;
         let db_path = dir.path().join("test.db");
@@ -29829,8 +29866,17 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn legacy_omp_v2_preserves_a_pending_v1_derived_asset_rebuild() -> anyhow::Result<()> {
         let dir = TempDir::new()?;
+        let _pi_sessions = set_env_var("PI_SESSIONS_DIR", "");
+        let _omp_sessions = set_env_var("PI_CODING_AGENT_SESSION_DIR", "");
+        let _shared_agent = set_env_var("PI_CODING_AGENT_DIR", "");
+        let _omp_archive = set_env_var("CASS_OMP_DATA_ROOT", "");
+        let _config_dir = set_env_var("PI_CONFIG_DIR", "");
+        let _profile = set_env_var("OMP_PROFILE", "");
+        let _legacy_profile = set_env_var("PI_PROFILE", "");
+        let _xdg = set_env_var("XDG_DATA_HOME", "");
         let storage = SqliteStorage::open(dir.path().join("test.db"))?;
         storage.conn.execute_compat(
             "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'analytics_pending')",
@@ -29844,6 +29890,27 @@ mod tests {
                 lexical_rebuild_required: true,
             },
             "versioning the path classifier must not forget a crash between the v1 identity swap and lexical publish"
+        );
+        let rebound_pending: String = storage.conn.query_row_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
+            |row| row.get_typed(0),
+        )?;
+        assert!(
+            rebound_pending.starts_with("analytics_pending:")
+                && rebound_pending.len() > "analytics_pending:".len(),
+            "the context-free v1 pending state must be rebound before rebuilding: {rebound_pending:?}"
+        );
+        storage.complete_legacy_omp_reclassification()?;
+        let completed: String = storage.conn.query_row_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(
+            completed,
+            rebound_pending.replacen("analytics_pending:", "complete:", 1),
+            "completion must promote the stored pending context exactly"
         );
         Ok(())
     }

@@ -6,6 +6,7 @@ use crate::indexer::redact_secrets::{
     GENERIC_SECRET_ASSIGNMENT_PATTERN, GITHUB_TOKEN_PATTERN, JWT_PATTERN, OPENAI_API_KEY_PATTERN,
     PRIVATE_KEY_BLOCK_PATTERN, SLACK_TOKEN_PATTERN, STRIPE_KEY_PATTERN,
 };
+use super::{SQLITE_SIDECAR_SUFFIXES, sqlite_sidecar_path};
 use anyhow::{Context, Result, bail};
 use console::{Term, style};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -451,10 +452,8 @@ pub fn scan_staged_export_database<P: AsRef<Path>>(
 }
 
 fn ensure_staged_export_has_no_sidecars(db_path: &Path, phase: &str) -> Result<()> {
-    for suffix in ["-journal", "-wal", "-shm"] {
-        let mut sidecar_path = db_path.as_os_str().to_os_string();
-        sidecar_path.push(suffix);
-        let sidecar_path = PathBuf::from(sidecar_path);
+    for suffix in SQLITE_SIDECAR_SUFFIXES {
+        let sidecar_path = sqlite_sidecar_path(db_path, suffix);
         match std::fs::symlink_metadata(&sidecar_path) {
             Ok(_) => {
                 bail!(
@@ -2429,44 +2428,31 @@ mod tests {
 
     #[test]
     fn staged_export_scan_rejects_unbound_sqlite_sidecars() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let db_path = temp.path().join("export.db");
-        let conn = crate::franken_sync::Connection::open(db_path.to_string_lossy().as_ref())?;
-        conn.execute_batch(
-            r#"
-            CREATE TABLE conversations (
-                id INTEGER PRIMARY KEY,
-                agent TEXT NOT NULL,
-                workspace TEXT,
-                title TEXT,
-                source_path TEXT NOT NULL,
-                metadata_json TEXT
-            );
-            CREATE TABLE messages (
-                id INTEGER PRIMARY KEY,
-                conversation_id INTEGER NOT NULL,
-                idx INTEGER NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL
-            );
-            "#,
-        )?;
-        drop(conn);
-
-        let mut wal_path = db_path.as_os_str().to_os_string();
-        wal_path.push("-wal");
-        let wal_path = PathBuf::from(wal_path);
-        std::fs::write(&wal_path, b"unbound sidecar bytes")?;
-
         let config = SecretScanConfig::from_inputs_with_env(&[], &[], false)?;
-        let error = scan_staged_export_database(&db_path, &config)
-            .expect_err("a main-file digest must not attest an unbound SQLite sidecar");
-        let diagnostic = format!("{error:#}");
-        assert!(diagnostic.contains("-wal"), "unexpected error: {diagnostic}");
-        assert!(
-            diagnostic.contains("main-file-only artifact attestation"),
-            "unexpected error: {diagnostic}"
-        );
+        for suffix in SQLITE_SIDECAR_SUFFIXES {
+            let temp = tempfile::tempdir()?;
+            let db_path = temp.path().join("export.db");
+            let sentinel_path = sqlite_sidecar_path(&db_path, suffix);
+            std::fs::write(&db_path, b"main-file sentinel")?;
+            std::fs::write(&sentinel_path, b"unbound sidecar sentinel")?;
+
+            let error = scan_staged_export_database(&db_path, &config)
+                .expect_err("a main-file digest must not attest an unbound SQLite sidecar");
+            let diagnostic = format!("{error:#}");
+            assert!(
+                diagnostic.contains(suffix),
+                "diagnostic omitted rejected suffix {suffix}: {diagnostic}"
+            );
+            assert!(
+                diagnostic.contains("main-file-only artifact attestation"),
+                "unexpected error for {suffix}: {diagnostic}"
+            );
+            assert_eq!(
+                std::fs::read(&sentinel_path)?,
+                b"unbound sidecar sentinel",
+                "attestation rejection mutated sentinel {suffix}"
+            );
+        }
         Ok(())
     }
 

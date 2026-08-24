@@ -18933,12 +18933,7 @@ fn publish_staged_lexical_index(staged_index_path: &Path, index_path: &Path) -> 
             // explicitly via `err.chain()` and `Error::downcast_ref` on
             // each link — robust regardless of how anyhow's top-level
             // `downcast_ref` resolves chained types across versions.
-            let einval = err.chain().any(|cause| {
-                cause
-                    .downcast_ref::<std::io::Error>()
-                    .and_then(std::io::Error::raw_os_error)
-                    == Some(linux_publish_swap::EINVAL)
-            });
+            let einval = linux_atomic_exchange_is_unsupported(&err);
             if einval {
                 tracing::info!(
                     index_path = %index_path.display(),
@@ -19369,7 +19364,7 @@ fn path_to_cstring(path: &Path) -> Result<CString> {
 }
 
 #[cfg(target_os = "linux")]
-fn atomic_exchange_paths(left: &Path, right: &Path) -> Result<()> {
+pub(crate) fn atomic_exchange_paths(left: &Path, right: &Path) -> Result<()> {
     let left_c = path_to_cstring(left)?;
     let right_c = path_to_cstring(right)?;
     let result = unsafe {
@@ -19391,6 +19386,16 @@ fn atomic_exchange_paths(left: &Path, right: &Path) -> Result<()> {
             left.display(),
             right.display()
         )
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_atomic_exchange_is_unsupported(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+            == Some(linux_publish_swap::EINVAL)
     })
 }
 

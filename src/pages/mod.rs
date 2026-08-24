@@ -34,6 +34,31 @@ pub mod summary;
 pub mod verify;
 pub mod wizard;
 
+/// Exact SQLite/FrankenSQLite artifact siblings that cannot accompany a
+/// main-file-only Pages export. Keep publication, staged cleanup, and exact
+/// secret-scan attestation on this one private source of truth.
+const SQLITE_SIDECAR_SUFFIXES: &[&str] = &[
+    "-journal",
+    "-wal",
+    "-shm",
+    "-lock-shared",
+    "-lock-reserved",
+    "-lock-pending",
+    "-fsqlite-ns-gate",
+    "-fsqlite-ns-use",
+    "-wal-cert",
+    "-wal-cert-head",
+];
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut file_name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("pages_export.db"))
+        .to_os_string();
+    file_name.push(suffix);
+    path.with_file_name(file_name)
+}
+
 fn ensure_real_directory(path: &Path, metadata: &Metadata, label: &str) -> Result<()> {
     let file_type = metadata.file_type();
     if file_type.is_symlink() {
