@@ -7,7 +7,7 @@
 
 import { createStrengthMeter } from './password-strength.js';
 import { COI_STATE, getCOIState, initCOIDetection, onServiceWorkerActivated } from './coi-detector.js';
-import { StorageMode, getArchiveScopeId, getStorageMode, getStoredMode, isOpfsEnabled } from './storage.js';
+import { StorageMode, getArchiveScopeId, getStorageMode, getStoredMode } from './storage.js';
 import { SESSION_CONFIG } from './session.js';
 import { registerServiceWorker } from './sw-register.js';
 
@@ -925,6 +925,7 @@ function handleUnlockFailed(data) {
  */
 async function handleDecryptSuccess(data) {
     const initToken = activeAppInitToken;
+    let dbBytes = null;
     updateProgress('Database decrypted', 100);
 
     if (!data?.dbBytes) {
@@ -937,8 +938,6 @@ async function handleDecryptSuccess(data) {
     }
 
     try {
-        const dbModule = await import('./database.js');
-        let dbBytes;
         if (data.dbBytes instanceof ArrayBuffer) {
             dbBytes = new Uint8Array(data.dbBytes);
         } else if (ArrayBuffer.isView(data.dbBytes)) {
@@ -950,6 +949,7 @@ async function handleDecryptSuccess(data) {
         } else {
             throw new Error('Invalid database payload');
         }
+        const dbModule = await import('./database.js');
         await dbModule.initDatabase(dbBytes);
         if (!isCurrentAppInitToken(initToken)) {
             await closeLiveDatabase();
@@ -978,6 +978,10 @@ async function handleDecryptSuccess(data) {
             return;
         }
         await recoverFromAppInitFailure('Failed to initialize database', error, initToken);
+    } finally {
+        // database.js consumes and wipes accepted views; retain an auth-side
+        // defense for failures before that module takes ownership.
+        dbBytes?.fill(0);
     }
 }
 
@@ -1073,7 +1077,6 @@ function transitionToApp() {
             type: 'DECRYPT_DATABASE',
             dek: window.cassSession.dek,
             config: config,
-            opfsEnabled: isOpfsEnabled(),
             requestId: activeDecryptRequestId,
         });
     } catch (error) {
@@ -1140,7 +1143,8 @@ async function loadUnencryptedDatabase(initToken = activeAppInitToken) {
         dbModule = await import('./database.js');
         await dbModule.initDatabase(dbBytes);
     } finally {
-        // database.js takes its own stable copy before its first await.
+        // database.js consumes and wipes this view. Wipe again if import failed
+        // before it could take ownership.
         dbBytes.fill(0);
     }
     if (!isCurrentAppInitToken(initToken)) {
@@ -1203,27 +1207,32 @@ async function readResponseBytesExact(response, expectedSize, label) {
     }
 
     const reader = response.body.getReader();
-    const chunks = [];
+    let bytes = null;
     let totalLength = 0;
     try {
+        bytes = new Uint8Array(expectedSize);
         while (true) {
             const { done, value } = await reader.read();
             if (done) break;
             if (!(value instanceof Uint8Array)) {
                 throw new Error(`${label} returned an invalid response chunk`);
             }
-            totalLength += value.byteLength;
-            if (
-                !Number.isSafeInteger(totalLength)
-                || totalLength > expectedSize
-                || totalLength > MAX_BROWSER_DATABASE_SIZE
-            ) {
+            try {
+                const nextLength = totalLength + value.byteLength;
+                if (
+                    !Number.isSafeInteger(nextLength)
+                    || nextLength > expectedSize
+                    || nextLength > MAX_BROWSER_DATABASE_SIZE
+                ) {
+                    throw new Error(
+                        `${label} exceeds its declared ${expectedSize}-byte size`
+                    );
+                }
+                bytes.set(value, totalLength);
+                totalLength = nextLength;
+            } finally {
                 value.fill(0);
-                throw new Error(
-                    `${label} exceeds its declared ${expectedSize}-byte size`
-                );
             }
-            chunks.push(value);
         }
 
         if (totalLength !== expectedSize) {
@@ -1232,24 +1241,15 @@ async function readResponseBytesExact(response, expectedSize, label) {
             );
         }
 
-        const bytes = new Uint8Array(totalLength);
-        let offset = 0;
-        for (const chunk of chunks) {
-            bytes.set(chunk, offset);
-            offset += chunk.byteLength;
-        }
         return bytes;
     } catch (error) {
+        bytes?.fill(0);
         try {
             await reader.cancel(error?.message || String(error));
         } catch {
             // The response stream may already be closed or errored.
         }
         throw error;
-    } finally {
-        for (const chunk of chunks) {
-            chunk.fill(0);
-        }
     }
 }
 

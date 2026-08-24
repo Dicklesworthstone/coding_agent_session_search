@@ -1668,6 +1668,20 @@ mod tests {
                     .contains("console.error('[COI] Activation callback failed:', error);"),
             "service worker activation fanout should catch rejected async callbacks instead of leaking unhandled promise rejections"
         );
+        assert!(
+            coi_detector_js
+                .contains("const ARCHIVE_SCOPE_URL = new URL('./', import.meta.url).href;")
+                && coi_detector_js
+                    .contains("const registrations = await navigator.serviceWorker.getRegistrations();")
+                && coi_detector_js.contains(
+                    "registrations.find((registration) => registration.scope === expectedScope)"
+                )
+                && coi_detector_js.contains(
+                    "Boolean(registration?.active || registration?.installing || registration?.waiting)"
+                )
+                && !coi_detector_js.contains("navigator.serviceWorker.getRegistration()"),
+            "COI detection must not mistake a broader or workerless registration for this archive's active installation"
+        );
     }
 
     #[test]
@@ -1715,6 +1729,9 @@ mod tests {
                 && sw_js.contains("!request.headers.has('range')")
                 && sw_js.contains("request.cache !== 'no-store'")
                 && sw_js.contains("responseAllowsCaching(response)")
+                && sw_js.contains("response.status === 200")
+                && sw_js.contains("directive === 'no-cache'")
+                && sw_js.contains("directive === 'private'")
                 && !sw_js.contains("caches.match("),
             "runtime caching must stay inside the archive scope and must not fall through to stale or unrelated origin caches"
         );
@@ -1750,7 +1767,15 @@ mod tests {
             "service worker unregister should treat unsupported or already-unregistered states as successful no-ops"
         );
         assert!(
-            sw_register_js.contains("const registrations = await navigator.serviceWorker.getRegistrations();")
+            sw_register_js
+                .contains("const ARCHIVE_SCOPE_URL = new URL('./', import.meta.url).href;")
+                && sw_register_js
+                    .contains("const SERVICE_WORKER_URL = new URL('./sw.js', import.meta.url).href;")
+                && sw_register_js.contains(
+                    "navigator.serviceWorker.register(SERVICE_WORKER_URL, {\n            scope: ARCHIVE_SCOPE_URL,"
+                )
+                && sw_register_js
+                    .contains("const registrations = await navigator.serviceWorker.getRegistrations();")
                 && sw_register_js.contains("registrations.find(hasExactScope) || null")
                 && sw_register_js.contains("const activeWorker = currentRegistration?.active;")
                 && sw_register_js.contains("activeWorker.postMessage(message, [channel.port2]);")
@@ -2417,13 +2442,15 @@ mod tests {
     fn test_crypto_worker_inflates_each_encrypted_payload_chunk_independently() {
         let crypto_worker_js = include_str!("../src/pages_assets/crypto_worker.js");
         assert!(
-            crypto_worker_js.contains("const plaintextChunks = [];")
+            crypto_worker_js.contains("dbBytes = new Uint8Array(payload.total_plaintext_size);")
                 && crypto_worker_js.contains("const plaintext = await decompressDeflate(")
                 && crypto_worker_js.contains("payload.chunk_size")
-                && crypto_worker_js.contains("dbBytes = concatenateChunks(plaintextChunks);")
+                && crypto_worker_js.contains("dbBytes.set(plaintext, totalDecrypted);")
+                && crypto_worker_js.contains("plaintext.fill(0);")
+                && !crypto_worker_js.contains("const plaintextChunks = [];")
                 && !crypto_worker_js
                     .contains("const compressed = concatenateChunks(decryptedChunks);"),
-            "crypto worker must inflate each independently-compressed payload chunk before concatenating plaintext"
+            "crypto worker must inflate each independent chunk directly into one bounded database buffer"
         );
     }
 
@@ -2850,6 +2877,9 @@ mod tests {
                 && database_js.contains("const MAX_BROWSER_DATABASE_SIZE = 512 * 1024 * 1024;")
                 && database_js.contains("const MAX_WASM32_ALLOCATION_SIZE = 0xFFFFFFFF;")
                 && database_js.contains("checkedDatabaseAllocationSize(dbBytes.byteLength)")
+                && database_js.contains("Ownership of a valid Uint8Array transfers to this function")
+                && database_js.contains("dbBytes.fill(0);")
+                && !database_js.contains("new Uint8Array(dbBytes)")
                 && database_js.contains("wasmHeap.fill(")
                 && database_js.contains("wasmOffset + allocationSize")
                 && database_js.contains("if (wasmPtr && !sqliteOwnsBytes)")
@@ -2859,6 +2889,8 @@ mod tests {
                 && database_js.contains("stmt.get(0)")
                 && database_js.contains("sqlite3.wasm.heap8u()")
                 && !database_js.contains("new sqlite3.oo1.OpfsDb")
+                && !database_js.contains("writeBytesToOPFS")
+                && database_js.contains("decrypted database bytes remain memory-only")
                 && !database_js.contains("stmt.free()")
                 && !database_js.contains("getAsObject()")
         );
@@ -2876,6 +2908,9 @@ mod tests {
                 && !worker_js.contains("let config = null;")
                 && worker_js.contains("Recovery secret must contain at least 24 bytes")
                 && worker_js.contains("MAX_BROWSER_ARCHIVE_CHUNKS = 4096")
+                && worker_js.contains("cannot be read safely without streaming response support")
+                && worker_js.contains("return concatenateAndZeroChunks(chunks);")
+                && !worker_js.contains("await response.arrayBuffer()")
                 && worker_js.matches("await writer.abort(error);").count() == 1
         );
 
@@ -2905,9 +2940,13 @@ mod tests {
         assert!(
             auth_js.contains("const expectedSize = getUnencryptedPayloadSize();")
                 && auth_js.contains("response.body.getReader()")
-                && auth_js.contains("totalLength > expectedSize")
+                && auth_js.contains("bytes = new Uint8Array(expectedSize);")
+                && auth_js.contains("nextLength > expectedSize")
                 && auth_js.contains("if (totalLength !== expectedSize)")
                 && auth_js.contains("dbBytes.fill(0);")
+                && auth_js.contains("dbBytes?.fill(0);")
+                && !auth_js.contains("isOpfsEnabled")
+                && !auth_js.contains("opfsEnabled")
                 && !auth_js.contains("new Uint8Array(await response.arrayBuffer())"),
             "unencrypted database loading must stream within its declared size and zero temporary plaintext bytes"
         );

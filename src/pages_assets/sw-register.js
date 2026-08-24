@@ -10,9 +10,11 @@ let updateAvailable = false;
 const DEFAULT_SW_MESSAGE_TIMEOUT_MS = 3000;
 const watchedRegistrations = new WeakSet();
 let controllerChangeListenerInstalled = false;
+const ARCHIVE_SCOPE_URL = new URL('./', import.meta.url).href;
+const SERVICE_WORKER_URL = new URL('./sw.js', import.meta.url).href;
 
 function getCurrentScopeUrl() {
-    return new URL('./', window.location.href).href;
+    return ARCHIVE_SCOPE_URL;
 }
 
 function hasExactScope(candidate) {
@@ -98,8 +100,8 @@ export async function registerServiceWorker() {
     }
 
     try {
-        registration = await navigator.serviceWorker.register('./sw.js', {
-            scope: './',
+        registration = await navigator.serviceWorker.register(SERVICE_WORKER_URL, {
+            scope: ARCHIVE_SCOPE_URL,
         });
 
         console.log('[SW] Registered, scope:', registration.scope);

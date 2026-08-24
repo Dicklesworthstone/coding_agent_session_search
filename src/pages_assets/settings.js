@@ -1,7 +1,7 @@
 /**
  * cass Archive Viewer - Settings Panel Module
  *
- * Provides the settings UI for storage mode selection, OPFS opt-in,
+ * Provides the settings UI for storage mode selection, legacy OPFS cleanup,
  * cache management, and session controls.
  *
  * Security model:
@@ -16,8 +16,6 @@ import {
     getStorageMode,
     setStorageMode,
     isOPFSAvailable,
-    isOpfsEnabled,
-    setOpfsEnabled,
     clearCurrentStorage,
     clearOPFS,
     clearAllStorage,
@@ -31,14 +29,6 @@ import {
 let settingsContainer = null;
 let onSessionReset = null;
 let settingsRenderEpoch = 0;
-
-function getEffectiveStorageMode() {
-    const mode = getStorageMode();
-    if (mode === StorageMode.OPFS) {
-        return StorageMode.MEMORY;
-    }
-    return mode;
-}
 
 /**
  * Initialize settings module
@@ -64,9 +54,8 @@ export async function render() {
     const epoch = settingsRenderEpoch;
     const targetContainer = settingsContainer;
 
-    const currentMode = getEffectiveStorageMode();
+    const currentMode = getStorageMode();
     const opfsAvailable = isOPFSAvailable();
-    const opfsEnabled = opfsAvailable && isOpfsEnabled();
     const stats = await getStorageStats();
 
     if (
@@ -131,34 +120,27 @@ export async function render() {
                     </div>
                 </section>
 
-                <!-- OPFS Section -->
+                <!-- Legacy OPFS cleanup -->
                 <section class="settings-section">
-                    <h3>Database Caching (OPFS)</h3>
+                    <h3>Local Database Residue (OPFS)</h3>
                     ${opfsAvailable ? `
                         <p class="settings-description">
-                            Cache the decrypted database locally for faster browsing after unlock.
-                            This cache stays in this browser profile until you clear it.
+                            The active decrypted database is kept in memory only and is never
+                            restored from OPFS. Earlier viewer versions may have left decrypted
+                            database files in this browser profile; use the cleanup action below
+                            to remove any residue for this archive.
                         </p>
 
-                        <div class="setting-item">
-                            <label class="toggle-switch">
-                                <input type="checkbox" id="opfs-toggle"
-                                    ${opfsEnabled ? 'checked' : ''}>
-                                <span class="toggle-slider"></span>
-                                <span class="toggle-label">Remember on this device</span>
-                            </label>
-                        </div>
-
-                        ${opfsEnabled ? `
+                        ${(stats.opfs.dbBytes || 0) > 0 ? `
                             <div class="settings-warning">
                                 <span class="warning-icon">⚠️</span>
-                                <span>Database is cached locally. Clear cache when done on shared devices.</span>
+                                <span>Legacy decrypted database files were detected in OPFS.</span>
                             </div>
                         ` : ''}
                     ` : `
                         <p class="settings-description">
-                            Your browser does not support OPFS (Origin Private File System).
-                            The database will be decrypted fresh on each visit.
+                            This browser does not expose OPFS (Origin Private File System).
+                            The active decrypted database remains in memory only.
                         </p>
                     `}
                 </section>
@@ -206,7 +188,7 @@ export async function render() {
                             Clear Current Storage
                         </button>
                         <button type="button" class="btn btn-secondary" id="clear-opfs-btn" ${!opfsAvailable ? 'disabled' : ''}>
-                            Clear OPFS Cache
+                            Clear OPFS Data
                         </button>
                         <button type="button" class="btn btn-secondary" id="clear-sw-cache-btn">
                             Clear Service Worker Cache
@@ -292,12 +274,6 @@ function setupEventHandlers(root) {
         radio.addEventListener('change', handleStorageModeChange);
     });
 
-    // OPFS toggle
-    const opfsToggle = root.querySelector('#opfs-toggle');
-    if (opfsToggle) {
-        opfsToggle.addEventListener('change', handleOPFSToggle);
-    }
-
     // Clear current storage
     const clearCurrentBtn = root.querySelector('#clear-current-cache-btn');
     if (clearCurrentBtn) {
@@ -365,7 +341,7 @@ function setupEventHandlers(root) {
  */
 async function handleStorageModeChange(e) {
     const newMode = e.target.value;
-    const currentMode = getEffectiveStorageMode();
+    const currentMode = getStorageMode();
 
     if (newMode === currentMode) return;
 
@@ -395,64 +371,10 @@ async function handleStorageModeChange(e) {
 }
 
 /**
- * Handle OPFS toggle
- */
-async function handleOPFSToggle(e) {
-    const enabled = e.target.checked;
-
-    if (enabled) {
-        const confirmed = confirm(
-            'Enable database caching?\n\n' +
-            'The decrypted database will be stored locally for faster loading.\n' +
-            'Remember to clear the cache when done on shared devices.'
-        );
-
-        if (!confirmed) {
-            await rerenderSettingsUI('OPFS enable cancellation');
-            return;
-        }
-
-        try {
-            setOpfsEnabled(true);
-            showNotification('OPFS caching enabled', 'success');
-        } catch (err) {
-            console.error('[Settings] Failed to enable OPFS:', err);
-            showNotification('Failed to enable OPFS caching', 'error');
-            await rerenderSettingsUI('OPFS enable failure');
-            return;
-        }
-    } else {
-        // Switching away from OPFS - clear it first
-        try {
-            const opfsCleared = await clearOPFS();
-            if (!opfsCleared) {
-                showNotification('Failed to disable OPFS caching because cached files could not be fully cleared', 'error');
-                await render();
-                return;
-            }
-            setOpfsEnabled(false);
-            showNotification('OPFS caching disabled and cleared', 'success');
-        } catch (err) {
-            console.error('[Settings] Failed to disable OPFS:', err);
-            showNotification('Failed to disable OPFS caching', 'error');
-            await rerenderSettingsUI('OPFS disable failure');
-            return;
-        }
-    }
-
-    try {
-        await render();
-    } catch (err) {
-        console.error('[Settings] Failed to refresh settings after OPFS toggle:', err);
-        showNotification('Failed to refresh settings', 'error');
-    }
-}
-
-/**
  * Handle clear current storage
  */
 async function handleClearCurrentStorage() {
-    const mode = getEffectiveStorageMode();
+    const mode = getStorageMode();
     const confirmed = confirm(`Clear all data in ${mode} storage?`);
 
     if (!confirmed) return;
@@ -487,8 +409,8 @@ async function handleClearCurrentStorage() {
  */
 async function handleClearOPFS() {
     const confirmed = confirm(
-        'Clear this archive\'s OPFS cache?\n\n' +
-        'This archive\'s cached database will be deleted. You\'ll need to decrypt again on next visit.'
+        'Clear this archive\'s OPFS data?\n\n' +
+        'Decrypted database files left by earlier viewer versions and any other archive-scoped OPFS data will be deleted.'
     );
 
     if (!confirmed) return;
@@ -496,11 +418,11 @@ async function handleClearOPFS() {
     try {
         const opfsCleared = await clearOPFS();
         if (!opfsCleared) {
-            showNotification('Failed to clear OPFS cache', 'error');
+            showNotification('Failed to fully clear OPFS data', 'error');
             return;
         }
 
-        showNotification('OPFS cache cleared', 'success');
+        showNotification('OPFS data cleared', 'success');
         await render();
     } catch (err) {
         console.error('[Settings] Failed to clear OPFS:', err);
@@ -549,7 +471,6 @@ async function handleClearAll() {
     try {
         const storageCleared = await clearAllStorage();
         await setStorageMode(StorageMode.MEMORY);
-        setOpfsEnabled(false);
         window.dispatchEvent(new CustomEvent('cass:session-mode-change', { detail: { mode: StorageMode.MEMORY } }));
         if (onSessionReset) {
             onSessionReset('clear-all');
@@ -612,7 +533,6 @@ async function handleResetSession() {
     try {
         const storageCleared = await clearAllStorage();
         await setStorageMode(StorageMode.MEMORY);
-        setOpfsEnabled(false);
         window.dispatchEvent(new CustomEvent('cass:session-mode-change', { detail: { mode: StorageMode.MEMORY } }));
         if (onSessionReset) {
             onSessionReset('reset');

@@ -24,6 +24,7 @@ let activeReloadController = null;
 const serviceWorkerActivationCallbacks = new Set();
 let serviceWorkerActivationListenersInstalled = false;
 let serviceWorkerActivationDispatchScheduled = false;
+const ARCHIVE_SCOPE_URL = new URL('./', import.meta.url).href;
 
 function hashScopeId(input) {
     let hash = 0x811c9dc5;
@@ -35,18 +36,11 @@ function hashScopeId(input) {
 }
 
 function getSetupCompleteKey() {
-    try {
-        return `cass-coi-setup-complete-${hashScopeId(new URL('./', window.location.href).href)}`;
-    } catch {
-        const href = typeof window?.location?.href === 'string'
-            ? window.location.href
-            : 'unknown';
-        return `cass-coi-setup-complete-${hashScopeId(href.split('#')[0].split('?')[0])}`;
-    }
+    return `cass-coi-setup-complete-${hashScopeId(getArchiveScopeUrl())}`;
 }
 
 function getArchiveScopeUrl() {
-    return new URL('./', window.location.href).href;
+    return ARCHIVE_SCOPE_URL;
 }
 
 /**

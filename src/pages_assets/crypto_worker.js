@@ -372,7 +372,6 @@ async function handleDecryptDatabase(dekBase64, cfg, requestId) {
     invalidateUnlockAttempts();
     validateSupportedPayloadFormat(cfg);
     const requestDek = base64ToArray(dekBase64);
-    const plaintextChunks = [];
     let dbBytes = null;
     try {
         if (requestDek.byteLength !== 32) {
@@ -382,6 +381,7 @@ async function handleDecryptDatabase(dekBase64, cfg, requestId) {
         const totalChunks = payload.chunk_count;
         const baseNonce = base64ToArray(cfg.base_nonce);
         const exportId = base64ToArray(cfg.export_id);
+        dbBytes = new Uint8Array(payload.total_plaintext_size);
 
         self.postMessage({ type: 'PROGRESS', phase: 'Decrypting...', percent: 0, requestId });
 
@@ -395,107 +395,108 @@ async function handleDecryptDatabase(dekBase64, cfg, requestId) {
             ['decrypt']
         );
 
-    // Decrypt and decompress each chunk. Rust writes one independent deflate
-    // stream per encrypted chunk, so concatenating compressed streams before
-    // inflate would drop data in browsers/engines that stop at the first stream.
-    let totalDecrypted = 0;
-    let totalCiphertext = 0;
+        // Decrypt and decompress each chunk. Rust writes one independent deflate
+        // stream per encrypted chunk, so concatenating compressed streams before
+        // inflate would drop data in browsers/engines that stop at the first stream.
+        let totalDecrypted = 0;
+        let totalCiphertext = 0;
 
-    for (let i = 0; i < totalChunks; i++) {
-        const chunkName = `chunk-${String(i).padStart(5, '0')}.bin`;
-        const expectedChunkPath = `payload/${chunkName}`;
-        if (payload.files[i] !== expectedChunkPath) {
-            throw new Error(`Invalid payload file entry ${i}: expected ${expectedChunkPath}`);
-        }
-        const chunkUrl = `./payload/${chunkName}`;
-
-        try {
-            const response = await fetch(chunkUrl);
-            if (!response.ok) {
-                throw new Error(`Failed to fetch chunk ${i}: ${response.status}`);
+        for (let i = 0; i < totalChunks; i++) {
+            const chunkName = `chunk-${String(i).padStart(5, '0')}.bin`;
+            const expectedChunkPath = `payload/${chunkName}`;
+            if (payload.files[i] !== expectedChunkPath) {
+                throw new Error(`Invalid payload file entry ${i}: expected ${expectedChunkPath}`);
             }
-            const encryptedChunk = await readResponseBytesBounded(
-                response,
-                maxCiphertextChunkSize(payload.chunk_size),
-                `encrypted chunk ${i}`
-            );
-            totalCiphertext += encryptedChunk.byteLength;
-            if (
-                !Number.isSafeInteger(totalCiphertext)
-                || totalCiphertext > payload.total_compressed_size
-            ) {
-                throw new Error('Encrypted payload exceeds its declared total size');
-            }
+            const chunkUrl = `./payload/${chunkName}`;
 
-            // Derive chunk nonce: first 8 bytes from base_nonce, last 4 bytes are counter
-            const chunkNonce = deriveChunkNonce(baseNonce, i);
-
-            // Build chunk AAD: export_id || chunk_index (big-endian u32)
-            const aad = buildChunkAad(exportId, i);
-
-            const decrypted = await crypto.subtle.decrypt(
-                {
-                    name: 'AES-GCM',
-                    iv: chunkNonce,
-                    additionalData: aad,
-                },
-                dekKey,
-                encryptedChunk
-            );
-            const compressedChunk = new Uint8Array(decrypted);
             try {
-                const plaintext = await decompressDeflate(
-                    compressedChunk,
-                    payload.chunk_size
+                const response = await fetch(chunkUrl);
+                if (!response.ok) {
+                    throw new Error(`Failed to fetch chunk ${i}: ${response.status}`);
+                }
+                const encryptedChunk = await readResponseBytesBounded(
+                    response,
+                    maxCiphertextChunkSize(payload.chunk_size),
+                    `encrypted chunk ${i}`
                 );
-                plaintextChunks.push(plaintext);
-                totalDecrypted += plaintext.byteLength;
-            } finally {
-                compressedChunk.fill(0);
-            }
-            if (
-                !Number.isSafeInteger(totalDecrypted)
-                || totalDecrypted > payload.total_plaintext_size
-            ) {
-                throw new Error('Decrypted payload exceeds its declared total size');
-            }
+                totalCiphertext += encryptedChunk.byteLength;
+                if (
+                    !Number.isSafeInteger(totalCiphertext)
+                    || totalCiphertext > payload.total_compressed_size
+                ) {
+                    throw new Error('Encrypted payload exceeds its declared total size');
+                }
 
-            // Report progress
-            const percent = Math.round(((i + 1) / totalChunks) * 90);
-            self.postMessage({
-                type: 'PROGRESS',
-                phase: `Decrypting chunk ${i + 1}/${totalChunks}...`,
-                percent,
-                requestId,
-            });
-        } catch (error) {
+                // Derive chunk nonce: first 8 bytes from base_nonce, last 4 bytes are counter
+                const chunkNonce = deriveChunkNonce(baseNonce, i);
+
+                // Build chunk AAD: export_id || chunk_index (big-endian u32)
+                const aad = buildChunkAad(exportId, i);
+
+                const decrypted = await crypto.subtle.decrypt(
+                    {
+                        name: 'AES-GCM',
+                        iv: chunkNonce,
+                        additionalData: aad,
+                    },
+                    dekKey,
+                    encryptedChunk
+                );
+                const compressedChunk = new Uint8Array(decrypted);
+                try {
+                    const plaintext = await decompressDeflate(
+                        compressedChunk,
+                        payload.chunk_size
+                    );
+                    try {
+                        const nextTotal = totalDecrypted + plaintext.byteLength;
+                        if (
+                            !Number.isSafeInteger(nextTotal)
+                            || nextTotal > payload.total_plaintext_size
+                        ) {
+                            throw new Error('Decrypted payload exceeds its declared total size');
+                        }
+                        dbBytes.set(plaintext, totalDecrypted);
+                        totalDecrypted = nextTotal;
+                    } finally {
+                        plaintext.fill(0);
+                    }
+                } finally {
+                    compressedChunk.fill(0);
+                }
+
+                // Report progress
+                const percent = Math.round(((i + 1) / totalChunks) * 90);
+                self.postMessage({
+                    type: 'PROGRESS',
+                    phase: `Decrypting chunk ${i + 1}/${totalChunks}...`,
+                    percent,
+                    requestId,
+                });
+            } catch (error) {
+                throw new Error(
+                    `Failed to decrypt chunk ${i}: ${error?.message || String(error)}`
+                );
+            }
+        }
+
+        if (totalCiphertext !== payload.total_compressed_size) {
             throw new Error(
-                `Failed to decrypt chunk ${i}: ${error?.message || String(error)}`
+                `Encrypted payload size mismatch: got ${totalCiphertext}, expected ${payload.total_compressed_size}`
             );
         }
-    }
+        if (totalDecrypted !== payload.total_plaintext_size) {
+            throw new Error(
+                `Decrypted payload size mismatch: got ${totalDecrypted}, expected ${payload.total_plaintext_size}`
+            );
+        }
 
-    if (totalCiphertext !== payload.total_compressed_size) {
-        throw new Error(
-            `Encrypted payload size mismatch: got ${totalCiphertext}, expected ${payload.total_compressed_size}`
-        );
-    }
-    if (totalDecrypted !== payload.total_plaintext_size) {
-        throw new Error(
-            `Decrypted payload size mismatch: got ${totalDecrypted}, expected ${payload.total_plaintext_size}`
-        );
-    }
+        self.postMessage({ type: 'PROGRESS', phase: 'Loading database...', percent: 95, requestId });
 
-    self.postMessage({ type: 'PROGRESS', phase: 'Loading database...', percent: 95, requestId });
-
-    dbBytes = concatenateChunks(plaintextChunks);
-    for (const plaintext of plaintextChunks) {
-        plaintext.fill(0);
-    }
-    const dbSize = dbBytes.byteLength;
-    // concatenateChunks() creates an exact full-buffer view, so transfer that
-    // buffer directly instead of retaining a second plaintext database copy.
-    const transfer = dbBytes.buffer;
+        const dbSize = dbBytes.byteLength;
+        // dbBytes is the exact preallocated database buffer. Transfer it
+        // directly instead of retaining a second plaintext database copy.
+        const transfer = dbBytes.buffer;
 
         self.postMessage(
             {
@@ -508,9 +509,6 @@ async function handleDecryptDatabase(dekBase64, cfg, requestId) {
         );
     } finally {
         requestDek.fill(0);
-        for (const plaintext of plaintextChunks) {
-            plaintext.fill(0);
-        }
         if (dbBytes?.byteLength) {
             dbBytes.fill(0);
         }
@@ -760,6 +758,17 @@ function concatenateChunks(chunks) {
     return result;
 }
 
+function concatenateAndZeroChunks(chunks) {
+    try {
+        return concatenateChunks(chunks);
+    } finally {
+        for (const chunk of chunks) {
+            chunk.fill(0);
+        }
+        chunks.length = 0;
+    }
+}
+
 /**
  * Decompress deflate data
  */
@@ -790,6 +799,7 @@ async function decompressDeflate(compressed, maximumOutputBytes) {
                 if (done) break;
                 totalLength += value.byteLength;
                 if (totalLength > maximumOutputBytes) {
+                    value.fill(0);
                     await reader.cancel('archive chunk exceeds declared plaintext bound');
                     throw new Error(
                         `Decompressed chunk exceeds ${maximumOutputBytes}-byte archive limit`
@@ -809,9 +819,13 @@ async function decompressDeflate(compressed, maximumOutputBytes) {
             } catch {
                 // Preserve the original bounded-decompression error.
             }
+            for (const chunk of chunks) {
+                chunk.fill(0);
+            }
+            chunks.length = 0;
             throw error;
         }
-        return concatenateChunks(chunks);
+        return concatenateAndZeroChunks(chunks);
     }
 
     if (!self.fflate?.Inflate) {
@@ -830,6 +844,7 @@ async function decompressDeflate(compressed, maximumOutputBytes) {
     const inflater = new self.fflate.Inflate((chunk, final) => {
         totalLength += chunk.byteLength;
         if (totalLength > maximumOutputBytes) {
+            chunk.fill(0);
             throw limitError;
         }
         chunks.push(chunk);
@@ -849,18 +864,28 @@ async function decompressDeflate(compressed, maximumOutputBytes) {
             }
         }
     } catch (error) {
+        for (const chunk of chunks) {
+            chunk.fill(0);
+        }
+        chunks.length = 0;
         if (error === limitError) {
             throw limitError;
         }
         throw new Error(`Compressed chunk is invalid: ${error?.message || String(error)}`);
     }
     if (!finalChunkSeen) {
+        for (const chunk of chunks) {
+            chunk.fill(0);
+        }
         throw new Error('Compressed chunk ended before the final DEFLATE block');
     }
-    return concatenateChunks(chunks);
+    return concatenateAndZeroChunks(chunks);
 }
 
 async function readResponseBytesBounded(response, maximumBytes, label) {
+    if (!Number.isSafeInteger(maximumBytes) || maximumBytes <= 0) {
+        throw new Error(`${label} has an invalid download limit`);
+    }
     const contentLengthHeader = response.headers?.get?.('content-length');
     if (contentLengthHeader && /^\d+$/.test(contentLengthHeader)) {
         const contentLength = Number(contentLengthHeader);
@@ -870,27 +895,36 @@ async function readResponseBytesBounded(response, maximumBytes, label) {
     }
 
     if (!response.body?.getReader) {
-        const bytes = new Uint8Array(await response.arrayBuffer());
-        if (bytes.byteLength > maximumBytes) {
-            throw new Error(`${label} exceeds the ${maximumBytes}-byte download limit`);
-        }
-        return bytes;
+        throw new Error(`${label} cannot be read safely without streaming response support`);
     }
 
     const reader = response.body.getReader();
     const chunks = [];
     let totalLength = 0;
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        totalLength += value.byteLength;
-        if (totalLength > maximumBytes) {
-            await reader.cancel(`${label} exceeds its download limit`);
-            throw new Error(`${label} exceeds the ${maximumBytes}-byte download limit`);
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            totalLength += value.byteLength;
+            if (totalLength > maximumBytes) {
+                value.fill(0);
+                throw new Error(`${label} exceeds the ${maximumBytes}-byte download limit`);
+            }
+            chunks.push(value);
         }
-        chunks.push(value);
+        return concatenateAndZeroChunks(chunks);
+    } catch (error) {
+        for (const chunk of chunks) {
+            chunk.fill(0);
+        }
+        chunks.length = 0;
+        try {
+            await reader.cancel(error?.message || String(error));
+        } catch {
+            // The response stream may already be closed or errored.
+        }
+        throw error;
     }
-    return concatenateChunks(chunks);
 }
 
 /**

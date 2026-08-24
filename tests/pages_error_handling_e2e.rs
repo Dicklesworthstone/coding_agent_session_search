@@ -1016,6 +1016,271 @@ fn browser_storage_clear_reports_partial_failures_and_continues_cleanup() {
     );
 }
 
+#[test]
+fn browser_opfs_cleanup_is_scope_bound_and_truthful() {
+    let script = r#"
+        class StorageMock {
+            constructor() {
+                this.data = new Map();
+            }
+
+            get length() {
+                return this.data.size;
+            }
+
+            key(index) {
+                return Array.from(this.data.keys())[index] ?? null;
+            }
+
+            getItem(key) {
+                return this.data.has(key) ? this.data.get(key) : null;
+            }
+
+            setItem(key, value) {
+                this.data.set(key, String(value));
+            }
+
+            removeItem(key) {
+                this.data.delete(key);
+            }
+        }
+
+        class OpfsRootMock {
+            constructor(entries) {
+                this.entries = new Set(entries);
+                this.failedEntries = new Set();
+                this.removeAttempts = [];
+            }
+
+            async *keys() {
+                for (const entry of [...this.entries]) {
+                    yield entry;
+                }
+            }
+
+            async removeEntry(entry) {
+                this.removeAttempts.push(entry);
+                if (this.failedEntries.has(entry)) {
+                    throw new Error(`injected OPFS remove failure for ${entry}`);
+                }
+                this.entries.delete(entry);
+            }
+        }
+
+        const originalWindow = globalThis.window;
+        const originalLocalStorage = globalThis.localStorage;
+        const originalNavigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+
+        globalThis.window = { location: { href: 'https://example.com/archive/index.html#/' } };
+        globalThis.localStorage = new StorageMock();
+
+        try {
+            const { clearOPFS, getArchiveScopeId } = await import('./src/pages_assets/storage.js');
+            const scopeId = getArchiveScopeId();
+            const otherScopeId = scopeId === 'deadbeef' ? 'feedface' : 'deadbeef';
+            const currentDb = `cass-archive-${scopeId}.sqlite3`;
+            const currentData = `cass-archive-${scopeId}-data-state`;
+            const otherDb = `cass-archive-${otherScopeId}.sqlite3`;
+            const otherData = `cass-archive-${otherScopeId}-data-state`;
+            const legacyDb = 'cass-archive.sqlite3';
+            const unrelated = 'unrelated-app.db';
+            const root = new OpfsRootMock([
+                currentDb,
+                currentData,
+                otherDb,
+                otherData,
+                legacyDb,
+                unrelated,
+            ]);
+            Object.defineProperty(globalThis, 'navigator', {
+                value: { storage: { getDirectory: async () => root } },
+                configurable: true,
+                writable: true,
+            });
+
+            const currentPreference = `cass-archive-${scopeId}-pref-opfs-enabled`;
+            const otherPreference = `cass-archive-${otherScopeId}-pref-opfs-enabled`;
+            localStorage.setItem(currentPreference, 'true');
+            localStorage.setItem(otherPreference, 'true');
+            localStorage.setItem('cass-archive-opfs-enabled', 'true');
+            root.failedEntries.add(currentDb);
+
+            const partialResult = await clearOPFS();
+            if (partialResult !== false || !root.entries.has(currentDb)) {
+                throw new Error('scoped OPFS cleanup must report the injected deletion failure');
+            }
+            if (root.entries.has(currentData) || root.entries.has(legacyDb)) {
+                throw new Error('OPFS cleanup must continue after one entry deletion fails');
+            }
+            if (!root.entries.has(otherDb) || !root.entries.has(otherData) || !root.entries.has(unrelated)) {
+                throw new Error('scoped OPFS cleanup must preserve other archives and unrelated data');
+            }
+            if (localStorage.getItem(currentPreference) !== null || localStorage.getItem('cass-archive-opfs-enabled') !== null) {
+                throw new Error('scoped OPFS cleanup must retire current and legacy opt-in preferences');
+            }
+            if (localStorage.getItem(otherPreference) !== 'true') {
+                throw new Error('scoped OPFS cleanup must preserve another archive preference');
+            }
+
+            root.failedEntries.clear();
+            if (!await clearOPFS() || root.entries.has(currentDb)) {
+                throw new Error('a successful retry must remove the retained current-archive file');
+            }
+
+            if (!await clearOPFS({ allArchives: true })) {
+                throw new Error('all-archive OPFS cleanup should succeed after failures are removed');
+            }
+            if (root.entries.has(otherDb) || root.entries.has(otherData)) {
+                throw new Error('all-archive OPFS cleanup must remove other cass archive data');
+            }
+            if (!root.entries.has(unrelated) || localStorage.getItem(otherPreference) !== null) {
+                throw new Error('all-archive cleanup must remove cass state without touching unrelated OPFS data');
+            }
+        } finally {
+            globalThis.window = originalWindow;
+            globalThis.localStorage = originalLocalStorage;
+            if (originalNavigatorDescriptor) {
+                Object.defineProperty(globalThis, 'navigator', originalNavigatorDescriptor);
+            } else {
+                delete globalThis.navigator;
+            }
+        }
+    "#;
+
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("run scoped OPFS cleanup assertions with node");
+
+    assert!(
+        output.status.success(),
+        "scoped OPFS cleanup assertions failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn browser_session_teardown_survives_partial_storage_failures() {
+    let script = r#"
+        class StorageMock {
+            constructor() {
+                this.data = new Map();
+                this.failedKeys = new Set();
+                this.removeAttempts = [];
+            }
+
+            getItem(key) {
+                return this.data.has(key) ? this.data.get(key) : null;
+            }
+
+            setItem(key, value) {
+                this.data.set(key, String(value));
+            }
+
+            removeItem(key) {
+                this.removeAttempts.push(key);
+                if (this.failedKeys.has(key)) {
+                    throw new Error(`injected remove failure for ${key}`);
+                }
+                this.data.delete(key);
+            }
+        }
+
+        const originalWindow = globalThis.window;
+        const originalDocument = globalThis.document;
+        const originalLocalStorage = globalThis.localStorage;
+        const originalSessionStorage = globalThis.sessionStorage;
+        const removedListeners = [];
+
+        globalThis.window = {
+            location: { href: 'https://example.com/archive/index.html#/' },
+            addEventListener() {},
+            removeEventListener(type) { removedListeners.push(`window:${type}`); },
+        };
+        globalThis.document = {
+            addEventListener() {},
+            removeEventListener(type) { removedListeners.push(`document:${type}`); },
+        };
+        globalThis.localStorage = new StorageMock();
+        globalThis.sessionStorage = new StorageMock();
+
+        try {
+            const { SessionManager, SESSION_CONFIG } = await import('./src/pages_assets/session.js');
+            const { getArchiveScopeId } = await import('./src/pages_assets/storage.js');
+            const scopeId = getArchiveScopeId();
+            const tokenKey = `${SESSION_CONFIG.KEY_SESSION_TOKEN}_${scopeId}`;
+            const expiryKey = `${SESSION_CONFIG.KEY_EXPIRY}_${scopeId}`;
+
+            sessionStorage.setItem(tokenKey, 'session-secret');
+            sessionStorage.setItem(expiryKey, '123');
+            localStorage.setItem(tokenKey, 'local-secret');
+            localStorage.setItem(expiryKey, '456');
+            localStorage.setItem(SESSION_CONFIG.KEY_SESSION_TOKEN, 'legacy-secret');
+            sessionStorage.failedKeys.add(tokenKey);
+
+            const manager = new SessionManager();
+            const dek = new Uint8Array([1, 2, 3, 4]);
+            manager.dek = dek;
+            manager.expiryTs = Date.now() + 60_000;
+            manager.persistent = true;
+            manager.setupCleanupHandlers();
+
+            const partialResult = manager.endSession();
+            if (partialResult !== false) {
+                throw new Error('endSession must report a persisted-key deletion failure');
+            }
+            if (manager.dek !== null || dek.some((byte) => byte !== 0)) {
+                throw new Error('endSession must zeroize and release the in-memory DEK');
+            }
+            if (manager.expiryTs !== 0 || manager.persistent || manager.cleanupHandlersInstalled) {
+                throw new Error('endSession must finish in-memory state and listener teardown');
+            }
+            if (
+                !removedListeners.includes('document:visibilitychange')
+                || !removedListeners.includes('window:beforeunload')
+            ) {
+                throw new Error('endSession must remove both cleanup listeners');
+            }
+            if (sessionStorage.getItem(tokenKey) !== 'session-secret') {
+                throw new Error('the injected failure must demonstrate that a secret can remain');
+            }
+            if (
+                sessionStorage.getItem(expiryKey) !== null
+                || localStorage.getItem(tokenKey) !== null
+                || localStorage.getItem(expiryKey) !== null
+                || localStorage.getItem(SESSION_CONFIG.KEY_SESSION_TOKEN) !== null
+            ) {
+                throw new Error('cleanup must continue across later keys and storage backends');
+            }
+
+            sessionStorage.failedKeys.clear();
+            if (!manager.clearStorage() || sessionStorage.getItem(tokenKey) !== null) {
+                throw new Error('a successful retry must remove the retained session secret');
+            }
+        } finally {
+            globalThis.window = originalWindow;
+            globalThis.document = originalDocument;
+            globalThis.localStorage = originalLocalStorage;
+            globalThis.sessionStorage = originalSessionStorage;
+        }
+    "#;
+
+    let output = Command::new("node")
+        .args(["--input-type=module", "--eval", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("run browser session teardown assertions with node");
+
+    assert!(
+        output.status.success(),
+        "browser session teardown assertions failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // =============================================================================
 // Performance: Error Path Performance
 // =============================================================================

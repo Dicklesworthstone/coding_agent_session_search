@@ -93,8 +93,16 @@ function isCacheEligibleRequest(request, url) {
 }
 
 function responseAllowsCaching(response) {
-    const cacheControl = response.headers.get('cache-control') || '';
-    return response.ok && !/(?:^|,)\s*no-store(?:\s*(?:,|$)|=)/i.test(cacheControl);
+    const cacheDirectives = (response.headers.get('cache-control') || '')
+        .split(',')
+        .map((directive) => directive.trim().toLowerCase());
+    const forbidsStorage = cacheDirectives.some((directive) =>
+        directive === 'no-store'
+        || directive === 'no-cache'
+        || directive === 'private'
+        || directive.startsWith('private=')
+    );
+    return response.status === 200 && !forbidsStorage;
 }
 
 function log(level, ...args) {

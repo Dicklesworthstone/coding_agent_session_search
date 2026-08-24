@@ -1,15 +1,17 @@
 /**
  * cass Archive Viewer - Storage Abstraction Module
  *
- * Provides a unified interface for different storage backends:
+ * Provides a unified interface for active storage backends:
  *   - memory: In-memory only (most secure, lost on page close)
  *   - session: sessionStorage (cleared when tab closes)
  *   - local: localStorage (persists across sessions)
- *   - opfs: Origin Private File System (persistent, largest capacity)
+ * Legacy OPFS database residue can be inspected and cleared, but OPFS is not
+ * an active storage mode and decrypted databases always stay in memory.
  *
  * Security model:
  *   - Default is memory-only for maximum security
- *   - User must explicitly opt-in to persistent storage
+ *   - Session/local persistence requires explicit user selection
+ *   - Decrypted database bytes are never persisted to OPFS
  *   - Clear functions available for all storage types
  */
 
@@ -18,8 +20,8 @@ export const StorageMode = {
     MEMORY: 'memory',
     SESSION: 'session',
     LOCAL: 'local',
-    OPFS: 'opfs',
 };
+const LEGACY_OPFS_MODE = 'opfs';
 
 // Storage keys (prefixed to avoid collisions)
 const STORAGE_PREFIX = 'cass-archive-';
@@ -73,10 +75,6 @@ const memoryStore = new Map();
 
 // Current storage mode
 let currentMode = StorageMode.MEMORY;
-let opfsEnabled = false;
-
-// OPFS directory handle (cached)
-let opfsRoot = null;
 
 function tryGetSessionStorage() {
     try {
@@ -111,7 +109,9 @@ function hashScopeId(input) {
 
 export function getArchiveScopeUrl() {
     try {
-        return new URL('./', window.location.href).href;
+        // This module ships at the archive root. Derive identity from the
+        // asset URL, not the current document URL, which may be a nested route.
+        return new URL('./', import.meta.url).href;
     } catch (error) {
         const href = typeof window?.location?.href === 'string'
             ? window.location.href
@@ -179,7 +179,7 @@ function getServiceWorkerCachePrefix() {
     return `cass-archive-${getArchiveScopeId()}-`;
 }
 
-export function getArchiveOpfsDbFiles() {
+function getArchiveOpfsDbFiles() {
     const scopeId = getArchiveScopeId();
     return [
         `cass-archive-${scopeId}.sqlite3`,
@@ -189,10 +189,6 @@ export function getArchiveOpfsDbFiles() {
         `cass-archive-${scopeId}.db-wal`,
         `cass-archive-${scopeId}.db-shm`,
     ];
-}
-
-export function getArchiveOpfsPrimaryDbName() {
-    return getArchiveOpfsDbFiles()[0];
 }
 
 function isCassOpfsDbFile(name) {
@@ -209,20 +205,8 @@ function isCassOpfsDbFile(name) {
 export async function initStorage() {
     console.log('[Storage] Initializing...');
 
-    const savedMode = getStoredMode();
-    opfsEnabled = getPersistedOpfsEnabled();
-    currentMode = savedMode;
-    if (currentMode === StorageMode.OPFS) {
-        if (!isOpfsEnabled()) {
-            setOpfsEnabled(true);
-        }
-        currentMode = StorageMode.MEMORY;
-        try {
-            localStorage.setItem(KEYS.MODE, StorageMode.MEMORY);
-        } catch (e) {
-            // Ignore
-        }
-    }
+    currentMode = getStoredMode();
+    clearLegacyOpfsPreferences();
     console.log('[Storage] Restored mode:', currentMode);
 
     return currentMode;
@@ -250,38 +234,6 @@ export function getStoredMode() {
     return StorageMode.MEMORY;
 }
 
-function getPersistedOpfsEnabled() {
-    try {
-        return localStorage.getItem(KEYS.OPFS_ENABLED) === 'true';
-    } catch (e) {
-        return false;
-    }
-}
-
-/**
- * Check if OPFS persistence is enabled by user
- */
-export function isOpfsEnabled() {
-    return opfsEnabled;
-}
-
-/**
- * Persist OPFS opt-in preference
- */
-export function setOpfsEnabled(enabled) {
-    opfsEnabled = Boolean(enabled);
-    try {
-        if (opfsEnabled) {
-            localStorage.setItem(KEYS.OPFS_ENABLED, 'true');
-        } else {
-            localStorage.removeItem(KEYS.OPFS_ENABLED);
-        }
-    } catch (e) {
-        console.warn('[Storage] Could not persist OPFS preference');
-    }
-    return opfsEnabled;
-}
-
 /**
  * Set storage mode
  * @param {string} mode - One of StorageMode values
@@ -290,13 +242,6 @@ export function setOpfsEnabled(enabled) {
 export async function setStorageMode(mode, migrate = false) {
     if (!Object.values(StorageMode).includes(mode)) {
         throw new Error(`Invalid storage mode: ${mode}`);
-    }
-
-    if (mode === StorageMode.OPFS) {
-        if (!isOpfsEnabled()) {
-            setOpfsEnabled(true);
-        }
-        mode = StorageMode.MEMORY;
     }
 
     const oldMode = currentMode;
@@ -324,29 +269,6 @@ export async function setStorageMode(mode, migrate = false) {
  */
 export function isOPFSAvailable() {
     return 'storage' in navigator && 'getDirectory' in navigator.storage;
-}
-
-/**
- * Initialize OPFS
- */
-async function initOPFS() {
-    if (!isOPFSAvailable()) {
-        throw new Error('OPFS not available in this browser');
-    }
-
-    opfsRoot = await navigator.storage.getDirectory();
-    console.log('[Storage] OPFS initialized');
-    return opfsRoot;
-}
-
-/**
- * Get OPFS directory handle
- */
-export async function getOPFSRoot() {
-    if (!opfsRoot) {
-        await initOPFS();
-    }
-    return opfsRoot;
 }
 
 /**
@@ -381,9 +303,6 @@ export async function setItem(key, value) {
             }
             break;
 
-        case StorageMode.OPFS:
-            await writeOPFSFile(fullKey, serialized);
-            break;
     }
 }
 
@@ -404,6 +323,9 @@ export async function getItem(key, defaultValue = null) {
         case StorageMode.SESSION:
             try {
                 serialized = sessionStorage.getItem(fullKey);
+                if (serialized === null) {
+                    serialized = memoryStore.get(fullKey);
+                }
             } catch (e) {
                 serialized = memoryStore.get(fullKey);
             }
@@ -412,14 +334,14 @@ export async function getItem(key, defaultValue = null) {
         case StorageMode.LOCAL:
             try {
                 serialized = localStorage.getItem(fullKey);
+                if (serialized === null) {
+                    serialized = memoryStore.get(fullKey);
+                }
             } catch (e) {
                 serialized = memoryStore.get(fullKey);
             }
             break;
 
-        case StorageMode.OPFS:
-            serialized = await readOPFSFile(fullKey);
-            break;
     }
 
     if (serialized === null || serialized === undefined) {
@@ -463,111 +385,7 @@ export async function removeItem(key) {
             memoryStore.delete(fullKey);
             break;
 
-        case StorageMode.OPFS:
-            await deleteOPFSFile(fullKey);
-            break;
     }
-}
-
-/**
- * Write file to OPFS
- */
-async function writeOPFSFile(filename, content) {
-    try {
-        const root = await getOPFSRoot();
-        const fileHandle = await root.getFileHandle(filename, { create: true });
-        const writable = await fileHandle.createWritable();
-        await writable.write(content);
-        await writable.close();
-    } catch (e) {
-        console.error('[Storage] OPFS write failed:', e);
-        // Fallback to memory
-        memoryStore.set(filename, content);
-    }
-}
-
-/**
- * Read file from OPFS
- */
-async function readOPFSFile(filename) {
-    try {
-        const root = await getOPFSRoot();
-        const fileHandle = await root.getFileHandle(filename);
-        const file = await fileHandle.getFile();
-        return await file.text();
-    } catch (e) {
-        if (e.name !== 'NotFoundError') {
-            console.warn('[Storage] OPFS read failed:', e);
-        }
-        return null;
-    }
-}
-
-/**
- * Delete file from OPFS
- */
-async function deleteOPFSFile(filename) {
-    try {
-        const root = await getOPFSRoot();
-        await root.removeEntry(filename);
-    } catch (e) {
-        if (e.name !== 'NotFoundError') {
-            console.warn('[Storage] OPFS delete failed:', e);
-        }
-    }
-}
-
-/**
- * Store binary data (for database file)
- * @param {string} key - Storage key
- * @param {ArrayBuffer|Uint8Array} data - Binary data
- */
-export async function setBinaryItem(key, data) {
-    const fullKey = getArchiveDataKey(key);
-
-    if (currentMode === StorageMode.OPFS) {
-        try {
-            const root = await getOPFSRoot();
-            const fileHandle = await root.getFileHandle(fullKey, { create: true });
-            const writable = await fileHandle.createWritable();
-            await writable.write(data);
-            await writable.close();
-            console.log('[Storage] Binary data written to OPFS:', fullKey);
-            return true;
-        } catch (e) {
-            console.error('[Storage] OPFS binary write failed:', e);
-            return false;
-        }
-    }
-
-    // For non-OPFS modes, we can't efficiently store binary data
-    // Log warning and return false
-    console.warn('[Storage] Binary storage only supported in OPFS mode');
-    return false;
-}
-
-/**
- * Get binary data
- * @param {string} key - Storage key
- */
-export async function getBinaryItem(key) {
-    const fullKey = getArchiveDataKey(key);
-
-    if (currentMode === StorageMode.OPFS) {
-        try {
-            const root = await getOPFSRoot();
-            const fileHandle = await root.getFileHandle(fullKey);
-            const file = await fileHandle.getFile();
-            return await file.arrayBuffer();
-        } catch (e) {
-            if (e.name !== 'NotFoundError') {
-                console.warn('[Storage] OPFS binary read failed:', e);
-            }
-            return null;
-        }
-    }
-
-    return null;
 }
 
 /**
@@ -623,32 +441,28 @@ async function migrateStorage(fromMode, toMode) {
             }
             break;
 
-        case StorageMode.OPFS:
-            // OPFS data lives behind async file handles; migrating it into the
-            // synchronous/local branches would require an async UX path with
-            // explicit progress/error handling. Until that exists, leave the
-            // data in OPFS and warn instead of silently pretending migration ran.
-            console.warn('[Storage] OPFS→other migration not yet supported; data remains in OPFS');
-            return;
     }
 
     // Write to destination
     const oldMode = currentMode;
     currentMode = toMode;
 
-    for (const key of keys) {
-        const shortKey = key.slice(archiveDataPrefix.length);
-        const value = values.get(key);
-        if (value) {
-            try {
-                await setItem(shortKey, JSON.parse(value));
-            } catch (e) {
-                await setItem(shortKey, value);
+    try {
+        for (const key of keys) {
+            const shortKey = key.slice(archiveDataPrefix.length);
+            const value = values.get(key);
+            if (value) {
+                try {
+                    await setItem(shortKey, JSON.parse(value));
+                } catch (e) {
+                    await setItem(shortKey, value);
+                }
             }
         }
+    } finally {
+        currentMode = oldMode;
     }
 
-    currentMode = oldMode;
     console.log('[Storage] Migrated', keys.length, 'items');
 }
 
@@ -658,10 +472,6 @@ function removeMapEntriesWithPrefix(map, prefix) {
             map.delete(key);
         }
     }
-}
-
-function removeStorageEntriesWithPrefix(storage, prefix) {
-    return removeStorageEntries(storage, (key) => key.startsWith(prefix));
 }
 
 function removeStorageEntries(storage, predicate) {
@@ -706,6 +516,25 @@ function removeStorageEntries(storage, predicate) {
         }
     }
 
+    // Re-enumerate after deletion. This catches a failed/no-op removeItem(),
+    // unexpected storage mutation while clearing, and entries missed during
+    // the initial snapshot instead of reporting a false success.
+    try {
+        const remainingCount = storage.length;
+        if (!Number.isSafeInteger(remainingCount) || remainingCount < 0) {
+            return false;
+        }
+        for (let i = 0; i < remainingCount; i++) {
+            const key = storage.key(i);
+            if (key && predicate(key)) {
+                cleared = false;
+            }
+        }
+    } catch (error) {
+        console.warn('[Storage] Could not verify browser storage cleanup:', error);
+        cleared = false;
+    }
+
     return cleared;
 }
 
@@ -725,6 +554,44 @@ function removeStorageKeys(storage, keys) {
     }
 
     return cleared;
+}
+
+function clearLegacyOpfsPreferences(options = {}) {
+    const { allArchives = false } = options;
+    const storage = tryGetLocalStorage();
+    if (!storage) {
+        return false;
+    }
+
+    if (allArchives) {
+        return removeStorageEntries(storage, (key) => {
+            if (key === LEGACY_PREF_KEYS.OPFS_ENABLED) {
+                return true;
+            }
+            if (key === LEGACY_PREF_KEYS.MODE) {
+                return storage.getItem(key) === LEGACY_OPFS_MODE;
+            }
+            if (!isArchivePreferenceKey(key)) {
+                return false;
+            }
+            return key.endsWith('-opfs-enabled')
+                || (key.endsWith('-storage-mode') && storage.getItem(key) === LEGACY_OPFS_MODE);
+        });
+    }
+
+    const keys = new Set([KEYS.OPFS_ENABLED, LEGACY_PREF_KEYS.OPFS_ENABLED]);
+    try {
+        if (storage.getItem(KEYS.MODE) === LEGACY_OPFS_MODE) {
+            keys.add(KEYS.MODE);
+        }
+        if (storage.getItem(LEGACY_PREF_KEYS.MODE) === LEGACY_OPFS_MODE) {
+            keys.add(LEGACY_PREF_KEYS.MODE);
+        }
+    } catch (error) {
+        console.warn('[Storage] Could not inspect legacy OPFS preferences:', error);
+        return false;
+    }
+    return removeStorageKeys(storage, keys);
 }
 
 function clearCurrentArchivePreferenceKeys(options = {}) {
@@ -814,12 +681,6 @@ export async function clearCurrentStorage() {
             }
             break;
 
-        case StorageMode.OPFS:
-            {
-                const opfsCleared = await clearOPFS();
-                cleared = opfsCleared && cleared;
-            }
-            break;
     }
 
     return cleared;
@@ -830,9 +691,10 @@ export async function clearCurrentStorage() {
  */
 export async function clearOPFS(options = {}) {
     const { allArchives = false } = options;
+    const preferencesCleared = clearLegacyOpfsPreferences({ allArchives });
 
     if (!isOPFSAvailable()) {
-        return true;
+        return preferencesCleared;
     }
 
     try {
@@ -864,8 +726,32 @@ export async function clearOPFS(options = {}) {
             }
         }
 
-        console.log('[Storage] OPFS cleared:', entries.length, 'entries');
-        return cleared;
+        // Verify the postcondition instead of assuming removeEntry() did what
+        // it promised. Another same-origin context may also have recreated an
+        // archive file while cleanup was in progress.
+        try {
+            for await (const entry of root.keys()) {
+                const shouldDeleteData = allArchives
+                    ? isArchiveDataEntryName(entry)
+                    : entry.startsWith(archiveDataPrefix);
+                const shouldDeleteDb = allArchives
+                    ? isCassOpfsDbFile(entry)
+                    : currentArchiveDbFiles.has(entry) || LEGACY_OPFS_DB_FILES.includes(entry);
+                if (shouldDeleteData || shouldDeleteDb) {
+                    cleared = false;
+                }
+            }
+        } catch (e) {
+            console.warn('[Storage] Could not verify OPFS cleanup:', e);
+            cleared = false;
+        }
+
+        if (cleared) {
+            console.log('[Storage] OPFS cleared:', entries.length, 'entries');
+        } else {
+            console.warn('[Storage] Some OPFS data could not be fully cleared');
+        }
+        return cleared && preferencesCleared;
     } catch (e) {
         console.error('[Storage] OPFS clear failed:', e);
         return false;
@@ -973,12 +859,27 @@ export async function clearServiceWorkerCache(options = {}) {
                 : name.startsWith(cachePrefix)
         );
 
-        const deleteResults = await Promise.all(cassNames.map((name) => caches.delete(name)));
-        const cleared = deleteResults.every(Boolean);
+        const deleteResults = await Promise.allSettled(
+            cassNames.map((name) => caches.delete(name))
+        );
+        for (let index = 0; index < deleteResults.length; index++) {
+            const result = deleteResults[index];
+            if (result.status === 'rejected') {
+                console.warn('[Storage] Failed to delete Service Worker cache:', cassNames[index], result.reason);
+            }
+        }
+
+        const remainingNames = await caches.keys();
+        const remainingCassNames = remainingNames.filter(
+            (name) => allArchives
+                ? name.startsWith('cass-archive-')
+                : name.startsWith(cachePrefix)
+        );
+        const cleared = remainingCassNames.length === 0;
         if (cleared) {
             console.log('[Storage] Service Worker caches cleared:', cassNames);
         } else {
-            console.warn('[Storage] Some Service Worker caches could not be cleared:', cassNames);
+            console.warn('[Storage] Some Service Worker caches could not be cleared:', remainingCassNames);
         }
         return cleared;
     } catch (e) {
@@ -990,9 +891,7 @@ export async function clearServiceWorkerCache(options = {}) {
 /**
  * Unregister Service Worker
  */
-export async function unregisterServiceWorker(options = {}) {
-    const { allArchives = false } = options;
-
+export async function unregisterServiceWorker() {
     if (!('serviceWorker' in navigator)) {
         return true;
     }
@@ -1000,9 +899,25 @@ export async function unregisterServiceWorker(options = {}) {
     try {
         const registrations = await navigator.serviceWorker.getRegistrations();
         const currentScope = getArchiveScopeUrl();
-        const targets = registrations.filter((reg) => allArchives || reg.scope === currentScope);
-        const unregisterResults = await Promise.all(targets.map((reg) => reg.unregister()));
-        const unregistered = unregisterResults.every(Boolean);
+        // Registrations have no trustworthy application identifier. Keep reset
+        // strictly scoped to this archive rather than letting an "all archives"
+        // request unregister unrelated same-origin applications.
+        const targets = registrations.filter((reg) => reg.scope === currentScope);
+        const unregisterResults = await Promise.allSettled(
+            targets.map((reg) => reg.unregister())
+        );
+        for (let index = 0; index < unregisterResults.length; index++) {
+            const result = unregisterResults[index];
+            if (result.status === 'rejected') {
+                console.warn('[Storage] Failed to unregister Service Worker:', targets[index].scope, result.reason);
+            }
+        }
+
+        const remainingRegistrations = await navigator.serviceWorker.getRegistrations();
+        const remainingTargets = remainingRegistrations.filter(
+            (reg) => reg.scope === currentScope
+        );
+        const unregistered = remainingTargets.length === 0;
         if (unregistered) {
             console.log('[Storage] Service Workers unregistered');
         } else {
@@ -1087,13 +1002,15 @@ export async function getStorageStats() {
         try {
             const root = await navigator.storage.getDirectory();
             for await (const name of root.keys()) {
-                if (name.startsWith(archiveDataPrefix) || currentArchiveDbFiles.has(name)) {
+                const isDatabaseResidue = currentArchiveDbFiles.has(name)
+                    || LEGACY_OPFS_DB_FILES.includes(name);
+                if (name.startsWith(archiveDataPrefix) || isDatabaseResidue) {
                     stats.opfs.items++;
                     try {
                         const handle = await root.getFileHandle(name);
                         const file = await handle.getFile();
                         stats.opfs.bytes += file.size;
-                        if (currentArchiveDbFiles.has(name)) {
+                        if (isDatabaseResidue) {
                             stats.opfs.dbBytes += file.size;
                             stats.opfs.dbFiles.push(name);
                         }
@@ -1117,26 +1034,6 @@ export async function getStorageStats() {
     }
 
     return stats;
-}
-
-/**
- * Check if database is cached in OPFS
- */
-export async function isDatabaseCached() {
-    try {
-        const root = await getOPFSRoot();
-        for (const name of getArchiveOpfsDbFiles()) {
-            try {
-                await root.getFileHandle(name);
-                return true;
-            } catch (e) {
-                // Try next name
-            }
-        }
-        return false;
-    } catch (e) {
-        return false;
-    }
 }
 
 /**
@@ -1167,24 +1064,16 @@ export default {
     getStorageMode,
     setStorageMode,
     isOPFSAvailable,
-    isOpfsEnabled,
-    setOpfsEnabled,
-    getOPFSRoot,
     setItem,
     getItem,
     removeItem,
-    setBinaryItem,
-    getBinaryItem,
     clearCurrentStorage,
     clearOPFS,
     clearAllStorage,
     clearServiceWorkerCache,
     unregisterServiceWorker,
     getStorageStats,
-    isDatabaseCached,
     formatBytes,
     getArchiveScopeUrl,
     getArchiveScopeId,
-    getArchiveOpfsDbFiles,
-    getArchiveOpfsPrimaryDbName,
 };

@@ -13,10 +13,12 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;
 use ring::rand::{SecureRandom, SystemRandom};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -104,9 +106,10 @@ impl ExportEngine {
         V: FnOnce(&Path) -> Result<T>,
     {
         let output_path = resolve_export_output_path(&self.source_db_path, &self.output_path)?;
+        let publish_guard = acquire_export_publish_guard(&output_path)?;
         #[cfg(windows)]
         let output_path = {
-            recover_or_refuse_interrupted_export_publish(&output_path)?;
+            recover_or_refuse_interrupted_export_publish(&output_path, &publish_guard)?;
             // Recovery can make a formerly absent destination name an alias
             // of the source (for example through a pre-existing hard link).
             // Re-run the source-identity proof against the restored entry
@@ -145,13 +148,9 @@ impl ExportEngine {
         let result = (|| -> Result<(ExportStats, T)> {
             create_staged_export_file(&builder_path)?;
             builder_owned = true;
-            // Deliberately NOT named `output_path`: this is the PRIVATE
-            // BUILDER database, and shadowing the resolved export
-            // destination here once routed the final install onto the
-            // builder path (GH#418).
-            let builder_db_path = builder_path.to_string_lossy().to_string();
-            let dest = Connection::open(&builder_db_path)
-                .context("Failed to create output database")?;
+            let output_path = builder_path.to_string_lossy().to_string();
+            let dest =
+                Connection::open(&output_path).context("Failed to create output database")?;
 
             dest.execute_batch(
                 // Pages exports are encrypted/copied as one portable SQLite file.
@@ -580,6 +579,7 @@ impl ExportEngine {
                 &temp_output_path,
                 &output_path,
                 &mut retain_temp_on_replace_error,
+                &publish_guard,
             )
             .context("Failed to install completed export database")?;
             candidate_owned = false;
@@ -896,33 +896,288 @@ fn derive_attachment_refs(extra_json: Option<&str>) -> Option<String> {
     })
 }
 
-/// A backup path that is never reused within this process, so a retried
-/// replacement cannot rename over the backup of an earlier attempt.
-///
-/// Deliberately infallible: this is only reached inside the error-recovery
-/// branch of a failed rename, and failing to NAME a backup there would
-/// strand the export entirely. Per-process uniqueness comes from a
-/// monotonic counter; the pid disambiguates backups left by a crashed
-/// sibling process.
-#[cfg(any(windows, test))]
-fn unique_replace_backup_path(path: &Path) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let file_name = path
-        .file_name()
-        .unwrap_or_else(|| std::ffi::OsStr::new("pages_export.db"));
-    let mut backup_name = std::ffi::OsString::from(".");
-    backup_name.push(file_name);
-    backup_name.push(format!(
-        ".pages-export-replace.{}.{seq}.bak",
-        std::process::id()
-    ));
-    path.with_file_name(backup_name)
+const EXPORT_PUBLISH_JOURNAL_FORMAT: &str = "cass-pages-export-publish-v1";
+const EXPORT_PUBLISH_JOURNAL_MAX_BYTES: u64 = 16 * 1024;
+const EXPORT_PUBLISH_BACKUP_SCAN_LIMIT: usize = 65_536;
+
+struct ExportPublishGuard {
+    final_path: PathBuf,
+    _lock_file: std::fs::File,
+}
+
+struct ExportFileEvidence {
+    identity: crate::franken_sync::FileIdentity,
+    size_bytes: u64,
+    sha256: String,
 }
 
 #[cfg(any(windows, test))]
-fn export_publish_recovery_backup_path(path: &Path) -> PathBuf {
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExportPublishJournal {
+    format: String,
+    backup_file_name: String,
+    prior_size_bytes: u64,
+    prior_sha256: String,
+    candidate_size_bytes: u64,
+    candidate_sha256: String,
+}
+
+fn export_publish_lock_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("pages_export.db"));
+    let mut lock_name = std::ffi::OsString::from(".");
+    lock_name.push(file_name);
+    lock_name.push(".pages-export-publish.lock");
+    path.with_file_name(lock_name)
+}
+
+fn acquire_export_publish_guard(final_path: &Path) -> Result<ExportPublishGuard> {
+    let lock_path = export_publish_lock_path(final_path);
+    let lock_exists = match std::fs::symlink_metadata(&lock_path) {
+        Ok(metadata) if metadata.file_type().is_file() => true,
+        Ok(_) => {
+            bail!(
+                "Pages export publish lock is not a regular file; refused to open it: {}",
+                lock_path.display()
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed inspecting Pages export publish lock {} before open",
+                    lock_path.display()
+                )
+            });
+        }
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    if lock_exists {
+        options.create(false);
+    } else {
+        options.create_new(true);
+    }
+    #[cfg(unix)]
+    options.mode(0o600);
+    let lock_file = options.open(&lock_path).with_context(|| {
+        format!(
+            "failed opening Pages export publish lock {}",
+            lock_path.display()
+        )
+    })?;
+
+    let lock_identity = crate::franken_sync::FileIdentity::from_file(&lock_file)
+        .with_context(|| {
+            format!(
+                "failed identifying opened Pages export publish lock {}",
+                lock_path.display()
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "filesystem does not expose a stable identity for Pages export publish lock {}",
+                lock_path.display()
+            )
+        })?;
+    fs2::FileExt::try_lock_exclusive(&lock_file).with_context(|| {
+        format!(
+            "another Pages export is already publishing to {}; lock contention at {}",
+            final_path.display(),
+            lock_path.display()
+        )
+    })?;
+
+    let path_metadata = std::fs::symlink_metadata(&lock_path).with_context(|| {
+        format!(
+            "failed re-inspecting Pages export publish lock {} after acquisition",
+            lock_path.display()
+        )
+    })?;
+    if !path_metadata.file_type().is_file() {
+        bail!(
+            "Pages export publish lock {} changed to a non-regular entry during acquisition",
+            lock_path.display()
+        );
+    }
+    #[cfg(unix)]
+    if path_metadata.nlink() != 1 {
+        bail!(
+            "Pages export publish lock {} has {} hard links after acquisition; exclusive pathname ownership is not provable",
+            lock_path.display(),
+            path_metadata.nlink()
+        );
+    }
+    let path_probe = std::fs::File::open(&lock_path).with_context(|| {
+        format!(
+            "failed re-opening Pages export publish lock {} after acquisition",
+            lock_path.display()
+        )
+    })?;
+    let path_identity = crate::franken_sync::FileIdentity::from_file(&path_probe)
+        .with_context(|| {
+            format!(
+                "failed re-identifying Pages export publish lock {} after acquisition",
+                lock_path.display()
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "filesystem does not expose a stable pathname identity for Pages export publish lock {}",
+                lock_path.display()
+            )
+        })?;
+    if path_identity != lock_identity {
+        bail!(
+            "Pages export publish lock {} changed identity during acquisition",
+            lock_path.display()
+        );
+    }
+
+    Ok(ExportPublishGuard {
+        final_path: final_path.to_path_buf(),
+        _lock_file: lock_file,
+    })
+}
+
+fn require_export_publish_guard(
+    final_path: &Path,
+    publish_guard: &ExportPublishGuard,
+) -> Result<()> {
+    if publish_guard.final_path != final_path {
+        bail!(
+            "Pages export publish guard for {} cannot authorize publication to {}",
+            publish_guard.final_path.display(),
+            final_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn inspect_export_regular_file(path: &Path, label: &str) -> Result<ExportFileEvidence> {
+    let path_metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed inspecting {label} {}", path.display()))?;
+    if !path_metadata.file_type().is_file() {
+        bail!("{label} is not a regular file: {}", path.display());
+    }
+
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("failed opening {label} {}", path.display()))?;
+    let identity = crate::franken_sync::FileIdentity::from_file(&file)
+        .with_context(|| format!("failed identifying {label} {}", path.display()))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "filesystem does not expose a stable identity for {label} {}",
+                path.display()
+            )
+        })?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed inspecting opened {label} {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("opened {label} is not a regular file: {}", path.display());
+    }
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("failed hashing {label} {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    let final_path_metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed re-inspecting {label} {}", path.display()))?;
+    if !final_path_metadata.file_type().is_file() {
+        bail!("{label} changed file type while inspected: {}", path.display());
+    }
+    let path_probe = std::fs::File::open(path)
+        .with_context(|| format!("failed re-opening {label} {}", path.display()))?;
+    let path_identity = crate::franken_sync::FileIdentity::from_file(&path_probe)
+        .with_context(|| format!("failed re-identifying {label} {}", path.display()))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "filesystem stopped exposing a stable identity for {label} {}",
+                path.display()
+            )
+        })?;
+    if path_identity != identity {
+        bail!("{label} changed identity while inspected: {}", path.display());
+    }
+
+    Ok(ExportFileEvidence {
+        identity,
+        size_bytes: metadata.len(),
+        sha256: hex::encode(hasher.finalize()),
+    })
+}
+
+fn evidence_matches(
+    actual: &ExportFileEvidence,
+    expected_size_bytes: u64,
+    expected_sha256: &str,
+) -> bool {
+    actual.size_bytes == expected_size_bytes && actual.sha256 == expected_sha256
+}
+
+fn sync_export_regular_file(
+    path: &Path,
+    expected: &ExportFileEvidence,
+    label: &str,
+) -> Result<()> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("failed opening {label} {} for sync", path.display()))?;
+    let identity = crate::franken_sync::FileIdentity::from_file(&file)
+        .with_context(|| format!("failed identifying {label} {} before sync", path.display()))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "filesystem does not expose a stable identity for {label} {} before sync",
+                path.display()
+            )
+        })?;
+    if identity != expected.identity {
+        bail!("{label} changed identity before sync: {}", path.display());
+    }
+    file.sync_all()
+        .with_context(|| format!("failed syncing {label} {}", path.display()))?;
+    let path_probe = std::fs::File::open(path)
+        .with_context(|| format!("failed re-opening {label} {} after sync", path.display()))?;
+    let path_identity = crate::franken_sync::FileIdentity::from_file(&path_probe)
+        .with_context(|| format!("failed re-identifying {label} {} after sync", path.display()))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "filesystem stopped exposing a stable identity for {label} {} after sync",
+                path.display()
+            )
+        })?;
+    if path_identity != expected.identity {
+        bail!("{label} changed identity during sync: {}", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn export_publish_recovery_journal_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("pages_export.db"));
+    let mut journal_name = std::ffi::OsString::from(".");
+    journal_name.push(file_name);
+    journal_name.push(".pages-export-publish-in-progress.json");
+    path.with_file_name(journal_name)
+}
+
+#[cfg(any(windows, test))]
+fn legacy_export_publish_recovery_backup_path(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
         .unwrap_or_else(|| std::ffi::OsStr::new("pages_export.db"));
@@ -949,6 +1204,259 @@ fn unpredictable_atomic_sidecar_path(
         ".{file_name}.{suffix}.{}",
         hex::encode(nonce)
     )))
+}
+
+#[cfg(any(windows, test))]
+fn unpredictable_export_publish_backup_path(path: &Path) -> Result<PathBuf> {
+    unpredictable_atomic_sidecar_path(path, "publish-backup", "pages_export.db")
+}
+
+#[cfg(any(windows, test))]
+fn export_publish_backup_prefix(path: &Path) -> String {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("pages_export.db");
+    format!(".{file_name}.publish-backup.")
+}
+
+#[cfg(any(windows, test))]
+fn journal_backup_path(final_path: &Path, journal: &ExportPublishJournal) -> Result<PathBuf> {
+    let backup_name_path = Path::new(&journal.backup_file_name);
+    if backup_name_path.file_name() != Some(backup_name_path.as_os_str())
+        || backup_name_path.components().count() != 1
+    {
+        bail!(
+            "Pages export publish journal for {} contains a non-local backup name",
+            final_path.display()
+        );
+    }
+    let prefix = export_publish_backup_prefix(final_path);
+    let Some(nonce) = journal.backup_file_name.strip_prefix(&prefix) else {
+        bail!(
+            "Pages export publish journal for {} contains an unexpected backup name {}",
+            final_path.display(),
+            journal.backup_file_name
+        );
+    };
+    if nonce.len() != 32 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!(
+            "Pages export publish journal for {} contains an invalid backup nonce",
+            final_path.display()
+        );
+    }
+    Ok(final_path.with_file_name(&journal.backup_file_name))
+}
+
+#[cfg(any(windows, test))]
+fn validate_export_publish_journal(
+    final_path: &Path,
+    journal: &ExportPublishJournal,
+) -> Result<PathBuf> {
+    if journal.format != EXPORT_PUBLISH_JOURNAL_FORMAT {
+        bail!(
+            "Pages export publish journal for {} has unsupported format {}",
+            final_path.display(),
+            journal.format
+        );
+    }
+    for (label, digest) in [
+        ("prior", journal.prior_sha256.as_str()),
+        ("candidate", journal.candidate_sha256.as_str()),
+    ] {
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!(
+                "Pages export publish journal for {} has an invalid {label} SHA-256 digest",
+                final_path.display()
+            );
+        }
+    }
+    journal_backup_path(final_path, journal)
+}
+
+#[cfg(any(windows, test))]
+fn read_export_publish_journal(final_path: &Path) -> Result<Option<ExportPublishJournal>> {
+    let journal_path = export_publish_recovery_journal_path(final_path);
+    let metadata = match std::fs::symlink_metadata(&journal_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed inspecting Pages export publish journal {}",
+                    journal_path.display()
+                )
+            });
+        }
+    };
+    if !metadata.file_type().is_file() {
+        bail!(
+            "Pages export publish journal is not a regular file; preserved it without mutation: {}",
+            journal_path.display()
+        );
+    }
+    #[cfg(unix)]
+    if metadata.nlink() != 1 {
+        bail!(
+            "Pages export publish journal {} has {} hard links; preserved it because exclusive pathname ownership is not provable",
+            journal_path.display(),
+            metadata.nlink()
+        );
+    }
+
+    let mut bytes = Vec::new();
+    std::fs::File::open(&journal_path)
+        .with_context(|| format!("failed opening Pages export publish journal {}", journal_path.display()))?
+        .take(EXPORT_PUBLISH_JOURNAL_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed reading Pages export publish journal {}", journal_path.display()))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > EXPORT_PUBLISH_JOURNAL_MAX_BYTES {
+        bail!(
+            "Pages export publish journal exceeds the {}-byte bound; preserved it without mutation: {}",
+            EXPORT_PUBLISH_JOURNAL_MAX_BYTES,
+            journal_path.display()
+        );
+    }
+    let journal: ExportPublishJournal = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "Pages export publish journal is invalid and was preserved without mutation: {}",
+            journal_path.display()
+        )
+    })?;
+    validate_export_publish_journal(final_path, &journal)?;
+    Ok(Some(journal))
+}
+
+#[cfg(any(windows, test))]
+fn write_export_publish_journal(
+    final_path: &Path,
+    backup_path: &Path,
+    prior: &ExportFileEvidence,
+    candidate: &ExportFileEvidence,
+) -> Result<ExportPublishJournal> {
+    let backup_file_name = backup_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Pages export publish backup has no UTF-8 file name: {}",
+                backup_path.display()
+            )
+        })?
+        .to_string();
+    let journal = ExportPublishJournal {
+        format: EXPORT_PUBLISH_JOURNAL_FORMAT.to_string(),
+        backup_file_name,
+        prior_size_bytes: prior.size_bytes,
+        prior_sha256: prior.sha256.clone(),
+        candidate_size_bytes: candidate.size_bytes,
+        candidate_sha256: candidate.sha256.clone(),
+    };
+    validate_export_publish_journal(final_path, &journal)?;
+    let bytes = serde_json::to_vec(&journal).context("failed serializing Pages export publish journal")?;
+    let journal_path = export_publish_recovery_journal_path(final_path);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&journal_path).with_context(|| {
+        format!(
+            "failed exclusively creating Pages export publish journal {}; preserved the live and staged generations",
+            journal_path.display()
+        )
+    })?;
+    file.write_all(&bytes).with_context(|| {
+        format!(
+            "failed writing Pages export publish journal {}; preserved it for inspection",
+            journal_path.display()
+        )
+    })?;
+    file.sync_all().with_context(|| {
+        format!(
+            "failed syncing Pages export publish journal {}; preserved it for inspection",
+            journal_path.display()
+        )
+    })?;
+    sync_parent_directory(&journal_path).with_context(|| {
+        format!(
+            "failed durably publishing Pages export journal {}; preserved it for recovery",
+            journal_path.display()
+        )
+    })?;
+    Ok(journal)
+}
+
+#[cfg(any(windows, test))]
+fn remove_export_publish_journal(final_path: &Path) -> Result<()> {
+    let journal_path = export_publish_recovery_journal_path(final_path);
+    match std::fs::remove_file(&journal_path) {
+        Ok(()) => sync_parent_directory(&journal_path).with_context(|| {
+            format!(
+                "removed completed Pages export publish journal {}, but could not durably sync its parent directory",
+                journal_path.display()
+            )
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed removing completed Pages export publish journal {}",
+                journal_path.display()
+            )
+        }),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn first_unmarked_export_publish_backup(
+    final_path: &Path,
+    owned_backup_path: Option<&Path>,
+) -> Result<Option<PathBuf>> {
+    let legacy_path = legacy_export_publish_recovery_backup_path(final_path);
+    match std::fs::symlink_metadata(&legacy_path) {
+        Ok(_) => return Ok(Some(legacy_path)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed inspecting legacy Pages export recovery path {}",
+                    legacy_path.display()
+                )
+            });
+        }
+    }
+
+    let parent = final_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let prefix = export_publish_backup_prefix(final_path);
+    let entries = std::fs::read_dir(parent).with_context(|| {
+        format!(
+            "failed scanning Pages export directory {} for unmarked recovery backups",
+            parent.display()
+        )
+    })?;
+    for (index, entry) in entries.enumerate() {
+        if index >= EXPORT_PUBLISH_BACKUP_SCAN_LIMIT {
+            bail!(
+                "Pages export directory {} exceeds the {}-entry recovery scan bound",
+                parent.display(),
+                EXPORT_PUBLISH_BACKUP_SCAN_LIMIT
+            );
+        }
+        let entry = entry.with_context(|| {
+            format!(
+                "failed reading Pages export directory entry in {}",
+                parent.display()
+            )
+        })?;
+        if entry.file_name().to_string_lossy().starts_with(&prefix)
+            && owned_backup_path != Some(entry.path().as_path())
+        {
+            return Ok(Some(entry.path()));
+        }
+    }
+    Ok(None)
 }
 
 fn cleanup_sqlite_sidecars(artifacts: Vec<PathBuf>) -> Result<()> {
@@ -1120,12 +1628,8 @@ fn enforce_private_candidate_permissions(path: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn enforce_private_candidate_permissions(path: &Path) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(path)
-        .with_context(|| format!("failed inspecting staged export {}", path.display()))?;
-    if !metadata.file_type().is_file() {
-        bail!("staged Pages export is not a regular file: {}", path.display());
-    }
-    Ok(())
+    let evidence = inspect_export_regular_file(path, "staged Pages export")?;
+    sync_export_regular_file(path, &evidence, "staged Pages export")
 }
 
 /// Refuse to publish one SQLite main file over an existing artifact family.
@@ -1177,7 +1681,17 @@ fn replacement_path_entry_exists(path: &Path) -> Result<bool> {
 #[cfg(any(windows, test))]
 fn reject_non_regular_existing_publish_destination(path: &Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(metadata) if metadata.file_type().is_file() => {
+            #[cfg(unix)]
+            if metadata.nlink() != 1 {
+                bail!(
+                    "existing Pages export destination {} has {} hard links; refused recoverable replacement because exclusive pathname ownership is not provable",
+                    path.display(),
+                    metadata.nlink()
+                );
+            }
+            Ok(())
+        }
         Ok(_) => {
             bail!(
                 "existing Pages export destination {} is not a regular file; refused backup replacement without mutation",
@@ -1194,97 +1708,218 @@ fn reject_non_regular_existing_publish_destination(path: &Path) -> Result<()> {
     }
 }
 
-/// Resolve the only automatically recoverable state left by the Windows
-/// replacement fallback.
-///
-/// Windows cannot atomically rename a staged file over an existing file with
-/// `std::fs::rename`, so replacement temporarily parks the prior generation at
-/// a deterministic sidecar. If the process stops before installing the new
-/// generation, the missing live path plus that sidecar unambiguously means the
-/// prior generation must be restored. If both entries exist, publication may
-/// already have completed; preserve both generations and require an operator
-/// to resolve the ambiguous state instead of guessing which sensitive bytes to
-/// discard.
+/// Recover only states authenticated by a durable journal. An unmarked file at
+/// any reserved backup spelling is never treated as cass-owned: it is
+/// preserved and reported for explicit operator resolution.
 #[cfg(any(windows, test))]
-fn recover_or_refuse_interrupted_export_publish(final_path: &Path) -> Result<()> {
-    let backup_path = export_publish_recovery_backup_path(final_path);
-    let backup_metadata = match std::fs::symlink_metadata(&backup_path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "failed inspecting Pages export publish-recovery backup {}",
-                    backup_path.display()
-                )
-            });
+fn recover_or_refuse_interrupted_export_publish(
+    final_path: &Path,
+    publish_guard: &ExportPublishGuard,
+) -> Result<()> {
+    require_export_publish_guard(final_path, publish_guard)?;
+    let Some(journal) = read_export_publish_journal(final_path)? else {
+        if let Some(unmarked_backup) =
+            first_unmarked_export_publish_backup(final_path, None)?
+        {
+            bail!(
+                "unmarked Pages export recovery artifact {} was preserved; refusing to infer ownership or modify live path {}",
+                unmarked_backup.display(),
+                final_path.display()
+            );
         }
+        return Ok(());
     };
-    if !backup_metadata.file_type().is_file() {
+    let backup_path = validate_export_publish_journal(final_path, &journal)?;
+    if let Some(unmarked_backup) =
+        first_unmarked_export_publish_backup(final_path, Some(&backup_path))?
+    {
         bail!(
-            "Pages export publish-recovery path {} is not a regular file; preserved it and refused to modify live path {}",
+            "Pages export publish journal identifies {}, but additional unmarked recovery artifact {} also exists; preserved every generation",
             backup_path.display(),
-            final_path.display()
-        );
-    }
-    #[cfg(unix)]
-    if backup_metadata.nlink() != 1 {
-        bail!(
-            "Pages export publish-recovery backup {} has {} hard links; preserved it and refused to modify live path {} because exclusive pathname ownership is not provable",
-            backup_path.display(),
-            backup_metadata.nlink(),
-            final_path.display()
+            unmarked_backup.display()
         );
     }
 
-    if replacement_path_entry_exists(final_path)? {
-        bail!(
-            "an interrupted Pages export publish left both live generation {} and prior generation {}; preserved both because publication completion is ambiguous",
+    let backup_evidence = if replacement_path_entry_exists(&backup_path)? {
+        reject_existing_sqlite_sidecars(&backup_path, "publish-recovery backup")?;
+        let evidence = inspect_export_regular_file(&backup_path, "publish-recovery backup")?;
+        if !evidence_matches(
+            &evidence,
+            journal.prior_size_bytes,
+            &journal.prior_sha256,
+        ) {
+            bail!(
+                "Pages export publish-recovery backup {} does not match the journaled prior generation; preserved it without mutation",
+                backup_path.display()
+            );
+        }
+        Some(evidence)
+    } else {
+        None
+    };
+    reject_existing_sqlite_sidecars(final_path, "interrupted publish destination")?;
+    let final_evidence = if replacement_path_entry_exists(final_path)? {
+        reject_non_regular_existing_publish_destination(final_path)?;
+        Some(inspect_export_regular_file(
+            final_path,
+            "interrupted publish destination",
+        )?)
+    } else {
+        None
+    };
+
+    match (final_evidence, backup_evidence) {
+        (None, Some(prior)) => {
+            std::fs::rename(&backup_path, final_path).with_context(|| {
+                format!(
+                    "failed restoring journaled Pages export backup {} to missing live path {}; preserved the backup and journal",
+                    backup_path.display(),
+                    final_path.display()
+                )
+            })?;
+            let restored = inspect_export_regular_file(final_path, "restored Pages export")?;
+            if restored.identity != prior.identity
+                || !evidence_matches(
+                    &restored,
+                    journal.prior_size_bytes,
+                    &journal.prior_sha256,
+                )
+            {
+                bail!(
+                    "restored Pages export {} does not retain the journaled prior-generation identity; preserved the journal",
+                    final_path.display()
+                );
+            }
+            sync_export_regular_file(final_path, &restored, "restored Pages export")?;
+            sync_parent_directory(final_path).with_context(|| {
+                format!(
+                    "the prior Pages export was restored at {}, but the recovery rename could not be durably synced; journal retained at {}",
+                    final_path.display(),
+                    export_publish_recovery_journal_path(final_path).display()
+                )
+            })?;
+            #[cfg(windows)]
+            bail!(
+                "restored the prior Pages export at {}, but Windows std cannot prove durable deletion of the recovery namespace; journal retained at {} for explicit resolution",
+                final_path.display(),
+                export_publish_recovery_journal_path(final_path).display()
+            );
+            #[cfg(not(windows))]
+            remove_export_publish_journal(final_path)
+        }
+        (Some(live), Some(prior)) => {
+            if !evidence_matches(
+                &live,
+                journal.candidate_size_bytes,
+                &journal.candidate_sha256,
+            ) {
+                bail!(
+                    "journaled Pages export recovery found live {} and prior {}; live bytes do not match the journaled candidate, so both were preserved",
+                    final_path.display(),
+                    backup_path.display()
+                );
+            }
+            #[cfg(windows)]
+            bail!(
+                "new Pages export is live at {} and journaled prior generation remains at {}; Windows std cannot prove durable namespace cleanup, so backup and journal were preserved",
+                final_path.display(),
+                backup_path.display()
+            );
+            #[cfg(not(windows))]
+            remove_prior_export_backup_after_publish(
+                &backup_path,
+                final_path,
+                &journal,
+                Some(prior.identity),
+            )
+        }
+        (Some(live), None) => {
+            let live_is_prior = evidence_matches(
+                &live,
+                journal.prior_size_bytes,
+                &journal.prior_sha256,
+            );
+            let live_is_candidate = evidence_matches(
+                &live,
+                journal.candidate_size_bytes,
+                &journal.candidate_sha256,
+            );
+            if !live_is_prior && !live_is_candidate {
+                bail!(
+                    "Pages export publish journal remains at {}, but live file {} matches neither journaled generation; preserved both",
+                    export_publish_recovery_journal_path(final_path).display(),
+                    final_path.display()
+                );
+            }
+            #[cfg(windows)]
+            bail!(
+                "Pages export {} matches a journaled generation, but its backup namespace is absent and Windows std cannot prove the completed transition; journal retained at {}",
+                final_path.display(),
+                export_publish_recovery_journal_path(final_path).display()
+            );
+            #[cfg(not(windows))]
+            remove_export_publish_journal(final_path)
+        }
+        (None, None) => bail!(
+            "Pages export publish journal remains at {}, but both live {} and journaled backup {} are missing; preserved the journal",
+            export_publish_recovery_journal_path(final_path).display(),
             final_path.display(),
             backup_path.display()
-        );
+        ),
     }
-
-    reject_existing_sqlite_sidecars(&backup_path, "publish-recovery backup")?;
-    reject_existing_sqlite_sidecars(final_path, "interrupted publish destination")?;
-    std::fs::rename(&backup_path, final_path).with_context(|| {
-        format!(
-            "failed restoring interrupted Pages export backup {} to missing live path {}; preserved the backup for recovery",
-            backup_path.display(),
-            final_path.display()
-        )
-    })?;
-    sync_parent_directory(final_path).with_context(|| {
-        format!(
-            "the prior Pages export was restored at {}, but the recovery rename could not be durably synced",
-            final_path.display()
-        )
-    })
 }
 
 #[cfg(any(windows, test))]
 fn replace_file_from_temp_via_backup(
     temp_path: &Path,
     final_path: &Path,
-    first_err: &std::io::Error,
     retain_temp_on_error: &mut bool,
+    publish_guard: &ExportPublishGuard,
 ) -> Result<()> {
     *retain_temp_on_error = false;
-    recover_or_refuse_interrupted_export_publish(final_path)?;
+    require_export_publish_guard(final_path, publish_guard)?;
+    recover_or_refuse_interrupted_export_publish(final_path, publish_guard)?;
     reject_non_regular_existing_publish_destination(final_path)?;
     reject_existing_sqlite_sidecars(final_path, "destination before backup replacement")?;
-    let backup_path = export_publish_recovery_backup_path(final_path);
+
+    let prior = inspect_export_regular_file(final_path, "prior Pages export")?;
+    let candidate = inspect_export_regular_file(temp_path, "staged Pages export")?;
+    sync_export_regular_file(temp_path, &candidate, "staged Pages export")?;
+    let backup_path = unpredictable_export_publish_backup_path(final_path)?;
+    if replacement_path_entry_exists(&backup_path)? {
+        bail!(
+            "unpredictable Pages export backup path unexpectedly exists; preserved every generation: {}",
+            backup_path.display()
+        );
+    }
+    let journal =
+        write_export_publish_journal(final_path, &backup_path, &prior, &candidate)?;
+
     std::fs::rename(final_path, &backup_path).with_context(|| {
         format!(
-            "failed preparing backup {} before replacing {} after initial rename error: {}",
-            backup_path.display(),
+            "failed parking prior Pages export {} at journaled backup {}; staged candidate and journal were preserved",
             final_path.display(),
-            first_err
+            backup_path.display()
         )
     })?;
+    let parked = inspect_export_regular_file(&backup_path, "parked prior Pages export")?;
+    if parked.identity != prior.identity
+        || !evidence_matches(
+            &parked,
+            journal.prior_size_bytes,
+            &journal.prior_sha256,
+        )
+    {
+        *retain_temp_on_error = true;
+        bail!(
+            "parked Pages export {} changed identity or content; preserved it, the staged candidate {}, and the publish journal",
+            backup_path.display(),
+            temp_path.display()
+        );
+    }
     sync_parent_directory(&backup_path).with_context(|| {
         format!(
-            "prior Pages export was parked at {} and the staged candidate remains at {}, but the backup rename could not be durably synced",
+            "prior Pages export was parked at {} and staged candidate remains at {}, but the backup rename could not be durably synced; journal preserved",
             backup_path.display(),
             temp_path.display()
         )
@@ -1292,66 +1927,173 @@ fn replace_file_from_temp_via_backup(
 
     match std::fs::rename(temp_path, final_path) {
         Ok(()) => {
-            sync_parent_directory(final_path).with_context(|| {
-                format!(
-                    "new Pages export is live at {} and the prior generation remains at {}, but the replacement could not be durably synced",
-                    final_path.display(),
-                    backup_path.display()
+            let published =
+                inspect_export_regular_file(final_path, "published Pages export candidate")?;
+            if published.identity != candidate.identity
+                || !evidence_matches(
+                    &published,
+                    journal.candidate_size_bytes,
+                    &journal.candidate_sha256,
                 )
-            })?;
-            remove_prior_export_backup_after_publish(&backup_path, final_path)?;
-            sync_parent_directory(final_path).with_context(|| {
-                format!(
-                    "new Pages export is live at {} and its prior-generation backup was removed, but the backup cleanup could not be durably synced",
-                    final_path.display()
-                )
-            })?;
-            Ok(())
-        }
-        Err(second_err) => match std::fs::rename(&backup_path, final_path) {
-            Ok(()) => {
-                let replacement_error = anyhow::anyhow!(
-                    "failed replacing {} with {}: first error: {}; second error: {}; restored original file",
-                    final_path.display(),
-                    temp_path.display(),
-                    first_err,
-                    second_err
-                );
-                match sync_parent_directory(final_path) {
-                    Ok(()) => Err(replacement_error),
-                    Err(sync_error) => Err(replacement_error.context(format!(
-                        "the prior Pages export was restored at {}, but the restoration could not be durably synced: {sync_error:#}",
-                        final_path.display()
-                    ))),
-                }
-            }
-            Err(restore_err) => {
+            {
                 *retain_temp_on_error = true;
                 bail!(
-                    "failed replacing {} with {}: first error: {}; second error: {}; restore error: {}; temp file retained at {}; prior generation retained at {}",
+                    "published Pages export {} changed identity or content; prior generation and journal retained at {}",
                     final_path.display(),
-                    temp_path.display(),
-                    first_err,
-                    second_err,
-                    restore_err,
-                    temp_path.display(),
                     backup_path.display()
                 );
             }
-        },
+            sync_export_regular_file(
+                final_path,
+                &published,
+                "published Pages export candidate",
+            )?;
+            sync_parent_directory(final_path).with_context(|| {
+                format!(
+                    "new Pages export is live at {} and prior generation remains at {}, but publication could not be durably synced; journal preserved",
+                    final_path.display(),
+                    backup_path.display()
+                )
+            })?;
+            remove_prior_export_backup_after_publish(
+                &backup_path,
+                final_path,
+                &journal,
+                Some(prior.identity),
+            )
+        }
+        Err(publish_error) => {
+            let restore_probe =
+                inspect_export_regular_file(&backup_path, "parked prior Pages export")?;
+            if restore_probe.identity != prior.identity
+                || !evidence_matches(
+                    &restore_probe,
+                    journal.prior_size_bytes,
+                    &journal.prior_sha256,
+                )
+            {
+                *retain_temp_on_error = true;
+                bail!(
+                    "failed publishing staged Pages export {} at {}: {}; parked prior generation {} no longer matches its journal, so every artifact was preserved",
+                    temp_path.display(),
+                    final_path.display(),
+                    publish_error,
+                    backup_path.display()
+                );
+            }
+            match std::fs::rename(&backup_path, final_path) {
+                Ok(()) => {
+                    let restored =
+                        inspect_export_regular_file(final_path, "restored prior Pages export")?;
+                    if restored.identity != prior.identity
+                        || !evidence_matches(
+                            &restored,
+                            journal.prior_size_bytes,
+                            &journal.prior_sha256,
+                        )
+                    {
+                        *retain_temp_on_error = true;
+                        bail!(
+                            "failed publishing staged Pages export and restored path {} changed identity or content; staged candidate and journal preserved",
+                            final_path.display()
+                        );
+                    }
+                    sync_export_regular_file(
+                        final_path,
+                        &restored,
+                        "restored prior Pages export",
+                    )?;
+                    sync_parent_directory(final_path).with_context(|| {
+                        format!(
+                            "restored prior Pages export at {}, but could not durably sync the rollback; journal preserved",
+                            final_path.display()
+                        )
+                    })?;
+                    #[cfg(windows)]
+                    return Err(publish_error).context(format!(
+                        "restored prior Pages export at {}, but Windows std cannot prove durable journal cleanup; journal retained at {}",
+                        final_path.display(),
+                        export_publish_recovery_journal_path(final_path).display()
+                    ));
+                    #[cfg(not(windows))]
+                    {
+                        remove_export_publish_journal(final_path)?;
+                        Err(publish_error).with_context(|| {
+                            format!(
+                                "failed publishing staged Pages export {} at {}; restored the prior generation",
+                                temp_path.display(),
+                                final_path.display()
+                            )
+                        })
+                    }
+                }
+                Err(restore_error) => {
+                    *retain_temp_on_error = true;
+                    bail!(
+                        "failed publishing staged Pages export {} at {}: {}; restore error: {}; staged candidate retained at {}; prior generation retained at {}; journal retained at {}",
+                        temp_path.display(),
+                        final_path.display(),
+                        publish_error,
+                        restore_error,
+                        temp_path.display(),
+                        backup_path.display(),
+                        export_publish_recovery_journal_path(final_path).display()
+                    );
+                }
+            }
+        }
     }
 }
 
 #[cfg(any(windows, test))]
-fn remove_prior_export_backup_after_publish(backup_path: &Path, final_path: &Path) -> Result<()> {
-    match std::fs::remove_file(backup_path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(anyhow::Error::new(error).context(format!(
-            "new Pages export is live at {}, but the prior sensitive generation remains at {}",
-            final_path.display(),
-            backup_path.display()
-        ))),
+fn remove_prior_export_backup_after_publish(
+    backup_path: &Path,
+    final_path: &Path,
+    journal: &ExportPublishJournal,
+    expected_identity: Option<crate::franken_sync::FileIdentity>,
+) -> Result<()> {
+    #[cfg(windows)]
+    bail!(
+        "new Pages export is live at {}, but Windows std cannot prove durable namespace cleanup; prior generation {} and journal {} were preserved",
+        final_path.display(),
+        backup_path.display(),
+        export_publish_recovery_journal_path(final_path).display()
+    );
+
+    #[cfg(not(windows))]
+    {
+        let cleanup_probe =
+            inspect_export_regular_file(backup_path, "prior Pages export cleanup backup")?;
+        if expected_identity
+            .map(|identity| identity != cleanup_probe.identity)
+            .unwrap_or(false)
+            || !evidence_matches(
+                &cleanup_probe,
+                journal.prior_size_bytes,
+                &journal.prior_sha256,
+            )
+        {
+            bail!(
+                "new Pages export is live at {}, but prior-generation backup {} changed identity or content; backup and journal were preserved",
+                final_path.display(),
+                backup_path.display()
+            );
+        }
+        std::fs::remove_file(backup_path).with_context(|| {
+            format!(
+                "new Pages export is live at {}, but the validated prior sensitive generation remains at {}",
+                final_path.display(),
+                backup_path.display()
+            )
+        })?;
+        sync_parent_directory(backup_path).with_context(|| {
+            format!(
+                "new Pages export is live at {} and prior backup {} was removed, but backup deletion could not be durably synced; journal preserved",
+                final_path.display(),
+                backup_path.display()
+            )
+        })?;
+        remove_export_publish_journal(final_path)
     }
 }
 
@@ -1359,56 +2101,51 @@ fn replace_file_from_temp(
     temp_path: &Path,
     final_path: &Path,
     retain_temp_on_error: &mut bool,
+    publish_guard: &ExportPublishGuard,
 ) -> Result<()> {
     *retain_temp_on_error = false;
+    require_export_publish_guard(final_path, publish_guard)?;
+    let candidate = inspect_export_regular_file(temp_path, "staged Pages export")?;
+    sync_export_regular_file(temp_path, &candidate, "staged Pages export")?;
     #[cfg(windows)]
-    recover_or_refuse_interrupted_export_publish(final_path)?;
+    recover_or_refuse_interrupted_export_publish(final_path, publish_guard)?;
     #[cfg(windows)]
     reject_non_regular_existing_publish_destination(final_path)?;
     reject_existing_sqlite_sidecars(final_path, "destination")?;
     #[cfg(windows)]
     {
-        match std::fs::rename(temp_path, final_path) {
-            Ok(()) => {
-                sync_parent_directory(final_path).with_context(|| {
-                    format!(
-                        "new Pages export is live at {}, but its first publication could not be durably synced",
-                        final_path.display()
-                    )
-                })?;
-                Ok(())
-            }
-            Err(first_err)
-                if matches!(
-                    first_err.kind(),
-                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
-                ) =>
-            {
-                if replacement_path_entry_exists(final_path)? {
-                    replace_file_from_temp_via_backup(
-                        temp_path,
-                        final_path,
-                        &first_err,
-                        retain_temp_on_error,
-                    )
-                } else {
-                    Err(first_err).with_context(|| {
-                        format!(
-                            "failed renaming completed export {} into place at {}",
-                            temp_path.display(),
-                            final_path.display()
-                        )
-                    })
-                }
-            }
-            Err(rename_err) => Err(rename_err).with_context(|| {
-                format!(
-                    "failed renaming completed export {} into place at {}",
-                    temp_path.display(),
-                    final_path.display()
-                )
-            }),
+        if replacement_path_entry_exists(final_path)? {
+            return replace_file_from_temp_via_backup(
+                temp_path,
+                final_path,
+                retain_temp_on_error,
+                publish_guard,
+            );
         }
+        std::fs::rename(temp_path, final_path).with_context(|| {
+            format!(
+                "failed renaming completed export {} into place at {}",
+                temp_path.display(),
+                final_path.display()
+            )
+        })?;
+        let published = inspect_export_regular_file(final_path, "published Pages export")?;
+        if published.identity != candidate.identity
+            || !evidence_matches(&published, candidate.size_bytes, &candidate.sha256)
+        {
+            *retain_temp_on_error = true;
+            bail!(
+                "published Pages export {} changed identity or content after its staged rename",
+                final_path.display()
+            );
+        }
+        sync_export_regular_file(final_path, &published, "published Pages export")?;
+        sync_parent_directory(final_path).with_context(|| {
+            format!(
+                "new Pages export is live at {}, but its first publication could not be durably synced",
+                final_path.display()
+            )
+        })
     }
 
     #[cfg(not(windows))]
@@ -1420,6 +2157,17 @@ fn replace_file_from_temp(
                 final_path.display()
             )
         })?;
+        let published = inspect_export_regular_file(final_path, "published Pages export")?;
+        if published.identity != candidate.identity
+            || !evidence_matches(&published, candidate.size_bytes, &candidate.sha256)
+        {
+            *retain_temp_on_error = true;
+            bail!(
+                "published Pages export {} changed identity or content after its staged rename",
+                final_path.display()
+            );
+        }
+        sync_export_regular_file(final_path, &published, "published Pages export")?;
         sync_parent_directory(final_path).with_context(|| {
             format!(
                 "new Pages export is live at {}, but its publication could not be durably synced",
@@ -1555,6 +2303,17 @@ mod tests {
     use chrono::{Datelike, TimeZone};
     use std::path::Path;
     use tempfile::TempDir;
+
+    fn write_test_publish_journal(
+        final_path: &Path,
+        backup_path: &Path,
+        candidate_path: &Path,
+    ) -> Result<()> {
+        let prior = inspect_export_regular_file(backup_path, "test prior generation")?;
+        let candidate = inspect_export_regular_file(candidate_path, "test candidate generation")?;
+        write_export_publish_journal(final_path, backup_path, &prior, &candidate)?;
+        Ok(())
+    }
 
     // ==================== ExportFilter tests ====================
 
@@ -2174,82 +2933,106 @@ mod tests {
     }
 
     #[test]
-    fn publish_recovery_backup_path_is_stable_and_reserved() -> Result<()> {
+    fn publish_recovery_uses_stable_journal_and_unpredictable_backups() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let final_path = temp_dir.path().join("export.db");
-        let first = export_publish_recovery_backup_path(&final_path);
-        let second = export_publish_recovery_backup_path(&final_path);
+        let journal_path = export_publish_recovery_journal_path(&final_path);
+        let first = unpredictable_export_publish_backup_path(&final_path)?;
+        let second = unpredictable_export_publish_backup_path(&final_path)?;
 
-        assert_eq!(first, second, "recovery path must survive process restart");
         assert_eq!(
-            first.file_name().and_then(|name| name.to_str()),
-            Some(".export.db.pages-export-publish-in-progress.bak")
+            journal_path.file_name().and_then(|name| name.to_str()),
+            Some(".export.db.pages-export-publish-in-progress.json")
         );
-
+        assert_ne!(first, second, "backup nonce must not be reused");
+        for backup_path in [first, second] {
+            let name = backup_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| anyhow::anyhow!("backup name is not UTF-8"))?;
+            assert!(name.starts_with(".export.db.publish-backup."));
+            assert_eq!(name.rsplit_once('.').map(|(_, nonce)| nonce.len()), Some(32));
+        }
         Ok(())
     }
 
     #[test]
-    fn interrupted_publish_restores_prior_generation_when_live_path_is_missing() -> Result<()> {
+    fn interrupted_publish_refuses_unmarked_deterministic_backup() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let final_path = temp_dir.path().join("export.db");
-        let backup_path = export_publish_recovery_backup_path(&final_path);
-        std::fs::write(&backup_path, b"prior generation")?;
+        let backup_path = legacy_export_publish_recovery_backup_path(&final_path);
+        std::fs::write(&backup_path, b"unowned bytes")?;
+        let guard = acquire_export_publish_guard(&final_path)?;
 
-        recover_or_refuse_interrupted_export_publish(&final_path)?;
+        let error = recover_or_refuse_interrupted_export_publish(&final_path, &guard)
+            .expect_err("an unmarked deterministic backup must never be adopted");
+
+        assert!(format!("{error:#}").contains("unmarked"));
+        assert_eq!(std::fs::read(&backup_path)?, b"unowned bytes");
+        assert!(std::fs::symlink_metadata(&final_path).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn interrupted_publish_restores_only_journaled_prior_generation() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let final_path = temp_dir.path().join("export.db");
+        let backup_path = unpredictable_export_publish_backup_path(&final_path)?;
+        let candidate_path = temp_dir.path().join("candidate-evidence.db");
+        std::fs::write(&backup_path, b"prior generation")?;
+        std::fs::write(&candidate_path, b"candidate generation")?;
+        let guard = acquire_export_publish_guard(&final_path)?;
+        write_test_publish_journal(&final_path, &backup_path, &candidate_path)?;
+
+        recover_or_refuse_interrupted_export_publish(&final_path, &guard)?;
 
         assert_eq!(std::fs::read(&final_path)?, b"prior generation");
+        assert!(std::fs::symlink_metadata(&backup_path).is_err());
         assert!(
-            std::fs::symlink_metadata(&backup_path).is_err(),
-            "successful recovery must consume the parked backup entry"
+            std::fs::symlink_metadata(export_publish_recovery_journal_path(&final_path)).is_err()
         );
-
         Ok(())
     }
 
     #[test]
-    fn interrupted_publish_preserves_both_ambiguous_generations() -> Result<()> {
+    fn interrupted_publish_finalizes_journaled_completed_generation() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let final_path = temp_dir.path().join("export.db");
-        let backup_path = export_publish_recovery_backup_path(&final_path);
-        std::fs::write(&final_path, b"possibly new generation")?;
+        let backup_path = unpredictable_export_publish_backup_path(&final_path)?;
+        std::fs::write(&final_path, b"candidate generation")?;
         std::fs::write(&backup_path, b"prior generation")?;
+        let guard = acquire_export_publish_guard(&final_path)?;
+        write_test_publish_journal(&final_path, &backup_path, &final_path)?;
 
-        let error = recover_or_refuse_interrupted_export_publish(&final_path)
-            .expect_err("both generations must be preserved for explicit resolution");
-        let message = format!("{error:#}");
+        recover_or_refuse_interrupted_export_publish(&final_path, &guard)?;
 
-        assert!(message.contains(&final_path.display().to_string()));
-        assert!(message.contains(&backup_path.display().to_string()));
-        assert_eq!(std::fs::read(&final_path)?, b"possibly new generation");
-        assert_eq!(std::fs::read(&backup_path)?, b"prior generation");
-
+        assert_eq!(std::fs::read(&final_path)?, b"candidate generation");
+        assert!(std::fs::symlink_metadata(&backup_path).is_err());
+        assert!(
+            std::fs::symlink_metadata(export_publish_recovery_journal_path(&final_path)).is_err()
+        );
         Ok(())
     }
 
     #[test]
-    fn interrupted_publish_preserves_backup_with_sqlite_companion() -> Result<()> {
+    fn interrupted_publish_preserves_journaled_backup_after_content_drift() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let final_path = temp_dir.path().join("export.db");
-        let backup_path = export_publish_recovery_backup_path(&final_path);
-        let backup_sidecar = sqlite_content_artifact_paths(&backup_path)
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("SQLite artifact family unexpectedly empty"))?;
-        std::fs::write(&backup_path, b"prior main")?;
-        std::fs::write(&backup_sidecar, b"prior companion")?;
+        let backup_path = unpredictable_export_publish_backup_path(&final_path)?;
+        let candidate_path = temp_dir.path().join("candidate-evidence.db");
+        std::fs::write(&backup_path, b"prior generation")?;
+        std::fs::write(&candidate_path, b"candidate generation")?;
+        let guard = acquire_export_publish_guard(&final_path)?;
+        write_test_publish_journal(&final_path, &backup_path, &candidate_path)?;
+        std::fs::write(&backup_path, b"changed generation")?;
 
-        let error = recover_or_refuse_interrupted_export_publish(&final_path)
-            .expect_err("main-only recovery must refuse a backup with companions");
+        let error = recover_or_refuse_interrupted_export_publish(&final_path, &guard)
+            .expect_err("drifted recovery bytes must never be restored or removed");
 
-        assert!(format!("{error:#}").contains(&backup_sidecar.display().to_string()));
-        assert_eq!(std::fs::read(&backup_path)?, b"prior main");
-        assert_eq!(std::fs::read(&backup_sidecar)?, b"prior companion");
-        assert!(
-            std::fs::symlink_metadata(&final_path).is_err(),
-            "refused recovery must not create a live main file"
-        );
-
+        assert!(format!("{error:#}").contains("does not match"));
+        assert_eq!(std::fs::read(&backup_path)?, b"changed generation");
+        assert!(std::fs::symlink_metadata(&final_path).is_err());
+        assert!(export_publish_recovery_journal_path(&final_path).is_file());
         Ok(())
     }
 
@@ -2257,15 +3040,19 @@ mod tests {
     fn interrupted_publish_preserves_backup_when_destination_companion_survives() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let final_path = temp_dir.path().join("export.db");
-        let backup_path = export_publish_recovery_backup_path(&final_path);
+        let backup_path = unpredictable_export_publish_backup_path(&final_path)?;
+        let candidate_path = temp_dir.path().join("candidate-evidence.db");
         let destination_sidecar = sqlite_content_artifact_paths(&final_path)
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("SQLite artifact family unexpectedly empty"))?;
         std::fs::write(&backup_path, b"prior main")?;
+        std::fs::write(&candidate_path, b"candidate main")?;
         std::fs::write(&destination_sidecar, b"unbound destination companion")?;
+        let guard = acquire_export_publish_guard(&final_path)?;
+        write_test_publish_journal(&final_path, &backup_path, &candidate_path)?;
 
-        let error = recover_or_refuse_interrupted_export_publish(&final_path)
+        let error = recover_or_refuse_interrupted_export_publish(&final_path, &guard)
             .expect_err("recovery must not mix a parked main with destination companions");
 
         assert!(format!("{error:#}").contains(&destination_sidecar.display().to_string()));
@@ -2275,30 +3062,41 @@ mod tests {
             b"unbound destination companion"
         );
         assert!(std::fs::symlink_metadata(&final_path).is_err());
-
         Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn interrupted_publish_preserves_unowned_recovery_symlink() -> Result<()> {
+    fn publish_lock_rejects_symlink_before_opening_target() -> Result<()> {
         use std::os::unix::fs::symlink;
 
         let temp_dir = TempDir::new()?;
         let final_path = temp_dir.path().join("export.db");
-        let backup_path = export_publish_recovery_backup_path(&final_path);
-        let unowned_target = temp_dir.path().join("unowned.db");
-        std::fs::write(&unowned_target, b"unowned bytes")?;
-        symlink(&unowned_target, &backup_path)?;
+        let lock_path = export_publish_lock_path(&final_path);
+        let target_path = temp_dir.path().join("unowned-lock-target");
+        std::fs::write(&target_path, b"unowned lock bytes")?;
+        symlink(&target_path, &lock_path)?;
 
-        let error = recover_or_refuse_interrupted_export_publish(&final_path)
-            .expect_err("a recovery symlink must never be followed or moved into place");
+        let error = acquire_export_publish_guard(&final_path)
+            .expect_err("publish lock acquisition must reject a pre-existing symlink");
 
-        assert!(format!("{error:#}").contains("not a regular file"));
-        assert!(std::fs::symlink_metadata(&backup_path)?.file_type().is_symlink());
-        assert_eq!(std::fs::read(&unowned_target)?, b"unowned bytes");
-        assert!(std::fs::symlink_metadata(&final_path).is_err());
+        assert!(format!("{error:#}").contains("refused to open"));
+        assert!(std::fs::symlink_metadata(&lock_path)?.file_type().is_symlink());
+        assert_eq!(std::fs::read(&target_path)?, b"unowned lock bytes");
+        Ok(())
+    }
 
+    #[test]
+    fn publish_lock_serializes_same_destination() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let final_path = temp_dir.path().join("export.db");
+        let first_guard = acquire_export_publish_guard(&final_path)?;
+
+        let error = acquire_export_publish_guard(&final_path)
+            .expect_err("a second publisher must not acquire the same destination lock");
+
+        assert!(format!("{error:#}").contains("already publishing"));
+        assert_eq!(first_guard.final_path, final_path);
         Ok(())
     }
 

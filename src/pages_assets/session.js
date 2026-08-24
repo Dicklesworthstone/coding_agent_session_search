@@ -48,24 +48,27 @@ function decodeBytes(base64) {
 
 function getPersistentStorages() {
     const storages = [];
+    let accessFailed = false;
 
     try {
         if (typeof sessionStorage !== 'undefined') {
-            storages.push(sessionStorage);
+            storages.push({ name: 'sessionStorage', storage: sessionStorage });
         }
     } catch (error) {
-        // Ignore unavailable storage backends and fall back to memory-only behavior.
+        console.warn('[Session] Could not access sessionStorage during cleanup:', error);
+        accessFailed = true;
     }
 
     try {
         if (typeof localStorage !== 'undefined') {
-            storages.push(localStorage);
+            storages.push({ name: 'localStorage', storage: localStorage });
         }
     } catch (error) {
-        // Ignore unavailable storage backends and fall back to memory-only behavior.
+        console.warn('[Session] Could not access localStorage during cleanup:', error);
+        accessFailed = true;
     }
 
-    return storages;
+    return { storages, accessFailed };
 }
 
 /**
@@ -124,19 +127,34 @@ export class SessionManager {
      * @param {boolean} rememberMe - Whether to persist the session
      */
     async startSession(dek, rememberMe = false) {
-        this.clearStorage();
-        this.dek = dek;
+        if (!(dek instanceof Uint8Array) || dek.byteLength === 0) {
+            throw new TypeError('Session DEK must be a non-empty Uint8Array');
+        }
+        if (!this.clearStorage()) {
+            throw new Error('Previous persisted session data could not be fully cleared');
+        }
 
         const expiry = Date.now() + this.duration;
-        this.expiryTs = expiry;
-        this.persistent = rememberMe && this.storage !== SESSION_CONFIG.STORAGE_MEMORY;
+        const persistent = rememberMe && this.storage !== SESSION_CONFIG.STORAGE_MEMORY;
 
-        if (this.persistent) {
+        if (persistent) {
             const storage = this.getStorage();
             const sessionKeys = getScopedSessionKeys();
-            storage.setItem(sessionKeys.TOKEN, encodeBytes(dek));
-            storage.setItem(sessionKeys.EXPIRY, expiry.toString());
+            try {
+                storage.setItem(sessionKeys.TOKEN, encodeBytes(dek));
+                storage.setItem(sessionKeys.EXPIRY, expiry.toString());
+            } catch (error) {
+                if (!this.clearStorage()) {
+                    console.warn('[Session] Failed session start left persisted data that could not be fully cleared');
+                }
+                throw new Error('Failed to persist the new session', { cause: error });
+            }
         }
+
+        // Publish active state only after persistent writes have committed.
+        this.dek = dek;
+        this.expiryTs = expiry;
+        this.persistent = persistent;
 
         // Set timers
         this.setTimers(expiry);
@@ -162,7 +180,9 @@ export class SessionManager {
 
         if (!token || Date.now() > expiry) {
             console.log('[Session] No valid session to restore');
-            this.clearStorage();
+            if (!this.clearStorage()) {
+                console.warn('[Session] Invalid persisted session data could not be fully cleared');
+            }
             return null;
         }
 
@@ -180,13 +200,16 @@ export class SessionManager {
             return dek;
         } catch (error) {
             console.error('[Session] Failed to restore:', error);
-            this.clearStorage();
+            if (!this.clearStorage()) {
+                console.warn('[Session] Unrestorable persisted session data could not be fully cleared');
+            }
             return null;
         }
     }
 
     /**
      * End the current session and cleanup
+     * @returns {boolean} Whether all persisted session keys were removed
      */
     endSession() {
         console.log('[Session] Ending session');
@@ -202,11 +225,19 @@ export class SessionManager {
         this.expiryTs = 0;
         this.persistent = false;
 
-        // Clear storage
-        this.clearStorage();
+        let storageCleared = false;
+        try {
+            // Clear storage
+            storageCleared = this.clearStorage();
+        } finally {
+            // Listener teardown must not depend on Web Storage availability.
+            this.removeCleanupHandlers();
+        }
 
-        // Remove cleanup handlers
-        this.removeCleanupHandlers();
+        if (!storageCleared) {
+            console.warn('[Session] Session ended, but persisted session data could not be fully cleared');
+        }
+        return storageCleared;
     }
 
     /**
@@ -335,15 +366,43 @@ export class SessionManager {
 
     /**
      * Clear all session data from storage
+     * @returns {boolean} Whether every session key was removed from every accessible backend
      */
     clearStorage() {
         const sessionKeys = getScopedSessionKeys();
-        this.memoryStorage.removeItem(sessionKeys.TOKEN);
-        this.memoryStorage.removeItem(sessionKeys.EXPIRY);
-        for (const storage of getPersistentStorages()) {
-            storage.removeItem(sessionKeys.TOKEN);
-            storage.removeItem(sessionKeys.EXPIRY);
+        const keys = new Set([
+            sessionKeys.TOKEN,
+            sessionKeys.EXPIRY,
+            // Clear sensitive keys written by pre-scope viewer versions too.
+            SESSION_CONFIG.KEY_SESSION_TOKEN,
+            SESSION_CONFIG.KEY_EXPIRY,
+        ]);
+        let cleared = true;
+
+        for (const key of keys) {
+            this.memoryStorage.removeItem(key);
+            if (this.memoryStorage.getItem(key) !== null) {
+                cleared = false;
+            }
         }
+
+        const { storages, accessFailed } = getPersistentStorages();
+        cleared = !accessFailed && cleared;
+        for (const { name, storage } of storages) {
+            for (const key of keys) {
+                try {
+                    storage.removeItem(key);
+                    if (storage.getItem(key) !== null) {
+                        cleared = false;
+                    }
+                } catch (error) {
+                    console.warn(`[Session] Could not clear ${key} from ${name}:`, error);
+                    cleared = false;
+                }
+            }
+        }
+
+        return cleared;
     }
 
     /**

@@ -673,6 +673,7 @@ fn validate_unencrypted_config(config: &UnencryptedConfig) -> Vec<String> {
     } else {
         let path = Path::new(&config.payload.path);
         validate_payload_path(&mut errors, "payload.path", path);
+        validate_browser_payload_url_path(&mut errors, "payload.path", &config.payload.path);
     }
 
     let valid_formats = ["sqlite"];
@@ -713,6 +714,31 @@ fn validate_payload_path(errors: &mut Vec<String>, label: &str, path: &Path) -> 
         ok = false;
     }
     ok
+}
+
+/// Mirror the browser's URL-path checks for an unencrypted payload.
+///
+/// `Path` validation alone is insufficient here: filesystems normalize empty
+/// and `.` components, while URL fetches interpret percent escapes and reserve
+/// query/fragment delimiters. A bundle must not verify successfully when the
+/// shipped browser loader will reject it or request a different resource.
+fn validate_browser_payload_url_path(errors: &mut Vec<String>, label: &str, raw_path: &str) {
+    if raw_path.contains(['?', '#', '\\', '%']) {
+        errors.push(format!(
+            "{label} contains URL query, fragment, backslash, or percent-escape characters"
+        ));
+    }
+
+    let segments = raw_path.split('/').collect::<Vec<_>>();
+    if segments.len() < 2 {
+        errors.push(format!("{label} must reference a file under payload/"));
+    }
+
+    for segment in segments {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            errors.push(format!("{label} contains an empty or traversal URL segment"));
+        }
+    }
 }
 
 /// Check payload manifest validity
@@ -1986,6 +2012,52 @@ mod tests {
                     .is_some_and(|details| details.contains("size does not match")),
             "payload bytes must exactly match their declaration: {:?}",
             manifest.details
+        );
+    }
+
+    #[test]
+    fn unencrypted_payload_path_must_match_browser_url_semantics() {
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+        copy_fixture("unencrypted", &site_dir).unwrap();
+        let config_path = site_dir.join("config.json");
+        let original: Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+
+        for invalid_path in [
+            "payload//data.sqlite",
+            "payload/./data.sqlite",
+            "payload/%2e%2e/data.sqlite",
+            "payload/subdir%2fdata.sqlite",
+            "payload/subdir%5cdata.sqlite",
+            "payload/data.sqlite?download=1",
+            "payload/data.sqlite#fragment",
+            "payload/%zz.sqlite",
+            "payload/data%20copy.sqlite",
+        ] {
+            let mut config = original.clone();
+            config["payload"]["path"] = Value::from(invalid_path);
+            fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+            let schema = check_config_schema(&site_dir);
+            assert!(
+                !schema.passed,
+                "browser-incompatible payload path must fail verification: {invalid_path}"
+            );
+        }
+
+        let mut ordinary_filename = original;
+        ordinary_filename["payload"]["path"] = Value::from("payload/data copy.sqlite");
+        fs::write(
+            &config_path,
+            serde_json::to_vec_pretty(&ordinary_filename).unwrap(),
+        )
+        .unwrap();
+        let schema = check_config_schema(&site_dir);
+        assert!(
+            schema.passed,
+            "ordinary filename characters should remain valid: {:?}",
+            schema.details
         );
     }
 

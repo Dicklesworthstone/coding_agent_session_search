@@ -52,34 +52,40 @@ function checkedDatabaseAllocationSize(byteLength) {
 
 /**
  * Initialize sqlite-wasm with decrypted database bytes
- * @param {Uint8Array} dbBytes - Decrypted database bytes
+ * Ownership of a valid Uint8Array transfers to this function. It is zeroized
+ * on every return path and must not be read or modified by the caller again.
+ * @param {Uint8Array} dbBytes - Owned decrypted database bytes
  * @returns {Promise<void>}
  */
 export async function initDatabase(dbBytes) {
-    if (isInitialized) {
-        console.warn('[DB] Already initialized');
-        return;
+    if (!(dbBytes instanceof Uint8Array)) {
+        throw new TypeError('Database payload must be a Uint8Array');
     }
-    if (initializationPromise) {
-        throw new Error('Database initialization is already in progress');
-    }
-    if (!(dbBytes instanceof Uint8Array) || dbBytes.byteLength === 0) {
-        throw new TypeError('Database payload must be a non-empty Uint8Array');
-    }
-    checkedDatabaseAllocationSize(dbBytes.byteLength);
 
-    console.log('[DB] Initializing sqlite-wasm...');
-    const generation = ++lifecycleGeneration;
-    // Own a stable copy across module loading/OPFS awaits. The caller is free
-    // to transfer, overwrite, or release its view after this function starts.
-    const ownedBytes = new Uint8Array(dbBytes);
-    const pending = initializeDatabase(ownedBytes, generation);
-    initializationPromise = pending;
+    let pending = null;
     try {
+        checkedDatabaseAllocationSize(dbBytes.byteLength);
+        if (isInitialized) {
+            console.warn('[DB] Already initialized');
+            return;
+        }
+        if (initializationPromise) {
+            throw new Error('Database initialization is already in progress');
+        }
+
+        console.log('[DB] Initializing sqlite-wasm...');
+        const generation = ++lifecycleGeneration;
+        pending = initializeDatabase(dbBytes, generation);
+        initializationPromise = pending;
         await pending;
     } finally {
-        ownedBytes.fill(0);
-        if (initializationPromise === pending) {
+        try {
+            dbBytes.fill(0);
+        } catch {
+            // A caller which violated the ownership contract may have detached
+            // the view; never let cleanup obscure the initialization result.
+        }
+        if (pending && initializationPromise === pending) {
             initializationPromise = null;
         }
     }
