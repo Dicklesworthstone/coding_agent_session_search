@@ -9392,8 +9392,15 @@ fn can_skip_unchanged_explicit_watch_once_index_run(
     opts: &IndexOptions,
     storage: &FrankenStorage,
     index_path: &Path,
+    canonical_rebuild_required: bool,
 ) -> Result<bool> {
-    if opts.watch || opts.full || opts.force_rebuild || opts.semantic || opts.build_hnsw {
+    if canonical_rebuild_required
+        || opts.watch
+        || opts.full
+        || opts.force_rebuild
+        || opts.semantic
+        || opts.build_hnsw
+    {
         return Ok(false);
     }
     if opts
@@ -13819,7 +13826,7 @@ pub fn run_index(
     complete_preflight_phase!();
 
     preflight_phase!("watch_startup:reclassify_legacy_omp");
-    let legacy_omp_upgrade = storage
+    let mut legacy_omp_upgrade = storage
         .reclassify_legacy_omp_conversations()
         .with_context(|| "reclassifying legacy Pi-labeled OMP archive rows")?;
     if legacy_omp_upgrade.conversations_reclassified > 0 {
@@ -13846,7 +13853,12 @@ pub fn run_index(
         ));
     }
 
-    if can_skip_unchanged_explicit_watch_once_index_run(&opts, &storage, &index_path)? {
+    if can_skip_unchanged_explicit_watch_once_index_run(
+        &opts,
+        &storage,
+        &index_path,
+        legacy_omp_upgrade.lexical_rebuild_required,
+    )? {
         let now_ms = FrankenStorage::now_millis();
         persist_final_index_run_metadata(&storage, &opts.db_path, false, now_ms, now_ms)?;
         record_lexical_population_strategy_if_unset(
@@ -14393,6 +14405,23 @@ pub fn run_index(
                 messages_imported = historical_salvage.messages_imported,
                 "historical cass bundles merged into canonical database before scan"
             );
+            let imported_omp_upgrade = storage
+                .reclassify_legacy_omp_conversations_after_historical_import()
+                .with_context(
+                    || "reclassifying legacy Pi-labeled OMP rows imported from historical bundles",
+                )?;
+            if imported_omp_upgrade.conversations_reclassified > 0 {
+                tracing::info!(
+                    conversations = imported_omp_upgrade.conversations_reclassified,
+                    "reclassified legacy OMP conversations imported from historical bundles"
+                );
+            }
+            legacy_omp_upgrade.conversations_reclassified = legacy_omp_upgrade
+                .conversations_reclassified
+                .saturating_add(imported_omp_upgrade.conversations_reclassified);
+            legacy_omp_upgrade.lexical_rebuild_required |=
+                imported_omp_upgrade.lexical_rebuild_required;
+            needs_rebuild |= imported_omp_upgrade.lexical_rebuild_required;
         }
         let rebuild_from_canonical_only =
             canonical_only_full_rebuild && historical_salvage.conversations_imported == 0;
@@ -25525,11 +25554,33 @@ fn explicit_watch_once_connector_hint(path: &Path) -> Option<ConnectorKind> {
         Some(ConnectorKind::Claude)
     } else if has_pair(".gemini", "tmp") {
         Some(ConnectorKind::Gemini)
-    } else if components.iter().any(|component| component == ".omp") || has_pair("share", "omp") {
+    } else if crate::connectors::omp::owns_session_path(path) {
         Some(ConnectorKind::Omp)
     } else {
         None
     }
+}
+
+fn explicit_watch_once_scan_path(kind: ConnectorKind, path: &Path) -> PathBuf {
+    if kind != ConnectorKind::Omp {
+        return path.to_path_buf();
+    }
+    if let Some(root) = crate::connectors::omp::configured_session_root(path) {
+        return root;
+    }
+
+    // FAD accepts a direct `.omp` transcript as an explicit root, but an XDG
+    // transcript path has no `.omp` marker. Retain the nearest `sessions`
+    // root so OMP's v18 resolver can recognize and scan it.
+    if !path.to_string_lossy().contains(".omp") {
+        return path
+            .ancestors()
+            .find(|ancestor| ancestor.file_name().is_some_and(|name| name == "sessions"))
+            .unwrap_or(path)
+            .to_path_buf();
+    }
+
+    path.to_path_buf()
 }
 
 fn classify_paths(
@@ -25561,20 +25612,7 @@ fn classify_paths(
                 if p.starts_with(&root.path) {
                     matched_root = true;
                     let scan_path = if prefer_explicit_paths {
-                        // FAD accepts a direct `.omp` transcript as an
-                        // explicit root, but an XDG transcript path has no
-                        // `.omp` marker. Retain the nearest `sessions` root so
-                        // OMP's v18 resolver can recognize and scan it.
-                        if *kind == ConnectorKind::Omp && !p.to_string_lossy().contains(".omp") {
-                            p.ancestors()
-                                .find(|ancestor| {
-                                    ancestor.file_name().is_some_and(|name| name == "sessions")
-                                })
-                                .unwrap_or(&p)
-                                .to_path_buf()
-                        } else {
-                            p.clone()
-                        }
+                        explicit_watch_once_scan_path(*kind, &p)
                     } else {
                         root.path.clone()
                     };
@@ -25602,10 +25640,10 @@ fn classify_paths(
                 && !matched_root
                 && let Some(hinted_kind) = hinted_kind
             {
-                let mut scan_root = ScanRoot::local(p.clone());
-                scan_root.path = p.clone();
+                let scan_path = explicit_watch_once_scan_path(hinted_kind, &p);
+                let scan_root = ScanRoot::local(scan_path.clone());
                 let entry = batch_map
-                    .entry((hinted_kind, p.clone()))
+                    .entry((hinted_kind, scan_path))
                     .or_insert((scan_root, None, None));
                 entry.1 = match (entry.1, ts) {
                     (Some(prev), Some(cur)) => Some(prev.min(cur)),
@@ -48267,6 +48305,92 @@ mod tests {
 
     #[test]
     #[serial]
+    fn classify_paths_keeps_custom_omp_session_override_for_watch_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions_root = tmp.path().join("launch-sessions");
+        let session = sessions_root
+            .join("-projects-cass")
+            .join("2026-08-23T12-00-00_omp.jsonl");
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(&session, b"{}\n").unwrap();
+        let _session_dir = set_env_var(
+            "PI_CODING_AGENT_SESSION_DIR",
+            sessions_root.to_string_lossy(),
+        );
+
+        let classified = classify_paths(vec![session], &[], true);
+
+        assert_eq!(classified.len(), 1);
+        assert_eq!(classified[0].0, ConnectorKind::Omp);
+        assert_eq!(classified[0].1.path, sessions_root);
+        assert!(classified[0].2.is_some());
+        assert!(classified[0].3.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn reindex_paths_watch_once_indexes_custom_omp_session_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        let sessions_root = tmp.path().join("launch-sessions");
+        let session = sessions_root
+            .join("-projects-cass")
+            .join("2026-08-23T12-00-00_omp.jsonl");
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            &session,
+            r#"{"type":"session","version":3,"id":"omp-watch-once","timestamp":"2026-08-23T12:00:00Z","cwd":"/projects/cass"}
+{"type":"message","timestamp":"2026-08-23T12:00:01Z","message":{"role":"user","content":"watch custom OMP root"}}
+{"type":"message","timestamp":"2026-08-23T12:00:02Z","message":{"role":"assistant","content":"indexed"}}
+"#,
+        )
+        .unwrap();
+        let _session_dir = set_env_var(
+            "PI_CODING_AGENT_SESSION_DIR",
+            sessions_root.to_string_lossy(),
+        );
+        let _profile = set_env_var("OMP_PROFILE", "review");
+        let opts = super::IndexOptions {
+            full: false,
+            watch: false,
+            force_rebuild: false,
+            watch_once_paths: Some(vec![session.clone()]),
+            db_path: data_dir.join("db.sqlite"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_interval_secs: 30,
+        };
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        let index_path = index_dir(&opts.data_dir).unwrap();
+        let state = Mutex::new(HashMap::new());
+        let storage = Mutex::new(storage);
+        let t_index = Mutex::new(None);
+
+        let indexed = reindex_paths(
+            &opts,
+            vec![session],
+            &[],
+            &state,
+            &storage,
+            &t_index,
+            &index_path,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(indexed, 1);
+        let conversations = storage.lock().unwrap().list_conversations(10, 0).unwrap();
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].agent_slug, "omp");
+        assert_eq!(conversations[0].metadata_json["profile"], "review");
+    }
+
+    #[test]
+    #[serial]
     fn reindex_paths_watch_once_indexes_explicit_codex_path_without_detected_root() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("cass-data");
@@ -50710,11 +50834,21 @@ mod tests {
 
         let startup_skip = {
             let guard = storage.lock().unwrap();
-            can_skip_unchanged_explicit_watch_once_index_run(&opts, &guard, &index_path).unwrap()
+            can_skip_unchanged_explicit_watch_once_index_run(&opts, &guard, &index_path, false)
+                .unwrap()
         };
         assert!(
             startup_skip,
             "unchanged explicit watch-once files with current lexical assets can skip startup maintenance"
+        );
+        let migration_skip = {
+            let guard = storage.lock().unwrap();
+            can_skip_unchanged_explicit_watch_once_index_run(&opts, &guard, &index_path, true)
+                .unwrap()
+        };
+        assert!(
+            !migration_skip,
+            "a pending canonical identity migration must publish fresh lexical assets"
         );
 
         let second = reindex_paths(
@@ -53797,7 +53931,7 @@ mod tests {
     }
 
     #[test]
-    fn cass_connector_registry_only_replaces_codex_factory() {
+    fn cass_connector_registry_installs_every_cass_adapter() {
         let upstream = franken_agent_detection::get_connector_factories();
         let configured = get_connector_factories();
         assert_eq!(configured.len(), upstream.len());
@@ -53806,7 +53940,7 @@ mod tests {
             configured.into_iter().zip(upstream)
         {
             assert_eq!(configured_name, upstream_name);
-            if configured_name == "codex" {
+            if matches!(configured_name, "codex" | "omp" | "pi_agent") {
                 assert!(!std::ptr::fn_addr_eq(configured_factory, upstream_factory));
             } else {
                 assert!(std::ptr::fn_addr_eq(configured_factory, upstream_factory));

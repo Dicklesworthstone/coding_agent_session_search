@@ -1,8 +1,8 @@
 //! Connectors for agent histories.
 //!
 //! Most connector implementations live in `franken_agent_detection`.
-//! This module provides re-export stubs plus the CASS-specific Codex enrichment
-//! wrapper used by every connector factory exposed to the indexer.
+//! This module provides re-export stubs plus the CASS-specific wrappers used by
+//! every connector factory exposed to the indexer.
 
 use std::fs;
 use std::io;
@@ -264,21 +264,32 @@ fn codex_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(codex::CodexConnector::new())
 }
 
+fn omp_connector_factory() -> Box<dyn Connector + Send> {
+    Box::new(omp::OmpConnector::new())
+}
+
+fn pi_agent_connector_factory() -> Box<dyn Connector + Send> {
+    Box::new(pi_agent::PiAgentConnector::new())
+}
+
 /// Return connector factories with CASS-specific wrappers applied.
 ///
-/// Non-Codex factories remain exactly the upstream FAD factories. Codex must
-/// pass through CASS's enrichment wrapper so modern `function_call` arguments
-/// reach the production indexer instead of remaining placeholder-only content.
+/// Codex passes through CASS's enrichment wrapper so modern `function_call`
+/// arguments reach the production indexer. OMP passes through its profile
+/// provenance adapter, and Pi Agent passes through the OMP identity boundary
+/// that prevents broad explicit roots from indexing the same store twice.
 #[must_use]
 pub fn get_connector_factories() -> Vec<(&'static str, ConnectorFactory)> {
     franken_agent_detection::get_connector_factories()
         .into_iter()
         .map(|(name, factory)| {
-            if name == "codex" {
-                (name, codex_connector_factory as ConnectorFactory)
-            } else {
-                (name, factory)
-            }
+            let factory = match name {
+                "codex" => codex_connector_factory as ConnectorFactory,
+                "omp" => omp_connector_factory as ConnectorFactory,
+                "pi_agent" => pi_agent_connector_factory as ConnectorFactory,
+                _ => factory,
+            };
+            (name, factory)
         })
         .collect()
 }

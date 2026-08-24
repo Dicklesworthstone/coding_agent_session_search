@@ -91213,31 +91213,32 @@ fn infer_followup_agent_and_workspace(path: &Path) -> (Option<String>, Option<St
     let path_str = path.to_string_lossy();
     let path_lower = path_str.to_ascii_lowercase().replace('\\', "/");
 
-    let agent_name = [
-        (".local/share/opencode", "opencode"),
-        ("sourcegraph.amp", "amp"),
-        (".local/share/amp", "amp"),
-        (".config/gh-copilot", "copilot"),
-        (".config/gh/copilot", "copilot"),
-        ("github-copilot", "copilot"),
-        (".copilot", "copilot"),
-        (".omp/", "omp"),
-        ("/omp/profiles/", "omp"),
-        ("/omp/sessions", "omp"),
-        (".pi/agent", "pi_agent"),
-        (".openclaw", "openclaw"),
-        ("clawdbot", "clawdbot"),
-        ("cline", "cline"),
-        (".aider", "aider"),
-        (".claude", "claude_code"),
-        (".codex", "codex"),
-        ("cursor", "cursor"),
-        (".config/gemini", "gemini"),
-        (".gemini", "gemini"),
-        (".vibe", "vibe"),
-    ]
-    .into_iter()
-    .find_map(|(marker, slug)| path_lower.contains(marker).then(|| slug.to_string()));
+    let agent_name = if crate::connectors::omp::owns_session_path(path) {
+        Some("omp".to_string())
+    } else {
+        [
+            (".local/share/opencode", "opencode"),
+            ("sourcegraph.amp", "amp"),
+            (".local/share/amp", "amp"),
+            (".config/gh-copilot", "copilot"),
+            (".config/gh/copilot", "copilot"),
+            ("github-copilot", "copilot"),
+            (".copilot", "copilot"),
+            (".pi/agent", "pi_agent"),
+            (".openclaw", "openclaw"),
+            ("clawdbot", "clawdbot"),
+            ("cline", "cline"),
+            (".aider", "aider"),
+            (".claude", "claude_code"),
+            (".codex", "codex"),
+            ("cursor", "cursor"),
+            (".config/gemini", "gemini"),
+            (".gemini", "gemini"),
+            (".vibe", "vibe"),
+        ]
+        .into_iter()
+        .find_map(|(marker, slug)| path_lower.contains(marker).then(|| slug.to_string()))
+    };
 
     let workspace = path.parent().map(|parent| parent.display().to_string());
     (agent_name, workspace)
@@ -94793,104 +94794,14 @@ struct DetectedAgent {
     reason: String,
 }
 
-fn normalize_omp_profile_name(profile: &str) -> Option<String> {
-    let name = profile.trim();
-    if name.is_empty() || name == "default" || name == "." || name == ".." {
-        return None;
-    }
-    if name.ends_with('.') || name.len() > 64 {
-        return None;
-    }
-    let mut chars = name.chars();
-    if !chars
-        .next()
-        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c))
-    {
-        return None;
-    }
-    let base = name.split('.').next().unwrap_or(name);
-    let upper = base.to_ascii_uppercase();
-    let reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (upper.len() == 4
-            && (upper.starts_with("COM") || upper.starts_with("LPT"))
-            && upper.as_bytes()[3].is_ascii_digit());
-    (!reserved).then(|| name.to_string())
-}
-
-fn active_omp_profile_from_env() -> Option<String> {
-    let raw = match dotenvy::var("OMP_PROFILE") {
-        Ok(value) => Some(value),
-        Err(_) => dotenvy::var("PI_PROFILE").ok(),
-    }?;
-    normalize_omp_profile_name(&raw)
-}
-
-fn configured_omp_session_root(path: &Path) -> Option<PathBuf> {
-    let direct = dotenvy::var("PI_CODING_AGENT_SESSION_DIR")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from);
-    if direct.as_ref().is_some_and(|root| path.starts_with(root)) {
-        return direct;
-    }
-
-    if active_omp_profile_from_env().is_none()
-        && let Some(agent_root) = dotenvy::var("PI_CODING_AGENT_DIR")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(PathBuf::from)
-    {
-        let sessions = agent_root.join("sessions");
-        if path.starts_with(&sessions) {
-            return Some(sessions);
-        }
-    }
-
-    let config_name = dotenvy::var("PI_CONFIG_DIR")
-        .ok()
-        .filter(|value| !value.trim().is_empty())?;
-    let home = dirs::home_dir()?;
-    let sessions = home
-        .join(config_name.trim_start_matches(['/', '\\']))
-        .join("agent")
-        .join("sessions");
-    path.starts_with(&sessions).then_some(sessions)
-}
-
-fn omp_profile_from_session_path(path: &Path) -> Option<String> {
-    let normalized = path.to_string_lossy().replace('\\', "/");
-    let parts = normalized
-        .split('/')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>();
-
-    for window in parts.windows(5) {
-        if window[0] == ".omp"
-            && window[1] == "profiles"
-            && window[3] == "agent"
-            && window[4] == "sessions"
-        {
-            return Some(window[2].to_string());
-        }
-    }
-    for window in parts.windows(4) {
-        if window[0] == "omp" && window[1] == "profiles" && window[3] == "sessions" {
-            return Some(window[2].to_string());
-        }
-    }
-    None
-}
-
 fn omp_session_dir_from_path(path: &Path) -> Option<PathBuf> {
-    if let Some(root) = configured_omp_session_root(path) {
+    if let Some(root) = crate::connectors::omp::configured_session_root(path) {
         return Some(root);
     }
 
     let normalized = path.to_string_lossy().replace('\\', "/");
-    if normalized.contains("/.omp/agent/sessions/") || omp_profile_from_session_path(path).is_some()
+    if normalized.contains("/.omp/agent/sessions/")
+        || crate::connectors::omp::profile_from_session_path(path).is_some()
     {
         return None;
     }
@@ -94941,7 +94852,6 @@ fn detect_resume_agent(path: &Path, agent_override: Option<&str>) -> CliResult<D
     }
 
     let path_str = path.to_string_lossy();
-    let path_normalized = path_str.replace('\\', "/");
     // Path-substring detection. These match the real on-disk layouts
     // and are ordered longest-match-first where it matters.
     //
@@ -94975,12 +94885,7 @@ fn detect_resume_agent(path: &Path, agent_override: Option<&str>) -> CliResult<D
             reason: "path references opencode storage".to_string(),
         });
     }
-    if path_normalized.contains("/.omp/")
-        || path_normalized.ends_with("/.omp")
-        || path_normalized.contains("/omp/sessions/")
-        || path_normalized.contains("/omp/profiles/")
-        || configured_omp_session_root(path).is_some()
-    {
+    if crate::connectors::omp::owns_session_path(path) {
         return Ok(DetectedAgent {
             slug: "omp",
             is_override: false,
@@ -95436,8 +95341,9 @@ fn resolve_resume_target(path: &Path, agent_override: Option<&str>) -> CliResult
         "omp" => {
             let id = extract_pi_agent_session_id(path)?;
             let mut argv = vec!["omp".to_string()];
-            let profile = omp_profile_from_session_path(path).or_else(|| {
-                configured_omp_session_root(path).and_then(|_| active_omp_profile_from_env())
+            let profile = crate::connectors::omp::profile_from_session_path(path).or_else(|| {
+                crate::connectors::omp::configured_session_root(path)
+                    .and_then(|_| crate::connectors::omp::active_profile_from_env())
             });
             if let Some(profile) = profile {
                 argv.extend(["--profile".to_string(), profile]);
