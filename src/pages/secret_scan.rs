@@ -2455,6 +2455,88 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn database_scan_uses_one_snapshot_across_all_payload_surfaces() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db_path = temp.path().join("scan.db");
+        let setup = crate::franken_sync::Connection::open(db_path.to_string_lossy().as_ref())?;
+        setup.execute_batch(
+            r#"
+            PRAGMA journal_mode = WAL;
+            CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent TEXT NOT NULL,
+                workspace TEXT,
+                title TEXT,
+                source_path TEXT NOT NULL,
+                metadata_json TEXT
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL
+            );
+            INSERT INTO conversations (
+                id, agent, workspace, title, source_path, metadata_json
+            ) VALUES (
+                1, 'codex', '/tmp/project', 'ordinary title',
+                '/tmp/project/session.jsonl', '{}'
+            );
+            INSERT INTO messages (id, conversation_id, idx, role, content)
+            VALUES (7, 1, 0, 'user', 'ordinary message');
+            "#,
+        )?;
+        drop(setup);
+
+        let writer = crate::franken_sync::Connection::open(db_path.to_string_lossy().as_ref())?;
+        let mutation_committed = std::cell::Cell::new(false);
+        let filters = SecretScanFilters {
+            agents: None,
+            workspaces: None,
+            since_ts: None,
+            until_ts: None,
+        };
+        let config = SecretScanConfig::from_inputs_with_env(&[], &[], false)?;
+
+        let report = scan_database_with_cancel_check(
+            &db_path,
+            &filters,
+            &config,
+            None,
+            |checkpoint| {
+                if checkpoint == SecretScanCheckpoint::BeforeMessagePage
+                    && !mutation_committed.get()
+                {
+                    writer
+                        .execute(
+                            "UPDATE messages SET content = 'credential AKIAIOSFODNN7EXAMPLE' WHERE id = 7",
+                        )
+                        .expect("concurrent WAL update must commit during the scan");
+                    mutation_committed.set(true);
+                }
+                false
+            },
+        )?;
+
+        assert!(
+            mutation_committed.get(),
+            "the test must mutate the database after the scan snapshot is established"
+        );
+        assert_eq!(
+            report.summary.total, 0,
+            "one scan must not combine pre-update conversations with post-update messages"
+        );
+        let live_content: String = writer.query_row_map(
+            "SELECT content FROM messages WHERE id = 7",
+            params![],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(live_content, "credential AKIAIOSFODNN7EXAMPLE");
+        Ok(())
+    }
+
     // =========================================================================
     // Scan text tests (via scan_database with crafted DB)
     // =========================================================================

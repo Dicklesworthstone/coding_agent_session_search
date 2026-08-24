@@ -231,6 +231,83 @@ fn verify_export_schema(conn: &Connection) -> TestResult<()> {
     Ok(())
 }
 
+fn assert_review_exclusion_fixture_payload(conn: &Connection) {
+    assert_eq!(
+        query_strings(conn, "SELECT title FROM conversations ORDER BY id").unwrap(),
+        vec!["KeepNeighbor7xy"]
+    );
+    assert_eq!(
+        query_strings(conn, "SELECT content FROM messages ORDER BY id").unwrap(),
+        vec!["KeepNeighbor7xy"]
+    );
+    assert_eq!(
+        query_strings(conn, "SELECT snippet_text FROM snippets ORDER BY id").unwrap(),
+        vec!["KeepNeighbor7xy"]
+    );
+
+    assert_eq!(
+        query_i64(
+            conn,
+            "SELECT COUNT(*) FROM conversations
+             WHERE title IN ('DropWorkspace7xy', 'DropConversation7xy', 'DropPattern7xy')",
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        query_i64(
+            conn,
+            "SELECT COUNT(*) FROM messages
+             WHERE content IN ('DropWorkspace7xy', 'DropConversation7xy', 'DropPattern7xy')",
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        query_i64(
+            conn,
+            "SELECT COUNT(*) FROM snippets
+             WHERE snippet_text IN ('DropWorkspace7xy', 'DropConversation7xy', 'DropPattern7xy')",
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        query_i64(
+            conn,
+            "SELECT COUNT(*) FROM messages_fts
+             WHERE messages_fts MATCH 'dropworkspace7xy OR dropconversation7xy OR droppattern7xy'",
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        query_i64(
+            conn,
+            "SELECT COUNT(*) FROM messages_code_fts
+             WHERE messages_code_fts MATCH 'dropworkspace7xy OR dropconversation7xy OR droppattern7xy'",
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        query_i64(
+            conn,
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'keepneighbor7xy'",
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        query_i64(
+            conn,
+            "SELECT COUNT(*) FROM messages_code_fts WHERE messages_code_fts MATCH 'keepneighbor7xy'",
+        )
+        .unwrap(),
+        1
+    );
+}
+
 // =============================================================================
 // Basic Export Tests
 // =============================================================================
@@ -487,12 +564,17 @@ fn export_engine_applies_review_exclusions_before_writing_any_payload_surface() 
     let progress_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
     let progress_observer = Arc::clone(&progress_calls);
     let engine = ExportEngine::new(&source_path, &output_path, filter).with_exclusions(exclusions);
-    let stats = engine
-        .execute(
+    let (stats, ()) = engine
+        .execute_verified(
             move |current, total| {
                 progress_observer.lock().unwrap().push((current, total));
             },
             None,
+            |staged_db_path| {
+                let staged_conn = open_db(staged_db_path)?;
+                assert_review_exclusion_fixture_payload(&staged_conn);
+                Ok(())
+            },
         )
         .unwrap();
 
@@ -501,80 +583,7 @@ fn export_engine_applies_review_exclusions_before_writing_any_payload_surface() 
     assert_eq!(progress_calls.lock().unwrap().as_slice(), &[(1, 1)]);
 
     let out_conn = open_db(&output_path).unwrap();
-    assert_eq!(
-        query_strings(&out_conn, "SELECT title FROM conversations ORDER BY id").unwrap(),
-        vec!["KeepNeighbor7xy"]
-    );
-    assert_eq!(
-        query_strings(&out_conn, "SELECT content FROM messages ORDER BY id").unwrap(),
-        vec!["KeepNeighbor7xy"]
-    );
-    assert_eq!(
-        query_strings(&out_conn, "SELECT snippet_text FROM snippets ORDER BY id").unwrap(),
-        vec!["KeepNeighbor7xy"]
-    );
-
-    assert_eq!(
-        query_i64(
-            &out_conn,
-            "SELECT COUNT(*) FROM conversations
-             WHERE title IN ('DropWorkspace7xy', 'DropConversation7xy', 'DropPattern7xy')",
-        )
-        .unwrap(),
-        0
-    );
-    assert_eq!(
-        query_i64(
-            &out_conn,
-            "SELECT COUNT(*) FROM messages
-             WHERE content IN ('DropWorkspace7xy', 'DropConversation7xy', 'DropPattern7xy')",
-        )
-        .unwrap(),
-        0
-    );
-    assert_eq!(
-        query_i64(
-            &out_conn,
-            "SELECT COUNT(*) FROM snippets
-             WHERE snippet_text IN ('DropWorkspace7xy', 'DropConversation7xy', 'DropPattern7xy')",
-        )
-        .unwrap(),
-        0
-    );
-    assert_eq!(
-        query_i64(
-            &out_conn,
-            "SELECT COUNT(*) FROM messages_fts
-             WHERE messages_fts MATCH 'dropworkspace7xy OR dropconversation7xy OR droppattern7xy'",
-        )
-        .unwrap(),
-        0
-    );
-    assert_eq!(
-        query_i64(
-            &out_conn,
-            "SELECT COUNT(*) FROM messages_code_fts
-             WHERE messages_code_fts MATCH 'dropworkspace7xy OR dropconversation7xy OR droppattern7xy'",
-        )
-        .unwrap(),
-        0
-    );
-    assert_eq!(
-        query_i64(
-            &out_conn,
-            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'keepneighbor7xy'",
-        )
-        .unwrap(),
-        1
-    );
-    assert_eq!(
-        query_i64(
-            &out_conn,
-            "SELECT COUNT(*) FROM messages_code_fts WHERE messages_code_fts MATCH 'keepneighbor7xy'",
-        )
-        .unwrap(),
-        1
-    );
+    assert_review_exclusion_fixture_payload(&out_conn);
 }
 
 // =============================================================================
