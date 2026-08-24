@@ -1,4 +1,6 @@
 use super::sqlite_artifact_paths;
+#[cfg(test)]
+use super::sqlite_fixed_artifact_paths;
 use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt, params_from_iter};
 use crate::franken_sync::params;
 use crate::indexer::redact_secrets::{
@@ -452,7 +454,7 @@ pub fn scan_staged_export_database<P: AsRef<Path>>(
 }
 
 fn ensure_staged_export_has_no_sidecars(db_path: &Path, phase: &str) -> Result<()> {
-    for sidecar_path in sqlite_artifact_paths(db_path) {
+    for sidecar_path in sqlite_artifact_paths(db_path)? {
         match std::fs::symlink_metadata(&sidecar_path) {
             Ok(_) => {
                 bail!(
@@ -2428,7 +2430,7 @@ mod tests {
     #[test]
     fn staged_export_scan_rejects_unbound_sqlite_sidecars() -> Result<()> {
         let config = SecretScanConfig::from_inputs_with_env(&[], &[], false)?;
-        let artifact_paths = sqlite_artifact_paths(Path::new("export.db"));
+        let artifact_paths = sqlite_fixed_artifact_paths(Path::new("export.db"));
         for relative_path in artifact_paths {
             let temp = tempfile::tempdir()?;
             let db_path = temp.path().join("export.db");
@@ -2454,6 +2456,30 @@ mod tests {
                 "attestation rejection mutated sentinel {artifact_label}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn staged_export_scan_rejects_parallel_wal_segments_without_mutation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db_path = temp.path().join("export.db");
+        let segment_path = temp.path().join("export.db-wal-seg-not-an-epoch");
+        let config = SecretScanConfig::from_inputs_with_env(&[], &[], false)?;
+        std::fs::write(&db_path, b"main-file sentinel")?;
+        std::fs::write(&segment_path, b"parallel WAL segment sentinel")?;
+
+        let error = scan_staged_export_database(&db_path, &config)
+            .expect_err("an unbound parallel WAL segment must block attestation");
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains(&segment_path.display().to_string()),
+            "diagnostic omitted rejected WAL segment: {diagnostic}"
+        );
+        assert_eq!(std::fs::read(&db_path)?, b"main-file sentinel");
+        assert_eq!(
+            std::fs::read(&segment_path)?,
+            b"parallel WAL segment sentinel"
+        );
         Ok(())
     }
 

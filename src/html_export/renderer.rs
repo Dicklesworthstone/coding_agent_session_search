@@ -463,7 +463,7 @@ const ICON_TERMINAL: &str = r#"<svg class="lucide-icon" xmlns="http://www.w3.org
 const ICON_FILE_TEXT: &str = r#"<svg class="lucide-icon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/></svg>"#;
 
 /// Pencil icon - for write/edit
-const ICON_PENCIL: &str = r#"<svg class="lucide-icon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 .73 2.73l-.22.38a2 2 0 0 0-.73 2.73l.22.39a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V4a2 2 0 0 0-2-2z"/><path d="M20 3v4"/><path d="M22 5h-4"/><path d="M4 17v2"/><path d="M5 18H3"/></svg>"#;
+const ICON_PENCIL: &str = r#"<svg class="lucide-icon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.5z"/><path d="m15 5 4 4"/></svg>"#;
 
 /// Search icon - for glob/grep/search
 const ICON_SEARCH: &str = r#"<svg class="lucide-icon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>"#;
@@ -2085,7 +2085,10 @@ mod tests {
         // Check icon mappings
         assert!(get_tool_lucide_icon("Bash").contains("polyline")); // Terminal
         assert!(get_tool_lucide_icon("Read").contains("M15 2H6")); // FileText
-        assert!(get_tool_lucide_icon("Write").contains("M21.174")); // Pencil
+        let pencil = get_tool_lucide_icon("Write");
+        assert!(pencil.contains("M21.174"));
+        assert!(pencil.contains(r#"<path d="m15 5 4 4"/>"#));
+        assert!(!pencil.contains("a2 2 0 0 0 2 0l.43.25"));
         assert!(get_tool_lucide_icon("Glob").contains("circle cx=\"11\"")); // Search
         assert!(get_tool_lucide_icon("WebFetch").contains("circle cx=\"12\" cy=\"12\" r=\"10\"")); // Globe
         assert!(get_tool_lucide_icon("mcp__mcp-agent-mail__send").contains("rect width=\"20\"")); // Mail

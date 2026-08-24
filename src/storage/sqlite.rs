@@ -8290,25 +8290,57 @@ impl FrankenStorage {
                 |row| row.get_typed(0),
             )
             .optional()?;
-        let legacy_conversation_ids = if let Some(agent_id) = legacy_agent_id {
+        struct LegacyOmpConversation {
+            id: i64,
+            source_path: String,
+            external_id: Option<String>,
+            normalized_source_id: String,
+            source_kind: SourceKind,
+            normalized_origin_host: Option<String>,
+        }
+
+        let legacy_conversations = if let Some(agent_id) = legacy_agent_id {
             self.conn
                 .query_map_collect(
-                    "SELECT id, source_path
+                    "SELECT id, source_path, source_id, origin_host, external_id
                      FROM conversations
                      WHERE agent_id = ?1",
                     fparams![agent_id],
-                    |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<String>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get_typed::<i64>(0)?,
+                            row.get_typed::<String>(1)?,
+                            row.get_typed::<String>(2)?,
+                            row.get_typed::<Option<String>>(3)?,
+                            row.get_typed::<Option<String>>(4)?,
+                        ))
+                    },
                 )?
                 .into_iter()
-                .filter_map(|(id, source_path)| {
-                    (ownership.owner(Path::new(&source_path)) == PiFamilyOwner::Omp)
-                        .then_some(id)
+                .filter_map(|(id, source_path, source_id, origin_host, external_id)| {
+                    if ownership.owner(Path::new(&source_path)) != PiFamilyOwner::Omp {
+                        return None;
+                    }
+                    let (normalized_source_id, source_kind, normalized_origin_host) =
+                        normalized_storage_source_parts(
+                            Some(source_id.as_str()),
+                            None,
+                            origin_host.as_deref(),
+                        );
+                    Some(LegacyOmpConversation {
+                        id,
+                        source_path,
+                        external_id,
+                        normalized_source_id,
+                        source_kind,
+                        normalized_origin_host,
+                    })
                 })
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
-        let legacy_count = legacy_conversation_ids.len();
+        let legacy_count = legacy_conversations.len();
 
         if legacy_count > 0 {
             let omp_agent_id = self.ensure_agent(&Agent {
@@ -8320,55 +8352,89 @@ impl FrankenStorage {
             })?;
             let legacy_agent_id = legacy_agent_id.expect("positive legacy count requires agent id");
             let mut conflicting_rows = 0usize;
-            for conversation_id in &legacy_conversation_ids {
-                let conflict: i64 = self.conn.query_row_map(
-                    "SELECT EXISTS(
-                         SELECT 1
-                         FROM conversations legacy
-                         JOIN conversations current
-                           ON current.source_id = legacy.source_id
-                          AND current.agent_id = ?1
-                          AND (
-                               current.source_path = legacy.source_path
-                               OR (
-                                    legacy.external_id IS NOT NULL
-                                    AND current.external_id = legacy.external_id
-                               )
-                          )
-                         WHERE legacy.id = ?2
-                           AND legacy.agent_id = ?3
-                     )",
-                    fparams![omp_agent_id, *conversation_id, legacy_agent_id],
-                    |row| row.get_typed(0),
+            let mut seen_legacy_paths = HashSet::new();
+            let mut seen_legacy_external_ids = HashSet::new();
+            for legacy in &legacy_conversations {
+                let path_is_new = seen_legacy_paths.insert((
+                    legacy.normalized_source_id.clone(),
+                    legacy.source_path.clone(),
+                ));
+                let external_id_is_new = legacy.external_id.as_ref().is_none_or(|external_id| {
+                    seen_legacy_external_ids.insert((
+                        legacy.normalized_source_id.clone(),
+                        external_id.clone(),
+                    ))
+                });
+                let current_sources = self.conn.query_map_collect(
+                    "SELECT source_id, origin_host
+                     FROM conversations
+                     WHERE agent_id = ?1
+                       AND (
+                            source_path = ?2
+                            OR (?3 IS NOT NULL AND external_id = ?3)
+                       )",
+                    fparams![
+                        omp_agent_id,
+                        legacy.source_path.as_str(),
+                        legacy.external_id.as_deref()
+                    ],
+                    |row| {
+                        Ok((
+                            row.get_typed::<String>(0)?,
+                            row.get_typed::<Option<String>>(1)?,
+                        ))
+                    },
                 )?;
-                conflicting_rows += usize::from(conflict != 0);
+                let conflict = current_sources
+                    .into_iter()
+                    .any(|(source_id, origin_host)| {
+                        normalized_storage_source_parts(
+                            Some(source_id.as_str()),
+                            None,
+                            origin_host.as_deref(),
+                        )
+                        .0 == legacy.normalized_source_id
+                    });
+                conflicting_rows +=
+                    usize::from(conflict || !path_is_new || !external_id_is_new);
             }
             if conflicting_rows > 0 {
                 return Err(anyhow!(
-                    "cannot reclassify {conflicting_rows} legacy OMP conversation(s): matching first-class OMP rows already exist; run a source-path duplicate audit before indexing"
+                    "cannot reclassify {conflicting_rows} legacy OMP conversation(s): matching normalized OMP identities already exist; run a source-path duplicate audit before indexing"
                 ));
             }
 
             let mut metadata_updates = Vec::with_capacity(legacy_count);
-            for conversation_id in &legacy_conversation_ids {
+            for legacy in &legacy_conversations {
                 let (metadata_json, metadata_bin): (Option<String>, Option<Vec<u8>>) = self
                     .conn
                     .query_row_map(
                         "SELECT metadata_json, metadata_bin
                          FROM conversations
                          WHERE id = ?1 AND agent_id = ?2",
-                        fparams![*conversation_id, legacy_agent_id],
+                        fparams![legacy.id, legacy_agent_id],
                         |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
                     )?;
-                let mut metadata = metadata_bin
+                let mut metadata = if let Some(bytes) = metadata_bin
                     .as_deref()
-                    .and_then(|bytes| rmp_serde::from_slice(bytes).ok())
-                    .or_else(|| {
-                        metadata_json
-                            .as_deref()
-                            .and_then(|json| serde_json::from_str(json).ok())
-                    })
-                    .unwrap_or(serde_json::Value::Null);
+                    .filter(|bytes| !bytes.is_empty())
+                {
+                    rmp_serde::from_slice(bytes).with_context(|| {
+                        format!(
+                            "decoding MessagePack metadata for legacy OMP conversation {}",
+                            legacy.id
+                        )
+                    })?
+                } else if let Some(json) = metadata_json.as_deref() {
+                    serde_json::from_str(json).with_context(|| {
+                        format!(
+                            "decoding JSON metadata for legacy OMP conversation {}",
+                            legacy.id
+                        )
+                    })?
+                } else {
+                    serde_json::Value::Null
+                };
                 if let Some(object) = metadata.as_object_mut()
                     && object.get("source").and_then(serde_json::Value::as_str)
                         == Some("pi_agent")
@@ -8376,8 +8442,10 @@ impl FrankenStorage {
                     object.insert("source".into(), serde_json::Value::String("omp".into()));
                 }
                 metadata_updates.push((
-                    *conversation_id,
-                    serde_json::to_string(&metadata).unwrap_or_else(|_| "null".into()),
+                    legacy.id,
+                    legacy.normalized_source_id.clone(),
+                    legacy.normalized_origin_host.clone(),
+                    serde_json::to_string(&metadata)?,
                 ));
             }
 
@@ -8386,21 +8454,41 @@ impl FrankenStorage {
                 "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
                 fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY, pending_state.as_str()],
             )?;
-            for (conversation_id, metadata_json) in metadata_updates {
+            let now_ms = Self::now_millis();
+            let mut normalized_sources = HashMap::new();
+            for legacy in &legacy_conversations {
+                normalized_sources
+                    .entry(legacy.normalized_source_id.as_str())
+                    .or_insert((legacy.source_kind, legacy.normalized_origin_host.as_deref()));
+            }
+            for (source_id, (source_kind, host_label)) in normalized_sources {
+                tx.execute_compat(
+                    "INSERT OR IGNORE INTO sources(
+                         id, kind, host_label, created_at, updated_at
+                     ) VALUES(?1, ?2, ?3, ?4, ?4)",
+                    fparams![source_id, source_kind.as_str(), host_label, now_ms],
+                )?;
+            }
+            for (conversation_id, source_id, origin_host, metadata_json) in metadata_updates {
                 tx.execute_compat(
                     "UPDATE conversations
-                     SET agent_id = ?1, metadata_json = ?2, metadata_bin = NULL
-                     WHERE id = ?3 AND agent_id = ?4",
+                     SET agent_id = ?1, source_id = ?2, origin_host = ?3,
+                         metadata_json = ?4, metadata_bin = NULL
+                     WHERE id = ?5 AND agent_id = ?6",
                     fparams![
                         omp_agent_id,
+                        source_id.as_str(),
+                        origin_host.as_deref(),
                         metadata_json,
                         conversation_id,
                         legacy_agent_id
                     ],
                 )?;
                 tx.execute_compat(
-                    "UPDATE token_usage SET agent_id = ?1 WHERE conversation_id = ?2",
-                    fparams![omp_agent_id, conversation_id],
+                    "UPDATE token_usage
+                     SET agent_id = ?1, source_id = ?2
+                     WHERE conversation_id = ?3",
+                    fparams![omp_agent_id, source_id.as_str(), conversation_id],
                 )?;
                 tx.execute_compat(
                     "DELETE FROM conversation_external_lookup WHERE conversation_id = ?1",
@@ -29624,6 +29712,141 @@ mod tests {
                 ("remote-a".to_string(), "omp".to_string()),
                 ("remote-b".to_string(), "omp".to_string()),
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_omp_reclassification_normalizes_host_only_remote_provenance()
+    -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let _pi_sessions = set_env_var("PI_SESSIONS_DIR", "");
+        let _omp_sessions = set_env_var("PI_CODING_AGENT_SESSION_DIR", "");
+        let _shared_agent = set_env_var("PI_CODING_AGENT_DIR", "");
+        let _omp_archive = set_env_var("CASS_OMP_DATA_ROOT", "");
+        let _config_dir = set_env_var("PI_CONFIG_DIR", "");
+        let _profile = set_env_var("OMP_PROFILE", "");
+        let _legacy_profile = set_env_var("PI_PROFILE", "");
+        let _xdg = set_env_var("XDG_DATA_HOME", "");
+        let storage = SqliteStorage::open(dir.path().join("test.db"))?;
+        let pi_agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "pi_agent".into(),
+            name: "Pi Agent".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        storage.conn.execute_compat(
+            "INSERT INTO sources(id, kind, host_label, created_at, updated_at)
+             VALUES('   ', 'ssh', ' build-host ', 1000, 1000)",
+            fparams![],
+        )?;
+        let source_path = "/home/dev/.omp/agent/sessions/project/remote.jsonl";
+        storage.conn.execute_compat(
+            "INSERT INTO conversations(
+                 agent_id, source_id, external_id, title, source_path, started_at,
+                 origin_host, metadata_json
+             ) VALUES(
+                 ?1, '   ', 'remote-session', 'Remote legacy OMP', ?2, 1000,
+                 ' build-host ', '{\"source\":\"pi_agent\"}'
+             )",
+            fparams![pi_agent_id, source_path],
+        )?;
+        let conversation_id: i64 = storage.conn.query_row_map(
+            "SELECT id FROM conversations WHERE external_id = 'remote-session'",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        storage.conn.execute_compat(
+            "INSERT INTO messages(
+                 conversation_id, idx, role, created_at, content
+             ) VALUES(?1, 0, 'user', 1000, 'legacy remote message')",
+            fparams![conversation_id],
+        )?;
+        let message_id: i64 = storage.conn.query_row_map(
+            "SELECT id FROM messages WHERE conversation_id = ?1",
+            fparams![conversation_id],
+            |row| row.get_typed(0),
+        )?;
+        storage.conn.execute_compat(
+            "INSERT INTO token_usage(
+                 message_id, conversation_id, agent_id, source_id, timestamp_ms,
+                 day_id, role, content_chars
+             ) VALUES(?1, ?2, ?3, '   ', 1000, 0, 'user', 21)",
+            fparams![message_id, conversation_id, pi_agent_id],
+        )?;
+
+        assert_eq!(
+            storage.reclassify_legacy_omp_conversations()?,
+            LegacyOmpReclassificationResult {
+                conversations_reclassified: 1,
+                lexical_rebuild_required: true,
+            }
+        );
+        let (source_id, origin_host, agent_slug): (String, Option<String>, String) =
+            storage.conn.query_row_map(
+                "SELECT c.source_id, c.origin_host, a.slug
+                 FROM conversations c
+                 JOIN agents a ON a.id = c.agent_id
+                 WHERE c.id = ?1",
+                fparams![conversation_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+            )?;
+        assert_eq!(source_id, "build-host");
+        assert_eq!(origin_host.as_deref(), Some("build-host"));
+        assert_eq!(agent_slug, "omp");
+        let (token_source_id, token_agent_id): (String, i64) =
+            storage.conn.query_row_map(
+                "SELECT source_id, agent_id FROM token_usage WHERE conversation_id = ?1",
+                fparams![conversation_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )?;
+        let omp_agent_id: i64 = storage.conn.query_row_map(
+            "SELECT id FROM agents WHERE slug = 'omp'",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(token_source_id, "build-host");
+        assert_eq!(token_agent_id, omp_agent_id);
+
+        let incoming = Conversation {
+            id: None,
+            agent_slug: "omp".into(),
+            workspace: None,
+            external_id: Some("remote-session".into()),
+            title: Some("Remote first-class OMP".into()),
+            source_path: PathBuf::from(source_path),
+            started_at: Some(1000),
+            ended_at: Some(2000),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({"source":"omp"}),
+            messages: vec![Message {
+                id: None,
+                idx: 1,
+                role: MessageRole::Agent,
+                author: None,
+                created_at: Some(2000),
+                content: "first-class append".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: "build-host".into(),
+            origin_host: Some("build-host".into()),
+        };
+        storage.insert_conversations_batched(&[(omp_agent_id, None, &incoming)])?;
+        let canonical_count: i64 = storage.conn.query_row_map(
+            "SELECT COUNT(*)
+             FROM conversations
+             WHERE source_id = 'build-host'
+               AND agent_id = ?1
+               AND external_id = 'remote-session'",
+            fparams![omp_agent_id],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(
+            canonical_count, 1,
+            "the first current OMP scan must reuse the normalized legacy row"
         );
         Ok(())
     }

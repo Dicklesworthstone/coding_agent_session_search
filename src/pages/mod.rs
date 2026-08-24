@@ -66,6 +66,7 @@ fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(file_name)
 }
 
+#[cfg(test)]
 fn sqlite_migration_marker_path(path: &Path) -> PathBuf {
     sqlite_sidecar_path(path, SQLITE_MIGRATION_MARKER_SUFFIX)
 }
@@ -130,7 +131,9 @@ fn sqlite_wal_segment_artifact_paths(path: &Path) -> Result<Vec<PathBuf>> {
         .unwrap_or_else(|| Path::new("."));
     let db_name = path
         .file_name()
-        .ok_or_else(|| anyhow::anyhow!("SQLite artifact path has no file name: {}", path.display()))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("SQLite artifact path has no file name: {}", path.display())
+        })?;
     let mut segment_prefix = db_name.to_os_string();
     segment_prefix.push("-wal-seg-");
 
@@ -333,6 +336,24 @@ mod tests {
             ]
             .map(PathBuf::from)
         );
+    }
+
+    #[test]
+    fn sqlite_wal_segment_paths_match_only_the_pinned_direct_sibling_prefix() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db = temp.path().join("export.db");
+        let first = temp.path().join("export.db-wal-seg-42");
+        let malformed_epoch = temp.path().join("export.db-wal-seg-not-an-epoch");
+        let near_miss = temp.path().join("export.db-wal-segment-42");
+        let other_db = temp.path().join("other.db-wal-seg-42");
+        for path in [&db, &first, &malformed_epoch, &near_miss, &other_db] {
+            std::fs::write(path, b"sentinel")?;
+        }
+
+        let mut expected = vec![first, malformed_epoch];
+        expected.sort_unstable();
+        assert_eq!(sqlite_wal_segment_artifact_paths(&db)?, expected);
+        Ok(())
     }
 
     #[test]

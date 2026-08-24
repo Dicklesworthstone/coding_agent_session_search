@@ -1,6 +1,6 @@
 use super::{
     sqlite_artifact_paths, sqlite_content_artifact_paths, sqlite_fixed_artifact_paths,
-    sqlite_migration_marker_path, sqlite_runtime_artifact_paths,
+    sqlite_runtime_artifact_paths, sqlite_wal_segment_artifact_paths,
 };
 use crate::franken_sync::compat::{
     ConnectionExt, ParamValue, RowExt, Transaction, TransactionExt,
@@ -14,9 +14,8 @@ use clap::ValueEnum;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::io::Read;
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -552,6 +551,7 @@ impl ExportEngine {
                 .context("Failed to materialize self-contained Pages export candidate")?;
             dest.close()
                 .context("Failed to close and checkpoint Pages export builder")?;
+            enforce_private_candidate_permissions(&temp_output_path)?;
             cleanup_sqlite_temp_artifacts(&builder_path)
                 .context("Failed to remove closed Pages export builder artifacts")?;
             finalize_staged_sqlite_sidecars(&temp_output_path)
@@ -820,114 +820,13 @@ fn cleanup_sqlite_sidecars(path: &Path) -> Result<()> {
     first_error.map_or(Ok(()), Err)
 }
 
-const STAGED_MIGRATION_MARKER_MAX_BYTES: u64 = 4 * 1024;
-const EXPECTED_STAGED_MIGRATION_VERSION: u32 = 1;
-const STAGED_MIGRATION_CLOCK_SKEW_SECONDS: u64 = 300;
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StagedMigrationMarker {
-    last_upgrade_version: u32,
-    last_run_at: u64,
-    repairs_applied: Vec<String>,
-}
-
-fn remove_expected_staged_migration_marker(path: &Path) -> Result<()> {
-    let marker_path = sqlite_migration_marker_path(path);
-    let metadata = match std::fs::symlink_metadata(&marker_path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!(
-                    "failed inspecting staged FrankenSQLite migration marker {}",
-                    marker_path.display()
-                )
-            });
-        }
-    };
-    if !metadata.file_type().is_file() {
-        bail!(
-            "staged FrankenSQLite migration marker is not a regular file: {}",
-            marker_path.display()
-        );
-    }
-    if metadata.len() > STAGED_MIGRATION_MARKER_MAX_BYTES {
-        bail!(
-            "staged FrankenSQLite migration marker {} is {} bytes, exceeding the {}-byte validation bound",
-            marker_path.display(),
-            metadata.len(),
-            STAGED_MIGRATION_MARKER_MAX_BYTES
-        );
-    }
-
-    let mut bytes = Vec::new();
-    std::fs::File::open(&marker_path)
-        .with_context(|| {
-            format!(
-                "failed opening staged FrankenSQLite migration marker {}",
-                marker_path.display()
-            )
-        })?
-        .take(STAGED_MIGRATION_MARKER_MAX_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| {
-            format!(
-                "failed reading staged FrankenSQLite migration marker {}",
-                marker_path.display()
-            )
-        })?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > STAGED_MIGRATION_MARKER_MAX_BYTES {
-        bail!(
-            "staged FrankenSQLite migration marker {} grew beyond the {}-byte validation bound",
-            marker_path.display(),
-            STAGED_MIGRATION_MARKER_MAX_BYTES
-        );
-    }
-
-    let marker: StagedMigrationMarker = serde_json::from_slice(&bytes).with_context(|| {
-        format!(
-            "staged FrankenSQLite migration marker is malformed: {}",
-            marker_path.display()
-        )
-    })?;
-    let latest_sane_timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .saturating_add(STAGED_MIGRATION_CLOCK_SKEW_SECONDS);
-    if marker.last_upgrade_version != EXPECTED_STAGED_MIGRATION_VERSION
-        || marker.last_run_at == 0
-        || marker.last_run_at > latest_sane_timestamp
-        || !marker.repairs_applied.is_empty()
-    {
-        bail!(
-            "staged FrankenSQLite migration marker {} is not the expected fresh-database marker-at-birth",
-            marker_path.display()
-        );
-    }
-
-    std::fs::remove_file(&marker_path).with_context(|| {
-        format!(
-            "failed removing validated staged FrankenSQLite migration marker {}",
-            marker_path.display()
-        )
-    })
-}
-
 fn finalize_staged_sqlite_sidecars(path: &Path) -> Result<()> {
     // Rollback journals, WAL/SHM, FrankenSQLite's WAL-FEC recovery files,
-    // parallel-WAL commit certificates, and an incomplete migration-marker
-    // write can describe state that does not belong to a standalone main file.
-    // Journal mode is DELETE for Pages exports, so those survivors are
-    // unexpected and must block publication rather than be discarded. The
-    // completed migration marker is handled separately below because pinned
-    // FrankenSQLite stamps a known marker at birth on every new database.
-    let migration_marker = sqlite_migration_marker_path(path);
-    for sidecar in sqlite_content_artifact_paths(path)
-        .into_iter()
-        .filter(|sidecar| sidecar != &migration_marker)
-    {
+    // parallel-WAL commit certificates, and migration marker files can
+    // describe state that does not belong to a standalone main file. The
+    // publishable path is a VACUUM INTO image, which should emit none of them;
+    // any survivor therefore blocks publication rather than being discarded.
+    for sidecar in sqlite_content_artifact_paths(path) {
         match std::fs::symlink_metadata(&sidecar) {
             Ok(_) => {
                 bail!(
@@ -946,11 +845,12 @@ fn finalize_staged_sqlite_sidecars(path: &Path) -> Result<()> {
             }
         }
     }
-
-    // FrankenSQLite 0.3.8 stamps a marker on every fresh on-disk database.
-    // It is removable producer metadata only when its bounded JSON content is
-    // exactly the no-repair marker-at-birth expected for this unique stage.
-    remove_expected_staged_migration_marker(path)?;
+    for segment in sqlite_wal_segment_artifact_paths(path)? {
+        bail!(
+            "staged Pages export retained content-bearing SQLite WAL segment {}; refusing main-file-only publication",
+            segment.display()
+        );
+    }
 
     let mut first_error = None;
     for sidecar in sqlite_runtime_artifact_paths(path) {
@@ -997,6 +897,42 @@ fn create_staged_export_file(path: &Path) -> Result<()> {
     options
         .open(path)
         .with_context(|| format!("failed securely creating staged export {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn enforce_private_candidate_permissions(path: &Path) -> Result<()> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("failed opening staged export {} for chmod", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed inspecting staged export {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("staged Pages export is not a regular file: {}", path.display());
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed setting staged export {} to mode 0600", path.display()))?;
+    let mode = file
+        .metadata()
+        .with_context(|| format!("failed verifying staged export mode for {}", path.display()))?
+        .permissions()
+        .mode();
+    if mode & 0o077 != 0 {
+        bail!(
+            "staged Pages export {} retained non-owner permission bits after chmod: {mode:o}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn enforce_private_candidate_permissions(path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed inspecting staged export {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("staged Pages export is not a regular file: {}", path.display());
+    }
     Ok(())
 }
 
@@ -1877,11 +1813,7 @@ mod tests {
     #[test]
     fn staged_finalization_rejects_content_sidecars_without_mutating_them() -> Result<()> {
         let content_paths = sqlite_content_artifact_paths(Path::new("export.tmp.db"));
-        let marker_path = sqlite_migration_marker_path(Path::new("export.tmp.db"));
-        for relative_path in content_paths
-            .into_iter()
-            .filter(|path| path != &marker_path)
-        {
+        for relative_path in content_paths {
             let temp_dir = TempDir::new()?;
             let staged_path = temp_dir.path().join("export.tmp.db");
             let sentinel_path = temp_dir.path().join(relative_path);
@@ -1914,94 +1846,46 @@ mod tests {
     }
 
     #[test]
-    fn staged_finalization_removes_only_a_valid_marker_at_birth() -> Result<()> {
+    fn staged_finalization_rejects_parallel_wal_segments_without_mutation() -> Result<()> {
         let temp_dir = TempDir::new()?;
         let staged_path = temp_dir.path().join("export.tmp.db");
-        let marker_path = sqlite_migration_marker_path(&staged_path);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs();
+        let segment_path = temp_dir.path().join("export.tmp.db-wal-seg-not-an-epoch");
         std::fs::write(&staged_path, b"staged main")?;
-        std::fs::write(
-            &marker_path,
-            format!(
-                r#"{{"last_upgrade_version":1,"last_run_at":{now},"repairs_applied":[]}}"#
-            ),
-        )?;
+        std::fs::write(&segment_path, b"parallel WAL segment")?;
 
-        finalize_staged_sqlite_sidecars(&staged_path)?;
-
-        assert_eq!(std::fs::read(&staged_path)?, b"staged main");
+        let error = finalize_staged_sqlite_sidecars(&staged_path)
+            .expect_err("a parallel WAL segment must block publication");
         assert!(
-            matches!(
-                std::fs::symlink_metadata(&marker_path),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound
-            ),
-            "validated marker-at-birth survived staged finalization"
+            format!("{error:#}").contains(&segment_path.display().to_string()),
+            "WAL-segment rejection omitted exact artifact path"
         );
+        assert_eq!(std::fs::read(&staged_path)?, b"staged main");
+        assert_eq!(std::fs::read(&segment_path)?, b"parallel WAL segment");
         Ok(())
     }
 
     #[test]
-    fn staged_finalization_preserves_invalid_migration_markers() -> Result<()> {
+    fn staged_vacuum_candidate_rejects_even_a_valid_marker_at_birth() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let staged_path = temp_dir.path().join("export.tmp.db");
+        let marker_path = crate::pages::sqlite_migration_marker_path(&staged_path);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
-        let invalid_markers = [
-            ("malformed", b"{".to_vec()),
-            (
-                "wrong-version",
-                format!(
-                    r#"{{"last_upgrade_version":2,"last_run_at":{now},"repairs_applied":[]}}"#
-                )
-                .into_bytes(),
-            ),
-            (
-                "repairs-applied",
-                format!(
-                    r#"{{"last_upgrade_version":1,"last_run_at":{now},"repairs_applied":["repair_orphaned_pages:1"]}}"#
-                )
-                .into_bytes(),
-            ),
-            (
-                "future-timestamp",
-                format!(
-                    r#"{{"last_upgrade_version":1,"last_run_at":{},"repairs_applied":[]}}"#,
-                    now.saturating_add(3_600)
-                )
-                .into_bytes(),
-            ),
-            (
-                "oversized",
-                vec![b'x'; usize::try_from(STAGED_MIGRATION_MARKER_MAX_BYTES)? + 1],
-            ),
-        ];
+        std::fs::write(&staged_path, b"staged main")?;
+        let marker_bytes = format!(
+            r#"{{"last_upgrade_version":1,"last_run_at":{now},"repairs_applied":[]}}"#
+        );
+        std::fs::write(&marker_path, marker_bytes.as_bytes())?;
 
-        for (case, marker_bytes) in invalid_markers {
-            let temp_dir = TempDir::new()?;
-            let staged_path = temp_dir.path().join("export.tmp.db");
-            let marker_path = sqlite_migration_marker_path(&staged_path);
-            std::fs::write(&staged_path, b"staged main")?;
-            std::fs::write(&marker_path, &marker_bytes)?;
-
-            let error = finalize_staged_sqlite_sidecars(&staged_path)
-                .expect_err("an invalid migration marker must block publication");
-            let message = format!("{error:#}");
-            assert!(
-                message.contains(&marker_path.display().to_string()),
-                "{case} rejection omitted marker path: {message}"
-            );
-            assert_eq!(
-                std::fs::read(&staged_path)?,
-                b"staged main",
-                "{case} rejection mutated staged main"
-            );
-            assert_eq!(
-                std::fs::read(&marker_path)?,
-                marker_bytes,
-                "{case} rejection mutated marker"
-            );
-        }
+        let error = finalize_staged_sqlite_sidecars(&staged_path)
+            .expect_err("a VACUUM candidate must never carry a migration marker");
+        assert!(
+            format!("{error:#}").contains(&marker_path.display().to_string()),
+            "candidate-marker rejection omitted exact marker path"
+        );
+        assert_eq!(std::fs::read(&staged_path)?, b"staged main");
+        assert_eq!(std::fs::read(&marker_path)?, marker_bytes.as_bytes());
         Ok(())
     }
 
@@ -2046,11 +1930,20 @@ mod tests {
              CREATE TABLE exported (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
              INSERT INTO exported VALUES (1, 'candidate row');",
         )?;
+        let candidate_path_text = candidate_path.to_string_lossy();
         builder.execute_compat(
             "VACUUM INTO ?1;",
-            params![candidate_path.to_string_lossy().as_ref()],
+            params![candidate_path_text.as_ref()],
         )?;
         builder.close()?;
+        enforce_private_candidate_permissions(&candidate_path)?;
+
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&candidate_path)?.permissions().mode() & 0o077,
+            0,
+            "VACUUM candidate must be private before verification"
+        );
 
         let builder_wal = sqlite_content_artifact_paths(&builder_path)
             .into_iter()
@@ -2196,6 +2089,35 @@ mod tests {
                 ));
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn replacement_rejects_existing_parallel_wal_segment_without_mutation() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let final_path = temp_dir.path().join("export.db");
+        let staged_path = temp_dir.path().join("export.tmp.db");
+        let segment_path = temp_dir.path().join("export.db-wal-seg-42");
+        std::fs::write(&final_path, b"old main")?;
+        std::fs::write(&staged_path, b"new main")?;
+        std::fs::write(&segment_path, b"old WAL segment")?;
+
+        let mut retain_temp_on_error = false;
+        let error = replace_file_from_temp(
+            &staged_path,
+            &final_path,
+            &mut retain_temp_on_error,
+        )
+        .expect_err("an existing WAL segment must block main-file replacement");
+
+        assert!(
+            format!("{error:#}").contains(&segment_path.display().to_string()),
+            "replacement refusal omitted exact WAL segment path"
+        );
+        assert_eq!(std::fs::read(&final_path)?, b"old main");
+        assert_eq!(std::fs::read(&staged_path)?, b"new main");
+        assert_eq!(std::fs::read(&segment_path)?, b"old WAL segment");
+        assert!(!retain_temp_on_error);
         Ok(())
     }
 }
