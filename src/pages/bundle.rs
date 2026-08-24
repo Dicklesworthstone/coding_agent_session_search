@@ -204,6 +204,10 @@ impl BundleBuilder {
         let encrypted_dir = encrypted_dir.as_ref();
         let output_dir = output_dir.as_ref();
 
+        // Heal an interrupted fallback publish before doing potentially long
+        // archive validation/copying work, so a parked prior generation is
+        // returned to the live handle as soon as the next build starts.
+        recover_interrupted_bundle_publish(output_dir)?;
         ensure_replaceable_bundle_output_dir(output_dir)?;
 
         // Validate encrypted_dir has required files
@@ -2754,9 +2758,9 @@ mod tests {
         let backup_dir = bundle_publish_in_progress_backup_path(&final_dir);
 
         fs::create_dir_all(final_dir.join("private")).unwrap();
-        fs::write(final_dir.join("private/old-secret.txt"), "old").unwrap();
+        fs::write(final_dir.join("private/old-private.txt"), "old").unwrap();
         fs::create_dir_all(staged_dir.join("private")).unwrap();
-        fs::write(staged_dir.join("private/new-secret.txt"), "new").unwrap();
+        fs::write(staged_dir.join("private/new-private.txt"), "new").unwrap();
 
         // Failpoint state: the fallback publisher durably parked OLD, then
         // the process died before installing NEW at the live handle.
@@ -2766,12 +2770,12 @@ mod tests {
         recover_interrupted_bundle_publish(&final_dir).unwrap();
 
         assert_eq!(
-            fs::read_to_string(final_dir.join("private/old-secret.txt")).unwrap(),
+            fs::read_to_string(final_dir.join("private/old-private.txt")).unwrap(),
             "old"
         );
         assert!(!backup_dir.exists());
         assert_eq!(
-            fs::read_to_string(staged_dir.join("private/new-secret.txt")).unwrap(),
+            fs::read_to_string(staged_dir.join("private/new-private.txt")).unwrap(),
             "new",
             "recovery must not consume the next staged candidate"
         );
@@ -2785,9 +2789,9 @@ mod tests {
         let backup_dir = bundle_publish_in_progress_backup_path(&final_dir);
 
         fs::create_dir_all(final_dir.join("private")).unwrap();
-        fs::write(final_dir.join("private/old-secret.txt"), "old").unwrap();
+        fs::write(final_dir.join("private/old-private.txt"), "old").unwrap();
         fs::create_dir_all(staged_dir.join("private")).unwrap();
-        fs::write(staged_dir.join("private/new-secret.txt"), "new").unwrap();
+        fs::write(staged_dir.join("private/new-private.txt"), "new").unwrap();
 
         // Failpoint state: OLD was parked and NEW reached the live handle,
         // then the process died before removing OLD.
@@ -2797,10 +2801,10 @@ mod tests {
         recover_interrupted_bundle_publish(&final_dir).unwrap();
 
         assert_eq!(
-            fs::read_to_string(final_dir.join("private/new-secret.txt")).unwrap(),
+            fs::read_to_string(final_dir.join("private/new-private.txt")).unwrap(),
             "new"
         );
-        assert!(!final_dir.join("private/old-secret.txt").exists());
+        assert!(!final_dir.join("private/old-private.txt").exists());
         assert!(!backup_dir.exists());
     }
 
@@ -2840,7 +2844,7 @@ mod tests {
         let backup_dir = bundle_publish_in_progress_backup_path(&final_dir);
         fs::create_dir_all(final_dir.join("site")).unwrap();
         fs::create_dir_all(backup_dir.join("private")).unwrap();
-        fs::write(backup_dir.join("private/recovery-secret.txt"), "secret").unwrap();
+        fs::write(backup_dir.join("private/recovery-material.txt"), "private").unwrap();
 
         let error = cleanup_prior_bundle_after_publish_with(
             &backup_dir,
@@ -2859,7 +2863,7 @@ mod tests {
         assert!(message.contains(&backup_dir.display().to_string()));
         assert!(message.contains("injected cleanup denial"));
         assert!(message.contains("private artifacts retained"));
-        assert!(backup_dir.join("private/recovery-secret.txt").exists());
+        assert!(backup_dir.join("private/recovery-material.txt").exists());
     }
 
     #[test]
@@ -2872,7 +2876,7 @@ mod tests {
         let final_dir = temp.path().join("bundle");
         let backup_dir = bundle_publish_in_progress_backup_path(&final_dir);
         fs::create_dir_all(outside.path().join("private")).unwrap();
-        fs::write(outside.path().join("private/secret.txt"), "secret").unwrap();
+        fs::write(outside.path().join("private/material.txt"), "private").unwrap();
         symlink(outside.path(), &backup_dir).unwrap();
 
         let error = recover_interrupted_bundle_publish(&final_dir)
@@ -2881,8 +2885,8 @@ mod tests {
         assert!(error.to_string().contains("must not be a symlink"));
         assert!(error.to_string().contains(&backup_dir.display().to_string()));
         assert_eq!(
-            fs::read_to_string(outside.path().join("private/secret.txt")).unwrap(),
-            "secret"
+            fs::read_to_string(outside.path().join("private/material.txt")).unwrap(),
+            "private"
         );
         assert!(!final_dir.exists());
     }

@@ -212,17 +212,25 @@ IMPORTANT:
     pub fn write_to_dir(&self, dir: &Path) -> Result<()> {
         ensure_recovery_artifact_dir(dir)?;
 
-        // Write recovery-secret.txt
         let secret_path = dir.join("recovery-secret.txt");
+        let png_path = dir.join("qr-code.png");
+        let svg_path = dir.join("qr-code.svg");
+
+        // Validate the complete destination set before changing any member.
+        // Otherwise a symlink or special file at a later path could leave the
+        // directory with a newly installed secret and stale/missing QR codes.
+        for artifact_path in [&secret_path, &png_path, &svg_path] {
+            reject_recovery_artifact_symlink(artifact_path)?;
+        }
+
+        // Write recovery-secret.txt
         write_recovery_artifact(&secret_path, self.secret_text.as_bytes())
             .context("Failed to write recovery-secret.txt")?;
 
         // Write qr-code.png
-        let png_path = dir.join("qr-code.png");
         write_recovery_artifact(&png_path, &self.qr_png).context("Failed to write qr-code.png")?;
 
         // Write qr-code.svg
-        let svg_path = dir.join("qr-code.svg");
         write_recovery_artifact(&svg_path, self.qr_svg.as_bytes())
             .context("Failed to write qr-code.svg")?;
 
@@ -574,6 +582,62 @@ mod tests {
                 .is_symlink(),
             "rejected recovery secret symlink should be left intact"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recovery_artifact_preflight_rejects_later_symlink_before_writing_secret() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().expect("create temp dir");
+        let private_dir = tmp.path().join("private");
+        std::fs::create_dir_all(&private_dir).expect("create private dir");
+        let secret_path = private_dir.join("recovery-secret.txt");
+        std::fs::write(&secret_path, "prior coherent generation").expect("write prior secret");
+        let protected = tmp.path().join("protected.png");
+        std::fs::write(&protected, "do not overwrite").expect("write protected target");
+        symlink(&protected, private_dir.join("qr-code.png")).expect("create QR symlink");
+
+        let artifacts = RecoveryArtifacts {
+            secret: RecoverySecret::from_bytes(vec![9; 32]).expect("valid secret"),
+            secret_text: "replacement secret".to_string(),
+            qr_png: b"replacement png".to_vec(),
+            qr_svg: "<svg>replacement</svg>".to_string(),
+        };
+
+        let error = artifacts
+            .write_to_dir(&private_dir)
+            .expect_err("a symlink anywhere in the artifact set must fail preflight");
+        assert!(
+            format!("{error:#}").contains("must not be a symlink"),
+            "unexpected preflight error: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&secret_path).expect("read preserved secret"),
+            "prior coherent generation"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&protected).expect("read protected target"),
+            "do not overwrite"
+        );
+    }
+
+    #[test]
+    fn recovery_temp_cleanup_failure_reports_retained_sensitive_path() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let retained_path = tmp.path().join("retained-temp-directory");
+        std::fs::create_dir(&retained_path)?;
+
+        let error = cleanup_failed_recovery_temp(
+            &retained_path,
+            anyhow::anyhow!("primary write failure"),
+        );
+        let message = format!("{error:#}");
+        assert!(message.contains("primary write failure"));
+        assert!(message.contains("cleanup also failed"));
+        assert!(message.contains(&retained_path.display().to_string()));
+        assert!(retained_path.is_dir(), "cleanup test sentinel was not retained");
+        Ok(())
     }
 
     #[test]

@@ -29344,8 +29344,17 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn legacy_omp_reclassification_preserves_one_canonical_conversation() -> anyhow::Result<()> {
         let dir = TempDir::new()?;
+        let _pi_sessions = set_env_var("PI_SESSIONS_DIR", "");
+        let _omp_sessions = set_env_var("PI_CODING_AGENT_SESSION_DIR", "");
+        let _shared_agent = set_env_var("PI_CODING_AGENT_DIR", "");
+        let _omp_archive = set_env_var("CASS_OMP_DATA_ROOT", "");
+        let _config_dir = set_env_var("PI_CONFIG_DIR", "");
+        let _profile = set_env_var("OMP_PROFILE", "");
+        let _legacy_profile = set_env_var("PI_PROFILE", "");
+        let _xdg = set_env_var("XDG_DATA_HOME", "");
         let db_path = dir.path().join("test.db");
         let storage = SqliteStorage::open(&db_path)?;
         let pi_agent_id = storage.ensure_agent(&Agent {
@@ -29508,8 +29517,17 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn legacy_remote_omp_reclassification_rejects_non_mirror_lookalikes() -> anyhow::Result<()> {
         let dir = TempDir::new()?;
+        let _pi_sessions = set_env_var("PI_SESSIONS_DIR", "");
+        let _omp_sessions = set_env_var("PI_CODING_AGENT_SESSION_DIR", "");
+        let _shared_agent = set_env_var("PI_CODING_AGENT_DIR", "");
+        let _omp_archive = set_env_var("CASS_OMP_DATA_ROOT", "");
+        let _config_dir = set_env_var("PI_CONFIG_DIR", "");
+        let _profile = set_env_var("OMP_PROFILE", "");
+        let _legacy_profile = set_env_var("PI_PROFILE", "");
+        let _xdg = set_env_var("XDG_DATA_HOME", "");
         let db_path = dir.path().join("test.db");
         let storage = SqliteStorage::open(&db_path)?;
         let pi_agent_id = storage.ensure_agent(&Agent {

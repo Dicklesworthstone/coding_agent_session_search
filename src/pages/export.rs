@@ -537,11 +537,13 @@ impl ExportEngine {
                 }
             };
             drop(dest);
-            cleanup_sqlite_sidecars(&temp_output_path)
+            finalize_staged_sqlite_sidecars(&temp_output_path)
                 .context("Failed to finalize staged Pages export as one SQLite main file")?;
 
             let verification = verifier(&temp_output_path)
                 .context("Staged Pages export verification failed")?;
+            reject_existing_sqlite_sidecars(&temp_output_path, "verified staged database")
+                .context("Staged Pages export verifier left an unbound SQLite sidecar")?;
 
             replace_file_from_temp(
                 &temp_output_path,
@@ -773,6 +775,57 @@ fn cleanup_sqlite_sidecars(path: &Path) -> Result<()> {
     first_error.map_or(Ok(()), Err)
 }
 
+fn finalize_staged_sqlite_sidecars(path: &Path) -> Result<()> {
+    // A rollback journal, WAL, or SHM file can carry database state that has
+    // not reached the main file. Journal mode is DELETE for Pages exports, so
+    // any survivor is unexpected and must block publication rather than be
+    // discarded. FrankenSQLite's lock/namespace/certification sidecars are
+    // operational metadata; after the sole writer is closed they can be
+    // removed so the verifier receives the promised main-file-only artifact.
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let sidecar = sqlite_sidecar_path(path, suffix);
+        match std::fs::symlink_metadata(&sidecar) {
+            Ok(_) => {
+                bail!(
+                    "staged Pages export retained content-bearing SQLite sidecar {}; refusing main-file-only publication",
+                    sidecar.display()
+                );
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed inspecting staged SQLite sidecar before verification: {}",
+                        sidecar.display()
+                    )
+                });
+            }
+        }
+    }
+
+    let mut first_error = None;
+    for suffix in SQLITE_SIDECAR_SUFFIXES
+        .iter()
+        .copied()
+        .filter(|suffix| !matches!(*suffix, "-journal" | "-wal" | "-shm"))
+    {
+        let sidecar = sqlite_sidecar_path(path, suffix);
+        match std::fs::remove_file(&sidecar) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                if first_error.is_none() {
+                    first_error = Some(anyhow::Error::new(err).context(format!(
+                        "failed removing closed staged SQLite runtime sidecar {}",
+                        sidecar.display()
+                    )));
+                }
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 fn cleanup_sqlite_temp_artifacts(path: &Path) -> Result<()> {
     let main_result = match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -810,14 +863,14 @@ fn create_staged_export_file(path: &Path) -> Result<()> {
 /// only the main file while retaining any of those sidecars can therefore make
 /// readers observe a mixed or corrupt generation. The exporter cannot safely
 /// decide that an existing sidecar is stale, so preserve it and fail closed.
-fn reject_existing_final_sqlite_sidecars(final_path: &Path) -> Result<()> {
+fn reject_existing_sqlite_sidecars(path: &Path, artifact_label: &str) -> Result<()> {
     for suffix in SQLITE_SIDECAR_SUFFIXES {
-        let sidecar = sqlite_sidecar_path(final_path, suffix);
+        let sidecar = sqlite_sidecar_path(path, suffix);
         match std::fs::symlink_metadata(&sidecar) {
             Ok(_) => {
                 bail!(
-                    "refusing to replace Pages export {} while SQLite sidecar exists at {}; close every process using the destination and preserve or move the complete SQLite artifact family before retrying",
-                    final_path.display(),
+                    "refusing main-file-only Pages export publication because {artifact_label} {} has SQLite sidecar {}; close every process using that artifact and preserve or move the complete SQLite family before retrying",
+                    path.display(),
                     sidecar.display()
                 );
             }
@@ -825,8 +878,9 @@ fn reject_existing_final_sqlite_sidecars(final_path: &Path) -> Result<()> {
             Err(err) => {
                 return Err(err).with_context(|| {
                     format!(
-                        "failed inspecting SQLite sidecar before replacing Pages export: {}",
-                        sidecar.display()
+                        "failed inspecting SQLite sidecar {} for {artifact_label} {}",
+                        sidecar.display(),
+                        path.display()
                     )
                 });
             }
@@ -905,7 +959,7 @@ fn replace_file_from_temp(
     retain_temp_on_error: &mut bool,
 ) -> Result<()> {
     *retain_temp_on_error = false;
-    reject_existing_final_sqlite_sidecars(final_path)?;
+    reject_existing_sqlite_sidecars(final_path, "destination")?;
     #[cfg(windows)]
     {
         match std::fs::rename(temp_path, final_path) {
@@ -1673,6 +1727,71 @@ mod tests {
                 return Err(anyhow::anyhow!(
                     "rejected staged SQLite artifact survived cleanup: {}",
                     artifact.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn staged_finalization_rejects_content_sidecars_without_mutating_them() -> Result<()> {
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let temp_dir = TempDir::new()?;
+            let staged_path = temp_dir.path().join("export.tmp.db");
+            let sentinel_path = sqlite_sidecar_path(&staged_path, suffix);
+            std::fs::write(&staged_path, b"staged main")?;
+            std::fs::write(&sentinel_path, b"content-bearing sentinel")?;
+
+            let error = finalize_staged_sqlite_sidecars(&staged_path)
+                .expect_err("a content-bearing staged sidecar must block publication");
+            let message = format!("{error:#}");
+            if !message.contains(&sentinel_path.display().to_string()) {
+                return Err(anyhow::anyhow!(
+                    "staged sidecar rejection omitted {}: {message}",
+                    sentinel_path.display()
+                ));
+            }
+            if std::fs::read(&staged_path)? != b"staged main" {
+                return Err(anyhow::anyhow!(
+                    "staged sidecar rejection mutated the main file for {suffix}"
+                ));
+            }
+            if std::fs::read(&sentinel_path)? != b"content-bearing sentinel" {
+                return Err(anyhow::anyhow!(
+                    "staged sidecar rejection mutated the sidecar for {suffix}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn staged_finalization_removes_closed_runtime_sidecars() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let staged_path = temp_dir.path().join("export.tmp.db");
+        std::fs::write(&staged_path, b"staged main")?;
+        let runtime_sidecars = SQLITE_SIDECAR_SUFFIXES
+            .iter()
+            .copied()
+            .filter(|suffix| !matches!(*suffix, "-journal" | "-wal" | "-shm"))
+            .map(|suffix| sqlite_sidecar_path(&staged_path, suffix))
+            .collect::<Vec<_>>();
+        for sidecar in &runtime_sidecars {
+            std::fs::write(sidecar, b"closed runtime sentinel")?;
+        }
+
+        finalize_staged_sqlite_sidecars(&staged_path)?;
+
+        if std::fs::read(&staged_path)? != b"staged main" {
+            return Err(anyhow::anyhow!(
+                "staged finalization mutated the SQLite main file"
+            ));
+        }
+        for sidecar in runtime_sidecars {
+            if std::fs::symlink_metadata(&sidecar).is_ok() {
+                return Err(anyhow::anyhow!(
+                    "closed runtime sidecar survived staged finalization: {}",
+                    sidecar.display()
                 ));
             }
         }
