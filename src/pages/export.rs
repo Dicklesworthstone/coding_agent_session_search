@@ -145,9 +145,13 @@ impl ExportEngine {
         let result = (|| -> Result<(ExportStats, T)> {
             create_staged_export_file(&builder_path)?;
             builder_owned = true;
-            let output_path = builder_path.to_string_lossy().to_string();
-            let dest =
-                Connection::open(&output_path).context("Failed to create output database")?;
+            // Deliberately NOT named `output_path`: this is the PRIVATE
+            // BUILDER database, and shadowing the resolved export
+            // destination here once routed the final install onto the
+            // builder path (GH#418).
+            let builder_db_path = builder_path.to_string_lossy().to_string();
+            let dest = Connection::open(&builder_db_path)
+                .context("Failed to create output database")?;
 
             dest.execute_batch(
                 // Pages exports are encrypted/copied as one portable SQLite file.
@@ -890,6 +894,31 @@ fn derive_attachment_refs(extra_json: Option<&str>) -> Option<String> {
             serde_json::to_string(candidate).ok()
         }
     })
+}
+
+/// A backup path that is never reused within this process, so a retried
+/// replacement cannot rename over the backup of an earlier attempt.
+///
+/// Deliberately infallible: this is only reached inside the error-recovery
+/// branch of a failed rename, and failing to NAME a backup there would
+/// strand the export entirely. Per-process uniqueness comes from a
+/// monotonic counter; the pid disambiguates backups left by a crashed
+/// sibling process.
+#[cfg(any(windows, test))]
+fn unique_replace_backup_path(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("pages_export.db"));
+    let mut backup_name = std::ffi::OsString::from(".");
+    backup_name.push(file_name);
+    backup_name.push(format!(
+        ".pages-export-replace.{}.{seq}.bak",
+        std::process::id()
+    ));
+    path.with_file_name(backup_name)
 }
 
 #[cfg(any(windows, test))]

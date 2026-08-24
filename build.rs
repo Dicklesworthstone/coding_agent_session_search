@@ -111,8 +111,11 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "franken-agent-detection",
         crate_package_name: "franken-agent-detection",
         manifest_package_field: None,
-        expected_git: "https://github.com/Dicklesworthstone/franken_agent_detection",
-        expected_rev: "82424dc8571ef47215cac342696a36faabd07bca",
+        // GH#416: registry pin. crates.io 0.2.1's src/ is byte-identical to
+        // the previously pinned git rev 82424dc8 (verified by tree diff, not
+        // the version field), and crates.io refuses git dependencies.
+        expected_git: "",
+        expected_rev: "",
         expected_version: "0.2.1",
         expected_features: &[
             "chatgpt",
@@ -273,9 +276,13 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "toon",
         crate_package_name: "tru",
         manifest_package_field: Some("tru"),
-        expected_git: "https://github.com/Dicklesworthstone/toon_rust",
-        expected_rev: "d7185c78",
-        expected_version: "0.2.3",
+        // GH#416: registry pin. crates.io 0.2.4 differs from the previously
+        // pinned git rev d7185c78 by exactly one TEST assertion line
+        // (src/decode/event_builder.rs); production sources are
+        // byte-identical (verified by tree diff, not the version field).
+        expected_git: "",
+        expected_rev: "",
+        expected_version: "0.2.4",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../toon_rust",
@@ -460,39 +467,66 @@ fn validate_fsqlite_registry_pin(manifest_dir: &Path, manifest: &Value, packaged
         .unwrap_or_else(|| {
             fatal("dependency source contract: Cargo.lock has no [[package]] entries")
         });
+    // Collect EVERY off-pin family member before failing, and print the
+    // exact remediation for each (GH#417): reporting only the first
+    // mismatch made a multi-member drift a whack-a-mole loop, and only 2 of
+    // the ~20 family members are direct dependencies, so a bare
+    // `cargo update` can float any transitive member off-pin.
     let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut violations: Vec<String> = Vec::new();
+    let mut remediations: Vec<String> = Vec::new();
     for package in packages {
         let name = package.get("name").and_then(Value::as_str).unwrap_or("");
         if !(name == "fsqlite" || name.starts_with("fsqlite-")) {
             continue;
         }
+        let version = package.get("version").and_then(Value::as_str).unwrap_or("");
         if !seen.insert(name) {
-            fatal(format!(
-                "dependency source contract violation: Cargo.lock resolves more than one \
-                 version of `{name}`; the fsqlite family must converge on a single \
-                 registry release"
+            violations.push(format!(
+                "`{name}` resolves at more than one version; the fsqlite family must \
+                 converge on a single registry release"
             ));
         }
-        let version = package.get("version").and_then(Value::as_str).unwrap_or("");
         if version != EXPECTED_VERSION {
-            fatal(format!(
-                "dependency source contract violation: Cargo.lock resolves `{name}` at \
-                 version `{version}`, expected `{EXPECTED_VERSION}`"
+            violations.push(format!(
+                "`{name}` resolves at `{version}`, expected `{EXPECTED_VERSION}`"
+            ));
+            remediations.push(format!(
+                "cargo update -p {name}@{version} --precise {EXPECTED_VERSION}"
             ));
         }
         let source = package.get("source").and_then(Value::as_str).unwrap_or("");
         if source != REGISTRY_SOURCE {
-            fatal(format!(
-                "dependency source contract violation: Cargo.lock resolves `{name}` from \
-                 `{source}`, expected the crates.io registry (`{REGISTRY_SOURCE}`)"
+            violations.push(format!(
+                "`{name}` resolves from `{source}`, expected the crates.io registry \
+                 (`{REGISTRY_SOURCE}`)"
             ));
         }
     }
     if !seen.contains("fsqlite") {
-        fatal(
-            "dependency source contract violation: Cargo.lock does not resolve `fsqlite`; \
-             the engine dependency is missing",
+        violations.push(
+            "Cargo.lock does not resolve `fsqlite`; the engine dependency is missing".to_owned(),
         );
+    }
+    if !violations.is_empty() {
+        let mut message = format!(
+            "dependency source contract violation: {} fsqlite-family problem(s) in Cargo.lock:\n",
+            violations.len()
+        );
+        for violation in &violations {
+            message.push_str("  - ");
+            message.push_str(violation);
+            message.push('\n');
+        }
+        if !remediations.is_empty() {
+            message.push_str("remediate every off-pin member, then rebuild:\n");
+            for remediation in &remediations {
+                message.push_str("  ");
+                message.push_str(remediation);
+                message.push('\n');
+            }
+        }
+        fatal(message);
     }
 }
 

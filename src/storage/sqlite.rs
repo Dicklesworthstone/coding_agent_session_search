@@ -29883,7 +29883,7 @@ mod tests {
         let _profile = set_env_var("OMP_PROFILE", "");
         let _legacy_profile = set_env_var("PI_PROFILE", "");
         let _xdg = set_env_var("XDG_DATA_HOME", "");
-        let storage = SqliteStorage::open(dir.path().join("test.db"))?;
+        let storage = SqliteStorage::open(&dir.path().join("test.db"))?;
         let pi_agent_id = storage.ensure_agent(&Agent {
             id: None,
             slug: "pi_agent".into(),
