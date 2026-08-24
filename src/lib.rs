@@ -85220,6 +85220,10 @@ fn run_config_based_export(
 
     let bundle_builder = crate::pages::bundle::BundleBuilder::with_config(bundle_config);
     let bundle_result = bundle_builder.build(&encrypted_dir, output_dir, |_phase, _msg| {})?;
+    crate::pages::verify::ensure_valid_bundle(&bundle_result.site_dir, false)
+        .map_err(|error| {
+            error.context("Completed config-driven Pages bundle failed full verification")
+        })?;
 
     // Optional deployment
     let deploy_result = match wizard_state.target {

@@ -1,5 +1,6 @@
 //! `SQLite` backend: schema, pragmas, and migrations.
 
+use crate::connectors::omp::classify_omp_archive_path;
 use crate::franken_sync::{
     Connection as FrankenConnection, Row as FrankenRow, SqliteValue,
     compat::{
@@ -3504,7 +3505,8 @@ fn has_db_sidecar_suffix(name: &str) -> bool {
 /// Public schema version constant for external checks.
 pub const CURRENT_SCHEMA_VERSION: i64 = 20;
 pub(crate) const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
-const LEGACY_OMP_RECLASSIFICATION_META_KEY: &str = "legacy_omp_reclassification_v1";
+const LEGACY_OMP_RECLASSIFICATION_META_KEY: &str = "legacy_omp_reclassification_v2";
+const PREVIOUS_LEGACY_OMP_RECLASSIFICATION_META_KEY: &str = "legacy_omp_reclassification_v1";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LegacyOmpReclassificationResult {
@@ -8243,11 +8245,6 @@ impl FrankenStorage {
         &self,
         recheck_complete_archive: bool,
     ) -> Result<LegacyOmpReclassificationResult> {
-        const LEGACY_PATH_PREDICATE: &str = r"(
-            REPLACE(c.source_path, '\', '/') LIKE '%/.omp/agent/%'
-            OR REPLACE(c.source_path, '\', '/') LIKE '.omp/agent/%'
-        )";
-
         let state: Option<String> = self
             .conn
             .query_row_map(
@@ -8259,7 +8256,19 @@ impl FrankenStorage {
         if state.as_deref() == Some("complete") && !recheck_complete_archive {
             return Ok(LegacyOmpReclassificationResult::default());
         }
-        let assets_were_pending = state.as_deref() == Some("analytics_pending");
+        let previous_state: Option<String> = if state.is_none() {
+            self.conn
+                .query_row_map(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    fparams![PREVIOUS_LEGACY_OMP_RECLASSIFICATION_META_KEY],
+                    |row| row.get_typed(0),
+                )
+                .optional()?
+        } else {
+            None
+        };
+        let assets_were_pending = state.as_deref() == Some("analytics_pending")
+            || previous_state.as_deref() == Some("analytics_pending");
 
         let legacy_agent_id: Option<i64> = self
             .conn
@@ -8269,18 +8278,26 @@ impl FrankenStorage {
                 |row| row.get_typed(0),
             )
             .optional()?;
-        let legacy_count = if let Some(agent_id) = legacy_agent_id {
-            self.conn.query_row_map(
-                &format!(
-                    "SELECT COUNT(*) FROM conversations c
-                     WHERE c.agent_id = ?1 AND {LEGACY_PATH_PREDICATE}"
-                ),
-                fparams![agent_id],
-                |row| row.get_typed::<i64>(0),
-            )?
+        let legacy_conversation_ids = if let Some(agent_id) = legacy_agent_id {
+            self.conn
+                .query_map_collect(
+                    "SELECT id, source_path
+                     FROM conversations
+                     WHERE agent_id = ?1",
+                    fparams![agent_id],
+                    |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<String>(1)?)),
+                )?
+                .into_iter()
+                .filter_map(|(id, source_path)| {
+                    classify_omp_archive_path(Path::new(&source_path))
+                        .is_some()
+                        .then_some(id)
+                })
+                .collect::<Vec<_>>()
         } else {
-            0
+            Vec::new()
         };
+        let legacy_count = legacy_conversation_ids.len();
 
         if legacy_count > 0 {
             let omp_agent_id = self.ensure_agent(&Agent {
@@ -8291,111 +8308,92 @@ impl FrankenStorage {
                 kind: AgentKind::Cli,
             })?;
             let legacy_agent_id = legacy_agent_id.expect("positive legacy count requires agent id");
-            let conflicting_rows: i64 = self.conn.query_row_map(
-                &format!(
-                    "SELECT COUNT(*)
-                     FROM conversations legacy
-                     JOIN conversations current
-                       ON current.source_id = legacy.source_id
-                      AND current.agent_id = ?1
-                      AND current.external_id = legacy.external_id
-                     WHERE legacy.agent_id = ?2
-                       AND {}",
-                    LEGACY_PATH_PREDICATE.replace("c.", "legacy.")
-                ),
-                fparams![omp_agent_id, legacy_agent_id],
-                |row| row.get_typed(0),
-            )?;
+            let mut conflicting_rows = 0usize;
+            for conversation_id in &legacy_conversation_ids {
+                let conflict: i64 = self.conn.query_row_map(
+                    "SELECT EXISTS(
+                         SELECT 1
+                         FROM conversations legacy
+                         JOIN conversations current
+                           ON current.source_id = legacy.source_id
+                          AND current.agent_id = ?1
+                          AND current.external_id = legacy.external_id
+                         WHERE legacy.id = ?2
+                           AND legacy.agent_id = ?3
+                     )",
+                    fparams![omp_agent_id, *conversation_id, legacy_agent_id],
+                    |row| row.get_typed(0),
+                )?;
+                conflicting_rows += usize::from(conflict != 0);
+            }
             if conflicting_rows > 0 {
                 return Err(anyhow!(
                     "cannot reclassify {conflicting_rows} legacy OMP conversation(s): matching first-class OMP rows already exist; run a source-path duplicate audit before indexing"
                 ));
             }
 
-            let metadata_updates: Vec<(i64, String)> = self.conn.query_map_collect(
-                &format!(
-                    "SELECT c.id, c.metadata_json, c.metadata_bin
-                     FROM conversations c
-                     WHERE c.agent_id = ?1 AND {LEGACY_PATH_PREDICATE}"
-                ),
-                fparams![legacy_agent_id],
-                |row| {
-                    let id: i64 = row.get_typed(0)?;
-                    let metadata_json: Option<String> = row.get_typed(1)?;
-                    let metadata_bin: Option<Vec<u8>> = row.get_typed(2)?;
-                    let mut metadata = metadata_bin
-                        .as_deref()
-                        .and_then(|bytes| rmp_serde::from_slice(bytes).ok())
-                        .or_else(|| {
-                            metadata_json
-                                .as_deref()
-                                .and_then(|json| serde_json::from_str(json).ok())
-                        })
-                        .unwrap_or(serde_json::Value::Null);
-                    if let Some(object) = metadata.as_object_mut()
-                        && object.get("source").and_then(serde_json::Value::as_str)
-                            == Some("pi_agent")
-                    {
-                        object.insert("source".into(), serde_json::Value::String("omp".into()));
-                    }
-                    Ok((
-                        id,
-                        serde_json::to_string(&metadata).unwrap_or_else(|_| "null".into()),
-                    ))
-                },
-            )?;
+            let mut metadata_updates = Vec::with_capacity(legacy_count);
+            for conversation_id in &legacy_conversation_ids {
+                let (metadata_json, metadata_bin): (Option<String>, Option<Vec<u8>>) = self
+                    .conn
+                    .query_row_map(
+                        "SELECT metadata_json, metadata_bin
+                         FROM conversations
+                         WHERE id = ?1 AND agent_id = ?2",
+                        fparams![*conversation_id, legacy_agent_id],
+                        |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+                    )?;
+                let mut metadata = metadata_bin
+                    .as_deref()
+                    .and_then(|bytes| rmp_serde::from_slice(bytes).ok())
+                    .or_else(|| {
+                        metadata_json
+                            .as_deref()
+                            .and_then(|json| serde_json::from_str(json).ok())
+                    })
+                    .unwrap_or(serde_json::Value::Null);
+                if let Some(object) = metadata.as_object_mut()
+                    && object.get("source").and_then(serde_json::Value::as_str)
+                        == Some("pi_agent")
+                {
+                    object.insert("source".into(), serde_json::Value::String("omp".into()));
+                }
+                metadata_updates.push((
+                    *conversation_id,
+                    serde_json::to_string(&metadata).unwrap_or_else(|_| "null".into()),
+                ));
+            }
 
             let mut tx = self.conn.transaction()?;
             tx.execute_compat(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'analytics_pending')",
                 fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
             )?;
-            tx.execute_compat(
-                &format!(
-                    "UPDATE conversations SET agent_id = ?1
-                     WHERE agent_id = ?2 AND {}",
-                    LEGACY_PATH_PREDICATE.replace("c.", "")
-                ),
-                fparams![omp_agent_id, legacy_agent_id],
-            )?;
             for (conversation_id, metadata_json) in metadata_updates {
                 tx.execute_compat(
                     "UPDATE conversations
-                     SET metadata_json = ?1, metadata_bin = NULL
-                     WHERE id = ?2",
-                    fparams![metadata_json, conversation_id],
+                     SET agent_id = ?1, metadata_json = ?2, metadata_bin = NULL
+                     WHERE id = ?3 AND agent_id = ?4",
+                    fparams![
+                        omp_agent_id,
+                        metadata_json,
+                        conversation_id,
+                        legacy_agent_id
+                    ],
+                )?;
+                tx.execute_compat(
+                    "UPDATE token_usage SET agent_id = ?1 WHERE conversation_id = ?2",
+                    fparams![omp_agent_id, conversation_id],
+                )?;
+                tx.execute_compat(
+                    "DELETE FROM conversation_external_lookup WHERE conversation_id = ?1",
+                    fparams![conversation_id],
+                )?;
+                tx.execute_compat(
+                    "DELETE FROM conversation_external_tail_lookup WHERE conversation_id = ?1",
+                    fparams![conversation_id],
                 )?;
             }
-            tx.execute_compat(
-                &format!(
-                    "UPDATE token_usage SET agent_id = ?1
-                     WHERE conversation_id IN (
-                         SELECT c.id FROM conversations c
-                         WHERE c.agent_id = ?1 AND {LEGACY_PATH_PREDICATE}
-                     )"
-                ),
-                fparams![omp_agent_id],
-            )?;
-            tx.execute_compat(
-                &format!(
-                    "DELETE FROM conversation_external_lookup
-                     WHERE conversation_id IN (
-                         SELECT c.id FROM conversations c
-                         WHERE c.agent_id = ?1 AND {LEGACY_PATH_PREDICATE}
-                     )"
-                ),
-                fparams![omp_agent_id],
-            )?;
-            tx.execute_compat(
-                &format!(
-                    "DELETE FROM conversation_external_tail_lookup
-                     WHERE conversation_id IN (
-                         SELECT c.id FROM conversations c
-                         WHERE c.agent_id = ?1 AND {LEGACY_PATH_PREDICATE}
-                     )"
-                ),
-                fparams![omp_agent_id],
-            )?;
             tx.execute(
                 "INSERT OR REPLACE INTO conversation_external_lookup (lookup_key, conversation_id)
                  SELECT
@@ -8422,7 +8420,7 @@ impl FrankenStorage {
                    AND c.external_id IS NOT NULL",
             )?;
             tx.commit()?;
-        } else if state.as_deref() != Some("analytics_pending") {
+        } else if !assets_were_pending {
             self.conn.execute_compat(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'complete')",
                 fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
@@ -8438,7 +8436,7 @@ impl FrankenStorage {
             .with_context(|| "rebuilding daily stats after legacy OMP identity upgrade")?;
 
         Ok(LegacyOmpReclassificationResult {
-            conversations_reclassified: legacy_count.max(0) as usize,
+            conversations_reclassified: legacy_count,
             // The transaction commits the canonical identity change before
             // rebuilding derived assets. If a prior run stopped in that
             // window, `legacy_count` is already zero on retry, but the live

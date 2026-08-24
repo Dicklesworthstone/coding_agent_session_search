@@ -200,6 +200,42 @@ fn documentation_summary(
     }
 }
 
+fn wizard_archive_description(no_encryption: bool) -> &'static str {
+    if no_encryption {
+        "Create a searchable web archive without encryption. Published content will be plaintext."
+    } else {
+        "Create an encrypted, searchable web archive of your AI coding agent conversations."
+    }
+}
+
+fn archive_size_summary_line(no_encryption: bool, estimated_size_bytes: usize) -> String {
+    if no_encryption {
+        "  Archive Size:  calculated from the final unencrypted SQLite file after export"
+            .to_string()
+    } else {
+        format!(
+            "  Archive Size:  ~{} (estimated, compressed + encrypted)",
+            format_size(estimated_size_bytes)
+        )
+    }
+}
+
+fn summary_security_lines(no_encryption: bool, planned_key_slots: usize) -> [String; 3] {
+    if no_encryption {
+        [
+            "Encryption: Disabled (public plaintext)".to_string(),
+            "Key Derivation: Not applicable".to_string(),
+            "Key Slots: 0".to_string(),
+        ]
+    } else {
+        [
+            "Encryption: AES-256-GCM".to_string(),
+            "Key Derivation: Argon2id".to_string(),
+            format!("Planned Key Slots: {planned_key_slots}"),
+        ]
+    }
+}
+
 pub struct PagesWizard {
     state: WizardState,
     no_encryption_mode: bool,
@@ -394,7 +430,8 @@ impl PagesWizard {
         )?;
         writeln!(
             term,
-            "Create an encrypted, searchable web archive of your AI coding agent conversations."
+            "{}",
+            wizard_archive_description(self.no_encryption_mode)
         )?;
         writeln!(term)?;
         Ok(())
@@ -769,7 +806,11 @@ impl PagesWizard {
 
         // Generate comprehensive summary from database
         writeln!(term, "\n  Generating summary...")?;
-        let summary = self.generate_prepublish_summary()?;
+        let mut summary = self.generate_prepublish_summary()?;
+        if self.no_encryption_mode {
+            summary.encryption_config = None;
+            summary.key_slots.clear();
+        }
         self.state.last_summary = Some(summary.clone());
 
         // Display content overview
@@ -793,8 +834,11 @@ impl PagesWizard {
         )?;
         writeln!(
             term,
-            "  Archive Size:  ~{} (estimated, compressed + encrypted)",
-            style(format_size(summary.estimated_size_bytes)).yellow()
+            "{}",
+            archive_size_summary_line(
+                self.no_encryption_mode,
+                summary.estimated_size_bytes
+            )
         )?;
 
         // Display date range
@@ -903,32 +947,30 @@ impl PagesWizard {
         // Display security status
         writeln!(term, "\n{}", style("🔒 SECURITY").bold().cyan())?;
         writeln!(term, "{}", style("─".repeat(40)).dim())?;
-        if let Some(enc) = &summary.encryption_config {
-            writeln!(term, "  Encryption: {}", enc.algorithm)?;
-            writeln!(term, "  Key Derivation: {}", enc.key_derivation)?;
-            writeln!(term, "  Key Slots: {}", enc.key_slot_count)?;
-        } else {
-            writeln!(term, "  Encryption: AES-256-GCM")?;
-            writeln!(term, "  Key Derivation: Argon2id")?;
+        let planned_key_slots = usize::from(self.state.password.is_some())
+            + usize::from(self.state.generate_recovery);
+        for line in summary_security_lines(self.no_encryption_mode, planned_key_slots) {
+            writeln!(term, "  {line}")?;
         }
 
-        // Secret scan status
-        let secret_status = if summary.secret_scan.total_findings == 0 {
-            style("✓ No secrets detected".to_string()).green()
-        } else if summary.secret_scan.has_critical {
+        // This display reflects the preliminary source scan from Step 2. The
+        // exact staged-artifact scan remains the publication authority later.
+        let secret_status = if self.state.secret_scan_count == 0 {
+            style("✓ No potential secrets detected".to_string()).green()
+        } else if self.state.secret_scan_has_critical {
             style(format!(
                 "⚠️  {} issues (CRITICAL)",
-                summary.secret_scan.total_findings
+                self.state.secret_scan_count
             ))
             .red()
         } else {
             style(format!(
                 "⚠️  {} issues found",
-                summary.secret_scan.total_findings
+                self.state.secret_scan_count
             ))
             .yellow()
         };
-        writeln!(term, "  Secret Scan: {}", secret_status)?;
+        writeln!(term, "  Preliminary Secret Scan: {}", secret_status)?;
 
         // Configuration summary
         writeln!(term, "\n{}", style("⚙️  CONFIGURATION").bold().cyan())?;
@@ -1803,12 +1845,19 @@ impl PagesWizard {
                 DeployTarget::Local => None,
             };
 
-            let doc_config = if let Some(url) = target_url {
+            let mut doc_config = if let Some(url) = target_url {
                 DocConfig::new().with_url(url)
             } else {
                 DocConfig::new()
             }
             .with_archive_mode(archive_mode);
+            if let Some(config) = encryption_config.as_ref() {
+                doc_config = doc_config.with_argon_params(
+                    config.kdf_defaults.memory_kb,
+                    config.kdf_defaults.iterations,
+                    config.kdf_defaults.parallelism,
+                );
+            }
 
             let doc_generator = DocumentationGenerator::new(doc_config, documentation_summary);
             doc_generator.generate_all()
@@ -1834,6 +1883,8 @@ impl PagesWizard {
             builder.build(&encrypted_dir, &self.state.output_dir, |phase, msg| {
                 pb3.set_message(format!("{}: {}", phase, msg));
             })?;
+        crate::pages::verify::ensure_valid_bundle(&bundle_result.site_dir, false)
+            .context("Completed Pages bundle failed full verification")?;
         self.state.final_site_dir = Some(bundle_result.site_dir.clone());
 
         pb3.finish_with_message(format!(
@@ -2296,11 +2347,53 @@ mod tests {
             Some(2)
         );
 
+        let security_doc = DocumentationGenerator::new(
+            DocConfig::new()
+                .with_archive_mode(mode)
+                .with_argon_params(
+                    emitted.kdf_defaults.memory_kb,
+                    emitted.kdf_defaults.iterations,
+                    emitted.kdf_defaults.parallelism,
+                ),
+            documented.clone(),
+        )
+        .generate_security_doc();
+        assert!(security_doc.content.contains(&format!(
+            "m={}KB, t={}, p={}",
+            emitted.kdf_defaults.memory_kb,
+            emitted.kdf_defaults.iterations,
+            emitted.kdf_defaults.parallelism
+        )));
+
         let (unencrypted, mode) = documentation_summary(&documented, None);
         assert_eq!(mode, ArchiveMode::Unencrypted);
         assert!(unencrypted.key_slots.is_empty());
         assert!(unencrypted.encryption_config.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn unencrypted_summary_copy_never_claims_encrypted_output() {
+        assert!(wizard_archive_description(true).contains("plaintext"));
+
+        let size_line = archive_size_summary_line(true, 1_048_576);
+        assert!(size_line.contains("final unencrypted SQLite file"));
+        assert!(!size_line.contains("compressed + encrypted"));
+
+        let security_lines = summary_security_lines(true, 2).join("\n");
+        assert!(security_lines.contains("Encryption: Disabled (public plaintext)"));
+        assert!(security_lines.contains("Key Derivation: Not applicable"));
+        assert!(security_lines.contains("Key Slots: 0"));
+        assert!(!security_lines.contains("AES-256-GCM"));
+        assert!(!security_lines.contains("Argon2id"));
+    }
+
+    #[test]
+    fn encrypted_summary_copy_reports_planned_slots() {
+        let security_lines = summary_security_lines(false, 2).join("\n");
+        assert!(security_lines.contains("Encryption: AES-256-GCM"));
+        assert!(security_lines.contains("Key Derivation: Argon2id"));
+        assert!(security_lines.contains("Planned Key Slots: 2"));
     }
 
     // =========================

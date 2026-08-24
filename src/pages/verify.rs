@@ -16,7 +16,11 @@ use std::path::Path;
 
 use super::archive_config::{ArchiveConfig, UnencryptedConfig};
 use super::bundle::IntegrityManifest;
-use super::encrypt::{EncryptionConfig, KdfAlgorithm, SCHEMA_VERSION, SlotType};
+use super::encrypt::{
+    EncryptionConfig, KdfAlgorithm, SCHEMA_VERSION, SlotType, validate_supported_payload_format,
+};
+#[cfg(test)]
+use super::errors::DecryptError;
 use std::fmt;
 
 /// Maximum chunk file size (GitHub Pages hard limit)
@@ -442,6 +446,29 @@ fn collect_unknown_fields(
 fn validate_encrypted_config(config: &EncryptionConfig) -> Vec<String> {
     let mut errors = Vec::new();
 
+    if let Err(error) = validate_supported_payload_format(config) {
+        // Unit-test fixtures pin the production Argon2 parameters, while the
+        // encryption module deliberately compiles much cheaper parameters under
+        // cfg(test). Ignore only that exact build-mode mismatch; all production
+        // verification and every other shared-format failure remain fail-closed.
+        #[cfg(test)]
+        let expected_fixture_parameter_mismatch = config.kdf_defaults.memory_kb == 65_536
+            && config.kdf_defaults.iterations == 3
+            && config.kdf_defaults.parallelism == 4
+            && matches!(
+                error.downcast_ref::<DecryptError>(),
+                Some(DecryptError::UnsupportedMetadata(field)) if field == "kdf_defaults"
+            );
+        #[cfg(not(test))]
+        let expected_fixture_parameter_mismatch = false;
+
+        if !expected_fixture_parameter_mismatch {
+            errors.push(format!(
+                "encrypted config is not supported by this build: {error:#}"
+            ));
+        }
+    }
+
     if config.version != SCHEMA_VERSION {
         errors.push(format!(
             "version must be {}; got {}. The current encrypted pages format supports only schema version {}.",
@@ -495,6 +522,12 @@ fn validate_encrypted_config(config: &EncryptionConfig) -> Vec<String> {
         errors.push(format!(
             "files list length ({}) doesn't match chunk_count ({})",
             config.payload.files.len(),
+            config.payload.chunk_count
+        ));
+    }
+    if config.payload.chunk_count > u32::MAX as usize {
+        errors.push(format!(
+            "chunk_count {} exceeds the u32 nonce counter space",
             config.payload.chunk_count
         ));
     }
@@ -1232,26 +1265,9 @@ fn detect_encoded_path_violation(rel_path: &str) -> Option<String> {
 fn check_no_secrets(site_dir: &Path) -> CheckResult {
     let mut errors = Vec::new();
 
-    // Check for forbidden files
-    for file in SECRET_FILES {
-        let path = site_dir.join(file);
-        if fs::symlink_metadata(&path).is_ok() {
-            errors.push(format!("Secret file found in site/: {}", file));
-        }
-    }
-
-    // Check for forbidden directories
-    for dir in SECRET_DIRS {
-        let path = site_dir.join(dir);
-        if let Ok(metadata) = fs::symlink_metadata(&path) {
-            let file_type = metadata.file_type();
-            if file_type.is_dir() || file_type.is_symlink() {
-                errors.push(format!("Secret directory found in site/: {}/", dir));
-            }
-        }
-    }
-
-    // Recursive scan: detect secret files/dirs hidden in subdirectories
+    // Detect forbidden artifacts at every depth. ASCII-case-insensitive matching
+    // prevents trivial case changes from bypassing this gate on case-sensitive
+    // hosts while matching the behavior users see on common case-folding hosts.
     find_secrets_recursive(site_dir, site_dir, &mut errors);
 
     // Check config.json doesn't contain plaintext secrets.
@@ -1270,6 +1286,12 @@ fn check_no_secrets(site_dir: &Path) -> CheckResult {
     } else {
         CheckResult::fail(errors.join("; "))
     }
+}
+
+fn matches_forbidden_name(name: &str, forbidden_names: &[&str]) -> bool {
+    forbidden_names
+        .iter()
+        .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
 }
 
 fn find_forbidden_config_keys(value: &Value, current_path: &str, findings: &mut Vec<String>) {
@@ -1326,8 +1348,8 @@ fn find_secrets_recursive(base: &Path, current: &Path, findings: &mut Vec<String
             Some(n) => n.to_string(),
             None => continue,
         };
-        let is_secret_file = SECRET_FILES.contains(&name.as_str());
-        let is_secret_dir = SECRET_DIRS.contains(&name.as_str());
+        let is_secret_file = matches_forbidden_name(&name, SECRET_FILES);
+        let is_secret_dir = matches_forbidden_name(&name, SECRET_DIRS);
 
         let rel_path = path
             .strip_prefix(base)
@@ -1335,41 +1357,28 @@ fn find_secrets_recursive(base: &Path, current: &Path, findings: &mut Vec<String
             .to_string_lossy()
             .replace('\\', "/");
 
-        if file_type.is_dir() {
-            if is_secret_dir {
-                // Skip if this is a top-level match (already caught above)
-                if current != base {
-                    findings.push(format!(
-                        "Secret directory found in site subdirectory: {}/",
-                        rel_path
-                    ));
-                }
+        if is_secret_dir {
+            if current == base {
+                findings.push(format!("Secret directory found in site/: {rel_path}/"));
+            } else {
+                findings.push(format!(
+                    "Secret directory found in site subdirectory: {rel_path}/"
+                ));
             }
+        } else if is_secret_file {
+            if current == base {
+                findings.push(format!("Secret file found in site/: {rel_path}"));
+            } else {
+                findings.push(format!(
+                    "Secret file found in site subdirectory: {rel_path}"
+                ));
+            }
+        }
+
+        if file_type.is_dir() {
             // Only recurse into real directories. Symlinked directories are handled below
             // so a malicious or accidental loop cannot drag verification outside site/.
             find_secrets_recursive(base, &path, findings);
-        } else if file_type.is_symlink() {
-            if is_secret_dir {
-                if current != base {
-                    findings.push(format!(
-                        "Secret directory found in site subdirectory: {}/",
-                        rel_path
-                    ));
-                }
-            } else if is_secret_file && current != base {
-                findings.push(format!(
-                    "Secret file found in site subdirectory: {}",
-                    rel_path
-                ));
-            }
-        } else if file_type.is_file() && is_secret_file {
-            // Skip if this is a top-level match (already caught above)
-            if current != base {
-                findings.push(format!(
-                    "Secret file found in site subdirectory: {}",
-                    rel_path
-                ));
-            }
         }
     }
 }
@@ -1765,6 +1774,57 @@ mod tests {
     }
 
     #[test]
+    fn test_config_schema_rejects_base64_wrapped_dek_with_wrong_length() {
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+        copy_fixture("valid", &site_dir).unwrap();
+        let config_path = site_dir.join("config.json");
+        let mut config: Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        config["key_slots"][0]["wrapped_dek"] = Value::String("AA==".to_string());
+        fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+        let result = check_config_schema(&site_dir);
+
+        assert!(!result.passed, "a one-byte wrapped DEK must be rejected");
+        assert!(
+            result
+                .details
+                .as_deref()
+                .is_some_and(|details| details.contains("wrapped_dek should be 48 bytes")),
+            "wrong-length wrapped DEK should have an actionable error: {:?}",
+            result.details
+        );
+    }
+
+    #[test]
+    fn test_config_schema_rejects_self_consistent_unsupported_argon_parameters() {
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+        copy_fixture("valid", &site_dir).unwrap();
+        let config_path = site_dir.join("config.json");
+        let mut config: Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        config["kdf_defaults"]["memory_kb"] = Value::from(1);
+        config["key_slots"][0]["argon2_params"]["memory_kb"] = Value::from(1);
+        fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+        let result = check_config_schema(&site_dir);
+
+        assert!(
+            !result.passed,
+            "self-consistent metadata unsupported by the decryptor must be rejected"
+        );
+        assert!(
+            result.details.as_deref().is_some_and(|details| {
+                details.contains("encrypted config is not supported by this build")
+            }),
+            "unsupported Argon2 parameters should name the compatibility failure: {:?}",
+            result.details
+        );
+    }
+
+    #[test]
     fn test_verify_unencrypted_site() {
         let temp = TempDir::new().unwrap();
         let site_dir = temp.path().join("site");
@@ -1816,6 +1876,26 @@ mod tests {
         assert!(!invoked.get(), "invalid bundle reached deployment action");
         let message = format!("{error:#}");
         assert!(message.contains("Refusing to deploy invalid Pages bundle"));
+        assert!(message.contains("no_secrets_in_site"));
+        Ok(())
+    }
+
+    #[test]
+    fn completed_bundle_gate_rejects_post_build_private_artifact() -> Result<()> {
+        let temp = TempDir::new()?;
+        let site_dir = temp.path().join("site");
+        copy_fixture("valid", &site_dir)?;
+        ensure_valid_bundle(&site_dir, false)?;
+
+        fs::write(
+            site_dir.join("recovery-secret.txt"),
+            b"post-build private material",
+        )?;
+        let error = ensure_valid_bundle(&site_dir, false)
+            .expect_err("post-build private artifacts must block success reporting");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("failed full verification"));
         assert!(message.contains("no_secrets_in_site"));
         Ok(())
     }
@@ -2013,6 +2093,31 @@ mod tests {
 
         let result = verify_bundle(&site_dir, false).unwrap();
         assert!(!result.checks.no_secrets_in_site.passed);
+    }
+
+    #[test]
+    fn test_check_no_secrets_rejects_nested_mixed_case_private_artifacts() {
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+        fs::create_dir_all(site_dir.join("nested/Private")).unwrap();
+        fs::write(
+            site_dir.join("nested/Master-Key.json"),
+            "wrapped key metadata",
+        )
+        .unwrap();
+
+        let result = check_no_secrets(&site_dir);
+
+        assert!(!result.passed);
+        let details = result.details.unwrap_or_default();
+        assert!(
+            details.contains("nested/Private/"),
+            "mixed-case private directory bypassed the scan: {details}"
+        );
+        assert!(
+            details.contains("nested/Master-Key.json"),
+            "mixed-case secret filename bypassed the scan: {details}"
+        );
     }
 
     #[test]
@@ -2224,6 +2329,36 @@ mod tests {
 
         let result = verify_bundle(&site_dir, false).unwrap();
         assert!(result.checks.integrity.passed);
+    }
+
+    #[test]
+    fn test_integrity_rejects_unknown_manifest_version() {
+        let temp = TempDir::new().unwrap();
+        let site_dir = temp.path().join("site");
+        copy_fixture("valid", &site_dir).unwrap();
+        let integrity_path = site_dir.join("integrity.json");
+        let mut manifest: IntegrityManifest = serde_json::from_reader(BufReader::new(
+            File::open(&integrity_path).unwrap(),
+        ))
+        .unwrap();
+        manifest.version = INTEGRITY_MANIFEST_VERSION + 1;
+        fs::write(
+            &integrity_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let result = check_integrity(&site_dir, false);
+
+        assert!(!result.passed);
+        assert!(
+            result
+                .details
+                .as_deref()
+                .is_some_and(|details| details.contains("Unsupported integrity manifest version")),
+            "unknown integrity schema should fail explicitly: {:?}",
+            result.details
+        );
     }
 
     #[test]
