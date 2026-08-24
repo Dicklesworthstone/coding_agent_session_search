@@ -77,27 +77,70 @@ fn redact(text: &str, tally: &mut RedactionTally) -> String {
     out
 }
 
-/// Recursively redact every string value in an arbitrary JSON value.
+/// Redact arbitrary JSON with the canonical key-aware secret policy followed
+/// by the strict swarm-evidence policy. Object keys are output strings too,
+/// and credential-bearing keys can make otherwise innocuous short scalars
+/// sensitive, so a value-only walk is not sufficient here.
 fn redact_value(value: &Value, tally: &mut RedactionTally) -> Value {
+    tally.strings_seen = tally
+        .strings_seen
+        .saturating_add(json_output_string_count(value));
+    tally.fields_scrubbed = tally
+        .fields_scrubbed
+        .saturating_add(json_redaction_count(value));
+    crate::pages::redact::redact_swarm_json_value(value)
+}
+
+fn json_output_string_count(value: &Value) -> usize {
     match value {
-        Value::String(text) => Value::String(redact(text, tally)),
-        Value::Array(items) => {
-            Value::Array(items.iter().map(|item| redact_value(item, tally)).collect())
+        Value::String(_) => 1,
+        Value::Array(items) => items.iter().fold(0usize, |total, item| {
+            total.saturating_add(json_output_string_count(item))
+        }),
+        Value::Object(map) => map.iter().fold(0usize, |total, (_, value)| {
+            total
+                .saturating_add(1)
+                .saturating_add(json_output_string_count(value))
+        }),
+        Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+    }
+}
+
+fn json_redaction_count(value: &Value) -> usize {
+    match value {
+        Value::String(text) => {
+            let redacted = crate::pages::redact::redact_swarm_text(text);
+            usize::from(redacted != text.as_str())
         }
-        Value::Object(map) => Value::Object(
-            map.iter()
-                .map(|(key, val)| (key.clone(), redact_value(val, tally)))
-                .collect(),
-        ),
-        other => other.clone(),
+        Value::Array(items) => items.iter().fold(0usize, |total, item| {
+            total.saturating_add(json_redaction_count(item))
+        }),
+        Value::Object(map) => map.iter().fold(0usize, |total, (key, value)| {
+            let redacted_key = crate::pages::redact::redact_swarm_text(key);
+            let key_changed = usize::from(redacted_key != key.as_str());
+            let value_changes = if crate::indexer::redact_secrets::is_sensitive_json_field(key)
+                && !value.is_null()
+            {
+                usize::from(value.as_str() != Some("[REDACTED]"))
+            } else {
+                json_redaction_count(value)
+            };
+            total
+                .saturating_add(key_changed)
+                .saturating_add(value_changes)
+        }),
+        Value::Null | Value::Bool(_) | Value::Number(_) => 0,
     }
 }
 
 fn render_payload(fixture_id: &str, source_kind: &str, facts: CapsuleFacts) -> Value {
     let mut tally = RedactionTally::default();
-    let share_safe_fixture_id = redact(fixture_id, &mut RedactionTally::default());
+    let share_safe_fixture_id = redact(fixture_id, &mut tally);
 
     let opted_into_full = facts.privacy_tier.eq_ignore_ascii_case("full");
+    let privacy_tier = if opted_into_full { "full" } else { "redacted" };
+    let incident_kind = redact(&normalize_kind(&facts.incident_kind), &mut tally);
+    let cass_version = redact(&facts.cass_version, &mut tally);
     // Private session text is dropped to a marker unless the operator opts into
     // the full tier; even then it is redacted, never emitted raw.
     let session_text = match (&facts.private_session_text, opted_into_full) {
@@ -122,7 +165,7 @@ fn render_payload(fixture_id: &str, source_kind: &str, facts: CapsuleFacts) -> V
     let actual = redact(&facts.actual, &mut tally);
 
     let body = json!({
-        "incident_kind": normalize_kind(&facts.incident_kind),
+        "incident_kind": incident_kind,
         "command": command,
         "transcript": transcript,
         "env_summary": env,
@@ -137,7 +180,7 @@ fn render_payload(fixture_id: &str, source_kind: &str, facts: CapsuleFacts) -> V
     let replay_value = |key: &str| body.get(key).cloned().unwrap_or(Value::Null);
     let replay_source = json!({
         "incident_kind": replay_value("incident_kind"),
-        "cass_version": redact(&facts.cass_version, &mut RedactionTally::default()),
+        "cass_version": cass_version,
         "command": replay_value("command"),
         "transcript": replay_value("transcript"),
         "env": replay_value("env_summary"),
@@ -146,7 +189,7 @@ fn render_payload(fixture_id: &str, source_kind: &str, facts: CapsuleFacts) -> V
         "expected": replay_value("expected"),
         "actual": replay_value("actual"),
         "private_session_text": replay_value("session_text"),
-        "privacy_tier": if opted_into_full { "full" } else { "redacted" }
+        "privacy_tier": privacy_tier
     });
 
     let summary = summarize(&facts, &tally);
@@ -172,9 +215,9 @@ fn render_payload(fixture_id: &str, source_kind: &str, facts: CapsuleFacts) -> V
         "manifest": {
             "capsule_id": capsule_id,
             "schema_version": SCHEMA_VERSION,
-            "incident_kind": normalize_kind(&facts.incident_kind),
-            "cass_version": redact(&facts.cass_version, &mut RedactionTally::default()),
-            "privacy_tier": facts.privacy_tier,
+            "incident_kind": replay_value("incident_kind"),
+            "cass_version": replay_source["cass_version"].clone(),
+            "privacy_tier": privacy_tier,
             "evidence_ref_count": facts.evidence_refs.len()
         },
         "summary": summary,
@@ -431,6 +474,51 @@ mod tests {
     }
 
     #[test]
+    fn structured_json_redacts_keys_and_short_sensitive_values_without_loss() {
+        let short_password = ["a", "bc"].concat();
+        let first_secret_key = ["api_key=", "abcdefgh12345678"].concat();
+        let second_secret_key = ["password=", "abcdefgh12345678"].concat();
+        let source = json!({
+            "incident_kind": "ci-failure",
+            "env": {
+                "password": short_password,
+                (first_secret_key.clone()): "first",
+                (second_secret_key.clone()): "second",
+            },
+            "health_excerpt": {
+                "nested": { "pin": ["12", "34"].concat() },
+            },
+        });
+
+        let out = render_repro_capsule_fixture("capsule", Some(&source));
+        let serialized = serde_json::to_string(&out).expect("serialize redacted capsule");
+        for raw in [first_secret_key.as_str(), second_secret_key.as_str()] {
+            assert!(!serialized.contains(raw), "structured JSON leaked {raw:?}");
+        }
+        assert_eq!(out["capsule"]["env_summary"]["password"], "[REDACTED]");
+        assert_eq!(
+            out["capsule"]["health_excerpt"]["nested"]["pin"],
+            "[REDACTED]"
+        );
+
+        let env = out["capsule"]["env_summary"]
+            .as_object()
+            .expect("redacted env object");
+        let mut collision_values = env
+            .iter()
+            .filter(|(key, _)| key.starts_with("[REDACTED]"))
+            .map(|(_, value)| value.as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        collision_values.sort_unstable();
+        assert_eq!(collision_values, vec!["first", "second"]);
+        assert!(
+            out["redaction_report"]["fields_scrubbed"]
+                .as_u64()
+                .is_some_and(|count| count >= 4)
+        );
+    }
+
+    #[test]
     fn rerun_uses_real_share_safe_fixture_surface() {
         let out = render_repro_capsule_fixture("capsule", Some(&risky_source("redacted")));
         assert_eq!(out["rerun"]["targets_live_data"], json!(false));
@@ -504,6 +592,28 @@ mod tests {
         assert_eq!(
             out["capsule"]["incident_kind"],
             json!("other:meteor-strike")
+        );
+    }
+
+    #[test]
+    fn envelope_strings_are_redacted_and_privacy_tier_is_normalized() {
+        let secret = ["sk-ant-", "api03-", "AAAABBBBCCCCDDDDEEEE"].concat();
+        let source = json!({
+            "incident_kind": format!("unknown-{secret}"),
+            "cass_version": format!("build-at-/home/alice/{secret}"),
+            "privacy_tier": format!("full-{secret}"),
+        });
+
+        let out = render_repro_capsule_fixture(&format!("fixture-{secret}"), Some(&source));
+        let serialized = serde_json::to_string(&out).expect("serialize redacted capsule");
+        assert!(!serialized.contains(&secret));
+        assert!(!serialized.contains("/home/alice"));
+        assert_eq!(out["manifest"]["privacy_tier"], "redacted");
+        assert_eq!(out["sources"]["repro_capsule"]["privacy_tier"], "redacted");
+        assert!(
+            out["redaction_report"]["fields_scrubbed"]
+                .as_u64()
+                .is_some_and(|count| count >= 3)
         );
     }
 

@@ -28,7 +28,7 @@ const REDACTED: &str = "[REDACTED]";
 /// semantics. Normalization deliberately accepts the common snake/kebab/camel
 /// spellings while using an exact allowlist to avoid broad false positives such
 /// as `keyframe`, `monkey`, or `token_count`.
-fn is_sensitive_json_field(key: &str) -> bool {
+pub(crate) fn is_sensitive_json_field(key: &str) -> bool {
     let normalized = key
         .bytes()
         .filter(|byte| byte.is_ascii_alphanumeric())
@@ -37,8 +37,7 @@ fn is_sensitive_json_field(key: &str) -> bool {
 
     matches!(
         normalized.as_str(),
-        "password"
-            | "passwd"
+        "passwd"
             | "pwd"
             | "passphrase"
             | "pin"
@@ -52,6 +51,7 @@ fn is_sensitive_json_field(key: &str) -> bool {
             | "sessiontoken"
             | "bearertoken"
             | "secrettoken"
+            | "oauthtoken"
             | "secret"
             | "secretkey"
             | "accesskey"
@@ -59,16 +59,23 @@ fn is_sensitive_json_field(key: &str) -> bool {
             | "awssecretaccesskey"
             | "awssessiontoken"
             | "awssecuritytoken"
-            | "clientsecret"
             | "clienttoken"
             | "credential"
             | "credentials"
             | "authorization"
+            | "cookie"
+            | "setcookie"
             | "privatekey"
             | "privatekeypem"
-            | "databasepassword"
-            | "dbpassword"
-    )
+            | "databaseurl"
+            | "connectionstring"
+    ) || normalized.ends_with("password")
+        || normalized.ends_with("passwordhash")
+        || normalized.ends_with("hashedpassword")
+        || normalized.ends_with("secret")
+        || normalized.ends_with("token")
+        || normalized.ends_with("apikey")
+        || normalized.ends_with("credential")
 }
 
 fn redact_sensitive_json_value(
@@ -89,7 +96,20 @@ struct SecretPattern {
     regex: Regex,
 }
 
-const PRIVATE_KEY_BLOCK_PATTERN: &str = concat!(
+pub(crate) const AWS_ACCESS_KEY_PATTERN: &str = r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b";
+pub(crate) const AWS_SECRET_KEY_PATTERN: &str =
+    r#"(?i)aws(.{0,20})?(secret|access)?[_-]?key\s*[:=]\s*['"]?[A-Za-z0-9/+=]{40}['"]?"#;
+pub(crate) const AWS_SESSION_TOKEN_PATTERN: &str = r#"(?i)\baws[_-]?(?:session|security)[_-]?token\s*[:=]\s*(?:"(?:\\.|[^"\\\r\n]){8,}"|'(?:\\.|[^'\\\r\n]){8,}'|[^\s,;}\]]{8,})"#;
+pub(crate) const GITHUB_TOKEN_PATTERN: &str =
+    r"\b(?:gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20,})\b";
+pub(crate) const OPENAI_API_KEY_PATTERN: &str = r"\b(?:sk-(?:proj-|admin-)[A-Za-z0-9_-]{19,}[A-Za-z0-9_]|sk-[A-Za-z0-9]{20,})\b";
+pub(crate) const ANTHROPIC_API_KEY_PATTERN: &str =
+    r"\bsk-ant-(?:api[0-9]{2}-)?[A-Za-z0-9_-]{19,}[A-Za-z0-9_]\b";
+pub(crate) const BEARER_TOKEN_PATTERN: &str =
+    r"(?i)\bBearer[ \t]+[A-Za-z0-9._~+/=-]{8,}";
+pub(crate) const JWT_PATTERN: &str =
+    r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b";
+pub(crate) const PRIVATE_KEY_BLOCK_PATTERN: &str = concat!(
     r"(?s)(?:",
     r"-----BEGIN RSA PRIVATE KEY-----.*?(?:-----END RSA PRIVATE KEY-----|\z)|", // ubs:ignore — public key-block regex, not embedded credentials.
     r"-----BEGIN EC PRIVATE KEY-----.*?(?:-----END EC PRIVATE KEY-----|\z)|", // ubs:ignore — public key-block regex, not embedded credentials.
@@ -100,6 +120,11 @@ const PRIVATE_KEY_BLOCK_PATTERN: &str = concat!(
     r"-----BEGIN PGP PRIVATE KEY BLOCK-----.*?(?:-----END PGP PRIVATE KEY BLOCK-----|\z)", // ubs:ignore — public key-block regex, not embedded credentials.
     r")",
 );
+pub(crate) const DATABASE_URL_PATTERN: &str =
+    r#"(?i)\b(postgres|postgresql|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s'"]{8,}"#;
+pub(crate) const GENERIC_SECRET_ASSIGNMENT_PATTERN: &str = r#"(?i)\b(?:api[ _-]?(?:key|secret|token)|auth[ _-]?token|access[ _-]?(?:token|key)|secret[ _-]?key|session[ _-]?token|password|passwd|passphrase|token|secret|authorization)\s*[:=]\s*(?:"(?:\\.|[^"\\\r\n]){4,}"|'(?:\\.|[^'\\\r\n]){4,}'|[^\s,;}\]]{8,})"#;
+pub(crate) const SLACK_TOKEN_PATTERN: &str = r"\bxox[bpsaor]-[A-Za-z0-9\-]{10,}";
+pub(crate) const STRIPE_KEY_PATTERN: &str = r"\b[spr]k_live_[A-Za-z0-9]{20,}";
 
 /// All built-in patterns, compiled once on first use.
 static SECRET_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
@@ -107,43 +132,43 @@ static SECRET_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
         // AWS access key IDs: AKIA for long-lived IAM credentials and ASIA
         // for temporary STS credentials.
         SecretPattern {
-            pattern: r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
-            regex: Regex::new(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")
-                .expect("aws access key regex"),
+            pattern: AWS_ACCESS_KEY_PATTERN,
+            regex: Regex::new(AWS_ACCESS_KEY_PATTERN).expect("aws access key regex"),
         },
         // AWS Secret Key in assignment context
         SecretPattern {
-            pattern: r#"(?i)aws(.{0,20})?(secret|access)?[_-]?key\s*[:=]\s*['"]?[A-Za-z0-9/+=]{40}['"]?"#,
-            regex: Regex::new(
-                r#"(?i)aws(.{0,20})?(secret|access)?[_-]?key\s*[:=]\s*['"]?[A-Za-z0-9/+=]{40}['"]?"#,
-            )
-            .expect("aws secret regex"),
+            pattern: AWS_SECRET_KEY_PATTERN,
+            regex: Regex::new(AWS_SECRET_KEY_PATTERN).expect("aws secret regex"),
         },
-        // GitHub PAT (ghp_, gho_, ghu_, ghs_, ghr_)
+        // AWS STS session/security token in configuration context.
         SecretPattern {
-            pattern: r"\bgh[pousr]_[A-Za-z0-9]{36}\b",
-            regex: Regex::new(r"\bgh[pousr]_[A-Za-z0-9]{36}\b").expect("github pat regex"),
+            pattern: AWS_SESSION_TOKEN_PATTERN,
+            regex: Regex::new(AWS_SESSION_TOKEN_PATTERN).expect("aws session token regex"),
         },
-        // OpenAI API key (sk-...)
+        // GitHub classic/app tokens and fine-grained PATs.
         SecretPattern {
-            pattern: r"\bsk-[A-Za-z0-9]{20,}\b",
-            regex: Regex::new(r"\bsk-[A-Za-z0-9]{20,}\b").expect("openai key regex"),
+            pattern: GITHUB_TOKEN_PATTERN,
+            regex: Regex::new(GITHUB_TOKEN_PATTERN).expect("github token regex"),
         },
-        // Anthropic API key (sk-ant-...)
+        // OpenAI legacy, project, and admin API keys.
         SecretPattern {
-            pattern: r"\bsk-ant-[A-Za-z0-9]{20,}\b",
-            regex: Regex::new(r"\bsk-ant-[A-Za-z0-9]{20,}\b").expect("anthropic key regex"),
+            pattern: OPENAI_API_KEY_PATTERN,
+            regex: Regex::new(OPENAI_API_KEY_PATTERN).expect("openai key regex"),
+        },
+        // Anthropic API keys, including current apiNN segmented keys.
+        SecretPattern {
+            pattern: ANTHROPIC_API_KEY_PATTERN,
+            regex: Regex::new(ANTHROPIC_API_KEY_PATTERN).expect("anthropic key regex"),
         },
         // Bearer tokens in authorization headers
         SecretPattern {
-            pattern: r"(?i)Bearer\s+[A-Za-z0-9_\-.]{20,}",
-            regex: Regex::new(r"(?i)Bearer\s+[A-Za-z0-9_\-.]{20,}").expect("bearer token regex"),
+            pattern: BEARER_TOKEN_PATTERN,
+            regex: Regex::new(BEARER_TOKEN_PATTERN).expect("bearer token regex"),
         },
         // JWT tokens (eyJ...)
         SecretPattern {
-            pattern: r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b",
-            regex: Regex::new(r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b")
-                .expect("jwt regex"),
+            pattern: JWT_PATTERN,
+            regex: Regex::new(JWT_PATTERN).expect("jwt regex"),
         },
         // PEM/OpenSSH/PGP private-key blocks. Match through the corresponding
         // footer, or through end-of-input for a truncated paste. Redacting
@@ -154,29 +179,24 @@ static SECRET_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
         },
         // Database connection URLs with credentials
         SecretPattern {
-            pattern: r"(?i)\b(postgres|postgresql|mysql|mongodb|redis)://[^\s]{8,}",
-            regex: Regex::new(
-                r"(?i)\b(postgres|postgresql|mysql|mongodb|redis)://[^\s]{8,}",
-            )
-            .expect("db url regex"),
+            pattern: DATABASE_URL_PATTERN,
+            regex: Regex::new(DATABASE_URL_PATTERN).expect("db url regex"),
         },
         // Generic key/token/secret/password assignments
         SecretPattern {
-            pattern: r#"(?i)(api[_-]?key|api[_-]?secret|auth[_-]?token|access[_-]?token|secret[_-]?key|password|passwd)\s*[:=]\s*['"]?[A-Za-z0-9_\-/+=]{8,}['"]?"#,
-            regex: Regex::new(
-                r#"(?i)(api[_-]?key|api[_-]?secret|auth[_-]?token|access[_-]?token|secret[_-]?key|password|passwd)\s*[:=]\s*['"]?[A-Za-z0-9_\-/+=]{8,}['"]?"#,
-            )
-            .expect("generic api key regex"),
+            pattern: GENERIC_SECRET_ASSIGNMENT_PATTERN,
+            regex: Regex::new(GENERIC_SECRET_ASSIGNMENT_PATTERN)
+                .expect("generic secret assignment regex"),
         },
-        // Slack tokens (xoxb-, xoxp-, xoxs-, xoxa-, xoxo-, xoxr-)
+        // Slack tokens (xoxb-, xoxp-, xoxs-, xoxa-, xoxo-, xoxr-).
         SecretPattern {
-            pattern: r"\bxox[bpsar]-[A-Za-z0-9\-]{10,}",
-            regex: Regex::new(r"\bxox[bpsar]-[A-Za-z0-9\-]{10,}").expect("slack token regex"),
+            pattern: SLACK_TOKEN_PATTERN,
+            regex: Regex::new(SLACK_TOKEN_PATTERN).expect("slack token regex"),
         },
         // Stripe keys (sk_live_, pk_live_, rk_live_)
         SecretPattern {
-            pattern: r"\b[spr]k_live_[A-Za-z0-9]{20,}",
-            regex: Regex::new(r"\b[spr]k_live_[A-Za-z0-9]{20,}").expect("stripe key regex"),
+            pattern: STRIPE_KEY_PATTERN,
+            regex: Regex::new(STRIPE_KEY_PATTERN).expect("stripe key regex"),
         },
     ]
 });
@@ -221,7 +241,7 @@ fn apply_replacements<'a>(input: &'a str, matches: &regex::SetMatches) -> Cow<'a
 /// whose distinct source key redacted to the same placeholder. Generated
 /// suffixes contain only public punctuation/digits, so collision handling
 /// never reintroduces source-key bytes.
-fn insert_redacted_json_entry(
+pub(crate) fn insert_redacted_json_entry(
     object: &mut serde_json::Map<String, serde_json::Value>,
     next_suffixes: &mut HashMap<String, usize>,
     redacted_key: String,
@@ -715,6 +735,17 @@ mod tests {
         let output = redact_text(input);
         assert_eq!(output, "my key is [REDACTED]");
         assert!(!output.contains("sk-ABCDE"));
+
+        for current in [
+            "sk-proj-AbCdEf_0123456789-xYz987654321",
+            "sk-admin-AbCdEf_0123456789-xYz987654321",
+        ] {
+            assert_eq!(redact_text(current), REDACTED);
+        }
+        assert_eq!(
+            redact_text("sk-project-AbCdEf_0123456789-xYz987654321"),
+            "sk-project-AbCdEf_0123456789-xYz987654321"
+        );
     }
 
     #[test]
@@ -722,6 +753,11 @@ mod tests {
         let input = "sk-ant-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij";
         let output = redact_text(input);
         assert_eq!(output, "[REDACTED]");
+        assert_eq!(
+            redact_text("sk-ant-api03-AbCdEf_0123456789-xYz987654321"),
+            REDACTED
+        );
+        assert_eq!(redact_text("sk-ant-api03-short"), "sk-ant-api03-short");
     }
 
     #[test]
@@ -729,6 +765,11 @@ mod tests {
         let input = "token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij";
         let output = redact_text(input);
         assert_eq!(output, "token [REDACTED]");
+        assert_eq!(
+            redact_text("github_pat_AbCdEf_0123456789_xYz987654321"),
+            REDACTED
+        );
+        assert_eq!(redact_text("github_pat_short"), "github_pat_short");
     }
 
     #[test]
@@ -799,16 +840,30 @@ mod tests {
 
     #[test]
     fn redacts_generic_api_key_assignment() {
-        let input = "api_key=abcdefgh12345678";
-        let output = redact_text(input);
-        assert_eq!(output, "[REDACTED]");
+        for input in [
+            "api_key=abcdefgh12345678",
+            "password=\"correct horse battery staple!\"",
+            "password=P@ssw0rd!",
+            "api_key:'abc.def$ghi'",
+            "AWS_SESSION_TOKEN=AQoEXAMPLE0123456789/value+=",
+        ] {
+            assert_eq!(redact_text(input), REDACTED, "secret survived in {input:?}");
+        }
+        for near_miss in ["password=short", "AWS_SESSION_TOKEN=short"] {
+            assert_eq!(redact_text(near_miss), near_miss);
+        }
     }
 
     #[test]
     fn redacts_database_url() {
-        let input = "DATABASE_URL=postgres://user:pass@host:5432/db";
-        let output = redact_text(input);
-        assert!(!output.contains("user:pass"));
+        for input in [
+            "DATABASE_URL=postgres://user:pass@host:5432/db",
+            "mongodb+srv://user:pass@cluster.mongodb.net/db",
+            "amqp://user:pass@broker.internal/vhost",
+        ] {
+            let output = redact_text(input);
+            assert!(!output.contains("user:pass"), "credential URL survived: {output}");
+        }
     }
 
     #[test]
@@ -821,9 +876,12 @@ mod tests {
 
     #[test]
     fn redacts_slack_token() {
-        let input = "xoxb-123456789-abcdefghij";
-        let output = redact_text(input);
-        assert_eq!(output, "[REDACTED]");
+        for input in [
+            "xoxb-123456789-abcdefghij",
+            "xoxo-123456789-abcdefghij",
+        ] {
+            assert_eq!(redact_text(input), REDACTED);
+        }
     }
 
     #[test]
@@ -921,7 +979,11 @@ mod tests {
             },
             "nested": {
                 "clientSecret": ["short", "values"],
-                "private_key_pem": {"body": "short"}
+                "private_key_pem": {"body": "short"},
+                "oauth_token": "opaque-short-value",
+                "service_password_hash": "not-pattern-shaped",
+                "cookie": "session=short",
+                "connection_string": "custom-driver opaque value"
             },
             "null_password": null,
             "keyframe": "animation-safe",
@@ -945,6 +1007,10 @@ mod tests {
             "/credentials",
             "/nested/clientSecret",
             "/nested/private_key_pem",
+            "/nested/oauth_token",
+            "/nested/service_password_hash",
+            "/nested/cookie",
+            "/nested/connection_string",
         ] {
             if plain.pointer(pointer) != Some(&json!(REDACTED)) {
                 return Err(format!("sensitive field was not fully redacted: {pointer}"));

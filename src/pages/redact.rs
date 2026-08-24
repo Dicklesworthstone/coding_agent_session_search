@@ -474,7 +474,12 @@ pub fn redact_swarm_text(input: &str) -> String {
 
 pub fn redact_swarm_json_value(value: &Value) -> Value {
     let engine = RedactionEngine::new(swarm_evidence_redaction_config());
-    redact_swarm_json_value_with_engine(&engine, value)
+    // Structured credentials are frequently split across an object key and a
+    // bare value, so scalar-by-scalar text redaction cannot see the assignment
+    // context. Apply the canonical key-aware JSON policy first, then layer the
+    // swarm-specific path, host, and PII policy over the safe structure.
+    let secret_redacted = crate::indexer::redact_secrets::redact_json(value);
+    redact_swarm_json_value_with_engine(&engine, &secret_redacted)
 }
 
 fn insert_redacted_swarm_entry(
@@ -1022,6 +1027,38 @@ mod tests {
         assert!(report.redaction_applied);
         assert!(report.command_arguments_scrubbed > 0);
         assert!(report.evidence_references_scrubbed > 0);
+    }
+
+    #[test]
+    fn strict_swarm_json_redacts_structured_credentials_by_key() {
+        let input = serde_json::json!({
+            "AWS_SESSION_TOKEN": "AQoEXAMPLE-session/value+=with.punctuation", // ubs:ignore -- synthetic redaction fixture.
+            "password": "correct horse battery staple!", // ubs:ignore -- synthetic redaction fixture.
+            "nested": {
+                "oauth-token": "opaque-short-value",
+                "pin": 123456,
+                "cookie": "session=short"
+            },
+            "token_count": 42,
+            "keyframe": "safe"
+        });
+
+        let output = redact_swarm_json_value(&input);
+        for pointer in [
+            "/AWS_SESSION_TOKEN",
+            "/password",
+            "/nested/oauth-token",
+            "/nested/pin",
+            "/nested/cookie",
+        ] {
+            assert_eq!(
+                output.pointer(pointer),
+                Some(&serde_json::json!("[REDACTED]")),
+                "structured swarm credential leaked at {pointer}: {output}"
+            );
+        }
+        assert_eq!(output["token_count"], input["token_count"]);
+        assert_eq!(output["keyframe"], input["keyframe"]);
     }
 
     #[test]

@@ -29,6 +29,7 @@ use frankensearch::{
     },
     rrf_fuse as fs_rrf_fuse,
 };
+use frankensqlite::AsyncConnection as SearchSqliteConnection;
 use lru::LruCache;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
@@ -41,21 +42,202 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::franken_sync::Connection;
 #[cfg(test)]
 use crate::franken_sync::compat::OptionalExtension;
-use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt, Transaction, TransactionExt};
+use crate::franken_sync::compat::{ParamValue, RowExt, param_slice_to_values};
 #[cfg(test)]
 use crate::franken_sync::params;
 
-/// Wrapper around `crate::franken_sync::Connection` that implements `Send`.
+/// Row-mapping conveniences for the dedicated-owner search connection.
 ///
-/// `crate::franken_sync::Connection` is `!Send` because it uses `Rc` internally.
-/// However, the `Rc` values are entirely self-contained within the Connection
-/// and are not shared with any external references.  When wrapped in a `Mutex`
-/// (as in `SearchClient`), exclusive access is guaranteed, making cross-thread
-/// transfer safe.
-struct SendConnection(Connection);
+/// `AsyncConnection` intentionally exposes owned rows across its worker-thread
+/// boundary. Mapping them on the caller keeps application-specific conversion
+/// errors out of the worker protocol while preserving the former fallible row
+/// mapper semantics.
+trait SearchSqliteConnectionExt {
+    #[cfg(test)]
+    fn query_row_map<T, F>(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+        map: F,
+    ) -> Result<T, crate::franken_sync::FrankenError>
+    where
+        F: FnOnce(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>;
+
+    fn query_map_collect<T, F>(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+        map: F,
+    ) -> Result<Vec<T>, crate::franken_sync::FrankenError>
+    where
+        F: FnMut(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>;
+}
+
+impl SearchSqliteConnectionExt for SearchSqliteConnection {
+    #[cfg(test)]
+    fn query_row_map<T, F>(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+        map: F,
+    ) -> Result<T, crate::franken_sync::FrankenError>
+    where
+        F: FnOnce(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>,
+    {
+        let values = param_slice_to_values(params);
+        let row = self.query_row_with_params_sync(sql, &values)?;
+        map(&row)
+    }
+
+    fn query_map_collect<T, F>(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+        mut map: F,
+    ) -> Result<Vec<T>, crate::franken_sync::FrankenError>
+    where
+        F: FnMut(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>,
+    {
+        let values = param_slice_to_values(params);
+        let rows = self.query_with_params_sync(sql, &values)?;
+        rows.iter().map(&mut map).collect()
+    }
+}
+
+#[cfg(test)]
+struct SearchSqliteFixture(Option<SearchSqliteConnection>);
+
+#[cfg(test)]
+impl SearchSqliteFixture {
+    fn in_memory() -> Result<Self, crate::franken_sync::FrankenError> {
+        SearchSqliteConnection::open_sync(":memory:").map(|conn| Self(Some(conn)))
+    }
+
+    fn into_connection(mut self) -> SearchSqliteConnection {
+        self.0
+            .take()
+            .expect("search sqlite fixture connection must be present")
+    }
+
+    fn connection(&self) -> &SearchSqliteConnection {
+        self.0
+            .as_ref()
+            .expect("search sqlite fixture connection must be present")
+    }
+
+    fn execute(
+        &self,
+        sql: &str,
+    ) -> Result<usize, crate::franken_sync::FrankenError> {
+        self.connection().execute_sync(sql)
+    }
+
+    fn execute_with_params(
+        &self,
+        sql: &str,
+        params: &[crate::franken_sync::SqliteValue],
+    ) -> Result<usize, crate::franken_sync::FrankenError> {
+        self.connection().execute_with_params_sync(sql, params)
+    }
+
+    fn execute_batch(&self, sql: &str) -> Result<(), crate::franken_sync::FrankenError> {
+        self.connection().execute_batch_sync(sql)
+    }
+
+    fn query_row_map<T, F>(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+        map: F,
+    ) -> Result<T, crate::franken_sync::FrankenError>
+    where
+        F: FnOnce(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>,
+    {
+        let values = param_slice_to_values(params);
+        let row = self.connection().query_row_with_params_sync(sql, &values)?;
+        map(&row)
+    }
+
+    fn execute_compat(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+    ) -> Result<usize, crate::franken_sync::FrankenError> {
+        let values = param_slice_to_values(params);
+        self.connection().execute_with_params_sync(sql, &values)
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for SearchSqliteFixture {
+    type Target = SearchSqliteConnection;
+
+    fn deref(&self) -> &Self::Target {
+        self.connection()
+    }
+}
+
+#[cfg(test)]
+impl Drop for SearchSqliteFixture {
+    fn drop(&mut self) {
+        if let Some(mut conn) = self.0.take()
+            && let Err(error) = conn.close_without_checkpoint_sync()
+        {
+            tracing::warn!(%error, "failed to close search sqlite fixture owner");
+        }
+    }
+}
+
+/// Read snapshot whose rollback obligation remains on the dedicated owner.
+///
+/// Search hydration deliberately takes an explicit transaction so related
+/// message and conversation queries observe one archive generation. The
+/// guard makes early-return/error paths rollback on the same worker that owns
+/// the connection.
+struct SearchReadTransaction<'conn> {
+    conn: &'conn SearchSqliteConnection,
+    active: bool,
+}
+
+impl<'conn> SearchReadTransaction<'conn> {
+    fn begin(conn: &'conn SearchSqliteConnection) -> Result<Self, crate::franken_sync::FrankenError> {
+        conn.begin_transaction_sync()?;
+        Ok(Self { conn, active: true })
+    }
+
+    fn query_map_collect<T, F>(
+        &self,
+        sql: &str,
+        params: &[ParamValue],
+        map: F,
+    ) -> Result<Vec<T>, crate::franken_sync::FrankenError>
+    where
+        F: FnMut(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>,
+    {
+        self.conn.query_map_collect(sql, params, map)
+    }
+
+    fn rollback(&mut self) -> Result<(), crate::franken_sync::FrankenError> {
+        self.conn.rollback_transaction_sync()?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for SearchReadTransaction<'_> {
+    fn drop(&mut self) {
+        if self.active
+            && let Err(error) = self.conn.rollback_transaction_sync()
+        {
+            tracing::warn!(
+                %error,
+                "failed to roll back search hydration read transaction"
+            );
+        }
+    }
+}
 
 type TantivyContentExactKey = (i64, i64);
 type TantivyContentFallbackKey = (String, String, i64);
@@ -87,11 +269,27 @@ type SqliteFtsMessageRow = (
     Option<String>,
     Option<String>,
 );
-type SqliteMessageScanAlternative = Vec<String>;
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SqliteMessageScanTermPart {
+    text: String,
+    prefix: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SqliteMessageScanOperand {
+    Terms(Vec<SqliteMessageScanTermPart>),
+    Phrase(Vec<String>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SqliteMessageScanAlternative {
+    operand: SqliteMessageScanOperand,
+    negated: bool,
+}
+
 type SqliteMessageScanGroup = Vec<SqliteMessageScanAlternative>;
 struct SqliteMessageScanQuery {
-    include_groups: Vec<SqliteMessageScanGroup>,
-    exclude_terms: Vec<String>,
+    groups: Vec<SqliteMessageScanGroup>,
 }
 
 #[derive(Clone, Copy)]
@@ -100,6 +298,7 @@ struct SqliteMessageScanRequest<'a> {
     filters: &'a SearchFilters,
     limit: usize,
     offset: usize,
+    scan_limit: usize,
     field_mask: FieldMask,
     query_match_type: MatchType,
 }
@@ -121,25 +320,18 @@ const SQLITE_MESSAGE_SCAN_FALLBACK_LIMIT: usize = 30_000;
 const SEARCH_SQLITE_HYDRATION_CACHE_KIB: i64 = 4_096;
 const SEMANTIC_EXACT_CHUNK_OVERFETCH_MULTIPLIER: usize = 4;
 
-// Safety: Rc fields inside Connection are not cloned or shared externally.
-// The Mutex<Option<SendConnection>> in SearchClient ensures exclusive access.
-unsafe impl Send for SendConnection {}
-
-impl std::ops::Deref for SendConnection {
-    type Target = Connection;
-    fn deref(&self) -> &Connection {
-        &self.0
-    }
-}
-
-fn open_search_hydration_sqlite(path: &Path, timeout: Duration) -> Result<Connection> {
-    let conn =
-        crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout(path, timeout)?;
-    conn.execute("PRAGMA query_only = 1;")
+fn open_search_hydration_sqlite(
+    path: &Path,
+    timeout: Duration,
+) -> Result<SearchSqliteConnection> {
+    let conn = crate::storage::sqlite::open_franken_async_readonly_connection_with_timeout(
+        path, timeout,
+    )?;
+    conn.execute_sync("PRAGMA query_only = 1;")
         .with_context(|| "setting search hydration query_only")?;
-    conn.execute("PRAGMA busy_timeout = 5000;")
+    conn.execute_sync("PRAGMA busy_timeout = 5000;")
         .with_context(|| "setting search hydration busy_timeout")?;
-    conn.execute(&format!(
+    conn.execute_sync(&format!(
         "PRAGMA cache_size = -{SEARCH_SQLITE_HYDRATION_CACHE_KIB};"
     ))
     .with_context(|| "setting search hydration cache_size")?;
@@ -156,7 +348,7 @@ fn nfc_sanitize_query(raw: &str) -> String {
 }
 
 fn franken_query_map_collect_retry<T, F>(
-    conn: &Connection,
+    conn: &SearchSqliteConnection,
     sql: &str,
     params: &[ParamValue],
     map: F,
@@ -187,7 +379,7 @@ where
 }
 
 fn hydrate_message_content_by_conversation(
-    conn: &Connection,
+    conn: &SearchSqliteConnection,
     requests: &[TantivyContentExactKey],
 ) -> Result<HashMap<TantivyContentExactKey, String>> {
     if requests.is_empty() {
@@ -789,8 +981,10 @@ impl QueryExplanation {
 
         // Extract terms, phrases, and operators
         let mut parsed = ParsedQuery::default();
-        let mut has_explicit_operator = false;
         let mut next_negated = false;
+        let mut saw_operand = false;
+        let mut explicit_binary_since_operand = false;
+        let mut uses_implicit_and = false;
 
         for token in &tokens {
             match token {
@@ -823,6 +1017,11 @@ impl QueryExplanation {
                         negated: next_negated,
                         subterms,
                     });
+                    if saw_operand && !explicit_binary_since_operand {
+                        uses_implicit_and = true;
+                    }
+                    saw_operand = true;
+                    explicit_binary_since_operand = false;
                     next_negated = false;
                 }
                 FsCassQueryToken::Phrase(p) => {
@@ -833,27 +1032,34 @@ impl QueryExplanation {
                         .collect();
                     if !parts.is_empty() {
                         parsed.phrases.push(parts.join(" "));
+                        if saw_operand && !explicit_binary_since_operand {
+                            uses_implicit_and = true;
+                        }
+                        saw_operand = true;
+                        explicit_binary_since_operand = false;
                     }
                     next_negated = false;
                 }
                 FsCassQueryToken::And => {
                     parsed.operators.push("AND".to_string());
-                    has_explicit_operator = true;
+                    explicit_binary_since_operand = saw_operand;
                 }
                 FsCassQueryToken::Or => {
                     parsed.operators.push("OR".to_string());
-                    has_explicit_operator = true;
+                    explicit_binary_since_operand = saw_operand;
                 }
                 FsCassQueryToken::Not => {
                     parsed.operators.push("NOT".to_string());
-                    has_explicit_operator = true;
                     next_negated = true;
                 }
             }
         }
 
-        // Implicit AND between terms if no explicit operators
-        parsed.implicit_and = !has_explicit_operator && parsed.terms.len() > 1;
+        // Every pair of adjacent operands is implicitly conjoined, including
+        // quoted phrases and a unary-NOT operand. Track adjacency directly:
+        // a query can contain both an explicit connector and a later implicit
+        // one (`foo AND bar baz`).
+        parsed.implicit_and = uses_implicit_and;
 
         // Determine query type
         let query_type = Self::classify_query(&parsed, filters, &sanitized);
@@ -1611,12 +1817,13 @@ fn normalized_search_source_id_sql_expr(
 
 /// SQL twin of [`normalized_search_hit_origin_kind`]: the normalized origin
 /// kind (`local` / `remote` / other lowercase kind) of a conversation row,
-/// from its `sources.kind` with the same `source_id` fallback the hit
-/// derivation uses. Lets the SQLite lane's `--source local|remote` select by
-/// kind instead of by `source_id == 'local'` (bead 5bf29).
+/// from its `sources.kind` with the same `source_id` / `origin_host` fallback
+/// the hit derivation uses. Lets the SQLite lane's `--source local|remote`
+/// select by kind instead of by `source_id == 'local'` (bead 5bf29).
 fn normalized_search_origin_kind_sql_expr(
     source_id_column: &str,
     origin_kind_column: &str,
+    origin_host_column: &str,
 ) -> String {
     format!(
         "CASE \
@@ -1624,7 +1831,9 @@ fn normalized_search_origin_kind_sql_expr(
             WHEN LOWER(TRIM(COALESCE({origin_kind_column}, ''))) IN ('ssh', 'remote') THEN 'remote' \
             WHEN TRIM(COALESCE({origin_kind_column}, '')) != '' THEN LOWER(TRIM({origin_kind_column})) \
             WHEN LOWER(TRIM(COALESCE({source_id_column}, ''))) = '{local}' THEN '{local}' \
-            ELSE 'remote' \
+            WHEN TRIM(COALESCE({source_id_column}, '')) != '' THEN 'remote' \
+            WHEN TRIM(COALESCE({origin_host_column}, '')) != '' THEN 'remote' \
+            ELSE '{local}' \
          END",
         local = crate::sources::provenance::LOCAL_SOURCE_ID,
     )
@@ -2704,7 +2913,7 @@ pub struct SearchClient {
         frankensearch::quill::QuillSearchIndex,
         crate::search::quill_bridge::QuillCassFields,
     )>,
-    sqlite: Mutex<Option<SendConnection>>,
+    sqlite: Mutex<Option<SearchSqliteConnection>>,
     sqlite_path: Option<PathBuf>,
     prefix_cache: Mutex<CacheShards>,
     reload_on_search: bool,
@@ -2740,6 +2949,15 @@ impl Default for SearchClientOptions {
 
 impl Drop for SearchClient {
     fn drop(&mut self) {
+        let sqlite = match self.sqlite.get_mut() {
+            Ok(sqlite) => sqlite,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(mut conn) = sqlite.take()
+            && let Err(error) = conn.close_without_checkpoint_sync()
+        {
+            tracing::warn!(%error, "failed to close search sqlite owner");
+        }
         FEDERATED_SEARCH_READERS
             .write()
             .remove(&self.cache_namespace);
@@ -3757,7 +3975,9 @@ impl SearchClient {
         }))
     }
 
-    fn sqlite_guard(&self) -> Result<std::sync::MutexGuard<'_, Option<SendConnection>>> {
+    fn sqlite_guard(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Option<SearchSqliteConnection>>> {
         let mut guard = self
             .sqlite
             .lock()
@@ -3768,7 +3988,7 @@ impl SearchClient {
         {
             match open_search_hydration_sqlite(path, std::time::Duration::from_secs(1)) {
                 Ok(conn) => {
-                    *guard = Some(SendConnection(conn));
+                    *guard = Some(conn);
                 }
                 Err(err) => {
                     tracing::debug!(
@@ -5332,7 +5552,7 @@ impl SearchClient {
 
     fn hydrate_ranked_message_hits_in_transaction(
         &self,
-        transaction: &Transaction<'_>,
+        transaction: &SearchReadTransaction<'_>,
         results: &[RankedMessageHydrationCandidate],
         field_mask: FieldMask,
         match_type: MatchType,
@@ -5573,7 +5793,7 @@ impl SearchClient {
         let conn = sqlite_guard
             .as_ref()
             .ok_or_else(|| anyhow!("semantic search requires database connection"))?;
-        let mut transaction = conn.transaction()?;
+        let mut transaction = SearchReadTransaction::begin(conn)?;
         let hits = self.hydrate_ranked_message_hits_in_transaction(
             &transaction,
             &candidates,
@@ -6164,8 +6384,7 @@ impl SearchClient {
                     "CASS Layer-B projection requires a database connection"
                 ))
             })?;
-            let mut transaction = conn
-                .transaction()
+            let mut transaction = SearchReadTransaction::begin(conn)
                 .map_err(|error| CassLexicalLayerBError::Hydration(anyhow::Error::new(error)))?;
             let mut conversation_ids = indices_by_conversation.keys().copied().collect::<Vec<_>>();
             conversation_ids.sort_unstable();
@@ -7317,7 +7536,7 @@ impl SearchClient {
         Ok((combined_hits, total_count))
     }
 
-    fn sqlite_fts_uses_message_id_column(conn: &Connection) -> Result<bool> {
+    fn sqlite_fts_uses_message_id_column(conn: &SearchSqliteConnection) -> Result<bool> {
         let params: [ParamValue; 0] = [];
         let ddl_rows: Vec<String> = franken_query_map_collect_retry(
             conn,
@@ -7335,7 +7554,7 @@ impl SearchClient {
             .unwrap_or(false))
     }
 
-    fn sqlite_fts_match_mode(conn: &Connection) -> Result<SqliteFtsMatchMode> {
+    fn sqlite_fts_match_mode(conn: &SearchSqliteConnection) -> Result<SqliteFtsMatchMode> {
         let params = [ParamValue::from("__cass_fts_probe_no_match__")];
         match franken_query_map_collect_retry(
             conn,
@@ -7355,7 +7574,7 @@ impl SearchClient {
         }
     }
 
-    fn sqlite_fts5_rowid_projection_available(conn: &Connection) -> bool {
+    fn sqlite_fts5_rowid_projection_available(conn: &SearchSqliteConnection) -> bool {
         let params: [ParamValue; 0] = [];
         franken_query_map_collect_retry(
             conn,
@@ -7550,12 +7769,59 @@ impl SearchClient {
     }
 
     fn sqlite_message_scan_query(raw_query: &str) -> Option<SqliteMessageScanQuery> {
-        fn scan_parts(parts: Vec<String>) -> Vec<String> {
+        fn scan_parts(parts: Vec<String>) -> Vec<SqliteMessageScanTermPart> {
             parts
                 .into_iter()
-                .map(|part| part.trim_end_matches('*').to_lowercase())
-                .filter(|part| !part.is_empty())
+                .filter_map(|part| {
+                    let prefix = part.ends_with('*');
+                    let text = part.trim_end_matches('*').to_lowercase();
+                    (!text.is_empty()).then_some(SqliteMessageScanTermPart { text, prefix })
+                })
                 .collect()
+        }
+
+        fn flush_pending_or_group(
+            pending_or_group: &mut SqliteMessageScanGroup,
+            groups: &mut Vec<SqliteMessageScanGroup>,
+        ) {
+            if !pending_or_group.is_empty() {
+                groups.push(std::mem::take(pending_or_group));
+            }
+        }
+
+        fn apply_operand(
+            operand: SqliteMessageScanOperand,
+            next_negated: &mut bool,
+            in_or_sequence: &mut bool,
+            just_saw_or: &mut bool,
+            pending_or_group: &mut SqliteMessageScanGroup,
+            groups: &mut Vec<SqliteMessageScanGroup>,
+        ) {
+            let alternative = SqliteMessageScanAlternative {
+                operand,
+                negated: *next_negated,
+            };
+
+            if *in_or_sequence && *just_saw_or {
+                if pending_or_group.is_empty()
+                    && let Some(previous_group) = groups.pop()
+                {
+                    // The primary frankensearch builder lifts its preceding
+                    // Must/MustNot clause into the tighter-binding OR group.
+                    // Flattening an already-grouped clause is equivalent and
+                    // also handles permissive malformed forms such as
+                    // `A AND OR B` without changing their established meaning.
+                    pending_or_group.extend(previous_group);
+                }
+                pending_or_group.push(alternative);
+            } else {
+                flush_pending_or_group(pending_or_group, groups);
+                *in_or_sequence = false;
+                groups.push(vec![alternative]);
+            }
+
+            *just_saw_or = false;
+            *next_negated = false;
         }
 
         let tokens = fs_cass_parse_boolean_query(raw_query);
@@ -7563,135 +7829,167 @@ impl SearchClient {
             return None;
         }
 
-        let mut include_groups = Vec::new();
+        let mut groups = Vec::new();
         let mut pending_or_group: SqliteMessageScanGroup = Vec::new();
-        let mut exclude_terms = Vec::new();
-        let mut negated = false;
+        let mut next_negated = false;
         let mut in_or_sequence = false;
+        let mut just_saw_or = false;
         for token in tokens {
             match token {
                 FsCassQueryToken::And => {
-                    if !pending_or_group.is_empty() {
-                        include_groups.push(std::mem::take(&mut pending_or_group));
-                    }
+                    flush_pending_or_group(&mut pending_or_group, &mut groups);
                     in_or_sequence = false;
-                    negated = false;
+                    just_saw_or = false;
+                    next_negated = false;
                 }
                 FsCassQueryToken::Or => {
-                    if include_groups.is_empty() && pending_or_group.is_empty() {
-                        continue;
-                    }
-                    if negated {
-                        return None;
-                    }
                     in_or_sequence = true;
+                    just_saw_or = true;
                 }
                 FsCassQueryToken::Not => {
-                    if in_or_sequence {
-                        return None;
+                    if !just_saw_or {
+                        flush_pending_or_group(&mut pending_or_group, &mut groups);
+                        in_or_sequence = false;
+                        just_saw_or = false;
                     }
-                    if !pending_or_group.is_empty() {
-                        include_groups.push(std::mem::take(&mut pending_or_group));
-                    }
-                    negated = true;
-                    in_or_sequence = false;
+                    // Repeated NOT tokens remain one negation in the pinned
+                    // compatibility grammar; they do not toggle polarity.
+                    next_negated = true;
                 }
                 FsCassQueryToken::Term(term) => {
                     let parts = scan_parts(normalize_term_parts(&term));
                     if parts.is_empty() {
                         continue;
                     }
-                    if negated {
-                        exclude_terms.extend(parts);
-                    } else if in_or_sequence {
-                        if pending_or_group.is_empty() {
-                            let previous = include_groups.pop()?;
-                            pending_or_group.extend(previous);
-                        }
-                        pending_or_group.push(parts);
-                    } else {
-                        include_groups.push(vec![parts]);
-                    }
-                    negated = false;
+                    apply_operand(
+                        SqliteMessageScanOperand::Terms(parts),
+                        &mut next_negated,
+                        &mut in_or_sequence,
+                        &mut just_saw_or,
+                        &mut pending_or_group,
+                        &mut groups,
+                    );
                 }
                 FsCassQueryToken::Phrase(phrase) => {
                     let parts = normalize_phrase_terms(&phrase);
                     if parts.is_empty() {
                         continue;
                     }
-                    if negated {
-                        exclude_terms.extend(parts);
-                    } else if in_or_sequence {
-                        if pending_or_group.is_empty() {
-                            let previous = include_groups.pop()?;
-                            pending_or_group.extend(previous);
-                        }
-                        pending_or_group.push(parts);
-                    } else {
-                        include_groups.push(vec![parts]);
-                    }
-                    negated = false;
+                    apply_operand(
+                        SqliteMessageScanOperand::Phrase(parts),
+                        &mut next_negated,
+                        &mut in_or_sequence,
+                        &mut just_saw_or,
+                        &mut pending_or_group,
+                        &mut groups,
+                    );
                 }
             }
         }
 
-        if !pending_or_group.is_empty() {
-            include_groups.push(pending_or_group);
-        }
+        flush_pending_or_group(&mut pending_or_group, &mut groups);
 
-        for group in &mut include_groups {
+        for group in &mut groups {
             for alternative in group.iter_mut() {
-                alternative.sort();
-                alternative.dedup();
+                if let SqliteMessageScanOperand::Terms(parts) = &mut alternative.operand {
+                    parts.sort();
+                    parts.dedup();
+                }
             }
-            group.retain(|alternative| !alternative.is_empty());
             group.sort();
             group.dedup();
         }
-        include_groups.retain(|group| !group.is_empty());
-        exclude_terms.sort();
-        exclude_terms.dedup();
-        if include_groups.is_empty() {
+        groups.retain(|group| !group.is_empty());
+        if groups.is_empty() {
             return None;
         }
 
-        Some(SqliteMessageScanQuery {
-            include_groups,
-            exclude_terms,
-        })
+        Some(SqliteMessageScanQuery { groups })
     }
 
-    fn sqlite_message_scan_score(haystack: &str, scan_query: &SqliteMessageScanQuery) -> f32 {
-        for term in &scan_query.exclude_terms {
-            if haystack.contains(term) {
-                return 0.0;
+    fn sqlite_message_scan_score(
+        haystacks: &[String],
+        scan_query: &SqliteMessageScanQuery,
+    ) -> f32 {
+        let tokenized_haystacks = haystacks
+            .iter()
+            .map(|haystack| normalize_phrase_terms(haystack))
+            .collect::<Vec<_>>();
+
+        let operand_score = |operand: &SqliteMessageScanOperand| -> f32 {
+            match operand {
+                SqliteMessageScanOperand::Terms(terms) => {
+                    let mut score = 0.0;
+                    for term in terms {
+                        let matches = tokenized_haystacks
+                            .iter()
+                            .flatten()
+                            .filter(|token| {
+                                if term.prefix {
+                                    token.starts_with(term.text.as_str())
+                                } else {
+                                    token.as_str() == term.text
+                                }
+                            })
+                            .count();
+                        if matches < 1 {
+                            return 0.0;
+                        }
+                        score += matches as f32;
+                    }
+                    score
+                }
+                SqliteMessageScanOperand::Phrase(phrase) => tokenized_haystacks
+                    .iter()
+                    .map(|tokens| {
+                        tokens
+                            .windows(phrase.len())
+                            .filter(|window| *window == phrase.as_slice())
+                            .count()
+                    })
+                    .sum::<usize>() as f32,
             }
-        }
+        };
 
         let mut score = 0.0f32;
-        for group in &scan_query.include_groups {
+        for group in &scan_query.groups {
+            let mut group_matched = false;
             let mut group_score = 0.0f32;
             for alternative in group {
-                let mut alternative_score = 0.0f32;
-                for term in alternative {
-                    let matches = haystack.matches(term).count();
-                    if matches < 1 {
-                        alternative_score = 0.0;
-                        break;
+                let alternative_score = operand_score(&alternative.operand);
+                let alternative_matched = if alternative.negated {
+                    alternative_score <= 0.0
+                } else {
+                    alternative_score > 0.0
+                };
+                if alternative_matched {
+                    group_matched = true;
+                    if !alternative.negated {
+                        group_score = group_score.max(alternative_score);
                     }
-                    alternative_score += matches as f32;
                 }
-                group_score = group_score.max(alternative_score);
             }
-            if group_score <= 0.0 {
+            if !group_matched {
                 return 0.0;
             }
             score += group_score;
         }
-        score
+
+        // A negative-only query has no positive relevance contribution, but
+        // its complement matches still need a non-zero sentinel so the caller
+        // does not discard them. Mixed-query negative clauses stay score-neutral.
+        if score > 0.0 {
+            score
+        } else {
+            1.0
+        }
     }
 
-    fn sqlite_message_scan_query_sql(field_mask: FieldMask) -> String {
+    fn sqlite_message_scan_query_sql(
+        field_mask: FieldMask,
+        filters: &SearchFilters,
+        scan_limit: usize,
+    ) -> (String, Vec<ParamValue>) {
         let title_expr = if field_mask.wants_title() {
             "COALESCE(c.title, '')"
         } else {
@@ -7705,7 +8003,7 @@ impl SearchClient {
         let normalized_source_sql =
             normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
 
-        format!(
+        let mut sql = format!(
             "SELECT m.id,
                     {title_expr},
                     {content_expr},
@@ -7725,22 +8023,87 @@ impl SearchClient {
              LEFT JOIN sources s ON c.source_id = s.id
              LEFT JOIN agents a ON c.agent_id = a.id
              LEFT JOIN workspaces w ON c.workspace_id = w.id
-             ORDER BY m.id
-             LIMIT ?"
-        )
+             WHERE 1=1"
+        );
+        let mut params = Vec::new();
+
+        // The scan budget bounds query-text evaluation, not the unfiltered
+        // archive prefix. Apply every metadata filter before LIMIT so a small,
+        // selective corpus is not hidden behind earlier unrelated messages.
+        if !filters.agents.is_empty() {
+            let placeholders = sql_placeholders(filters.agents.len());
+            sql.push_str(&format!(
+                " AND COALESCE(a.slug, '') IN ({placeholders})"
+            ));
+            for agent in &filters.agents {
+                params.push(ParamValue::from(agent.as_str()));
+            }
+        }
+        if !filters.workspaces.is_empty() {
+            let placeholders = sql_placeholders(filters.workspaces.len());
+            sql.push_str(&format!(
+                " AND COALESCE(w.path, '') IN ({placeholders})"
+            ));
+            for workspace in &filters.workspaces {
+                params.push(ParamValue::from(workspace.as_str()));
+            }
+        }
+        if let Some(created_from) = filters.created_from {
+            sql.push_str(" AND CAST(m.created_at AS INTEGER) >= ?");
+            params.push(ParamValue::from(created_from));
+        }
+        if let Some(created_to) = filters.created_to {
+            sql.push_str(" AND CAST(m.created_at AS INTEGER) <= ?");
+            params.push(ParamValue::from(created_to));
+        }
+
+        let origin_kind_sql =
+            normalized_search_origin_kind_sql_expr("c.source_id", "s.kind", "c.origin_host");
+        match &filters.source_filter {
+            SourceFilter::All => {}
+            SourceFilter::Local => sql.push_str(&format!(
+                " AND {origin_kind_sql} = '{local}'",
+                local = crate::sources::provenance::LOCAL_SOURCE_ID,
+            )),
+            SourceFilter::Remote => sql.push_str(&format!(
+                " AND {origin_kind_sql} != '{local}'",
+                local = crate::sources::provenance::LOCAL_SOURCE_ID,
+            )),
+            SourceFilter::SourceId(id) => {
+                sql.push_str(&format!(" AND {normalized_source_sql} = ?"));
+                params.push(ParamValue::from(normalize_search_source_filter_value(id)));
+            }
+        }
+
+        if !filters.session_paths.is_empty() {
+            let placeholders = sql_placeholders(filters.session_paths.len());
+            sql.push_str(&format!(
+                " AND COALESCE(c.source_path, '') IN ({placeholders})"
+            ));
+            for source_path in &filters.session_paths {
+                params.push(ParamValue::from(source_path.as_str()));
+            }
+        }
+
+        sql.push_str(" ORDER BY m.id LIMIT ?");
+        params.push(ParamValue::from(scan_limit as i64));
+        (sql, params)
     }
 
     fn search_sqlite_message_scan(
         &self,
-        conn: &Connection,
+        conn: &SearchSqliteConnection,
         request: SqliteMessageScanRequest<'_>,
     ) -> Result<Vec<SearchHit>> {
         let Some(scan_query) = Self::sqlite_message_scan_query(request.raw_query) else {
             return Ok(Vec::new());
         };
 
-        let sql = Self::sqlite_message_scan_query_sql(request.field_mask);
-        let params = [ParamValue::from(SQLITE_MESSAGE_SCAN_FALLBACK_LIMIT as i64)];
+        let (sql, params) = Self::sqlite_message_scan_query_sql(
+            request.field_mask,
+            request.filters,
+            request.scan_limit,
+        );
         let rows: Vec<(SqliteFtsMessageRow, String, String)> =
             franken_query_map_collect_retry(conn, &sql, &params, |row| {
                 Ok((
@@ -7783,25 +8146,12 @@ impl SearchClient {
             scan_title,
         ) in rows
         {
-            let mut haystack = String::with_capacity(
-                scan_content.len()
-                    + scan_title.len()
-                    + agent.len()
-                    + workspace.len()
-                    + source_path.len()
-                    + 4,
-            );
-            haystack.push_str(&scan_content);
-            haystack.push(' ');
-            haystack.push_str(&scan_title);
-            haystack.push(' ');
-            haystack.push_str(&agent);
-            haystack.push(' ');
-            haystack.push_str(&workspace);
-            haystack.push(' ');
-            haystack.push_str(&source_path);
-            let haystack = haystack.to_lowercase();
-            let score = Self::sqlite_message_scan_score(&haystack, &scan_query);
+            // The primary CASS lexical query targets title/content; agent,
+            // workspace, and source are filters rather than searchable text.
+            // Keep the two text fields separate so a quoted phrase cannot
+            // accidentally bridge the content/title boundary.
+            let scan_haystacks = [scan_content.to_lowercase(), scan_title.to_lowercase()];
+            let score = Self::sqlite_message_scan_score(&scan_haystacks, &scan_query);
             if score <= 0.0 {
                 continue;
             }
@@ -7884,14 +8234,30 @@ impl SearchClient {
             return Ok(Vec::new());
         }
 
-        let fts_query = match transpile_to_fts5(raw_query) {
-            Some(q) if !q.trim().is_empty() => q,
-            _ => return Ok(Vec::new()),
-        };
-
         let sqlite_guard = self.sqlite_guard()?;
         let Some(conn) = sqlite_guard.as_ref() else {
             return Ok(Vec::new());
+        };
+
+        let query_match_type = dominant_match_type(raw_query);
+        let scan_request = SqliteMessageScanRequest {
+            raw_query,
+            filters: &filters,
+            limit,
+            offset,
+            scan_limit: SQLITE_MESSAGE_SCAN_FALLBACK_LIMIT,
+            field_mask,
+            query_match_type,
+        };
+        let fts_query = match transpile_to_fts5(raw_query) {
+            Some(q) if !q.trim().is_empty() => q,
+            _ => {
+                tracing::debug!(
+                    query = raw_query,
+                    "query is not faithfully representable in FTS5; using source-table scan fallback"
+                );
+                return self.search_sqlite_message_scan(conn, scan_request);
+            }
         };
 
         let empty_params: [ParamValue; 0] = [];
@@ -7904,20 +8270,10 @@ impl SearchClient {
         .map(|rows| !rows.is_empty())
         .unwrap_or(false);
         if !has_fts {
-            return Ok(Vec::new());
+            return self.search_sqlite_message_scan(conn, scan_request);
         }
-
-        let query_match_type = dominant_match_type(raw_query);
-        let scan_request = SqliteMessageScanRequest {
-            raw_query,
-            filters: &filters,
-            limit,
-            offset,
-            field_mask,
-            query_match_type,
-        };
         if let Err(err) =
-            crate::storage::sqlite::validate_fts_messages_integrity_for_connection(conn)
+            crate::storage::sqlite::validate_fts_messages_integrity_for_async_connection(conn)
         {
             tracing::warn!(
                 error = %err,
@@ -8285,7 +8641,7 @@ impl SearchClient {
 
     fn browse_by_date_sqlite(
         &self,
-        conn: &Connection,
+        conn: &SearchSqliteConnection,
         filters: SearchFilters,
         limit: usize,
         offset: usize,
@@ -8349,7 +8705,8 @@ impl SearchClient {
 
         // Apply source filter. `local`/`remote` select by origin *kind*
         // (bead 5bf29); only `SourceId` matches the normalized id.
-        let origin_kind_sql = normalized_search_origin_kind_sql_expr("c.source_id", "s.kind");
+        let origin_kind_sql =
+            normalized_search_origin_kind_sql_expr("c.source_id", "s.kind", "c.origin_host");
         match &filters.source_filter {
             SourceFilter::All => {}
             SourceFilter::Local => sql.push_str(&format!(
@@ -8462,6 +8819,7 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
     let mut pending_or_group: Vec<String> = Vec::new();
     let mut next_op = "AND";
     let mut in_or_sequence = false;
+    let mut just_saw_or = false;
     for token in tokens {
         match token {
             FsCassQueryToken::And => {
@@ -8475,6 +8833,7 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
                     pending_or_group.clear();
                 }
                 in_or_sequence = false;
+                just_saw_or = false;
                 next_op = "AND";
             }
             FsCassQueryToken::Or => {
@@ -8484,15 +8843,24 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
                     // whole fallback query into an empty result set.
                     continue;
                 }
+                if next_op == "NOT" {
+                    // The pinned parser accepts permissive token sequences such
+                    // as `A NOT OR B` and interprets them as `A OR NOT B`.
+                    // FTS5 has no match-all operand with which to express that
+                    // complement branch, so fail over to the source scan rather
+                    // than silently broadening it to `A OR B`.
+                    return None;
+                }
                 // Start or continue an OR group. Unsupported `OR NOT` forms
                 // are rejected when the subsequent NOT token arrives.
                 in_or_sequence = true;
+                just_saw_or = true;
             }
             FsCassQueryToken::Not => {
                 // FTS5 supports binary (`foo NOT bar`) NOT, but not a leading
                 // unary-NOT query (`NOT foo`). We also reject `OR NOT` groupings
                 // in the fallback transpiler.
-                if in_or_sequence {
+                if just_saw_or {
                     return None;
                 }
 
@@ -8510,6 +8878,7 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
                     pending_or_group.clear();
                 }
                 in_or_sequence = false;
+                just_saw_or = false;
                 next_op = "NOT";
             }
             FsCassQueryToken::Term(t) => {
@@ -8544,7 +8913,7 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
                     rendered_parts[0].clone()
                 };
 
-                if in_or_sequence {
+                if in_or_sequence && just_saw_or {
                     if pending_or_group.is_empty() {
                         let (op, _) = fts_clauses.last()?;
                         if *op != "AND" {
@@ -8558,8 +8927,19 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
                     pending_or_group.push(fts_term);
                     in_or_sequence = true;
                 } else {
+                    if !pending_or_group.is_empty() {
+                        let group = if pending_or_group.len() > 1 {
+                            format!("({})", pending_or_group.join(" OR "))
+                        } else {
+                            pending_or_group.pop().unwrap_or_default()
+                        };
+                        fts_clauses.push(("AND", group));
+                        pending_or_group.clear();
+                    }
+                    in_or_sequence = false;
                     fts_clauses.push((next_op, fts_term));
                 }
+                just_saw_or = false;
                 next_op = "AND";
             }
             FsCassQueryToken::Phrase(p) => {
@@ -8569,7 +8949,7 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
                 }
                 let fts_phrase = format!("\"{}\"", phrase_parts.join(" "));
 
-                if in_or_sequence {
+                if in_or_sequence && just_saw_or {
                     if pending_or_group.is_empty() {
                         let (op, _) = fts_clauses.last()?;
                         if *op != "AND" {
@@ -8583,8 +8963,19 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
                     pending_or_group.push(fts_phrase);
                     in_or_sequence = true;
                 } else {
+                    if !pending_or_group.is_empty() {
+                        let group = if pending_or_group.len() > 1 {
+                            format!("({})", pending_or_group.join(" OR "))
+                        } else {
+                            pending_or_group.pop().unwrap_or_default()
+                        };
+                        fts_clauses.push(("AND", group));
+                        pending_or_group.clear();
+                    }
+                    in_or_sequence = false;
                     fts_clauses.push((next_op, fts_phrase));
                 }
+                just_saw_or = false;
                 next_op = "AND";
             }
         }
@@ -9437,7 +9828,7 @@ mod tests {
     use super::*;
     use crate::connectors::{NormalizedConversation, NormalizedMessage, NormalizedSnippet};
     use crate::franken_sync::Connection as FrankenConnection;
-    use crate::franken_sync::compat::ParamValue;
+    use crate::franken_sync::compat::{ConnectionExt as FrankenConnectionExt, ParamValue};
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use crate::search::tantivy::TantivyIndex;
     use crate::search::vector_index::VectorIndex;
@@ -9497,10 +9888,10 @@ mod tests {
         }
     }
 
-    fn cass_layer_b_test_client(connection: Option<FrankenConnection>) -> SearchClient {
+    fn cass_layer_b_test_client(connection: Option<SearchSqliteConnection>) -> SearchClient {
         SearchClient {
             reader: None,
-            sqlite: Mutex::new(connection.map(SendConnection)),
+            sqlite: Mutex::new(connection),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -10684,7 +11075,7 @@ mod tests {
         let workspace_id = 1_i64;
         let source_id = crate::sources::provenance::LOCAL_SOURCE_ID;
         let source_hash = crc32fast::hash(source_id.as_bytes());
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             r#"
             CREATE TABLE agents (
@@ -10894,7 +11285,7 @@ mod tests {
             });
         let client = SearchClient {
             reader,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -12423,10 +12814,10 @@ mod tests {
     #[test]
     fn sqlite_backend_skips_wildcard_queries() -> Result<()> {
         // Build a client with SQLite only; wildcard queries should short-circuit without errors.
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteFixture::in_memory()?;
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -12452,7 +12843,7 @@ mod tests {
 
     #[test]
     fn sqlite_backend_handles_null_workspace() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
@@ -12505,7 +12896,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -12531,7 +12922,7 @@ mod tests {
 
     #[test]
     fn sqlite_backend_supports_legacy_fts_message_id_schema() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
@@ -12591,7 +12982,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -12634,7 +13025,7 @@ mod tests {
             "test fixture should open a Tantivy reader even with an empty index"
         );
 
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
@@ -12693,7 +13084,7 @@ mod tests {
 
         let client = SearchClient {
             reader,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -12826,6 +13217,8 @@ mod tests {
             cache_size, -SEARCH_SQLITE_HYDRATION_CACHE_KIB,
             "search hydration should not inherit the general storage cache profile"
         );
+        conn.execute_sync("DELETE FROM meta WHERE 1 = 0")
+            .expect_err("search hydration connection must remain physically read-only");
         drop(guard);
 
         // The read-only open must not rewrite the rebuild-generation marker.
@@ -12854,8 +13247,111 @@ mod tests {
     }
 
     #[test]
+    fn search_client_hydrates_one_lazy_connection_from_multiple_workers() -> Result<()> {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<SearchSqliteConnection>();
+        assert_send_sync::<SearchClient>();
+
+        let temp_dir = TempDir::new()?;
+        let db_path = temp_dir.path().join("cross-worker-hydration.db");
+        {
+            let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned())?;
+            conn.execute_batch(
+                "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT NOT NULL);
+                 CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
+                 CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL);
+                 CREATE TABLE conversations (
+                     id INTEGER PRIMARY KEY,
+                     agent_id INTEGER,
+                     workspace_id INTEGER,
+                     source_id TEXT,
+                     origin_host TEXT,
+                     title TEXT,
+                     source_path TEXT NOT NULL
+                 );
+                 CREATE TABLE messages (
+                     id INTEGER PRIMARY KEY,
+                     conversation_id INTEGER NOT NULL,
+                     idx INTEGER NOT NULL,
+                     content TEXT NOT NULL,
+                     created_at INTEGER
+                 );
+                 INSERT INTO sources(id, kind) VALUES('local', 'local');
+                 INSERT INTO agents(id, slug) VALUES(1, 'codex');
+                 INSERT INTO workspaces(id, path) VALUES(1, '/cross-worker');
+                 INSERT INTO conversations(
+                     id, agent_id, workspace_id, source_id, origin_host, title, source_path
+                 ) VALUES(
+                     1, 1, 1, 'local', NULL, 'worker-owned archive', '/tmp/cross-worker.jsonl'
+                 );
+                 INSERT INTO messages(id, conversation_id, idx, content, created_at)
+                 VALUES(1, 1, 0, 'cross worker hydration sentinel', 42);",
+            )?;
+        }
+
+        let client = Arc::new(SearchClient {
+            reader: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: Some(db_path),
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:cross-worker"),
+            semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
+        });
+        let worker_count = 4;
+        let start = Arc::new(std::sync::Barrier::new(worker_count + 1));
+        let mut workers = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let client = Arc::clone(&client);
+            let start = Arc::clone(&start);
+            workers.push(std::thread::spawn(move || -> Result<()> {
+                start.wait();
+                for _ in 0..3 {
+                    let hits = client.browse_by_date(
+                        SearchFilters::default(),
+                        1,
+                        0,
+                        true,
+                        FieldMask::FULL,
+                    )?;
+                    assert_eq!(hits.len(), 1);
+                    assert_eq!(hits[0].content, "cross worker hydration sentinel");
+                    assert_eq!(hits[0].source_path, "/tmp/cross-worker.jsonl");
+                }
+                Ok(())
+            }));
+        }
+        start.wait();
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| anyhow!("cross-worker hydration worker panicked"))??;
+        }
+
+        let mut guard = client.sqlite_guard()?;
+        let mut conn = guard
+            .take()
+            .expect("the shared client should retain one dedicated-owner connection");
+        drop(guard);
+        conn.close_without_checkpoint_sync()
+            .map_err(|error| anyhow!("closing cross-worker sqlite owner: {error}"))?;
+        Ok(())
+    }
+
+    #[test]
     fn sqlite_path_rusqlite_fallback_matches_hyphenated_ids_with_workspace_filter() -> Result<()> {
-        fn fts_match_count(conn: &FrankenConnection, fts_query: &str) -> Result<Option<usize>> {
+        fn fts_match_count_async(
+            conn: &SearchSqliteConnection,
+            fts_query: &str,
+        ) -> Result<Option<usize>> {
             let match_mode = SearchClient::sqlite_fts_match_mode(conn)?;
             let sql = format!(
                 "SELECT COUNT(*) FROM fts_messages WHERE {}",
@@ -12866,6 +13362,42 @@ mod tests {
             match franken_query_map_collect_retry(conn, &sql, &params, |row| row.get_typed(0)) {
                 Ok(rows) => {
                     let count: i64 = rows.into_iter().next().unwrap_or(0);
+                    Ok(Some(usize::try_from(count.max(0)).unwrap_or(usize::MAX)))
+                }
+                Err(err) if err.to_string().contains("no such function: MATCH/2") => Ok(None),
+                Err(err) => Err(err.into()),
+            }
+        }
+
+        fn fts_match_count_raw(
+            conn: &FrankenConnection,
+            fts_query: &str,
+        ) -> Result<Option<usize>> {
+            let probe_params = [ParamValue::from("__cass_fts_probe_no_match__")];
+            let match_mode = match conn.query_map_collect(
+                "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH ?",
+                &probe_params,
+                |row| row.get_typed::<i64>(0),
+            ) {
+                Ok(_) => SqliteFtsMatchMode::Table,
+                Err(err)
+                    if err
+                        .to_string()
+                        .contains("no such column: fts_messages in table fts_messages") =>
+                {
+                    SqliteFtsMatchMode::IndexedColumns
+                }
+                Err(err) => return Err(err.into()),
+            };
+            let sql = format!(
+                "SELECT COUNT(*) FROM fts_messages WHERE {}",
+                SearchClient::sqlite_fts5_match_clause(match_mode)
+            );
+            let mut params = Vec::new();
+            SearchClient::push_sqlite_fts5_match_params(&mut params, fts_query, match_mode);
+            match conn.query_map_collect(&sql, &params, |row| row.get_typed::<i64>(0)) {
+                Ok(rows) => {
+                    let count = rows.into_iter().next().unwrap_or(0);
                     Ok(Some(usize::try_from(count.max(0)).unwrap_or(usize::MAX)))
                 }
                 Err(err) if err.to_string().contains("no such function: MATCH/2") => Ok(None),
@@ -12939,7 +13471,7 @@ mod tests {
                 "freshly seeded file-backed FTS should retain the inserted rows"
             );
             let transpiled = transpile_to_fts5("br-123").expect("transpiled fallback query");
-            if let Some(match_count) = fts_match_count(conn, transpiled.as_str())? {
+            if let Some(match_count) = fts_match_count_raw(conn, transpiled.as_str())? {
                 assert_eq!(
                     match_count, 2,
                     "freshly seeded file-backed FTS should match the transpiled hyphenated query before reopen"
@@ -12975,7 +13507,7 @@ mod tests {
             "reopened file-backed FTS should still contain the seeded rows"
         );
         let transpiled = transpile_to_fts5("br-123").expect("transpiled fallback query");
-        if let Some(match_count) = fts_match_count(conn, transpiled.as_str())? {
+        if let Some(match_count) = fts_match_count_async(conn, transpiled.as_str())? {
             assert_eq!(
                 match_count, 2,
                 "reopened file-backed FTS should still match the transpiled hyphenated query"
@@ -13041,7 +13573,7 @@ mod tests {
 
     #[test]
     fn sqlite_backend_orders_hits_by_bm25_score() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             "CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY,
@@ -13112,7 +13644,7 @@ mod tests {
         )?;
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -13212,7 +13744,7 @@ mod tests {
     #[test]
     fn tantivy_fallback_hydration_narrows_by_normalized_source_before_message_lookup() -> Result<()>
     {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             "CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY,
@@ -13248,7 +13780,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -13281,7 +13813,7 @@ mod tests {
 
     #[test]
     fn exact_content_hydration_returns_only_requested_message_indices() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             "CREATE TABLE messages (
                 id INTEGER PRIMARY KEY,
@@ -13326,7 +13858,7 @@ mod tests {
 
     #[test]
     fn sqlite_backend_generates_snippet_from_content() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             "CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY,
@@ -13381,7 +13913,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -13407,7 +13939,7 @@ mod tests {
 
     #[test]
     fn sqlite_backend_respects_source_filter() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
@@ -13479,7 +14011,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -13527,7 +14059,7 @@ mod tests {
     #[test]
     fn sqlite_backend_remote_source_filter_matches_blank_source_id_with_origin_host() -> Result<()>
     {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
@@ -13606,7 +14138,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -13669,7 +14201,7 @@ mod tests {
 
     #[test]
     fn sqlite_backend_workspace_filter_matches_null_workspace_as_empty_string() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
@@ -13742,7 +14274,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -13776,57 +14308,311 @@ mod tests {
 
     #[test]
     fn sqlite_message_scan_preserves_boolean_or_precedence() {
+        fn score(haystack: &str, query: &SqliteMessageScanQuery) -> f32 {
+            SearchClient::sqlite_message_scan_score(&[haystack.to_lowercase()], query)
+        }
+
         let simple_or =
             SearchClient::sqlite_message_scan_query("alpha OR beta").expect("simple OR scan query");
-        assert!(SearchClient::sqlite_message_scan_score("alpha", &simple_or) > 0.0);
-        assert!(SearchClient::sqlite_message_scan_score("beta", &simple_or) > 0.0);
-        assert_eq!(
-            SearchClient::sqlite_message_scan_score("gamma", &simple_or),
-            0.0
-        );
+        assert!(score("alpha", &simple_or) > 0.0);
+        assert!(score("beta", &simple_or) > 0.0);
+        assert_eq!(score("gamma", &simple_or), 0.0);
 
         let and_then_or = SearchClient::sqlite_message_scan_query("alpha AND beta OR gamma")
             .expect("AND followed by OR scan query");
         assert!(
-            SearchClient::sqlite_message_scan_score("alpha gamma", &and_then_or) > 0.0,
+            score("alpha gamma", &and_then_or) > 0.0,
             "alpha AND (beta OR gamma) should accept the gamma branch"
         );
-        assert_eq!(
-            SearchClient::sqlite_message_scan_score("alpha", &and_then_or),
-            0.0
-        );
-        assert_eq!(
-            SearchClient::sqlite_message_scan_score("beta gamma", &and_then_or),
-            0.0
-        );
+        assert_eq!(score("alpha", &and_then_or), 0.0);
+        assert_eq!(score("beta gamma", &and_then_or), 0.0);
 
         let or_then_and = SearchClient::sqlite_message_scan_query("alpha OR beta AND gamma")
             .expect("OR followed by AND scan query");
         assert!(
-            SearchClient::sqlite_message_scan_score("alpha gamma", &or_then_and) > 0.0,
+            score("alpha gamma", &or_then_and) > 0.0,
             "(alpha OR beta) AND gamma should accept the alpha branch"
         );
         assert!(
-            SearchClient::sqlite_message_scan_score("beta gamma", &or_then_and) > 0.0,
+            score("beta gamma", &or_then_and) > 0.0,
             "(alpha OR beta) AND gamma should accept the beta branch"
         );
-        assert_eq!(
-            SearchClient::sqlite_message_scan_score("alpha", &or_then_and),
-            0.0
-        );
+        assert_eq!(score("alpha", &or_then_and), 0.0);
 
         let binary_not =
             SearchClient::sqlite_message_scan_query("alpha NOT beta").expect("NOT scan query");
-        assert!(SearchClient::sqlite_message_scan_score("alpha", &binary_not) > 0.0);
+        assert!(score("alpha", &binary_not) > 0.0);
+        assert_eq!(score("alpha beta", &binary_not), 0.0);
+    }
+
+    #[test]
+    fn sqlite_message_scan_matches_primary_negated_or_truth_tables() {
+        fn score(haystack: &str, query: &SqliteMessageScanQuery) -> f32 {
+            SearchClient::sqlite_message_scan_score(&[haystack.to_lowercase()], query)
+        }
+
+        // OR binds tighter than the implicit conjunction around NOT, so this
+        // is `alpha AND (NOT beta OR gamma)` in the pinned primary builder.
+        let nested = SearchClient::sqlite_message_scan_query("alpha NOT beta OR gamma")
+            .expect("nested negated OR scan query");
+        assert!(score("alpha", &nested) > 0.0);
+        assert_eq!(score("alpha beta", &nested), 0.0);
+        assert!(score("alpha beta gamma", &nested) > 0.0);
+        assert_eq!(score("gamma", &nested), 0.0);
+
+        let or_not = SearchClient::sqlite_message_scan_query("alpha OR NOT beta")
+            .expect("OR-NOT scan query");
+        assert!(score("alpha beta", &or_not) > 0.0);
+        assert_eq!(score("gamma beta", &or_not), 0.0);
+        assert!(score("gamma delta", &or_not) > 0.0);
+
+        let standalone_not =
+            SearchClient::sqlite_message_scan_query("NOT beta").expect("standalone NOT query");
+        assert!(score("alpha", &standalone_not) > 0.0);
+        assert_eq!(score("alpha beta", &standalone_not), 0.0);
+
+        let repeated_not = SearchClient::sqlite_message_scan_query("NOT NOT beta")
+            .expect("repeated standalone NOT query");
+        assert!(score("alpha", &repeated_not) > 0.0);
+        assert_eq!(score("alpha beta", &repeated_not), 0.0);
+
+        let permissive = SearchClient::sqlite_message_scan_query("alpha NOT OR beta")
+            .expect("permissive NOT-before-OR query");
+        assert!(score("alpha beta", &permissive) > 0.0);
+        assert_eq!(score("gamma beta", &permissive), 0.0);
+        assert!(score("gamma delta", &permissive) > 0.0);
+    }
+
+    #[test]
+    fn sqlite_message_scan_preserves_phrase_adjacency_within_one_field() {
+        fn score(fields: &[&str], query: &SqliteMessageScanQuery) -> f32 {
+            let fields = fields
+                .iter()
+                .map(|field| field.to_lowercase())
+                .collect::<Vec<_>>();
+            SearchClient::sqlite_message_scan_score(&fields, query)
+        }
+
+        let phrase = SearchClient::sqlite_message_scan_query("\"alpha beta\"")
+            .expect("phrase scan query");
+        assert!(score(&["alpha beta"], &phrase) > 0.0);
+        assert!(score(&["alpha, beta"], &phrase) > 0.0);
+        assert_eq!(score(&["alpha x beta"], &phrase), 0.0);
         assert_eq!(
-            SearchClient::sqlite_message_scan_score("alpha beta", &binary_not),
-            0.0
+            score(&["alpha", "beta"], &phrase),
+            0.0,
+            "phrase must not bridge content and title"
+        );
+
+        let negated_phrase = SearchClient::sqlite_message_scan_query("NOT \"alpha beta\"")
+            .expect("negated phrase scan query");
+        assert_eq!(score(&["alpha beta"], &negated_phrase), 0.0);
+        assert!(score(&["alpha x beta"], &negated_phrase) > 0.0);
+    }
+
+    #[test]
+    fn sqlite_message_scan_uses_token_exact_and_prefix_semantics() {
+        fn score(haystack: &str, query: &SqliteMessageScanQuery) -> f32 {
+            SearchClient::sqlite_message_scan_score(&[haystack.to_lowercase()], query)
+        }
+
+        let exact = SearchClient::sqlite_message_scan_query("row").expect("exact scan query");
+        assert!(score("one row", &exact) > 0.0);
+        assert_eq!(
+            score("one arrow", &exact),
+            0.0,
+            "an exact term must not match inside another token"
+        );
+
+        let prefix = SearchClient::sqlite_message_scan_query("foo*").expect("prefix scan query");
+        assert!(score("foobar", &prefix) > 0.0);
+        assert_eq!(
+            score("seafood", &prefix),
+            0.0,
+            "a prefix term must not degrade to an arbitrary substring"
         );
     }
 
     #[test]
+    fn sqlite_message_scan_pushes_all_filters_before_scan_limit() {
+        let filters = SearchFilters {
+            agents: HashSet::from(["codex".to_string()]),
+            workspaces: HashSet::from(["/workspace".to_string()]),
+            created_from: Some(10),
+            created_to: Some(20),
+            source_filter: SourceFilter::SourceId("remote-a".to_string()),
+            session_paths: HashSet::from(["/tmp/session.jsonl".to_string()]),
+        };
+        let (sql, params) =
+            SearchClient::sqlite_message_scan_query_sql(FieldMask::FULL, &filters, 7);
+        let limit_pos = sql.find(" ORDER BY m.id LIMIT ?").expect("bounded scan limit");
+
+        for predicate in [
+            "COALESCE(a.slug, '') IN (?)",
+            "COALESCE(w.path, '') IN (?)",
+            "CAST(m.created_at AS INTEGER) >= ?",
+            "CAST(m.created_at AS INTEGER) <= ?",
+            "END = ?",
+            "COALESCE(c.source_path, '') IN (?)",
+        ] {
+            let predicate_pos = sql.find(predicate).expect("source-scan filter predicate");
+            assert!(
+                predicate_pos < limit_pos,
+                "filter predicate must precede the bounded scan limit: {predicate}"
+            );
+        }
+        assert_eq!(params.len(), 7, "six filter values plus scan limit");
+
+        let (local_sql, _) = SearchClient::sqlite_message_scan_query_sql(
+            FieldMask::FULL,
+            &SearchFilters {
+                source_filter: SourceFilter::Local,
+                ..SearchFilters::default()
+            },
+            7,
+        );
+        let (remote_sql, _) = SearchClient::sqlite_message_scan_query_sql(
+            FieldMask::FULL,
+            &SearchFilters {
+                source_filter: SourceFilter::Remote,
+                ..SearchFilters::default()
+            },
+            7,
+        );
+        assert!(local_sql.contains("END = 'local'"));
+        assert!(remote_sql.contains("END != 'local'"));
+    }
+
+    #[test]
+    fn sqlite_message_scan_filtering_precedes_low_scan_cap() -> Result<()> {
+        let conn = SearchSqliteFixture::in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL);
+             CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
+                source_id TEXT,
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT NOT NULL
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER,
+                content TEXT NOT NULL,
+                created_at INTEGER
+             );
+             INSERT INTO sources(id, kind) VALUES('local', 'local');
+             INSERT INTO agents(id, slug) VALUES(1, 'claude'), (2, 'codex');
+             INSERT INTO conversations(
+                id, agent_id, workspace_id, source_id, origin_host, title, source_path
+             ) VALUES
+                (1, 1, NULL, 'local', NULL, 'excluded', '/tmp/excluded.jsonl'),
+                (2, 2, NULL, 'local', NULL, 'target', '/tmp/target.jsonl');
+             INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES
+                (1, 1, 0, 'needle in excluded row', 1),
+                (2, 2, 0, 'needle in target row', 2);",
+        )?;
+        let filters = SearchFilters {
+            agents: HashSet::from(["codex".to_string()]),
+            ..SearchFilters::default()
+        };
+        let client = cass_layer_b_test_client(None);
+
+        let hits = client.search_sqlite_message_scan(
+            conn.connection(),
+            SqliteMessageScanRequest {
+                raw_query: "needle",
+                filters: &filters,
+                limit: 10,
+                offset: 0,
+                scan_limit: 1,
+                field_mask: FieldMask::FULL,
+                query_match_type: MatchType::Exact,
+            },
+        )?;
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].agent, "codex");
+        assert_eq!(hits[0].source_path, "/tmp/target.jsonl");
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_fts_fallback_scans_untranspilable_negated_or_query() -> Result<()> {
+        let conn = SearchSqliteFixture::in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL);
+             CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
+                source_id TEXT,
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT NOT NULL
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER,
+                content TEXT NOT NULL,
+                created_at INTEGER
+             );
+             CREATE TABLE fts_messages (marker TEXT);
+             INSERT INTO sources(id, kind) VALUES('local', 'local');
+             INSERT INTO agents(id, slug) VALUES(1, 'codex');
+             INSERT INTO workspaces(id, path) VALUES(1, '/workspace');
+             INSERT INTO conversations(
+                id, agent_id, workspace_id, source_id, origin_host, title, source_path
+             ) VALUES(1, 1, 1, 'local', NULL, 'fallback title', '/tmp/fallback.jsonl');
+             INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES
+                (1, 1, 0, 'alpha beta', 1),
+                (2, 1, 1, 'gamma beta', 2),
+                (3, 1, 2, 'gamma delta', 3);",
+        )?;
+        let client = SearchClient {
+            reader: None,
+            sqlite: Mutex::new(Some(conn.into_connection())),
+            sqlite_path: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: false,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:negated-or-fallback"),
+            semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
+        };
+
+        let hits = client.search_sqlite_fts5(
+            Path::new(":memory:"),
+            "alpha OR NOT beta",
+            SearchFilters::default(),
+            10,
+            0,
+            FieldMask::FULL,
+        )?;
+        let contents = hits
+            .iter()
+            .map(|hit| hit.content.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(contents, HashSet::from(["alpha beta", "gamma delta"]));
+        Ok(())
+    }
+
+    #[test]
     fn browse_by_date_treats_null_workspace_and_source_as_local() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE conversations (
@@ -13860,7 +14646,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -13897,7 +14683,7 @@ mod tests {
     #[test]
     fn hydrate_semantic_hits_with_ids_snippet_only_uses_full_content_for_snippets_and_identity()
     -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE conversations (
@@ -13952,7 +14738,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -14314,7 +15100,7 @@ mod tests {
 
     #[test]
     fn cass_layer_b_projection_rejects_ambiguous_historical_identity() -> Result<()> {
-        let conn = FrankenConnection::open(":memory:")?;
+        let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             "CREATE TABLE messages (
                 id INTEGER PRIMARY KEY,
@@ -14324,7 +15110,7 @@ mod tests {
              INSERT INTO messages(id, conversation_id, idx) VALUES(1, 7, 0);
              INSERT INTO messages(id, conversation_id, idx) VALUES(2, 7, 0);",
         )?;
-        let client = cass_layer_b_test_client(Some(conn));
+        let client = cass_layer_b_test_client(Some(conn.into_connection()));
         let candidates = [CassLexicalLayerBCandidate {
             conversation_id: 7,
             message_index: 0,
@@ -14354,7 +15140,7 @@ mod tests {
 
     #[test]
     fn hydrate_semantic_hits_with_ids_normalizes_trimmed_local_source_metadata() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE conversations (
@@ -14394,7 +15180,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -14426,7 +15212,7 @@ mod tests {
 
     #[test]
     fn hydrate_semantic_hits_with_ids_preserves_remote_origin_without_source_row() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE conversations (
@@ -14466,7 +15252,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -14500,7 +15286,7 @@ mod tests {
     #[test]
     fn resolve_semantic_doc_ids_for_hits_distinguishes_same_source_path_line_by_content_hash()
     -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
@@ -14554,7 +15340,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -14630,7 +15416,7 @@ mod tests {
 
     #[test]
     fn hydrate_semantic_hits_with_ids_keeps_missing_title_empty() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE conversations (
@@ -14670,7 +15456,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -14702,7 +15488,7 @@ mod tests {
     #[test]
     fn resolve_semantic_doc_ids_for_hits_prefers_conversation_id_over_ambiguous_provenance()
     -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
@@ -14755,7 +15541,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -14808,7 +15594,7 @@ mod tests {
 
     #[test]
     fn resolve_semantic_doc_ids_for_hits_treats_null_source_as_local() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
@@ -14847,7 +15633,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -14890,7 +15676,7 @@ mod tests {
 
     #[test]
     fn resolve_semantic_doc_ids_for_hits_matches_trimmed_local_source_id() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
@@ -14929,7 +15715,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -14972,7 +15758,7 @@ mod tests {
 
     #[test]
     fn resolve_semantic_doc_ids_for_hits_normalizes_blank_local_source_id() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
@@ -15011,7 +15797,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -15055,7 +15841,7 @@ mod tests {
     #[test]
     fn resolve_semantic_doc_ids_for_hits_infers_remote_source_from_origin_host_when_source_id_blank()
     -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
@@ -15094,7 +15880,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -15137,7 +15923,7 @@ mod tests {
 
     #[test]
     fn browse_by_date_snippet_only_uses_full_content_for_hit_identity() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
              CREATE TABLE conversations (
@@ -15190,7 +15976,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: true,
@@ -18518,6 +19304,11 @@ mod tests {
     fn transpile_to_fts5_rejects_or_not_forms_it_cannot_represent() {
         assert_eq!(transpile_to_fts5("foo OR NOT bar"), None);
         assert_eq!(transpile_to_fts5("foo NOT bar OR baz"), None);
+        assert_eq!(
+            transpile_to_fts5("foo NOT OR bar"),
+            None,
+            "permissive NOT-before-OR syntax must not broaden to foo OR bar"
+        );
     }
 
     #[test]
@@ -18550,6 +19341,10 @@ mod tests {
         assert_eq!(
             transpile_to_fts5("foo NOT bar-baz"),
             Some("foo NOT (bar AND baz)".to_string())
+        );
+        assert_eq!(
+            transpile_to_fts5("foo OR bar NOT baz"),
+            Some("(foo OR bar) NOT baz".to_string())
         );
     }
 
@@ -18611,7 +19406,7 @@ mod tests {
     ///    split could break by hydrating before honoring the limit).
     #[test]
     fn search_sqlite_fts5_rank_and_hydrate_split_preserves_limit_prefix_invariant() -> Result<()> {
-        let conn = Connection::open(":memory:")?;
+        let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
@@ -18697,7 +19492,7 @@ mod tests {
 
         let client = SearchClient {
             reader: None,
-            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite: Mutex::new(Some(conn.into_connection())),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: false,
@@ -19319,6 +20114,35 @@ mod tests {
         let exp = QueryExplanation::analyze("foo bar", &SearchFilters::default());
         assert!(exp.parsed.implicit_and);
         assert_eq!(exp.parsed.terms.len(), 2);
+
+        let term_and_phrase =
+            QueryExplanation::analyze("foo \"bar baz\"", &SearchFilters::default());
+        assert!(term_and_phrase.parsed.implicit_and);
+        assert_eq!(term_and_phrase.parsed.terms.len(), 1);
+        assert_eq!(term_and_phrase.parsed.phrases.len(), 1);
+
+        let two_phrases =
+            QueryExplanation::analyze("\"foo bar\" \"baz qux\"", &SearchFilters::default());
+        assert!(two_phrases.parsed.implicit_and);
+        assert_eq!(two_phrases.parsed.phrases.len(), 2);
+
+        let one_phrase = QueryExplanation::analyze("\"foo bar\"", &SearchFilters::default());
+        assert!(!one_phrase.parsed.implicit_and);
+
+        let mixed_connectors =
+            QueryExplanation::analyze("foo AND bar baz", &SearchFilters::default());
+        assert!(mixed_connectors.parsed.implicit_and);
+
+        let implicit_before_not =
+            QueryExplanation::analyze("foo NOT bar", &SearchFilters::default());
+        assert!(implicit_before_not.parsed.implicit_and);
+
+        let explicit_before_not =
+            QueryExplanation::analyze("foo AND NOT bar", &SearchFilters::default());
+        assert!(!explicit_before_not.parsed.implicit_and);
+
+        let explicit_or = QueryExplanation::analyze("foo OR bar", &SearchFilters::default());
+        assert!(!explicit_or.parsed.implicit_and);
     }
 
     #[test]
@@ -22970,6 +23794,17 @@ mod tests {
         assert_eq!(
             transpile_to_fts5("A OR B OR C"),
             Some("(A OR B OR C)".to_string())
+        );
+
+        // An implicit conjunction ends the OR sequence just like an explicit
+        // AND. Remaining in OR mode here would silently broaden the query.
+        assert_eq!(
+            transpile_to_fts5("A OR B C"),
+            Some("(A OR B) AND C".to_string())
+        );
+        assert_eq!(
+            transpile_to_fts5("A OR B C OR D"),
+            Some("(A OR B) AND (C OR D)".to_string())
         );
 
         // Phrases
