@@ -419,7 +419,9 @@ pub fn scan_staged_export_database<P: AsRef<Path>>(
     config: &SecretScanConfig,
 ) -> Result<StagedSecretScan> {
     let db_path = db_path.as_ref();
+    ensure_staged_export_has_no_sidecars(db_path, "before verification")?;
     let digest_before = sha256_file(db_path)?;
+    ensure_staged_export_has_no_sidecars(db_path, "after pre-scan hashing")?;
     let filters = SecretScanFilters {
         agents: None,
         workspaces: None,
@@ -427,7 +429,9 @@ pub fn scan_staged_export_database<P: AsRef<Path>>(
         until_ts: None,
     };
     let report = scan_database(db_path, &filters, config, None, None)?;
+    ensure_staged_export_has_no_sidecars(db_path, "after the secret scan")?;
     let digest_after = sha256_file(db_path)?;
+    ensure_staged_export_has_no_sidecars(db_path, "after post-scan hashing")?;
 
     if digest_before != digest_after {
         bail!(
@@ -444,6 +448,32 @@ pub fn scan_staged_export_database<P: AsRef<Path>>(
         report,
         artifact_sha256: digest_after,
     })
+}
+
+fn ensure_staged_export_has_no_sidecars(db_path: &Path, phase: &str) -> Result<()> {
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let mut sidecar_path = db_path.as_os_str().to_os_string();
+        sidecar_path.push(suffix);
+        let sidecar_path = PathBuf::from(sidecar_path);
+        match std::fs::symlink_metadata(&sidecar_path) {
+            Ok(_) => {
+                bail!(
+                    "Staged Pages export has SQLite sidecar {} {phase}; refusing a main-file-only artifact attestation",
+                    sidecar_path.display()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to inspect staged SQLite sidecar {} {phase}",
+                        sidecar_path.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
@@ -2394,6 +2424,49 @@ mod tests {
         assert!(auxiliary_findings.iter().all(|finding| {
             finding.message_id == Some(8) && finding.location == SecretLocation::MessageMetadata
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn staged_export_scan_rejects_unbound_sqlite_sidecars() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db_path = temp.path().join("export.db");
+        let conn = crate::franken_sync::Connection::open(db_path.to_string_lossy().as_ref())?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent TEXT NOT NULL,
+                workspace TEXT,
+                title TEXT,
+                source_path TEXT NOT NULL,
+                metadata_json TEXT
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL
+            );
+            "#,
+        )?;
+        drop(conn);
+
+        let mut wal_path = db_path.as_os_str().to_os_string();
+        wal_path.push("-wal");
+        let wal_path = PathBuf::from(wal_path);
+        std::fs::write(&wal_path, b"unbound sidecar bytes")?;
+
+        let config = SecretScanConfig::from_inputs_with_env(&[], &[], false)?;
+        let error = scan_staged_export_database(&db_path, &config)
+            .expect_err("a main-file digest must not attest an unbound SQLite sidecar");
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("-wal"), "unexpected error: {diagnostic}");
+        assert!(
+            diagnostic.contains("main-file-only artifact attestation"),
+            "unexpected error: {diagnostic}"
+        );
         Ok(())
     }
 

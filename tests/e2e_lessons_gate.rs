@@ -35,6 +35,8 @@ const SURFACE_BOUND: Duration = Duration::from_secs(60);
 const RAW_USERNAME: &str = "realuser";
 const RAW_EMAIL_DOMAIN: &str = "corp.example";
 const RAW_DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+const RCH_COMMIT_REF: &str = "commit:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const EXPORT_COMMIT_REF: &str = "commit:cccccccccccccccccccccccccccccccccccccccc";
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lessons")
@@ -333,7 +335,7 @@ fn repeated_fix_dedupes_with_merged_provenance() -> Result<(), String> {
 
     let matches: Vec<Value> = lessons_array(&v)
         .into_iter()
-        .filter(|l| has_source_ref(l, "commit:abc123") || has_source_ref(l, "bead:bd-rch-1"))
+        .filter(|l| has_source_ref(l, RCH_COMMIT_REF) || has_source_ref(l, "bead:bd-rch-1"))
         .collect();
     if matches.len() != 1 {
         failures.push(format!(
@@ -342,8 +344,8 @@ fn repeated_fix_dedupes_with_merged_provenance() -> Result<(), String> {
         ));
     }
     if let Some(lesson) = matches.first() {
-        if !has_source_ref(lesson, "commit:abc123") {
-            failures.push("rch lesson missing commit:abc123 provenance".to_string());
+        if !has_source_ref(lesson, RCH_COMMIT_REF) {
+            failures.push(format!("rch lesson missing {RCH_COMMIT_REF} provenance"));
         }
         if !has_source_ref(lesson, "bead:bd-rch-1") {
             failures.push("rch lesson missing bead:bd-rch-1 provenance".to_string());
@@ -492,7 +494,7 @@ fn redaction_removes_planted_markers_and_counts_them() -> Result<(), String> {
     // The redacted export lesson is still present and useful.
     let has_export = lessons_array(&v)
         .into_iter()
-        .any(|l| has_source_ref(&l, "commit:leak01"));
+        .any(|l| has_source_ref(&l, EXPORT_COMMIT_REF));
     if !has_export {
         failures.push("redacted export lesson is missing".to_string());
     }

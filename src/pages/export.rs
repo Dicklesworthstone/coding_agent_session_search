@@ -551,7 +551,11 @@ impl ExportEngine {
         })();
 
         match result {
-            Err(export_error) if !replace_attempted => {
+            // A failed POSIX rename leaves the staged path untouched and safe
+            // to clean. Windows replacement can enter the backup/restore
+            // recovery path, where the staged file is deliberately retained
+            // if restoring the prior output also fails.
+            Err(export_error) if !replace_attempted || cfg!(not(windows)) => {
                 match cleanup_sqlite_temp_artifacts(&temp_output_path) {
                     Ok(()) => Err(export_error),
                     Err(cleanup_error) => Err(export_error.context(format!(
@@ -745,6 +749,7 @@ fn cleanup_sqlite_temp_artifacts(path: &Path) -> Result<()> {
     let mut first_error = None;
     for artifact in [
         path.to_path_buf(),
+        sidecar_path(path, "-journal"),
         sidecar_path(path, "-wal"),
         sidecar_path(path, "-shm"),
     ] {
@@ -1550,6 +1555,33 @@ mod tests {
             ));
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_export_cleanup_removes_every_sqlite_artifact() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let staged_path = temp_dir.path().join("export.tmp.db");
+        let artifacts = [
+            staged_path.clone(),
+            sidecar_path(&staged_path, "-journal"),
+            sidecar_path(&staged_path, "-wal"),
+            sidecar_path(&staged_path, "-shm"),
+        ];
+        for artifact in &artifacts {
+            std::fs::write(artifact, b"staged bytes")?;
+        }
+
+        cleanup_sqlite_temp_artifacts(&staged_path)?;
+
+        for artifact in artifacts {
+            if std::fs::symlink_metadata(&artifact).is_ok() {
+                return Err(anyhow::anyhow!(
+                    "rejected staged SQLite artifact survived cleanup: {}",
+                    artifact.display()
+                ));
+            }
+        }
         Ok(())
     }
 

@@ -19,7 +19,9 @@
 //! re-redact those strings; it preserves the supplied topic, project,
 //! provenance, applicability, and summary metadata. Production callers must
 //! therefore cross [`crate::lessons_extraction::extract`] before building a
-//! graph. Keeping that boundary explicit avoids implying that the Rust type
+//! graph. Failed approaches are retired only by fresher landed lessons on the
+//! same topic; independent current lessons can coexist within a topic. Keeping
+//! that boundary explicit avoids implying that the Rust type
 //! alone can distinguish redacted text from raw private text.
 
 use serde::{Deserialize, Serialize};
@@ -83,9 +85,9 @@ impl LessonConfidence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LessonStatus {
-    /// Current best lesson for its topic.
+    /// Current, independently useful lesson.
     Active,
-    /// Replaced by a fresher lesson on the same topic.
+    /// Failed approach replaced by a fresher landed lesson on the same topic.
     Superseded,
     /// Known to be out of date (advice no longer applies).
     Outdated,
@@ -107,7 +109,7 @@ impl LessonStatus {
 /// private text; this module stores exactly what it is given.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LessonCandidate {
-    /// Topic the lesson is about (the dedup/supersession key, with `project`).
+    /// Topic the lesson is about (used with `project` when retiring failed approaches).
     pub topic: String,
     /// Project the lesson belongs to.
     pub project: String,
@@ -237,9 +239,9 @@ pub struct LessonGraph {
 
 impl LessonGraph {
     /// Build a graph from candidates: dedupe by stable id (merging provenance
-    /// refs and keeping the freshest metadata), then resolve supersession so
-    /// that for each (topic, project) the single freshest non-outdated lesson is
-    /// `Active` and older ones become `Superseded`. Pure and deterministic.
+    /// refs and keeping the freshest metadata), then retire failed approaches
+    /// that have a strictly fresher landed lesson on the same (topic, project).
+    /// Independent non-outdated lessons remain `Active`. Pure and deterministic.
     pub fn build(candidates: Vec<LessonCandidate>) -> Self {
         use std::collections::BTreeMap;
 
@@ -273,32 +275,34 @@ impl LessonGraph {
 
         let mut lessons: Vec<LessonRecord> = by_id.into_values().collect();
 
-        // 2) Supersession: per (topic, project), the freshest non-outdated
-        //    lesson stays Active; older non-outdated ones become Superseded.
-        let mut freshest: BTreeMap<(String, String), (u64, String)> = BTreeMap::new();
+        // 2) Supersession is deliberately narrow. A topic is a coarse classifier,
+        //    not an identity key, so distinct current lessons on one topic must
+        //    coexist. Only a failed approach with a strictly fresher landed
+        //    lesson on the same topic is known to have been replaced.
+        let mut freshest_landed: BTreeMap<(String, String), u64> = BTreeMap::new();
         for l in &lessons {
-            if l.status == LessonStatus::Outdated {
+            if l.status == LessonStatus::Outdated || l.kind == LessonKind::FailedApproach {
                 continue;
             }
             let key = (l.topic.clone(), l.project.clone());
-            let entry = freshest
+            freshest_landed
                 .entry(key)
-                .or_insert((l.freshness_ms, l.lesson_id.clone()));
-            // Freshest wins; ties broken by lesson_id for determinism.
-            if l.freshness_ms > entry.0 || (l.freshness_ms == entry.0 && l.lesson_id < entry.1) {
-                *entry = (l.freshness_ms, l.lesson_id.clone());
-            }
+                .and_modify(|freshness| *freshness = (*freshness).max(l.freshness_ms))
+                .or_insert(l.freshness_ms);
         }
         for l in &mut lessons {
             if l.status == LessonStatus::Outdated {
                 continue;
             }
             let key = (l.topic.clone(), l.project.clone());
-            let is_active = freshest.get(&key).is_some_and(|(_, id)| id == &l.lesson_id);
-            l.status = if is_active {
-                LessonStatus::Active
-            } else {
+            let replaced_failed_approach = l.kind == LessonKind::FailedApproach
+                && freshest_landed
+                    .get(&key)
+                    .is_some_and(|freshness| *freshness > l.freshness_ms);
+            l.status = if replaced_failed_approach {
                 LessonStatus::Superseded
+            } else {
+                LessonStatus::Active
             };
         }
 
@@ -414,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn fresher_lesson_supersedes_older_on_same_topic() {
+    fn fresher_landed_lesson_supersedes_failed_approach_on_same_topic() {
         // A "failed workaround" replaced by a "high-confidence landed decision".
         let g = LessonGraph::build(vec![
             candidate(
@@ -441,6 +445,37 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].freshness_ms, 300);
         assert_eq!(active[0].kind, LessonKind::ReusableDecision);
+    }
+
+    #[test]
+    fn independent_lessons_on_same_topic_remain_active() {
+        let g = LessonGraph::build(vec![
+            candidate(
+                "search",
+                LessonKind::Gotcha,
+                LessonConfidence::High,
+                100,
+                "cursor pagination must preserve the stable tiebreak",
+                "commit-cursor",
+            ),
+            candidate(
+                "search",
+                LessonKind::ReusableDecision,
+                LessonConfidence::High,
+                300,
+                "hybrid search fails open to lexical",
+                "commit-hybrid",
+            ),
+        ]);
+
+        assert_eq!(g.summary.total, 2);
+        assert_eq!(g.summary.active, 2);
+        assert_eq!(g.summary.superseded, 0);
+        assert!(
+            g.lessons
+                .iter()
+                .all(|lesson| lesson.status == LessonStatus::Active)
+        );
     }
 
     #[test]

@@ -2,28 +2,28 @@
   "project": "cass",
   "commits": [
     {
-      "sha": "abc123",
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "subject": "fix(rch): preflight broken on remote",
       "timestamp_ms": 100000
     },
     {
-      "sha": "fsql99",
+      "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       "subject": "feat(frankensqlite-group-by): use SUM(0) in grouped query",
       "timestamp_ms": 300000
     },
     {
-      "sha": "leak01",
+      "sha": "cccccccccccccccccccccccccccccccccccccccc",
       "subject": "fix(export): redact path in exported summary",
       "body": "reported by realuser@corp.example from /home/realuser/private/notes digest 0123456789abcdef0123456789abcdef0123456789abcdef",
       "timestamp_ms": 50000
     },
     {
-      "sha": "sec01",
+      "sha": "dddddddddddddddddddddddddddddddddddddddd",
       "subject": "fix(update): validate version chars to prevent shell injection",
       "timestamp_ms": 400000
     },
     {
-      "sha": "feat01",
+      "sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
       "subject": "feat(storage): atomic-swap lexical publish via renameat2",
       "timestamp_ms": 500000
     }

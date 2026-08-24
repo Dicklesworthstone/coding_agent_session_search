@@ -205,17 +205,16 @@ pub fn redact(input: &str) -> (String, RedactionReport) {
 const SECURITY_KEYWORDS: &[&str] = &[
     "security",
     "vuln",
-    "cve",
     "injection",
     "exploit",
-    "rce",
-    "xss",
-    "csrf",
-    "ssrf",
     "sandbox escape",
     "privilege escalation",
     "unsafe",
 ];
+
+/// Short security acronyms must match as standalone ASCII words. Raw substring
+/// matching would, for example, classify every mention of `source` as RCE.
+const SECURITY_ACRONYMS: &[&str] = &["cve", "rce", "xss", "csrf", "ssrf"];
 
 /// Keywords that mark an approach as a dead end.
 const FAILED_KEYWORDS: &[&str] = &[
@@ -231,19 +230,59 @@ const FAILED_KEYWORDS: &[&str] = &[
     "rolled back",
 ];
 
-/// Keywords that mark advice as outdated/superseded at the source.
-const OUTDATED_KEYWORDS: &[&str] = &[
-    "supersed",
-    "obsolet",
-    "outdated",
-    "deprecat",
-    "no longer",
-    "stale",
-];
-
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     let lower = haystack.to_ascii_lowercase();
     needles.iter().any(|n| lower.contains(n))
+}
+
+fn contains_ascii_word(haystack: &str, needle: &str) -> bool {
+    let lower = haystack.to_ascii_lowercase();
+    lower.match_indices(needle).any(|(start, matched)| {
+        let end = start + matched.len();
+        let before_is_word = start > 0 && lower.as_bytes()[start - 1].is_ascii_alphanumeric();
+        let after_is_word = end < lower.len() && lower.as_bytes()[end].is_ascii_alphanumeric();
+        !before_is_word && !after_is_word
+    })
+}
+
+fn contains_security_keyword(haystack: &str) -> bool {
+    contains_any(haystack, SECURITY_KEYWORDS)
+        || SECURITY_ACRONYMS
+            .iter()
+            .any(|acronym| contains_ascii_word(haystack, acronym))
+}
+
+/// Whether a closing reason explicitly retires the underlying advice.
+///
+/// Topical words such as "stale" and "deprecated" commonly describe the bug
+/// that a successful fix removes. Looking only for explicit retirement language
+/// in the close reason avoids turning those current fixes into outdated lessons.
+fn bead_marks_advice_outdated(close_reason: &str) -> bool {
+    let reason = close_reason
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    const RETIREMENT_PREFIXES: &[&str] = &[
+        "superseded",
+        "replaced by",
+        "outdated",
+        "deprecated",
+        "obsolete",
+        "retired in favor",
+    ];
+    const RETIREMENT_PHRASES: &[&str] = &[
+        "no longer applies",
+        "no longer needed",
+        "no longer supported",
+        "no longer valid",
+    ];
+    RETIREMENT_PREFIXES
+        .iter()
+        .any(|prefix| reason.starts_with(prefix))
+        || RETIREMENT_PHRASES
+            .iter()
+            .any(|phrase| reason.contains(phrase))
 }
 
 /// Parse a conventional-commit `type(scope): summary` line into `(type, scope)`.
@@ -293,7 +332,7 @@ fn classify_commit(commit: &CommitEvidence) -> (LessonKind, String) {
     let combined = format!("{} {}", commit.subject, commit.body);
     let (ctype, scope) = parse_conventional(&commit.subject);
     let topic = scope.unwrap_or_else(|| first_word(&commit.subject));
-    if contains_any(&combined, SECURITY_KEYWORDS) {
+    if contains_security_keyword(&combined) {
         return (LessonKind::SecurityWarning, topic);
     }
     let kind = match ctype.as_deref() {
@@ -324,8 +363,8 @@ fn classify_bead(bead: &BeadEvidence) -> (LessonKind, String, bool) {
         .find(|label| !label.is_empty())
         .map(str::to_ascii_lowercase)
         .unwrap_or_else(|| first_word(&bead.title));
-    let outdated = contains_any(&combined, OUTDATED_KEYWORDS);
-    let kind = if contains_any(&combined, SECURITY_KEYWORDS) {
+    let outdated = bead_marks_advice_outdated(&bead.close_reason);
+    let kind = if contains_security_keyword(&combined) {
         LessonKind::SecurityWarning
     } else if contains_any(&combined, FAILED_KEYWORDS) {
         LessonKind::FailedApproach
@@ -418,8 +457,7 @@ fn redact_field(input: &str, report: &mut RedactionReport) -> String {
 
 fn commit_source_ref(sha: &str, report: &mut RedactionReport) -> String {
     let trimmed = sha.trim();
-    if !trimmed.is_empty()
-        && trimmed.len() <= 64
+    if matches!(trimmed.len(), 40 | 64)
         && trimmed.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         return format!("commit:{trimmed}");
@@ -475,6 +513,11 @@ pub fn extract(evidence: &LessonsEvidence) -> ExtractionResult {
     }
 
     for bead in &evidence.beads {
+        // An empty id cannot provide useful or attributable provenance. Treat
+        // fixture input the same as live Beads gathering and skip it entirely.
+        if bead.id.trim().is_empty() {
+            continue;
+        }
         let (kind, raw_topic, outdated) = classify_bead(bead);
         let topic = redact_field(&raw_topic, &mut redaction);
         let (reason, r1) = redact(&bead.close_reason);
@@ -574,6 +617,13 @@ pub fn extract(evidence: &LessonsEvidence) -> ExtractionResult {
 mod tests {
     use super::*;
     use crate::lessons::{LessonGraph, LessonStatus};
+
+    const SHA1_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SHA1_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const SHA1_C: &str = "cccccccccccccccccccccccccccccccccccccccc";
+    const SHA1_D: &str = "dddddddddddddddddddddddddddddddddddddddd";
+    const SHA256_A: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn commit(sha: &str, subject: &str, ts: u64) -> CommitEvidence {
         CommitEvidence {
@@ -685,6 +735,76 @@ mod tests {
         assert_eq!(kind, LessonKind::SecurityWarning);
     }
 
+    #[test]
+    fn short_security_acronyms_require_word_boundaries() {
+        let (source_kind, _) = classify_commit(&commit(
+            SHA1_A,
+            "fix(indexer): preserve source metadata",
+            1,
+        ));
+        assert_eq!(
+            source_kind,
+            LessonKind::Gotcha,
+            "the `rce` substring inside `source` is not an RCE warning"
+        );
+
+        let (rce_kind, _) = classify_commit(&commit(
+            SHA1_B,
+            "fix(runtime): reject RCE payloads",
+            1,
+        ));
+        assert_eq!(rce_kind, LessonKind::SecurityWarning);
+    }
+
+    #[test]
+    fn outdated_requires_explicit_retirement_language_in_close_reason() {
+        let current = bead(
+            "bd-current",
+            "Remove stale cache entries",
+            "fixed stale invalidation and verified the current implementation",
+            "bug",
+            1,
+        );
+        assert!(
+            !classify_bead(&current).2,
+            "a successful fix for stale state is still current advice"
+        );
+
+        let retired = bead(
+            "bd-retired",
+            "Local patch override",
+            "deprecated: no longer needed after the upstream release",
+            "task",
+            2,
+        );
+        assert!(classify_bead(&retired).2);
+    }
+
+    #[test]
+    fn commit_source_refs_require_full_git_object_ids() {
+        let mut report = RedactionReport::default();
+        assert_eq!(
+            commit_source_ref(SHA1_A, &mut report),
+            format!("commit:{SHA1_A}")
+        );
+        assert_eq!(
+            commit_source_ref(SHA256_A, &mut report),
+            format!("commit:{SHA256_A}")
+        );
+        assert_eq!(report.total(), 0);
+
+        for invalid in [
+            "abc123",
+            "0123456789abcdef0123456789abcdef",
+            "0123456789abcdef0123456789abcdef0123456789abcdef",
+        ] {
+            let source_ref = commit_source_ref(invalid, &mut report);
+            assert_eq!(source_ref, "commit:<invalid-id>");
+            assert!(!source_ref.contains(invalid));
+        }
+        assert_eq!(report.digests, 3);
+    }
+
     // ---- end-to-end extraction over the required corpus -------------------
 
     #[test]
@@ -694,7 +814,7 @@ mod tests {
         let evidence = LessonsEvidence {
             project: "cass".to_string(),
             commits: vec![commit(
-                "abc123",
+                SHA1_A,
                 "fix(rch): preflight broken on remote",
                 100,
             )],
@@ -714,7 +834,7 @@ mod tests {
         let graph = LessonGraph::build(result.candidates);
         assert_eq!(graph.summary.total, 1, "identical lessons dedupe");
         let l = &graph.lessons[0];
-        assert!(l.source_refs.contains(&"commit:abc123".to_string()));
+        assert!(l.source_refs.contains(&format!("commit:{SHA1_A}")));
         assert!(l.source_refs.contains(&"bead:bd-1".to_string()));
         assert_eq!(l.freshness_ms, 200, "freshest metadata kept");
         assert_eq!(l.status, LessonStatus::Active);
@@ -725,7 +845,7 @@ mod tests {
         let evidence = LessonsEvidence {
             project: "cass".to_string(),
             commits: vec![commit(
-                "new99",
+                SHA1_B,
                 "feat(frankensqlite): use SUM(0) in grouped query",
                 300,
             )],
@@ -803,7 +923,7 @@ mod tests {
         let evidence = LessonsEvidence {
             project: "cass".to_string(),
             commits: vec![commit(
-                "feat1",
+                SHA1_C,
                 "feat(storage): atomic-swap lexical publish via renameat2",
                 500,
             )],
@@ -852,7 +972,7 @@ mod tests {
         let evidence = LessonsEvidence {
             project: "cass".to_string(),
             commits: vec![CommitEvidence {
-                sha: "leak1".to_string(),
+                sha: SHA1_D.to_string(),
                 subject: "fix(export): handle path".to_string(),
                 body: "reported by realuser@corp.example from /home/realuser/private/notes"
                     .to_string(),
@@ -877,7 +997,7 @@ mod tests {
         let evidence = LessonsEvidence {
             project: "repo=file:///Users/project-owner/private-repo".to_string(),
             commits: vec![CommitEvidence {
-                sha: "abc123".to_string(),
+                sha: SHA1_A.to_string(),
                 subject: "fix(cwd=/Users/commit-owner/private): keep metadata safe".to_string(),
                 body: String::new(),
                 timestamp_ms: 1,
@@ -913,13 +1033,16 @@ mod tests {
         ] {
             assert!(!json.contains(sensitive), "metadata leaked {sensitive}: {json}");
         }
-        assert!(json.contains("commit:abc123"), "validated commit id lost: {json}");
+        assert!(
+            json.contains(&format!("commit:{SHA1_A}")),
+            "validated commit id lost: {json}"
+        );
         assert!(redaction_total >= 6, "redactions were not audited: {redaction_total}");
     }
 
     #[test]
     fn malformed_commit_identifier_is_not_serialized_as_provenance() {
-        let raw_id = "private-branch-owner";
+        let raw_id = "0123456789abcdef0123456789abcdef";
         let evidence = LessonsEvidence {
             project: "cass".to_string(),
             commits: vec![commit(raw_id, "fix(storage): retain safe provenance", 1)],
@@ -933,6 +1056,27 @@ mod tests {
         let json = serde_json::to_string(&graph).unwrap();
         assert!(!json.contains(raw_id), "malformed id leaked: {json}");
         assert!(json.contains("commit:<invalid-id>"));
+    }
+
+    #[test]
+    fn bead_without_an_identifier_is_not_emitted() {
+        let evidence = LessonsEvidence {
+            project: "cass".to_string(),
+            commits: Vec::new(),
+            beads: vec![bead(
+                " \n ",
+                "fix(storage): retain a transaction boundary",
+                "landed and verified",
+                "bug",
+                1,
+            )],
+            proofs: Vec::new(),
+        };
+
+        let result = extract(&evidence);
+        assert_eq!(result.manifest.beads_scanned, 1);
+        assert_eq!(result.manifest.candidates_emitted, 0);
+        assert!(result.candidates.is_empty());
     }
 
     #[test]
@@ -998,8 +1142,8 @@ mod tests {
         let evidence = LessonsEvidence {
             project: "cass".to_string(),
             commits: vec![
-                commit("c1", "feat(a): one", 1),
-                commit("c2", "fix(b): two", 2),
+                commit(SHA1_A, "feat(a): one", 1),
+                commit(SHA1_B, "fix(b): two", 2),
             ],
             beads: vec![bead("b1", "task three", "landed cleanly", "task", 3)],
             proofs: vec![ProofEvidence {
