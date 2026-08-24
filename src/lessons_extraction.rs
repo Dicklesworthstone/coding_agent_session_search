@@ -272,14 +272,20 @@ fn parse_conventional(subject: &str) -> (Option<String>, Option<String>) {
 
 /// First non-empty, lowercased word of `text` (a fallback topic).
 fn first_word(text: &str) -> String {
-    text.split_whitespace()
+    let word = text
+        .split_whitespace()
         .next()
         .unwrap_or("general")
         // Preserve path separators until the redaction pass sees them. Removing
         // a leading slash here would turn `/Users/alice/...` into an
         // unrecognizable relative token before the home-path scrubber runs.
         .trim_matches(|c: char| !c.is_alphanumeric() && !matches!(c, '/' | '\\'))
-        .to_ascii_lowercase()
+        .to_ascii_lowercase();
+    if word.is_empty() {
+        "general".to_string()
+    } else {
+        word
+    }
 }
 
 /// Classify a commit into a [`LessonKind`] and a topic.
@@ -313,8 +319,10 @@ fn classify_bead(bead: &BeadEvidence) -> (LessonKind, String, bool) {
     );
     let topic = bead
         .labels
-        .first()
-        .map(|l| l.to_ascii_lowercase())
+        .iter()
+        .map(|label| label.trim())
+        .find(|label| !label.is_empty())
+        .map(str::to_ascii_lowercase)
         .unwrap_or_else(|| first_word(&bead.title));
     let outdated = contains_any(&combined, OUTDATED_KEYWORDS);
     let kind = if contains_any(&combined, SECURITY_KEYWORDS) {
@@ -333,7 +341,7 @@ fn classify_bead(bead: &BeadEvidence) -> (LessonKind, String, bool) {
 fn classify_proof(proof: &ProofEvidence) -> (LessonKind, String) {
     let topic = first_word(&proof.name);
     let kind = if matches!(
-        proof.status.to_ascii_lowercase().as_str(),
+        proof.status.trim().to_ascii_lowercase().as_str(),
         "pass" | "ok" | "passed" | "green"
     ) {
         LessonKind::Invariant
@@ -348,8 +356,8 @@ fn classify_proof(proof: &ProofEvidence) -> (LessonKind, String) {
 fn summary_from(parts: &[&str]) -> Option<String> {
     let joined = parts
         .iter()
-        .map(|p| p.trim())
-        .filter(|p| !p.is_empty())
+        .map(|part| part.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join(" — ");
     if joined.is_empty() {
@@ -402,7 +410,8 @@ pub struct ExtractionManifest {
 }
 
 fn redact_field(input: &str, report: &mut RedactionReport) -> String {
-    let (redacted, field_report) = redact(input);
+    let normalized = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    let (redacted, field_report) = redact(&normalized);
     report.add(field_report);
     redacted
 }
@@ -435,7 +444,7 @@ pub fn extract(evidence: &LessonsEvidence) -> ExtractionResult {
     let raw_project = if evidence.project.trim().is_empty() {
         default_project()
     } else {
-        evidence.project.clone()
+        evidence.project.trim().to_string()
     };
     let mut candidates: Vec<LessonCandidate> = Vec::new();
     let mut redaction = RedactionReport::default();
@@ -484,11 +493,12 @@ pub fn extract(evidence: &LessonsEvidence) -> ExtractionResult {
         let mut applies_to: Vec<String> = bead
             .labels
             .iter()
-            .map(|label| redact_field(&label.to_ascii_lowercase(), &mut redaction))
+            .map(|label| redact_field(&label.trim().to_ascii_lowercase(), &mut redaction))
+            .filter(|label| !label.is_empty())
             .collect();
         applies_to.sort();
         applies_to.dedup();
-        let bead_id = redact_field(&bead.id, &mut redaction);
+        let bead_id = redact_field(bead.id.trim(), &mut redaction);
         candidates.push(LessonCandidate {
             topic,
             project: project.clone(),
@@ -506,9 +516,16 @@ pub fn extract(evidence: &LessonsEvidence) -> ExtractionResult {
         let (kind, raw_topic) = classify_proof(proof);
         let topic = redact_field(&raw_topic, &mut redaction);
         let proof_name = redact_field(proof.name.trim(), &mut redaction);
+        if proof_name.is_empty() {
+            continue;
+        }
         let (command, r1) = redact(&proof.command);
         redaction.add(r1);
-        let status = redact_field(&proof.status.to_ascii_lowercase(), &mut redaction);
+        let normalized_status = proof.status.trim().to_ascii_lowercase();
+        let mut status = redact_field(&normalized_status, &mut redaction);
+        if status.is_empty() {
+            status = "unknown".to_string();
+        }
         let summary = match summary_from(&[&command]) {
             Some(cmd) => format!("{cmd} → {status}"),
             None => format!("{proof_name} → {status}"),
@@ -655,6 +672,7 @@ mod tests {
             classify_commit(&commit("c", "revert(daemon): undo cache change", 1)),
             (LessonKind::FailedApproach, "daemon".to_string())
         );
+        assert_eq!(first_word("!!!"), "general");
     }
 
     #[test]
@@ -915,6 +933,64 @@ mod tests {
         let json = serde_json::to_string(&graph).unwrap();
         assert!(!json.contains(raw_id), "malformed id leaked: {json}");
         assert!(json.contains("commit:<invalid-id>"));
+    }
+
+    #[test]
+    fn extraction_normalizes_metadata_and_skips_unattributed_proofs() {
+        let evidence = LessonsEvidence {
+            project: "  cass  ".to_string(),
+            commits: Vec::new(),
+            beads: vec![BeadEvidence {
+                id: "  bead-1  ".to_string(),
+                title: "storage lesson".to_string(),
+                close_reason: "keep one\nlogical transaction".to_string(),
+                issue_type: "task".to_string(),
+                status: "closed".to_string(),
+                labels: vec!["  ".to_string(), " Storage\n ".to_string()],
+                updated_ms: 1,
+            }],
+            proofs: vec![
+                ProofEvidence {
+                    name: "  storage gate  ".to_string(),
+                    status: " PASS \n".to_string(),
+                    command: "cargo test\n--lib".to_string(),
+                    timestamp_ms: 2,
+                },
+                ProofEvidence {
+                    name: " \n ".to_string(),
+                    status: "pass".to_string(),
+                    command: "cargo test --ignored".to_string(),
+                    timestamp_ms: 3,
+                },
+            ],
+        };
+
+        let result = extract(&evidence);
+        assert_eq!(result.manifest.project, "cass");
+        assert_eq!(result.manifest.proofs_scanned, 2);
+        assert_eq!(result.manifest.candidates_emitted, 2);
+        let graph = LessonGraph::build(result.candidates);
+        assert!(graph.lessons.iter().all(|lesson| !lesson.summary.contains('\n')));
+        let bead = graph
+            .lessons
+            .iter()
+            .find(|lesson| {
+                matches!(lesson.source_refs.as_slice(), [source] if source == "bead:bead-1")
+            })
+            .unwrap();
+        assert_eq!(bead.topic, "storage");
+        assert_eq!(bead.applies_to, vec!["storage".to_string()]);
+        assert_eq!(bead.summary, "keep one logical transaction");
+        let proof = graph
+            .lessons
+            .iter()
+            .find(|lesson| {
+                matches!(lesson.source_refs.as_slice(), [source] if source == "proof:storage gate")
+            })
+            .unwrap();
+        assert_eq!(proof.kind, LessonKind::Invariant);
+        assert_eq!(proof.confidence, LessonConfidence::High);
+        assert_eq!(proof.summary, "cargo test --lib → pass");
     }
 
     #[test]

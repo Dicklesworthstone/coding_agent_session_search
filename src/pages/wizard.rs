@@ -507,7 +507,7 @@ impl PagesWizard {
         Ok(())
     }
 
-    fn step_secret_scan(&mut self, term: &mut Term, theme: &ColorfulTheme) -> Result<()> {
+    fn step_secret_scan(&mut self, term: &mut Term, _theme: &ColorfulTheme) -> Result<()> {
         writeln!(term, "\n{}", style("Step 2 of 9: Secret Scan").bold())?;
         writeln!(term, "{}", style("─".repeat(40)).dim())?;
         writeln!(
@@ -555,16 +555,13 @@ impl PagesWizard {
         if report.summary.has_critical {
             writeln!(
                 term,
-                "  {} Critical secrets detected. Export is blocked without acknowledgement.",
-                style("✗").red()
+                "  {} Critical findings are present in this preliminary review.",
+                style("⚠").yellow()
             )?;
-            let ack: String = Input::with_theme(theme)
-                .with_prompt("Type \"I UNDERSTAND\" to proceed")
-                .interact_text()?;
-            if ack.trim() != "I UNDERSTAND" {
-                bail!("Export cancelled due to critical secrets");
-            }
-            writeln!(term, "  {} Acknowledged", style("✓").green())?;
+            writeln!(
+                term,
+                "  Configuration may continue, but only the later exact staged-artifact scan can authorize encryption or publication."
+            )?;
         }
 
         Ok(())
@@ -1115,9 +1112,12 @@ impl PagesWizard {
         };
 
         let config = ConfirmationConfig {
-            has_secrets: self.state.secret_scan_has_findings,
-            has_critical_secrets: self.state.secret_scan_has_critical,
-            secret_count: self.state.secret_scan_count,
+            // Step 2 inspected a mutable live source and is informational only.
+            // Secret-risk approval is intentionally absent here: execute_export
+            // scans and gates the exact staged artifact after filtering/export.
+            has_secrets: false,
+            has_critical_secrets: false,
+            secret_count: 0,
             target_domain,
             is_remote_publish: self.state.target != DeployTarget::Local,
             password_entropy_bits: self.state.password_entropy_bits,
@@ -1186,7 +1186,7 @@ impl PagesWizard {
 
         writeln!(
             term,
-            "\n  {} All safety checks completed",
+            "\n  {} Pre-export confirmations completed; exact staged-artifact scan remains",
             style("✓").green()
         )?;
         Ok(true)

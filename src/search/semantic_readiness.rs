@@ -474,6 +474,9 @@ mod tests {
         let r = s.report();
         assert_eq!(r.reason, SemanticReadinessReason::FastTierReady);
         assert!(r.available);
+        assert!(r.semantic_only_search_available);
+        assert!(r.fast_tier_ready);
+        assert!(!r.quality_tier_ready);
         assert_eq!(r.fallback_mode, FallbackMode::None);
         assert_eq!(
             r.realized_refinement,
@@ -491,6 +494,7 @@ mod tests {
         assert_eq!(r.reason, SemanticReadinessReason::QualityTierReady);
         assert!(r.available);
         assert!(r.semantic_only_search_available);
+        assert!(r.quality_tier_ready);
         assert_eq!(r.fallback_mode, FallbackMode::None);
         assert_eq!(
             r.realized_refinement,
