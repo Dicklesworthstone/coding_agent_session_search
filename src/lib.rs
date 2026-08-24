@@ -97335,10 +97335,11 @@ fn run_export_html(
         .enumerate()
         .flat_map(|(i, msg)| {
             let role = extract_role(msg);
-            if pi_family_export && !include_tools && role == "tool" {
-                // Pi-family tool results are standalone messages. Omitting
-                // them here makes `--include-tools=false` exclude both sides
-                // of the interaction while retaining assistant thinking/text.
+            if !include_tools && role == "tool" {
+                // Several providers encode tool results as standalone
+                // messages. Honor `--include-tools=false` from the message
+                // role itself even when the provider cannot be inferred from
+                // an arbitrary direct path.
                 return Vec::new();
             }
             let ts = extract_message_timestamp(msg);
@@ -97355,10 +97356,24 @@ fn run_export_html(
                 Vec::new()
             };
 
-            let content = if !tool_calls.is_empty() {
-                strip_tool_marker(&extract_text_content_without_tool_blocks(msg))
+            let content = if include_tools {
+                if !tool_calls.is_empty() {
+                    strip_tool_marker(&extract_text_content_without_tool_blocks(msg))
+                } else {
+                    extract_text_content(msg)
+                }
             } else {
-                extract_text_content(msg)
+                let content = extract_text_content_without_tool_blocks(msg);
+                if pi_family_export && role == "assistant" {
+                    // Older/incomplete indexed Pi-family rows may lack a
+                    // recoverable source envelope. Their normalized assistant
+                    // text contains one flattened `[Tool: ...] ...` line per
+                    // invocation, so fail closed on those lines when tools
+                    // were explicitly excluded.
+                    strip_flattened_tool_call_lines(&content)
+                } else {
+                    content
+                }
             };
 
             // --- Drop entire messages that are skill injections (unless opted in) ---
@@ -102265,6 +102280,23 @@ fn extract_role(msg: &serde_json::Value) -> String {
         }
     }
     "unknown".to_string()
+}
+
+/// Remove lossy tool-call lines from normalized Pi-family assistant text.
+///
+/// This is only used when the canonical source envelope is unavailable and
+/// the caller explicitly disabled tools. FAD emits each flattened invocation
+/// on its own line as `[Tool: name] arguments`; without the envelope there is
+/// no structured representation left to filter.
+fn strip_flattened_tool_call_lines(content: &str) -> String {
+    content
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !(trimmed.starts_with("[Tool:") && trimmed.contains(']'))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Strip redundant "[Tool: X]" markers from content when tool call is shown separately.
