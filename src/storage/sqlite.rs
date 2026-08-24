@@ -30225,6 +30225,81 @@ mod tests {
         assert_eq!(lazy.path(), path.as_path());
     }
 
+    #[test]
+    fn dedicated_owner_safe_handles_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<FrankenOwnerConnection>();
+        assert_send_sync::<LazyFrankenDb>();
+        assert_send_sync::<FrankenConnectionManager>();
+    }
+
+    #[test]
+    fn dedicated_owner_lazy_and_manager_reads_cross_worker_boundaries() {
+        use crate::franken_sync::compat::RowExt as _;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("owner-thread-dispatch.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        storage
+            .raw()
+            .execute_batch(
+                "CREATE TABLE owner_thread_probe (value INTEGER NOT NULL);\
+                 INSERT INTO owner_thread_probe(value) VALUES (41), (1);",
+            )
+            .unwrap();
+        storage.close().unwrap();
+
+        let lazy = Arc::new(LazyFrankenDb::new(db_path.clone()));
+        let lazy_workers = (0..4)
+            .map(|_| {
+                let lazy = Arc::clone(&lazy);
+                std::thread::spawn(move || {
+                    let conn = lazy
+                        .get_with_timeout("cross-worker lazy read", Duration::from_secs(5))
+                        .unwrap();
+                    conn.query_row_map(
+                        "SELECT SUM(value) FROM owner_thread_probe",
+                        fparams![],
+                        |row| row.get_typed::<i64>(0),
+                    )
+                    .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in lazy_workers {
+            assert_eq!(worker.join().unwrap(), 42);
+        }
+
+        let manager = Arc::new(
+            FrankenConnectionManager::new(
+                &db_path,
+                ConnectionManagerConfig {
+                    reader_count: 2,
+                    max_writers: 1,
+                },
+            )
+            .unwrap(),
+        );
+        let manager_workers = (0..4)
+            .map(|_| {
+                let manager = Arc::clone(&manager);
+                std::thread::spawn(move || {
+                    let conn = manager.reader();
+                    conn.query_row_map(
+                        "SELECT SUM(value) FROM owner_thread_probe",
+                        fparams![],
+                        |row| row.get_typed::<i64>(0),
+                    )
+                    .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in manager_workers {
+            assert_eq!(worker.join().unwrap(), 42);
+        }
+    }
+
     // =========================================================================
     // Pricing / cost estimation tests (bead z9fse.10)
     // =========================================================================
@@ -31848,7 +31923,7 @@ mod tests {
             guard.mark_committed();
         }
 
-        // Verify via reader (returns MutexGuard<SendFrankenConnection>)
+        // Verify via a guard around the dedicated-owner reader handle.
         let reader_guard = mgr.reader();
         let rows = reader_guard.query("SELECT val FROM cm_test").unwrap();
         assert_eq!(rows.len(), 1);

@@ -1599,6 +1599,23 @@ mod tests {
         assert_eq!(config.max_findings, DEFAULT_MAX_FINDINGS);
     }
 
+    #[test]
+    fn table_exists_distinguishes_absence_from_invalid_schema_probe() -> Result<()> {
+        let conn = crate::franken_sync::Connection::open(":memory:")?;
+        conn.execute("CREATE TABLE snippets (id INTEGER PRIMARY KEY);")?;
+
+        assert!(table_exists(&conn, "snippets")?);
+        assert!(!table_exists(&conn, "not_present")?);
+
+        let error = table_exists(&conn, "snippets; DROP TABLE snippets")
+            .expect_err("invalid schema identifiers must fail closed");
+        assert!(
+            error.to_string().contains("Invalid SQLite identifier"),
+            "unexpected invalid-identifier diagnostic: {error:#}"
+        );
+        Ok(())
+    }
+
     // =========================================================================
     // Scan text tests (via scan_database with crafted DB)
     // =========================================================================

@@ -269,11 +269,21 @@ type SqliteFtsMessageRow = (
     Option<String>,
     Option<String>,
 );
-type SqliteMessageScanAlternative = Vec<String>;
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SqliteMessageScanOperand {
+    Terms(Vec<String>),
+    Phrase(Vec<String>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SqliteMessageScanAlternative {
+    operand: SqliteMessageScanOperand,
+    negated: bool,
+}
+
 type SqliteMessageScanGroup = Vec<SqliteMessageScanAlternative>;
 struct SqliteMessageScanQuery {
-    include_groups: Vec<SqliteMessageScanGroup>,
-    exclude_terms: Vec<String>,
+    groups: Vec<SqliteMessageScanGroup>,
 }
 
 #[derive(Clone, Copy)]
@@ -1027,8 +1037,11 @@ impl QueryExplanation {
             }
         }
 
-        // Implicit AND between terms if no explicit operators
-        parsed.implicit_and = !has_explicit_operator && parsed.terms.len() > 1;
+        // Every adjacent query operand is implicitly conjoined, including
+        // quoted phrases. Counting only bare terms made explanations for
+        // `foo "bar baz"` and `"foo bar" "baz qux"` disagree with execution.
+        let operand_count = parsed.terms.len().saturating_add(parsed.phrases.len());
+        parsed.implicit_and = !has_explicit_operator && operand_count > 1;
 
         // Determine query type
         let query_type = Self::classify_query(&parsed, filters, &sanitized);
