@@ -80,8 +80,6 @@ impl RedactionKind {
 #[derive(Debug, Clone)]
 pub struct RedactionChange {
     pub kind: RedactionKind,
-    pub original: String,
-    pub redacted: String,
 }
 
 #[derive(Debug, Clone)]
@@ -104,8 +102,6 @@ pub struct RedactionReport {
 #[derive(Debug, Clone)]
 pub struct RedactionSample {
     pub location: String,
-    pub before: String,
-    pub after: String,
     pub kinds: Vec<RedactionKind>,
 }
 
@@ -305,8 +301,6 @@ impl RedactionEngine {
             output = redacted;
             changes.push(RedactionChange {
                 kind: RedactionKind::HomePath,
-                original: home_str.clone(),
-                redacted: "~".to_string(),
             });
         }
 
@@ -319,8 +313,6 @@ impl RedactionEngine {
                     output = replaced.to_string();
                     changes.push(RedactionChange {
                         kind: RedactionKind::Username,
-                        original: pattern.as_str().to_string(),
-                        redacted: replacement.clone(),
                     });
                 }
             }
@@ -331,8 +323,6 @@ impl RedactionEngine {
                 output = output.replace(from, to);
                 changes.push(RedactionChange {
                     kind: RedactionKind::PathReplacement,
-                    original: from.clone(),
-                    redacted: to.clone(),
                 });
             }
         }
@@ -343,8 +333,6 @@ impl RedactionEngine {
                 .to_string();
             changes.push(RedactionChange {
                 kind: RedactionKind::Email,
-                original: "email".to_string(),
-                redacted: "[EMAIL_REDACTED]".to_string(),
             });
         }
 
@@ -363,8 +351,6 @@ impl RedactionEngine {
                 .to_string();
             changes.push(RedactionChange {
                 kind: RedactionKind::Hostname,
-                original: "url_hostname".to_string(),
-                redacted: "[HOST_REDACTED]".to_string(),
             });
         }
 
@@ -376,8 +362,6 @@ impl RedactionEngine {
                     .to_string();
                 changes.push(RedactionChange {
                     kind: RedactionKind::CustomPattern,
-                    original: pattern.name.clone(),
-                    redacted: pattern.replacement.clone(),
                 });
             }
         }
@@ -390,8 +374,6 @@ impl RedactionEngine {
         {
             changes.push(RedactionChange {
                 kind: RedactionKind::ProjectName,
-                original: output.clone(),
-                redacted: redacted.clone(),
             });
             output = redacted;
         }
@@ -523,8 +505,6 @@ fn redact_swarm_scalar_with_engine(engine: &RedactionEngine, input: &str) -> Red
         // truthful without retaining any source secret bytes.
         redacted.changes.push(RedactionChange {
             kind: RedactionKind::CustomPattern,
-            original: "canonical_secret_pattern".to_string(),
-            redacted: "[REDACTED]".to_string(),
         });
     }
     redacted
@@ -576,13 +556,7 @@ impl RedactionReport {
         }
     }
 
-    pub fn record(
-        &mut self,
-        location: &str,
-        before: &str,
-        after: &str,
-        changes: &[RedactionChange],
-    ) {
+    pub fn record(&mut self, location: &str, changes: &[RedactionChange]) {
         if changes.is_empty() {
             return;
         }
@@ -600,23 +574,24 @@ impl RedactionReport {
                 }
             }
             self.samples.push(RedactionSample {
-                location: location.to_string(),
-                before: truncate_for_report(before, 140),
-                after: truncate_for_report(after, 140),
+                location: sanitize_report_location(location),
                 kinds,
             });
         }
     }
 }
 
-fn truncate_for_report(input: &str, max: usize) -> String {
-    let mut chars = input.chars();
-    let mut out: String = chars.by_ref().take(max).collect();
-    if chars.next().is_some() && !out.is_empty() {
-        out.pop(); // remove the last character to make room for the ellipsis
-        out.push('…');
+fn sanitize_report_location(location: &str) -> String {
+    if !location.is_empty()
+        && location.len() <= 64
+        && location
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        location.to_string()
+    } else {
+        "[redacted-location]".to_string()
     }
-    out
 }
 
 fn build_username_patterns(
@@ -1205,14 +1180,15 @@ mod tests {
         let result = engine.redact_text("/home/alice/projects/app.rs");
         let mut report = RedactionReport::new(2);
 
-        report.record(
-            "message.content",
-            "/home/alice/projects/app.rs",
-            &result.output,
-            &result.changes,
-        );
+        report.record("/home/alice/private/session.jsonl", &result.changes);
 
         assert!(report.total_redactions > 0);
         assert!(!report.samples.is_empty());
+        let diagnostics = format!("{:?}{:?}", result.changes, report.samples);
+        assert!(
+            !diagnostics.contains("/home/alice"),
+            "redaction diagnostics must not retain source bytes: {diagnostics}"
+        );
+        assert_eq!(report.samples[0].location, "[redacted-location]");
     }
 }
