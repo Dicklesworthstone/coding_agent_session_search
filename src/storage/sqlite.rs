@@ -3320,6 +3320,12 @@ pub const CURRENT_SCHEMA_VERSION: i64 = 20;
 pub(crate) const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
 const LEGACY_OMP_RECLASSIFICATION_META_KEY: &str = "legacy_omp_reclassification_v1";
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LegacyOmpReclassificationResult {
+    pub conversations_reclassified: usize,
+    pub lexical_rebuild_required: bool,
+}
+
 /// Result of checking schema compatibility.
 #[derive(Debug, Clone)]
 pub enum SchemaCheck {
@@ -7986,7 +7992,7 @@ impl FrankenStorage {
     /// first OMP scan merges into the existing canonical rows instead of
     /// creating a second copy under another agent id. Analytics are derived
     /// from canonical messages and rebuilt after the identity swap.
-    pub fn reclassify_legacy_omp_conversations(&self) -> Result<usize> {
+    pub fn reclassify_legacy_omp_conversations(&self) -> Result<LegacyOmpReclassificationResult> {
         const LEGACY_PATH_PREDICATE: &str = r"(
             REPLACE(c.source_path, '\', '/') LIKE '%/.omp/agent/%'
             OR REPLACE(c.source_path, '\', '/') LIKE '.omp/agent/%'
@@ -8001,8 +8007,9 @@ impl FrankenStorage {
             )
             .optional()?;
         if state.as_deref() == Some("complete") {
-            return Ok(0);
+            return Ok(LegacyOmpReclassificationResult::default());
         }
+        let assets_were_pending = state.as_deref() == Some("analytics_pending");
 
         let legacy_agent_id: Option<i64> = self
             .conn
@@ -8055,6 +8062,39 @@ impl FrankenStorage {
                 ));
             }
 
+            let metadata_updates: Vec<(i64, String)> = self.conn.query_map_collect(
+                &format!(
+                    "SELECT c.id, c.metadata_json, c.metadata_bin
+                     FROM conversations c
+                     WHERE c.agent_id = ?1 AND {LEGACY_PATH_PREDICATE}"
+                ),
+                fparams![legacy_agent_id],
+                |row| {
+                    let id: i64 = row.get_typed(0)?;
+                    let metadata_json: Option<String> = row.get_typed(1)?;
+                    let metadata_bin: Option<Vec<u8>> = row.get_typed(2)?;
+                    let mut metadata = metadata_bin
+                        .as_deref()
+                        .and_then(|bytes| rmp_serde::from_slice(bytes).ok())
+                        .or_else(|| {
+                            metadata_json
+                                .as_deref()
+                                .and_then(|json| serde_json::from_str(json).ok())
+                        })
+                        .unwrap_or(serde_json::Value::Null);
+                    if let Some(object) = metadata.as_object_mut()
+                        && object.get("source").and_then(serde_json::Value::as_str)
+                            == Some("pi_agent")
+                    {
+                        object.insert("source".into(), serde_json::Value::String("omp".into()));
+                    }
+                    Ok((
+                        id,
+                        serde_json::to_string(&metadata).unwrap_or_else(|_| "null".into()),
+                    ))
+                },
+            )?;
+
             let mut tx = self.conn.transaction()?;
             tx.execute_compat(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'analytics_pending')",
@@ -8068,6 +8108,14 @@ impl FrankenStorage {
                 ),
                 fparams![omp_agent_id, legacy_agent_id],
             )?;
+            for (conversation_id, metadata_json) in metadata_updates {
+                tx.execute_compat(
+                    "UPDATE conversations
+                     SET metadata_json = ?1, metadata_bin = NULL
+                     WHERE id = ?2",
+                    fparams![metadata_json, conversation_id],
+                )?;
+            }
             tx.execute_compat(
                 &format!(
                     "UPDATE token_usage SET agent_id = ?1
@@ -8129,7 +8177,7 @@ impl FrankenStorage {
                 "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'complete')",
                 fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
             )?;
-            return Ok(0);
+            return Ok(LegacyOmpReclassificationResult::default());
         }
 
         self.rebuild_analytics()
@@ -8143,7 +8191,14 @@ impl FrankenStorage {
             fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
         )?;
 
-        Ok(legacy_count.max(0) as usize)
+        Ok(LegacyOmpReclassificationResult {
+            conversations_reclassified: legacy_count.max(0) as usize,
+            // The transaction commits the canonical identity change before
+            // rebuilding derived assets. If a prior run stopped in that
+            // window, `legacy_count` is already zero on retry, but the live
+            // lexical generation still carries the old `pi_agent` identity.
+            lexical_rebuild_required: legacy_count > 0 || assets_were_pending,
+        })
     }
 
     /// Get the timestamp of the last successful index completion.
@@ -16383,10 +16438,7 @@ impl FrankenStorage {
     /// Pagination is keyset (`WHERE m.id > last_id`), so the cost is linear in
     /// the number of rescanned rows rather than quadratic as the previous
     /// `LIMIT/OFFSET` form was. A progress event is logged per chunk.
-    pub fn rebuild_analytics_since(
-        &self,
-        since_ms: Option<i64>,
-    ) -> Result<AnalyticsRebuildResult> {
+    pub fn rebuild_analytics_since(&self, since_ms: Option<i64>) -> Result<AnalyticsRebuildResult> {
         let start = Instant::now();
 
         // Day-aligned scope. `None` => full rebuild.
@@ -16398,11 +16450,12 @@ impl FrankenStorage {
         });
 
         let total_messages: i64 = match scope {
-            None => self
-                .conn
-                .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
-                    row.get_typed(0)
-                })?,
+            None => {
+                self.conn
+                    .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                        row.get_typed(0)
+                    })?
+            }
             Some((_, _, cutoff_ms)) => self.conn.query_row_map(
                 "SELECT COUNT(*)
                  FROM messages m
@@ -22488,9 +22541,7 @@ mod tests {
         assert_eq!(daily_count(day1), 0);
 
         // Re-running the same windowed rebuild must not double count.
-        let again = storage
-            .rebuild_analytics_since(Some(day2_ts))
-            .unwrap();
+        let again = storage.rebuild_analytics_since(Some(day2_ts)).unwrap();
         assert_eq!(again.message_metrics_rows, 5);
         assert_eq!(daily_count(day2), 5);
         let hourly_day2: i64 = conn
@@ -22503,9 +22554,7 @@ mod tests {
         assert_eq!(hourly_day2, 5);
 
         // A window reaching back to day 1 restores it without disturbing day 2.
-        let full_window = storage
-            .rebuild_analytics_since(Some(day1_ts))
-            .unwrap();
+        let full_window = storage.rebuild_analytics_since(Some(day1_ts)).unwrap();
         assert_eq!(full_window.message_metrics_rows, 7);
         assert_eq!(daily_count(day1), 2);
         assert_eq!(daily_count(day2), 5);
@@ -28955,7 +29004,7 @@ mod tests {
             started_at: Some(1_700_000_000_000),
             ended_at: Some(1_700_000_001_000),
             approx_tokens: None,
-            metadata_json: json!({"source":"pi_agent"}),
+            metadata_json: serde_json::json!({"source":"pi_agent"}),
             messages: vec![Message {
                 id: None,
                 idx: 0,
@@ -28963,7 +29012,7 @@ mod tests {
                 author: Some("openrouter/stealth/ox-alpha".into()),
                 created_at: Some(1_700_000_001_000),
                 content: "legacy OMP answer".into(),
-                extra_json: json!({"message":{"model":"openrouter/stealth/ox-alpha"}}),
+                extra_json: serde_json::json!({"message":{"model":"openrouter/stealth/ox-alpha"}}),
                 snippets: Vec::new(),
             }],
             source_id: LOCAL_SOURCE_ID.into(),
@@ -28971,12 +29020,22 @@ mod tests {
         };
         storage.insert_conversation_tree(pi_agent_id, None, &conversation)?;
 
-        assert_eq!(storage.reclassify_legacy_omp_conversations()?, 1);
-        assert_eq!(storage.reclassify_legacy_omp_conversations()?, 0);
+        assert_eq!(
+            storage.reclassify_legacy_omp_conversations()?,
+            LegacyOmpReclassificationResult {
+                conversations_reclassified: 1,
+                lexical_rebuild_required: true,
+            }
+        );
+        assert_eq!(
+            storage.reclassify_legacy_omp_conversations()?,
+            LegacyOmpReclassificationResult::default()
+        );
 
         let conversations = storage.list_conversations(10, 0)?;
         assert_eq!(conversations.len(), 1);
         assert_eq!(conversations[0].agent_slug, "omp");
+        assert_eq!(conversations[0].metadata_json["source"], "omp");
         let omp_agent_id: i64 = storage.conn.query_row_map(
             "SELECT id FROM agents WHERE slug = 'omp'",
             fparams![],
@@ -28994,6 +29053,26 @@ mod tests {
             |row| row.get_typed(0),
         )?;
         assert_eq!(metrics_slug, "omp");
+
+        // Simulate a crash after the canonical identity transaction committed
+        // but before the derived lexical publish completed. The retry must
+        // retain the lexical-rebuild signal even though no Pi-labeled rows
+        // remain to reclassify.
+        storage.conn.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'analytics_pending')",
+            fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
+        )?;
+        assert_eq!(
+            storage.reclassify_legacy_omp_conversations()?,
+            LegacyOmpReclassificationResult {
+                conversations_reclassified: 0,
+                lexical_rebuild_required: true,
+            }
+        );
+        assert_eq!(
+            storage.reclassify_legacy_omp_conversations()?,
+            LegacyOmpReclassificationResult::default()
+        );
         Ok(())
     }
 
