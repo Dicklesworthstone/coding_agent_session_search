@@ -316,7 +316,9 @@ const SQLITE_FTS5_HYDRATE_PARAM_CHUNK: usize = 30_000;
 const SQLITE_MAX_VARIABLE_NUMBER: usize = 32_766;
 const SQLITE_FTS5_POST_FILTER_SCAN_CHUNK: usize = 1_024;
 const SQLITE_FTS5_POST_FILTER_SCAN_LIMIT: usize = 30_000;
-const SQLITE_MESSAGE_SCAN_FALLBACK_PAGE_ROWS: usize = 30_000;
+// Source-table fallback scans the complete read snapshot while materializing
+// at most this many raw message rows at once.
+const SQLITE_MESSAGE_SCAN_FALLBACK_PAGE_ROWS: usize = 1_024;
 const SEARCH_SQLITE_HYDRATION_CACHE_KIB: i64 = 4_096;
 const SEMANTIC_EXACT_CHUNK_OVERFETCH_MULTIPLIER: usize = 4;
 
@@ -8049,9 +8051,9 @@ impl SearchClient {
         );
         let mut params = Vec::new();
 
-        // The scan budget bounds query-text evaluation, not the unfiltered
-        // archive prefix. Apply every metadata filter before LIMIT so a small,
-        // selective corpus is not hidden behind earlier unrelated messages.
+        // Each keyset page bounds materialized rows, not corpus completeness.
+        // Apply every metadata filter before LIMIT so pages contain only rows
+        // whose title/content must actually be evaluated.
         if !filters.agents.is_empty() {
             let placeholders = sql_placeholders(filters.agents.len());
             sql.push_str(&format!(
@@ -8229,6 +8231,11 @@ impl SearchClient {
             return Ok(Vec::new());
         };
         let retained_hit_count = request.offset.saturating_add(request.limit);
+        // Keyset pagination must observe one archive generation. Without an
+        // explicit read transaction, concurrent indexing can append rows
+        // between pages, changing ranking inputs or preventing termination.
+        let mut read_transaction = SearchReadTransaction::begin(conn)
+            .context("starting SQLite source-scan read snapshot")?;
 
         let fixed_param_count = request
             .filters
@@ -8344,12 +8351,16 @@ impl SearchClient {
         }
         Self::trim_sqlite_message_scan_hits(&mut scored_hits, retained_hit_count);
 
-        Ok(scored_hits
+        let hits = scored_hits
             .into_iter()
             .skip(request.offset)
             .take(request.limit)
             .map(|(_, hit)| hit)
-            .collect())
+            .collect();
+        read_transaction
+            .rollback()
+            .context("closing SQLite source-scan read snapshot")?;
+        Ok(hits)
     }
 
     fn search_sqlite_fts5(
@@ -14565,7 +14576,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_message_scan_pushes_all_filters_before_scan_limit() {
+    fn sqlite_message_scan_pushes_all_filters_before_page_limit() {
         let filters = SearchFilters {
             agents: HashSet::from(["codex".to_string()]),
             workspaces: HashSet::from(["/workspace".to_string()]),
