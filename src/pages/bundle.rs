@@ -372,7 +372,7 @@ impl BundleBuilder {
                 output_dir,
                 &mut retain_temp_on_replace_error,
             )
-                .context("Failed to install completed bundle")?;
+            .context("Failed to install completed bundle")?;
 
             progress("complete", "Bundle complete!");
 
@@ -1814,6 +1814,14 @@ mod tests {
             "unexpected error: {err:#}"
         );
         assert!(!output_parent.path().join("escaped.md").exists());
+        let leftovers = fs::read_dir(output_parent.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "rejected bundle staging directory leaked: {leftovers:?}"
+        );
     }
 
     #[test]

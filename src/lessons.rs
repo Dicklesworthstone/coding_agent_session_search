@@ -279,13 +279,13 @@ impl LessonGraph {
         //    not an identity key, so distinct current lessons on one topic must
         //    coexist. Only a failed approach with a strictly fresher landed
         //    lesson on the same topic is known to have been replaced.
-        let mut freshest_landed: BTreeMap<(String, String), u64> = BTreeMap::new();
+        let mut freshest_decision: BTreeMap<(String, String), u64> = BTreeMap::new();
         for l in &lessons {
-            if l.status == LessonStatus::Outdated || l.kind == LessonKind::FailedApproach {
+            if l.status == LessonStatus::Outdated || l.kind != LessonKind::ReusableDecision {
                 continue;
             }
             let key = (l.topic.clone(), l.project.clone());
-            freshest_landed
+            freshest_decision
                 .entry(key)
                 .and_modify(|freshness| *freshness = (*freshness).max(l.freshness_ms))
                 .or_insert(l.freshness_ms);
@@ -296,7 +296,7 @@ impl LessonGraph {
             }
             let key = (l.topic.clone(), l.project.clone());
             let replaced_failed_approach = l.kind == LessonKind::FailedApproach
-                && freshest_landed
+                && freshest_decision
                     .get(&key)
                     .is_some_and(|freshness| *freshness > l.freshness_ms);
             l.status = if replaced_failed_approach {
@@ -476,6 +476,31 @@ mod tests {
                 .iter()
                 .all(|lesson| lesson.status == LessonStatus::Active)
         );
+    }
+
+    #[test]
+    fn newer_gotcha_does_not_supersede_failed_approach() {
+        let g = LessonGraph::build(vec![
+            candidate(
+                "search",
+                LessonKind::FailedApproach,
+                LessonConfidence::High,
+                100,
+                "abandoned an unrelated remote cache experiment",
+                "bead-cache",
+            ),
+            candidate(
+                "search",
+                LessonKind::Gotcha,
+                LessonConfidence::High,
+                300,
+                "cursor pagination must preserve the stable tiebreak",
+                "commit-cursor",
+            ),
+        ]);
+
+        assert_eq!(g.summary.active, 2);
+        assert_eq!(g.summary.superseded, 0);
     }
 
     #[test]

@@ -264,12 +264,15 @@ fn bead_marks_advice_outdated(close_reason: &str) -> bool {
         .join(" ")
         .to_ascii_lowercase();
     const RETIREMENT_PREFIXES: &[&str] = &[
-        "superseded",
-        "replaced by",
-        "outdated",
-        "deprecated",
-        "obsolete",
-        "retired in favor",
+        "superseded:",
+        "superseded by ",
+        "replaced by ",
+        "replaced by:",
+        "outdated:",
+        "deprecated:",
+        "obsolete:",
+        "retired in favor of ",
+        "retired in favor:",
     ];
     const RETIREMENT_PHRASES: &[&str] = &[
         "no longer applies",
@@ -760,8 +763,8 @@ mod tests {
     fn outdated_requires_explicit_retirement_language_in_close_reason() {
         let current = bead(
             "bd-current",
-            "Remove stale cache entries",
-            "fixed stale invalidation and verified the current implementation",
+            "Remove stale deprecated cache entries",
+            "fixed stale invalidation in the deprecated cache API and verified the current implementation",
             "bug",
             1,
         );

@@ -129,7 +129,7 @@ impl ExportEngine {
         // replace the final output only after a successful commit.
         let temp_output_path =
             unique_atomic_sidecar_path(&self.output_path, "tmp", "pages_export.db");
-        let mut replace_attempted = false;
+        let mut retain_temp_on_replace_error = false;
         let result = (|| -> Result<(ExportStats, T)> {
             let output_path = temp_output_path.to_string_lossy().to_string();
             let dest =
@@ -537,9 +537,12 @@ impl ExportEngine {
             let verification = verifier(&temp_output_path)
                 .context("Staged Pages export verification failed")?;
 
-            replace_attempted = true;
-            replace_file_from_temp(&temp_output_path, &self.output_path)
-                .context("Failed to install completed export database")?;
+            replace_file_from_temp(
+                &temp_output_path,
+                &self.output_path,
+                &mut retain_temp_on_replace_error,
+            )
+            .context("Failed to install completed export database")?;
 
             Ok((
                 ExportStats {
@@ -551,11 +554,10 @@ impl ExportEngine {
         })();
 
         match result {
-            // A failed POSIX rename leaves the staged path untouched and safe
-            // to clean. Windows replacement can enter the backup/restore
-            // recovery path, where the staged file is deliberately retained
-            // if restoring the prior output also fails.
-            Err(export_error) if !replace_attempted || cfg!(not(windows)) => {
+            // Only the catastrophic Windows backup/restore failure retains the
+            // staged database for recovery. Every ordinary rejection or failed
+            // replacement removes the complete SQLite artifact family.
+            Err(export_error) if !retain_temp_on_replace_error => {
                 match cleanup_sqlite_temp_artifacts(&temp_output_path) {
                     Ok(()) => Err(export_error),
                     Err(cleanup_error) => Err(export_error.context(format!(
@@ -793,7 +795,9 @@ fn replace_file_from_temp_via_backup(
     temp_path: &Path,
     final_path: &Path,
     first_err: &std::io::Error,
+    retain_temp_on_error: &mut bool,
 ) -> Result<()> {
+    *retain_temp_on_error = false;
     let backup_path = unique_replace_backup_path(final_path);
     std::fs::rename(final_path, &backup_path).with_context(|| {
         let _ = std::fs::remove_file(temp_path);
@@ -824,6 +828,7 @@ fn replace_file_from_temp_via_backup(
                 );
             }
             Err(restore_err) => {
+                *retain_temp_on_error = true;
                 bail!(
                     "failed replacing {} with {}: first error: {}; second error: {}; restore error: {}; temp file retained at {}",
                     final_path.display(),
@@ -838,7 +843,12 @@ fn replace_file_from_temp_via_backup(
     }
 }
 
-fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<()> {
+fn replace_file_from_temp(
+    temp_path: &Path,
+    final_path: &Path,
+    retain_temp_on_error: &mut bool,
+) -> Result<()> {
+    *retain_temp_on_error = false;
     #[cfg(windows)]
     {
         match std::fs::rename(temp_path, final_path) {
@@ -853,7 +863,12 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> Result<()> {
                 ) =>
             {
                 if replacement_path_entry_exists(final_path)? {
-                    replace_file_from_temp_via_backup(temp_path, final_path, &first_err)
+                    replace_file_from_temp_via_backup(
+                        temp_path,
+                        final_path,
+                        &first_err,
+                        retain_temp_on_error,
+                    )
                 } else {
                     Err(first_err).with_context(|| {
                         format!(
@@ -1595,7 +1610,13 @@ mod tests {
         std::fs::write(&final_path, b"old export")?;
         std::fs::write(&temp_path, b"new export")?;
 
-        replace_file_from_temp_via_backup(&temp_path, &final_path, &first_err)?;
+        let mut retain_temp_on_error = false;
+        replace_file_from_temp_via_backup(
+            &temp_path,
+            &final_path,
+            &first_err,
+            &mut retain_temp_on_error,
+        )?;
 
         if !matches!(
             std::fs::read(&final_path)?.as_slice().cmp(b"new export"),
@@ -1608,6 +1629,11 @@ mod tests {
         if temp_path.exists() {
             return Err(anyhow::anyhow!("export temp path was not consumed"));
         }
+        if retain_temp_on_error {
+            return Err(anyhow::anyhow!(
+                "successful replacement incorrectly requested temp retention"
+            ));
+        }
 
         Ok(())
     }
@@ -1618,19 +1644,23 @@ mod tests {
         let final_path = temp_dir.path().join("export.db");
         let first_tmp = temp_dir.path().join("first.tmp");
         let second_tmp = temp_dir.path().join("second.tmp");
+        let mut retain_temp_on_error = false;
 
         std::fs::write(&first_tmp, b"first").expect("write first temp");
-        replace_file_from_temp(&first_tmp, &final_path).expect("initial replace");
+        replace_file_from_temp(&first_tmp, &final_path, &mut retain_temp_on_error)
+            .expect("initial replace");
         assert_eq!(
             std::fs::read(&final_path).expect("read first final"),
             b"first"
         );
 
         std::fs::write(&second_tmp, b"second").expect("write second temp");
-        replace_file_from_temp(&second_tmp, &final_path).expect("overwrite replace");
+        replace_file_from_temp(&second_tmp, &final_path, &mut retain_temp_on_error)
+            .expect("overwrite replace");
         assert_eq!(
             std::fs::read(&final_path).expect("read second final"),
             b"second"
         );
+        assert!(!retain_temp_on_error);
     }
 }
