@@ -816,7 +816,7 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
         .to_string();
 
     // 5b. The semantic daemon socket path derives from $TMPDIR and $USER
-    // ("$TMPDIR/semantic-daemon-$USER.sock"), so its value is pure host
+    // ("$TMPDIR/cass-semantic-daemon-$USER.sock"), so its value is pure host
     // environment — a golden regenerated on a different machine (or through
     // rch) would otherwise freeze that host's temp dir into the contract.
     // Keep the field, scrub the value.

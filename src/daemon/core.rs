@@ -617,10 +617,31 @@ impl ModelDaemon {
             // Decode and handle request
             let response = match decode_message::<Request>(&payload) {
                 Ok(msg) => {
-                    self.total_requests.fetch_add(1, Ordering::Relaxed);
-                    self.touch_activity();
-                    let response = self.handle_request(msg.request_id.clone(), msg.payload);
-                    FramedMessage::new(msg.request_id, response)
+                    if msg.version != PROTOCOL_VERSION {
+                        warn!(
+                            request_version = msg.version,
+                            expected_version = PROTOCOL_VERSION,
+                            request_id = %msg.request_id,
+                            "Rejected daemon request with incompatible protocol version"
+                        );
+                        FramedMessage::new(
+                            msg.request_id,
+                            Response::Error(ErrorResponse {
+                                code: ErrorCode::VersionMismatch,
+                                message: format!(
+                                    "protocol version mismatch: expected {}, got {}",
+                                    PROTOCOL_VERSION, msg.version
+                                ),
+                                retryable: false,
+                                retry_after_ms: None,
+                            }),
+                        )
+                    } else {
+                        self.total_requests.fetch_add(1, Ordering::Relaxed);
+                        self.touch_activity();
+                        let response = self.handle_request(msg.request_id.clone(), msg.payload);
+                        FramedMessage::new(msg.request_id, response)
+                    }
                 }
                 Err(e) => {
                     warn!(error = %e, "Failed to decode request");
@@ -1004,6 +1025,54 @@ mod tests {
         assert!(!daemon.shutdown.load(Ordering::SeqCst));
         daemon.request_shutdown();
         assert!(daemon.shutdown.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn incompatible_protocol_shutdown_is_rejected_without_side_effects() {
+        let config = DaemonConfig {
+            request_timeout: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let models = ModelManager::new(&test_data_dir());
+        let daemon = Arc::new(ModelDaemon::new(config, models));
+        let (server_stream, mut client_stream) = UnixStream::pair().expect("create socket pair");
+
+        let handler_daemon = Arc::clone(&daemon);
+        let handler =
+            std::thread::spawn(move || handler_daemon.handle_connection(server_stream));
+
+        let request = FramedMessage {
+            version: PROTOCOL_VERSION + 1,
+            request_id: "future-shutdown".to_string(),
+            payload: Request::Shutdown,
+        };
+        client_stream
+            .write_all(&encode_message(&request).expect("encode request"))
+            .expect("write request");
+
+        let mut len = [0_u8; 4];
+        client_stream
+            .read_exact(&mut len)
+            .expect("read response length");
+        let mut payload = vec![0_u8; u32::from_be_bytes(len) as usize];
+        client_stream
+            .read_exact(&mut payload)
+            .expect("read response payload");
+        let response = decode_message::<Response>(&payload).expect("decode response");
+
+        assert_eq!(response.version, PROTOCOL_VERSION);
+        assert_eq!(response.request_id, "future-shutdown");
+        let Response::Error(error) = response.payload else {
+            panic!("version mismatch must return an error response");
+        };
+        assert_eq!(error.code, ErrorCode::VersionMismatch);
+        assert!(!error.retryable);
+        assert!(error.message.contains("expected 1, got 2"));
+        assert!(!daemon.shutdown.load(Ordering::SeqCst));
+        assert_eq!(daemon.total_requests.load(Ordering::Relaxed), 0);
+
+        drop(client_stream);
+        assert!(handler.join().expect("handler thread").is_ok());
     }
 
     #[test]

@@ -1,7 +1,10 @@
-//! Wire-compatible protocol for semantic model daemon.
+//! CASS semantic-model daemon protocol.
 //!
-//! This protocol is designed to be wire-compatible with xf's daemon implementation,
-//! allowing both tools to share a daemon if both are installed.
+//! CASS uses its own socket namespace because its frame envelope and response
+//! model-identity contract differ from xf's daemon protocol. Pointing both
+//! clients at the same socket would make the first daemon to start look
+//! connectable to the other client even though their messages cannot be
+//! decoded safely.
 //!
 //! Protocol uses MessagePack for efficient binary serialization over Unix Domain Sockets.
 
@@ -9,20 +12,20 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Protocol version for compatibility checks.
-/// Both cass and xf must use the same version to share a daemon.
+/// Clients and the CASS daemon must use the same version.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// Default socket path (shared between cass and xf).
+/// Default CASS-owned socket path.
 pub fn default_socket_path() -> PathBuf {
     let user = dotenvy::var("USER").unwrap_or_else(|_| "unknown".into());
     let safe_user = sanitize_socket_user(&user);
-    std::env::temp_dir().join(format!("semantic-daemon-{safe_user}.sock"))
+    std::env::temp_dir().join(format!("cass-semantic-daemon-{safe_user}.sock"))
 }
 
 fn sanitize_socket_user(user: &str) -> String {
     let safe_user: String = user
         .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .take(64)
         .collect();
 
@@ -471,7 +474,7 @@ mod tests {
             .map(|name| name.to_string_lossy())
             .unwrap_or_default();
         ensure(
-            file_name.starts_with("semantic-daemon-"),
+            file_name.starts_with("cass-semantic-daemon-"),
             "socket file prefix",
         )?;
         ensure(file_name.ends_with(".sock"), "socket path suffix")
@@ -488,6 +491,11 @@ mod tests {
             sanitize_socket_user(""),
             "unknown".to_string(),
             "empty user fallback",
+        )?;
+        ensure_eq(
+            sanitize_socket_user("用户"),
+            "unknown".to_string(),
+            "non-ASCII usernames must not defeat the socket byte-length cap",
         )?;
         ensure_eq(
             sanitize_socket_user("a".repeat(80).as_str()).len(),

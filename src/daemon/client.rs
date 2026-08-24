@@ -426,20 +426,41 @@ impl UdsDaemonClient {
             }
         }
 
-        // Release connection lock before decoding
-        drop(stream_guard);
-
         // Decode response
-        let response: FramedMessage<Response> = decode_message(&payload)
-            .map_err(|e| DaemonError::Failed(format!("failed to decode response: {}", e)))?;
+        let response: FramedMessage<Response> = match decode_message(&payload) {
+            Ok(response) => response,
+            Err(error) => {
+                *stream_guard = None;
+                self.available.store(false, Ordering::SeqCst);
+                return Err(DaemonError::Failed(format!(
+                    "failed to decode response: {error}"
+                )));
+            }
+        };
 
         // Check version compatibility
         if response.version != PROTOCOL_VERSION {
+            *stream_guard = None;
+            self.available.store(false, Ordering::SeqCst);
             return Err(DaemonError::Failed(format!(
                 "protocol version mismatch: expected {}, got {}",
                 PROTOCOL_VERSION, response.version
             )));
         }
+
+        // A response for another request indicates a broken or incompatible
+        // peer. Close the stream so no later call can consume a frame from a
+        // protocol sequence we no longer trust.
+        if response.request_id != request_id {
+            let response_id = response.request_id;
+            *stream_guard = None;
+            self.available.store(false, Ordering::SeqCst);
+            return Err(DaemonError::Failed(format!(
+                "response request ID mismatch: expected {request_id}, got {response_id}"
+            )));
+        }
+
+        drop(stream_guard);
 
         // Handle error responses
         match response.payload {
@@ -1039,7 +1060,7 @@ mod tests {
             .file_name()
             .expect("default socket path has a filename")
             .to_string_lossy();
-        assert!(file_name.starts_with("semantic-daemon-"));
+        assert!(file_name.starts_with("cass-semantic-daemon-"));
         assert!(file_name.ends_with(".sock"));
     }
 
@@ -1069,6 +1090,54 @@ mod tests {
         assert!(matches!(error, DaemonError::InvalidInput(_)));
         assert!(error.to_string().contains("expected minilm-384"));
         assert!(error.to_string().contains("received hash-384"));
+    }
+
+    #[test]
+    fn response_request_id_mismatch_closes_the_untrusted_connection() {
+        let (client_stream, mut server_stream) = UnixStream::pair().expect("create socket pair");
+        let client = UdsDaemonClient::new(DaemonClientConfig {
+            auto_spawn: false,
+            ..Default::default()
+        });
+        *client.connection.lock() = Some(client_stream);
+        client.available.store(true, Ordering::SeqCst);
+
+        let server = std::thread::spawn(move || {
+            let mut len = [0_u8; 4];
+            server_stream
+                .read_exact(&mut len)
+                .expect("read request length");
+            let mut payload = vec![0_u8; u32::from_be_bytes(len) as usize];
+            server_stream
+                .read_exact(&mut payload)
+                .expect("read request payload");
+            let request = decode_message::<Request>(&payload).expect("decode request");
+            assert_eq!(request.request_id, "cass-0");
+
+            let response = FramedMessage::new(
+                "different-request",
+                Response::Health(HealthStatus {
+                    uptime_secs: 1,
+                    version: PROTOCOL_VERSION,
+                    ready: true,
+                    memory_bytes: 0,
+                }),
+            );
+            server_stream
+                .write_all(&encode_message(&response).expect("encode response"))
+                .expect("write mismatched response");
+        });
+
+        let error = client
+            .health()
+            .expect_err("a response for another request must be rejected");
+        server.join().expect("server thread");
+
+        assert!(matches!(error, DaemonError::Failed(_)));
+        assert!(error.to_string().contains("expected cass-0"));
+        assert!(error.to_string().contains("got different-request"));
+        assert!(client.connection.lock().is_none());
+        assert!(!client.available.load(Ordering::SeqCst));
     }
 
     #[test]
