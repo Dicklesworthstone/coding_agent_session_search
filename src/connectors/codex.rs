@@ -40,7 +40,7 @@ impl Connector for CodexConnector {
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         let mut conversations = self.inner.scan(ctx)?;
         for conversation in &mut conversations {
-            augment_modern_codex_messages(conversation);
+            augment_modern_codex_messages(conversation, ctx.progress_tick.as_deref());
         }
         Ok(conversations)
     }
@@ -59,15 +59,16 @@ impl Connector for CodexConnector {
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
         self.inner.scan_with_callback(ctx, &mut |mut conversation| {
-            augment_modern_codex_messages(&mut conversation);
+            augment_modern_codex_messages(&mut conversation, ctx.progress_tick.as_deref());
             on_conversation(conversation)
         })
     }
 }
 
 /// gh373/oeu5a: heartbeat stride for the rollout line loop below. One
-/// [`scan_activity::tick`] per this many lines keeps the stall watchdog fed
-/// while this second pass re-parses a giant rollout (~40k lines, minutes).
+/// owning [`ScanContext`] progress tick per this many lines keeps the stall
+/// watchdog fed while this second pass re-parses a giant rollout (~40k lines,
+/// minutes).
 const AUGMENT_HEARTBEAT_LINE_STRIDE: usize = 1024;
 
 // TODO(gh373/oeu5a follow-up): this function is a full second parse of every
@@ -78,7 +79,10 @@ const AUGMENT_HEARTBEAT_LINE_STRIDE: usize = 1024;
 // (Cargo.toml rev pin), so the merge must land there first with cass-side
 // plumbing behind a feature/rev bump. Deferred deliberately; do not attempt
 // by duplicating FAD parse internals here.
-fn augment_modern_codex_messages(conversation: &mut NormalizedConversation) {
+fn augment_modern_codex_messages(
+    conversation: &mut NormalizedConversation,
+    progress_tick: Option<&(dyn Fn() + Send + Sync)>,
+) {
     if conversation
         .source_path
         .extension()
@@ -122,9 +126,7 @@ fn augment_modern_codex_messages(conversation: &mut NormalizedConversation) {
         let line_no = line_no_zero + 1;
         // gh373/oeu5a: connector-internal liveness during the minutes-long
         // re-parse of one giant rollout (see AUGMENT_HEARTBEAT_LINE_STRIDE).
-        if line_no_zero % AUGMENT_HEARTBEAT_LINE_STRIDE == 0 {
-            super::scan_activity::tick();
-        }
+        tick_augment_progress(progress_tick, line_no_zero);
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -194,6 +196,17 @@ fn augment_modern_codex_messages(conversation: &mut NormalizedConversation) {
                 .then_with(|| left.idx.cmp(&right.idx))
         });
         reindex_messages(&mut conversation.messages);
+    }
+}
+
+fn tick_augment_progress(
+    progress_tick: Option<&(dyn Fn() + Send + Sync)>,
+    line_no_zero: usize,
+) {
+    if line_no_zero % AUGMENT_HEARTBEAT_LINE_STRIDE == 0
+        && let Some(tick) = progress_tick
+    {
+        tick();
     }
 }
 
@@ -584,6 +597,7 @@ fn tool_call_content_has_name(content: &str, tool_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn message(content: &str, call_id: Option<&str>) -> NormalizedMessage {
         NormalizedMessage {
@@ -680,5 +694,26 @@ mod tests {
         assert!(!merge_modern_codex_tool_call(&mut existing, &candidate));
         assert_eq!(existing.content, "canonical response");
         assert_eq!(existing.invocations.len(), 1);
+    }
+
+    #[test]
+    fn augment_progress_ticks_only_the_owning_scan_context_at_stride() {
+        let owner_ticks = AtomicUsize::new(0);
+        let unrelated_ticks = AtomicUsize::new(0);
+        let owner = || {
+            owner_ticks.fetch_add(1, Ordering::Relaxed);
+        };
+        let unrelated = || {
+            unrelated_ticks.fetch_add(1, Ordering::Relaxed);
+        };
+
+        tick_augment_progress(Some(&owner), 0);
+        tick_augment_progress(Some(&owner), AUGMENT_HEARTBEAT_LINE_STRIDE - 1);
+        tick_augment_progress(Some(&owner), AUGMENT_HEARTBEAT_LINE_STRIDE);
+        tick_augment_progress(None, AUGMENT_HEARTBEAT_LINE_STRIDE * 2);
+
+        assert_eq!(owner_ticks.load(Ordering::Relaxed), 2);
+        assert_eq!(unrelated_ticks.load(Ordering::Relaxed), 0);
+        let _ = unrelated;
     }
 }

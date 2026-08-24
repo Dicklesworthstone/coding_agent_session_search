@@ -13038,6 +13038,11 @@ fn run_batch_index_with_connector_factories(
         since_ts,
         &connector_factories,
     )?);
+    let scan_progress_tick: Option<Arc<dyn Fn() + Send + Sync>> =
+        opts.progress.as_ref().map(|progress| {
+            let progress = Arc::clone(progress);
+            Arc::new(move || progress.tick_activity()) as Arc<dyn Fn() + Send + Sync>
+        });
 
     // Keep scan completion state with each connector so watermarks are only
     // advanced for connectors whose full scan scope completed successfully.
@@ -13052,6 +13057,12 @@ fn run_batch_index_with_connector_factories(
                 let mut is_discovered = false;
                 let mut scan_succeeded = true;
                 let mut scan_errors = Vec::new();
+                let with_scan_tick = |ctx: crate::connectors::ScanContext| {
+                    match &scan_progress_tick {
+                        Some(tick) => ctx.with_progress_tick(Arc::clone(tick)),
+                        None => ctx,
+                    }
+                };
 
                 if detect.detected {
                     // Update discovered agents count immediately when detected
@@ -13066,10 +13077,10 @@ fn run_batch_index_with_connector_factories(
                         .get(name)
                         .copied()
                         .unwrap_or(since_ts);
-                    let ctx = crate::connectors::ScanContext::local_default(
+                    let ctx = with_scan_tick(crate::connectors::ScanContext::local_default(
                         data_dir.clone(),
                         local_since_ts,
-                    );
+                    ));
                     let fallback_roots: Vec<ScanRoot> = detect
                         .root_paths
                         .iter()
@@ -13140,11 +13151,11 @@ fn run_batch_index_with_connector_factories(
                                 "configured scan root is using a full root scan so already-mirrored sessions can be promoted to canonical"
                             );
                         }
-                        let ctx = crate::connectors::ScanContext::with_roots(
+                        let ctx = with_scan_tick(crate::connectors::ScanContext::with_roots(
                             root.path.clone(),
                             vec![root.clone()],
                             root_since_ts,
-                        );
+                        ));
                         let mut ingest_diagnostics = capture_connector_sources_before_parse(
                             conn.as_ref(),
                             &ctx,
@@ -13445,17 +13456,6 @@ pub fn run_index(
 ) -> Result<()> {
     ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(false, Ordering::Relaxed);
     let _progress_reset = RunIndexProgressReset::new(opts.progress.clone());
-    // gh373/oeu5a: let connector-internal parse loops (which have no
-    // IndexingProgress handle) tick work-liveness for this run's stall
-    // watchdog. Weak: the sink must never extend the progress lifetime.
-    let _scan_activity_guard = opts.progress.as_ref().map(|progress| {
-        let weak = Arc::downgrade(progress);
-        crate::connectors::scan_activity::register(Box::new(move || {
-            if let Some(progress) = weak.upgrade() {
-                progress.tick_activity();
-            }
-        }))
-    });
     // Analytics tables are derived assets and can be rebuilt by doctor/rebuild
     // flows. Keep routine indexing focused on the canonical conversation store
     // and lexical assets; set CASS_INLINE_ANALYTICS_UPDATES=1 to restore the
