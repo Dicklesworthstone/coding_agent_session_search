@@ -22230,7 +22230,8 @@ mod log_hygiene_tests {
     use super::{
         BoundedTraceMakeWriter, DEFAULT_DEP_LOG_SUPPRESSION, DEFAULT_TRACE_FILE_LOG_DIRECTIVE,
         MIN_TRACE_FILE_MAX_BYTES, TraceSuppressionReason, default_trace_metadata_enabled,
-        enrich_trace_json, redact_bounded_trace_text, redact_trace_args, robot_aware_log_directive,
+        enrich_trace_json, redact_bounded_trace_text, redact_trace_args, redact_trace_json,
+        robot_aware_log_directive,
     };
     use std::sync::{
         Arc,
@@ -22375,6 +22376,53 @@ mod log_hygiene_tests {
         trace_test_require!(
             redact_bounded_trace_text(&raw_secret, 16).eq("[REDACTED]"),
             "correlation values must be redacted before their length bound is applied"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn trace_json_uses_shared_key_policy_and_preserves_redacted_key_collisions()
+    -> TraceTestResult {
+        let raw_password = "correct horse battery staple!"; // ubs:ignore -- synthetic redaction fixture.
+        let raw_session = "AQoEXAMPLE-session/value+=with.punctuation"; // ubs:ignore -- synthetic redaction fixture.
+        let input = serde_json::json!({
+            "fields": {
+                "password": raw_password,
+                "AWS_SESSION_TOKEN": raw_session,
+                "service_password_hash": "opaque-short-hash",
+                "api_key=abcdefgh12345678": "first", // ubs:ignore -- synthetic collision fixture.
+                "password=abcdefgh12345678": "second", // ubs:ignore -- synthetic collision fixture.
+                "token_count": 42,
+            }
+        });
+
+        let output = redact_trace_json(&input);
+        let encoded = serde_json::to_string(&output)?;
+        for secret in [raw_password, raw_session, "opaque-short-hash", "abcdefgh12345678"] {
+            trace_test_require!(
+                !encoded.contains(secret),
+                "trace JSON retained sensitive bytes: {encoded}"
+            );
+        }
+        trace_test_require!(
+            trace_json_text_is(&output, "/fields/password", "[REDACTED]"),
+            "password field was not redacted"
+        );
+        trace_test_require!(
+            trace_json_text_is(&output, "/fields/AWS_SESSION_TOKEN", "[REDACTED]"),
+            "session-token field was not redacted"
+        );
+        trace_test_require!(
+            output.pointer("/fields/token_count") == Some(&serde_json::json!(42)),
+            "safe token_count near-miss changed"
+        );
+        let fields = output
+            .pointer("/fields")
+            .and_then(serde_json::Value::as_object)
+            .ok_or("redacted trace fields missing")?;
+        trace_test_require!(
+            fields.len() == 6,
+            "redacted key collision discarded a trace field: {fields:?}"
         );
         Ok(())
     }

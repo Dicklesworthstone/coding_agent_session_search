@@ -1,5 +1,11 @@
 use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt, params_from_iter};
 use crate::franken_sync::params;
+use crate::indexer::redact_secrets::{
+    ANTHROPIC_API_KEY_PATTERN, AWS_ACCESS_KEY_PATTERN, AWS_SECRET_KEY_PATTERN,
+    AWS_SESSION_TOKEN_PATTERN, BEARER_TOKEN_PATTERN, DATABASE_URL_PATTERN,
+    GENERIC_SECRET_ASSIGNMENT_PATTERN, GITHUB_TOKEN_PATTERN, JWT_PATTERN,
+    OPENAI_API_KEY_PATTERN, PRIVATE_KEY_BLOCK_PATTERN, SLACK_TOKEN_PATTERN, STRIPE_KEY_PATTERN,
+};
 use anyhow::{Context, Result, bail};
 use console::{Term, style};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -17,6 +23,8 @@ const DEFAULT_ENTROPY_THRESHOLD: f64 = 4.0;
 const DEFAULT_ENTROPY_MIN_LEN: usize = 20;
 const DEFAULT_CONTEXT_BYTES: usize = 120;
 const DEFAULT_MAX_FINDINGS: usize = 500;
+const REDACTED_CONTEXT: &str = "[redacted]";
+const CUSTOM_DENYLIST_PATTERN_ID: &str = "custom_denylist";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -173,62 +181,68 @@ static BUILTIN_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
         SecretPattern {
             id: "aws_access_key_id",
             severity: SecretSeverity::High,
-            regex: Regex::new(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")
-                .expect("aws access key regex"),
+            regex: Regex::new(AWS_ACCESS_KEY_PATTERN).expect("aws access key regex"),
         },
         SecretPattern {
             id: "aws_secret_key",
             severity: SecretSeverity::Critical,
-            regex: Regex::new(
-                r#"(?i)aws(.{0,20})?(secret|access)?[_-]?key\s*[:=]\s*['"]?[A-Za-z0-9/+=]{40}['"]?"#,
-            )
-                .expect("aws secret regex"),
+            regex: Regex::new(AWS_SECRET_KEY_PATTERN).expect("aws secret regex"),
         },
         SecretPattern {
             id: "github_pat",
             severity: SecretSeverity::High,
-            regex: Regex::new(r"\bgh[pousr]_[A-Za-z0-9]{36}\b").expect("github pat regex"),
+            regex: Regex::new(GITHUB_TOKEN_PATTERN).expect("github token regex"),
         },
         SecretPattern {
             id: "openai_key",
             severity: SecretSeverity::High,
-            // Note: this also matches Anthropic keys (sk-ant-...) — the anthropic_key
-            // pattern below is more specific and checked separately. Dedup by position
-            // in the caller prevents double-reporting.
-            regex: Regex::new(r"\bsk-[A-Za-z0-9]{20,}\b").expect("openai key regex"),
+            regex: Regex::new(OPENAI_API_KEY_PATTERN).expect("openai key regex"),
         },
         SecretPattern {
             id: "anthropic_key",
             severity: SecretSeverity::High,
-            regex: Regex::new(r"\bsk-ant-[A-Za-z0-9]{20,}\b").expect("anthropic key regex"),
+            regex: Regex::new(ANTHROPIC_API_KEY_PATTERN).expect("anthropic key regex"),
         },
         SecretPattern {
             id: "jwt",
             severity: SecretSeverity::Medium,
-            regex: Regex::new(r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b")
-                .expect("jwt regex"),
+            regex: Regex::new(JWT_PATTERN).expect("jwt regex"),
         },
         SecretPattern {
             id: "private_key",
             severity: SecretSeverity::Critical,
-            regex: Regex::new(
-                r"-----BEGIN (?:RSA PRIVATE KEY|EC PRIVATE KEY|DSA PRIVATE KEY|OPENSSH PRIVATE KEY|PRIVATE KEY|ENCRYPTED PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----",
-            )
-            .expect("private key regex"),
+            regex: Regex::new(PRIVATE_KEY_BLOCK_PATTERN).expect("private key regex"),
         },
         SecretPattern {
             id: "database_url",
             severity: SecretSeverity::Medium,
-            regex: Regex::new(r"(?i)\b(postgres|postgresql|mysql|mongodb|redis)://[^\s]+")
-                .expect("db url regex"),
+            regex: Regex::new(DATABASE_URL_PATTERN).expect("database URL regex"),
         },
         SecretPattern {
             id: "generic_api_key",
             severity: SecretSeverity::Low,
-            regex: Regex::new(
-                r#"(?i)(api[_-]?key|token|secret|password|passwd)\s*[:=]\s*['"]?[A-Za-z0-9_\-]{8,}['"]?"#,
-            )
-            .expect("generic api key regex"),
+            regex: Regex::new(GENERIC_SECRET_ASSIGNMENT_PATTERN)
+                .expect("generic secret assignment regex"),
+        },
+        SecretPattern {
+            id: "aws_session_token",
+            severity: SecretSeverity::Critical,
+            regex: Regex::new(AWS_SESSION_TOKEN_PATTERN).expect("aws session token regex"),
+        },
+        SecretPattern {
+            id: "bearer_token",
+            severity: SecretSeverity::High,
+            regex: Regex::new(BEARER_TOKEN_PATTERN).expect("bearer token regex"),
+        },
+        SecretPattern {
+            id: "slack_token",
+            severity: SecretSeverity::High,
+            regex: Regex::new(SLACK_TOKEN_PATTERN).expect("slack token regex"),
+        },
+        SecretPattern {
+            id: "stripe_key",
+            severity: SecretSeverity::High,
+            regex: Regex::new(STRIPE_KEY_PATTERN).expect("stripe key regex"),
         },
     ]
 });
@@ -276,10 +290,16 @@ pub fn scan_database<P: AsRef<Path>>(
     // LEFT JOIN + COALESCE on agents so secret scanning also covers legacy
     // conversations with NULL agent_id — dropping them would hide credential
     // leaks rather than exposing them.
+    let has_metadata_bin = table_has_column(&conn, "conversations", "metadata_bin")?;
+    let metadata_bin_projection = if has_metadata_bin {
+        "c.metadata_bin"
+    } else {
+        "NULL"
+    };
     let (conv_where, conv_params) = build_where_clause(filters)?;
     let conv_sql = format!(
-        "SELECT c.id, c.title, c.metadata_json, c.source_path, COALESCE(a.slug, 'unknown'), w.path\n         FROM conversations c\n         LEFT JOIN agents a ON c.agent_id = a.id\n         LEFT JOIN workspaces w ON c.workspace_id = w.id{}",
-        conv_where
+        "SELECT c.id, c.title, c.metadata_json, c.source_path, COALESCE(a.slug, 'unknown'), w.path, {metadata_bin_projection}\n         FROM conversations c\n         LEFT JOIN agents a ON c.agent_id = a.id\n         LEFT JOIN workspaces w ON c.workspace_id = w.id{}",
+        conv_where,
     );
     let conv_param_values = params_from_iter(conv_params);
     let conv_rows = conn.query_with_params(&conv_sql, &conv_param_values)?;
@@ -297,6 +317,7 @@ pub fn scan_database<P: AsRef<Path>>(
         let source_path: String = row.get_typed(3)?;
         let agent_slug: String = row.get_typed(4)?;
         let workspace_path: Option<String> = row.get_typed(5)?;
+        let metadata_bin: Option<Vec<u8>> = row.get_typed(6)?;
 
         let ctx = ScanContext {
             agent: Some(agent_slug),
@@ -318,7 +339,12 @@ pub fn scan_database<P: AsRef<Path>>(
                 &mut truncated,
             );
         }
-        if let Some(meta) = metadata_json {
+        if let Some(meta) = structured_metadata_scan_text(
+            metadata_bin.as_deref(),
+            metadata_json.as_deref(),
+            "conversations.metadata_bin",
+            conv_id,
+        )? {
             scan_text(
                 &meta,
                 SecretLocation::ConversationMetadata,
@@ -340,10 +366,16 @@ pub fn scan_database<P: AsRef<Path>>(
     }
 
     if !truncated {
+        let has_extra_bin = table_has_column(&conn, "messages", "extra_bin")?;
+        let extra_bin_projection = if has_extra_bin {
+            "m.extra_bin"
+        } else {
+            "NULL"
+        };
         let (msg_where, msg_params) = build_where_clause(filters)?;
         let msg_sql = format!(
-            "SELECT m.id, m.idx, m.content, m.extra_json, c.id, c.source_path, COALESCE(a.slug, 'unknown'), w.path\n             FROM messages m\n             JOIN conversations c ON m.conversation_id = c.id\n             LEFT JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id{}",
-            msg_where
+            "SELECT m.id, m.idx, m.content, m.extra_json, c.id, c.source_path, COALESCE(a.slug, 'unknown'), w.path, {extra_bin_projection}\n             FROM messages m\n             JOIN conversations c ON m.conversation_id = c.id\n             LEFT JOIN agents a ON c.agent_id = a.id\n             LEFT JOIN workspaces w ON c.workspace_id = w.id{}",
+            msg_where,
         );
         let msg_param_values = params_from_iter(msg_params);
         let msg_rows = conn.query_with_params(&msg_sql, &msg_param_values)?;
@@ -363,6 +395,7 @@ pub fn scan_database<P: AsRef<Path>>(
             let source_path: String = row.get_typed(5)?;
             let agent_slug: String = row.get_typed(6)?;
             let workspace_path: Option<String> = row.get_typed(7)?;
+            let extra_bin: Option<Vec<u8>> = row.get_typed(8)?;
 
             let ctx = ScanContext {
                 agent: Some(agent_slug),
@@ -382,7 +415,12 @@ pub fn scan_database<P: AsRef<Path>>(
                 &mut seen,
                 &mut truncated,
             );
-            if let Some(extra) = extra_json {
+            if let Some(extra) = structured_metadata_scan_text(
+                extra_bin.as_deref(),
+                extra_json.as_deref(),
+                "messages.extra_bin",
+                msg_id,
+            )? {
                 scan_text(
                     &extra,
                     SecretLocation::MessageMetadata,
@@ -498,6 +536,55 @@ fn table_exists(conn: &crate::franken_sync::Connection, table_name: &str) -> boo
     conn.query_map_collect(&pragma, params![], |row| row.get_typed::<String>(1))
         .map(|columns| !columns.is_empty())
         .unwrap_or(false)
+}
+
+fn table_has_column(
+    conn: &crate::franken_sync::Connection,
+    table_name: &str,
+    column_name: &str,
+) -> Result<bool> {
+    if !table_name
+        .chars()
+        .chain(column_name.chars())
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        bail!("Invalid SQLite identifier while inspecting secret-scan schema");
+    }
+
+    let pragma = format!("PRAGMA table_info({table_name})");
+    let columns = conn
+        .query_map_collect(&pragma, params![], |row| row.get_typed::<String>(1))
+        .with_context(|| format!("Failed to inspect {table_name} schema for secret scan"))?;
+    Ok(columns.iter().any(|column| column == column_name))
+}
+
+/// Select the authoritative structured metadata representation for scanning.
+///
+/// New archive rows store MessagePack in `*_bin`; legacy rows store JSON text.
+/// A non-empty binary value is authoritative and must never silently fall back
+/// to a stale JSON shadow. In particular, malformed binary is an integrity
+/// error: falling back could hide secrets that exist only in the canonical
+/// binary payload.
+fn structured_metadata_scan_text(
+    binary: Option<&[u8]>,
+    legacy_json: Option<&str>,
+    binary_column: &str,
+    row_id: i64,
+) -> Result<Option<String>> {
+    if let Some(bytes) = binary.filter(|bytes| !bytes.is_empty()) {
+        let value = rmp_serde::from_slice::<serde_json::Value>(bytes).with_context(|| {
+            format!(
+                "Failed to decode non-empty {binary_column} MessagePack for row {row_id}; refusing legacy JSON fallback"
+            )
+        })?;
+        return serde_json::to_string(&value)
+            .with_context(|| {
+                format!("Failed to serialize decoded {binary_column} value for row {row_id}")
+            })
+            .map(Some);
+    }
+
+    Ok(legacy_json.map(str::to_owned))
 }
 
 pub fn print_human_report(
