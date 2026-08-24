@@ -263,6 +263,11 @@ struct ScanContext {
     message_idx: Option<i64>,
 }
 
+struct StructuredMetadataScan {
+    text: String,
+    value: Option<serde_json::Value>,
+}
+
 struct FindingCandidate<'a> {
     severity: SecretSeverity,
     kind: &'a str,
@@ -396,7 +401,7 @@ pub fn scan_database<P: AsRef<Path>>(
                 conv_id,
             )? {
                 scan_text(
-                    &meta,
+                    &meta.text,
                     SecretLocation::ConversationMetadata,
                     &ctx,
                     config,
@@ -404,6 +409,16 @@ pub fn scan_database<P: AsRef<Path>>(
                     &mut seen,
                     &mut truncated,
                 );
+                if let Some(value) = meta.value.as_ref() {
+                    scan_sensitive_json_fields(
+                        value,
+                        SecretLocation::ConversationMetadata,
+                        &ctx,
+                        config,
+                        &mut findings,
+                        &mut truncated,
+                    );
+                }
             }
 
             if truncated {
@@ -497,7 +512,7 @@ pub fn scan_database<P: AsRef<Path>>(
                     msg_id,
                 )? {
                     scan_text(
-                        &extra,
+                        &extra.text,
                         SecretLocation::MessageMetadata,
                         &ctx,
                         config,
@@ -505,6 +520,16 @@ pub fn scan_database<P: AsRef<Path>>(
                         &mut seen,
                         &mut truncated,
                     );
+                    if let Some(value) = extra.value.as_ref() {
+                        scan_sensitive_json_fields(
+                            value,
+                            SecretLocation::MessageMetadata,
+                            &ctx,
+                            config,
+                            &mut findings,
+                            &mut truncated,
+                        );
+                    }
                 }
 
                 if truncated {
@@ -699,7 +724,7 @@ fn structured_metadata_scan_text(
     legacy_json: Option<&str>,
     binary_column: &str,
     row_id: i64,
-) -> Result<Option<String>> {
+) -> Result<Option<StructuredMetadataScan>> {
     if let Some(bytes) = binary.filter(|bytes| !bytes.is_empty()) {
         let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(bytes));
         let value = serde_json::Value::deserialize(&mut deserializer).with_context(|| {
@@ -719,10 +744,171 @@ fn structured_metadata_scan_text(
             .with_context(|| {
                 format!("Failed to serialize decoded {binary_column} value for row {row_id}")
             })
-            .map(Some);
+            .map(|text| Some(StructuredMetadataScan {
+                text,
+                value: Some(value),
+            }));
     }
 
-    Ok(legacy_json.map(str::to_owned))
+    Ok(legacy_json.map(|text| StructuredMetadataScan {
+        text: text.to_owned(),
+        value: serde_json::from_str(text).ok(),
+    }))
+}
+
+/// Report credential-bearing structured fields that text patterns cannot see.
+///
+/// The ingestion redactor treats field names such as `pin`, `cookie`, and
+/// `private_key` as authoritative even when their values are too short to
+/// satisfy a token regex. The post-hoc scanner must apply the same structural
+/// floor or it can return a false-clean report for historical rows. A field
+/// already covered by a denylist, built-in, or entropy detector is skipped so
+/// the structural floor does not inflate an existing finding.
+fn scan_sensitive_json_fields(
+    value: &serde_json::Value,
+    location: SecretLocation,
+    ctx: &ScanContext,
+    config: &SecretScanConfig,
+    findings: &mut Vec<SecretFinding>,
+    truncated: &mut bool,
+) {
+    if *truncated {
+        return;
+    }
+
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                scan_sensitive_json_fields(
+                    value,
+                    location.clone(),
+                    ctx,
+                    config,
+                    findings,
+                    truncated,
+                );
+                if *truncated {
+                    return;
+                }
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for (field, field_value) in fields {
+                if crate::indexer::redact_secrets::is_sensitive_json_field(field) {
+                    if !structured_value_contains_material(field_value)
+                        || structured_value_is_fully_allowlisted(field_value, config)
+                        || structured_field_has_text_detector(field, field_value, config)
+                    {
+                        continue;
+                    }
+                    if findings.len() >= config.max_findings {
+                        *truncated = true;
+                        return;
+                    }
+                    findings.push(SecretFinding {
+                        severity: SecretSeverity::High,
+                        kind: "sensitive_metadata_field".to_string(),
+                        pattern: "sensitive_json_field".to_string(),
+                        match_redacted: REDACTED_CONTEXT.to_string(),
+                        context: "credential-bearing metadata field: [redacted]".to_string(),
+                        location: location.clone(),
+                        agent: ctx.agent.clone(),
+                        workspace: ctx.workspace.clone(),
+                        source_path: ctx.source_path.clone(),
+                        conversation_id: ctx.conversation_id,
+                        message_id: ctx.message_id,
+                        message_idx: ctx.message_idx,
+                    });
+                } else {
+                    scan_sensitive_json_fields(
+                        field_value,
+                        location.clone(),
+                        ctx,
+                        config,
+                        findings,
+                        truncated,
+                    );
+                    if *truncated {
+                        return;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn structured_value_contains_material(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::String(text) => {
+            let trimmed = text.trim();
+            !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case(REDACTED_CONTEXT)
+        }
+        serde_json::Value::Array(values) => {
+            values.iter().any(structured_value_contains_material)
+        }
+        serde_json::Value::Object(fields) => {
+            fields.values().any(structured_value_contains_material)
+        }
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
+    }
+}
+
+fn structured_value_is_fully_allowlisted(
+    value: &serde_json::Value,
+    config: &SecretScanConfig,
+) -> bool {
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(text) => {
+            text.trim().is_empty()
+                || text.trim().eq_ignore_ascii_case(REDACTED_CONTEXT)
+                || is_allowlisted(text, config)
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .filter(|value| structured_value_contains_material(value))
+            .all(|value| structured_value_is_fully_allowlisted(value, config)),
+        serde_json::Value::Object(fields) => fields
+            .values()
+            .filter(|value| structured_value_contains_material(value))
+            .all(|value| structured_value_is_fully_allowlisted(value, config)),
+        serde_json::Value::Bool(value) => is_allowlisted(&value.to_string(), config),
+        serde_json::Value::Number(value) => is_allowlisted(&value.to_string(), config),
+    }
+}
+
+fn structured_field_has_text_detector(
+    field: &str,
+    value: &serde_json::Value,
+    config: &SecretScanConfig,
+) -> bool {
+    let mut object = serde_json::Map::new();
+    object.insert(field.to_string(), value.clone());
+    let text = serde_json::Value::Object(object).to_string();
+
+    if config
+        .denylist
+        .iter()
+        .any(|pattern| pattern.is_match(&text))
+    {
+        return true;
+    }
+    if BUILTIN_PATTERNS.iter().any(|pattern| {
+        pattern
+            .regex
+            .find_iter(&text)
+            .any(|matched| !is_allowlisted(matched.as_str(), config))
+    }) {
+        return true;
+    }
+    ENTROPY_BASE64_RE
+        .find_iter(&text)
+        .any(|matched| is_base64_entropy_secret(matched.as_str(), config, true))
+        || ENTROPY_HEX_RE
+            .find_iter(&text)
+            .any(|matched| is_hex_entropy_secret(matched.as_str(), config, true))
 }
 
 pub fn print_human_report(

@@ -30257,6 +30257,26 @@ mod tests {
     }
 
     #[test]
+    fn storage_source_forbids_manual_raw_connection_auto_trait_overrides() {
+        let storage_source = include_str!("sqlite.rs");
+        let lib_source = include_str!("../lib.rs");
+        let forbidden = [
+            ["unsafe impl ", "Send for"].concat(),
+            ["unsafe impl ", "Sync for"].concat(),
+            ["SendFranken", "Connection"].concat(),
+        ];
+
+        for source in [storage_source, lib_source] {
+            for fragment in &forbidden {
+                assert!(
+                    !source.contains(fragment),
+                    "thread-affine FrankenSQLite safety override reintroduced: {fragment}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn dedicated_owner_lazy_and_manager_reads_cross_worker_boundaries() {
         use crate::franken_sync::compat::RowExt as _;
 

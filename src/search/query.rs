@@ -8744,6 +8744,7 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
     let mut pending_or_group: Vec<String> = Vec::new();
     let mut next_op = "AND";
     let mut in_or_sequence = false;
+    let mut just_saw_or = false;
     for token in tokens {
         match token {
             FsCassQueryToken::And => {
@@ -8757,6 +8758,7 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
                     pending_or_group.clear();
                 }
                 in_or_sequence = false;
+                just_saw_or = false;
                 next_op = "AND";
             }
             FsCassQueryToken::Or => {
@@ -8777,12 +8779,13 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
                 // Start or continue an OR group. Unsupported `OR NOT` forms
                 // are rejected when the subsequent NOT token arrives.
                 in_or_sequence = true;
+                just_saw_or = true;
             }
             FsCassQueryToken::Not => {
                 // FTS5 supports binary (`foo NOT bar`) NOT, but not a leading
                 // unary-NOT query (`NOT foo`). We also reject `OR NOT` groupings
                 // in the fallback transpiler.
-                if in_or_sequence {
+                if just_saw_or {
                     return None;
                 }
 
@@ -8800,6 +8803,7 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
                     pending_or_group.clear();
                 }
                 in_or_sequence = false;
+                just_saw_or = false;
                 next_op = "NOT";
             }
             FsCassQueryToken::Term(t) => {
@@ -8834,7 +8838,7 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
                     rendered_parts[0].clone()
                 };
 
-                if in_or_sequence {
+                if in_or_sequence && just_saw_or {
                     if pending_or_group.is_empty() {
                         let (op, _) = fts_clauses.last()?;
                         if *op != "AND" {
@@ -8848,8 +8852,19 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
                     pending_or_group.push(fts_term);
                     in_or_sequence = true;
                 } else {
+                    if !pending_or_group.is_empty() {
+                        let group = if pending_or_group.len() > 1 {
+                            format!("({})", pending_or_group.join(" OR "))
+                        } else {
+                            pending_or_group.pop().unwrap_or_default()
+                        };
+                        fts_clauses.push(("AND", group));
+                        pending_or_group.clear();
+                    }
+                    in_or_sequence = false;
                     fts_clauses.push((next_op, fts_term));
                 }
+                just_saw_or = false;
                 next_op = "AND";
             }
             FsCassQueryToken::Phrase(p) => {
@@ -8859,7 +8874,7 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
                 }
                 let fts_phrase = format!("\"{}\"", phrase_parts.join(" "));
 
-                if in_or_sequence {
+                if in_or_sequence && just_saw_or {
                     if pending_or_group.is_empty() {
                         let (op, _) = fts_clauses.last()?;
                         if *op != "AND" {
@@ -8873,8 +8888,19 @@ fn transpile_to_fts5(raw_query: &str) -> Option<String> {
                     pending_or_group.push(fts_phrase);
                     in_or_sequence = true;
                 } else {
+                    if !pending_or_group.is_empty() {
+                        let group = if pending_or_group.len() > 1 {
+                            format!("({})", pending_or_group.join(" OR "))
+                        } else {
+                            pending_or_group.pop().unwrap_or_default()
+                        };
+                        fts_clauses.push(("AND", group));
+                        pending_or_group.clear();
+                    }
+                    in_or_sequence = false;
                     fts_clauses.push((next_op, fts_phrase));
                 }
+                just_saw_or = false;
                 next_op = "AND";
             }
         }
@@ -14269,6 +14295,17 @@ mod tests {
             SearchClient::sqlite_message_scan_query("NOT beta").expect("standalone NOT query");
         assert!(score("alpha", &standalone_not) > 0.0);
         assert_eq!(score("alpha beta", &standalone_not), 0.0);
+
+        let repeated_not = SearchClient::sqlite_message_scan_query("NOT NOT beta")
+            .expect("repeated standalone NOT query");
+        assert!(score("alpha", &repeated_not) > 0.0);
+        assert_eq!(score("alpha beta", &repeated_not), 0.0);
+
+        let permissive = SearchClient::sqlite_message_scan_query("alpha NOT OR beta")
+            .expect("permissive NOT-before-OR query");
+        assert!(score("alpha beta", &permissive) > 0.0);
+        assert_eq!(score("gamma beta", &permissive), 0.0);
+        assert!(score("gamma delta", &permissive) > 0.0);
     }
 
     #[test]
@@ -14291,6 +14328,11 @@ mod tests {
             0.0,
             "phrase must not bridge content and title"
         );
+
+        let negated_phrase = SearchClient::sqlite_message_scan_query("NOT \"alpha beta\"")
+            .expect("negated phrase scan query");
+        assert_eq!(score(&["alpha beta"], &negated_phrase), 0.0);
+        assert!(score(&["alpha x beta"], &negated_phrase) > 0.0);
     }
 
     #[test]

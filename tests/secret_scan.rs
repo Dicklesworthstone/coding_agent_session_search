@@ -851,6 +851,109 @@ mod tests {
                 .any(|finding| finding.kind == "anthropic_key"),
             "legacy extra_json must not override a non-empty extra_bin"
         );
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|finding| finding.kind == "sensitive_metadata_field"),
+            "a structurally sensitive field already covered by a token detector must not duplicate the finding"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn binary_metadata_detects_short_sensitive_fields_without_leaking_values() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("scan.db");
+        let short_pin = ["12", "34"].concat();
+        let short_cookie = ["s", "id"].concat();
+        let metadata_bin = rmp_serde::to_vec(&serde_json::json!({
+            "pin": short_pin,
+        }))?;
+        let extra_bin = rmp_serde::to_vec(&serde_json::json!({
+            "nested": { "cookie": short_cookie },
+        }))?;
+        setup_db_with_binary_metadata(&db_path, "{}", &metadata_bin, "{}", &extra_bin)?;
+
+        let report = scan(&db_path)?;
+        let structural = report
+            .findings
+            .iter()
+            .filter(|finding| finding.kind == "sensitive_metadata_field")
+            .collect::<Vec<_>>();
+        assert_eq!(structural.len(), 2);
+        assert!(structural.iter().any(|finding| {
+            finding.location
+                == coding_agent_search::pages::secret_scan::SecretLocation::ConversationMetadata
+        }));
+        assert!(structural.iter().any(|finding| {
+            finding.location
+                == coding_agent_search::pages::secret_scan::SecretLocation::MessageMetadata
+        }));
+
+        let serialized = serde_json::to_string(&report)?;
+        assert!(!serialized.contains("1234"));
+        assert!(!serialized.contains("sid"));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_json_detects_short_sensitive_fields() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("scan.db");
+        let metadata = serde_json::json!({ "pin": ["12", "34"].concat() }).to_string();
+        let extra = serde_json::json!({ "cookie": ["s", "id"].concat() }).to_string();
+        let messages = [(0, "safe content", Some(extra.as_str()))];
+        setup_db_full(
+            &db_path,
+            "codex",
+            "/tmp/proj",
+            "Clean title",
+            &metadata,
+            1700000000000,
+            &messages,
+        )?;
+
+        let report = scan(&db_path)?;
+        let structural = report
+            .findings
+            .iter()
+            .filter(|finding| finding.kind == "sensitive_metadata_field")
+            .collect::<Vec<_>>();
+        assert_eq!(structural.len(), 2);
+        assert!(structural.iter().any(|finding| {
+            finding.location
+                == coding_agent_search::pages::secret_scan::SecretLocation::ConversationMetadata
+        }));
+        assert!(structural.iter().any(|finding| {
+            finding.location
+                == coding_agent_search::pages::secret_scan::SecretLocation::MessageMetadata
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn empty_null_and_already_redacted_sensitive_fields_remain_clean() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("scan.db");
+        let metadata_bin = rmp_serde::to_vec(&serde_json::json!({
+            "pin": "",
+            "cookie": null,
+            "password": "[REDACTED]",
+        }))?;
+        let extra_bin = rmp_serde::to_vec(&serde_json::json!({
+            "credentials": { "empty": "" },
+            "token": [],
+        }))?;
+        setup_db_with_binary_metadata(&db_path, "{}", &metadata_bin, "{}", &extra_bin)?;
+
+        let report = scan(&db_path)?;
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|finding| finding.kind == "sensitive_metadata_field")
+        );
         Ok(())
     }
 
