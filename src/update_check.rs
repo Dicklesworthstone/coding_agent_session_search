@@ -50,9 +50,9 @@ fn updates_disabled() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct UpdateState {
     /// Unix timestamp of last successful check
-    pub last_check_ts: i64,
+    last_check_ts: i64,
     /// Version string that user chose to skip (e.g., "0.2.0")
-    pub skipped_version: Option<String>,
+    skipped_version: Option<String>,
 }
 
 impl UpdateState {
