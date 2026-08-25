@@ -41173,6 +41173,35 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn quarantine_retry_refuses_to_overwrite_malformed_operator_checkpoint() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+        let state_path = QuarantineState::path(&data_dir);
+        let malformed = b"not valid quarantine json";
+        std::fs::write(&state_path, malformed)?;
+        let config = quarantine_retry::RetryConfig::default();
+
+        let plan_error = plan_quarantine_retry(&data_dir, &config)
+            .expect_err("retry planning must surface a malformed checkpoint");
+        anyhow::ensure!(
+            format!("{plan_error:#}").contains("invalid quarantine state"),
+            "unexpected retry-plan error: {plan_error:#}"
+        );
+        let apply_error = run_quarantine_retry(&data_dir, &config, true)
+            .expect_err("retry apply must surface a malformed checkpoint");
+        anyhow::ensure!(
+            format!("{apply_error:#}").contains("invalid quarantine state"),
+            "unexpected retry-apply error: {apply_error:#}"
+        );
+        anyhow::ensure!(
+            std::fs::read(&state_path)?.as_slice() == malformed,
+            "failed operator commands must preserve malformed checkpoint bytes"
+        );
+        Ok(())
+    }
+
     /// xaztn: dry-run classifies without mutation; apply reparses exactly the
     /// keyed source conversation and persists it before clearing quarantine.
     #[test]

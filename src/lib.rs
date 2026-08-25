@@ -78,7 +78,7 @@ use crate::franken_sync::compat::{
     ConnectionExt, OpenFlags as FrankenOpenFlags, RowExt,
     open_with_flags as open_franken_with_flags,
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use base64::prelude::*;
 use chrono::Utc;
 use clap::{Arg, ArgAction, Command, CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
@@ -8660,8 +8660,9 @@ fn run_quarantine_retry_command(
 /// retry-eligible under the current binary (version-stale/legacy).
 fn quarantine_entries_json(data_dir: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
     use crate::indexer::quarantine::QuarantineState;
-    let state = QuarantineState::load_for_operator(data_dir)
-        .context("loading quarantine state for operator list")?;
+    let state = QuarantineState::load_for_operator(data_dir).map_err(|error| {
+        anyhow::anyhow!("loading quarantine state for operator list: {error}")
+    })?;
     let current_version = env!("CARGO_PKG_VERSION");
     let mut entries = state
         .iter()
