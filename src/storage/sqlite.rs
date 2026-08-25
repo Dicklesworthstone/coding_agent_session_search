@@ -402,9 +402,7 @@ impl Drop for DeferAnalyticsUpdatesGuard {
     }
 }
 
-fn defer_analytics_updates_guard_for(
-    depth: &'static AtomicUsize,
-) -> DeferAnalyticsUpdatesGuard {
+fn defer_analytics_updates_guard_for(depth: &'static AtomicUsize) -> DeferAnalyticsUpdatesGuard {
     depth.fetch_add(1, Ordering::SeqCst);
     DeferAnalyticsUpdatesGuard { depth }
 }
