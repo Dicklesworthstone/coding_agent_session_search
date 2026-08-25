@@ -1,4 +1,20 @@
+# Pinned to a dated nightly on purpose. Do not change this back to a bare
+# `channel = "nightly"`.
+#
+# A floating nightly means the compiler moves under the repo between builds:
+# the same commit built clean on one host and ICE'd on another during the
+# 2026-08 release run, because the two machines had resolved `nightly` on
+# different days. That failure looks like a code bug and gets debugged as one,
+# which is the expensive part -- an ICE is a toolchain failure until proven
+# otherwise, and a floating channel makes it unprovable.
+#
+# It also breaks release reproducibility: the host that gates a release and the
+# host that builds the artifact can disagree about what `nightly` means.
+#
+# nightly-2026-08-20 is the date standardised across this workspace during that
+# run. Bump it deliberately, as its own commit, after a green gate -- never by
+# letting it float.
 [toolchain]
-channel = "nightly"
+channel = "nightly-2026-08-20"
 components = ["rustfmt", "clippy"]
 profile = "default"
