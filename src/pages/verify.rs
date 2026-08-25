@@ -845,15 +845,15 @@ fn check_payload_manifest(site_dir: &Path) -> CheckResult {
                             errors.push(format!("{} must not be a symlink", unenc.payload.path));
                         } else if !file_type.is_file() {
                             errors.push(format!("{} must be a regular file", unenc.payload.path));
-                        } else if let Some(expected) = unenc.payload.size_bytes {
-                            if expected != meta.len() {
-                                errors.push(format!(
-                                    "{} size does not match payload.size_bytes (actual {}, declared {})",
-                                    unenc.payload.path,
-                                    meta.len(),
-                                    expected
-                                ));
-                            }
+                        } else if let Some(expected) = unenc.payload.size_bytes
+                            && expected != meta.len()
+                        {
+                            errors.push(format!(
+                                "{} size does not match payload.size_bytes (actual {}, declared {})",
+                                unenc.payload.path,
+                                meta.len(),
+                                expected
+                            ));
                         }
                     }
                     Err(_) => errors.push(format!("Missing payload file: {}", unenc.payload.path)),

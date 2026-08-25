@@ -7402,8 +7402,10 @@ async fn execute_cli(
                             dry_run,
                             structured_format,
                             verbose,
-                            &secrets_allow,
-                            &secrets_deny,
+                            ConfigExportSecretInputs {
+                                allow: &secrets_allow,
+                                deny: &secrets_deny,
+                            },
                         )
                         .map_err(|e| CliError {
                             code: 9,
@@ -17342,14 +17344,14 @@ fn open_franken_cli_read_db_with_hard_timeout(
         let reason = reason.clone();
         move || {
             let result = open_franken_cli_owner_read_db(path, &reason, timeout);
-            if let Err(std::sync::mpsc::SendError(Ok(mut conn))) = tx.send(result) {
-                if let Err(err) = conn.close_without_checkpoint_sync() {
-                    warn!(
-                        error = %err,
-                        reason = %reason,
-                        "hard-timeout CLI read open completed after its receiver exited; owner-thread cleanup failed"
-                    );
-                }
+            if let Err(std::sync::mpsc::SendError(Ok(mut conn))) = tx.send(result)
+                && let Err(err) = conn.close_without_checkpoint_sync()
+            {
+                warn!(
+                    error = %err,
+                    reason = %reason,
+                    "hard-timeout CLI read open completed after its receiver exited; owner-thread cleanup failed"
+                );
             }
         }
     });
@@ -85489,6 +85491,11 @@ fn staged_secret_scan_json(
 }
 
 /// Run export based on JSON config file.
+struct ConfigExportSecretInputs<'a> {
+    allow: &'a [String],
+    deny: &'a [String],
+}
+
 fn run_config_based_export(
     config: &crate::pages::config_input::PagesConfig,
     wizard_state: &crate::pages::wizard::WizardState,
@@ -85496,8 +85503,7 @@ fn run_config_based_export(
     dry_run: bool,
     output_format: Option<RobotFormat>,
     verbose: bool,
-    secrets_allow: &[String],
-    secrets_deny: &[String],
+    secret_inputs: ConfigExportSecretInputs<'_>,
 ) -> anyhow::Result<()> {
     use chrono::DateTime;
     use rand::Rng;
@@ -85560,8 +85566,8 @@ fn run_config_based_export(
 
     let running = Arc::new(AtomicBool::new(true));
     let secret_scan_config = crate::pages::secret_scan::SecretScanConfig::from_inputs(
-        secrets_allow,
-        secrets_deny,
+        secret_inputs.allow,
+        secret_inputs.deny,
     )?;
     let (stats, staged_secret_scan) = export_engine.execute_verified(
         |_current, _total| {},
@@ -97716,7 +97722,7 @@ fn run_export_html(
         ExportOptions as HtmlExportOptions, HtmlExporter, Message, TemplateMetadata,
         generate_full_filename, get_downloads_dir, is_valid_filename, unique_filename,
     };
-    use std::io::{self, Write};
+    use std::io;
 
     if let Some(source_id) = source_id {
         validate_followup_source_id(source_id, "cass export-html")?;

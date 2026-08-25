@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, Read, Write};
+#[cfg(test)]
+use std::io::BufWriter;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -1249,7 +1251,7 @@ fn inspect_bundle_tree_with_entry_limit(
             })?);
             entry_count += 1;
         }
-        entries.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+        entries.sort_by_key(|entry| entry.file_name());
         let mut child_directories = Vec::new();
 
         for entry in entries {
@@ -1542,9 +1544,13 @@ fn replace_dir_from_temp(
         bail!("staged bundle path does not exist: {}", temp_dir.display());
     }
 
+    let publish_guard = acquire_bundle_publish_guard(final_dir)?;
+    require_bundle_publish_guard(final_dir, &publish_guard)?;
     recover_interrupted_bundle_publish(final_dir)?;
+    require_bundle_publish_guard(final_dir, &publish_guard)?;
     let candidate = inspect_bundle_tree(temp_dir, "staged bundle path")?;
     if !ensure_replaceable_bundle_output_dir(final_dir)? {
+        require_bundle_publish_guard(final_dir, &publish_guard)?;
         fs::rename(temp_dir, final_dir).with_context(|| {
             format!(
                 "failed renaming completed bundle {} into place at {}",
@@ -1570,6 +1576,7 @@ fn replace_dir_from_temp(
             backup_dir.display()
         );
     }
+    require_bundle_publish_guard(final_dir, &publish_guard)?;
     let journal =
         write_bundle_publish_journal(final_dir, &backup_dir, &prior, &candidate)?;
     if bundle_path_entry_exists(&backup_dir)? {
@@ -1580,6 +1587,7 @@ fn replace_dir_from_temp(
     }
     ensure_bundle_tree_matches(final_dir, "prior live bundle", &prior)?;
     ensure_bundle_tree_matches(temp_dir, "staged bundle path", &candidate)?;
+    require_bundle_publish_guard(final_dir, &publish_guard)?;
 
     #[cfg(target_os = "linux")]
     {

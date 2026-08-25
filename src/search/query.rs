@@ -146,20 +146,6 @@ impl SearchSqliteFixture {
         self.connection().execute_batch_sync(sql)
     }
 
-    fn query_row_map<T, F>(
-        &self,
-        sql: &str,
-        params: &[ParamValue],
-        map: F,
-    ) -> Result<T, crate::franken_sync::FrankenError>
-    where
-        F: FnOnce(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>,
-    {
-        let values = param_slice_to_values(params);
-        let row = self.connection().query_row_with_params_sync(sql, &values)?;
-        map(&row)
-    }
-
     fn execute_compat(
         &self,
         sql: &str,
@@ -7987,6 +7973,7 @@ impl SearchClient {
         }
     }
 
+    #[cfg(test)]
     fn sqlite_message_scan_query_sql(
         field_mask: FieldMask,
         filters: &SearchFilters,

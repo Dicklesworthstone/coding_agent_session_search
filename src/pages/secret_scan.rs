@@ -1,4 +1,3 @@
-use super::sqlite_artifact_paths;
 #[cfg(test)]
 use super::sqlite_fixed_artifact_paths;
 use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt, params_from_iter};
@@ -1674,13 +1673,12 @@ fn redact_context(
     // admission: every known secret span is masked, including allowlisted
     // spans and adjacent matches that are not the focal finding. Only ranges
     // intersecting this bounded window are retained in memory.
-    let mut local_redactions = Vec::with_capacity(1);
     // The focal match must be masked even if a future finding source is not
     // represented in `collect_context_redactions` yet.
-    local_redactions.push(RedactionRange {
+    let local_redactions = vec![RedactionRange {
         start: safe_start,
         end: safe_end,
-    });
+    }];
     redact_report_slice(text, ctx_start, ctx_end, config, local_redactions)
 }
 

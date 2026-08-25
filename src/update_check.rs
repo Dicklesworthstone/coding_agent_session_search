@@ -129,7 +129,8 @@ impl UpdateState {
     }
 
     /// Clear skip preference (on upgrade or manual clear)
-    pub fn clear_skip(&mut self) {
+    #[cfg(test)]
+    fn clear_skip(&mut self) {
         self.skipped_version = None;
     }
 }
@@ -836,6 +837,7 @@ fn mutate_persisted_update_state_at(
     let lock_path = update_state_lock_path(path);
     let lock_file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)
