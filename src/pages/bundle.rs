@@ -327,7 +327,8 @@ impl BundleBuilder {
         // Heal an interrupted fallback publish before doing potentially long
         // archive validation/copying work, so a parked prior generation is
         // returned to the live handle as soon as the next build starts.
-        recover_interrupted_bundle_publish(output_dir)?;
+        let publication_guard = acquire_pages_publication_lock(output_dir)?;
+        recover_interrupted_bundle_publish_while_locked(output_dir, &publication_guard)?;
         ensure_replaceable_bundle_output_dir(output_dir)?;
 
         // Validate encrypted_dir has required files
@@ -520,6 +521,7 @@ impl BundleBuilder {
             replace_dir_from_temp(
                 &temp_output_dir,
                 output_dir,
+                &publication_guard,
                 &mut retain_temp_on_replace_error,
             )
             .context("Failed to install completed bundle")?;
@@ -1369,6 +1371,7 @@ fn is_allowed_system_symlink_ancestor(_path: &Path) -> bool {
 fn replace_dir_from_temp(
     temp_dir: &Path,
     final_dir: &Path,
+    guard: &PagesPublicationLockGuard,
     retain_temp_on_error: &mut bool,
 ) -> Result<()> {
     *retain_temp_on_error = false;
@@ -1376,9 +1379,11 @@ fn replace_dir_from_temp(
         bail!("staged bundle path does not exist: {}", temp_dir.display());
     }
 
-    recover_interrupted_bundle_publish(final_dir)?;
+    require_pages_publication_lock(final_dir, guard)?;
+    recover_interrupted_bundle_publish_while_locked(final_dir, guard)?;
     let candidate = inspect_bundle_tree(temp_dir, "staged bundle path")?;
     if !ensure_replaceable_bundle_output_dir(final_dir)? {
+        require_pages_publication_lock(final_dir, guard)?;
         fs::rename(temp_dir, final_dir).with_context(|| {
             format!(
                 "failed renaming completed bundle {} into place at {}",
@@ -1404,8 +1409,13 @@ fn replace_dir_from_temp(
             backup_dir.display()
         );
     }
-    let journal =
-        write_bundle_publish_journal(final_dir, &backup_dir, &prior, &candidate)?;
+    let journal = write_bundle_publish_journal(
+        final_dir,
+        guard,
+        &backup_dir,
+        &prior,
+        &candidate,
+    )?;
     if bundle_path_entry_exists(&backup_dir)? {
         bail!(
             "journaled Pages bundle backup path {} appeared before publication; preserved every generation and the journal",
@@ -1420,6 +1430,7 @@ fn replace_dir_from_temp(
         if try_publish_linux_bundle_via_atomic_exchange(
             temp_dir,
             final_dir,
+            guard,
             &backup_dir,
             &journal,
             &prior,
@@ -1433,6 +1444,7 @@ fn replace_dir_from_temp(
     replace_dir_from_temp_via_recoverable_rename_pair(
         temp_dir,
         final_dir,
+        guard,
         &backup_dir,
         &journal,
         &prior,
@@ -1442,6 +1454,15 @@ fn replace_dir_from_temp(
 }
 
 fn recover_interrupted_bundle_publish(final_dir: &Path) -> Result<()> {
+    let guard = acquire_pages_publication_lock(final_dir)?;
+    recover_interrupted_bundle_publish_while_locked(final_dir, &guard)
+}
+
+fn recover_interrupted_bundle_publish_while_locked(
+    final_dir: &Path,
+    guard: &PagesPublicationLockGuard,
+) -> Result<()> {
+    require_pages_publication_lock(final_dir, guard)?;
     let Some(journal) = read_bundle_publish_journal(final_dir)? else {
         if let Some(unowned_backup) = first_unowned_bundle_publish_backup(final_dir, None)? {
             bail!(
@@ -1495,6 +1516,7 @@ fn recover_interrupted_bundle_publish(final_dir: &Path) -> Result<()> {
                 "journaled prior Pages bundle",
                 &prior,
             )?;
+            require_pages_publication_lock(final_dir, guard)?;
             fs::rename(&backup_dir, final_dir).with_context(|| {
                 format!(
                     "failed restoring journaled prior Pages bundle {} to missing live path {}; preserved the backup and journal",
@@ -1510,7 +1532,7 @@ fn recover_interrupted_bundle_publish(final_dir: &Path) -> Result<()> {
                     bundle_publish_recovery_journal_path(final_dir).display()
                 )
             })?;
-            remove_bundle_publish_journal(final_dir, &journal)
+            remove_bundle_publish_journal(final_dir, guard, &journal)
         }
         (None, Some(_)) => bail!(
             "journaled Pages bundle backup {} does not match the prior generation while live path {} is missing; preserved the backup and journal",
@@ -1526,10 +1548,11 @@ fn recover_interrupted_bundle_publish(final_dir: &Path) -> Result<()> {
             cleanup_journaled_bundle_tree_after_publish(
                 &backup_dir,
                 final_dir,
+                guard,
                 "journaled prior Pages bundle",
                 &prior,
             )?;
-            remove_bundle_publish_journal(final_dir, &journal)
+            remove_bundle_publish_journal(final_dir, guard, &journal)
         }
         (Some(live), Some(backup)) if live == prior && backup == candidate => {
             ensure_bundle_tree_matches(
@@ -1540,10 +1563,11 @@ fn recover_interrupted_bundle_publish(final_dir: &Path) -> Result<()> {
             cleanup_journaled_bundle_tree_after_publish(
                 &backup_dir,
                 final_dir,
+                guard,
                 "journaled rejected candidate Pages bundle",
                 &candidate,
             )?;
-            remove_bundle_publish_journal(final_dir, &journal)
+            remove_bundle_publish_journal(final_dir, guard, &journal)
         }
         (Some(_), Some(_)) => bail!(
             "journaled Pages bundle recovery found live {} and backup {}, but their exact tree evidence does not match a valid publish state; preserved both and the journal",
@@ -1556,7 +1580,7 @@ fn recover_interrupted_bundle_publish(final_dir: &Path) -> Result<()> {
                 "journaled surviving Pages bundle",
                 &live,
             )?;
-            remove_bundle_publish_journal(final_dir, &journal)
+            remove_bundle_publish_journal(final_dir, guard, &journal)
         }
         (Some(_), None) => bail!(
             "Pages bundle publish journal remains at {}, but live tree {} matches neither journaled generation; preserved both",
@@ -1575,12 +1599,14 @@ fn recover_interrupted_bundle_publish(final_dir: &Path) -> Result<()> {
 fn cleanup_journaled_bundle_tree_after_publish(
     tree_dir: &Path,
     final_dir: &Path,
+    guard: &PagesPublicationLockGuard,
     label: &str,
     expected: &BundleTreeEvidence,
 ) -> Result<()> {
     cleanup_journaled_bundle_tree_after_publish_with(
         tree_dir,
         final_dir,
+        guard,
         label,
         expected,
         |path| fs::remove_dir_all(path),
@@ -1590,6 +1616,7 @@ fn cleanup_journaled_bundle_tree_after_publish(
 fn cleanup_journaled_bundle_tree_after_publish_with<F>(
     tree_dir: &Path,
     final_dir: &Path,
+    guard: &PagesPublicationLockGuard,
     label: &str,
     expected: &BundleTreeEvidence,
     remove_dir: F,
@@ -1597,7 +1624,9 @@ fn cleanup_journaled_bundle_tree_after_publish_with<F>(
 where
     F: FnOnce(&Path) -> std::io::Result<()>,
 {
+    require_pages_publication_lock(final_dir, guard)?;
     ensure_bundle_tree_matches(tree_dir, label, expected)?;
+    require_pages_publication_lock(final_dir, guard)?;
     remove_dir(tree_dir).with_context(|| {
         format!(
             "new bundle is live at {}, but failed to remove {label} containing private artifacts retained at {}",
@@ -1610,19 +1639,22 @@ where
             "removed {label} after publishing {}, but could not durably sync its parent directory",
             final_dir.display()
         )
-    })
+    })?;
+    require_pages_publication_lock(final_dir, guard)
 }
 
 #[cfg(target_os = "linux")]
 fn try_publish_linux_bundle_via_atomic_exchange(
     temp_dir: &Path,
     final_dir: &Path,
+    guard: &PagesPublicationLockGuard,
     backup_dir: &Path,
     journal: &BundlePublishJournal,
     prior: &BundleTreeEvidence,
     candidate: &BundleTreeEvidence,
     retain_temp_on_error: &mut bool,
 ) -> Result<bool> {
+    require_pages_publication_lock(final_dir, guard)?;
     fs::rename(temp_dir, backup_dir).with_context(|| {
         format!(
             "failed moving staged bundle {} to journaled atomic-exchange path {}",
@@ -1642,6 +1674,8 @@ fn try_publish_linux_bundle_via_atomic_exchange(
         return match restore_linux_atomic_staged_candidate(
             backup_dir,
             temp_dir,
+            final_dir,
+            guard,
             candidate,
             retain_temp_on_error,
         ) {
@@ -1660,6 +1694,7 @@ fn try_publish_linux_bundle_via_atomic_exchange(
         };
     }
 
+    require_pages_publication_lock(final_dir, guard)?;
     match crate::indexer::atomic_exchange_paths(final_dir, backup_dir) {
         Ok(()) => {
             if let Err(sync_error) = sync_parent_directory(final_dir) {
@@ -1682,13 +1717,14 @@ fn try_publish_linux_bundle_via_atomic_exchange(
             if let Err(cleanup_error) = cleanup_journaled_bundle_tree_after_publish(
                 backup_dir,
                 final_dir,
+                guard,
                 "journaled prior Pages bundle",
                 prior,
             ) {
                 *retain_temp_on_error = true;
                 return Err(cleanup_error);
             }
-            remove_bundle_publish_journal(final_dir, journal)?;
+            remove_bundle_publish_journal(final_dir, guard, journal)?;
             Ok(true)
         }
         Err(exchange_error)
@@ -1697,6 +1733,8 @@ fn try_publish_linux_bundle_via_atomic_exchange(
             restore_linux_atomic_staged_candidate(
                 backup_dir,
                 temp_dir,
+                final_dir,
+                guard,
                 candidate,
                 retain_temp_on_error,
             )
@@ -1714,6 +1752,8 @@ fn try_publish_linux_bundle_via_atomic_exchange(
             match restore_linux_atomic_staged_candidate(
                 backup_dir,
                 temp_dir,
+                final_dir,
+                guard,
                 candidate,
                 retain_temp_on_error,
             ) {
@@ -1739,9 +1779,12 @@ fn try_publish_linux_bundle_via_atomic_exchange(
 fn restore_linux_atomic_staged_candidate(
     backup_dir: &Path,
     temp_dir: &Path,
+    final_dir: &Path,
+    guard: &PagesPublicationLockGuard,
     candidate: &BundleTreeEvidence,
     retain_temp_on_error: &mut bool,
 ) -> Result<()> {
+    require_pages_publication_lock(final_dir, guard)?;
     if let Err(restore_error) = fs::rename(backup_dir, temp_dir) {
         *retain_temp_on_error = true;
         bail!(
@@ -1772,12 +1815,14 @@ fn restore_linux_atomic_staged_candidate(
 fn replace_dir_from_temp_via_recoverable_rename_pair(
     temp_dir: &Path,
     final_dir: &Path,
+    guard: &PagesPublicationLockGuard,
     backup_dir: &Path,
     journal: &BundlePublishJournal,
     prior: &BundleTreeEvidence,
     candidate: &BundleTreeEvidence,
     retain_temp_on_error: &mut bool,
 ) -> Result<()> {
+    require_pages_publication_lock(final_dir, guard)?;
     ensure_bundle_tree_matches(final_dir, "prior live Pages bundle", prior)?;
     ensure_bundle_tree_matches(temp_dir, "staged Pages bundle candidate", candidate)?;
     if bundle_path_entry_exists(backup_dir)? {
@@ -1786,6 +1831,7 @@ fn replace_dir_from_temp_via_recoverable_rename_pair(
             backup_dir.display()
         );
     }
+    require_pages_publication_lock(final_dir, guard)?;
     fs::rename(final_dir, backup_dir).with_context(|| {
         format!(
             "failed parking live bundle {} at journaled recovery path {}",
@@ -1801,6 +1847,7 @@ fn replace_dir_from_temp_via_recoverable_rename_pair(
     }
 
     if let Err(park_sync_error) = sync_parent_directory(final_dir) {
+        require_pages_publication_lock(final_dir, guard)?;
         return match fs::rename(backup_dir, final_dir) {
             Ok(()) => {
                 ensure_bundle_tree_matches(final_dir, "restored prior Pages bundle", prior)?;
@@ -1833,6 +1880,7 @@ fn replace_dir_from_temp_via_recoverable_rename_pair(
         };
     }
 
+    require_pages_publication_lock(final_dir, guard)?;
     match fs::rename(temp_dir, final_dir) {
         Ok(()) => {
             if let Err(error) = ensure_bundle_tree_matches(
@@ -1855,15 +1903,18 @@ fn replace_dir_from_temp_via_recoverable_rename_pair(
             if let Err(cleanup_error) = cleanup_journaled_bundle_tree_after_publish(
                 backup_dir,
                 final_dir,
+                guard,
                 "journaled prior Pages bundle",
                 prior,
             ) {
                 *retain_temp_on_error = true;
                 return Err(cleanup_error);
             }
-            remove_bundle_publish_journal(final_dir, journal)
+            remove_bundle_publish_journal(final_dir, guard, journal)
         }
-        Err(publish_error) => match fs::rename(backup_dir, final_dir) {
+        Err(publish_error) => {
+            require_pages_publication_lock(final_dir, guard)?;
+            match fs::rename(backup_dir, final_dir) {
             Ok(()) => {
                 ensure_bundle_tree_matches(final_dir, "restored prior Pages bundle", prior)?;
                 sync_parent_directory(final_dir)?;
@@ -1887,7 +1938,8 @@ fn replace_dir_from_temp_via_recoverable_rename_pair(
                     temp_dir.display()
                 );
             }
-        },
+        }
+        }
     }
 }
 
@@ -2926,6 +2978,16 @@ mod tests {
         serde_json::to_writer_pretty(BufWriter::new(file), &config).unwrap();
     }
 
+    fn write_test_bundle_publish_journal(
+        final_dir: &Path,
+        backup_dir: &Path,
+        prior: &BundleTreeEvidence,
+        candidate: &BundleTreeEvidence,
+    ) -> BundlePublishJournal {
+        let guard = acquire_pages_publication_lock(final_dir).unwrap();
+        write_bundle_publish_journal(final_dir, &guard, backup_dir, prior, candidate).unwrap()
+    }
+
     fn encrypted_config_for_files(files: Vec<&str>) -> EncryptionConfig {
         use base64::prelude::*;
         let chunk_count = files.len();
@@ -3917,8 +3979,9 @@ mod tests {
         fs::create_dir_all(staged_dir.join("site")).unwrap();
         fs::write(staged_dir.join("site/new.txt"), "new").unwrap();
 
+        let guard = acquire_pages_publication_lock(&final_dir).unwrap();
         let mut retain_temp_on_error = false;
-        replace_dir_from_temp(&staged_dir, &final_dir, &mut retain_temp_on_error).unwrap();
+        replace_dir_from_temp(&staged_dir, &final_dir, &guard, &mut retain_temp_on_error).unwrap();
 
         assert!(!staged_dir.exists());
         assert!(final_dir.join("site/new.txt").exists());
@@ -3944,8 +4007,9 @@ mod tests {
         fs::create_dir_all(staged_dir.join("site")).unwrap();
         fs::write(staged_dir.join("site/new.txt"), "new").unwrap();
 
+        let guard = acquire_pages_publication_lock(&final_dir).unwrap();
         let mut retain_temp_on_error = false;
-        replace_dir_from_temp(&staged_dir, &final_dir, &mut retain_temp_on_error).unwrap();
+        replace_dir_from_temp(&staged_dir, &final_dir, &guard, &mut retain_temp_on_error).unwrap();
 
         assert!(!retain_temp_on_error);
         assert!(!staged_dir.exists());
@@ -3974,7 +4038,7 @@ mod tests {
         let prior = inspect_bundle_tree(&final_dir, "prior").unwrap();
         let candidate = inspect_bundle_tree(&staged_dir, "candidate").unwrap();
         let backup_dir = unpredictable_bundle_publish_backup_path(&final_dir).unwrap();
-        write_bundle_publish_journal(&final_dir, &backup_dir, &prior, &candidate).unwrap();
+        write_test_bundle_publish_journal(&final_dir, &backup_dir, &prior, &candidate);
 
         // Failpoint state: the fallback publisher durably parked OLD, then
         // the process died before installing NEW at the live handle.
@@ -4009,7 +4073,7 @@ mod tests {
         let prior = inspect_bundle_tree(&final_dir, "prior").unwrap();
         let candidate = inspect_bundle_tree(&staged_dir, "candidate").unwrap();
         let backup_dir = unpredictable_bundle_publish_backup_path(&final_dir).unwrap();
-        write_bundle_publish_journal(&final_dir, &backup_dir, &prior, &candidate).unwrap();
+        write_test_bundle_publish_journal(&final_dir, &backup_dir, &prior, &candidate);
 
         // Failpoint state: OLD was parked and NEW reached the live handle,
         // then the process died before removing OLD.
@@ -4112,7 +4176,7 @@ mod tests {
         let prior = inspect_bundle_tree(&final_dir, "prior").unwrap();
         let candidate = inspect_bundle_tree(&staged_dir, "candidate").unwrap();
         let exchange_dir = unpredictable_bundle_publish_backup_path(&final_dir).unwrap();
-        write_bundle_publish_journal(&final_dir, &exchange_dir, &prior, &candidate).unwrap();
+        write_test_bundle_publish_journal(&final_dir, &exchange_dir, &prior, &candidate);
 
         // Failpoint state: NEW reached the journaled exchange handle,
         // but the process died before the atomic exchange committed.
@@ -4142,7 +4206,7 @@ mod tests {
         let prior = inspect_bundle_tree(&final_dir, "prior").unwrap();
         let candidate = inspect_bundle_tree(&staged_dir, "candidate").unwrap();
         let exchange_dir = unpredictable_bundle_publish_backup_path(&final_dir).unwrap();
-        write_bundle_publish_journal(&final_dir, &exchange_dir, &prior, &candidate).unwrap();
+        write_test_bundle_publish_journal(&final_dir, &exchange_dir, &prior, &candidate);
 
         // Failpoint state immediately after exchange: NEW is live and OLD is
         // at the exact random path authenticated by the durable journal.
@@ -4173,7 +4237,7 @@ mod tests {
         let prior = inspect_bundle_tree(&final_dir, "prior").unwrap();
         let candidate = inspect_bundle_tree(&staged_dir, "candidate").unwrap();
         let backup_dir = unpredictable_bundle_publish_backup_path(&final_dir).unwrap();
-        write_bundle_publish_journal(&final_dir, &backup_dir, &prior, &candidate).unwrap();
+        write_test_bundle_publish_journal(&final_dir, &backup_dir, &prior, &candidate);
         fs::rename(&final_dir, &backup_dir).unwrap();
         fs::write(backup_dir.join("private/old-private.txt"), "tampered").unwrap();
 
@@ -4202,13 +4266,21 @@ mod tests {
         let prior = inspect_bundle_tree(&final_dir, "prior").unwrap();
         let candidate = inspect_bundle_tree(&staged_dir, "candidate").unwrap();
         let backup_dir = unpredictable_bundle_publish_backup_path(&final_dir).unwrap();
-        let journal =
-            write_bundle_publish_journal(&final_dir, &backup_dir, &prior, &candidate).unwrap();
+        let guard = acquire_pages_publication_lock(&final_dir).unwrap();
+        let journal = write_bundle_publish_journal(
+            &final_dir,
+            &guard,
+            &backup_dir,
+            &prior,
+            &candidate,
+        )
+        .unwrap();
 
         let mut retain_temp_on_error = false;
         replace_dir_from_temp_via_recoverable_rename_pair(
             &staged_dir,
             &final_dir,
+            &guard,
             &backup_dir,
             &journal,
             &prior,
@@ -4236,9 +4308,11 @@ mod tests {
         fs::write(backup_dir.join("private/recovery-material.txt"), "private").unwrap();
         let expected = inspect_bundle_tree(&backup_dir, "prior").unwrap();
 
+        let guard = acquire_pages_publication_lock(&final_dir).unwrap();
         let error = cleanup_journaled_bundle_tree_after_publish_with(
             &backup_dir,
             &final_dir,
+            &guard,
             "journaled prior Pages bundle",
             &expected,
             |_| {
@@ -4271,9 +4345,11 @@ mod tests {
         fs::write(&private_file, "changed after journal").unwrap();
         let remove_called = std::cell::Cell::new(false);
 
+        let guard = acquire_pages_publication_lock(&final_dir).unwrap();
         cleanup_journaled_bundle_tree_after_publish_with(
             &backup_dir,
             &final_dir,
+            &guard,
             "journaled prior Pages bundle",
             &expected,
             |_| {
@@ -4321,7 +4397,7 @@ mod tests {
         let prior = inspect_bundle_tree(&final_dir, "prior").unwrap();
         let candidate = inspect_bundle_tree(&staged_dir, "candidate").unwrap();
         let backup_dir = unpredictable_bundle_publish_backup_path(&final_dir).unwrap();
-        write_bundle_publish_journal(&final_dir, &backup_dir, &prior, &candidate).unwrap();
+        write_test_bundle_publish_journal(&final_dir, &backup_dir, &prior, &candidate);
         fs::create_dir_all(outside.path().join("private")).unwrap();
         fs::write(outside.path().join("private/material.txt"), "private").unwrap();
         symlink(outside.path(), &backup_dir).unwrap();
@@ -4360,9 +4436,15 @@ mod tests {
         fs::write(outside.path().join("site/new.txt"), "new").unwrap();
         symlink(outside.path(), &staged_dir).unwrap();
 
+        let guard = acquire_pages_publication_lock(&final_dir).unwrap();
         let mut retain_temp_on_error = false;
-        let error = replace_dir_from_temp(&staged_dir, &final_dir, &mut retain_temp_on_error)
-            .expect_err("a symlinked staged bundle must fail closed");
+        let error = replace_dir_from_temp(
+            &staged_dir,
+            &final_dir,
+            &guard,
+            &mut retain_temp_on_error,
+        )
+        .expect_err("a symlinked staged bundle must fail closed");
 
         assert!(error.to_string().contains("must not be a symlink"));
         assert!(
@@ -4394,9 +4476,15 @@ mod tests {
         fs::write(staged_dir.join("site/new.txt"), "new").unwrap();
         symlink(temp.path().join("missing-target"), &final_dir).unwrap();
 
+        let guard = acquire_pages_publication_lock(&final_dir).unwrap();
         let mut retain_temp_on_error = false;
-        let err =
-            replace_dir_from_temp(&staged_dir, &final_dir, &mut retain_temp_on_error).unwrap_err();
+        let err = replace_dir_from_temp(
+            &staged_dir,
+            &final_dir,
+            &guard,
+            &mut retain_temp_on_error,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("must not be a symlink"),
             "unexpected error: {err:#}"
