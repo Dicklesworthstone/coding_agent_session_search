@@ -323,6 +323,67 @@ fn install_sh_rejects_archive_path_traversal_before_extracting() {
 
 #[test]
 #[serial]
+#[cfg(target_os = "linux")]
+fn install_sh_rejects_symlink_archive_members_before_extracting() {
+    let artifact_dir = tempfile::TempDir::new().expect("artifact directory");
+    let payload_dir = tempfile::TempDir::new().expect("payload directory");
+    let payload_cass = payload_dir.path().join("cass");
+    let link_status = Command::new("ln")
+        .arg("-s")
+        .arg("../outside-installer-tree")
+        .arg(&payload_cass)
+        .status()
+        .expect("create malicious symlink payload");
+    assert!(link_status.success(), "test symlink should be created");
+
+    let tar_path = artifact_dir.path().join("cass-linux-amd64.tar.gz");
+    let tar_status = Command::new("tar")
+        .arg("-czf")
+        .arg(&tar_path)
+        .arg("-C")
+        .arg(payload_dir.path())
+        .arg("cass")
+        .status()
+        .expect("create symlink tarball");
+    assert!(tar_status.success(), "test tarball should be created");
+
+    let checksum = file_sha256_hex(&tar_path);
+    let dest = tempfile::TempDir::new().expect("install destination");
+    let home = isolated_home();
+    let tmp_root = isolated_install_tmp_root();
+    let output = install_sh_command(&tmp_root)
+        .arg("--version")
+        .arg("vtest")
+        .arg("--dest")
+        .arg(dest.path())
+        .arg("--easy-mode")
+        .env("HOME", home.path())
+        .env("ARTIFACT_URL", format!("file://{}", tar_path.display()))
+        .env("CHECKSUM", checksum)
+        .output()
+        .expect("run install.sh with symlink archive");
+
+    assert!(
+        !output.status.success(),
+        "install.sh should reject symlink archive members"
+    );
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined_output.contains("Archive contains unsupported entry type: l"),
+        "installer should explain the rejected entry type, got: {combined_output}"
+    );
+    assert!(
+        !dest.path().join("cass").exists(),
+        "cass binary should not be installed from a symlink archive"
+    );
+}
+
+#[test]
+#[serial]
 #[cfg_attr(not(target_os = "linux"), ignore)]
 fn install_sh_fails_with_bad_checksum() {
     let tar = fixture("tests/fixtures/install/coding-agent-search-vtest-linux-x86_64.tar.gz");
@@ -1088,6 +1149,35 @@ fn powershell_verify_contract_fails_closed_on_native_command_errors() {
         assert!(
             script.contains(required),
             "PowerShell verification is missing: {required}"
+        );
+    }
+}
+
+#[test]
+fn installers_reject_link_and_special_archive_entries() {
+    let shell = fs::read_to_string("install.sh").expect("read install.sh");
+    for required in [
+        "tar -tvzf \"$archive\" > \"$metadata_list\"",
+        "Archive contains unsupported entry type",
+        "[ -f \"$BIN\" ] && [ -x \"$BIN\" ]",
+    ] {
+        assert!(
+            shell.contains(required),
+            "POSIX archive type validation is missing: {required}"
+        );
+    }
+
+    let powershell = fs::read_to_string("install.ps1").expect("read install.ps1");
+    for required in [
+        "function Test-ZipEntryHasSafeType",
+        "($Entry.ExternalAttributes -shr 16) -band 0xF000",
+        "$unixType -eq 0x8000",
+        "$unixType -eq 0x4000",
+        "Test-ZipEntryHasSafeType $Entry",
+    ] {
+        assert!(
+            powershell.contains(required),
+            "PowerShell archive type validation is missing: {required}"
         );
     }
 }

@@ -104,7 +104,7 @@ checksum_matches() {
 }
 
 # Member-safety check for archive validation. Its job is path-traversal /
-# zip-slip defense ONLY: reject absolute paths and any ".." path component.
+# zip-slip defense: reject absolute paths and any ".." path component.
 # It deliberately does NOT restrict membership to the binary name. The
 # installer extracts to a temp dir and copies ONLY the binary to the
 # destination (see `install -m 0755 "$BIN" ...`), so benign siblings bundled
@@ -154,14 +154,29 @@ archive_member_is_installable_binary() {
 validate_archive_members() {
   local archive="$1"
   local member_list="$TMP/archive-members.txt"
+  local metadata_list="$TMP/archive-metadata.txt"
   local member
+  local metadata
+  local entry_type
   local saw_binary=0
 
   case "$TAR" in
-    *.zip) unzip -Z1 "$archive" > "$member_list" ;;
-    *.tar.gz) tar -tzf "$archive" > "$member_list" ;;
-    *.tar.xz) tar -tJf "$archive" > "$member_list" ;;
-    *) tar -tf "$archive" > "$member_list" ;;
+    *.zip)
+      unzip -Z1 "$archive" > "$member_list"
+      unzip -Z -l "$archive" > "$metadata_list"
+      ;;
+    *.tar.gz)
+      tar -tzf "$archive" > "$member_list"
+      tar -tvzf "$archive" > "$metadata_list"
+      ;;
+    *.tar.xz)
+      tar -tJf "$archive" > "$member_list"
+      tar -tvJf "$archive" > "$metadata_list"
+      ;;
+    *)
+      tar -tf "$archive" > "$member_list"
+      tar -tvf "$archive" > "$metadata_list"
+      ;;
   esac || { err "Could not list archive members"; exit 1; }
 
   if [ ! -s "$member_list" ]; then
@@ -179,6 +194,31 @@ validate_archive_members() {
       saw_binary=1
     fi
   done < "$member_list"
+
+  # A safe-looking member name is not enough. Tar and Unix-origin zip files
+  # can encode symlinks, hard links, devices, FIFOs, or sockets. Extracting
+  # those entries before selecting the binary can escape the temporary tree or
+  # create filesystem objects the installer never intended. Official release
+  # archives contain only regular files (and, if packaging grows, directories),
+  # so fail closed on every other entry type.
+  if [[ "$TAR" == *.zip ]]; then
+    if grep -Eq '^[lbcpso][rwxStTs-]{9}[[:space:]]' "$metadata_list"; then
+      err "Archive contains a link or special filesystem entry"
+      exit 1
+    fi
+  else
+    while IFS= read -r metadata; do
+      [ -n "$metadata" ] || continue
+      entry_type="${metadata:0:1}"
+      case "$entry_type" in
+        -|d) ;;
+        *)
+          err "Archive contains unsupported entry type: $entry_type"
+          exit 1
+          ;;
+      esac
+    done < "$metadata_list"
+  fi
 
   if [ "$saw_binary" -ne 1 ]; then
     err "Archive does not contain a cass binary"
@@ -395,13 +435,13 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   git clone --depth 1 --branch "$VERSION" "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"
   (cd "$TMP/src" && cargo build --locked --release)
   BIN="$TMP/src/target/release/$INSTALL_BASENAME"
-  if [ ! -x "$BIN" ]; then
+  if [ ! -f "$BIN" ] || [ ! -x "$BIN" ]; then
     BIN="$TMP/src/target/release/cass"
   fi
-  if [ ! -x "$BIN" ]; then
+  if [ ! -f "$BIN" ] || [ ! -x "$BIN" ]; then
     BIN="$TMP/src/target/release/cass.exe"
   fi
-  [ -x "$BIN" ] || { err "Build failed"; exit 1; }
+  [ -f "$BIN" ] && [ -x "$BIN" ] || { err "Build failed"; exit 1; }
   install -m 0755 "$BIN" "$DEST/$INSTALL_BASENAME"
   ok "Installed to $DEST/$INSTALL_BASENAME (source build)"
   maybe_add_path
@@ -461,32 +501,32 @@ case "$TAR" in
   *) tar -xf "$TMP/$TAR" -C "$TMP" ;;
 esac
 BIN="$TMP/$INSTALL_BASENAME"
-if [ ! -x "$BIN" ] && [ -n "$TARGET" ]; then
+if { [ ! -f "$BIN" ] || [ ! -x "$BIN" ]; } && [ -n "$TARGET" ]; then
   BIN="$TMP/cass-${TARGET}/$INSTALL_BASENAME"
 fi
-if [ ! -x "$BIN" ] && [ "$INSTALL_BASENAME" != "cass.exe" ]; then
+if { [ ! -f "$BIN" ] || [ ! -x "$BIN" ]; } && [ "$INSTALL_BASENAME" != "cass.exe" ]; then
   BIN=$(find "$TMP" -maxdepth 3 -type f -name "cass" -perm -111 | head -n 1)
 fi
-if [ ! -x "$BIN" ] && [ "$INSTALL_BASENAME" = "cass.exe" ] && [ -f "$TMP/cass.exe" ]; then
+if { [ ! -f "$BIN" ] || [ ! -x "$BIN" ]; } && [ "$INSTALL_BASENAME" = "cass.exe" ] && [ -f "$TMP/cass.exe" ]; then
   BIN="$TMP/cass.exe"
 fi
-if [ ! -x "$BIN" ] && [ "$INSTALL_BASENAME" = "cass.exe" ] && [ -n "$TARGET" ] && [ -f "$TMP/cass-${TARGET}/cass.exe" ]; then
+if { [ ! -f "$BIN" ] || [ ! -x "$BIN" ]; } && [ "$INSTALL_BASENAME" = "cass.exe" ] && [ -n "$TARGET" ] && [ -f "$TMP/cass-${TARGET}/cass.exe" ]; then
   BIN="$TMP/cass-${TARGET}/cass.exe"
 fi
-if [ ! -x "$BIN" ] && [ "$INSTALL_BASENAME" = "cass.exe" ]; then
+if { [ ! -f "$BIN" ] || [ ! -x "$BIN" ]; } && [ "$INSTALL_BASENAME" = "cass.exe" ]; then
    BIN=$(find "$TMP" -maxdepth 3 -type f -name "coding-agent-search.exe" -perm -111 | head -n 1)
-   if [ -x "$BIN" ]; then
+   if [ -f "$BIN" ] && [ -x "$BIN" ]; then
       warn "Found 'coding-agent-search.exe' binary instead of 'cass.exe'; installing it as 'cass.exe'"
    fi
 fi
-if [ ! -x "$BIN" ] && [ "$INSTALL_BASENAME" != "cass.exe" ]; then
+if { [ ! -f "$BIN" ] || [ ! -x "$BIN" ]; } && [ "$INSTALL_BASENAME" != "cass.exe" ]; then
    BIN=$(find "$TMP" -maxdepth 3 -type f -name "coding-agent-search" -perm -111 | head -n 1)
-   if [ -x "$BIN" ]; then
+   if [ -f "$BIN" ] && [ -x "$BIN" ]; then
       warn "Found 'coding-agent-search' binary instead of 'cass'; installing as 'cass'"
    fi
 fi
 
-[ -x "$BIN" ] || { err "Binary not found in tar"; exit 1; }
+[ -f "$BIN" ] && [ -x "$BIN" ] || { err "Binary not found in archive"; exit 1; }
 install -m 0755 "$BIN" "$DEST/$INSTALL_BASENAME"
 ok "Installed to $DEST/$INSTALL_BASENAME"
 maybe_add_path

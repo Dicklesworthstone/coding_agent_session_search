@@ -165,6 +165,17 @@ function Test-ZipEntryHasSafePath {
   return -not ($segments -contains '..')
 }
 
+function Test-ZipEntryHasSafeType {
+  param($Entry)
+
+  # ZIP stores Unix mode bits in the high 16 bits of ExternalAttributes.
+  # Accept regular files, directories, and zero (archives created without Unix
+  # type metadata). Reject symlinks and every special filesystem type before
+  # ExtractToDirectory sees them.
+  $unixType = (($Entry.ExternalAttributes -shr 16) -band 0xF000)
+  return $unixType -eq 0 -or $unixType -eq 0x8000 -or $unixType -eq 0x4000
+}
+
 function Test-ZipEntryInstallableBinary {
   param(
     $Entry,
@@ -195,7 +206,7 @@ function Test-ZipEntryAllowed {
   # v0.6.15+ regression tracked in cass#299. The $ZipName parameter is retained
   # for call-site compatibility (the installable-binary check still uses it for
   # the saw-binary requirement in Assert-ZipLayoutSafe).
-  return (Test-ZipEntryHasSafePath $Entry)
+  return (Test-ZipEntryHasSafePath $Entry) -and (Test-ZipEntryHasSafeType $Entry)
 }
 
 function Assert-ZipLayoutSafe {
