@@ -48,8 +48,8 @@ which = "8.0.2"
 shell-words = "1.1.1"
 dotenvy = "0.15.7"
 notify = "8.2.0"
-# fsqlite 0.3.1 (crates.io): the 0.3.0 asupersync-0.4.3 runtime migration and
-# bug-fix wave (GH#333 concurrent-open BusyRecovery retries, GH#334
+# fsqlite 0.3.8 (crates.io) carries the 0.3.0 asupersync-0.4.3 runtime migration
+# and bug-fix wave (GH#333 concurrent-open BusyRecovery retries, GH#334
 # FileIdentity re-derivation after file replacement — the cass#393
 # st_dev/namespace-sidecar repair d29339c — 8-writer rollback cascade,
 # cross-connection visibility) plus the 0.3.1 correctness wave: allocator
@@ -75,8 +75,8 @@ itoa = "1.0.18"  # Zero-allocation integer-to-string for hot paths (bead w32k6)
 smallvec = "1.15.1"  # Stack-allocated small vectors for hot paths (Opt 4.4)
 regex = "1.12.3"
 portable-pty = "0.9.0"
-# FrankenTUI migration foundation (bead 2noh9.2.1).
-# Strategy: pin a Git revision for reproducible CI builds.
+# FrankenTUI migration foundation (bead 2noh9.2.1), exact-pinned to the
+# crates.io 0.5.0 release for reproducible CI builds.
 ftui = { version = "=0.5.0" }
 ftui-runtime = { version = "=0.5.0", features = ["native-backend", "crossterm-compat"] }
 ftui-tty = { version = "=0.5.0" }
@@ -117,11 +117,9 @@ arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimizatio
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
 
 # Crypto for ChatGPT encrypted conversations and HTML export encryption.
-# The aes-gcm + digest + hkdf + hmac + sha2 family must stay on compatible
-# majors: aes-gcm 0.10 uses digest 0.10, which is what sha2 0.10 / hmac 0.12 /
-# hkdf 0.12 export. Leaving these as wildcards lets cargo upgrade hkdf + hmac
-# to 0.13 (digest 0.11), which fails to satisfy aes-gcm's KeyInit bound and
-# breaks the encryption.rs build with ~29 trait-bound errors.
+# The aes-gcm + digest + hkdf + sha2 family must stay on compatible majors.
+# aes-gcm 0.11, sha2 0.11, and hkdf 0.13 share digest 0.11; mixing either side
+# with the former digest 0.10 family breaks the encryption trait bounds.
 aes-gcm = "0.11"
 ring = "0.17.14"
 url = "2.5.8"
@@ -209,9 +207,9 @@ rusqlite = { version = "0.40.2", features = ["bundled", "modern_sqlite"] }
 # fixture assertions, even though production also uses the same pinned crate.
 fsqlite-types = { version = "=0.3.8", package = "fsqlite-types" }
 
-# The fsqlite family now resolves from crates.io (0.3.1) for every direct and
+# The fsqlite family now resolves from crates.io (0.3.8) for every direct and
 # transitive consumer, so the former [patch.crates-io] git override is gone.
-# build.rs enforces the registry identity (single 0.3.1 fsqlite family in the
+# build.rs enforces the registry identity (single 0.3.8 fsqlite family in the
 # lockfile, no patch reintroduction) as the dependency source contract.
 
 [[bin]]

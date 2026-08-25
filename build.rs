@@ -48,12 +48,13 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "fsqlite",
         manifest_package_field: Some("fsqlite"),
         // crates.io-only exact pin (established with the fsqlite 0.2.1
-        // migration, bead bo000; now at 0.3.1, which carries the asupersync
+        // migration, bead bo000; now at 0.3.8, which carries the asupersync
         // 0.4.3 runtime migration, the GH#333/GH#334 bug-fix wave, the
-        // cass#393 namespace-sidecar st_dev repair, and the 0.3.1
-        // allocator/freelist/concurrent-writer correctness wave).
+        // cass#393 namespace-sidecar st_dev repair, the 0.3.1
+        // allocator/freelist/concurrent-writer correctness wave, and the
+        // later FTS5 correctness fixes).
         // Empty `expected_git` signals `validate_manifest_dependency_spec`
-        // to require a bare `=0.3.1` registry pin. Whole-family registry
+        // to require a bare `=0.3.8` registry pin. Whole-family registry
         // convergence is enforced by `validate_fsqlite_registry_pin`.
         expected_git: "",
         expected_rev: "",
