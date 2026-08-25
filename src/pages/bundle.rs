@@ -324,9 +324,9 @@ impl BundleBuilder {
         let encrypted_dir = encrypted_dir.as_ref();
         let output_dir = output_dir.as_ref();
 
-        // Heal an interrupted fallback publish before doing potentially long
-        // archive validation/copying work, so a parked prior generation is
-        // returned to the live handle as soon as the next build starts.
+        // Serialize the full build with key mutations and heal any interrupted
+        // publish before staging, so a parked prior generation returns to the
+        // live handle before the next candidate is derived.
         let publication_guard = acquire_pages_publication_lock(output_dir)?;
         recover_interrupted_bundle_publish_while_locked(output_dir, &publication_guard)?;
         ensure_replaceable_bundle_output_dir(output_dir)?;
@@ -739,12 +739,20 @@ fn read_bundle_publish_journal(final_dir: &Path) -> Result<Option<BundlePublishJ
         );
     }
     #[cfg(unix)]
-    if metadata.nlink() != 1 {
-        bail!(
-            "Pages bundle publish journal {} has {} hard links; preserved it because exclusive pathname ownership is not provable",
-            journal_path.display(),
-            metadata.nlink()
-        );
+    {
+        if metadata.nlink() != 1 {
+            bail!(
+                "Pages bundle publish journal {} has {} hard links; preserved it because exclusive pathname ownership is not provable",
+                journal_path.display(),
+                metadata.nlink()
+            );
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            bail!(
+                "Pages bundle publish journal is not owner-only; preserved it without mutation: {}",
+                journal_path.display()
+            );
+        }
     }
     if metadata.len() > BUNDLE_PUBLISH_JOURNAL_MAX_BYTES {
         bail!(
@@ -829,11 +837,19 @@ fn read_bundle_publish_journal(final_dir: &Path) -> Result<Option<BundlePublishJ
         );
     }
     #[cfg(unix)]
-    if observed_metadata.nlink() != 1 {
-        bail!(
-            "Pages bundle publish journal {} gained additional hard links while read; preserved it without mutation",
-            journal_path.display()
-        );
+    {
+        if observed_metadata.nlink() != 1 {
+            bail!(
+                "Pages bundle publish journal {} gained additional hard links while read; preserved it without mutation",
+                journal_path.display()
+            );
+        }
+        if observed_metadata.permissions().mode() & 0o077 != 0 {
+            bail!(
+                "Pages bundle publish journal permissions changed while read; preserved it without mutation: {}",
+                journal_path.display()
+            );
+        }
     }
 
     let journal: BundlePublishJournal = serde_json::from_slice(&bytes).with_context(|| {
@@ -1453,6 +1469,7 @@ fn replace_dir_from_temp(
     )
 }
 
+#[cfg(test)]
 fn recover_interrupted_bundle_publish(final_dir: &Path) -> Result<()> {
     let guard = acquire_pages_publication_lock(final_dir)?;
     recover_interrupted_bundle_publish_while_locked(final_dir, &guard)
@@ -4263,6 +4280,32 @@ mod tests {
             "tampered"
         );
         assert!(bundle_publish_recovery_journal_path(&final_dir).exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_recovery_rejects_non_owner_only_publish_journal() {
+        let temp = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let staged_dir = temp.path().join("bundle.staged");
+        fs::create_dir_all(final_dir.join("site")).unwrap();
+        fs::write(final_dir.join("site/old.txt"), "old").unwrap();
+        fs::create_dir_all(staged_dir.join("site")).unwrap();
+        fs::write(staged_dir.join("site/new.txt"), "new").unwrap();
+        let prior = inspect_bundle_tree(&final_dir, "prior").unwrap();
+        let candidate = inspect_bundle_tree(&staged_dir, "candidate").unwrap();
+        let backup_dir = unpredictable_bundle_publish_backup_path(&final_dir).unwrap();
+        write_test_bundle_publish_journal(&final_dir, &backup_dir, &prior, &candidate);
+        let journal_path = bundle_publish_recovery_journal_path(&final_dir);
+        fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = recover_interrupted_bundle_publish(&final_dir)
+            .expect_err("a public recovery journal must not authorize publication mutations");
+
+        assert!(error.to_string().contains("not owner-only"));
+        assert_eq!(fs::read_to_string(final_dir.join("site/old.txt")).unwrap(), "old");
+        assert!(journal_path.exists(), "rejected journal must be preserved");
+        assert!(!backup_dir.exists());
     }
 
     #[test]
