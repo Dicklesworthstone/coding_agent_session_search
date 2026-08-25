@@ -127,10 +127,7 @@ impl SearchSqliteFixture {
             .expect("search sqlite fixture connection must be present")
     }
 
-    fn execute(
-        &self,
-        sql: &str,
-    ) -> Result<usize, crate::franken_sync::FrankenError> {
+    fn execute(&self, sql: &str) -> Result<usize, crate::franken_sync::FrankenError> {
         self.connection().execute_sync(sql)
     }
 
@@ -188,7 +185,9 @@ struct SearchReadTransaction<'conn> {
 }
 
 impl<'conn> SearchReadTransaction<'conn> {
-    fn begin(conn: &'conn SearchSqliteConnection) -> Result<Self, crate::franken_sync::FrankenError> {
+    fn begin(
+        conn: &'conn SearchSqliteConnection,
+    ) -> Result<Self, crate::franken_sync::FrankenError> {
         conn.begin_transaction_sync()?;
         Ok(Self { conn, active: true })
     }
@@ -308,13 +307,9 @@ const SQLITE_MESSAGE_SCAN_FALLBACK_PAGE_ROWS: usize = 1_024;
 const SEARCH_SQLITE_HYDRATION_CACHE_KIB: i64 = 4_096;
 const SEMANTIC_EXACT_CHUNK_OVERFETCH_MULTIPLIER: usize = 4;
 
-fn open_search_hydration_sqlite(
-    path: &Path,
-    timeout: Duration,
-) -> Result<SearchSqliteConnection> {
-    let conn = crate::storage::sqlite::open_franken_async_readonly_connection_with_timeout(
-        path, timeout,
-    )?;
+fn open_search_hydration_sqlite(path: &Path, timeout: Duration) -> Result<SearchSqliteConnection> {
+    let conn =
+        crate::storage::sqlite::open_franken_async_readonly_connection_with_timeout(path, timeout)?;
     conn.execute_sync("PRAGMA query_only = 1;")
         .with_context(|| "setting search hydration query_only")?;
     conn.execute_sync("PRAGMA busy_timeout = 5000;")
@@ -3963,9 +3958,7 @@ impl SearchClient {
         }))
     }
 
-    fn sqlite_guard(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, Option<SearchSqliteConnection>>> {
+    fn sqlite_guard(&self) -> Result<std::sync::MutexGuard<'_, Option<SearchSqliteConnection>>> {
         let mut guard = self
             .sqlite
             .lock()
@@ -7895,10 +7888,7 @@ impl SearchClient {
         Some(SqliteMessageScanQuery { groups })
     }
 
-    fn sqlite_message_scan_score(
-        haystacks: &[String],
-        scan_query: &SqliteMessageScanQuery,
-    ) -> f32 {
+    fn sqlite_message_scan_score(haystacks: &[String], scan_query: &SqliteMessageScanQuery) -> f32 {
         let tokenized_haystacks = haystacks
             .iter()
             .map(|haystack| normalize_phrase_terms(haystack))
@@ -7935,7 +7925,8 @@ impl SearchClient {
                             .filter(|window| *window == phrase.as_slice())
                             .count()
                     })
-                    .sum::<usize>() as f32,
+                    .sum::<usize>()
+                    as f32,
             }
         };
 
@@ -7966,11 +7957,7 @@ impl SearchClient {
         // A negative-only query has no positive relevance contribution, but
         // its complement matches still need a non-zero sentinel so the caller
         // does not discard them. Mixed-query negative clauses stay score-neutral.
-        if score > 0.0 {
-            score
-        } else {
-            1.0
-        }
+        if score > 0.0 { score } else { 1.0 }
     }
 
     #[cfg(test)]
@@ -8043,18 +8030,14 @@ impl SearchClient {
         // whose title/content must actually be evaluated.
         if !filters.agents.is_empty() {
             let placeholders = sql_placeholders(filters.agents.len());
-            sql.push_str(&format!(
-                " AND COALESCE(a.slug, '') IN ({placeholders})"
-            ));
+            sql.push_str(&format!(" AND COALESCE(a.slug, '') IN ({placeholders})"));
             for agent in &filters.agents {
                 params.push(ParamValue::from(agent.as_str()));
             }
         }
         if !filters.workspaces.is_empty() {
             let placeholders = sql_placeholders(filters.workspaces.len());
-            sql.push_str(&format!(
-                " AND COALESCE(w.path, '') IN ({placeholders})"
-            ));
+            sql.push_str(&format!(" AND COALESCE(w.path, '') IN ({placeholders})"));
             for workspace in &filters.workspaces {
                 params.push(ParamValue::from(workspace.as_str()));
             }
@@ -8188,8 +8171,7 @@ impl SearchClient {
             origin_host,
         };
 
-        Self::sqlite_fts5_hit_matches_filters(&hit, request.filters)
-            .then_some((message_id, hit))
+        Self::sqlite_fts5_hit_matches_filters(&hit, request.filters).then_some((message_id, hit))
     }
 
     fn trim_sqlite_message_scan_hits(
@@ -8239,14 +8221,13 @@ impl SearchClient {
             } else {
                 0
             })
-            .saturating_add(if matches!(
-                &request.filters.source_filter,
-                SourceFilter::SourceId(_)
-            ) {
-                1
-            } else {
-                0
-            })
+            .saturating_add(
+                if matches!(&request.filters.source_filter, SourceFilter::SourceId(_)) {
+                    1
+                } else {
+                    0
+                },
+            )
             .saturating_add(2); // pagination cursor + page LIMIT
         if fixed_param_count > SQLITE_MAX_VARIABLE_NUMBER {
             bail!(
@@ -8264,9 +8245,7 @@ impl SearchClient {
         session_paths.dedup();
         let session_path_chunk_size = SQLITE_MAX_VARIABLE_NUMBER - fixed_param_count;
         if !session_paths.is_empty() && session_path_chunk_size == 0 {
-            bail!(
-                "SQLite source-scan filters leave no bind-variable capacity for session paths"
-            );
+            bail!("SQLite source-scan filters leave no bind-variable capacity for session paths");
         }
 
         let mut scored_hits = Vec::with_capacity(retained_hit_count.min(request.scan_page_rows));
@@ -8316,10 +8295,7 @@ impl SearchClient {
                     }
                 }
                 if scored_hits.len() > retained_hit_count {
-                    Self::trim_sqlite_message_scan_hits(
-                        &mut scored_hits,
-                        retained_hit_count,
-                    );
+                    Self::trim_sqlite_message_scan_hits(&mut scored_hits, retained_hit_count);
                 }
 
                 if page_len < request.scan_page_rows {
@@ -13498,10 +13474,7 @@ mod tests {
             }
         }
 
-        fn fts_match_count_raw(
-            conn: &FrankenConnection,
-            fts_query: &str,
-        ) -> Result<Option<usize>> {
+        fn fts_match_count_raw(conn: &FrankenConnection, fts_query: &str) -> Result<Option<usize>> {
             let probe_params = [ParamValue::from("__cass_fts_probe_no_match__")];
             let match_mode = match conn.query_map_collect(
                 "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH ?",
@@ -14522,8 +14495,8 @@ mod tests {
             SearchClient::sqlite_message_scan_score(&fields, query)
         }
 
-        let phrase = SearchClient::sqlite_message_scan_query("\"alpha beta\"")
-            .expect("phrase scan query");
+        let phrase =
+            SearchClient::sqlite_message_scan_query("\"alpha beta\"").expect("phrase scan query");
         assert!(score(&["alpha beta"], &phrase) > 0.0);
         assert!(score(&["alpha, beta"], &phrase) > 0.0);
         assert_eq!(score(&["alpha x beta"], &phrase), 0.0);
@@ -14574,7 +14547,9 @@ mod tests {
         };
         let (sql, params) =
             SearchClient::sqlite_message_scan_query_sql(FieldMask::FULL, &filters, 7);
-        let limit_pos = sql.find(" ORDER BY m.id LIMIT ?").expect("bounded scan limit");
+        let limit_pos = sql
+            .find(" ORDER BY m.id LIMIT ?")
+            .expect("bounded scan limit");
 
         for predicate in [
             "COALESCE(a.slug, '') IN (?)",

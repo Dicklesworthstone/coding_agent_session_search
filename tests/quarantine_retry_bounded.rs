@@ -289,7 +289,10 @@ fn cli_list_and_clear_include_poison_only_quarantine_records() -> anyhow::Result
         String::from_utf8_lossy(&dry.stderr)
     );
     let dry_json: serde_json::Value = serde_json::from_slice(&dry.stdout)?;
-    ensure!(dry_json["matched"] == 1, "dry-run must match poison-only key");
+    ensure!(
+        dry_json["matched"] == 1,
+        "dry-run must match poison-only key"
+    );
     ensure!(dry_json["cleared"] == 0, "dry-run must not clear the key");
     ensure!(
         fs::read_to_string(&poison_path)?.contains("poison-only"),

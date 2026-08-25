@@ -15022,8 +15022,7 @@ pub fn run_index(
             "deferring broad semantic indexing until targeted watch-once ingest completes"
         );
     } else if opts.semantic {
-        let semantic_identity_tier =
-            semantic_identity_tier_for_requested_embedder(&opts.embedder);
+        let semantic_identity_tier = semantic_identity_tier_for_requested_embedder(&opts.embedder);
         let semantic_identity_rebuild_required = storage
             .semantic_identity_rebuild_required(semantic_identity_tier)
             .with_context(|| "checking whether canonical semantic filter identity changed")?;
@@ -15055,10 +15054,7 @@ pub fn run_index(
                 (None, _) => false,
             };
 
-        if opts.watch
-            && !semantic_identity_rebuild_required
-            && has_existing_index
-            && has_watermark
+        if opts.watch && !semantic_identity_rebuild_required && has_existing_index && has_watermark
         {
             tracing::info!(
                 dir = %vi_dir.display(),
@@ -15289,9 +15285,9 @@ pub fn run_index(
                     &opts.data_dir,
                     semantic_indexer.embedder_id(),
                 )
-                .with_context(|| {
-                    "revoking identity-stale semantic shard generations after direct publish"
-                })?;
+                .with_context(
+                    || "revoking identity-stale semantic shard generations after direct publish",
+                )?;
                 persist::with_ephemeral_writer(
                     &storage,
                     false,
@@ -16776,9 +16772,9 @@ fn run_targeted_semantic_watch_once_publish(
                 data_dir,
                 indexer.embedder_id(),
             )
-            .with_context(|| {
-                "revoking identity-stale semantic shard generations after watch-once publish"
-            })?;
+            .with_context(
+                || "revoking identity-stale semantic shard generations after watch-once publish",
+            )?;
             persist::with_ephemeral_writer(
                 &guard,
                 false,
@@ -23357,9 +23353,8 @@ pub(crate) fn operator_quarantine_poison_records(
             Ok(contents) => contents,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => {
-                return Err(err).with_context(|| {
-                    format!("reading ingest quarantine file {}", path.display())
-                });
+                return Err(err)
+                    .with_context(|| format!("reading ingest quarantine file {}", path.display()));
             }
         };
         for line in contents.lines() {
@@ -24117,9 +24112,7 @@ impl QuarantineMutationGuard {
     }
 }
 
-pub(crate) fn acquire_quarantine_mutation_lock(
-    data_dir: &Path,
-) -> Result<QuarantineMutationGuard> {
+pub(crate) fn acquire_quarantine_mutation_lock(data_dir: &Path) -> Result<QuarantineMutationGuard> {
     let db_path = data_dir.join("agent_search.db");
     let lock = acquire_index_run_lock(data_dir, &db_path, SearchMaintenanceMode::Index)
         .context("acquiring quarantine mutation lock")?;
@@ -25857,11 +25850,13 @@ fn classify_paths(
                     continue;
                 }
                 if p.starts_with(&root.path) {
-                    if let Some(index) = matching_roots.iter().position(
-                        |(selected_kind, selected_root)| {
-                            *selected_kind == *kind && selected_root.origin == root.origin
-                        },
-                    ) {
+                    if let Some(index) =
+                        matching_roots
+                            .iter()
+                            .position(|(selected_kind, selected_root)| {
+                                *selected_kind == *kind && selected_root.origin == root.origin
+                            })
+                    {
                         if root.path.components().count()
                             > matching_roots[index].1.path.components().count()
                         {
@@ -28901,13 +28896,16 @@ pub mod persist {
 
             let plain = map_to_internal_with_redactor(&conv, None).metadata_json;
             let mut redactor = super::super::redact_secrets::MemoizingRedactor::with_capacity(8);
-            let memoized =
-                map_to_internal_with_redactor(&conv, Some(&mut redactor)).metadata_json;
-            assert_eq!(plain, memoized, "memoized and plain metadata paths diverged");
+            let memoized = map_to_internal_with_redactor(&conv, Some(&mut redactor)).metadata_json;
+            assert_eq!(
+                plain, memoized,
+                "memoized and plain metadata paths diverged"
+            );
 
             let object = plain.as_object().expect("metadata must remain an object");
             assert_eq!(object.len(), 3, "redacted key collision discarded a value");
-            let serialized = serde_json::to_string(&plain).expect("redacted metadata must serialize");
+            let serialized =
+                serde_json::to_string(&plain).expect("redacted metadata must serialize");
             assert!(!serialized.contains("abcdefgh12345678"));
             assert!(!serialized.contains("b3BlbnNzaC1rZXktdjE"));
             assert!(serialized.contains("prefix\\n[REDACTED]"));
@@ -48680,10 +48678,7 @@ mod tests {
         std::fs::write(&session, b"{}\n").unwrap();
         let roots = vec![
             (ConnectorKind::Omp, ScanRoot::local(app_root)),
-            (
-                ConnectorKind::Omp,
-                ScanRoot::local(profile_root.clone()),
-            ),
+            (ConnectorKind::Omp, ScanRoot::local(profile_root.clone())),
         ];
 
         let classified = classify_paths(vec![session], &roots, false);

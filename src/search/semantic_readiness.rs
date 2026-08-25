@@ -200,9 +200,7 @@ impl SemanticSignals {
         };
 
         let next_step = match reason {
-            R::QualityTierReady if self.backfill_in_progress => {
-                SemanticNextStep::WaitForBackfill
-            }
+            R::QualityTierReady if self.backfill_in_progress => SemanticNextStep::WaitForBackfill,
             R::QualityTierReady => SemanticNextStep::None,
             R::PolicyDisabled => SemanticNextStep::EnableSemanticPolicy,
             R::BaselineNoSemantic | R::ModelNotAcquired => SemanticNextStep::InstallModel,
@@ -211,9 +209,7 @@ impl SemanticSignals {
             R::VectorIndexMissing => SemanticNextStep::BuildVectorIndex,
             R::DbFingerprintMismatch => SemanticNextStep::RebuildForCurrentDb,
             R::BackfillInProgress => SemanticNextStep::WaitForBackfill,
-            R::FastTierReady if self.backfill_in_progress => {
-                SemanticNextStep::WaitForBackfill
-            }
+            R::FastTierReady if self.backfill_in_progress => SemanticNextStep::WaitForBackfill,
             R::FastTierReady => SemanticNextStep::None,
         };
 

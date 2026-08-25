@@ -113,9 +113,9 @@ fn export_html(
             "CASS_HTML_EXPORT_GOLDEN_BYTES_LABEL",
             RETIRED_ENTROPY_OVERRIDE,
         )
-            .arg("--encrypt")
-            .arg("--password-stdin")
-            .write_stdin(format!("{phrase}\n"));
+        .arg("--encrypt")
+        .arg("--password-stdin")
+        .write_stdin(format!("{phrase}\n"));
     }
 
     let output = cmd.output().expect("run cass export-html");

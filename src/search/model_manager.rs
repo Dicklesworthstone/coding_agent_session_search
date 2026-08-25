@@ -1032,9 +1032,7 @@ fn refuse_stale_semantic_assets(
         Ok(false) => {}
         Err(err) => {
             return Some(SemanticAvailability::LoadFailed {
-                context: format!(
-                    "checking canonical semantic identity invalidation marker: {err}"
-                ),
+                context: format!("checking canonical semantic identity invalidation marker: {err}"),
             });
         }
     }

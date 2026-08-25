@@ -1612,11 +1612,7 @@ mod tests {
         assert_eq!(agent_display_name("opencode"), "OpenCode");
         assert_eq!(agent_display_name("pi_agent"), "Pi Agent");
         for alias in ["omp", "Oh My Pi", "oh-my-pi", "oh_my_pi", "ohmypi"] {
-            assert_eq!(
-                agent_display_name(alias),
-                "Oh My Pi",
-                "OMP alias {alias:?}"
-            );
+            assert_eq!(agent_display_name(alias), "Oh My Pi", "OMP alias {alias:?}");
         }
         assert_eq!(agent_display_name("oh_my_pipeline"), "AI Assistant");
         assert_eq!(agent_display_name("factory"), "Factory");
@@ -1903,10 +1899,12 @@ mod tests {
 
         // Add tool calls
         group.add_tool_call(test_tool_call("Read"), Some("toolu_abc123".to_string()));
-        assert!(group.add_tool_result(
-            ToolResult::new("Read", "file contents here", ToolStatus::Success)
-                .with_correlation_id("toolu_abc123"),
-        ));
+        assert!(
+            group.add_tool_result(
+                ToolResult::new("Read", "file contents here", ToolStatus::Success)
+                    .with_correlation_id("toolu_abc123"),
+            )
+        );
 
         let opts = RenderOptions::default();
         let html = render_message_group(&group, 0, &opts).unwrap();
@@ -1926,10 +1924,12 @@ mod tests {
         group.add_tool_call(test_tool_call("Read"), Some("toolu_first".to_string()));
         group.add_tool_call(test_tool_call("Read"), Some("toolu_second".to_string()));
 
-        assert!(group.add_tool_result(
-            ToolResult::new("Read", "second file contents", ToolStatus::Success)
-                .with_correlation_id("toolu_second"),
-        ));
+        assert!(
+            group.add_tool_result(
+                ToolResult::new("Read", "second file contents", ToolStatus::Success)
+                    .with_correlation_id("toolu_second"),
+            )
+        );
 
         assert!(
             group.tool_calls[0].result.is_none(),
@@ -1950,10 +1950,12 @@ mod tests {
         let mut group = MessageGroup::assistant(msg);
         group.add_tool_call(test_tool_call("Read"), Some("toolu_expected".to_string()));
 
-        assert!(!group.add_tool_result(
-            ToolResult::new("Read", "wrong file contents", ToolStatus::Success)
-                .with_correlation_id("toolu_other"),
-        ));
+        assert!(
+            !group.add_tool_result(
+                ToolResult::new("Read", "wrong file contents", ToolStatus::Success)
+                    .with_correlation_id("toolu_other"),
+            )
+        );
 
         assert!(
             group.tool_calls[0].result.is_none(),

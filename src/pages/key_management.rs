@@ -205,10 +205,7 @@ fn derive_key_mutation_target(requested_path: &Path) -> Result<KeyMutationTarget
 
     Ok(KeyMutationTarget {
         lock_path: key_mutation_sidecar_path(&live_root, ".pages-key-mutation.lock"),
-        journal_path: key_mutation_sidecar_path(
-            &live_root,
-            ".pages-key-mutation-in-progress.json",
-        ),
+        journal_path: key_mutation_sidecar_path(&live_root, ".pages-key-mutation-in-progress.json"),
         live_root,
         site_relative,
     })
@@ -414,8 +411,8 @@ fn inspect_key_publication_tree(root: &Path) -> Result<TreeEvidence> {
             root.display()
         )
     })?;
-    let root_identity = crate::franken_sync::FileIdentity::from_file(&root_handle)?
-        .ok_or_else(|| {
+    let root_identity =
+        crate::franken_sync::FileIdentity::from_file(&root_handle)?.ok_or_else(|| {
             anyhow::anyhow!(
                 "filesystem does not expose a stable identity for Pages key-publication root {}",
                 root.display()
@@ -492,8 +489,8 @@ fn inspect_key_publication_tree(root: &Path) -> Result<TreeEvidence> {
             );
         }
         let probe = File::open(path)?;
-        let path_identity = crate::franken_sync::FileIdentity::from_file(&probe)?
-            .ok_or_else(|| {
+        let path_identity =
+            crate::franken_sync::FileIdentity::from_file(&probe)?.ok_or_else(|| {
                 anyhow::anyhow!(
                     "filesystem stopped exposing a stable identity for key-publication file {}",
                     path.display()
@@ -564,7 +561,10 @@ fn collect_key_publication_paths(
             );
         }
         for entry in std::fs::read_dir(&directory).with_context(|| {
-            format!("failed reading key-publication tree {}", directory.display())
+            format!(
+                "failed reading key-publication tree {}",
+                directory.display()
+            )
         })? {
             if paths.len() >= KEY_MUTATION_TREE_ENTRY_LIMIT {
                 bail!(
@@ -710,9 +710,10 @@ fn copy_key_mutation_tree_recursive(
         {
             continue;
         }
-        if relative.components().any(|component| {
-            !matches!(component, Component::Normal(_) | Component::CurDir)
-        }) {
+        if relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+        {
             bail!(
                 "refusing to stage unsafe Pages key-mutation path {}",
                 relative.display()
@@ -954,8 +955,8 @@ fn read_key_mutation_journal(guard: &KeyMutationGuard) -> Result<Option<KeyMutat
         );
     }
     let path_probe = File::open(&guard.target.journal_path)?;
-    let path_identity = crate::franken_sync::FileIdentity::from_file(&path_probe)?
-        .ok_or_else(|| {
+    let path_identity =
+        crate::franken_sync::FileIdentity::from_file(&path_probe)?.ok_or_else(|| {
             anyhow::anyhow!("filesystem stopped exposing a stable journal pathname identity")
         })?;
     if path_identity != identity {
@@ -1049,9 +1050,7 @@ fn evidence_has_digest(evidence: &Option<TreeEvidence>, digest: &str) -> bool {
         .is_some_and(|evidence| evidence.digest == digest)
 }
 
-fn recover_interrupted_key_mutation(
-    guard: &KeyMutationGuard,
-) -> Result<RecoveredKeyMutation> {
+fn recover_interrupted_key_mutation(guard: &KeyMutationGuard) -> Result<RecoveredKeyMutation> {
     let Some(journal) = read_key_mutation_journal(guard)? else {
         return Ok(RecoveredKeyMutation::None);
     };
@@ -1089,8 +1088,8 @@ fn recover_interrupted_key_mutation(
 
     if evidence_has_digest(&live, &journal.candidate_digest) {
         let linux_prior = evidence_has_digest(&staged, &journal.prior_digest) && backup.is_none();
-        let rename_pair_prior = staged.is_none()
-            && evidence_has_digest(&backup, &journal.prior_digest);
+        let rename_pair_prior =
+            staged.is_none() && evidence_has_digest(&backup, &journal.prior_digest);
         if linux_prior {
             remove_owned_key_mutation_tree(&staged_root, Some(&journal.prior_digest))?;
         } else if rename_pair_prior {
@@ -1141,9 +1140,7 @@ fn begin_key_mutation(requested_path: &Path) -> Result<KeyMutationGuard> {
 
     if guard.target.site_relative.as_os_str().is_empty() {
         match std::fs::symlink_metadata(guard.target.live_root.join("site")) {
-            Ok(metadata)
-                if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() =>
-            {
+            Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
                 guard.target.site_relative = PathBuf::from("site");
             }
             Ok(_) => {}
@@ -1185,11 +1182,7 @@ fn verify_published_key_tree(path: &Path, expected: &TreeEvidence) -> Result<()>
     Ok(())
 }
 
-fn cleanup_committed_key_mutation(
-    guard: &KeyMutationGuard,
-    prior_path: &Path,
-    prior_digest: &str,
-) {
+fn cleanup_committed_key_mutation(guard: &KeyMutationGuard, prior_path: &Path, prior_digest: &str) {
     if let Err(error) = remove_owned_key_mutation_tree(prior_path, Some(prior_digest)) {
         tracing::warn!(
             live_root = %guard.target.live_root.display(),
@@ -1269,7 +1262,9 @@ fn publish_staged_key_mutation(
                     "atomic Pages key-mutation exchange is unsupported; using recoverable rename-pair publication"
                 );
             }
-            Err(error) => return Err(error.context("failed atomically publishing Pages key mutation")),
+            Err(error) => {
+                return Err(error.context("failed atomically publishing Pages key mutation"));
+            }
         }
     }
 
@@ -1512,12 +1507,7 @@ pub fn key_add_recovery(
     let new_slot = create_recovery_slot(secret.as_bytes(), &dek, &config.export_id, slot_id)?;
 
     config.key_slots.push(new_slot);
-    publish_key_config_mutation(
-        &guard,
-        &config,
-        Some(secret.as_bytes()),
-        false,
-    )?;
+    publish_key_config_mutation(&guard, &config, Some(secret.as_bytes()), false)?;
 
     info!(slot_id, "Added recovery key slot");
     Ok((slot_id, secret))
@@ -1658,10 +1648,8 @@ pub fn key_rotate(
     // 4. Stage the complete site/private generation and publish it through
     // the same journaled transaction as add/revoke. Old payload and blob
     // ciphertext are deliberately omitted from the staged copy.
-    let (staged_root, prior) = stage_key_mutation_tree(
-        &guard.target,
-        KeyMutationStageMode::ReplaceEncryptedPayload,
-    )?;
+    let (staged_root, prior) =
+        stage_key_mutation_tree(&guard.target, KeyMutationStageMode::ReplaceEncryptedPayload)?;
     let staged_site_dir = guard.target.staged_site_dir(&staged_root);
     let prepare_result = (|| -> Result<TreeEvidence> {
         let (chunk_count, total_compressed_size) = encrypt_all_chunks(
@@ -2928,10 +2916,8 @@ mod tests {
     fn key_mutation_recovery_restores_exact_prior_after_park_crash() -> Result<()> {
         let (_temp_dir, archive_dir) = setup_test_archive();
         let guard = open_key_mutation_lock(derive_key_mutation_target(&archive_dir)?)?;
-        let (staged, prior) = stage_key_mutation_tree(
-            &guard.target,
-            KeyMutationStageMode::PreserveSite,
-        )?;
+        let (staged, prior) =
+            stage_key_mutation_tree(&guard.target, KeyMutationStageMode::PreserveSite)?;
         std::fs::write(staged.join("transaction-candidate.txt"), b"candidate")?;
         sync_tree(&staged)?;
         let candidate = inspect_key_publication_tree(&staged)?;

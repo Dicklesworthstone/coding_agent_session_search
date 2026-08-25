@@ -203,18 +203,18 @@ async fn check_for_updates_async_impl(current_version: &str, force: bool) -> Opt
     // bad upstream release cannot bypass the hourly throttle and turn every
     // startup into a fresh network request. Transient network errors above
     // still skip persistence so they do not suppress future checks.
-    let current_state =
-        match asupersync::runtime::spawn_blocking(mark_update_check_complete).await {
-            Ok(current_state) => current_state,
-            Err(e) => {
-                warn!("update check: failed to save state: {e}");
-                // The state loaded before the network request may now be stale
-                // (for example, the user may have skipped this version while
-                // the request was in flight). Even when cadence persistence
-                // fails, use the freshest readable preference for the banner.
-                UpdateState::load_async().await
-            }
-        };
+    let current_state = match asupersync::runtime::spawn_blocking(mark_update_check_complete).await
+    {
+        Ok(current_state) => current_state,
+        Err(e) => {
+            warn!("update check: failed to save state: {e}");
+            // The state loaded before the network request may now be stale
+            // (for example, the user may have skipped this version while
+            // the request was in flight). Even when cadence persistence
+            // fails, use the freshest readable preference for the banner.
+            UpdateState::load_async().await
+        }
+    };
 
     build_update_info(current_version, release, &current_state)
 }
@@ -817,9 +817,7 @@ fn update_state_lock_path(path: &Path) -> PathBuf {
 /// Serialize the complete read-modify-write operation so a background update
 /// check cannot overwrite a concurrently persisted skip choice (and a skip
 /// write cannot regress the check cadence timestamp).
-fn mutate_persisted_update_state(
-    mutate: impl FnOnce(&mut UpdateState),
-) -> Result<UpdateState> {
+fn mutate_persisted_update_state(mutate: impl FnOnce(&mut UpdateState)) -> Result<UpdateState> {
     let path = state_path();
     mutate_persisted_update_state_at(&path, &legacy_state_path(), mutate)
 }
@@ -1379,12 +1377,8 @@ mod tests {
         };
         save_update_state_to_path(&initial, &path).expect("seed update state");
 
-        let checked = mutate_persisted_update_state_at(
-            &path,
-            &path,
-            UpdateState::mark_checked,
-        )
-        .expect("persist check cadence");
+        let checked = mutate_persisted_update_state_at(&path, &path, UpdateState::mark_checked)
+            .expect("persist check cadence");
         assert!(checked.last_check_ts > 17);
         assert_eq!(checked.skipped_version.as_deref(), Some("1.2.3"));
 

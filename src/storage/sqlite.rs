@@ -251,11 +251,9 @@ impl LazyFrankenDb {
                 source: crate::franken_sync::FrankenError::Internal(err.to_string()),
             })?;
             let conn = FrankenOwnerConnection::open(self.path.to_string_lossy().into_owned())
-                .map_err(|e| {
-                    LazyDbError::FrankenOpenFailed {
-                        path: self.path.clone(),
-                        source: e,
-                    }
+                .map_err(|e| LazyDbError::FrankenOpenFailed {
+                    path: self.path.clone(),
+                    source: e,
                 })?;
             let elapsed_ms = start.elapsed().as_millis();
             info!(
@@ -869,8 +867,7 @@ pub(crate) fn open_franken_owner_readonly_connection_with_timeout(
     path: &Path,
     timeout: Duration,
 ) -> Result<FrankenOwnerConnection> {
-    open_franken_async_readonly_connection_with_timeout(path, timeout)
-        .map(FrankenOwnerConnection)
+    open_franken_async_readonly_connection_with_timeout(path, timeout).map(FrankenOwnerConnection)
 }
 
 pub(crate) fn retryable_franken_error(err: &crate::franken_sync::FrankenError) -> bool {
@@ -1570,15 +1567,13 @@ fn fts_schema_tolerates_missing_shadow_metadata(sql: &str) -> bool {
 }
 
 fn validate_fts_messages_integrity_with_queries(
-    query_strings: impl Fn(
-        &str,
-    ) -> std::result::Result<Vec<String>, crate::franken_sync::FrankenError>,
+    query_strings: impl Fn(&str) -> std::result::Result<Vec<String>, crate::franken_sync::FrankenError>,
     probe: impl Fn(&str) -> std::result::Result<(), crate::franken_sync::FrankenError>,
 ) -> Result<()> {
     let fts_schema_sql = query_strings(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fts_messages'",
     )
-        .with_context(|| "checking for fts_messages in sqlite_master")?;
+    .with_context(|| "checking for fts_messages in sqlite_master")?;
     if fts_schema_sql.is_empty() {
         return Ok(());
     }
@@ -4885,13 +4880,11 @@ impl FrankenStorage {
             matches!(&*cached, CachedEphemeralWriter::InUse),
             "cached ephemeral writer state should be in-use when releasing"
         );
-        *cached = CachedEphemeralWriter::Cached(Box::new(
-            CachedRawFrankenConnection::new(
-                conn,
-                checkpoint_pages,
-                busy_timeout_ms,
-            ),
-        ));
+        *cached = CachedEphemeralWriter::Cached(Box::new(CachedRawFrankenConnection::new(
+            conn,
+            checkpoint_pages,
+            busy_timeout_ms,
+        )));
     }
 
     pub(crate) fn discard_cached_ephemeral_writer(&self, mut writer: Self) {
@@ -8301,12 +8294,9 @@ impl FrankenStorage {
         } else {
             None
         };
-        let assets_were_pending = state
-            .as_deref()
-            .is_some_and(|value| {
-                value == "analytics_pending" || value.starts_with("analytics_pending:")
-            })
-            || previous_state.as_deref() == Some("analytics_pending");
+        let assets_were_pending = state.as_deref().is_some_and(|value| {
+            value == "analytics_pending" || value.starts_with("analytics_pending:")
+        }) || previous_state.as_deref() == Some("analytics_pending");
 
         let legacy_agent_id: Option<i64> = self
             .conn
@@ -8390,10 +8380,8 @@ impl FrankenStorage {
                     legacy.source_path.clone(),
                 ));
                 let external_id_is_new = legacy.external_id.as_ref().is_none_or(|external_id| {
-                    seen_legacy_external_ids.insert((
-                        legacy.normalized_source_id.clone(),
-                        external_id.clone(),
-                    ))
+                    seen_legacy_external_ids
+                        .insert((legacy.normalized_source_id.clone(), external_id.clone()))
                 });
                 let current_sources = self.conn.query_map_collect(
                     "SELECT source_id, origin_host
@@ -8415,18 +8403,15 @@ impl FrankenStorage {
                         ))
                     },
                 )?;
-                let conflict = current_sources
-                    .into_iter()
-                    .any(|(source_id, origin_host)| {
-                        normalized_storage_source_parts(
-                            Some(source_id.as_str()),
-                            None,
-                            origin_host.as_deref(),
-                        )
-                        .0 == legacy.normalized_source_id
-                    });
-                conflicting_rows +=
-                    usize::from(conflict || !path_is_new || !external_id_is_new);
+                let conflict = current_sources.into_iter().any(|(source_id, origin_host)| {
+                    normalized_storage_source_parts(
+                        Some(source_id.as_str()),
+                        None,
+                        origin_host.as_deref(),
+                    )
+                    .0 == legacy.normalized_source_id
+                });
+                conflicting_rows += usize::from(conflict || !path_is_new || !external_id_is_new);
             }
             if conflicting_rows > 0 {
                 return Err(anyhow!(
@@ -8436,18 +8421,16 @@ impl FrankenStorage {
 
             let mut metadata_updates = Vec::with_capacity(legacy_count);
             for legacy in &legacy_conversations {
-                let (metadata_json, metadata_bin): (Option<String>, Option<Vec<u8>>) = self
-                    .conn
-                    .query_row_map(
+                let (metadata_json, metadata_bin): (Option<String>, Option<Vec<u8>>) =
+                    self.conn.query_row_map(
                         "SELECT metadata_json, metadata_bin
                          FROM conversations
                          WHERE id = ?1 AND agent_id = ?2",
                         fparams![legacy.id, legacy_agent_id],
                         |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
                     )?;
-                let mut metadata = if let Some(bytes) = metadata_bin
-                    .as_deref()
-                    .filter(|bytes| !bytes.is_empty())
+                let mut metadata = if let Some(bytes) =
+                    metadata_bin.as_deref().filter(|bytes| !bytes.is_empty())
                 {
                     rmp_serde::from_slice(bytes).with_context(|| {
                         format!(
@@ -8478,20 +8461,16 @@ impl FrankenStorage {
                 // from optional legacy metadata. Always make the canonical
                 // metadata agree with the migrated agent row, including when
                 // the old row stored NULL or omitted `source` entirely.
-                object.insert(
-                    "source".into(),
-                    serde_json::Value::String("omp".into()),
-                );
+                object.insert("source".into(), serde_json::Value::String("omp".into()));
                 // A named profile encoded in the transcript path is durable
                 // provenance, including for remote mirrors. Legacy Pi-owned
                 // rows predate first-class OMP profile tagging, and ordinary
                 // append merges intentionally do not replace conversation
                 // metadata, so recover this authoritative field during the
                 // identity migration itself.
-                if let Some(profile) = crate::connectors::omp::profile_from_session_path(
-                    Path::new(&legacy.source_path),
-                )
-                {
+                if let Some(profile) = crate::connectors::omp::profile_from_session_path(Path::new(
+                    &legacy.source_path,
+                )) {
                     object.insert("profile".into(), serde_json::Value::String(profile));
                 }
                 metadata_updates.push((
@@ -8594,7 +8573,10 @@ impl FrankenStorage {
         } else if !assets_were_pending {
             self.conn.execute_compat(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
-                fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY, complete_state.as_str()],
+                fparams![
+                    LEGACY_OMP_RECLASSIFICATION_META_KEY,
+                    complete_state.as_str()
+                ],
             )?;
             return Ok(LegacyOmpReclassificationResult::default());
         } else {
@@ -8660,7 +8642,10 @@ impl FrankenStorage {
         let complete_state = format!("complete:{context}");
         self.conn.execute_compat(
             "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
-            fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY, complete_state.as_str()],
+            fparams![
+                LEGACY_OMP_RECLASSIFICATION_META_KEY,
+                complete_state.as_str()
+            ],
         )?;
         Ok(())
     }
@@ -14605,13 +14590,12 @@ fn franken_promote_pi_family_external_identity_by_source_path(
             source_path,
             started_at: conversation_effective_started_at(conv),
         };
-        let Some(existing_id) =
-            franken_find_existing_conversation_by_key_impl(
-                tx,
-                &source_path_key,
-                Some(conv),
-                false,
-            )?
+        let Some(existing_id) = franken_find_existing_conversation_by_key_impl(
+            tx,
+            &source_path_key,
+            Some(conv),
+            false,
+        )?
         else {
             return Ok(None);
         };
@@ -22062,11 +22046,9 @@ mod tests {
             "precondition: dedicated-owner test requires unreplayed WAL frames (len={dirty_len})"
         );
 
-        let mut conn = open_franken_async_readonly_connection_with_timeout(
-            &db_path,
-            Duration::from_secs(2),
-        )
-        .expect("dedicated-owner readonly open should read through the dirty WAL");
+        let mut conn =
+            open_franken_async_readonly_connection_with_timeout(&db_path, Duration::from_secs(2))
+                .expect("dedicated-owner readonly open should read through the dirty WAL");
         let rows = conn
             .query_sync("SELECT COUNT(*) FROM t;")
             .expect("dedicated owner should read committed rows through the WAL");
@@ -29726,9 +29708,7 @@ mod tests {
             title: Some("Legacy OMP".into()),
             source_path: dir
                 .path()
-                .join(
-                    "home/.omp/profiles/work/agent/sessions/-projects-cass/legacy-omp.jsonl",
-                ),
+                .join("home/.omp/profiles/work/agent/sessions/-projects-cass/legacy-omp.jsonl"),
             started_at: Some(1_700_000_000_000),
             ended_at: Some(1_700_000_001_000),
             approx_tokens: None,
@@ -29879,8 +29859,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn legacy_omp_first_scan_promotes_missing_or_changed_external_identity()
-    -> anyhow::Result<()> {
+    fn legacy_omp_first_scan_promotes_missing_or_changed_external_identity() -> anyhow::Result<()> {
         let dir = TempDir::new()?;
         let _pi_sessions = set_env_var("PI_SESSIONS_DIR", "");
         let _omp_sessions = set_env_var("PI_CODING_AGENT_SESSION_DIR", "");
@@ -29910,33 +29889,35 @@ mod tests {
         ];
         let legacy = cases
             .iter()
-            .map(|(filename, legacy_external_id, _, started_at)| Conversation {
-                id: None,
-                agent_slug: "pi_agent".into(),
-                workspace: None,
-                external_id: legacy_external_id.map(str::to_owned),
-                title: Some(format!("Legacy {filename}")),
-                source_path: dir
-                    .path()
-                    .join("home/.omp/agent/sessions/project")
-                    .join(filename),
-                started_at: Some(*started_at),
-                ended_at: Some(*started_at + 1),
-                approx_tokens: None,
-                metadata_json: serde_json::json!({"source":"pi_agent"}),
-                messages: vec![Message {
+            .map(
+                |(filename, legacy_external_id, _, started_at)| Conversation {
                     id: None,
-                    idx: 0,
-                    role: MessageRole::User,
-                    author: None,
-                    created_at: Some(*started_at),
-                    content: format!("initial {filename}"),
-                    extra_json: serde_json::Value::Null,
-                    snippets: Vec::new(),
-                }],
-                source_id: LOCAL_SOURCE_ID.into(),
-                origin_host: None,
-            })
+                    agent_slug: "pi_agent".into(),
+                    workspace: None,
+                    external_id: legacy_external_id.map(str::to_owned),
+                    title: Some(format!("Legacy {filename}")),
+                    source_path: dir
+                        .path()
+                        .join("home/.omp/agent/sessions/project")
+                        .join(filename),
+                    started_at: Some(*started_at),
+                    ended_at: Some(*started_at + 1),
+                    approx_tokens: None,
+                    metadata_json: serde_json::json!({"source":"pi_agent"}),
+                    messages: vec![Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: Some(*started_at),
+                        content: format!("initial {filename}"),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    }],
+                    source_id: LOCAL_SOURCE_ID.into(),
+                    origin_host: None,
+                },
+            )
             .collect::<Vec<_>>();
         let legacy_batch = legacy
             .iter()
@@ -29959,45 +29940,47 @@ mod tests {
 
         let current = cases
             .iter()
-            .map(|(filename, _, current_external_id, started_at)| Conversation {
-                id: None,
-                agent_slug: "omp".into(),
-                workspace: None,
-                external_id: Some((*current_external_id).to_owned()),
-                title: Some(format!("Current {filename}")),
-                source_path: dir
-                    .path()
-                    .join("home/.omp/agent/sessions/project")
-                    .join(filename),
-                started_at: Some(*started_at),
-                ended_at: Some(*started_at + 2),
-                approx_tokens: None,
-                metadata_json: serde_json::json!({"source":"omp"}),
-                messages: vec![
-                    Message {
-                        id: None,
-                        idx: 0,
-                        role: MessageRole::User,
-                        author: None,
-                        created_at: Some(*started_at),
-                        content: format!("initial {filename}"),
-                        extra_json: serde_json::Value::Null,
-                        snippets: Vec::new(),
-                    },
-                    Message {
-                        id: None,
-                        idx: 1,
-                        role: MessageRole::Agent,
-                        author: None,
-                        created_at: Some(*started_at + 2),
-                        content: format!("appended {filename}"),
-                        extra_json: serde_json::Value::Null,
-                        snippets: Vec::new(),
-                    },
-                ],
-                source_id: LOCAL_SOURCE_ID.into(),
-                origin_host: None,
-            })
+            .map(
+                |(filename, _, current_external_id, started_at)| Conversation {
+                    id: None,
+                    agent_slug: "omp".into(),
+                    workspace: None,
+                    external_id: Some((*current_external_id).to_owned()),
+                    title: Some(format!("Current {filename}")),
+                    source_path: dir
+                        .path()
+                        .join("home/.omp/agent/sessions/project")
+                        .join(filename),
+                    started_at: Some(*started_at),
+                    ended_at: Some(*started_at + 2),
+                    approx_tokens: None,
+                    metadata_json: serde_json::json!({"source":"omp"}),
+                    messages: vec![
+                        Message {
+                            id: None,
+                            idx: 0,
+                            role: MessageRole::User,
+                            author: None,
+                            created_at: Some(*started_at),
+                            content: format!("initial {filename}"),
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        },
+                        Message {
+                            id: None,
+                            idx: 1,
+                            role: MessageRole::Agent,
+                            author: None,
+                            created_at: Some(*started_at + 2),
+                            content: format!("appended {filename}"),
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        },
+                    ],
+                    source_id: LOCAL_SOURCE_ID.into(),
+                    origin_host: None,
+                },
+            )
             .collect::<Vec<_>>();
         let current_batch = current
             .iter()
@@ -30005,7 +29988,11 @@ mod tests {
             .collect::<Vec<_>>();
         let outcomes = storage.insert_conversations_batched(&current_batch)?;
         assert_eq!(outcomes.len(), 2);
-        assert!(outcomes.iter().all(|outcome| !outcome.conversation_inserted));
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| !outcome.conversation_inserted)
+        );
         assert!(
             outcomes
                 .iter()
@@ -30026,18 +30013,17 @@ mod tests {
                 .path()
                 .join("home/.omp/agent/sessions/project")
                 .join(filename);
-            let (conversation_id, stored_external_id): (i64, String) =
-                storage.conn.query_row_map(
-                    "SELECT id, external_id
+            let (conversation_id, stored_external_id): (i64, String) = storage.conn.query_row_map(
+                "SELECT id, external_id
                      FROM conversations
                      WHERE source_id = ?1 AND agent_id = ?2 AND source_path = ?3",
-                    fparams![
-                        LOCAL_SOURCE_ID,
-                        omp_agent_id,
-                        source_path.to_string_lossy().as_ref()
-                    ],
-                    |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
-                )?;
+                fparams![
+                    LOCAL_SOURCE_ID,
+                    omp_agent_id,
+                    source_path.to_string_lossy().as_ref()
+                ],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )?;
             assert_eq!(stored_external_id, current_external_id);
             let message_count: i64 = storage.conn.query_row_map(
                 "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
@@ -30142,7 +30128,10 @@ mod tests {
         };
         let current_outcome = storage.insert_conversation_tree(pi_agent_id, None, &current)?;
         assert!(!current_outcome.conversation_inserted);
-        assert_eq!(current_outcome.conversation_id, legacy_outcome.conversation_id);
+        assert_eq!(
+            current_outcome.conversation_id,
+            legacy_outcome.conversation_id
+        );
         assert_eq!(current_outcome.inserted_indices, vec![1]);
 
         let rows: Vec<(i64, String)> = storage.conn.query_map_collect(
@@ -30342,8 +30331,7 @@ mod tests {
                 fparams![source_id],
             )?;
         }
-        let shared_path =
-            "/home/dev/.omp/profiles/work/agent/sessions/project/session.jsonl";
+        let shared_path = "/home/dev/.omp/profiles/work/agent/sessions/project/session.jsonl";
         storage.conn.execute_compat(
             "INSERT INTO conversations(
                  agent_id, source_id, external_id, title, source_path, started_at
@@ -30451,8 +30439,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn legacy_omp_reclassification_normalizes_host_only_remote_provenance()
-    -> anyhow::Result<()> {
+    fn legacy_omp_reclassification_normalizes_host_only_remote_provenance() -> anyhow::Result<()> {
         let dir = TempDir::new()?;
         let _pi_sessions = set_env_var("PI_SESSIONS_DIR", "");
         let _omp_sessions = set_env_var("PI_CODING_AGENT_SESSION_DIR", "");
@@ -30529,12 +30516,11 @@ mod tests {
         assert_eq!(source_id, "build-host");
         assert_eq!(origin_host.as_deref(), Some("build-host"));
         assert_eq!(agent_slug, "omp");
-        let (token_source_id, token_agent_id): (String, i64) =
-            storage.conn.query_row_map(
-                "SELECT source_id, agent_id FROM token_usage WHERE conversation_id = ?1",
-                fparams![conversation_id],
-                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
-            )?;
+        let (token_source_id, token_agent_id): (String, i64) = storage.conn.query_row_map(
+            "SELECT source_id, agent_id FROM token_usage WHERE conversation_id = ?1",
+            fparams![conversation_id],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        )?;
         let omp_agent_id: i64 = storage.conn.query_row_map(
             "SELECT id FROM agents WHERE slug = 'omp'",
             fparams![],
@@ -30710,11 +30696,8 @@ mod tests {
             fparams![remote_external_id],
             |row| row.get_typed(0),
         )?;
-        let old_lookup = conversation_external_lookup_key(
-            &remote.source_id,
-            pi_agent_id,
-            remote_external_id,
-        );
+        let old_lookup =
+            conversation_external_lookup_key(&remote.source_id, pi_agent_id, remote_external_id);
         let old_lookup_exists: i64 = storage.conn.query_row_map(
             "SELECT EXISTS(
                  SELECT 1 FROM conversation_external_lookup WHERE lookup_key = ?1
@@ -30801,11 +30784,8 @@ mod tests {
         )?;
         assert_eq!(metrics_slug, "omp");
 
-        let new_lookup = conversation_external_lookup_key(
-            &remote.source_id,
-            omp_agent_id,
-            remote_external_id,
-        );
+        let new_lookup =
+            conversation_external_lookup_key(&remote.source_id, omp_agent_id, remote_external_id);
         let stale_lookup_exists: i64 = storage.conn.query_row_map(
             "SELECT EXISTS(
                  SELECT 1 FROM conversation_external_lookup WHERE lookup_key = ?1
@@ -30901,8 +30881,7 @@ mod tests {
         );
         let unrelated = conversation(
             unrelated_id,
-            dir.path()
-                .join("srv/omp/sessions/project/unrelated.jsonl"),
+            dir.path().join("srv/omp/sessions/project/unrelated.jsonl"),
         );
         storage.insert_conversations_batched(&[
             (pi_agent_id, None, &custom_xdg),
@@ -30910,16 +30889,14 @@ mod tests {
         ])?;
 
         let slug_for = |external_id: &str| -> anyhow::Result<String> {
-            let slug = storage
-                .conn
-                .query_row_map(
-                    "SELECT a.slug
+            let slug = storage.conn.query_row_map(
+                "SELECT a.slug
                      FROM conversations c
                      JOIN agents a ON a.id = c.agent_id
                      WHERE c.external_id = ?1",
-                    fparams![external_id],
-                    |row| row.get_typed(0),
-                )?;
+                fparams![external_id],
+                |row| row.get_typed(0),
+            )?;
             Ok(slug)
         };
 
@@ -30936,8 +30913,7 @@ mod tests {
         )?;
 
         let pending_state = {
-            let _current_xdg =
-                set_env_var("XDG_DATA_HOME", xdg_data_home.to_string_lossy());
+            let _current_xdg = set_env_var("XDG_DATA_HOME", xdg_data_home.to_string_lossy());
             assert_eq!(
                 storage.reclassify_legacy_omp_conversations()?,
                 LegacyOmpReclassificationResult {
@@ -32930,11 +32906,9 @@ mod tests {
         assert_eq!(duplicate_rows, 2);
         drop(conn);
 
-        let mut owner_reader = open_franken_async_readonly_connection_with_timeout(
-            &db_path,
-            Duration::from_secs(5),
-        )
-        .expect("dedicated-owner readonly open should repair duplicate FTS schema rows");
+        let mut owner_reader =
+            open_franken_async_readonly_connection_with_timeout(&db_path, Duration::from_secs(5))
+                .expect("dedicated-owner readonly open should repair duplicate FTS schema rows");
         let message_rows = owner_reader
             .query_sync("SELECT COUNT(*) FROM messages")
             .expect("canonical messages must remain readable after schema-row dedupe");

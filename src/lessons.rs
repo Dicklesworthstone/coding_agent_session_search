@@ -310,10 +310,14 @@ impl LessonGraph {
             by_id
                 .entry(record.lesson_id.clone())
                 .and_modify(|existing| {
-                    existing.source_refs.extend(record.source_refs.iter().cloned());
+                    existing
+                        .source_refs
+                        .extend(record.source_refs.iter().cloned());
                     existing.source_refs.sort();
                     existing.source_refs.dedup();
-                    existing.applies_to.extend(record.applies_to.iter().cloned());
+                    existing
+                        .applies_to
+                        .extend(record.applies_to.iter().cloned());
                     existing.applies_to.sort();
                     existing.applies_to.dedup();
                     if record.freshness_ms > existing.freshness_ms {
@@ -354,14 +358,12 @@ impl LessonGraph {
             }
             let key = (l.topic.clone(), l.project.clone());
             let replaced_failed_approach = l.kind == LessonKind::FailedApproach
-                && landed_decisions
-                    .get(&key)
-                    .is_some_and(|decisions| {
-                        decisions.iter().any(|(freshness, summary)| {
-                            *freshness > l.freshness_ms
-                                && summaries_share_replacement_context(&l.summary, summary)
-                        })
-                    });
+                && landed_decisions.get(&key).is_some_and(|decisions| {
+                    decisions.iter().any(|(freshness, summary)| {
+                        *freshness > l.freshness_ms
+                            && summaries_share_replacement_context(&l.summary, summary)
+                    })
+                });
             l.status = if replaced_failed_approach {
                 LessonStatus::Superseded
             } else {
@@ -652,7 +654,12 @@ mod tests {
         assert_eq!(rec.summary, "REDACTED-SUMMARY");
         let value = serde_json::to_value(&rec).unwrap();
         assert_eq!(value["summary"], "REDACTED-SUMMARY");
-        let mut keys: Vec<&str> = value.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         keys.sort_unstable();
         assert_eq!(
             keys,
@@ -695,7 +702,10 @@ mod tests {
 
         let forward = LessonGraph::build(vec![first.clone(), second.clone()]);
         let reverse = LessonGraph::build(vec![second, first]);
-        assert_eq!(forward, reverse, "candidate order must not change the graph");
+        assert_eq!(
+            forward, reverse,
+            "candidate order must not change the graph"
+        );
         assert_eq!(
             forward.lessons[0].applies_to,
             vec![

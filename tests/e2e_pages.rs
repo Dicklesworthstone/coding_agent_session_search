@@ -790,10 +790,7 @@ fn test_cli_pages_full_workflow_end_to_end() {
     assert_eq!(export_json["status"].as_str(), Some("success"));
     assert_eq!(export_json["stats"]["conversations"].as_u64(), Some(4));
     assert_eq!(export_json["encryption"]["enabled"].as_bool(), Some(true));
-    assert_eq!(
-        export_json["secret_scan"]["complete"].as_bool(),
-        Some(true)
-    );
+    assert_eq!(export_json["secret_scan"]["complete"].as_bool(), Some(true));
     assert_eq!(
         export_json["secret_scan"]["approval_state"].as_str(),
         Some("clean")

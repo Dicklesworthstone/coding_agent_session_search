@@ -1583,9 +1583,8 @@ mod tests {
             "legacy OPFS cleanup should await the async settings rerender"
         );
         assert!(
-            settings_js.contains(
-                "The active decrypted database is kept in memory only and is never"
-            )
+            settings_js
+                .contains("The active decrypted database is kept in memory only and is never")
                 && settings_js.contains("Legacy decrypted database files were detected in OPFS.")
                 && !settings_js.contains("opfs-toggle")
                 && !settings_js.contains("handleOPFSToggle")
@@ -1736,7 +1735,8 @@ mod tests {
             "service worker cache writes must stay best-effort for the response while remaining bound to the FetchEvent lifetime"
         );
         assert!(
-            sw_js.contains("if (cacheEligible && request.mode === 'navigate') {\n            try {")
+            sw_js
+                .contains("if (cacheEligible && request.mode === 'navigate') {\n            try {")
                 && sw_js.contains("const cachedIndex = await cache.match(indexUrl);")
                 && sw_js.contains("log(LOG.WARN, 'Navigation cache fallback error:', cacheError);"),
             "navigation fallback should not crash if the Cache API itself fails during offline fallback"
@@ -1830,7 +1830,9 @@ mod tests {
                 && sw_register_js.contains("watchInstallingWorker(reg, reg.installing);")
                 && sw_register_js.contains("const watchedInstallingWorkers = new WeakSet();")
                 && sw_register_js.contains("newWorker.state === 'installed'")
-                && sw_register_js.contains("return 'serviceWorker' in navigator && hasExactScope(registration);")
+                && sw_register_js.contains(
+                    "return 'serviceWorker' in navigator && hasExactScope(registration);"
+                )
                 && sw_register_js.contains("&& registration.active?.state === 'activated';"),
             "pre-existing waiting updates and status getters should be scoped to the exact archive registration"
         );
@@ -3025,7 +3027,8 @@ mod tests {
                 && database_js.contains("const MAX_BROWSER_DATABASE_SIZE = 512 * 1024 * 1024;")
                 && database_js.contains("const MAX_WASM32_ALLOCATION_SIZE = 0xFFFFFFFF;")
                 && database_js.contains("checkedDatabaseAllocationSize(dbBytes.byteLength)")
-                && database_js.contains("Ownership of a valid Uint8Array transfers to this function")
+                && database_js
+                    .contains("Ownership of a valid Uint8Array transfers to this function")
                 && database_js.contains("dbBytes.fill(0);")
                 && !database_js.contains("new Uint8Array(dbBytes)")
                 && database_js.contains("wasmHeap.fill(")
@@ -3107,9 +3110,7 @@ mod tests {
         );
 
         let attrs = include_str!("../.gitattributes");
-        assert!(attrs.contains(
-            "src/pages_assets/vendor/sqlite3.mjs whitespace=-trailing-space"
-        ));
+        assert!(attrs.contains("src/pages_assets/vendor/sqlite3.mjs whitespace=-trailing-space"));
         assert!(attrs.contains(
             "src/pages_assets/vendor/sqlite3-opfs-async-proxy.js whitespace=-trailing-space"
         ));

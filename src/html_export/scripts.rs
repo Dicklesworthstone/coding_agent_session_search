@@ -1360,11 +1360,11 @@ mod tests {
             bundle,
             "this.base64ToBytes(salt, CASS_HTML_SALT_BYTES, 'salt')"
         );
+        assert_inline_js_contains!(bundle, "this.base64ToBytes(iv, CASS_HTML_IV_BYTES, 'IV')");
         assert_inline_js_contains!(
             bundle,
-            "this.base64ToBytes(iv, CASS_HTML_IV_BYTES, 'IV')"
+            "ciphertextBytes.byteLength < CASS_HTML_GCM_TAG_BYTES"
         );
-        assert_inline_js_contains!(bundle, "ciphertextBytes.byteLength < CASS_HTML_GCM_TAG_BYTES");
         assert_inline_js_contains!(bundle, "!/^[A-Za-z0-9+/]*={0,2}$/.test(base64)");
     }
 }

@@ -1588,8 +1588,8 @@ fn write_export_publish_journal(
         candidate_sha256: candidate.sha256.clone(),
     };
     validate_export_publish_journal(final_path, &journal)?;
-    let bytes = serde_json::to_vec(&journal)
-        .context("failed serializing Pages export publish journal")?;
+    let bytes =
+        serde_json::to_vec(&journal).context("failed serializing Pages export publish journal")?;
     let journal_path = export_publish_recovery_journal_path(final_path);
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -2210,13 +2210,8 @@ fn replace_file_from_temp_via_backup(
             backup_path.display()
         );
     }
-    let journal = write_export_publish_journal(
-        final_path,
-        &backup_path,
-        &prior,
-        &candidate,
-        publish_guard,
-    )?;
+    let journal =
+        write_export_publish_journal(final_path, &backup_path, &prior, &candidate, publish_guard)?;
     if replacement_path_entry_exists(&backup_path)? {
         bail!(
             "journaled Pages export backup path {} appeared before the prior generation could be parked; preserved it, the live generation, staged candidate, and journal without mutation",
@@ -2225,11 +2220,7 @@ fn replace_file_from_temp_via_backup(
     }
     let live_probe = inspect_export_regular_file(final_path, "prior Pages export")?;
     if live_probe.identity != prior.identity
-        || !evidence_matches(
-            &live_probe,
-            journal.prior_size_bytes,
-            &journal.prior_sha256,
-        )
+        || !evidence_matches(&live_probe, journal.prior_size_bytes, &journal.prior_sha256)
     {
         bail!(
             "prior Pages export {} changed identity or content after its publish journal was created; preserved the live and staged generations and journal without mutation",
@@ -2713,13 +2704,7 @@ mod tests {
     ) -> Result<()> {
         let prior = inspect_export_regular_file(backup_path, "test prior generation")?;
         let candidate = inspect_export_regular_file(candidate_path, "test candidate generation")?;
-        write_export_publish_journal(
-            final_path,
-            backup_path,
-            &prior,
-            &candidate,
-            publish_guard,
-        )?;
+        write_export_publish_journal(final_path, backup_path, &prior, &candidate, publish_guard)?;
         Ok(())
     }
 
@@ -3626,7 +3611,10 @@ mod tests {
 
         assert!(format!("{error:#}").contains("was replaced"));
         require_export_publish_guard(&final_path, &second_guard)?;
-        assert!(parked_lock_path.is_file(), "original lock must be preserved");
+        assert!(
+            parked_lock_path.is_file(),
+            "original lock must be preserved"
+        );
         Ok(())
     }
 
@@ -4024,13 +4012,8 @@ mod tests {
         let prior = inspect_export_regular_file(&backup_path, "test prior generation")?;
         let candidate = inspect_export_regular_file(&final_path, "test live generation")?;
         let guard = acquire_export_publish_guard(&final_path)?;
-        let journal = write_export_publish_journal(
-            &final_path,
-            &backup_path,
-            &prior,
-            &candidate,
-            &guard,
-        )?;
+        let journal =
+            write_export_publish_journal(&final_path, &backup_path, &prior, &candidate, &guard)?;
         std::fs::write(&backup_path, b"changed prior generation")?;
 
         let error = remove_prior_export_backup_after_publish(
@@ -4071,13 +4054,8 @@ mod tests {
         let prior = inspect_export_regular_file(&backup_path, "test prior generation")?;
         let candidate = inspect_export_regular_file(&final_path, "test live generation")?;
         let guard = acquire_export_publish_guard(&final_path)?;
-        let journal = write_export_publish_journal(
-            &final_path,
-            &backup_path,
-            &prior,
-            &candidate,
-            &guard,
-        )?;
+        let journal =
+            write_export_publish_journal(&final_path, &backup_path, &prior, &candidate, &guard)?;
         let mut changed_journal = serde_json::to_value(&journal)?;
         changed_journal["candidate_sha256"] = serde_json::Value::String("0".repeat(64));
         std::fs::write(
@@ -4109,12 +4087,8 @@ mod tests {
         let guard = acquire_export_publish_guard(&final_path).expect("acquire publish guard");
 
         std::fs::write(&first_tmp, b"first").expect("write first temp");
-        let first_result = replace_file_from_temp(
-            &first_tmp,
-            &final_path,
-            &mut retain_temp_on_error,
-            &guard,
-        );
+        let first_result =
+            replace_file_from_temp(&first_tmp, &final_path, &mut retain_temp_on_error, &guard);
         #[cfg(not(windows))]
         first_result.expect("initial replace");
         #[cfg(windows)]

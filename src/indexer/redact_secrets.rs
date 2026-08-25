@@ -108,13 +108,12 @@ pub(crate) const AWS_SECRET_KEY_PATTERN: &str =
 pub(crate) const AWS_SESSION_TOKEN_PATTERN: &str = r#"(?i)\baws[_-]?(?:session|security)[_-]?token\s*[:=]\s*(?:"(?:\\.|[^"\\\r\n]){8,}"|'(?:\\.|[^'\\\r\n]){8,}'|[^\s,;}\]]{8,})"#;
 pub(crate) const GITHUB_TOKEN_PATTERN: &str =
     r"\b(?:gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20,})\b";
-pub(crate) const OPENAI_API_KEY_PATTERN: &str = r"\b(?:sk-(?:proj-|admin-)[A-Za-z0-9_-]{19,}[A-Za-z0-9_]|sk-[A-Za-z0-9]{20,})\b";
+pub(crate) const OPENAI_API_KEY_PATTERN: &str =
+    r"\b(?:sk-(?:proj-|admin-)[A-Za-z0-9_-]{19,}[A-Za-z0-9_]|sk-[A-Za-z0-9]{20,})\b";
 pub(crate) const ANTHROPIC_API_KEY_PATTERN: &str =
     r"\bsk-ant-(?:api[0-9]{2}-)?[A-Za-z0-9_-]{19,}[A-Za-z0-9_]\b";
-pub(crate) const BEARER_TOKEN_PATTERN: &str =
-    r"(?i)\bBearer[ \t]+[A-Za-z0-9._~+/=-]{8,}";
-pub(crate) const JWT_PATTERN: &str =
-    r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b";
+pub(crate) const BEARER_TOKEN_PATTERN: &str = r"(?i)\bBearer[ \t]+[A-Za-z0-9._~+/=-]{8,}";
+pub(crate) const JWT_PATTERN: &str = r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b";
 pub(crate) const PRIVATE_KEY_BLOCK_PATTERN: &str = concat!(
     r"(?s)(?:",
     r"-----BEGIN RSA PRIVATE KEY-----.*?(?:-----END RSA PRIVATE KEY-----|\z)|", // ubs:ignore — public key-block regex, not embedded credentials.
@@ -293,8 +292,7 @@ pub fn redact_json(value: &serde_json::Value) -> serde_json::Value {
             let mut next_suffixes = HashMap::new();
             for (k, v) in obj {
                 let redacted_key = redact_text(k).into_owned();
-                let redacted_value =
-                    redact_sensitive_json_value(k, v, || redact_json(v));
+                let redacted_value = redact_sensitive_json_value(k, v, || redact_json(v));
                 insert_redacted_json_entry(
                     &mut new_obj,
                     &mut next_suffixes,
@@ -662,8 +660,7 @@ impl MemoizingRedactor {
                 let mut next_suffixes = HashMap::new();
                 for (k, v) in obj {
                     let redacted_key = self.redact_text(k);
-                    let redacted_value =
-                        redact_sensitive_json_value(k, v, || self.redact_json(v));
+                    let redacted_value = redact_sensitive_json_value(k, v, || self.redact_json(v));
                     insert_redacted_json_entry(
                         &mut new_obj,
                         &mut next_suffixes,
@@ -868,7 +865,10 @@ mod tests {
             "amqp://user:pass@broker.internal/vhost",
         ] {
             let output = redact_text(input);
-            assert!(!output.contains("user:pass"), "credential URL survived: {output}");
+            assert!(
+                !output.contains("user:pass"),
+                "credential URL survived: {output}"
+            );
         }
     }
 
@@ -882,10 +882,7 @@ mod tests {
 
     #[test]
     fn redacts_slack_token() {
-        for input in [
-            "xoxb-123456789-abcdefghij",
-            "xoxo-123456789-abcdefghij",
-        ] {
+        for input in ["xoxb-123456789-abcdefghij", "xoxo-123456789-abcdefghij"] {
             assert_eq!(redact_text(input), REDACTED);
         }
     }

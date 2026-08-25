@@ -288,9 +288,7 @@ fn robot_help_prints_contract() {
     cmd.assert()
         .success()
         .stdout(contains("cass --robot-help (contract v1)"))
-        .stdout(contains(
-            "OMP aliases: oh-my-pi | oh_my_pi | ohmypi",
-        ))
+        .stdout(contains("OMP aliases: oh-my-pi | oh_my_pi | ohmypi"))
         .stdout(contains("Exit codes: 0 ok"));
 }
 
@@ -443,8 +441,7 @@ fn capabilities_are_self_describing_for_agents() {
         .find(|env_var| env_var["name"] == "PI_SESSIONS_DIR")
         .expect("PI_SESSIONS_DIR capability");
     assert_eq!(
-        pi_sessions_dir["description"],
-        "Override the exact Pi Agent sessions directory.",
+        pi_sessions_dir["description"], "Override the exact Pi Agent sessions directory.",
         "capabilities must distinguish the exact sessions override from the broader Pi-family agent directory"
     );
     let omp_data_root = env_vars

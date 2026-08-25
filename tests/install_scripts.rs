@@ -161,7 +161,9 @@ fn install_sh_keeps_tmp_root_warnings_out_of_command_substitution() {
         "test must remain coupled to the command-substitution risk"
     );
     assert!(
-        script.contains("warn \"Ignoring TMPDIR=${TMPDIR} because it is not an accessible directory\""),
+        script.contains(
+            "warn \"Ignoring TMPDIR=${TMPDIR} because it is not an accessible directory\""
+        ),
         "test must remain coupled to the invalid-TMPDIR warning path"
     );
 }
@@ -214,9 +216,7 @@ fn release_workflow_builds_and_publishes_the_exact_requested_tag() -> Result<(),
                 .to_string(),
         );
     }
-    if !workflow.contains(
-        "cargo build --locked --release --target ${{ matrix.target }}",
-    ) {
+    if !workflow.contains("cargo build --locked --release --target ${{ matrix.target }}") {
         return Err("release binaries must be built from the tagged Cargo.lock".to_string());
     }
     for required in [

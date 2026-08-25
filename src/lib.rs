@@ -7652,18 +7652,17 @@ async fn execute_cli(
                             }
                         }
 
-                        let scan_config =
-                            crate::pages::secret_scan::SecretScanConfig::from_inputs(
-                                &secrets_allow,
-                                &secrets_deny,
-                            )
-                            .map_err(|e| CliError {
-                                code: 9,
-                                kind: CliErrorKind::Pages.kind_str(),
-                                message: format!("Secret scan config error: {e}"),
-                                hint: None,
-                                retryable: false,
-                            })?;
+                        let scan_config = crate::pages::secret_scan::SecretScanConfig::from_inputs(
+                            &secrets_allow,
+                            &secrets_deny,
+                        )
+                        .map_err(|e| CliError {
+                            code: 9,
+                            kind: CliErrorKind::Pages.kind_str(),
+                            message: format!("Secret scan config error: {e}"),
+                            hint: None,
+                            retryable: false,
+                        })?;
                         let structured_export = structured_format.is_some() || robot_mode_here;
                         let (stats, (staged_secret_scan, approval_state)) =
                             crate::pages::export::export_pages_database_verified(
@@ -7744,8 +7743,7 @@ async fn execute_cli(
                         } else {
                             println!(
                                 "Export complete! Processed {} conversations, {} messages.",
-                                stats.conversations_processed,
-                                stats.messages_processed
+                                stats.conversations_processed, stats.messages_processed
                             );
                             println!(
                                 "Secret scan: complete ({approval_state}); artifact SHA-256 {}",
@@ -8662,9 +8660,8 @@ fn run_quarantine_retry_command(
 /// retry-eligible under the current binary (version-stale/legacy).
 fn quarantine_entries_json(data_dir: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
     use crate::indexer::quarantine::QuarantineState;
-    let state = QuarantineState::load_for_operator(data_dir).map_err(|error| {
-        anyhow::anyhow!("loading quarantine state for operator list: {error}")
-    })?;
+    let state = QuarantineState::load_for_operator(data_dir)
+        .map_err(|error| anyhow::anyhow!("loading quarantine state for operator list: {error}"))?;
     let current_version = env!("CARGO_PKG_VERSION");
     let mut entries = state
         .iter()
@@ -8744,8 +8741,7 @@ fn quarantine_entries_json(data_dir: &Path) -> anyhow::Result<Vec<serde_json::Va
                     // Cross-surface saves are best-effort. If either surface
                     // records a retry under this binary, do not falsely offer
                     // the key as retry-eligible because the other is stale.
-                    existing["cass_version_at_quarantine"] =
-                        serde_json::json!(current_version);
+                    existing["cass_version_at_quarantine"] = serde_json::json!(current_version);
                     existing["retry_eligible"] = serde_json::json!(false);
                 }
             }
@@ -8861,11 +8857,7 @@ fn run_quarantine_clear(
     // filter. With no filter, every entry is targeted.
     let matched = available_keys
         .into_iter()
-        .filter(|(key, _)| {
-            filter
-                .as_deref()
-                .is_none_or(|needle| key.contains(needle))
-        })
+        .filter(|(key, _)| filter.as_deref().is_none_or(|needle| key.contains(needle)))
         .collect::<Vec<_>>();
 
     let mut cleared = 0usize;
@@ -8873,10 +8865,7 @@ fn run_quarantine_clear(
         let original_state = state.clone();
         for (conversation_id, schema_version) in &matched {
             if let Ok(schema_version) = u32::try_from(*schema_version) {
-                state.clear(&QuarantineKey::new(
-                    conversation_id.clone(),
-                    schema_version,
-                ));
+                state.clear(&QuarantineKey::new(conversation_id.clone(), schema_version));
             }
         }
         state
@@ -8885,10 +8874,9 @@ fn run_quarantine_clear(
             .map_err(|err| quarantine_apply_cli_error("clear", err))?;
 
         let quarantine_keys = matched.iter().cloned().collect::<BTreeSet<_>>();
-        if let Err(ledger_error) = crate::indexer::clear_operator_quarantine_poison_records(
-            &data_dir,
-            &quarantine_keys,
-        ) {
+        if let Err(ledger_error) =
+            crate::indexer::clear_operator_quarantine_poison_records(&data_dir, &quarantine_keys)
+        {
             let error = match original_state.save(&data_dir) {
                 Ok(()) => anyhow::anyhow!(
                     "clearing mirrored poison quarantine records failed; restored the structured checkpoint: {ledger_error:#}"
@@ -9632,8 +9620,8 @@ fn gather_proof_evidence(
             gathered.rejected = gathered.rejected.saturating_add(1);
             continue;
         };
-        let evidence = structured_proof_evidence(&entry)
-            .or_else(|| lightweight_proof_evidence(path, &entry));
+        let evidence =
+            structured_proof_evidence(&entry).or_else(|| lightweight_proof_evidence(path, &entry));
         if let Some(evidence) = evidence {
             gathered.accepted.push(evidence);
         } else {
@@ -9648,8 +9636,8 @@ mod lessons_live_evidence_tests {
     use super::{gather_closed_bead_evidence, gather_proof_evidence};
 
     #[test]
-    fn bead_gatherer_separates_accepted_ignored_and_rejected_lines(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn bead_gatherer_separates_accepted_ignored_and_rejected_lines()
+    -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("issues.jsonl");
         let closed = serde_json::json!({
@@ -9667,9 +9655,7 @@ mod lessons_live_evidence_tests {
         let empty_closed_id = serde_json::json!({"id": "  ", "status": "closed"});
         std::fs::write(
             &path,
-            format!(
-                "\n{closed}\n{open}\nnot-json\n{missing_status}\n{empty_closed_id}\n\n"
-            ),
+            format!("\n{closed}\n{open}\nnot-json\n{missing_status}\n{empty_closed_id}\n\n"),
         )?;
 
         let gathered = gather_closed_bead_evidence(&path);
@@ -9685,8 +9671,8 @@ mod lessons_live_evidence_tests {
     }
 
     #[test]
-    fn proof_gatherer_accepts_either_shape_and_rejects_malformed_lines(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn proof_gatherer_accepts_either_shape_and_rejects_malformed_lines()
+    -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("proof-manifest.jsonl");
         let lightweight_with_structured_hint = serde_json::json!({
@@ -9840,9 +9826,7 @@ fn lesson_record_value(record: &crate::lessons::LessonRecord) -> serde_json::Val
 /// Warn once per lessons command when malformed live JSONL records were
 /// omitted. Only bounded source labels and counts are emitted; raw lines,
 /// parser errors, and repository paths never reach diagnostics.
-fn warn_rejected_lessons_evidence(
-    manifest: &crate::lessons_extraction::ExtractionManifest,
-) {
+fn warn_rejected_lessons_evidence(manifest: &crate::lessons_extraction::ExtractionManifest) {
     let rejected = manifest.rejected_records;
     let total = rejected.total();
     if total > 0 {
@@ -17456,9 +17440,7 @@ fn sqlite_header_preflight_error(
 }
 
 fn receive_franken_cli_read_db_open_result_with_hard_timeout(
-    rx: std::sync::mpsc::Receiver<
-        CliResult<crate::storage::sqlite::FrankenOwnerConnection>,
-    >,
+    rx: std::sync::mpsc::Receiver<CliResult<crate::storage::sqlite::FrankenOwnerConnection>>,
     display_path: String,
     reason: String,
     timeout: Duration,
@@ -22964,8 +22946,8 @@ mod log_hygiene_tests {
     }
 
     #[test]
-    fn trace_json_uses_shared_key_policy_and_preserves_redacted_key_collisions()
-    -> TraceTestResult {
+    fn trace_json_uses_shared_key_policy_and_preserves_redacted_key_collisions() -> TraceTestResult
+    {
         let raw_password = "correct horse battery staple!"; // ubs:ignore -- synthetic redaction fixture.
         let raw_session = "AQoEXAMPLE-session/value+=with.punctuation"; // ubs:ignore -- synthetic redaction fixture.
         let input = serde_json::json!({
@@ -22981,7 +22963,12 @@ mod log_hygiene_tests {
 
         let output = redact_trace_json(&input);
         let encoded = serde_json::to_string(&output)?;
-        for secret in [raw_password, raw_session, "opaque-short-hash", "abcdefgh12345678"] {
+        for secret in [
+            raw_password,
+            raw_session,
+            "opaque-short-hash",
+            "abcdefgh12345678",
+        ] {
             trace_test_require!(
                 !encoded.contains(secret),
                 "trace JSON retained sensitive bytes: {encoded}"
@@ -29599,8 +29586,7 @@ fn output_structured_value(payload: serde_json::Value, format: RobotFormat) -> C
         }
     }
 
-    out.flush()
-        .map_err(|error| output_error("flush", &error))?;
+    out.flush().map_err(|error| output_error("flush", &error))?;
     Ok(())
 }
 
@@ -32890,9 +32876,7 @@ trait DoctorArchiveReadConnection {
         map: F,
     ) -> Result<T, crate::franken_sync::FrankenError>
     where
-        F: FnOnce(
-            &crate::franken_sync::Row,
-        ) -> Result<T, crate::franken_sync::FrankenError>;
+        F: FnOnce(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>;
 }
 
 impl DoctorArchiveReadConnection for crate::franken_sync::Connection {
@@ -32910,9 +32894,7 @@ impl DoctorArchiveReadConnection for crate::franken_sync::Connection {
         map: F,
     ) -> Result<T, crate::franken_sync::FrankenError>
     where
-        F: FnOnce(
-            &crate::franken_sync::Row,
-        ) -> Result<T, crate::franken_sync::FrankenError>,
+        F: FnOnce(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>,
     {
         self.query_row_map(sql, params, map)
     }
@@ -32933,9 +32915,7 @@ impl DoctorArchiveReadConnection for crate::storage::sqlite::FrankenOwnerConnect
         map: F,
     ) -> Result<T, crate::franken_sync::FrankenError>
     where
-        F: FnOnce(
-            &crate::franken_sync::Row,
-        ) -> Result<T, crate::franken_sync::FrankenError>,
+        F: FnOnce(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>,
     {
         self.query_row_map(sql, params, map)
     }
@@ -77083,12 +77063,8 @@ enum DoctorFtsTableState {
     },
 }
 
-fn probe_doctor_fts_table<C: DoctorArchiveReadConnection>(
-    conn: &C,
-) -> DoctorFtsTableState {
-    if let Err(frankensqlite_error) =
-        conn.doctor_query("SELECT rowid FROM fts_messages LIMIT 1;")
-    {
+fn probe_doctor_fts_table<C: DoctorArchiveReadConnection>(conn: &C) -> DoctorFtsTableState {
+    if let Err(frankensqlite_error) = conn.doctor_query("SELECT rowid FROM fts_messages LIMIT 1;") {
         return DoctorFtsTableState::Missing {
             frankensqlite_error: frankensqlite_error.to_string(),
         };
@@ -79021,7 +78997,10 @@ mod cli_read_db_tests {
                 "claude",
             ),
             (r"C:\Users\ellis\.codex\sessions\session.jsonl", "codex"),
-            (r"C:\Users\ellis\.pi\agent\sessions\session.jsonl", "pi_agent"),
+            (
+                r"C:\Users\ellis\.pi\agent\sessions\session.jsonl",
+                "pi_agent",
+            ),
             (r"C:\Users\ellis\.gemini\sessions\session.jsonl", "gemini"),
         ] {
             let detected = detect_resume_agent(Path::new(path), None)
@@ -79649,11 +79628,21 @@ mod cli_read_db_tests {
         )
         .expect("write");
         for (harness, expected_name, expected_command, forbidden_command) in [
-            (PiFamilyHarness::PiAgent, "Pi Agent", "pi --resume", "omp --resume"),
-            (PiFamilyHarness::Omp, "Oh My Pi (omp)", "omp --resume", "pi --resume"),
+            (
+                PiFamilyHarness::PiAgent,
+                "Pi Agent",
+                "pi --resume",
+                "omp --resume",
+            ),
+            (
+                PiFamilyHarness::Omp,
+                "Oh My Pi (omp)",
+                "omp --resume",
+                "pi --resume",
+            ),
         ] {
-            let err = extract_pi_family_session_id(&f, harness)
-                .expect_err("must fail without header");
+            let err =
+                extract_pi_family_session_id(&f, harness).expect_err("must fail without header");
             assert_eq!(err.code, 5);
             assert_eq!(err.kind, "session-id-not-found");
             assert!(
@@ -80114,11 +80103,7 @@ fn run_bounded_doctor_archive_db_probe(
             }
         }
         set_phase("connection_close");
-        let _ = close_franken_cli_owner_read_db(
-            conn,
-            &worker_db_path,
-            "doctor database health",
-        );
+        let _ = close_franken_cli_owner_read_db(conn, &worker_db_path, "doctor database health");
         let _ = tx.send(DoctorBoundedArchiveDbProbe {
             conv_count,
             msg_count,
@@ -85374,8 +85359,8 @@ fn run_introspect(output_format: Option<RobotFormat>) -> CliResult<()> {
         };
 
         if matches!(fmt, RobotFormat::Toon) {
-            let payload = serde_json::to_value(&response)
-                .map_err(|error| output_error("encode", &error))?;
+            let payload =
+                serde_json::to_value(&response).map_err(|error| output_error("encode", &error))?;
             return output_structured_value(payload, fmt);
         }
 
@@ -85392,8 +85377,7 @@ fn run_introspect(output_format: Option<RobotFormat>) -> CliResult<()> {
                 .map_err(|error| output_error("encode compact JSON", &error))?;
         }
         writeln!(&mut out).map_err(|error| output_error("write newline for", &error))?;
-        out.flush()
-            .map_err(|error| output_error("flush", &error))?;
+        out.flush().map_err(|error| output_error("flush", &error))?;
         return Ok(());
     }
 
@@ -85655,10 +85639,9 @@ fn run_config_based_export(
 
     let bundle_builder = crate::pages::bundle::BundleBuilder::with_config(bundle_config);
     let bundle_result = bundle_builder.build(&encrypted_dir, output_dir, |_phase, _msg| {})?;
-    crate::pages::verify::ensure_valid_bundle(&bundle_result.site_dir, false)
-        .map_err(|error| {
-            error.context("Completed config-driven Pages bundle failed full verification")
-        })?;
+    crate::pages::verify::ensure_valid_bundle(&bundle_result.site_dir, false).map_err(|error| {
+        error.context("Completed config-driven Pages bundle failed full verification")
+    })?;
 
     // Optional deployment
     let deploy_result = match wizard_state.target {
@@ -85672,9 +85655,7 @@ fn run_config_based_export(
             let deployed = crate::pages::verify::with_verified_bundle_for_deployment(
                 &bundle_result.site_dir,
                 false,
-                |verified_site_dir| {
-                    deployer.deploy(verified_site_dir, |_phase, _msg| {})
-                },
+                |verified_site_dir| deployer.deploy(verified_site_dir, |_phase, _msg| {}),
             )?;
             Some(serde_json::to_value(deployed)?)
         }
@@ -85708,9 +85689,7 @@ fn run_config_based_export(
             let deployed = crate::pages::verify::with_verified_bundle_for_deployment(
                 &bundle_result.site_dir,
                 false,
-                |verified_site_dir| {
-                    deployer.deploy(verified_site_dir, |_phase, _msg| {})
-                },
+                |verified_site_dir| deployer.deploy(verified_site_dir, |_phase, _msg| {}),
             )?;
             Some(serde_json::to_value(deployed)?)
         }
@@ -92322,7 +92301,9 @@ fn conversation_view_to_html_raw_messages(
             continue;
         };
         if source_event.get("type").and_then(serde_json::Value::as_str) == Some("message")
-            && source_event.get("message").is_some_and(serde_json::Value::is_object)
+            && source_event
+                .get("message")
+                .is_some_and(serde_json::Value::is_object)
         {
             *raw_message = source_event;
         }
@@ -97615,12 +97596,9 @@ fn write_unique_export_output_file(
     output_path: &mut PathBuf,
     contents: &[u8],
 ) -> io::Result<()> {
-    publish_unique_export_output_file(
-        output_directory,
-        final_filename,
-        output_path,
-        |file| file.write_all(contents),
-    )
+    publish_unique_export_output_file(output_directory, final_filename, output_path, |file| {
+        file.write_all(contents)
+    })
 }
 
 #[cfg(not(windows))]
@@ -98961,13 +98939,9 @@ pub fn group_messages_for_export(
                 // or an existing tool-call-only group. It must never be folded
                 // into a user prompt or a standalone orphan-result group.
                 let can_attach = current_group.as_ref().is_some_and(|group| {
-                    matches!(
-                        group.group_type,
-                        html_export::MessageGroupType::Assistant
-                    ) || (matches!(
-                        group.group_type,
-                        html_export::MessageGroupType::ToolOnly
-                    ) && !group.tool_calls.is_empty())
+                    matches!(group.group_type, html_export::MessageGroupType::Assistant)
+                        || (matches!(group.group_type, html_export::MessageGroupType::ToolOnly)
+                            && !group.tool_calls.is_empty())
                 });
                 if !can_attach {
                     flush_group(&mut groups, &mut current_group);
@@ -99401,10 +99375,7 @@ mod export_timestamp_tests {
         );
         assert_eq!(format_export_duration(Some(1), Some(1)), None);
         assert_eq!(format_export_duration(Some(2), Some(1)), None);
-        assert_eq!(
-            format_export_duration(Some(i64::MIN), Some(i64::MAX)),
-            None
-        );
+        assert_eq!(format_export_duration(Some(i64::MIN), Some(i64::MAX)), None);
     }
 
     #[test]
@@ -99531,16 +99502,12 @@ mod export_timestamp_tests {
         let temp = TempDir::new().expect("temp dir");
         let mut output_path = temp.path().join("out.html");
 
-        let err = publish_unique_export_output_file(
-            temp.path(),
-            "out.html",
-            &mut output_path,
-            |file| {
+        let err =
+            publish_unique_export_output_file(temp.path(), "out.html", &mut output_path, |file| {
                 file.write_all(b"partial bytes")?;
                 Err(std::io::Error::other("injected staged-write failure"))
-            },
-        )
-        .expect_err("injected staged write should fail");
+            })
+            .expect_err("injected staged write should fail");
 
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
         assert!(
@@ -101709,7 +101676,8 @@ This should stay behind the indexed html export.
         }
         drop(storage);
 
-        for (case, indexed_path, assistant_sentinel, argument_sentinel, result_sentinel) in exports {
+        for (case, indexed_path, assistant_sentinel, argument_sentinel, result_sentinel) in exports
+        {
             let filename = format!("{case}-without-tools.html");
             run_export_html(
                 &indexed_path,
@@ -102585,10 +102553,8 @@ mod message_grouping_tests {
     #[test]
     fn mismatched_correlated_tool_result_is_preserved_without_wrong_pairing() {
         let mut call = msg_assistant_with_tool("Reading a file", "Read", "/expected");
-        call.tool_call
-            .as_mut()
-            .expect("tool call")
-            .correlation_id = Some("call-expected".to_string());
+        call.tool_call.as_mut().expect("tool call").correlation_id =
+            Some("call-expected".to_string());
 
         let mut result = msg_tool_result("Read", "different result", ToolStatus::Error);
         result
@@ -103345,10 +103311,7 @@ fn extract_text_content_without_tool_blocks(msg: &serde_json::Value) -> String {
         let mut result = String::new();
         for item in arr {
             let item_type = item.get("type").and_then(|v| v.as_str());
-            if matches!(
-                item_type,
-                Some("tool_use" | "tool_result" | "toolCall")
-            ) {
+            if matches!(item_type, Some("tool_use" | "tool_result" | "toolCall")) {
                 continue;
             }
 
@@ -108679,8 +108642,7 @@ fn run_models_backfill(
             return Err(CliError {
                 code: 5,
                 kind: CliErrorKind::SemanticManifest.kind_str(),
-                message: "Semantic identity rebuild published an unexpected generation"
-                    .to_string(),
+                message: "Semantic identity rebuild published an unexpected generation".to_string(),
                 hint: Some(
                     "Retry the semantic backfill; stale semantic serving remains fail-closed"
                         .into(),

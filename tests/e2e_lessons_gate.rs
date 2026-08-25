@@ -106,10 +106,7 @@ fn run_live_lessons(
         .env("NO_COLOR", "1")
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
-    let label = format!(
-        "lessons-live-{}",
-        extra.first().copied().unwrap_or("list")
-    );
+    let label = format!("lessons-live-{}", extra.first().copied().unwrap_or("list"));
     let out = spawn_with_timeout_or_diag(command, &label, Some(repo), SURFACE_BOUND);
     if !out.status.success() {
         return Err(format!(
@@ -181,9 +178,7 @@ fn seed_live_lessons_repo() -> Result<TempDir, String> {
     });
     std::fs::write(
         beads.join("issues.jsonl"),
-        format!(
-            "\n{closed}\nnot-json MALFORMED_BEAD_RAW_MARKER_must_not_be_logged\n\n{open}\n"
-        ),
+        format!("\n{closed}\nnot-json MALFORMED_BEAD_RAW_MARKER_must_not_be_logged\n\n{open}\n"),
     )
     .map_err(|e| format!("write Beads fixture: {e}"))?;
 

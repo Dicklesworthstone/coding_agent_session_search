@@ -60,9 +60,8 @@ static EMAIL_RE: Lazy<Regex> = Lazy::new(|| {
 
 /// Long hex material which may be a content digest, secret, or opaque local
 /// identifier. Short git shas remain useful and are deliberately retained.
-static OPAQUE_HEX_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\b[a-f0-9]{32,}\b").expect("durable lesson opaque-hex regex")
-});
+static OPAQUE_HEX_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\b[a-f0-9]{32,}\b").expect("durable lesson opaque-hex regex"));
 
 fn default_project() -> String {
     "cass".to_string()
@@ -486,9 +485,7 @@ fn redact_field(input: &str, report: &mut RedactionReport) -> String {
 
 fn commit_source_ref(sha: &str, report: &mut RedactionReport) -> String {
     let trimmed = sha.trim();
-    if matches!(trimmed.len(), 40 | 64)
-        && trimmed.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
+    if matches!(trimmed.len(), 40 | 64) && trimmed.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return format!("commit:{trimmed}");
     }
 
@@ -652,8 +649,7 @@ mod tests {
     const SHA1_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const SHA1_C: &str = "cccccccccccccccccccccccccccccccccccccccc";
     const SHA1_D: &str = "dddddddddddddddddddddddddddddddddddddddd";
-    const SHA256_A: &str =
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SHA256_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn commit(sha: &str, subject: &str, ts: u64) -> CommitEvidence {
         CommitEvidence {
@@ -767,22 +763,16 @@ mod tests {
 
     #[test]
     fn short_security_acronyms_require_word_boundaries() {
-        let (source_kind, _) = classify_commit(&commit(
-            SHA1_A,
-            "fix(indexer): preserve source metadata",
-            1,
-        ));
+        let (source_kind, _) =
+            classify_commit(&commit(SHA1_A, "fix(indexer): preserve source metadata", 1));
         assert_eq!(
             source_kind,
             LessonKind::Gotcha,
             "the `rce` substring inside `source` is not an RCE warning"
         );
 
-        let (rce_kind, _) = classify_commit(&commit(
-            SHA1_B,
-            "fix(runtime): reject RCE payloads",
-            1,
-        ));
+        let (rce_kind, _) =
+            classify_commit(&commit(SHA1_B, "fix(runtime): reject RCE payloads", 1));
         assert_eq!(rce_kind, LessonKind::SecurityWarning);
     }
 
@@ -843,11 +833,7 @@ mod tests {
         // summary => same stable id => one lesson, merged provenance.
         let evidence = LessonsEvidence {
             project: "cass".to_string(),
-            commits: vec![commit(
-                SHA1_A,
-                "fix(rch): preflight broken on remote",
-                100,
-            )],
+            commits: vec![commit(SHA1_A, "fix(rch): preflight broken on remote", 100)],
             beads: vec![BeadEvidence {
                 id: "bd-1".to_string(),
                 title: "fix(rch): preflight broken on remote".to_string(),
@@ -1061,13 +1047,19 @@ mod tests {
             "proof-owner",
             secret_status.as_str(),
         ] {
-            assert!(!json.contains(sensitive), "metadata leaked {sensitive}: {json}");
+            assert!(
+                !json.contains(sensitive),
+                "metadata leaked {sensitive}: {json}"
+            );
         }
         assert!(
             json.contains(&format!("commit:{SHA1_A}")),
             "validated commit id lost: {json}"
         );
-        assert!(redaction_total >= 6, "redactions were not audited: {redaction_total}");
+        assert!(
+            redaction_total >= 6,
+            "redactions were not audited: {redaction_total}"
+        );
     }
 
     #[test]
@@ -1144,7 +1136,12 @@ mod tests {
         assert_eq!(result.manifest.proofs_scanned, 2);
         assert_eq!(result.manifest.candidates_emitted, 2);
         let graph = LessonGraph::build(result.candidates);
-        assert!(graph.lessons.iter().all(|lesson| !lesson.summary.contains('\n')));
+        assert!(
+            graph
+                .lessons
+                .iter()
+                .all(|lesson| !lesson.summary.contains('\n'))
+        );
         let bead = graph
             .lessons
             .iter()

@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, Read, Write};
 #[cfg(test)]
 use std::io::BufWriter;
+use std::io::{BufReader, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -804,12 +804,15 @@ fn require_bundle_publish_guard(final_dir: &Path, guard: &BundlePublishGuard) ->
 }
 
 fn bundle_publish_backup_prefix(path: &Path) -> Result<String> {
-    let file_name = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
-        anyhow!(
-            "Pages bundle output has no UTF-8 file name: {}",
-            path.display()
-        )
-    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            anyhow!(
+                "Pages bundle output has no UTF-8 file name: {}",
+                path.display()
+            )
+        })?;
     Ok(format!(".{file_name}.publish-backup."))
 }
 
@@ -828,10 +831,7 @@ fn bundle_path_entry_exists(path: &Path) -> Result<bool> {
     }
 }
 
-fn journal_bundle_backup_path(
-    final_dir: &Path,
-    journal: &BundlePublishJournal,
-) -> Result<PathBuf> {
+fn journal_bundle_backup_path(final_dir: &Path, journal: &BundlePublishJournal) -> Result<PathBuf> {
     let backup_name_path = Path::new(&journal.backup_file_name);
     if backup_name_path.file_name() != Some(backup_name_path.as_os_str())
         || backup_name_path.components().count() != 1
@@ -1046,8 +1046,8 @@ fn write_bundle_publish_journal(
         candidate_sha256: candidate.sha256.clone(),
     };
     validate_bundle_publish_journal(final_dir, &journal)?;
-    let bytes = serde_json::to_vec(&journal)
-        .context("failed serializing Pages bundle publish journal")?;
+    let bytes =
+        serde_json::to_vec(&journal).context("failed serializing Pages bundle publish journal")?;
     let journal_path = bundle_publish_recovery_journal_path(final_dir);
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -1125,10 +1125,7 @@ fn write_bundle_publish_journal(
     Ok(journal)
 }
 
-fn remove_bundle_publish_journal(
-    final_dir: &Path,
-    expected: &BundlePublishJournal,
-) -> Result<()> {
+fn remove_bundle_publish_journal(final_dir: &Path, expected: &BundlePublishJournal) -> Result<()> {
     let journal_path = bundle_publish_recovery_journal_path(final_dir);
     let observed = read_bundle_publish_journal(final_dir)?.ok_or_else(|| {
         anyhow!(
@@ -1291,11 +1288,13 @@ fn inspect_bundle_tree_with_entry_limit(
                 );
             }
 
-            let mut file = File::open(&entry_path).with_context(|| {
-                format!("failed opening {label} file {}", entry_path.display())
-            })?;
+            let mut file = File::open(&entry_path)
+                .with_context(|| format!("failed opening {label} file {}", entry_path.display()))?;
             let opened_metadata = file.metadata().with_context(|| {
-                format!("failed inspecting opened {label} file {}", entry_path.display())
+                format!(
+                    "failed inspecting opened {label} file {}",
+                    entry_path.display()
+                )
             })?;
             if !opened_metadata.file_type().is_file() {
                 bail!(
@@ -1313,7 +1312,10 @@ fn inspect_bundle_tree_with_entry_limit(
             }
             let opened_identity = crate::franken_sync::FileIdentity::from_file(&file)
                 .with_context(|| {
-                    format!("failed identifying opened {label} file {}", entry_path.display())
+                    format!(
+                        "failed identifying opened {label} file {}",
+                        entry_path.display()
+                    )
                 })?
                 .ok_or_else(|| {
                     anyhow!(
@@ -1347,7 +1349,10 @@ fn inspect_bundle_tree_with_entry_limit(
             })?;
             let path_identity = crate::franken_sync::FileIdentity::from_file(&path_probe)
                 .with_context(|| {
-                    format!("failed re-identifying {label} file {}", entry_path.display())
+                    format!(
+                        "failed re-identifying {label} file {}",
+                        entry_path.display()
+                    )
                 })?
                 .ok_or_else(|| {
                     anyhow!(
@@ -1577,8 +1582,7 @@ fn replace_dir_from_temp(
         );
     }
     require_bundle_publish_guard(final_dir, &publish_guard)?;
-    let journal =
-        write_bundle_publish_journal(final_dir, &backup_dir, &prior, &candidate)?;
+    let journal = write_bundle_publish_journal(final_dir, &backup_dir, &prior, &candidate)?;
     if bundle_path_entry_exists(&backup_dir)? {
         bail!(
             "journaled Pages bundle backup path {} appeared before publication; preserved every generation and the journal",
@@ -1627,8 +1631,7 @@ fn recover_interrupted_bundle_publish(final_dir: &Path) -> Result<()> {
         return Ok(());
     };
     let backup_dir = validate_bundle_publish_journal(final_dir, &journal)?;
-    if let Some(unowned_backup) =
-        first_unowned_bundle_publish_backup(final_dir, Some(&backup_dir))?
+    if let Some(unowned_backup) = first_unowned_bundle_publish_backup(final_dir, Some(&backup_dir))?
     {
         bail!(
             "Pages bundle publish journal identifies {}, but additional unowned recovery artifact {} also exists; preserved every generation",
@@ -1664,11 +1667,7 @@ fn recover_interrupted_bundle_publish(final_dir: &Path) -> Result<()> {
                     final_dir.display()
                 );
             }
-            ensure_bundle_tree_matches(
-                &backup_dir,
-                "journaled prior Pages bundle",
-                &prior,
-            )?;
+            ensure_bundle_tree_matches(&backup_dir, "journaled prior Pages bundle", &prior)?;
             fs::rename(&backup_dir, final_dir).with_context(|| {
                 format!(
                     "failed restoring journaled prior Pages bundle {} to missing live path {}; preserved the backup and journal",
@@ -1706,11 +1705,7 @@ fn recover_interrupted_bundle_publish(final_dir: &Path) -> Result<()> {
             remove_bundle_publish_journal(final_dir, &journal)
         }
         (Some(live), Some(backup)) if live == prior && backup == candidate => {
-            ensure_bundle_tree_matches(
-                final_dir,
-                "journaled prior live Pages bundle",
-                &prior,
-            )?;
+            ensure_bundle_tree_matches(final_dir, "journaled prior live Pages bundle", &prior)?;
             cleanup_journaled_bundle_tree_after_publish(
                 &backup_dir,
                 final_dir,
@@ -1725,11 +1720,7 @@ fn recover_interrupted_bundle_publish(final_dir: &Path) -> Result<()> {
             backup_dir.display()
         ),
         (Some(live), None) if live == prior || live == candidate => {
-            ensure_bundle_tree_matches(
-                final_dir,
-                "journaled surviving Pages bundle",
-                &live,
-            )?;
+            ensure_bundle_tree_matches(final_dir, "journaled surviving Pages bundle", &live)?;
             remove_bundle_publish_journal(final_dir, &journal)
         }
         (Some(_), None) => bail!(
@@ -1752,13 +1743,9 @@ fn cleanup_journaled_bundle_tree_after_publish(
     label: &str,
     expected: &BundleTreeEvidence,
 ) -> Result<()> {
-    cleanup_journaled_bundle_tree_after_publish_with(
-        tree_dir,
-        final_dir,
-        label,
-        expected,
-        |path| fs::remove_dir_all(path),
-    )
+    cleanup_journaled_bundle_tree_after_publish_with(tree_dir, final_dir, label, expected, |path| {
+        fs::remove_dir_all(path)
+    })
 }
 
 fn cleanup_journaled_bundle_tree_after_publish_with<F>(
@@ -1804,11 +1791,9 @@ fn try_publish_linux_bundle_via_atomic_exchange(
             backup_dir.display()
         )
     })?;
-    if let Err(error) = ensure_bundle_tree_matches(
-        backup_dir,
-        "journaled atomic-exchange candidate",
-        candidate,
-    ) {
+    if let Err(error) =
+        ensure_bundle_tree_matches(backup_dir, "journaled atomic-exchange candidate", candidate)
+    {
         *retain_temp_on_error = true;
         return Err(error);
     }
@@ -1845,11 +1830,9 @@ fn try_publish_linux_bundle_via_atomic_exchange(
                     backup_dir.display()
                 );
             }
-            if let Err(error) = ensure_bundle_tree_matches(
-                final_dir,
-                "published Pages bundle candidate",
-                candidate,
-            ) {
+            if let Err(error) =
+                ensure_bundle_tree_matches(final_dir, "published Pages bundle candidate", candidate)
+            {
                 *retain_temp_on_error = true;
                 return Err(error);
             }
@@ -2009,11 +1992,9 @@ fn replace_dir_from_temp_via_recoverable_rename_pair(
 
     match fs::rename(temp_dir, final_dir) {
         Ok(()) => {
-            if let Err(error) = ensure_bundle_tree_matches(
-                final_dir,
-                "published Pages bundle candidate",
-                candidate,
-            ) {
+            if let Err(error) =
+                ensure_bundle_tree_matches(final_dir, "published Pages bundle candidate", candidate)
+            {
                 *retain_temp_on_error = true;
                 return Err(error);
             }
@@ -4354,7 +4335,11 @@ mod tests {
         let error = recover_interrupted_bundle_publish(&final_dir)
             .expect_err("mutated journaled bytes must not be restored");
 
-        assert!(error.to_string().contains("does not match the prior generation"));
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the prior generation")
+        );
         assert!(!final_dir.exists());
         assert_eq!(
             fs::read_to_string(backup_dir.join("private/old-private.txt")).unwrap(),
@@ -4458,7 +4443,10 @@ mod tests {
         .expect_err("tree mutation must stop before recursive cleanup");
 
         assert!(!remove_called.get());
-        assert_eq!(fs::read_to_string(private_file).unwrap(), "changed after journal");
+        assert_eq!(
+            fs::read_to_string(private_file).unwrap(),
+            "changed after journal"
+        );
     }
 
     #[test]
@@ -4473,7 +4461,11 @@ mod tests {
         let error = inspect_bundle_tree_with_entry_limit(&tree, "bounded bundle", 2)
             .expect_err("a tree beyond the evidence bound must fail closed");
 
-        assert!(error.to_string().contains("2-entry recovery-evidence bound"));
+        assert!(
+            error
+                .to_string()
+                .contains("2-entry recovery-evidence bound")
+        );
         assert_eq!(fs::read_to_string(tree.join("a.txt")).unwrap(), "a");
         assert_eq!(fs::read_to_string(tree.join("b.txt")).unwrap(), "b");
         assert_eq!(fs::read_to_string(tree.join("c.txt")).unwrap(), "c");

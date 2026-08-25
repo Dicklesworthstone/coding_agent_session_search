@@ -199,10 +199,7 @@ fn augment_modern_codex_messages(
     }
 }
 
-fn tick_augment_progress(
-    progress_tick: Option<&(dyn Fn() + Send + Sync)>,
-    line_no_zero: usize,
-) {
+fn tick_augment_progress(progress_tick: Option<&(dyn Fn() + Send + Sync)>, line_no_zero: usize) {
     if line_no_zero.is_multiple_of(AUGMENT_HEARTBEAT_LINE_STRIDE)
         && let Some(tick) = progress_tick
     {
