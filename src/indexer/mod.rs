@@ -24001,6 +24001,35 @@ pub fn plan_quarantine_retry(
     quarantine_retry::plan_retry(&state, current_cass_version(), config, &source_missing)
 }
 
+/// Holds the authoritative data-dir maintenance lock while a quarantine
+/// command mutates quarantine metadata, SQLite, or derived lexical assets.
+///
+/// The heartbeat is declared first so it stops before the underlying lock is
+/// released. Otherwise its worker could race the lock guard's final metadata
+/// cleanup during drop.
+pub(crate) struct QuarantineMutationGuard {
+    _heartbeat: IndexRunLockHeartbeat,
+    _lock: IndexRunLockGuard,
+}
+
+pub(crate) fn acquire_quarantine_mutation_lock(
+    data_dir: &Path,
+) -> Result<QuarantineMutationGuard> {
+    let db_path = data_dir.join("agent_search.db");
+    let lock = acquire_index_run_lock(data_dir, &db_path, SearchMaintenanceMode::Index)
+        .context("acquiring quarantine mutation lock")?;
+    let heartbeat = IndexRunLockHeartbeat::start(
+        data_dir.to_path_buf(),
+        index_run_lock_heartbeat_interval(),
+        Arc::clone(&lock.metadata_write_lock),
+        Arc::clone(&lock.last_progress_at_ms_atomic),
+    );
+    Ok(QuarantineMutationGuard {
+        _heartbeat: heartbeat,
+        _lock: lock,
+    })
+}
+
 /// Operator-facing bounded quarantine retry (#292 ask #3, `cass quarantine
 /// retry`). Wires the internal bounded retry classifier
 /// ([`quarantine_retry::plan_retry`]) to a CLI action.
@@ -24015,6 +24044,9 @@ pub fn run_quarantine_retry(
     config: &quarantine_retry::RetryConfig,
     apply: bool,
 ) -> Result<quarantine_retry::RetryReport> {
+    let _mutation_guard = apply
+        .then(|| acquire_quarantine_mutation_lock(data_dir))
+        .transpose()?;
     let mut state = QuarantineState::load(data_dir);
     let current_version = current_cass_version();
     let source_missing = quarantine_source_missing_ids(data_dir);
@@ -40996,6 +41028,32 @@ mod tests {
             summary.status == "critical",
             "a fresh burst is critical; got {}",
             summary.status
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn quarantine_retry_apply_refuses_to_race_active_index_run() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+        let db_path = data_dir.join("agent_search.db");
+        let _active_index =
+            acquire_index_run_lock(&data_dir, &db_path, SearchMaintenanceMode::Index)?;
+        let config = quarantine_retry::RetryConfig::default();
+
+        let dry_run = run_quarantine_retry(&data_dir, &config, false)?;
+        anyhow::ensure!(
+            dry_run.total_quarantined_before == 0,
+            "read-only quarantine planning should remain available while indexing is active"
+        );
+
+        let error = run_quarantine_retry(&data_dir, &config, true)
+            .expect_err("quarantine apply must not race the active index writer");
+        let rendered = format!("{error:#}");
+        anyhow::ensure!(
+            rendered.contains("another cass index process already holds"),
+            "quarantine apply should return the authoritative lock contention error: {rendered}"
         );
         Ok(())
     }

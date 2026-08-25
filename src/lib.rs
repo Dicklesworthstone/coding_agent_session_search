@@ -8530,6 +8530,32 @@ fn run_quarantine_command(cmd: QuarantineCommand, cli: &Cli) -> CliResult<()> {
 /// `cass quarantine retry`: a bounded, resumable retry of retry-eligible
 /// quarantined conversations (#292 ask #3). Dry-run emits the exact plan;
 /// `--apply` reparses and persists each planned conversation by quarantine key.
+fn quarantine_apply_cli_error(operation: &str, err: anyhow::Error) -> CliError {
+    let rendered = format!("{err:#}");
+    if error_chain_indicates_active_cass_index(&rendered) {
+        return CliError {
+            code: 7,
+            kind: "lock-busy",
+            message: format!(
+                "quarantine {operation} could not start because another index/watch run is active: {rendered}"
+            ),
+            hint: Some(
+                "Wait for the active index/watch process to finish, then retry the quarantine command."
+                    .to_string(),
+            ),
+            retryable: true,
+        };
+    }
+
+    CliError {
+        code: 9,
+        kind: "quarantine",
+        message: format!("quarantine {operation} failed: {rendered}"),
+        hint: Some("Run `cass quarantine list --json` to inspect current entries.".to_string()),
+        retryable: false,
+    }
+}
+
 fn run_quarantine_retry_command(
     data_dir_override: Option<PathBuf>,
     max_attempts: Option<usize>,
@@ -8584,16 +8610,8 @@ fn run_quarantine_retry_command(
         return Ok(());
     }
 
-    let report =
-        crate::indexer::run_quarantine_retry(&data_dir, &config, true).map_err(|err| CliError {
-            code: 9,
-            kind: "quarantine",
-            message: format!("quarantine retry failed: {err}"),
-            hint: Some(
-                "Run `cass quarantine list --json` to inspect entries, then retry.".to_string(),
-            ),
-            retryable: false,
-        })?;
+    let report = crate::indexer::run_quarantine_retry(&data_dir, &config, true)
+        .map_err(|err| quarantine_apply_cli_error("retry", err))?;
 
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
@@ -8735,6 +8753,10 @@ fn run_quarantine_clear(
     use crate::indexer::quarantine::{QuarantineKey, QuarantineState};
 
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
+    let _mutation_guard = apply
+        .then(|| crate::indexer::acquire_quarantine_mutation_lock(&data_dir))
+        .transpose()
+        .map_err(|err| quarantine_apply_cli_error("clear", err))?;
     let mut state = QuarantineState::load(&data_dir);
 
     // Collect the keys that match the optional conversation-id substring
@@ -8750,16 +8772,16 @@ fn run_quarantine_clear(
         .collect();
 
     let mut cleared = 0usize;
-    let mut save_error: Option<String> = None;
     if apply && !matched.is_empty() {
         for key in &matched {
             if state.clear(key) {
                 cleared += 1;
             }
         }
-        if let Err(err) = state.save(&data_dir) {
-            save_error = Some(err.to_string());
-        }
+        state
+            .save(&data_dir)
+            .map_err(anyhow::Error::from)
+            .map_err(|err| quarantine_apply_cli_error("clear", err))?;
     }
 
     let matched_json: Vec<serde_json::Value> = matched
@@ -8775,13 +8797,9 @@ fn run_quarantine_clear(
     let recommended_action = if matched.is_empty() {
         "No quarantine entries match. Nothing to clear.".to_string()
     } else if apply {
-        if let Some(err) = &save_error {
-            format!("Cleared {cleared} entr(ies) in memory but failed to persist: {err}")
-        } else {
-            format!(
-                "Cleared {cleared} quarantine entr(ies). They will be re-attempted on the next index/watch pass."
-            )
-        }
+        format!(
+            "Cleared {cleared} quarantine entr(ies). They will be re-attempted on the next index/watch pass."
+        )
     } else {
         format!(
             "{} quarantine entr(ies) match. Re-run with --apply to clear them.",
@@ -8806,7 +8824,7 @@ fn run_quarantine_clear(
             "filter": filter,
             "matched": matched.len(),
             "cleared": cleared,
-            "persist_error": save_error,
+            "persist_error": null,
             "entries": matched_json,
             "recommended_action": recommended_action,
         });
