@@ -392,11 +392,11 @@ pub(crate) fn message_lookup_trace_snapshot() -> MessageLookupTraceCounters {
     }
 }
 
-pub(crate) struct DefaultDeferAnalyticsUpdatesGuard {
+pub(crate) struct DeferAnalyticsUpdatesGuard {
     depth: &'static AtomicUsize,
 }
 
-impl Drop for DefaultDeferAnalyticsUpdatesGuard {
+impl Drop for DeferAnalyticsUpdatesGuard {
     fn drop(&mut self) {
         self.depth.fetch_sub(1, Ordering::SeqCst);
     }
@@ -404,12 +404,12 @@ impl Drop for DefaultDeferAnalyticsUpdatesGuard {
 
 fn defer_analytics_updates_guard_for(
     depth: &'static AtomicUsize,
-) -> DefaultDeferAnalyticsUpdatesGuard {
+) -> DeferAnalyticsUpdatesGuard {
     depth.fetch_add(1, Ordering::SeqCst);
-    DefaultDeferAnalyticsUpdatesGuard { depth }
+    DeferAnalyticsUpdatesGuard { depth }
 }
 
-pub(crate) fn default_defer_analytics_updates_guard() -> DefaultDeferAnalyticsUpdatesGuard {
+pub(crate) fn defer_analytics_updates_guard() -> DeferAnalyticsUpdatesGuard {
     defer_analytics_updates_guard_for(&DEFER_ANALYTICS_UPDATES_GUARD_DEPTH)
 }
 
@@ -14464,13 +14464,25 @@ fn defer_storage_lexical_updates_enabled() -> bool {
 }
 
 fn defer_analytics_updates_enabled() -> bool {
-    if env_flag_enabled("CASS_DEFER_ANALYTICS_UPDATES") {
+    resolve_defer_analytics_updates(
+        env_flag_enabled("CASS_DEFER_ANALYTICS_UPDATES"),
+        env_flag_enabled("CASS_INLINE_ANALYTICS_UPDATES"),
+        DEFER_ANALYTICS_UPDATES_GUARD_DEPTH.load(Ordering::SeqCst) > 0,
+    )
+}
+
+fn resolve_defer_analytics_updates(
+    explicit_defer: bool,
+    explicit_inline: bool,
+    ambient_defer: bool,
+) -> bool {
+    if explicit_defer {
         return true;
     }
-    if env_flag_enabled("CASS_INLINE_ANALYTICS_UPDATES") {
+    if explicit_inline {
         return false;
     }
-    DEFER_ANALYTICS_UPDATES_GUARD_DEPTH.load(Ordering::SeqCst) > 0
+    ambient_defer
 }
 
 enum ConversationInsertStatus {
@@ -19290,54 +19302,12 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn analytics_defer_default_can_be_overridden_explicitly() {
-        {
-            let _defer_env = unset_env_var("CASS_DEFER_ANALYTICS_UPDATES");
-            let _inline_env = unset_env_var("CASS_INLINE_ANALYTICS_UPDATES");
-            assert!(
-                !defer_analytics_updates_enabled(),
-                "analytics should stay inline when neither env nor index-run default requests deferral"
-            );
-
-            let _defer = set_env_var("CASS_DEFER_ANALYTICS_UPDATES", "no");
-            assert!(
-                !defer_analytics_updates_enabled(),
-                "false-like explicit defer value must not force analytics deferral"
-            );
-        }
-
-        let _defer_env = unset_env_var("CASS_DEFER_ANALYTICS_UPDATES");
-        let _inline_env = unset_env_var("CASS_INLINE_ANALYTICS_UPDATES");
-        let _default_guard = default_defer_analytics_updates_guard();
-        assert!(
-            defer_analytics_updates_enabled(),
-            "index-run default should defer analytics when no explicit env override is set"
-        );
-
-        {
-            let _inline = set_env_var("CASS_INLINE_ANALYTICS_UPDATES", "1");
-            assert!(
-                !defer_analytics_updates_enabled(),
-                "truthy inline override should restore inline analytics writes"
-            );
-        }
-
-        {
-            let _inline = set_env_var("CASS_INLINE_ANALYTICS_UPDATES", "no");
-            assert!(
-                defer_analytics_updates_enabled(),
-                "false-like inline override must not accidentally force inline analytics"
-            );
-        }
-
-        {
-            let _defer = set_env_var("CASS_DEFER_ANALYTICS_UPDATES", "no");
-            assert!(
-                defer_analytics_updates_enabled(),
-                "false-like explicit defer value should leave the index-run default in effect"
-            );
-        }
+    fn analytics_defer_precedence_is_explicit() {
+        assert!(!resolve_defer_analytics_updates(false, false, false));
+        assert!(resolve_defer_analytics_updates(false, false, true));
+        assert!(resolve_defer_analytics_updates(true, false, false));
+        assert!(resolve_defer_analytics_updates(true, true, false));
+        assert!(!resolve_defer_analytics_updates(false, true, true));
     }
 
     #[test]
