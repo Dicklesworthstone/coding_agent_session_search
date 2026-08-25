@@ -912,7 +912,6 @@ const EXPORT_PUBLISH_JOURNAL_MAX_BYTES: u64 = 16 * 1024;
 #[cfg(any(windows, test))]
 const EXPORT_PUBLISH_BACKUP_SCAN_LIMIT: usize = 65_536;
 
-#[derive(Debug)]
 struct ExportPublishGuard {
     final_path: PathBuf,
     lock_path: PathBuf,
