@@ -8527,9 +8527,6 @@ fn run_quarantine_command(cmd: QuarantineCommand, cli: &Cli) -> CliResult<()> {
     }
 }
 
-/// `cass quarantine retry`: a bounded, resumable retry of retry-eligible
-/// quarantined conversations (#292 ask #3). Dry-run emits the exact plan;
-/// `--apply` reparses and persists each planned conversation by quarantine key.
 fn quarantine_apply_cli_error(operation: &str, err: anyhow::Error) -> CliError {
     let rendered = format!("{err:#}");
     if error_chain_indicates_active_cass_index(&rendered) {
@@ -8556,6 +8553,9 @@ fn quarantine_apply_cli_error(operation: &str, err: anyhow::Error) -> CliError {
     }
 }
 
+/// `cass quarantine retry`: a bounded, resumable retry of retry-eligible
+/// quarantined conversations (#292 ask #3). Dry-run emits the exact plan;
+/// `--apply` reparses and persists each planned conversation by quarantine key.
 fn run_quarantine_retry_command(
     data_dir_override: Option<PathBuf>,
     max_attempts: Option<usize>,

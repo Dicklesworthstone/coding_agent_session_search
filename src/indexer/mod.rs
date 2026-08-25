@@ -24009,7 +24009,13 @@ pub fn plan_quarantine_retry(
 /// cleanup during drop.
 pub(crate) struct QuarantineMutationGuard {
     _heartbeat: IndexRunLockHeartbeat,
-    _lock: IndexRunLockGuard,
+    lock: IndexRunLockGuard,
+}
+
+impl QuarantineMutationGuard {
+    fn mark_progress(&self) {
+        bump_index_run_lock_progress_atomic(&self.lock.last_progress_at_ms_atomic);
+    }
 }
 
 pub(crate) fn acquire_quarantine_mutation_lock(
@@ -24026,7 +24032,7 @@ pub(crate) fn acquire_quarantine_mutation_lock(
     );
     Ok(QuarantineMutationGuard {
         _heartbeat: heartbeat,
-        _lock: lock,
+        lock,
     })
 }
 
@@ -24069,7 +24075,16 @@ pub fn run_quarantine_retry(
         config,
         &source_missing,
         now,
-        |key| targeted_quarantine_retry(data_dir, key, retry_sources.get(key)),
+        |key| {
+            if let Some(guard) = &_mutation_guard {
+                guard.mark_progress();
+            }
+            let result = targeted_quarantine_retry(data_dir, key, retry_sources.get(key));
+            if let Some(guard) = &_mutation_guard {
+                guard.mark_progress();
+            }
+            result
+        },
     );
 
     // Persist the structured state (the durable resume checkpoint) and clear the
