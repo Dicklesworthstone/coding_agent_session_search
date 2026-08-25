@@ -13482,7 +13482,7 @@ pub fn run_index(
     // and lexical assets; set CASS_INLINE_ANALYTICS_UPDATES=1 to restore the
     // old inline analytics writes for targeted maintenance runs.
     let _defer_analytics_guard =
-        crate::storage::sqlite::default_defer_analytics_updates_guard(true);
+        crate::storage::sqlite::default_defer_analytics_updates_guard();
     set_progress_last_error(opts.progress.as_ref(), None);
     let initial_lock_mode = if opts.watch {
         SearchMaintenanceMode::WatchStartup
