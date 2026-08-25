@@ -486,14 +486,12 @@ When the wizard installs `cass` on remote machines, it uses an intelligent fallb
 | 3 | **cargo install** | ~5min | Rust toolchain, 1GB disk, 2GB RAM |
 | 4 | **Full bootstrap** | ~10min | curl, 1GB disk, 2GB RAM (installs rustup) |
 
-> **crates.io is stale (GH#416):** the `coding-agent-search` crate on
-> crates.io is stuck at **0.6.13** and does not reflect current behaviour —
-> `cargo install coding-agent-search` from the registry installs an old
-> version. Use the installer, a GitHub Release binary, Homebrew/Scoop, or
-> `cargo install --git https://github.com/Dicklesworthstone/coding_agent_session_search`
-> instead. Registry publishing stays blocked until the `frankensearch`
-> dependency chain is publishable (its remaining git-sourced components
-> cannot currently be published under their crate names).
+> **crates.io publishing resumed at 0.7.0 (GH#416):** the long-stale
+> registry gap (0.6.13, published before the Quill/OMP era) is closed — the
+> entire dependency chain now resolves from crates.io (`frankensearch
+> 0.4.0`, the `frankentorch-*` family, `frankenhnsw`), so
+> `cargo install coding-agent-search` builds the current line again. The
+> installer and GitHub Release binaries remain the fastest paths.
 
 **Resource Requirements**:
 - Minimum 1GB disk space for installation
