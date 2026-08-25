@@ -20,6 +20,17 @@ fn open_db(path: &Path) -> TestResult<Connection> {
     Ok(Connection::open(path_str.as_ref())?)
 }
 
+/// Staged-export verifiers must not dirty the artifact they attest: a
+/// read-write FrankenSQLite open stamps `.fsqlite-migration-state` next to
+/// the database, which the engine then rejects as a verifier-created sidecar.
+fn open_db_readonly(path: &Path) -> TestResult<Connection> {
+    let path_str = path.to_string_lossy();
+    Ok(coding_agent_search::franken_sync::compat::open_with_flags(
+        path_str.as_ref(),
+        coding_agent_search::franken_sync::compat::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?)
+}
+
 fn query_i64(conn: &Connection, sql: &str) -> TestResult<i64> {
     Ok(conn.query_row_map(sql, &[], |row: &FrankenRow| row.get_typed(0))?)
 }
@@ -514,14 +525,10 @@ fn export_engine_applies_review_exclusions_before_writing_any_payload_surface() 
     insert_test_data(&src_conn).unwrap();
 
     src_conn
-        .execute(
-            "UPDATE conversations SET title = 'DropWorkspace7xy' WHERE id = 1",
-        )
+        .execute("UPDATE conversations SET title = 'DropWorkspace7xy' WHERE id = 1")
         .unwrap();
     src_conn
-        .execute(
-            "UPDATE conversations SET title = 'DropConversation7xy' WHERE id = 3",
-        )
+        .execute("UPDATE conversations SET title = 'DropConversation7xy' WHERE id = 3")
         .unwrap();
     src_conn
         .execute("UPDATE conversations SET title = 'DropPattern7xy' WHERE id = 4")
@@ -571,7 +578,7 @@ fn export_engine_applies_review_exclusions_before_writing_any_payload_surface() 
             },
             None,
             |staged_db_path| {
-                let staged_conn = open_db(staged_db_path)?;
+                let staged_conn = open_db_readonly(staged_db_path)?;
                 assert_review_exclusion_fixture_payload(&staged_conn);
                 Ok(())
             },
@@ -930,9 +937,13 @@ fn export_engine_preserves_existing_output_when_staged_verifier_rejects() {
     };
     let engine = ExportEngine::new(&source_path, &output_path, filter);
     let error = engine
-        .execute_verified(|_, _| {}, None, |_| -> anyhow::Result<()> {
-            anyhow::bail!("secret approval rejected staged generation")
-        })
+        .execute_verified(
+            |_, _| {},
+            None,
+            |_| -> anyhow::Result<()> {
+                anyhow::bail!("secret approval rejected staged generation")
+            },
+        )
         .expect_err("rejected staged export must not publish");
 
     assert!(error.to_string().contains("verification failed"));
@@ -976,12 +987,16 @@ fn export_engine_rejects_sidecar_created_by_staged_verifier() {
     };
     let engine = ExportEngine::new(&source_path, &output_path, filter);
     let error = engine
-        .execute_verified(|_, _| {}, None, |staged_path| {
-            let mut sidecar = staged_path.as_os_str().to_os_string();
-            sidecar.push("-wal-cert-head");
-            std::fs::write(sidecar, b"verifier-created sidecar")?;
-            Ok(())
-        })
+        .execute_verified(
+            |_, _| {},
+            None,
+            |staged_path| {
+                let mut sidecar = staged_path.as_os_str().to_os_string();
+                sidecar.push("-wal-cert-head");
+                std::fs::write(sidecar, b"verifier-created sidecar")?;
+                Ok(())
+            },
+        )
         .expect_err("a verifier-created sidecar must block main-file-only publication");
 
     let message = format!("{error:#}");
@@ -1056,13 +1071,25 @@ fn export_engine_reads_counts_messages_and_snippets_from_one_snapshot() {
         .unwrap();
 
     assert!(inserted.get(), "test mutation must execute");
-    assert_eq!(query_i64(&writer, "SELECT COUNT(*) FROM messages").unwrap(), 15);
-    assert_eq!(query_i64(&writer, "SELECT COUNT(*) FROM snippets").unwrap(), 2);
+    assert_eq!(
+        query_i64(&writer, "SELECT COUNT(*) FROM messages").unwrap(),
+        15
+    );
+    assert_eq!(
+        query_i64(&writer, "SELECT COUNT(*) FROM snippets").unwrap(),
+        2
+    );
     assert_eq!(stats.messages_processed, 14);
 
     let exported = open_db(&output_path).unwrap();
-    assert_eq!(query_i64(&exported, "SELECT COUNT(*) FROM messages").unwrap(), 14);
-    assert_eq!(query_i64(&exported, "SELECT COUNT(*) FROM snippets").unwrap(), 1);
+    assert_eq!(
+        query_i64(&exported, "SELECT COUNT(*) FROM messages").unwrap(),
+        14
+    );
+    assert_eq!(
+        query_i64(&exported, "SELECT COUNT(*) FROM snippets").unwrap(),
+        1
+    );
     assert_eq!(
         query_i64(
             &exported,

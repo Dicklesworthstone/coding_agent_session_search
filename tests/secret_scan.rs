@@ -312,10 +312,7 @@ mod tests {
     }
 
     fn aws_session_fixture() -> String {
-        fixture(&[
-            "IQoJb3JpZ2luX2VjEExampleSessionToken",
-            "1234567890+/=",
-        ])
+        fixture(&["IQoJb3JpZ2luX2VjEExampleSessionToken", "1234567890+/="])
     }
 
     fn slack_xoxo_fixture() -> String {
@@ -694,12 +691,8 @@ mod tests {
             "cluster.example.net",
             "production",
         );
-        let amqp_url = database_url_fixture(
-            "amqp",
-            "worker:credential",
-            "queue.example.net",
-            "vhost",
-        );
+        let amqp_url =
+            database_url_fixture("amqp", "worker:credential", "queue.example.net", "vhost");
         let content = format!(
             "{} {} {} aws_session_token={} {} {} {} {}",
             project_oai_fixture(),
@@ -1053,8 +1046,7 @@ mod tests {
 
         let prefix_config =
             SecretScanConfig::from_inputs_with_env(std::slice::from_ref(&prefix), &[], false)?;
-        let prefix_report =
-            scan_database(&db_path, &no_filters(), &prefix_config, None, None)?;
+        let prefix_report = scan_database(&db_path, &no_filters(), &prefix_config, None, None)?;
         assert!(
             prefix_report
                 .findings
@@ -1187,7 +1179,10 @@ mod tests {
         let error = scan(&db_path).expect_err("malformed legacy metadata must fail closed");
         let message = error.to_string();
         assert!(message.contains("conversations.metadata_json"), "{error:#}");
-        assert!(!message.contains(&short_pin), "diagnostic leaked metadata value");
+        assert!(
+            !message.contains(&short_pin),
+            "diagnostic leaked metadata value"
+        );
         Ok(())
     }
 
@@ -1222,17 +1217,10 @@ mod tests {
     fn metadata_bin_with_trailing_bytes_fails_closed() -> Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
-        let mut metadata_with_trailing =
-            rmp_serde::to_vec(&serde_json::json!({ "safe": true }))?;
+        let mut metadata_with_trailing = rmp_serde::to_vec(&serde_json::json!({ "safe": true }))?;
         metadata_with_trailing.push(0xc1);
         let safe_extra = rmp_serde::to_vec(&serde_json::json!({ "safe": true }))?;
-        setup_db_with_binary_metadata(
-            &db_path,
-            "{}",
-            &metadata_with_trailing,
-            "{}",
-            &safe_extra,
-        )?;
+        setup_db_with_binary_metadata(&db_path, "{}", &metadata_with_trailing, "{}", &safe_extra)?;
 
         let error = scan(&db_path).expect_err("trailing metadata bytes must fail closed");
         let message = error.to_string();
@@ -1246,16 +1234,9 @@ mod tests {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("scan.db");
         let safe_metadata = rmp_serde::to_vec(&serde_json::json!({ "safe": true }))?;
-        let mut extra_with_trailing =
-            rmp_serde::to_vec(&serde_json::json!({ "safe": true }))?;
+        let mut extra_with_trailing = rmp_serde::to_vec(&serde_json::json!({ "safe": true }))?;
         extra_with_trailing.push(0xc1);
-        setup_db_with_binary_metadata(
-            &db_path,
-            "{}",
-            &safe_metadata,
-            "{}",
-            &extra_with_trailing,
-        )?;
+        setup_db_with_binary_metadata(&db_path, "{}", &safe_metadata, "{}", &extra_with_trailing)?;
 
         let error = scan(&db_path).expect_err("trailing message metadata bytes must fail closed");
         let message = error.to_string();
@@ -1293,6 +1274,10 @@ mod tests {
             CREATE TABLE snippets (
                 id INTEGER PRIMARY KEY,
                 message_id INTEGER NOT NULL,
+                file_path TEXT,
+                start_line INTEGER,
+                end_line INTEGER,
+                language TEXT,
                 snippet_text TEXT NOT NULL
             );
             INSERT INTO agents (id, slug) VALUES (1, 'codex');
@@ -1766,16 +1751,18 @@ mod tests {
             "-----BEGIN OPENSSH PRIVATE KEY-----\n{private_body}\n-----END OPENSSH PRIVATE KEY-----"
         );
         let denied_secret = "INTERNAL_SECRET_ABC123XYZ789";
-        let entropy_secret =
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let entropy_secret = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let content = format!(
             "safe prefix {focal} private {private_block} denied {denied_secret} entropy {entropy_secret} safe suffix"
         );
         setup_db(&db_path, &content)?;
 
         let raw_denylist = "INTERNAL_SECRET_[A-Z0-9]+".to_string();
-        let mut config =
-            SecretScanConfig::from_inputs_with_env(&[], std::slice::from_ref(&raw_denylist), false)?;
+        let mut config = SecretScanConfig::from_inputs_with_env(
+            &[],
+            std::slice::from_ref(&raw_denylist),
+            false,
+        )?;
         config.context_bytes = content.len() * 2;
         let report = scan_database(&db_path, &no_filters(), &config, None, None)?;
         assert!(

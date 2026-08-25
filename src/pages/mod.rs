@@ -52,8 +52,7 @@ const SQLITE_CONTENT_ARTIFACT_SUFFIXES: &[&str] = &[
 ];
 
 const SQLITE_LOCK_SUFFIXES: &[&str] = &["-lock-shared", "-lock-reserved", "-lock-pending"];
-const SQLITE_VFS_LOCK_ROOT_SUFFIXES: &[&str] =
-    &["-journal", "-wal", "-wal-cert", "-wal-cert-head"];
+const SQLITE_VFS_LOCK_ROOT_SUFFIXES: &[&str] = &["-journal", "-wal", "-wal-cert", "-wal-cert-head"];
 const SQLITE_WAL_SEGMENT_DIRECTORY_ENTRY_LIMIT: usize = 65_536;
 const SQLITE_WAL_SEGMENT_MATCH_LIMIT: usize = 4_096;
 
@@ -129,11 +128,9 @@ fn sqlite_wal_segment_artifact_paths(path: &Path) -> Result<Vec<PathBuf>> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let db_name = path
-        .file_name()
-        .ok_or_else(|| {
-            anyhow::anyhow!("SQLite artifact path has no file name: {}", path.display())
-        })?;
+    let db_name = path.file_name().ok_or_else(|| {
+        anyhow::anyhow!("SQLite artifact path has no file name: {}", path.display())
+    })?;
     // `fsqlite-wal` 0.3.8's `segment_path` and `list_segments` both derive
     // this filename through `to_string_lossy()`. Mirror that producer rule so
     // a non-UTF-8 database basename cannot hide its actual UTF-8 segment name.
@@ -186,6 +183,31 @@ fn sqlite_artifact_paths(path: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = sqlite_fixed_artifact_paths(path);
     paths.extend(sqlite_wal_segment_artifact_paths(path)?);
     Ok(paths)
+}
+
+/// FrankenSQLite namespace identity records (`-fsqlite-ns-gate`,
+/// `-fsqlite-ns-use`) are stamped next to any database the VFS touches —
+/// including a `VACUUM INTO` target and a verifier's read-only probe — and
+/// persist as quiescent records after every clean close. They hold no
+/// database content.
+fn is_fsqlite_namespace_identity_record(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with("-fsqlite-ns-gate") || name.ends_with("-fsqlite-ns-use"))
+}
+
+/// The artifact family minus FrankenSQLite's namespace identity records.
+///
+/// Main-file-only attestations and destination replacement guards must use
+/// this set: the identity records are unavoidable runtime droppings, never
+/// payload, so refusing on them would refuse every FrankenSQLite-built
+/// artifact. Whole-family cleanup keeps using [`sqlite_artifact_paths`] so
+/// the records are still removed with their database.
+fn sqlite_content_bearing_artifact_paths(path: &Path) -> Result<Vec<PathBuf>> {
+    Ok(sqlite_artifact_paths(path)?
+        .into_iter()
+        .filter(|sidecar| !is_fsqlite_namespace_identity_record(sidecar))
+        .collect())
 }
 
 fn ensure_real_directory(path: &Path, metadata: &Metadata, label: &str) -> Result<()> {

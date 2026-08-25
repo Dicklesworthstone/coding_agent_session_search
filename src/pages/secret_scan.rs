@@ -260,8 +260,12 @@ static BUILTIN_PATTERNS: Lazy<Vec<SecretPattern>> = Lazy::new(|| {
     ]
 });
 
+// `=` is only valid as base64 *padding*, so keep it terminal. Putting it in
+// the repeated class made one candidate span an entire `key=value` assignment,
+// and the Medium entropy finding then shadowed the assignment-pattern kind
+// (e.g. `generic_api_key`) in overlap dedup.
 static ENTROPY_BASE64_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"[A-Za-z0-9+/=_-]{20,}").expect("entropy base64 regex"));
+    Lazy::new(|| Regex::new(r"[A-Za-z0-9+/_-]{20,}={0,2}").expect("entropy base64 regex"));
 static ENTROPY_HEX_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\b[A-Fa-f0-9]{32,}\b").expect("entropy hex regex"));
 
@@ -354,8 +358,7 @@ impl SecretScanSchema {
         }
 
         let has_archive_agent = table_has_column(conn, "conversations", "agent_id")?;
-        let has_archive_workspace =
-            table_has_column(conn, "conversations", "workspace_id")?;
+        let has_archive_workspace = table_has_column(conn, "conversations", "workspace_id")?;
         if has_archive_agent && has_archive_workspace {
             return Ok(Self::Archive);
         }
@@ -437,9 +440,7 @@ pub fn scan_staged_export_database<P: AsRef<Path>>(
     ensure_staged_export_has_no_sidecars(db_path, "after post-scan hashing")?;
 
     if digest_before != digest_after {
-        bail!(
-            "Staged Pages export changed while its secret scan was running; refusing approval"
-        );
+        bail!("Staged Pages export changed while its secret scan was running; refusing approval");
     }
     if report.summary.truncated {
         bail!(
@@ -454,7 +455,11 @@ pub fn scan_staged_export_database<P: AsRef<Path>>(
 }
 
 fn ensure_staged_export_has_no_sidecars(db_path: &Path, phase: &str) -> Result<()> {
-    for sidecar_path in sqlite_artifact_paths(db_path)? {
+    // FrankenSQLite namespace identity records are exempt: the VFS stamps
+    // them next to any database it touches (including this scan's own
+    // read-only open) and they hold no database content, so they cannot
+    // change what the attested main file contains.
+    for sidecar_path in super::sqlite_content_bearing_artifact_paths(db_path)? {
         match std::fs::symlink_metadata(&sidecar_path) {
             Ok(_) => {
                 bail!(
@@ -477,8 +482,12 @@ fn ensure_staged_export_has_no_sidecars(db_path: &Path, phase: &str) -> Result<(
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
-    let mut file = std::fs::File::open(path)
-        .with_context(|| format!("Failed to open staged export {} for hashing", path.display()))?;
+    let mut file = std::fs::File::open(path).with_context(|| {
+        format!(
+            "Failed to open staged export {} for hashing",
+            path.display()
+        )
+    })?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
@@ -513,13 +522,9 @@ fn scan_database_with_cancel_check<P: AsRef<Path>>(
     conn.execute("BEGIN TRANSACTION")
         .context("Failed to start secret-scan read snapshot")?;
 
-    let scan_result = scan_database_snapshot(
-        &conn,
-        filters,
-        config,
-        progress,
-        |checkpoint| cancellation_requested(checkpoint),
-    );
+    let scan_result = scan_database_snapshot(&conn, filters, config, progress, |checkpoint| {
+        cancellation_requested(checkpoint)
+    });
     let rollback_result = conn
         .execute("ROLLBACK")
         .map(|_| ())
@@ -582,9 +587,7 @@ fn scan_database_snapshot(
             SecretScanCheckpoint::BeforeConversationPage,
         )?;
         let page_where = bounded_keyset_page_where(&conv_where, "c.id", last_conv_id);
-        let conv_sql = format!(
-            "{conv_select}{page_where} ORDER BY c.id LIMIT {SCAN_PAGE_ROWS}"
-        );
+        let conv_sql = format!("{conv_select}{page_where} ORDER BY c.id LIMIT {SCAN_PAGE_ROWS}");
         let mut page_params = conv_params.clone();
         page_params.push(ParamValue::from(conv_high_watermark));
         if let Some(last_id) = last_conv_id {
@@ -704,11 +707,14 @@ fn scan_database_snapshot(
 
     if !truncated {
         let has_extra_json = table_has_column(conn, "messages", "extra_json")?;
-        let extra_json_projection = if has_extra_json { "m.extra_json" } else { "NULL" };
+        let extra_json_projection = if has_extra_json {
+            "m.extra_json"
+        } else {
+            "NULL"
+        };
         let has_extra_bin = table_has_column(conn, "messages", "extra_bin")?;
         let extra_bin_projection = if has_extra_bin { "m.extra_bin" } else { "NULL" };
-        let has_attachment_refs =
-            table_has_column(conn, "messages", "attachment_refs")?;
+        let has_attachment_refs = table_has_column(conn, "messages", "attachment_refs")?;
         let attachment_refs_projection =
             if schema == SecretScanSchema::PagesExport && has_attachment_refs {
                 "m.attachment_refs"
@@ -740,8 +746,7 @@ fn scan_database_snapshot(
                 SecretScanCheckpoint::BeforeMessagePage,
             )?;
             let page_where = bounded_keyset_page_where(&msg_where, "m.id", last_msg_id);
-            let msg_sql =
-                format!("{msg_select}{page_where} ORDER BY m.id LIMIT {SCAN_PAGE_ROWS}");
+            let msg_sql = format!("{msg_select}{page_where} ORDER BY m.id LIMIT {SCAN_PAGE_ROWS}");
             let mut page_params = msg_params.clone();
             page_params.push(ParamValue::from(msg_high_watermark));
             if let Some(last_id) = last_msg_id {
@@ -1023,10 +1028,7 @@ fn table_exists(conn: &crate::franken_sync::Connection, table_name: &str) -> Res
         .with_context(|| format!("Failed to inspect {table_name} schema for secret scan"))
 }
 
-fn table_max_id(
-    conn: &crate::franken_sync::Connection,
-    table_name: &str,
-) -> Result<Option<i64>> {
+fn table_max_id(conn: &crate::franken_sync::Connection, table_name: &str) -> Result<Option<i64>> {
     if !table_name
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
@@ -1092,10 +1094,12 @@ fn structured_metadata_scan_text(
             .with_context(|| {
                 format!("Failed to serialize decoded {binary_column} value for row {row_id}")
             })
-            .map(|text| Some(StructuredMetadataScan {
-                text,
-                value: Some(value),
-            }));
+            .map(|text| {
+                Some(StructuredMetadataScan {
+                    text,
+                    value: Some(value),
+                })
+            });
     }
 
     let Some(text) = legacy_json.filter(|text| !text.trim().is_empty()) else {
@@ -1213,9 +1217,7 @@ fn structured_value_contains_material(value: &serde_json::Value) -> bool {
             let trimmed = text.trim();
             !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case(REDACTED_CONTEXT)
         }
-        serde_json::Value::Array(values) => {
-            values.iter().any(structured_value_contains_material)
-        }
+        serde_json::Value::Array(values) => values.iter().any(structured_value_contains_material),
         serde_json::Value::Object(fields) => {
             fields.values().any(structured_value_contains_material)
         }
@@ -1503,6 +1505,12 @@ fn scan_text(
     // Entropy-based detection
     for mat in ENTROPY_BASE64_RE.find_iter(text) {
         let candidate = &text[mat.start()..mat.end()];
+        // A long pure-hex run belongs to the hex classifier below; classifying
+        // it here first would let the Medium base64 kind shadow the more
+        // specific `high_entropy_hex` kind in overlap dedup.
+        if candidate.len() >= 32 && candidate.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            continue;
+        }
         if is_base64_entropy_secret(candidate, config, true) {
             push_finding(
                 findings,
@@ -1570,9 +1578,7 @@ fn push_finding(
             existing.severity = candidate.severity;
             existing.kind = candidate.kind.to_string();
             existing.pattern = candidate.pattern.to_string();
-            existing.match_redacted = redact_token(
-                &candidate.text[candidate.start..candidate.end],
-            );
+            existing.match_redacted = redact_token(&candidate.text[candidate.start..candidate.end]);
             existing.context = redact_context(
                 candidate.text,
                 candidate.start,
@@ -1632,10 +1638,7 @@ fn redact_token(_token: &str) -> String {
     REDACTED_CONTEXT.to_string()
 }
 
-fn redact_report_provenance(
-    value: &Option<String>,
-    config: &SecretScanConfig,
-) -> Option<String> {
+fn redact_report_provenance(value: &Option<String>, config: &SecretScanConfig) -> Option<String> {
     value
         .as_deref()
         .map(|text| redact_report_slice(text, 0, text.len(), config, Vec::new()))
@@ -1904,8 +1907,7 @@ fn build_where_clause_for_columns(
 ) -> Result<(String, Vec<ParamValue>)> {
     for expression in [agent_expression, workspace_expression] {
         if !expression.chars().all(|ch| {
-            ch.is_ascii_alphanumeric()
-                || matches!(ch, '_' | '.' | '(' | ')' | ',' | '\'' | ' ')
+            ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '(' | ')' | ',' | '\'' | ' ')
         }) {
             bail!("Invalid SQLite expression while building secret-scan filters");
         }
@@ -2145,13 +2147,7 @@ mod tests {
         )
         .expect("construct test secret-scan config");
         let start = text.find(focal).expect("focal fixture offset");
-        let result = redact_context(
-            &text,
-            start,
-            start + focal.len(),
-            text.len() * 2,
-            &config,
-        );
+        let result = redact_context(&text, start, start + focal.len(), text.len() * 2, &config);
 
         assert!(!result.contains(allowlisted), "allowlisted neighbor leaked");
         assert!(!result.contains(denied), "denylisted neighbor leaked");
@@ -2223,12 +2219,8 @@ mod tests {
 
     #[test]
     fn structured_allowlist_requires_a_full_scalar_match() {
-        let config = SecretScanConfig::from_inputs_with_env(
-            &["SAFE".to_string()],
-            &[],
-            false,
-        )
-        .unwrap();
+        let config =
+            SecretScanConfig::from_inputs_with_env(&["SAFE".to_string()], &[], false).unwrap();
         assert!(is_fully_allowlisted("SAFE", &config));
         assert!(!is_fully_allowlisted("SAFE-real-secret", &config));
     }
@@ -2325,9 +2317,15 @@ mod tests {
     fn staged_export_scan_reads_flat_pages_schema_and_binds_digest() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let db_path = temp.path().join("export.db");
-        let conn = crate::franken_sync::Connection::open(db_path.to_string_lossy().as_ref())?;
+        // Match the production export flow: the staged scan target is a
+        // VACUUM INTO image that is never opened read-write, so it owns no
+        // WAL/journal sidecars. Building the fixture directly at `db_path`
+        // would leave an `export.db-wal` and trip the sidecar refusal.
+        let builder_path = temp.path().join("builder.db");
+        let conn = crate::franken_sync::Connection::open(builder_path.to_string_lossy().as_ref())?;
         conn.execute_batch(
             r#"
+            PRAGMA journal_mode = 'delete';
             CREATE TABLE conversations (
                 id INTEGER PRIMARY KEY,
                 agent TEXT NOT NULL,
@@ -2390,7 +2388,12 @@ mod tests {
             );
             "#,
         )?;
-        drop(conn);
+        conn.execute_batch(&format!(
+            "VACUUM INTO '{}';",
+            db_path.to_string_lossy().replace('\'', "''")
+        ))?;
+        conn.close()
+            .map_err(|error| anyhow::anyhow!("close staged export builder: {error}"))?;
 
         let config = SecretScanConfig::from_inputs_with_env(
             &[],
@@ -2430,7 +2433,9 @@ mod tests {
     #[test]
     fn staged_export_scan_rejects_unbound_sqlite_sidecars() -> Result<()> {
         let config = SecretScanConfig::from_inputs_with_env(&[], &[], false)?;
-        let artifact_paths = sqlite_fixed_artifact_paths(Path::new("export.db"));
+        let artifact_paths = sqlite_fixed_artifact_paths(Path::new("export.db"))
+            .into_iter()
+            .filter(|path| !crate::pages::is_fsqlite_namespace_identity_record(path));
         for relative_path in artifact_paths {
             let temp = tempfile::tempdir()?;
             let db_path = temp.path().join("export.db");
@@ -2455,6 +2460,20 @@ mod tests {
                 b"unbound sidecar sentinel",
                 "attestation rejection mutated sentinel {artifact_label}"
             );
+        }
+
+        // FrankenSQLite namespace identity records are unavoidable runtime
+        // droppings, not payload: their presence alone must not block a
+        // main-file-only attestation.
+        for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+            let temp = tempfile::tempdir()?;
+            let db_path = temp.path().join("export.db");
+            std::fs::write(&db_path, b"main-file sentinel")?;
+            std::fs::write(
+                temp.path().join(format!("export.db{suffix}")),
+                b"identity record",
+            )?;
+            ensure_staged_export_has_no_sidecars(&db_path, "before verification")?;
         }
         Ok(())
     }
@@ -2525,14 +2544,11 @@ mod tests {
             until_ts: None,
         };
         let config = SecretScanConfig::from_inputs_with_env(&[], &[], false)?;
-        let error = scan_database_with_cancel_check(
-            &db_path,
-            &filters,
-            &config,
-            None,
-            |checkpoint| checkpoint == SecretScanCheckpoint::AfterConversations,
-        )
-        .expect_err("page-boundary cancellation must abort instead of probing messages");
+        let error =
+            scan_database_with_cancel_check(&db_path, &filters, &config, None, |checkpoint| {
+                checkpoint == SecretScanCheckpoint::AfterConversations
+            })
+            .expect_err("page-boundary cancellation must abort instead of probing messages");
 
         assert!(
             error.to_string().contains("Secret scan cancelled"),
@@ -2754,7 +2770,10 @@ mod tests {
 
         let positions = ["critical", "high", "medium", "low"]
             .map(|label| encoded.find(label).expect("serialized severity label"));
-        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{encoded}");
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "{encoded}"
+        );
     }
 
     // =========================================================================
@@ -3054,12 +3073,9 @@ mod tests {
 
     #[test]
     fn scan_text_preserves_distinct_occurrences_with_identical_display_masks() {
-        let config = SecretScanConfig::from_inputs_with_env(
-            &[],
-            &[r"AA[0-9]{8}ZZ".to_string()],
-            false,
-        )
-        .unwrap();
+        let config =
+            SecretScanConfig::from_inputs_with_env(&[], &[r"AA[0-9]{8}ZZ".to_string()], false)
+                .unwrap();
         let ctx = ScanContext {
             agent: None,
             workspace: None,
@@ -3144,17 +3160,17 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].kind, "bearer_token");
         assert_eq!(findings[0].severity, SecretSeverity::High);
-        assert!(!truncated, "an overlapping upgrade must not consume capacity");
+        assert!(
+            !truncated,
+            "an overlapping upgrade must not consume capacity"
+        );
     }
 
     #[test]
     fn context_range_storage_excludes_matches_outside_the_window() {
-        let config = SecretScanConfig::from_inputs_with_env(
-            &[],
-            &[r"SECRET[0-9]{4}".to_string()],
-            false,
-        )
-        .unwrap();
+        let config =
+            SecretScanConfig::from_inputs_with_env(&[], &[r"SECRET[0-9]{4}".to_string()], false)
+                .unwrap();
         let text = (0..1_000)
             .map(|index| format!("SECRET{index:04} "))
             .collect::<String>();

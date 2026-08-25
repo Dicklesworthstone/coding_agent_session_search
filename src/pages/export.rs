@@ -3,9 +3,7 @@ use super::sqlite_artifact_paths;
 use super::{
     sqlite_content_artifact_paths, sqlite_fixed_artifact_paths, sqlite_runtime_artifact_paths,
 };
-use crate::franken_sync::compat::{
-    ConnectionExt, ParamValue, RowExt, Transaction, TransactionExt,
-};
+use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt, Transaction, TransactionExt};
 use crate::franken_sync::{Connection, Row as FrankenRow, params};
 use crate::pages::summary::ExclusionSet;
 use crate::ui::time_parser::parse_time_input;
@@ -139,11 +137,8 @@ impl ExportEngine {
         // brand-new on-disk connection permanently retains its bootstrap WAL;
         // the engine's bounded image contract therefore explicitly requires
         // VACUUM INTO rather than publishing an in-place writer database.
-        let builder_path = unpredictable_atomic_sidecar_path(
-            &output_path,
-            "builder",
-            "pages_export.db",
-        )?;
+        let builder_path =
+            unpredictable_atomic_sidecar_path(&output_path, "builder", "pages_export.db")?;
         let temp_output_path =
             unpredictable_atomic_sidecar_path(&output_path, "tmp", "pages_export.db")?;
         let mut retain_temp_on_replace_error = false;
@@ -152,9 +147,12 @@ impl ExportEngine {
         let result = (|| -> Result<(ExportStats, T)> {
             create_staged_export_file(&builder_path)?;
             builder_owned = true;
-            let output_path = builder_path.to_string_lossy().to_string();
+            // Deliberately NOT named `output_path`: shadowing the publish
+            // destination here once routed the final install onto the builder
+            // path (gh#418).
+            let builder_db_path = builder_path.to_string_lossy().to_string();
             let dest =
-                Connection::open(&output_path).context("Failed to create output database")?;
+                Connection::open(&builder_db_path).context("Failed to create output database")?;
 
             dest.execute_batch(
                 // Pages exports are encrypted/copied as one portable SQLite file.
@@ -574,8 +572,8 @@ impl ExportEngine {
             finalize_staged_sqlite_sidecars(&temp_output_path)
                 .context("Failed to finalize staged Pages export as one SQLite main file")?;
 
-            let verification = verifier(&temp_output_path)
-                .context("Staged Pages export verification failed")?;
+            let verification =
+                verifier(&temp_output_path).context("Staged Pages export verification failed")?;
             reject_existing_sqlite_sidecars(&temp_output_path, "verified staged database")
                 .context("Staged Pages export verifier left an unbound SQLite sidecar")?;
 
@@ -727,7 +725,12 @@ fn resolve_export_output_path(source_db_path: &Path, output_path: &Path) -> Resu
 
 fn existing_regular_files_share_identity(first: &Path, second: &Path) -> Result<bool> {
     if !std::fs::metadata(first)
-        .with_context(|| format!("Failed to inspect source identity probe {}", first.display()))?
+        .with_context(|| {
+            format!(
+                "Failed to inspect source identity probe {}",
+                first.display()
+            )
+        })?
         .is_file()
     {
         return Ok(false);
@@ -748,7 +751,12 @@ fn existing_regular_files_share_identity(first: &Path, second: &Path) -> Result<
         .with_context(|| format!("Failed to open source identity probe {}", first.display()))?;
     if !first_file
         .metadata()
-        .with_context(|| format!("Failed to inspect source identity probe {}", first.display()))?
+        .with_context(|| {
+            format!(
+                "Failed to inspect source identity probe {}",
+                first.display()
+            )
+        })?
         .is_file()
     {
         return Ok(false);
@@ -791,10 +799,7 @@ type MessageExportRow = (
     Option<String>,
 );
 
-fn table_columns_in_transaction(
-    conn: &Transaction<'_>,
-    table_name: &str,
-) -> Result<Vec<String>> {
+fn table_columns_in_transaction(conn: &Transaction<'_>, table_name: &str) -> Result<Vec<String>> {
     let pragma = format!("PRAGMA table_info({table_name})");
     conn.query_map_collect(&pragma, params![], |row: &FrankenRow| {
         row.get_typed::<String>(1)
@@ -907,6 +912,7 @@ const EXPORT_PUBLISH_JOURNAL_MAX_BYTES: u64 = 16 * 1024;
 #[cfg(any(windows, test))]
 const EXPORT_PUBLISH_BACKUP_SCAN_LIMIT: usize = 65_536;
 
+#[derive(Debug)]
 struct ExportPublishGuard {
     final_path: PathBuf,
     lock_path: PathBuf,
@@ -1203,16 +1209,16 @@ fn inspect_export_regular_file(path: &Path, label: &str) -> Result<ExportFileEvi
         .metadata()
         .with_context(|| format!("failed re-inspecting opened {label} {}", path.display()))?;
     if hashed_metadata.len() != metadata.len() {
-        bail!(
-            "{label} changed size while inspected: {}",
-            path.display()
-        );
+        bail!("{label} changed size while inspected: {}", path.display());
     }
 
     let final_path_metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("failed re-inspecting {label} {}", path.display()))?;
     if !final_path_metadata.file_type().is_file() {
-        bail!("{label} changed file type while inspected: {}", path.display());
+        bail!(
+            "{label} changed file type while inspected: {}",
+            path.display()
+        );
     }
     let path_probe = std::fs::File::open(path)
         .with_context(|| format!("failed re-opening {label} {}", path.display()))?;
@@ -1225,7 +1231,10 @@ fn inspect_export_regular_file(path: &Path, label: &str) -> Result<ExportFileEvi
             )
         })?;
     if path_identity != identity {
-        bail!("{label} changed identity while inspected: {}", path.display());
+        bail!(
+            "{label} changed identity while inspected: {}",
+            path.display()
+        );
     }
 
     Ok(ExportFileEvidence {
@@ -1243,11 +1252,7 @@ fn evidence_matches(
     actual.size_bytes == expected_size_bytes && actual.sha256 == expected_sha256
 }
 
-fn sync_export_regular_file(
-    path: &Path,
-    expected: &ExportFileEvidence,
-    label: &str,
-) -> Result<()> {
+fn sync_export_regular_file(path: &Path, expected: &ExportFileEvidence, label: &str) -> Result<()> {
     let before_sync = inspect_export_regular_file(path, label)?;
     if before_sync.identity != expected.identity
         || !evidence_matches(&before_sync, expected.size_bytes, &expected.sha256)
@@ -1278,7 +1283,12 @@ fn sync_export_regular_file(
     let path_probe = std::fs::File::open(path)
         .with_context(|| format!("failed re-opening {label} {} after sync", path.display()))?;
     let path_identity = crate::franken_sync::FileIdentity::from_file(&path_probe)
-        .with_context(|| format!("failed re-identifying {label} {} after sync", path.display()))?
+        .with_context(|| {
+            format!(
+                "failed re-identifying {label} {} after sync",
+                path.display()
+            )
+        })?
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "filesystem stopped exposing a stable identity for {label} {} after sync",
@@ -1335,10 +1345,7 @@ fn unpredictable_atomic_sidecar_path(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(fallback_name);
-    Ok(path.with_file_name(format!(
-        ".{file_name}.{suffix}.{}",
-        hex::encode(nonce)
-    )))
+    Ok(path.with_file_name(format!(".{file_name}.{suffix}.{}", hex::encode(nonce))))
 }
 
 #[cfg(any(windows, test))]
@@ -1873,7 +1880,10 @@ fn enforce_private_candidate_permissions(path: &Path) -> Result<()> {
     let path_metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("failed inspecting staged export {}", path.display()))?;
     if !path_metadata.file_type().is_file() {
-        bail!("staged Pages export is not a regular file: {}", path.display());
+        bail!(
+            "staged Pages export is not a regular file: {}",
+            path.display()
+        );
     }
     let file = std::fs::File::open(path)
         .with_context(|| format!("failed opening staged export {} for chmod", path.display()))?;
@@ -1881,7 +1891,10 @@ fn enforce_private_candidate_permissions(path: &Path) -> Result<()> {
         .metadata()
         .with_context(|| format!("failed inspecting staged export {}", path.display()))?;
     if !metadata.file_type().is_file() {
-        bail!("staged Pages export is not a regular file: {}", path.display());
+        bail!(
+            "staged Pages export is not a regular file: {}",
+            path.display()
+        );
     }
     if (path_metadata.dev(), path_metadata.ino()) != (metadata.dev(), metadata.ino()) {
         bail!(
@@ -1890,7 +1903,12 @@ fn enforce_private_candidate_permissions(path: &Path) -> Result<()> {
         );
     }
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("failed setting staged export {} to mode 0600", path.display()))?;
+        .with_context(|| {
+            format!(
+                "failed setting staged export {} to mode 0600",
+                path.display()
+            )
+        })?;
     file.sync_all().with_context(|| {
         format!(
             "failed syncing staged export {} after setting mode 0600",
@@ -1940,7 +1958,11 @@ fn enforce_private_candidate_permissions(path: &Path) -> Result<()> {
 /// readers observe a mixed or corrupt generation. The exporter cannot safely
 /// decide that an existing sidecar is stale, so preserve it and fail closed.
 fn reject_existing_sqlite_sidecars(path: &Path, artifact_label: &str) -> Result<()> {
-    for sidecar in sqlite_artifact_paths(path)? {
+    // Namespace identity records are exempt: FrankenSQLite stamps them next
+    // to every database it touches (VACUUM INTO targets included) and they
+    // carry no database content, so they cannot make a main-file-only
+    // artifact incomplete.
+    for sidecar in super::sqlite_content_bearing_artifact_paths(path)? {
         match std::fs::symlink_metadata(&sidecar) {
             Ok(_) => {
                 bail!(
@@ -2019,9 +2041,7 @@ fn recover_or_refuse_interrupted_export_publish(
 ) -> Result<()> {
     require_export_publish_guard(final_path, publish_guard)?;
     let Some(journal) = read_export_publish_journal(final_path)? else {
-        if let Some(unmarked_backup) =
-            first_unmarked_export_publish_backup(final_path, None)?
-        {
+        if let Some(unmarked_backup) = first_unmarked_export_publish_backup(final_path, None)? {
             bail!(
                 "unmarked Pages export recovery artifact {} was preserved; refusing to infer ownership or modify live path {}",
                 unmarked_backup.display(),
@@ -2044,11 +2064,7 @@ fn recover_or_refuse_interrupted_export_publish(
     let backup_evidence = if replacement_path_entry_exists(&backup_path)? {
         reject_existing_sqlite_sidecars(&backup_path, "publish-recovery backup")?;
         let evidence = inspect_export_regular_file(&backup_path, "publish-recovery backup")?;
-        if !evidence_matches(
-            &evidence,
-            journal.prior_size_bytes,
-            &journal.prior_sha256,
-        ) {
+        if !evidence_matches(&evidence, journal.prior_size_bytes, &journal.prior_sha256) {
             bail!(
                 "Pages export publish-recovery backup {} does not match the journaled prior generation; preserved it without mutation",
                 backup_path.display()
@@ -2088,11 +2104,7 @@ fn recover_or_refuse_interrupted_export_publish(
             })?;
             let restored = inspect_export_regular_file(final_path, "restored Pages export")?;
             if restored.identity != prior.identity
-                || !evidence_matches(
-                    &restored,
-                    journal.prior_size_bytes,
-                    &journal.prior_sha256,
-                )
+                || !evidence_matches(&restored, journal.prior_size_bytes, &journal.prior_sha256)
             {
                 bail!(
                     "restored Pages export {} does not retain the journaled prior-generation identity; preserved the journal",
@@ -2144,11 +2156,8 @@ fn recover_or_refuse_interrupted_export_publish(
             )
         }
         (Some(live), None) => {
-            let live_is_prior = evidence_matches(
-                &live,
-                journal.prior_size_bytes,
-                &journal.prior_sha256,
-            );
+            let live_is_prior =
+                evidence_matches(&live, journal.prior_size_bytes, &journal.prior_sha256);
             let live_is_candidate = evidence_matches(
                 &live,
                 journal.candidate_size_bytes,
@@ -2239,11 +2248,7 @@ fn replace_file_from_temp_via_backup(
     })?;
     let parked = inspect_export_regular_file(&backup_path, "parked prior Pages export")?;
     if parked.identity != prior.identity
-        || !evidence_matches(
-            &parked,
-            journal.prior_size_bytes,
-            &journal.prior_sha256,
-        )
+        || !evidence_matches(&parked, journal.prior_size_bytes, &journal.prior_sha256)
     {
         *retain_temp_on_error = true;
         bail!(
@@ -2280,11 +2285,7 @@ fn replace_file_from_temp_via_backup(
                     backup_path.display()
                 );
             }
-            sync_export_regular_file(
-                final_path,
-                &published,
-                "published Pages export candidate",
-            )?;
+            sync_export_regular_file(final_path, &published, "published Pages export candidate")?;
             sync_parent_directory(final_path).with_context(|| {
                 format!(
                     "new Pages export is live at {} and prior generation remains at {}, but publication could not be durably synced; journal preserved",
@@ -2348,11 +2349,7 @@ fn replace_file_from_temp_via_backup(
                             final_path.display()
                         );
                     }
-                    sync_export_regular_file(
-                        final_path,
-                        &restored,
-                        "restored prior Pages export",
-                    )?;
+                    sync_export_regular_file(final_path, &restored, "restored prior Pages export")?;
                     sync_parent_directory(final_path).with_context(|| {
                         format!(
                             "restored prior Pages export at {}, but could not durably sync the rollback; journal preserved",
@@ -3338,7 +3335,11 @@ mod tests {
             .expect_err("backup replacement must not move an untrusted link");
 
         assert!(format!("{error:#}").contains("not a regular file"));
-        assert!(std::fs::symlink_metadata(&final_path)?.file_type().is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&final_path)?
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(std::fs::read(&target_path)?, b"target generation");
 
         Ok(())
@@ -3363,7 +3364,10 @@ mod tests {
                 .and_then(|name| name.to_str())
                 .ok_or_else(|| anyhow::anyhow!("backup name is not UTF-8"))?;
             assert!(name.starts_with(".export.db.publish-backup."));
-            assert_eq!(name.rsplit_once('.').map(|(_, nonce)| nonce.len()), Some(32));
+            assert_eq!(
+                name.rsplit_once('.').map(|(_, nonce)| nonce.len()),
+                Some(32)
+            );
         }
         Ok(())
     }
@@ -3480,8 +3484,7 @@ mod tests {
         result?;
         #[cfg(windows)]
         {
-            let error =
-                result.expect_err("Windows finalization must preserve backup and journal");
+            let error = result.expect_err("Windows finalization must preserve backup and journal");
             assert!(format!("{error:#}").contains("backup and journal were preserved"));
         }
 
@@ -3569,7 +3572,11 @@ mod tests {
             .expect_err("publish lock acquisition must reject a pre-existing symlink");
 
         assert!(format!("{error:#}").contains("refused to open"));
-        assert!(std::fs::symlink_metadata(&lock_path)?.file_type().is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&lock_path)?
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(std::fs::read(&target_path)?, b"unowned lock bytes");
         Ok(())
     }
@@ -3637,7 +3644,10 @@ mod tests {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .ok_or_else(|| anyhow::anyhow!("candidate name is not UTF-8"))?;
-            assert!(name.starts_with(".export.db.tmp."), "unexpected name: {name}");
+            assert!(
+                name.starts_with(".export.db.tmp."),
+                "unexpected name: {name}"
+            );
             assert_eq!(
                 name.rsplit_once('.').map(|(_, nonce)| nonce.len()),
                 Some(32),
@@ -3766,7 +3776,9 @@ mod tests {
         );
         assert_eq!(std::fs::read(&replacement_target)?, b"unowned replacement");
         assert!(
-            std::fs::symlink_metadata(&staged_path)?.file_type().is_symlink(),
+            std::fs::symlink_metadata(&staged_path)?
+                .file_type()
+                .is_symlink(),
             "replacement symlink must be preserved"
         );
         assert_eq!(std::fs::read(&sidecar_path)?, b"unowned sidecar");
@@ -3836,9 +3848,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
         std::fs::write(&staged_path, b"staged main")?;
-        let marker_bytes = format!(
-            r#"{{"last_upgrade_version":1,"last_run_at":{now},"repairs_applied":[]}}"#
-        );
+        let marker_bytes =
+            format!(r#"{{"last_upgrade_version":1,"last_run_at":{now},"repairs_applied":[]}}"#);
         std::fs::write(&marker_path, marker_bytes.as_bytes())?;
 
         let error = finalize_staged_sqlite_sidecars(&staged_path)
@@ -3901,10 +3912,7 @@ mod tests {
              INSERT INTO exported VALUES (1, 'candidate row');",
         )?;
         let candidate_path_text = candidate_path.to_string_lossy();
-        builder.execute_compat(
-            "VACUUM INTO ?1;",
-            params![candidate_path_text.as_ref()],
-        )?;
+        builder.execute_compat("VACUUM INTO ?1;", params![candidate_path_text.as_ref()])?;
         builder.close()?;
         enforce_private_candidate_permissions(&candidate_path)?;
 
@@ -3997,7 +4005,10 @@ mod tests {
             let journal = read_export_publish_journal(&final_path)?
                 .ok_or_else(|| anyhow::anyhow!("Windows publish did not retain its journal"))?;
             let backup_path = journal_backup_path(&final_path, &journal)?;
-            assert!(backup_path.is_file(), "Windows publish lost its prior generation");
+            assert!(
+                backup_path.is_file(),
+                "Windows publish lost its prior generation"
+            );
             assert!(journal_path.is_file(), "Windows publish lost its journal");
         }
 
@@ -4041,7 +4052,7 @@ mod tests {
             message.contains(&backup_path.display().to_string()),
             "retained backup path was not reported: {message}"
         );
-        assert_eq!(std::fs::read(final_path)?, b"new live generation");
+        assert_eq!(std::fs::read(&final_path)?, b"new live generation");
         assert_eq!(std::fs::read(&backup_path)?, b"changed prior generation");
         assert!(
             export_publish_recovery_journal_path(&final_path).is_file(),
@@ -4119,12 +4130,8 @@ mod tests {
         );
 
         std::fs::write(&second_tmp, b"second").expect("write second temp");
-        let second_result = replace_file_from_temp(
-            &second_tmp,
-            &final_path,
-            &mut retain_temp_on_error,
-            &guard,
-        );
+        let second_result =
+            replace_file_from_temp(&second_tmp, &final_path, &mut retain_temp_on_error, &guard);
         #[cfg(not(windows))]
         second_result.expect("overwrite replace");
         #[cfg(windows)]
@@ -4142,7 +4149,11 @@ mod tests {
 
     #[test]
     fn replacement_rejects_existing_sqlite_sidecars_without_mutating_artifacts() -> Result<()> {
-        let artifact_paths = sqlite_fixed_artifact_paths(Path::new("export.db"));
+        // Namespace identity records are exempt from the rejection policy;
+        // see `sqlite_content_bearing_artifact_paths`.
+        let artifact_paths = sqlite_fixed_artifact_paths(Path::new("export.db"))
+            .into_iter()
+            .filter(|path| !crate::pages::is_fsqlite_namespace_identity_record(path));
         for relative_path in artifact_paths {
             let temp_dir = TempDir::new()?;
             let final_path = temp_dir.path().join("export.db");
@@ -4210,13 +4221,9 @@ mod tests {
 
         let guard = acquire_export_publish_guard(&final_path)?;
         let mut retain_temp_on_error = false;
-        let error = replace_file_from_temp(
-            &staged_path,
-            &final_path,
-            &mut retain_temp_on_error,
-            &guard,
-        )
-        .expect_err("an existing WAL segment must block main-file replacement");
+        let error =
+            replace_file_from_temp(&staged_path, &final_path, &mut retain_temp_on_error, &guard)
+                .expect_err("an existing WAL segment must block main-file replacement");
 
         assert!(
             format!("{error:#}").contains(&segment_path.display().to_string()),
