@@ -78,7 +78,6 @@ const REQUIRED_SITE_FILES: &[&str] = &[
 struct KeyMutationTarget {
     live_root: PathBuf,
     site_relative: PathBuf,
-    lock_path: PathBuf,
     journal_path: PathBuf,
 }
 
@@ -94,6 +93,12 @@ impl KeyMutationTarget {
 
 struct KeyMutationGuard {
     target: KeyMutationTarget,
+    publication_lock: PagesPublicationLockGuard,
+}
+
+pub(super) struct PagesPublicationLockGuard {
+    live_root: PathBuf,
+    lock_path: PathBuf,
     lock_identity: crate::franken_sync::FileIdentity,
     lock_file: File,
 }
@@ -204,7 +209,6 @@ fn derive_key_mutation_target(requested_path: &Path) -> Result<KeyMutationTarget
     };
 
     Ok(KeyMutationTarget {
-        lock_path: key_mutation_sidecar_path(&live_root, ".pages-key-mutation.lock"),
         journal_path: key_mutation_sidecar_path(
             &live_root,
             ".pages-key-mutation-in-progress.json",
@@ -214,37 +218,44 @@ fn derive_key_mutation_target(requested_path: &Path) -> Result<KeyMutationTarget
     })
 }
 
-fn open_key_mutation_lock(target: KeyMutationTarget) -> Result<KeyMutationGuard> {
-    let lock_exists = match std::fs::symlink_metadata(&target.lock_path) {
+fn pages_publication_lock_path(live_root: &Path) -> PathBuf {
+    key_mutation_sidecar_path(live_root, ".pages-publication.lock")
+}
+
+pub(super) fn acquire_pages_publication_lock(
+    live_root: &Path,
+) -> Result<PagesPublicationLockGuard> {
+    let lock_path = pages_publication_lock_path(live_root);
+    let lock_exists = match std::fs::symlink_metadata(&lock_path) {
         Ok(metadata) if metadata.file_type().is_file() => {
             #[cfg(unix)]
             {
                 if metadata.nlink() != 1 {
                     bail!(
-                        "Pages key-mutation lock {} has {} hard links; exclusive pathname ownership is not provable",
-                        target.lock_path.display(),
+                        "Pages publication lock {} has {} hard links; exclusive pathname ownership is not provable",
+                        lock_path.display(),
                         metadata.nlink()
                     );
                 }
                 if key_publication_mode(&metadata) & 0o077 != 0 {
                     bail!(
-                        "Pages key-mutation lock is not owner-only: {}",
-                        target.lock_path.display()
+                        "Pages publication lock is not owner-only: {}",
+                        lock_path.display()
                     );
                 }
             }
             true
         }
         Ok(_) => bail!(
-            "Pages key-mutation lock is not a regular file: {}",
-            target.lock_path.display()
+            "Pages publication lock is not a regular file: {}",
+            lock_path.display()
         ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => {
             return Err(error).with_context(|| {
                 format!(
-                    "failed inspecting Pages key-mutation lock {}",
-                    target.lock_path.display()
+                    "failed inspecting Pages publication lock {}",
+                    lock_path.display()
                 )
             });
         }
@@ -259,117 +270,140 @@ fn open_key_mutation_lock(target: KeyMutationTarget) -> Result<KeyMutationGuard>
     }
     #[cfg(unix)]
     options.mode(0o600);
-    let lock_file = options.open(&target.lock_path).with_context(|| {
+    let lock_file = options.open(&lock_path).with_context(|| {
         format!(
-            "failed opening Pages key-mutation lock {}",
-            target.lock_path.display()
+            "failed opening Pages publication lock {}",
+            lock_path.display()
         )
     })?;
     let lock_identity = crate::franken_sync::FileIdentity::from_file(&lock_file)
         .with_context(|| {
             format!(
-                "failed identifying Pages key-mutation lock {}",
-                target.lock_path.display()
+                "failed identifying Pages publication lock {}",
+                lock_path.display()
             )
         })?
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "filesystem does not expose a stable identity for Pages key-mutation lock {}",
-                target.lock_path.display()
+                "filesystem does not expose a stable identity for Pages publication lock {}",
+                lock_path.display()
             )
         })?;
 
     match fs2::FileExt::try_lock_exclusive(&lock_file) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => bail!(
-            "another Pages key mutation is already active for {}; lock contention at {}",
-            target.live_root.display(),
-            target.lock_path.display()
+            "another Pages publication is already active for {}; lock contention at {}",
+            live_root.display(),
+            lock_path.display()
         ),
         Err(error) => {
             return Err(error).with_context(|| {
                 format!(
-                    "failed acquiring Pages key-mutation lock {}",
-                    target.lock_path.display()
+                    "failed acquiring Pages publication lock {}",
+                    lock_path.display()
                 )
             });
         }
     }
 
-    let guard = KeyMutationGuard {
-        target,
+    let guard = PagesPublicationLockGuard {
+        live_root: live_root.to_path_buf(),
+        lock_path,
         lock_identity,
         lock_file,
     };
-    require_key_mutation_guard(&guard)?;
+    require_pages_publication_lock(live_root, &guard)?;
     Ok(guard)
 }
 
-fn require_key_mutation_guard(guard: &KeyMutationGuard) -> Result<()> {
+pub(super) fn require_pages_publication_lock(
+    live_root: &Path,
+    guard: &PagesPublicationLockGuard,
+) -> Result<()> {
+    if live_root != guard.live_root {
+        bail!(
+            "Pages publication lock for {} cannot authorize publication to {}",
+            guard.live_root.display(),
+            live_root.display()
+        );
+    }
     let held_identity = crate::franken_sync::FileIdentity::from_file(&guard.lock_file)
-        .context("failed re-identifying held Pages key-mutation lock")?
+        .context("failed re-identifying held Pages publication lock")?
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "filesystem stopped exposing a stable identity for held Pages key-mutation lock {}",
-                guard.target.lock_path.display()
+                "filesystem stopped exposing a stable identity for held Pages publication lock {}",
+                guard.lock_path.display()
             )
         })?;
     if held_identity != guard.lock_identity {
         bail!(
-            "held Pages key-mutation lock {} changed identity",
-            guard.target.lock_path.display()
+            "held Pages publication lock {} changed identity",
+            guard.lock_path.display()
         );
     }
 
-    let metadata = std::fs::symlink_metadata(&guard.target.lock_path).with_context(|| {
+    let metadata = std::fs::symlink_metadata(&guard.lock_path).with_context(|| {
         format!(
-            "failed re-inspecting Pages key-mutation lock {}",
-            guard.target.lock_path.display()
+            "failed re-inspecting Pages publication lock {}",
+            guard.lock_path.display()
         )
     })?;
     if !metadata.file_type().is_file() {
         bail!(
-            "Pages key-mutation lock {} is no longer a regular file",
-            guard.target.lock_path.display()
+            "Pages publication lock {} is no longer a regular file",
+            guard.lock_path.display()
         );
     }
     #[cfg(unix)]
     {
         if metadata.nlink() != 1 {
             bail!(
-                "Pages key-mutation lock {} has {} hard links; refused publication",
-                guard.target.lock_path.display(),
+                "Pages publication lock {} has {} hard links; refused publication",
+                guard.lock_path.display(),
                 metadata.nlink()
             );
         }
         if key_publication_mode(&metadata) & 0o077 != 0 {
             bail!(
-                "Pages key-mutation lock is no longer owner-only: {}",
-                guard.target.lock_path.display()
+                "Pages publication lock is no longer owner-only: {}",
+                guard.lock_path.display()
             );
         }
     }
-    let probe = File::open(&guard.target.lock_path).with_context(|| {
+    let probe = File::open(&guard.lock_path).with_context(|| {
         format!(
-            "failed re-opening Pages key-mutation lock {}",
-            guard.target.lock_path.display()
+            "failed re-opening Pages publication lock {}",
+            guard.lock_path.display()
         )
     })?;
     let path_identity = crate::franken_sync::FileIdentity::from_file(&probe)
-        .context("failed re-identifying Pages key-mutation lock pathname")?
+        .context("failed re-identifying Pages publication lock pathname")?
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "filesystem stopped exposing a stable pathname identity for Pages key-mutation lock {}",
-                guard.target.lock_path.display()
+                "filesystem stopped exposing a stable pathname identity for Pages publication lock {}",
+                guard.lock_path.display()
             )
         })?;
     if path_identity != guard.lock_identity {
         bail!(
-            "Pages key-mutation lock {} was replaced after acquisition",
-            guard.target.lock_path.display()
+            "Pages publication lock {} was replaced after acquisition",
+            guard.lock_path.display()
         );
     }
     Ok(())
+}
+
+fn open_key_mutation_lock(target: KeyMutationTarget) -> Result<KeyMutationGuard> {
+    let publication_lock = acquire_pages_publication_lock(&target.live_root)?;
+    Ok(KeyMutationGuard {
+        target,
+        publication_lock,
+    })
+}
+
+fn require_key_mutation_guard(guard: &KeyMutationGuard) -> Result<()> {
+    require_pages_publication_lock(&guard.target.live_root, &guard.publication_lock)
 }
 
 fn random_key_mutation_sidecar_path(root: &Path, role: &str) -> PathBuf {

@@ -19,6 +19,9 @@ use std::path::{Path, PathBuf};
 use super::archive_config::{ArchiveConfig, UnencryptedConfig};
 use super::docs::{DocLocation, GeneratedDoc};
 use super::encrypt::{EncryptionConfig, validate_supported_payload_format};
+use super::key_management::{
+    PagesPublicationLockGuard, acquire_pages_publication_lock, require_pages_publication_lock,
+};
 
 /// Files embedded from pages_assets at compile time
 const PAGES_ASSETS: &[(&str, &[u8])] = &[
@@ -183,13 +186,6 @@ struct BundlePublishJournal {
     candidate_file_count: u64,
     candidate_size_bytes: u64,
     candidate_sha256: String,
-}
-
-struct BundlePublishGuard {
-    final_dir: PathBuf,
-    lock_path: PathBuf,
-    lock_identity: crate::franken_sync::FileIdentity,
-    lock_file: File,
 }
 
 /// Integrity entry for a single file
@@ -632,175 +628,6 @@ fn bundle_publish_recovery_journal_path(path: &Path) -> PathBuf {
     path.with_file_name(journal_name)
 }
 
-fn bundle_publish_lock_path(path: &Path) -> PathBuf {
-    let mut lock_name = std::ffi::OsString::from(".");
-    lock_name.push(
-        path.file_name()
-            .unwrap_or_else(|| std::ffi::OsStr::new("pages_bundle")),
-    );
-    lock_name.push(".pages-bundle-publish.lock");
-    path.with_file_name(lock_name)
-}
-
-fn acquire_bundle_publish_guard(final_dir: &Path) -> Result<BundlePublishGuard> {
-    ensure_existing_parent_ancestors_are_real_dirs(final_dir, "bundle publish lock")?;
-    if let Some(parent) = final_dir
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed creating Pages bundle publish-lock parent {}",
-                parent.display()
-            )
-        })?;
-    }
-    let lock_path = bundle_publish_lock_path(final_dir);
-    let lock_exists = match fs::symlink_metadata(&lock_path) {
-        Ok(metadata) if metadata.file_type().is_file() => {
-            #[cfg(unix)]
-            if metadata.nlink() != 1 {
-                bail!(
-                    "Pages bundle publish lock {} has {} hard links; exclusive pathname ownership is not provable",
-                    lock_path.display(),
-                    metadata.nlink()
-                );
-            }
-            true
-        }
-        Ok(_) => bail!(
-            "Pages bundle publish lock is not a regular file: {}",
-            lock_path.display()
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "failed inspecting Pages bundle publish lock {}",
-                    lock_path.display()
-                )
-            });
-        }
-    };
-    let mut options = OpenOptions::new();
-    options.read(true).write(true);
-    if lock_exists {
-        options.create(false);
-    } else {
-        options.create_new(true);
-    }
-    #[cfg(unix)]
-    options.mode(0o600);
-    let lock_file = options.open(&lock_path).with_context(|| {
-        format!(
-            "failed opening Pages bundle publish lock {}",
-            lock_path.display()
-        )
-    })?;
-    let lock_identity = crate::franken_sync::FileIdentity::from_file(&lock_file)
-        .with_context(|| {
-            format!(
-                "failed identifying Pages bundle publish lock {}",
-                lock_path.display()
-            )
-        })?
-        .ok_or_else(|| {
-            anyhow!(
-                "filesystem does not expose a stable identity for Pages bundle publish lock {}",
-                lock_path.display()
-            )
-        })?;
-    match fs2::FileExt::try_lock_exclusive(&lock_file) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => bail!(
-            "another Pages bundle publication is already active for {}; lock contention at {}",
-            final_dir.display(),
-            lock_path.display()
-        ),
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "failed acquiring Pages bundle publish lock {}",
-                    lock_path.display()
-                )
-            });
-        }
-    }
-    let guard = BundlePublishGuard {
-        final_dir: final_dir.to_path_buf(),
-        lock_path,
-        lock_identity,
-        lock_file,
-    };
-    require_bundle_publish_guard(final_dir, &guard)?;
-    Ok(guard)
-}
-
-fn require_bundle_publish_guard(final_dir: &Path, guard: &BundlePublishGuard) -> Result<()> {
-    if guard.final_dir != final_dir {
-        bail!(
-            "Pages bundle publish guard for {} cannot authorize mutation of {}",
-            guard.final_dir.display(),
-            final_dir.display()
-        );
-    }
-    let held_identity = crate::franken_sync::FileIdentity::from_file(&guard.lock_file)
-        .context("failed re-identifying held Pages bundle publish lock")?
-        .ok_or_else(|| {
-            anyhow!(
-                "filesystem stopped exposing a stable identity for held Pages bundle publish lock {}",
-                guard.lock_path.display()
-            )
-        })?;
-    if held_identity != guard.lock_identity {
-        bail!(
-            "held Pages bundle publish lock {} changed identity",
-            guard.lock_path.display()
-        );
-    }
-    let metadata = fs::symlink_metadata(&guard.lock_path).with_context(|| {
-        format!(
-            "failed re-inspecting Pages bundle publish lock {}",
-            guard.lock_path.display()
-        )
-    })?;
-    if !metadata.file_type().is_file() {
-        bail!(
-            "Pages bundle publish lock {} is no longer a regular file",
-            guard.lock_path.display()
-        );
-    }
-    #[cfg(unix)]
-    if metadata.nlink() != 1 {
-        bail!(
-            "Pages bundle publish lock {} has {} hard links; refused publication",
-            guard.lock_path.display(),
-            metadata.nlink()
-        );
-    }
-    let probe = File::open(&guard.lock_path).with_context(|| {
-        format!(
-            "failed re-opening Pages bundle publish lock {}",
-            guard.lock_path.display()
-        )
-    })?;
-    let path_identity = crate::franken_sync::FileIdentity::from_file(&probe)
-        .context("failed re-identifying Pages bundle publish lock pathname")?
-        .ok_or_else(|| {
-            anyhow!(
-                "filesystem stopped exposing a stable pathname identity for Pages bundle publish lock {}",
-                guard.lock_path.display()
-            )
-        })?;
-    if path_identity != guard.lock_identity {
-        bail!(
-            "Pages bundle publish lock pathname changed identity: {}",
-            guard.lock_path.display()
-        );
-    }
-    Ok(())
-}
-
 fn bundle_publish_backup_prefix(path: &Path) -> Result<String> {
     let file_name = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
         anyhow!(
@@ -1019,10 +846,12 @@ fn read_bundle_publish_journal(final_dir: &Path) -> Result<Option<BundlePublishJ
 
 fn write_bundle_publish_journal(
     final_dir: &Path,
+    guard: &PagesPublicationLockGuard,
     backup_dir: &Path,
     prior: &BundleTreeEvidence,
     candidate: &BundleTreeEvidence,
 ) -> Result<BundlePublishJournal> {
+    require_pages_publication_lock(final_dir, guard)?;
     let backup_file_name = backup_dir
         .file_name()
         .and_then(|name| name.to_str())
@@ -1120,13 +949,16 @@ fn write_bundle_publish_journal(
             journal_path.display()
         );
     }
+    require_pages_publication_lock(final_dir, guard)?;
     Ok(journal)
 }
 
 fn remove_bundle_publish_journal(
     final_dir: &Path,
+    guard: &PagesPublicationLockGuard,
     expected: &BundlePublishJournal,
 ) -> Result<()> {
+    require_pages_publication_lock(final_dir, guard)?;
     let journal_path = bundle_publish_recovery_journal_path(final_dir);
     let observed = read_bundle_publish_journal(final_dir)?.ok_or_else(|| {
         anyhow!(
@@ -1140,13 +972,15 @@ fn remove_bundle_publish_journal(
             journal_path.display()
         );
     }
+    require_pages_publication_lock(final_dir, guard)?;
     fs::remove_file(&journal_path).with_context(|| {
         format!(
             "failed removing completed Pages bundle publish journal {}",
             journal_path.display()
         )
     })?;
-    sync_parent_directory(&journal_path)
+    sync_parent_directory(&journal_path)?;
+    require_pages_publication_lock(final_dir, guard)
 }
 
 fn first_unowned_bundle_publish_backup(
