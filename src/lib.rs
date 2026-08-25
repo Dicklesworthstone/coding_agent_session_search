@@ -8680,47 +8680,71 @@ fn quarantine_entries_json(data_dir: &Path) -> anyhow::Result<Vec<serde_json::Va
         .collect::<BTreeMap<_, _>>();
 
     for (identity, record) in crate::indexer::operator_quarantine_poison_records(data_dir)? {
-        entries.entry(identity.clone()).or_insert_with(|| {
-            let first_attempt_at = record
-                .get("first_quarantined_at_ms")
-                .and_then(serde_json::Value::as_i64)
-                .or_else(|| {
-                    record
-                        .get("recorded_at_ms")
-                        .and_then(serde_json::Value::as_i64)
-                })
-                .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
-                .map(|timestamp| timestamp.to_rfc3339());
-            let last_attempt_at = record
-                .get("last_attempt_at_ms")
-                .and_then(serde_json::Value::as_i64)
-                .or_else(|| {
-                    record
-                        .get("recorded_at_ms")
-                        .and_then(serde_json::Value::as_i64)
-                })
-                .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
-                .map(|timestamp| timestamp.to_rfc3339());
-            let cass_version = record
-                .get("cass_version_at_quarantine")
-                .and_then(serde_json::Value::as_str);
-            serde_json::json!({
-                "conversation_id": identity.0,
-                "schema_version": identity.1,
-                "attempt_count": record
+        let first_attempt_at = record
+            .get("first_quarantined_at_ms")
+            .and_then(serde_json::Value::as_i64)
+            .or_else(|| {
+                record
+                    .get("recorded_at_ms")
+                    .and_then(serde_json::Value::as_i64)
+            })
+            .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+            .map(|timestamp| timestamp.to_rfc3339());
+        let last_attempt_at = record
+            .get("last_attempt_at_ms")
+            .and_then(serde_json::Value::as_i64)
+            .or_else(|| {
+                record
+                    .get("recorded_at_ms")
+                    .and_then(serde_json::Value::as_i64)
+            })
+            .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+            .map(|timestamp| timestamp.to_rfc3339());
+        let cass_version = record
+            .get("cass_version_at_quarantine")
+            .and_then(serde_json::Value::as_str);
+        let attempt_count = record
+            .get("attempt_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1);
+        let retry_eligible = cass_version != Some(current_version);
+        let poison_entry = serde_json::json!({
+            "conversation_id": identity.0.clone(),
+            "schema_version": identity.1,
+            "attempt_count": attempt_count,
+            "last_reason": record
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("ingest-out-of-memory"),
+            "first_attempt_at": first_attempt_at,
+            "last_attempt_at": last_attempt_at,
+            "cass_version_at_quarantine": cass_version,
+            "retry_eligible": retry_eligible,
+        });
+
+        match entries.entry(identity) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(poison_entry);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let existing = entry.get_mut();
+                let existing_attempt_count = existing
                     .get("attempt_count")
                     .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(1),
-                "last_reason": record
-                    .get("reason")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("ingest-out-of-memory"),
-                "first_attempt_at": first_attempt_at,
-                "last_attempt_at": last_attempt_at,
-                "cass_version_at_quarantine": cass_version,
-                "retry_eligible": cass_version != Some(current_version),
-            })
-        });
+                    .unwrap_or(0);
+                if attempt_count > existing_attempt_count {
+                    existing["attempt_count"] = serde_json::json!(attempt_count);
+                }
+                if !retry_eligible {
+                    // Cross-surface saves are best-effort. If either surface
+                    // records a retry under this binary, do not falsely offer
+                    // the key as retry-eligible because the other is stale.
+                    existing["cass_version_at_quarantine"] =
+                        serde_json::json!(current_version);
+                    existing["retry_eligible"] = serde_json::json!(false);
+                }
+            }
+        }
     }
 
     Ok(entries.into_values().collect())
