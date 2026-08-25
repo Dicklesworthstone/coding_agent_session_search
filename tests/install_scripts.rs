@@ -40,6 +40,82 @@ fn install_sh_command(tmp_root: &tempfile::TempDir) -> Command {
 }
 
 #[test]
+fn install_sh_rejects_unknown_options() {
+    let output = Command::new("bash")
+        .arg("install.sh")
+        .arg("--quiet")
+        .arg("--verison")
+        .arg("vtest")
+        .output()
+        .expect("run install.sh with a misspelled option");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Unknown option: --verison"),
+        "installer should identify the invalid option, got: {stderr}"
+    );
+}
+
+#[test]
+fn install_sh_rejects_options_with_missing_values() {
+    let output = Command::new("bash")
+        .arg("install.sh")
+        .arg("--version")
+        .arg("--quiet")
+        .output()
+        .expect("run install.sh with a missing option value");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--version requires a value"),
+        "installer should explain the missing value, got: {stderr}"
+    );
+}
+
+#[test]
+#[serial]
+#[cfg_attr(not(target_os = "linux"), ignore)]
+fn install_sh_does_not_fallback_from_an_explicit_artifact_url() {
+    let dest = tempfile::TempDir::new().expect("install destination");
+    let home = isolated_home();
+    let tmp_root = isolated_install_tmp_root();
+    let output = install_sh_command(&tmp_root)
+        .arg("--version")
+        .arg("vtest")
+        .arg("--dest")
+        .arg(dest.path())
+        .arg("--easy-mode")
+        .env("HOME", home.path())
+        .env(
+            "ARTIFACT_URL",
+            format!("file://{}/missing.tar.gz", tmp_root.path().display()),
+        )
+        .output()
+        .expect("run install.sh with a missing explicit artifact");
+
+    assert!(
+        !output.status.success(),
+        "an unavailable explicit artifact must fail the install"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Could not download explicitly requested artifact"),
+        "installer should identify the explicit artifact failure, got: {combined}"
+    );
+    assert!(
+        !combined.contains("Building from source"),
+        "installer must not substitute a source build for an explicit artifact"
+    );
+    assert!(!dest.path().join("cass").exists());
+}
+
+#[test]
 fn install_sh_has_no_baseline_artifact_selection() -> Result<(), String> {
     // cass#308 / bead tg5o9: the ONNX runtime is gone, so the installer must
     // never select a `-baseline` asset (they are not published anymore) and
@@ -69,6 +145,25 @@ fn install_sh_has_no_baseline_artifact_selection() -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+#[test]
+fn install_sh_keeps_tmp_root_warnings_out_of_command_substitution() {
+    let script = fs::read_to_string("install.sh").expect("read install.sh");
+    assert!(
+        script.contains(
+            "warn() { [ \"$QUIET\" -eq 1 ] && return 0; echo -e \"\\033[1;33m⚠\\033[0m $*\" >&2; }"
+        ),
+        "installer warnings must go to stderr"
+    );
+    assert!(
+        script.contains("TMP_ROOT=\"$(resolve_tmp_root)\""),
+        "test must remain coupled to the command-substitution risk"
+    );
+    assert!(
+        script.contains("warn \"Ignoring TMPDIR=${TMPDIR} because it is not an accessible directory\""),
+        "test must remain coupled to the invalid-TMPDIR warning path"
+    );
 }
 
 #[test]

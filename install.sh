@@ -23,8 +23,8 @@ LOCK_FILE=""
 log() { [ "$QUIET" -eq 1 ] && return 0; echo -e "$@"; }
 info() { log "\033[0;34m→\033[0m $*"; }
 ok() { log "\033[0;32m✓\033[0m $*"; }
-warn() { log "\033[1;33m⚠\033[0m $*"; }
-err() { log "\033[0;31m✗\033[0m $*"; }
+warn() { [ "$QUIET" -eq 1 ] && return 0; echo -e "\033[1;33m⚠\033[0m $*" >&2; }
+err() { echo -e "\033[0;31m✗\033[0m $*" >&2; }
 
 strip_url_suffix() {
   local value="$1"
@@ -301,25 +301,38 @@ ensure_rust() {
 usage() {
   cat <<EOFU
 Usage: install.sh [--version vX.Y.Z] [--dest DIR] [--system] [--easy-mode] [--verify] [--quickstart] \
-                  [--artifact-url URL] [--checksum HEX] [--checksum-url URL] [--quiet]
+                  [--artifact-url URL] [--checksum HEX] [--checksum-url URL] [--from-source] [--quiet]
 EOFU
+}
+
+require_option_value() {
+  if [ "$#" -ge 2 ]; then
+    case "$2" in
+      ""|-h|-q|--*) :;;
+      *) return 0;;
+    esac
+  fi
+  err "$1 requires a value"
+  usage >&2
+  exit 2
 }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --version) VERSION="$2"; shift 2;;
-    --dest) DEST="$2"; shift 2;;
+    --version) require_option_value "$@"; VERSION="$2"; shift 2;;
+    --dest) require_option_value "$@"; DEST="$2"; shift 2;;
     --system) DEST="/usr/local/bin"; shift;;
     --easy-mode) EASY=1; shift;;
     --verify) VERIFY=1; shift;;
     --quickstart) QUICKSTART=1; shift;;
-    --artifact-url) ARTIFACT_URL="$2"; shift 2;;
-    --checksum) CHECKSUM="$2"; shift 2;;
-    --checksum-url) CHECKSUM_URL="$2"; shift 2;;
+    --artifact-url) require_option_value "$@"; ARTIFACT_URL="$2"; shift 2;;
+    --checksum) require_option_value "$@"; CHECKSUM="$2"; shift 2;;
+    --checksum-url) require_option_value "$@"; CHECKSUM_URL="$2"; shift 2;;
     --from-source) FROM_SOURCE=1; shift;;
     --quiet|-q) QUIET=1; shift;;
     -h|--help) usage; exit 0;;
-    *) shift;;
+    --*) err "Unknown option: $1"; usage >&2; exit 2;;
+    *) err "Unexpected argument: $1"; usage >&2; exit 2;;
   esac
 done
 
@@ -424,6 +437,10 @@ trap cleanup EXIT
 if [ "$FROM_SOURCE" -eq 0 ]; then
   info "Downloading $URL"
   if ! curl -fsSL "$URL" -o "$TMP/$TAR"; then
+    if [ -n "$ARTIFACT_URL" ]; then
+      err "Could not download explicitly requested artifact: $ARTIFACT_URL"
+      exit 1
+    fi
     warn "Artifact download failed; falling back to build-from-source"
     FROM_SOURCE=1
   fi

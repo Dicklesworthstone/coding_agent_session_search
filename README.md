@@ -2928,7 +2928,7 @@ The project ships with a robust installer (`install.sh` / `install.ps1`) designe
 
 - **Checksum Verification**: Validates artifacts against a `.sha256` file or explicit `--checksum` flag.
 
-- **Rustup Bootstrap**: Automatically installs the nightly toolchain if missing.
+- **Rustup Bootstrap**: Source installs bootstrap Rust stable when Rust 1.85+ is unavailable.
 
 - **Easy Mode**: `--easy-mode` automates installation to `~/.local/bin` without prompts.
 
