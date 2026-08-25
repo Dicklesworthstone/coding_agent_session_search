@@ -253,10 +253,7 @@ fn failed_check_details(verification: &VerifyResult) -> String {
     [
         ("required_files", &verification.checks.required_files),
         ("config_schema", &verification.checks.config_schema),
-        (
-            "payload_manifest",
-            &verification.checks.payload_manifest,
-        ),
+        ("payload_manifest", &verification.checks.payload_manifest),
         ("size_limits", &verification.checks.size_limits),
         ("integrity", &verification.checks.integrity),
         (
@@ -639,9 +636,7 @@ fn validate_encrypted_config(config: &EncryptionConfig) -> Vec<String> {
                 "key_slot[{i}].wrapped_dek should be 48 bytes, got {}",
                 bytes.len()
             )),
-            Err(_) => errors.push(format!(
-                "key_slot[{i}].wrapped_dek is not valid base64"
-            )),
+            Err(_) => errors.push(format!("key_slot[{i}].wrapped_dek is not valid base64")),
         }
 
         match BASE64_STANDARD.decode(&slot.nonce) {
@@ -736,7 +731,9 @@ fn validate_browser_payload_url_path(errors: &mut Vec<String>, label: &str, raw_
 
     for segment in segments {
         if segment.is_empty() || segment == "." || segment == ".." {
-            errors.push(format!("{label} contains an empty or traversal URL segment"));
+            errors.push(format!(
+                "{label} contains an empty or traversal URL segment"
+            ));
         }
     }
 }
@@ -1978,13 +1975,8 @@ mod tests {
         );
 
         let mut oversized = original.clone();
-        oversized["payload"]["size_bytes"] =
-            Value::from(MAX_BROWSER_ARCHIVE_PLAINTEXT_SIZE + 1);
-        fs::write(
-            &config_path,
-            serde_json::to_vec_pretty(&oversized).unwrap(),
-        )
-        .unwrap();
+        oversized["payload"]["size_bytes"] = Value::from(MAX_BROWSER_ARCHIVE_PLAINTEXT_SIZE + 1);
+        fs::write(&config_path, serde_json::to_vec_pretty(&oversized).unwrap()).unwrap();
         let schema = check_config_schema(&site_dir);
         assert!(
             !schema.passed
@@ -2560,10 +2552,8 @@ mod tests {
         let site_dir = temp.path().join("site");
         copy_fixture("valid", &site_dir).unwrap();
         let integrity_path = site_dir.join("integrity.json");
-        let mut manifest: IntegrityManifest = serde_json::from_reader(BufReader::new(
-            File::open(&integrity_path).unwrap(),
-        ))
-        .unwrap();
+        let mut manifest: IntegrityManifest =
+            serde_json::from_reader(BufReader::new(File::open(&integrity_path).unwrap())).unwrap();
         manifest.version = INTEGRITY_MANIFEST_VERSION + 1;
         fs::write(
             &integrity_path,

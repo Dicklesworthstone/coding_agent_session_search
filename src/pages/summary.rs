@@ -1965,10 +1965,8 @@ mod tests {
 
     #[test]
     fn exclusion_set_deserialization_rejects_invalid_patterns() {
-        let error = serde_json::from_str::<ExclusionSet>(
-            r#"{"excluded_pattern_strings":["["]}"#,
-        )
-        .expect_err("an invalid persisted exclusion must fail closed");
+        let error = serde_json::from_str::<ExclusionSet>(r#"{"excluded_pattern_strings":["["]}"#)
+            .expect_err("an invalid persisted exclusion must fail closed");
 
         assert!(
             error.to_string().contains("Invalid exclusion pattern"),

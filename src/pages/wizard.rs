@@ -854,10 +854,7 @@ impl PagesWizard {
         writeln!(
             term,
             "{}",
-            archive_size_summary_line(
-                self.no_encryption_mode,
-                summary.estimated_size_bytes
-            )
+            archive_size_summary_line(self.no_encryption_mode, summary.estimated_size_bytes)
         )?;
 
         // Display date range
@@ -966,8 +963,8 @@ impl PagesWizard {
         // Display security status
         writeln!(term, "\n{}", style("🔒 SECURITY").bold().cyan())?;
         writeln!(term, "{}", style("─".repeat(40)).dim())?;
-        let planned_key_slots = usize::from(self.state.password.is_some())
-            + usize::from(self.state.generate_recovery);
+        let planned_key_slots =
+            usize::from(self.state.password.is_some()) + usize::from(self.state.generate_recovery);
         for line in summary_security_lines(self.no_encryption_mode, planned_key_slots) {
             writeln!(term, "  {line}")?;
         }
@@ -983,11 +980,7 @@ impl PagesWizard {
             ))
             .red()
         } else {
-            style(format!(
-                "⚠️  {} issues found",
-                self.state.secret_scan_count
-            ))
-            .yellow()
+            style(format!("⚠️  {} issues found", self.state.secret_scan_count)).yellow()
         };
         writeln!(term, "  Preliminary Secret Scan: {}", secret_status)?;
 
@@ -1724,9 +1717,7 @@ impl PagesWizard {
                 }
             },
             Some(running),
-            |staged_db_path| {
-                scan_staged_export_database(staged_db_path, &staged_scan_config)
-            },
+            |staged_db_path| scan_staged_export_database(staged_db_path, &staged_scan_config),
         )?;
 
         pb.finish_with_message(format!(
@@ -2051,8 +2042,7 @@ impl PagesWizard {
                             false,
                             |verified_site_dir| {
                                 deployer.deploy(verified_site_dir, |_phase, msg| {
-                                    let _ =
-                                        writeln!(term, "    {} {}", style("•").dim(), msg);
+                                    let _ = writeln!(term, "    {} {}", style("•").dim(), msg);
                                 })
                             },
                         ) {
@@ -2160,8 +2150,7 @@ impl PagesWizard {
                             false,
                             |verified_site_dir| {
                                 deployer.deploy(verified_site_dir, |_phase, msg| {
-                                    let _ =
-                                        writeln!(term, "    {} {}", style("•").dim(), msg);
+                                    let _ = writeln!(term, "    {} {}", style("•").dim(), msg);
                                 })
                             },
                         ) {
@@ -2416,13 +2405,11 @@ mod tests {
         );
 
         let security_doc = DocumentationGenerator::new(
-            DocConfig::new()
-                .with_archive_mode(mode)
-                .with_argon_params(
-                    emitted.kdf_defaults.memory_kb,
-                    emitted.kdf_defaults.iterations,
-                    emitted.kdf_defaults.parallelism,
-                ),
+            DocConfig::new().with_archive_mode(mode).with_argon_params(
+                emitted.kdf_defaults.memory_kb,
+                emitted.kdf_defaults.iterations,
+                emitted.kdf_defaults.parallelism,
+            ),
             documented.clone(),
         )
         .generate_security_doc();

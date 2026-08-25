@@ -269,9 +269,7 @@ pub(crate) fn validate_supported_payload_format(config: &EncryptionConfig) -> Re
     }
 
     let max_total_ciphertext_size = (config.payload.chunk_count as u64)
-        .saturating_mul(max_archive_ciphertext_chunk_size(
-            config.payload.chunk_size,
-        ));
+        .saturating_mul(max_archive_ciphertext_chunk_size(config.payload.chunk_size));
     if config.payload.total_compressed_size > max_total_ciphertext_size {
         return Err(invalid_archive_format(format!(
             "payload total_compressed_size {} exceeds the maximum {} bytes for {} chunks",
@@ -1348,11 +1346,8 @@ impl DecryptionEngine {
                 })?;
 
             // Decompress within the authenticated archive's declared chunk bound.
-            let plaintext = decompress_archive_chunk(
-                &compressed,
-                self.config.payload.chunk_size,
-                chunk_index,
-            )?;
+            let plaintext =
+                decompress_archive_chunk(&compressed, self.config.payload.chunk_size, chunk_index)?;
             total_plaintext_size = total_plaintext_size
                 .checked_add(plaintext.len() as u64)
                 .ok_or_else(|| {
@@ -1868,12 +1863,10 @@ mod tests {
             .encrypt_file(&input_path, &output_dir, |_, _| {})
             .unwrap();
 
-        let err = DecryptionEngine::unlock_with_recovery(
-            config,
-            &[0x5A; MIN_RECOVERY_SECRET_BYTES - 1],
-        )
-        .err()
-        .expect("short recovery material must be rejected");
+        let err =
+            DecryptionEngine::unlock_with_recovery(config, &[0x5A; MIN_RECOVERY_SECRET_BYTES - 1])
+                .err()
+                .expect("short recovery material must be rejected");
         assert!(
             err.to_string().contains("192 bits"),
             "unexpected short-recovery unlock error: {err:#}"

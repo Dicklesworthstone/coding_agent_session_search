@@ -402,8 +402,10 @@ fn write_recovery_artifact(path: &Path, contents: &[u8]) -> Result<()> {
     }
 
     if let Err(err) = std::fs::rename(&temp_path, path) {
-        let install_error = anyhow::Error::new(err)
-            .context(format!("Failed to install recovery artifact {}", path.display()));
+        let install_error = anyhow::Error::new(err).context(format!(
+            "Failed to install recovery artifact {}",
+            path.display()
+        ));
         return Err(cleanup_failed_recovery_temp(&temp_path, install_error));
     }
     Ok(())
@@ -632,15 +634,16 @@ mod tests {
         let retained_path = tmp.path().join("retained-temp-directory");
         std::fs::create_dir(&retained_path)?;
 
-        let error = cleanup_failed_recovery_temp(
-            &retained_path,
-            anyhow::anyhow!("primary write failure"),
-        );
+        let error =
+            cleanup_failed_recovery_temp(&retained_path, anyhow::anyhow!("primary write failure"));
         let message = format!("{error:#}");
         assert!(message.contains("primary write failure"));
         assert!(message.contains("cleanup also failed"));
         assert!(message.contains(&retained_path.display().to_string()));
-        assert!(retained_path.is_dir(), "cleanup test sentinel was not retained");
+        assert!(
+            retained_path.is_dir(),
+            "cleanup test sentinel was not retained"
+        );
         Ok(())
     }
 

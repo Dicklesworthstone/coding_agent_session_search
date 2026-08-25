@@ -525,12 +525,12 @@ impl BundleBuilder {
 }
 
 fn create_bundle_staging_root(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed creating bundle staging parent {}",
-                parent.display()
-            )
+            format!("failed creating bundle staging parent {}", parent.display())
         })?;
     }
 
@@ -539,25 +539,30 @@ fn create_bundle_staging_root(path: &Path) -> Result<()> {
         let mut builder = fs::DirBuilder::new();
         builder.mode(0o700);
         builder.create(path).with_context(|| {
-            format!("failed creating private bundle staging root {}", path.display())
+            format!(
+                "failed creating private bundle staging root {}",
+                path.display()
+            )
         })?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).with_context(|| {
-            format!("failed securing bundle staging root {}", path.display())
-        })?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed securing bundle staging root {}", path.display()))?;
     }
     #[cfg(not(unix))]
     {
-        fs::create_dir(path).with_context(|| {
-            format!("failed creating bundle staging root {}", path.display())
-        })?;
+        fs::create_dir(path)
+            .with_context(|| format!("failed creating bundle staging root {}", path.display()))?;
     }
     Ok(())
 }
 
 fn prepare_bundle_root_for_publish(path: &Path) -> Result<()> {
     #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-        .with_context(|| format!("failed setting bundle root permissions on {}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).with_context(|| {
+        format!(
+            "failed setting bundle root permissions on {}",
+            path.display()
+        )
+    })?;
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
@@ -567,8 +572,9 @@ fn cleanup_rejected_bundle_temp(path: &Path) -> Result<()> {
     match fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error)
-            .with_context(|| format!("failed removing staged bundle {}", path.display())),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed removing staged bundle {}", path.display()))
+        }
     }
 }
 
@@ -607,19 +613,24 @@ fn bundle_publish_marker_exists(bundle_dir: &Path) -> Result<bool> {
                     marker_path.display()
                 );
             }
-            let maximum_marker_bytes = u64::try_from(
-                BUNDLE_PUBLISH_MARKER_CONTENT.len().saturating_add(1),
-            )
-            .unwrap_or(u64::MAX);
+            let maximum_marker_bytes =
+                u64::try_from(BUNDLE_PUBLISH_MARKER_CONTENT.len().saturating_add(1))
+                    .unwrap_or(u64::MAX);
             let mut contents = Vec::with_capacity(BUNDLE_PUBLISH_MARKER_CONTENT.len());
             File::open(&marker_path)
                 .with_context(|| {
-                    format!("failed opening bundle publish marker {}", marker_path.display())
+                    format!(
+                        "failed opening bundle publish marker {}",
+                        marker_path.display()
+                    )
                 })?
                 .take(maximum_marker_bytes)
                 .read_to_end(&mut contents)
                 .with_context(|| {
-                    format!("failed reading bundle publish marker {}", marker_path.display())
+                    format!(
+                        "failed reading bundle publish marker {}",
+                        marker_path.display()
+                    )
                 })?;
             if contents != BUNDLE_PUBLISH_MARKER_CONTENT {
                 bail!(
@@ -653,10 +664,18 @@ fn write_bundle_publish_marker(bundle_dir: &Path) -> Result<()> {
         })?;
     marker
         .write_all(BUNDLE_PUBLISH_MARKER_CONTENT)
-        .with_context(|| format!("failed writing bundle publish marker {}", marker_path.display()))?;
-    marker
-        .sync_all()
-        .with_context(|| format!("failed syncing bundle publish marker {}", marker_path.display()))?;
+        .with_context(|| {
+            format!(
+                "failed writing bundle publish marker {}",
+                marker_path.display()
+            )
+        })?;
+    marker.sync_all().with_context(|| {
+        format!(
+            "failed syncing bundle publish marker {}",
+            marker_path.display()
+        )
+    })?;
     sync_parent_directory(&marker_path)
 }
 
@@ -929,9 +948,7 @@ fn cleanup_prior_bundle_after_publish(backup_dir: &Path, final_dir: &Path) -> Re
     // A closure rather than the bare `fs::remove_dir_all` fn item: the
     // generic fn monomorphizes with one concrete lifetime and cannot satisfy
     // the higher-ranked `for<'a> FnOnce(&'a Path)` bound.
-    cleanup_prior_bundle_after_publish_with(backup_dir, final_dir, |path| {
-        fs::remove_dir_all(path)
-    })
+    cleanup_prior_bundle_after_publish_with(backup_dir, final_dir, |path| fs::remove_dir_all(path))
 }
 
 fn cleanup_prior_bundle_after_publish_with<F>(
@@ -1010,9 +1027,7 @@ fn try_publish_linux_bundle_via_atomic_exchange(
                     backup_dir.display()
                 );
             }
-            if let Err(cleanup_error) =
-                cleanup_prior_bundle_after_publish(backup_dir, final_dir)
-            {
+            if let Err(cleanup_error) = cleanup_prior_bundle_after_publish(backup_dir, final_dir) {
                 *retain_temp_on_error = true;
                 return Err(cleanup_error);
             }
@@ -1042,25 +1057,24 @@ fn try_publish_linux_bundle_via_atomic_exchange(
             );
             Ok(false)
         }
-        Err(exchange_error) => match restore_linux_atomic_staged_candidate(
-            backup_dir,
-            temp_dir,
-            retain_temp_on_error,
-        ) {
-            Ok(()) => Err(exchange_error).with_context(|| {
-                format!(
-                    "failed atomically exchanging staged bundle {} with live bundle {}",
+        Err(exchange_error) => {
+            match restore_linux_atomic_staged_candidate(backup_dir, temp_dir, retain_temp_on_error)
+            {
+                Ok(()) => Err(exchange_error).with_context(|| {
+                    format!(
+                        "failed atomically exchanging staged bundle {} with live bundle {}",
+                        temp_dir.display(),
+                        final_dir.display()
+                    )
+                }),
+                Err(restore_error) => Err(anyhow!(
+                    "failed atomically exchanging staged bundle {} with live bundle {}: {exchange_error:#}; failed restoring staged candidate from {}: {restore_error:#}",
                     temp_dir.display(),
-                    final_dir.display()
-                )
-            }),
-            Err(restore_error) => Err(anyhow!(
-                "failed atomically exchanging staged bundle {} with live bundle {}: {exchange_error:#}; failed restoring staged candidate from {}: {restore_error:#}",
-                temp_dir.display(),
-                final_dir.display(),
-                backup_dir.display()
-            )),
-        },
+                    final_dir.display(),
+                    backup_dir.display()
+                )),
+            }
+        }
     }
 }
 
@@ -1146,9 +1160,7 @@ fn replace_dir_from_temp_via_recoverable_rename_pair(
                     backup_dir.display()
                 );
             }
-            if let Err(cleanup_error) =
-                cleanup_prior_bundle_after_publish(backup_dir, final_dir)
-            {
+            if let Err(cleanup_error) = cleanup_prior_bundle_after_publish(backup_dir, final_dir) {
                 *retain_temp_on_error = true;
                 return Err(cleanup_error);
             }
@@ -2364,7 +2376,9 @@ mod tests {
 
         let installed = fs::read(private_dir.join("master-key.json"))?;
         if installed != b"new generation" {
-            return Err(anyhow!("private artifact replacement published stale bytes"));
+            return Err(anyhow!(
+                "private artifact replacement published stale bytes"
+            ));
         }
         Ok(())
     }
@@ -2375,16 +2389,13 @@ mod tests {
         let private_dir = temp.path().join("private");
         let config = encrypted_config_for_files(Vec::new());
 
-        let error = write_private_artifacts_encrypted(
-            &private_dir,
-            &config,
-            None,
-            true,
-            false,
-        )
-        .expect_err("a requested QR without a recovery secret must fail closed");
+        let error = write_private_artifacts_encrypted(&private_dir, &config, None, true, false)
+            .expect_err("a requested QR without a recovery secret must fail closed");
 
-        if !error.to_string().contains("no recovery secret is available") {
+        if !error
+            .to_string()
+            .contains("no recovery secret is available")
+        {
             return Err(anyhow!("unexpected missing-recovery error: {error:#}"));
         }
         if private_dir.exists() {
@@ -2414,9 +2425,7 @@ mod tests {
         {
             return Err(anyhow!("QR generation error lost its cause: {message}"));
         }
-        if private_dir.join("qr-code.png").exists()
-            || private_dir.join("qr-code.svg").exists()
-        {
+        if private_dir.join("qr-code.png").exists() || private_dir.join("qr-code.svg").exists() {
             return Err(anyhow!(
                 "failed QR generation published a partial artifact set"
             ));
@@ -2443,12 +2452,8 @@ mod tests {
         {
             return Err(anyhow!("QR PNG generation error lost its cause: {message}"));
         }
-        if private_dir.join("qr-code.png").exists()
-            || private_dir.join("qr-code.svg").exists()
-        {
-            return Err(anyhow!(
-                "failed QR PNG generation published an artifact"
-            ));
+        if private_dir.join("qr-code.png").exists() || private_dir.join("qr-code.svg").exists() {
+            return Err(anyhow!("failed QR PNG generation published an artifact"));
         }
         Ok(())
     }
@@ -2468,9 +2473,7 @@ mod tests {
         if fs::read(private_dir.join("qr-code.png"))? != [1, 2, 3] {
             return Err(anyhow!("requested QR PNG bytes were not published"));
         }
-        if fs::read_to_string(private_dir.join("qr-code.svg"))?
-            != "<svg>recovery</svg>"
-        {
+        if fs::read_to_string(private_dir.join("qr-code.svg"))? != "<svg>recovery</svg>" {
             return Err(anyhow!("requested QR SVG bytes were not published"));
         }
         Ok(())
@@ -3222,12 +3225,7 @@ mod tests {
         fs::write(staged_dir.join("site/new.txt"), "new").unwrap();
 
         let mut retain_temp_on_error = false;
-        replace_dir_from_temp(
-            &staged_dir,
-            &final_dir,
-            &mut retain_temp_on_error,
-        )
-        .unwrap();
+        replace_dir_from_temp(&staged_dir, &final_dir, &mut retain_temp_on_error).unwrap();
 
         assert!(!staged_dir.exists());
         assert!(final_dir.join("site/new.txt").exists());
@@ -3252,12 +3250,7 @@ mod tests {
         fs::write(staged_dir.join("site/new.txt"), "new").unwrap();
 
         let mut retain_temp_on_error = false;
-        replace_dir_from_temp(
-            &staged_dir,
-            &final_dir,
-            &mut retain_temp_on_error,
-        )
-        .unwrap();
+        replace_dir_from_temp(&staged_dir, &final_dir, &mut retain_temp_on_error).unwrap();
 
         assert!(!retain_temp_on_error);
         assert!(!staged_dir.exists());
@@ -3347,7 +3340,10 @@ mod tests {
             .expect_err("two unmarked trees must be preserved as ambiguous");
         let message = format!("{error:#}");
 
-        assert!(message.contains("both unmarked"), "unexpected error: {message}");
+        assert!(
+            message.contains("both unmarked"),
+            "unexpected error: {message}"
+        );
         assert_eq!(
             fs::read_to_string(final_dir.join("site/live.txt")).unwrap(),
             "live"
@@ -3464,16 +3460,12 @@ mod tests {
         fs::create_dir_all(backup_dir.join("private")).unwrap();
         fs::write(backup_dir.join("private/recovery-material.txt"), "private").unwrap();
 
-        let error = cleanup_prior_bundle_after_publish_with(
-            &backup_dir,
-            &final_dir,
-            |_| {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "injected cleanup denial",
-                ))
-            },
-        )
+        let error = cleanup_prior_bundle_after_publish_with(&backup_dir, &final_dir, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected cleanup denial",
+            ))
+        })
         .expect_err("cleanup failure must fail the publication result");
         let message = format!("{error:#}");
 
@@ -3501,7 +3493,11 @@ mod tests {
             .expect_err("a symlinked recovery backup must fail closed");
 
         assert!(error.to_string().contains("must not be a symlink"));
-        assert!(error.to_string().contains(&backup_dir.display().to_string()));
+        assert!(
+            error
+                .to_string()
+                .contains(&backup_dir.display().to_string())
+        );
         assert_eq!(
             fs::read_to_string(outside.path().join("private/material.txt")).unwrap(),
             "private"
@@ -3525,15 +3521,15 @@ mod tests {
         symlink(outside.path(), &staged_dir).unwrap();
 
         let mut retain_temp_on_error = false;
-        let error = replace_dir_from_temp(
-            &staged_dir,
-            &final_dir,
-            &mut retain_temp_on_error,
-        )
-        .expect_err("a symlinked staged bundle must fail closed");
+        let error = replace_dir_from_temp(&staged_dir, &final_dir, &mut retain_temp_on_error)
+            .expect_err("a symlinked staged bundle must fail closed");
 
         assert!(error.to_string().contains("must not be a symlink"));
-        assert!(error.to_string().contains(&staged_dir.display().to_string()));
+        assert!(
+            error
+                .to_string()
+                .contains(&staged_dir.display().to_string())
+        );
         assert_eq!(
             fs::read_to_string(final_dir.join("site/old.txt")).unwrap(),
             "old"
@@ -3559,12 +3555,8 @@ mod tests {
         symlink(temp.path().join("missing-target"), &final_dir).unwrap();
 
         let mut retain_temp_on_error = false;
-        let err = replace_dir_from_temp(
-            &staged_dir,
-            &final_dir,
-            &mut retain_temp_on_error,
-        )
-        .unwrap_err();
+        let err =
+            replace_dir_from_temp(&staged_dir, &final_dir, &mut retain_temp_on_error).unwrap_err();
         assert!(
             err.to_string().contains("must not be a symlink"),
             "unexpected error: {err:#}"

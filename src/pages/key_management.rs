@@ -654,9 +654,7 @@ fn create_recovery_slot(
     slot_id: u8,
 ) -> Result<KeySlot> {
     if secret.len() < MIN_RECOVERY_SECRET_BYTES {
-        bail!(
-            "Recovery secret must contain at least {MIN_RECOVERY_SECRET_BYTES} bytes (192 bits)"
-        );
+        bail!("Recovery secret must contain at least {MIN_RECOVERY_SECRET_BYTES} bytes (192 bits)");
     }
     let export_id = BASE64_STANDARD.decode(export_id_b64)?;
 

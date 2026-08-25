@@ -979,7 +979,8 @@ mod tests {
                 "stripe": &stripe,
             }
         }));
-        let serialized = serde_json::to_string(&nested).expect("redacted swarm JSON must serialize");
+        let serialized =
+            serde_json::to_string(&nested).expect("redacted swarm JSON must serialize");
         for leaked_fragment in [
             "b3BlbnNzaC1rZXktdjE",
             "cGF5bG9hZDEyMzQ1Njc4OTA",

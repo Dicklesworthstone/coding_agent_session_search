@@ -565,10 +565,7 @@ mod tests {
                 &ANTHROPIC_KEY,
                 "sk-ant-api03-AbCdEf_0123456789-xYz987654321",
             ),
-            (
-                &GITHUB_TOKEN,
-                "github_pat_AbCdEf_0123456789_xYz987654321",
-            ),
+            (&GITHUB_TOKEN, "github_pat_AbCdEf_0123456789_xYz987654321"),
             (
                 &AWS_SESSION_TOKEN,
                 "AWS_SESSION_TOKEN=AQoEXAMPLE0123456789/value+=",
