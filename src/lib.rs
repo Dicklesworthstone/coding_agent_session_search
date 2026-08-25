@@ -8773,6 +8773,7 @@ fn run_quarantine_clear(
 
     let mut cleared = 0usize;
     if apply && !matched.is_empty() {
+        let original_state = state.clone();
         for key in &matched {
             if state.clear(key) {
                 cleared += 1;
@@ -8782,6 +8783,25 @@ fn run_quarantine_clear(
             .save(&data_dir)
             .map_err(anyhow::Error::from)
             .map_err(|err| quarantine_apply_cli_error("clear", err))?;
+
+        let quarantine_keys = matched
+            .iter()
+            .map(|key| (key.conversation_id.clone(), i64::from(key.schema_version)))
+            .collect::<BTreeSet<_>>();
+        if let Err(ledger_error) = crate::indexer::clear_operator_quarantine_poison_records(
+            &data_dir,
+            &quarantine_keys,
+        ) {
+            let error = match original_state.save(&data_dir) {
+                Ok(()) => anyhow::anyhow!(
+                    "clearing mirrored poison quarantine records failed; restored the structured checkpoint: {ledger_error:#}"
+                ),
+                Err(restore_error) => anyhow::anyhow!(
+                    "clearing mirrored poison quarantine records failed: {ledger_error:#}; restoring the structured checkpoint also failed: {restore_error}"
+                ),
+            };
+            return Err(quarantine_apply_cli_error("clear", error));
+        }
     }
 
     let matched_json: Vec<serde_json::Value> = matched

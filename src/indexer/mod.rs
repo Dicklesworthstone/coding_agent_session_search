@@ -23365,6 +23365,28 @@ fn clear_poison_jsonl_key_records(
     )
 }
 
+/// Clear operator-selected quarantine keys from both poison ledgers. The
+/// structured checkpoint is handled by the caller so it can restore that
+/// checkpoint if either ledger rewrite fails.
+pub(crate) fn clear_operator_quarantine_poison_records(
+    data_dir: &Path,
+    quarantine_keys: &BTreeSet<(String, i64)>,
+) -> Result<usize> {
+    let mut cleared = 0usize;
+    for (file_name, reason) in [
+        (WATCH_INGEST_POISON_FILE, "watch-ingest-out-of-memory"),
+        (INDEX_INGEST_POISON_FILE, "index-ingest-out-of-memory"),
+    ] {
+        cleared = cleared.saturating_add(clear_poison_jsonl_key_records(
+            data_dir,
+            file_name,
+            reason,
+            quarantine_keys,
+        )?);
+    }
+    Ok(cleared)
+}
+
 fn clear_poison_jsonl_records_where(
     data_dir: &Path,
     file_name: &str,
@@ -41623,6 +41645,50 @@ mod tests {
             QuarantineState::load(&data_dir).is_empty(),
             "successful retry should clear the matching structured quarantine record"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn operator_clear_removes_selected_key_from_both_poison_ledgers() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        let quarantine_dir = data_dir.join("quarantine");
+        std::fs::create_dir_all(&quarantine_dir)?;
+
+        for (file_name, reason) in [
+            (WATCH_INGEST_POISON_FILE, "watch-ingest-out-of-memory"),
+            (INDEX_INGEST_POISON_FILE, "index-ingest-out-of-memory"),
+        ] {
+            std::fs::write(
+                quarantine_dir.join(file_name),
+                format!(
+                    "{}\n{}\n",
+                    serde_json::json!({
+                        "conversation_id": "selected",
+                        "schema_version_at_quarantine": 1,
+                        "reason": reason,
+                    }),
+                    serde_json::json!({
+                        "conversation_id": "retained",
+                        "schema_version_at_quarantine": 1,
+                        "reason": reason,
+                    }),
+                ),
+            )?;
+        }
+
+        let selected = BTreeSet::from([("selected".to_string(), 1_i64)]);
+        assert_eq!(
+            clear_operator_quarantine_poison_records(&data_dir, &selected)?,
+            2
+        );
+        for file_name in [WATCH_INGEST_POISON_FILE, INDEX_INGEST_POISON_FILE] {
+            let path = quarantine_dir.join(file_name);
+            assert!(path.exists(), "operator clear must not delete {file_name}");
+            let contents = std::fs::read_to_string(path)?;
+            assert!(!contents.contains("selected"));
+            assert!(contents.contains("retained"));
+        }
         Ok(())
     }
 
