@@ -59,11 +59,12 @@ function Get-SiblingUrl {
     $builder = [System.UriBuilder]::new($uri)
     $path = $builder.Path
     if (-not $path) { return $null }
-    $directory = [System.IO.Path]::GetDirectoryName($path.TrimEnd('/'))
-    if ([string]::IsNullOrEmpty($directory)) {
+    $trimmedPath = $path.TrimEnd('/')
+    $lastSlash = $trimmedPath.LastIndexOf('/')
+    if ($lastSlash -le 0) {
       $builder.Path = "/$SiblingName"
     } else {
-      $builder.Path = ($directory.TrimEnd('/') + "/$SiblingName")
+      $builder.Path = ($trimmedPath.Substring(0, $lastSlash) + "/$SiblingName")
     }
     $builder.Query = ""
     $builder.Fragment = ""

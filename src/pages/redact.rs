@@ -496,10 +496,20 @@ fn insert_redacted_swarm_entry(
 /// privacy transforms alone would leak supported secret classes such as
 /// private-key blocks, raw JWTs, service tokens, and credential URLs.
 fn redact_swarm_scalar_with_engine(engine: &RedactionEngine, input: &str) -> RedactedString {
-    let secret_redacted = crate::indexer::redact_secrets::redact_text(input);
-    let canonical_secret_changed = secret_redacted.as_ref() != input;
-    let mut redacted = engine.redact_text(secret_redacted.as_ref());
-    if canonical_secret_changed {
+    // Swarm-specific patterns run FIRST so their precise markers survive
+    // ([SECRET_ENV_REDACTED], [SECRET_REDACTED], [REDACTED_PATH], ...), then the
+    // canonical floor catches whatever those rules do not cover.
+    //
+    // Running the floor first collapsed every class to its generic "[REDACTED]":
+    // it rewrote `TOKEN=...` before the swarm engine could see it, so
+    // `secret_env_assignment` and `api_key_literal` had nothing left to match and
+    // their markers never appeared (gh#419). Secrets were still scrubbed either
+    // way -- the floor is a safety net, not the labeller -- but the evidence
+    // report lost the ability to say *what kind* of secret had been there.
+    let mut redacted = engine.redact_text(input);
+    let floored = crate::indexer::redact_secrets::redact_text(&redacted.output).into_owned();
+    if floored != redacted.output {
+        redacted.output = floored;
         // `changes` counts pattern-class passes rather than individual matches.
         // Record one safe synthetic entry so the swarm evidence report remains
         // truthful without retaining any source secret bytes.

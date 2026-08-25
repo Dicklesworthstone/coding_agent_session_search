@@ -167,6 +167,25 @@ fn install_sh_keeps_tmp_root_warnings_out_of_command_substitution() {
 }
 
 #[test]
+fn install_ps1_derives_sibling_urls_without_host_path_semantics() {
+    let script = fs::read_to_string("install.ps1").expect("read install.ps1");
+    assert!(
+        !script.contains("[System.IO.Path]::GetDirectoryName($path.TrimEnd('/'))"),
+        "URI directory derivation must not depend on Windows filesystem separators"
+    );
+    for required in [
+        "$trimmedPath = $path.TrimEnd('/')",
+        "$lastSlash = $trimmedPath.LastIndexOf('/')",
+        "$trimmedPath.Substring(0, $lastSlash) + \"/$SiblingName\"",
+    ] {
+        assert!(
+            script.contains(required),
+            "PowerShell sibling URL derivation is missing: {required}"
+        );
+    }
+}
+
+#[test]
 fn release_workflow_builds_and_publishes_the_exact_requested_tag() -> Result<(), String> {
     let workflow =
         fs::read_to_string(".github/workflows/release.yml").map_err(|err| err.to_string())?;
@@ -199,6 +218,17 @@ fn release_workflow_builds_and_publishes_the_exact_requested_tag() -> Result<(),
         "cargo build --locked --release --target ${{ matrix.target }}",
     ) {
         return Err("release binaries must be built from the tagged Cargo.lock".to_string());
+    }
+    for required in [
+        "if [[ \"${API_VERSION}\" != \"1\" ]]",
+        "$apiVersionJson = & $binary api-version --json",
+        "if ($apiVersion.api_version -ne 1)",
+    ] {
+        if !workflow.contains(required) {
+            return Err(format!(
+                "release binaries must prove the pinned robot API contract: {required}"
+            ));
+        }
     }
     if workflow.contains("dtolnay/rust-toolchain@stable") {
         return Err("release workflow actions must be immutable-SHA pinned".to_string());

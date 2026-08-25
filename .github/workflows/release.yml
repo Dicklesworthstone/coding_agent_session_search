@@ -151,6 +151,10 @@ jobs:
           BINARY="target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
           "$BINARY" --version
           API_VERSION="$("$BINARY" api-version --json | python3 -c 'import json,sys;print(json.load(sys.stdin).get("api_version", -1))')"
+          if [[ "${API_VERSION}" != "1" ]]; then
+            echo "::error::Expected api_version 1 but got ${API_VERSION}"
+            exit 1
+          fi
           echo "api_version: ${API_VERSION}"
 
       - name: Smoke-test release binary (Windows)
@@ -160,6 +164,12 @@ jobs:
           $binary = "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
           & $binary --version
           if ($LASTEXITCODE -ne 0) { throw "cass.exe --version failed: exit $LASTEXITCODE" }
+          $apiVersionJson = & $binary api-version --json
+          if ($LASTEXITCODE -ne 0) { throw "cass.exe api-version failed: exit $LASTEXITCODE" }
+          $apiVersion = $apiVersionJson | ConvertFrom-Json
+          if ($apiVersion.api_version -ne 1) {
+            throw "Expected api_version 1 but got $($apiVersion.api_version)"
+          }
 
       - name: Verify binary architecture (Unix)
         if: runner.os != 'Windows'
