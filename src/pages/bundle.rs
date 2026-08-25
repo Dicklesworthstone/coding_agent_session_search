@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use super::archive_config::{ArchiveConfig, UnencryptedConfig};
@@ -604,7 +604,7 @@ fn unique_bundle_dir(path: &Path, suffix: &str) -> Result<PathBuf> {
     unique_bundle_sidecar_path(path, suffix, "pages_bundle")
 }
 
-fn bundle_publish_in_progress_backup_path(path: &Path) -> PathBuf {
+fn legacy_bundle_publish_in_progress_backup_path(path: &Path) -> PathBuf {
     let mut backup_name = std::ffi::OsString::from(".");
     backup_name.push(
         path.file_name()
@@ -614,105 +614,621 @@ fn bundle_publish_in_progress_backup_path(path: &Path) -> PathBuf {
     path.with_file_name(backup_name)
 }
 
-fn bundle_publish_marker_path(bundle_dir: &Path) -> PathBuf {
-    bundle_dir.join(BUNDLE_PUBLISH_MARKER_NAME)
+fn bundle_publish_recovery_journal_path(path: &Path) -> PathBuf {
+    let mut journal_name = std::ffi::OsString::from(".");
+    journal_name.push(
+        path.file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("pages_bundle")),
+    );
+    journal_name.push(".pages-bundle-publish-in-progress.json");
+    path.with_file_name(journal_name)
 }
 
-fn bundle_publish_marker_exists(bundle_dir: &Path) -> Result<bool> {
-    let marker_path = bundle_publish_marker_path(bundle_dir);
-    match fs::symlink_metadata(&marker_path) {
-        Ok(metadata) => {
+fn bundle_publish_backup_prefix(path: &Path) -> Result<String> {
+    let file_name = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
+        anyhow!(
+            "Pages bundle output has no UTF-8 file name: {}",
+            path.display()
+        )
+    })?;
+    Ok(format!(".{file_name}.publish-backup."))
+}
+
+fn unpredictable_bundle_publish_backup_path(path: &Path) -> Result<PathBuf> {
+    let prefix = bundle_publish_backup_prefix(path)?;
+    let nonce = bundle_sidecar_random_nonce()?;
+    Ok(path.with_file_name(format!("{prefix}{nonce:032x}")))
+}
+
+fn bundle_path_entry_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed inspecting bundle path entry {}", path.display())),
+    }
+}
+
+fn journal_bundle_backup_path(
+    final_dir: &Path,
+    journal: &BundlePublishJournal,
+) -> Result<PathBuf> {
+    let backup_name_path = Path::new(&journal.backup_file_name);
+    if backup_name_path.file_name() != Some(backup_name_path.as_os_str())
+        || backup_name_path.components().count() != 1
+    {
+        bail!(
+            "Pages bundle publish journal for {} contains a non-local backup name",
+            final_dir.display()
+        );
+    }
+    let prefix = bundle_publish_backup_prefix(final_dir)?;
+    let Some(nonce) = journal.backup_file_name.strip_prefix(&prefix) else {
+        bail!(
+            "Pages bundle publish journal for {} contains an unexpected backup name {}",
+            final_dir.display(),
+            journal.backup_file_name
+        );
+    };
+    if nonce.len() != 32
+        || !nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!(
+            "Pages bundle publish journal for {} contains an invalid backup nonce",
+            final_dir.display()
+        );
+    }
+    Ok(final_dir.with_file_name(&journal.backup_file_name))
+}
+
+fn validate_bundle_publish_journal(
+    final_dir: &Path,
+    journal: &BundlePublishJournal,
+) -> Result<PathBuf> {
+    if journal.format != BUNDLE_PUBLISH_JOURNAL_FORMAT {
+        bail!(
+            "Pages bundle publish journal for {} has unsupported format {}",
+            final_dir.display(),
+            journal.format
+        );
+    }
+    for (label, digest) in [
+        ("prior", journal.prior_sha256.as_str()),
+        ("candidate", journal.candidate_sha256.as_str()),
+    ] {
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            bail!(
+                "Pages bundle publish journal for {} has an invalid {label} SHA-256 digest",
+                final_dir.display()
+            );
+        }
+    }
+    journal_bundle_backup_path(final_dir, journal)
+}
+
+fn read_bundle_publish_journal(final_dir: &Path) -> Result<Option<BundlePublishJournal>> {
+    let journal_path = bundle_publish_recovery_journal_path(final_dir);
+    let metadata = match fs::symlink_metadata(&journal_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed inspecting Pages bundle publish journal {}",
+                    journal_path.display()
+                )
+            });
+        }
+    };
+    if !metadata.file_type().is_file() {
+        bail!(
+            "Pages bundle publish journal is not a regular file; preserved it without mutation: {}",
+            journal_path.display()
+        );
+    }
+    #[cfg(unix)]
+    if metadata.nlink() != 1 {
+        bail!(
+            "Pages bundle publish journal {} has {} hard links; preserved it because exclusive pathname ownership is not provable",
+            journal_path.display(),
+            metadata.nlink()
+        );
+    }
+    if metadata.len() > BUNDLE_PUBLISH_JOURNAL_MAX_BYTES {
+        bail!(
+            "Pages bundle publish journal exceeds the {}-byte bound; preserved it without mutation: {}",
+            BUNDLE_PUBLISH_JOURNAL_MAX_BYTES,
+            journal_path.display()
+        );
+    }
+
+    let mut file = File::open(&journal_path).with_context(|| {
+        format!(
+            "failed opening Pages bundle publish journal {}",
+            journal_path.display()
+        )
+    })?;
+    let opened_identity = crate::franken_sync::FileIdentity::from_file(&file)
+        .with_context(|| {
+            format!(
+                "failed identifying Pages bundle publish journal {}",
+                journal_path.display()
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow!(
+                "filesystem does not expose a stable identity for Pages bundle publish journal {}",
+                journal_path.display()
+            )
+        })?;
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(BUNDLE_PUBLISH_JOURNAL_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| {
+            format!(
+                "failed reading Pages bundle publish journal {}",
+                journal_path.display()
+            )
+        })?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > BUNDLE_PUBLISH_JOURNAL_MAX_BYTES
+        || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != metadata.len()
+    {
+        bail!(
+            "Pages bundle publish journal changed size while read; preserved it without mutation: {}",
+            journal_path.display()
+        );
+    }
+    let path_probe = File::open(&journal_path).with_context(|| {
+        format!(
+            "failed re-opening Pages bundle publish journal {}",
+            journal_path.display()
+        )
+    })?;
+    let path_identity = crate::franken_sync::FileIdentity::from_file(&path_probe)
+        .with_context(|| {
+            format!(
+                "failed re-identifying Pages bundle publish journal {}",
+                journal_path.display()
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow!(
+                "filesystem stopped exposing a stable identity for Pages bundle publish journal {}",
+                journal_path.display()
+            )
+        })?;
+    if path_identity != opened_identity {
+        bail!(
+            "Pages bundle publish journal changed identity while read; preserved it without mutation: {}",
+            journal_path.display()
+        );
+    }
+    let observed_metadata = fs::symlink_metadata(&journal_path).with_context(|| {
+        format!(
+            "failed re-inspecting Pages bundle publish journal {}",
+            journal_path.display()
+        )
+    })?;
+    if !observed_metadata.file_type().is_file() {
+        bail!(
+            "Pages bundle publish journal changed file type while read; preserved it without mutation: {}",
+            journal_path.display()
+        );
+    }
+    #[cfg(unix)]
+    if observed_metadata.nlink() != 1 {
+        bail!(
+            "Pages bundle publish journal {} gained additional hard links while read; preserved it without mutation",
+            journal_path.display()
+        );
+    }
+
+    let journal: BundlePublishJournal = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "Pages bundle publish journal is invalid and was preserved without mutation: {}",
+            journal_path.display()
+        )
+    })?;
+    validate_bundle_publish_journal(final_dir, &journal)?;
+    Ok(Some(journal))
+}
+
+fn write_bundle_publish_journal(
+    final_dir: &Path,
+    backup_dir: &Path,
+    prior: &BundleTreeEvidence,
+    candidate: &BundleTreeEvidence,
+) -> Result<BundlePublishJournal> {
+    let backup_file_name = backup_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            anyhow!(
+                "Pages bundle publish backup has no UTF-8 file name: {}",
+                backup_dir.display()
+            )
+        })?
+        .to_string();
+    let journal = BundlePublishJournal {
+        format: BUNDLE_PUBLISH_JOURNAL_FORMAT.to_string(),
+        backup_file_name,
+        prior_file_count: prior.file_count,
+        prior_size_bytes: prior.total_size_bytes,
+        prior_sha256: prior.sha256.clone(),
+        candidate_file_count: candidate.file_count,
+        candidate_size_bytes: candidate.total_size_bytes,
+        candidate_sha256: candidate.sha256.clone(),
+    };
+    validate_bundle_publish_journal(final_dir, &journal)?;
+    let bytes = serde_json::to_vec(&journal)
+        .context("failed serializing Pages bundle publish journal")?;
+    let journal_path = bundle_publish_recovery_journal_path(final_dir);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&journal_path).with_context(|| {
+        format!(
+            "failed exclusively creating Pages bundle publish journal {}; preserved the live and staged generations",
+            journal_path.display()
+        )
+    })?;
+    let created_identity = crate::franken_sync::FileIdentity::from_file(&file)
+        .with_context(|| {
+            format!(
+                "failed identifying newly created Pages bundle publish journal {}",
+                journal_path.display()
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow!(
+                "filesystem does not expose a stable identity for newly created Pages bundle publish journal {}",
+                journal_path.display()
+            )
+        })?;
+    file.write_all(&bytes).with_context(|| {
+        format!(
+            "failed writing Pages bundle publish journal {}; preserved it for inspection",
+            journal_path.display()
+        )
+    })?;
+    file.sync_all().with_context(|| {
+        format!(
+            "failed syncing Pages bundle publish journal {}; preserved it for inspection",
+            journal_path.display()
+        )
+    })?;
+    sync_parent_directory(&journal_path).with_context(|| {
+        format!(
+            "failed durably publishing Pages bundle journal {}; preserved it for recovery",
+            journal_path.display()
+        )
+    })?;
+    let path_probe = File::open(&journal_path).with_context(|| {
+        format!(
+            "failed re-opening newly created Pages bundle publish journal {}",
+            journal_path.display()
+        )
+    })?;
+    let path_identity = crate::franken_sync::FileIdentity::from_file(&path_probe)
+        .context("failed re-identifying newly created Pages bundle publish journal")?
+        .ok_or_else(|| {
+            anyhow!(
+                "filesystem stopped exposing a stable identity for newly created Pages bundle publish journal {}",
+                journal_path.display()
+            )
+        })?;
+    if path_identity != created_identity {
+        bail!(
+            "Pages bundle publish journal {} changed identity while it was created; live and staged generations were preserved",
+            journal_path.display()
+        );
+    }
+    let observed = read_bundle_publish_journal(final_dir)?.ok_or_else(|| {
+        anyhow!(
+            "newly created Pages bundle publish journal disappeared before publication: {}",
+            journal_path.display()
+        )
+    })?;
+    if observed != journal {
+        bail!(
+            "Pages bundle publish journal {} changed content before publication; live and staged generations were preserved",
+            journal_path.display()
+        );
+    }
+    Ok(journal)
+}
+
+fn remove_bundle_publish_journal(
+    final_dir: &Path,
+    expected: &BundlePublishJournal,
+) -> Result<()> {
+    let journal_path = bundle_publish_recovery_journal_path(final_dir);
+    let observed = read_bundle_publish_journal(final_dir)?.ok_or_else(|| {
+        anyhow!(
+            "completed Pages bundle publish journal disappeared before validated cleanup: {}",
+            journal_path.display()
+        )
+    })?;
+    if observed != *expected {
+        bail!(
+            "Pages bundle publish journal changed before cleanup; preserved the current entry without mutation: {}",
+            journal_path.display()
+        );
+    }
+    fs::remove_file(&journal_path).with_context(|| {
+        format!(
+            "failed removing completed Pages bundle publish journal {}",
+            journal_path.display()
+        )
+    })?;
+    sync_parent_directory(&journal_path)
+}
+
+fn first_unowned_bundle_publish_backup(
+    final_dir: &Path,
+    owned_backup: Option<&Path>,
+) -> Result<Option<PathBuf>> {
+    let legacy_path = legacy_bundle_publish_in_progress_backup_path(final_dir);
+    if owned_backup != Some(legacy_path.as_path()) && bundle_path_entry_exists(&legacy_path)? {
+        return Ok(Some(legacy_path));
+    }
+
+    let Some(parent) = final_dir.parent() else {
+        return Ok(None);
+    };
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed scanning Pages bundle publish namespace {}",
+                    parent.display()
+                )
+            });
+        }
+    };
+    let prefix = bundle_publish_backup_prefix(final_dir)?;
+    for (index, entry) in entries.enumerate() {
+        if index >= BUNDLE_PUBLISH_BACKUP_SCAN_LIMIT {
+            bail!(
+                "Pages bundle publish namespace {} exceeds the {}-entry recovery scan bound; preserved every entry",
+                parent.display(),
+                BUNDLE_PUBLISH_BACKUP_SCAN_LIMIT
+            );
+        }
+        let entry = entry.with_context(|| {
+            format!(
+                "failed reading Pages bundle publish namespace {}",
+                parent.display()
+            )
+        })?;
+        let path = entry.path();
+        if owned_backup == Some(path.as_path()) {
+            continue;
+        }
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(&prefix))
+        {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+fn update_bundle_evidence_path(hasher: &mut Sha256, kind: u8, path: &str) -> Result<()> {
+    let path_len = u64::try_from(path.len())
+        .map_err(|_| anyhow!("Pages bundle relative path length exceeds u64"))?;
+    hasher.update([kind]);
+    hasher.update(path_len.to_le_bytes());
+    hasher.update(path.as_bytes());
+    Ok(())
+}
+
+fn inspect_bundle_tree(path: &Path, label: &str) -> Result<BundleTreeEvidence> {
+    if !ensure_bundle_directory_entry(path, label)? {
+        bail!("{label} does not exist: {}", path.display());
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(BUNDLE_TREE_EVIDENCE_DOMAIN);
+    let mut file_count = 0_u64;
+    let mut total_size_bytes = 0_u64;
+    let mut pending_directories = vec![path.to_path_buf()];
+    let mut buffer = [0_u8; 64 * 1024];
+
+    while let Some(directory) = pending_directories.pop() {
+        let mut entries = fs::read_dir(&directory)
+            .with_context(|| format!("failed reading {label} directory {}", directory.display()))?
+            .collect::<std::io::Result<Vec<_>>>()
+            .with_context(|| format!("failed walking {label} directory {}", directory.display()))?;
+        entries.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+        let mut child_directories = Vec::new();
+
+        for entry in entries {
+            let entry_path = entry.path();
+            let relative = entry_path.strip_prefix(path).with_context(|| {
+                format!(
+                    "{label} entry escaped its root {}: {}",
+                    path.display(),
+                    entry_path.display()
+                )
+            })?;
+            let relative = relative.to_str().ok_or_else(|| {
+                anyhow!(
+                    "{label} contains a non-UTF-8 relative path, which cannot be recovery-bound: {}",
+                    entry_path.display()
+                )
+            })?;
+            let metadata = fs::symlink_metadata(&entry_path).with_context(|| {
+                format!("failed inspecting {label} entry {}", entry_path.display())
+            })?;
             let file_type = metadata.file_type();
             if file_type.is_symlink() {
                 bail!(
-                    "bundle publish marker must not be a symlink: {}",
-                    marker_path.display()
+                    "{label} contains a symlink, which cannot be safely published or recursively cleaned: {}",
+                    entry_path.display()
                 );
+            }
+            if file_type.is_dir() {
+                update_bundle_evidence_path(&mut hasher, b'D', relative)?;
+                child_directories.push(entry_path);
+                continue;
             }
             if !file_type.is_file() {
                 bail!(
-                    "bundle publish marker must be a regular file: {}",
-                    marker_path.display()
+                    "{label} contains an unsupported filesystem entry: {}",
+                    entry_path.display()
                 );
             }
-            let maximum_marker_bytes =
-                u64::try_from(BUNDLE_PUBLISH_MARKER_CONTENT.len().saturating_add(1))
-                    .unwrap_or(u64::MAX);
-            let mut contents = Vec::with_capacity(BUNDLE_PUBLISH_MARKER_CONTENT.len());
-            File::open(&marker_path)
+
+            let mut file = File::open(&entry_path).with_context(|| {
+                format!("failed opening {label} file {}", entry_path.display())
+            })?;
+            let opened_metadata = file.metadata().with_context(|| {
+                format!("failed inspecting opened {label} file {}", entry_path.display())
+            })?;
+            if !opened_metadata.file_type().is_file() {
+                bail!(
+                    "{label} entry changed file type while opening: {}",
+                    entry_path.display()
+                );
+            }
+            #[cfg(unix)]
+            if opened_metadata.nlink() != 1 {
+                bail!(
+                    "{label} file {} has {} hard links; exclusive tree ownership is not provable",
+                    entry_path.display(),
+                    opened_metadata.nlink()
+                );
+            }
+            let opened_identity = crate::franken_sync::FileIdentity::from_file(&file)
                 .with_context(|| {
-                    format!(
-                        "failed opening bundle publish marker {}",
-                        marker_path.display()
-                    )
+                    format!("failed identifying opened {label} file {}", entry_path.display())
                 })?
-                .take(maximum_marker_bytes)
-                .read_to_end(&mut contents)
-                .with_context(|| {
-                    format!(
-                        "failed reading bundle publish marker {}",
-                        marker_path.display()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "filesystem does not expose a stable identity for {label} file {}",
+                        entry_path.display()
                     )
                 })?;
-            if contents != BUNDLE_PUBLISH_MARKER_CONTENT {
+            update_bundle_evidence_path(&mut hasher, b'F', relative)?;
+            hasher.update(opened_metadata.len().to_le_bytes());
+            let mut observed_size = 0_u64;
+            loop {
+                let read = file.read(&mut buffer).with_context(|| {
+                    format!("failed hashing {label} file {}", entry_path.display())
+                })?;
+                if read == 0 {
+                    break;
+                }
+                observed_size = observed_size
+                    .checked_add(u64::try_from(read).unwrap_or(u64::MAX))
+                    .ok_or_else(|| anyhow!("{label} size overflow while hashing"))?;
+                hasher.update(&buffer[..read]);
+            }
+            if observed_size != opened_metadata.len() {
                 bail!(
-                    "bundle publish marker has unrecognized contents and will not be trusted: {}",
-                    marker_path.display()
+                    "{label} file changed size while hashing: {}",
+                    entry_path.display()
                 );
             }
-            Ok(true)
+            let path_probe = File::open(&entry_path).with_context(|| {
+                format!("failed re-opening {label} file {}", entry_path.display())
+            })?;
+            let path_identity = crate::franken_sync::FileIdentity::from_file(&path_probe)
+                .with_context(|| {
+                    format!("failed re-identifying {label} file {}", entry_path.display())
+                })?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "filesystem stopped exposing a stable identity for {label} file {}",
+                        entry_path.display()
+                    )
+                })?;
+            if path_identity != opened_identity {
+                bail!(
+                    "{label} file changed identity while hashing: {}",
+                    entry_path.display()
+                );
+            }
+            let observed_metadata = fs::symlink_metadata(&entry_path).with_context(|| {
+                format!("failed re-inspecting {label} file {}", entry_path.display())
+            })?;
+            if !observed_metadata.file_type().is_file()
+                || observed_metadata.len() != opened_metadata.len()
+            {
+                bail!(
+                    "{label} file changed metadata while hashing: {}",
+                    entry_path.display()
+                );
+            }
+            #[cfg(unix)]
+            if observed_metadata.nlink() != 1 {
+                bail!(
+                    "{label} file {} gained additional hard links while hashing",
+                    entry_path.display()
+                );
+            }
+            file_count = file_count
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("{label} file count overflow"))?;
+            total_size_bytes = total_size_bytes
+                .checked_add(opened_metadata.len())
+                .ok_or_else(|| anyhow!("{label} total size overflow"))?;
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error).with_context(|| {
-            format!(
-                "failed inspecting bundle publish marker {}",
-                marker_path.display()
-            )
-        }),
+
+        for child in child_directories.into_iter().rev() {
+            pending_directories.push(child);
+        }
+    }
+
+    Ok(BundleTreeEvidence {
+        file_count,
+        total_size_bytes,
+        sha256: hex::encode(hasher.finalize()),
+    })
+}
+
+fn journal_prior_evidence(journal: &BundlePublishJournal) -> BundleTreeEvidence {
+    BundleTreeEvidence {
+        file_count: journal.prior_file_count,
+        total_size_bytes: journal.prior_size_bytes,
+        sha256: journal.prior_sha256.clone(),
     }
 }
 
-fn write_bundle_publish_marker(bundle_dir: &Path) -> Result<()> {
-    let marker_path = bundle_publish_marker_path(bundle_dir);
-    let mut marker = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&marker_path)
-        .with_context(|| {
-            format!(
-                "failed creating bundle publish marker {}",
-                marker_path.display()
-            )
-        })?;
-    marker
-        .write_all(BUNDLE_PUBLISH_MARKER_CONTENT)
-        .with_context(|| {
-            format!(
-                "failed writing bundle publish marker {}",
-                marker_path.display()
-            )
-        })?;
-    marker.sync_all().with_context(|| {
-        format!(
-            "failed syncing bundle publish marker {}",
-            marker_path.display()
-        )
-    })?;
-    sync_parent_directory(&marker_path)
+fn journal_candidate_evidence(journal: &BundlePublishJournal) -> BundleTreeEvidence {
+    BundleTreeEvidence {
+        file_count: journal.candidate_file_count,
+        total_size_bytes: journal.candidate_size_bytes,
+        sha256: journal.candidate_sha256.clone(),
+    }
 }
 
-fn remove_bundle_publish_marker(bundle_dir: &Path) -> Result<()> {
-    if !bundle_publish_marker_exists(bundle_dir)? {
-        return Ok(());
+fn ensure_bundle_tree_matches(
+    path: &Path,
+    label: &str,
+    expected: &BundleTreeEvidence,
+) -> Result<BundleTreeEvidence> {
+    let observed = inspect_bundle_tree(path, label)?;
+    if observed != *expected {
+        bail!(
+            "{label} changed identity or content; preserved it without mutation: {}",
+            path.display()
+        );
     }
-    let marker_path = bundle_publish_marker_path(bundle_dir);
-    fs::remove_file(&marker_path).with_context(|| {
-        format!(
-            "failed removing completed bundle publish marker {}",
-            marker_path.display()
-        )
-    })?;
-    sync_parent_directory(&marker_path)
+    Ok(observed)
 }
 
 fn unique_bundle_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) -> Result<PathBuf> {

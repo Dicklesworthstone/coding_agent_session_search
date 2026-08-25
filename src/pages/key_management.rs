@@ -524,6 +524,386 @@ fn collect_key_publication_paths(
     Ok(())
 }
 
+fn allocate_key_mutation_staging_root(live_root: &Path) -> Result<PathBuf> {
+    for _ in 0..64 {
+        let path = random_key_mutation_sidecar_path(live_root, "staged");
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        builder.mode(0o700);
+        match builder.create(&path) {
+            Ok(()) => {
+                #[cfg(unix)]
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed creating Pages key-mutation staging root {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    bail!("failed allocating a unique Pages key-mutation staging root")
+}
+
+fn is_private_key_artifact_path(target: &KeyMutationTarget, relative: &Path) -> bool {
+    !target.site_relative.as_os_str().is_empty() && relative.starts_with("private")
+}
+
+fn rotation_replaces_site_entry(target: &KeyMutationTarget, relative: &Path) -> bool {
+    let site_relative = if target.site_relative.as_os_str().is_empty() {
+        relative
+    } else {
+        let Ok(relative) = relative.strip_prefix(&target.site_relative) else {
+            return false;
+        };
+        relative
+    };
+    site_relative.components().count() == 1
+        && matches!(
+            site_relative.to_str(),
+            Some("payload" | "blobs" | "config.json" | "integrity.json")
+        )
+}
+
+fn stage_key_mutation_tree(
+    target: &KeyMutationTarget,
+    mode: KeyMutationStageMode,
+) -> Result<(PathBuf, TreeEvidence)> {
+    let prior_evidence = inspect_key_publication_tree(&target.live_root)?;
+    let staged_root = allocate_key_mutation_staging_root(&target.live_root)?;
+    let canonical_live_root = target.live_root.canonicalize().with_context(|| {
+        format!(
+            "failed resolving Pages key-mutation root {}",
+            target.live_root.display()
+        )
+    })?;
+
+    let copy_result = copy_key_mutation_tree_recursive(
+        target,
+        &target.live_root,
+        &staged_root,
+        &target.live_root,
+        &canonical_live_root,
+        mode,
+    );
+    if let Err(error) = copy_result {
+        let cleanup_error = remove_owned_key_mutation_tree(&staged_root, None).err();
+        return match cleanup_error {
+            Some(cleanup_error) => Err(error.context(format!(
+                "failed cleaning rejected key-mutation staging root: {cleanup_error:#}"
+            ))),
+            None => Err(error),
+        };
+    }
+
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        &staged_root,
+        std::fs::Permissions::from_mode(key_publication_mode(&std::fs::metadata(
+            &target.live_root,
+        )?)),
+    )?;
+
+    Ok((staged_root, prior_evidence))
+}
+
+fn copy_key_mutation_tree_recursive(
+    target: &KeyMutationTarget,
+    source_directory: &Path,
+    staged_root: &Path,
+    source_root: &Path,
+    canonical_source_root: &Path,
+    mode: KeyMutationStageMode,
+) -> Result<()> {
+    for entry in std::fs::read_dir(source_directory).with_context(|| {
+        format!(
+            "failed reading Pages key-mutation source {}",
+            source_directory.display()
+        )
+    })? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let relative = source_path.strip_prefix(source_root)?;
+        if mode == KeyMutationStageMode::ReplaceEncryptedPayload
+            && rotation_replaces_site_entry(target, relative)
+        {
+            continue;
+        }
+        if relative.components().any(|component| {
+            !matches!(component, Component::Normal(_) | Component::CurDir)
+        }) {
+            bail!(
+                "refusing to stage unsafe Pages key-mutation path {}",
+                relative.display()
+            );
+        }
+        let destination = staged_root.join(relative);
+        let metadata = std::fs::symlink_metadata(&source_path)?;
+        let file_type = metadata.file_type();
+        let is_private = is_private_key_artifact_path(target, relative);
+
+        if file_type.is_symlink() {
+            if is_private {
+                bail!(
+                    "private key artifact must not be a symlink: {}",
+                    source_path.display()
+                );
+            }
+            let canonical_target = source_path.canonicalize().with_context(|| {
+                format!(
+                    "failed resolving symlinked Pages key-mutation source {}",
+                    source_path.display()
+                )
+            })?;
+            if !canonical_target.starts_with(canonical_source_root) {
+                bail!(
+                    "refusing to stage Pages key-mutation symlink outside archive root: {}",
+                    source_path.display()
+                );
+            }
+            if !std::fs::metadata(&canonical_target)?.file_type().is_file() {
+                bail!(
+                    "Pages key-mutation symlink must resolve to a regular file: {}",
+                    source_path.display()
+                );
+            }
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&canonical_target, &destination)?;
+            continue;
+        }
+
+        if file_type.is_dir() {
+            std::fs::create_dir(&destination).with_context(|| {
+                format!(
+                    "failed creating staged key-mutation directory {}",
+                    destination.display()
+                )
+            })?;
+            #[cfg(unix)]
+            std::fs::set_permissions(
+                &destination,
+                std::fs::Permissions::from_mode(if is_private {
+                    0o700
+                } else {
+                    key_publication_mode(&metadata)
+                }),
+            )?;
+            copy_key_mutation_tree_recursive(
+                target,
+                &source_path,
+                staged_root,
+                source_root,
+                canonical_source_root,
+                mode,
+            )?;
+            continue;
+        }
+
+        if !file_type.is_file() {
+            bail!(
+                "Pages key-mutation source contains a non-regular entry: {}",
+                source_path.display()
+            );
+        }
+        #[cfg(unix)]
+        if metadata.nlink() != 1 {
+            bail!(
+                "Pages key-mutation source file {} has {} hard links; exact ownership is not provable",
+                source_path.display(),
+                metadata.nlink()
+            );
+        }
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(&source_path, &destination).with_context(|| {
+            format!(
+                "failed copying Pages key-mutation source {} to {}",
+                source_path.display(),
+                destination.display()
+            )
+        })?;
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &destination,
+            std::fs::Permissions::from_mode(if is_private {
+                0o600
+            } else {
+                key_publication_mode(&metadata)
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+fn direct_child_from_journal(root: &Path, file_name: &str, label: &str) -> Result<PathBuf> {
+    let candidate = Path::new(file_name);
+    let mut components = candidate.components();
+    let Some(Component::Normal(name)) = components.next() else {
+        bail!("{label} is not a plain file name: {file_name}");
+    };
+    if components.next().is_some() {
+        bail!("{label} contains path separators: {file_name}");
+    }
+    Ok(root.with_file_name(name))
+}
+
+fn write_key_mutation_journal(
+    guard: &KeyMutationGuard,
+    staged_root: &Path,
+    backup_root: &Path,
+    prior: &TreeEvidence,
+    candidate: &TreeEvidence,
+) -> Result<()> {
+    require_key_mutation_guard(guard)?;
+    match std::fs::symlink_metadata(&guard.target.journal_path) {
+        Ok(_) => bail!(
+            "Pages key-mutation recovery journal already exists: {}",
+            guard.target.journal_path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let staged_file_name = staged_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("key-mutation staging name is not UTF-8"))?;
+    let backup_file_name = backup_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("key-mutation backup name is not UTF-8"))?;
+    let journal = KeyMutationJournal {
+        format: KEY_MUTATION_JOURNAL_FORMAT.to_string(),
+        staged_file_name: staged_file_name.to_string(),
+        backup_file_name: backup_file_name.to_string(),
+        prior_digest: prior.digest.clone(),
+        candidate_digest: candidate.digest.clone(),
+    };
+    let bytes = serde_json::to_vec_pretty(&journal)?;
+    if bytes.len() as u64 > KEY_MUTATION_JOURNAL_MAX_BYTES {
+        bail!("Pages key-mutation recovery journal exceeds its size bound");
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&guard.target.journal_path).with_context(|| {
+        format!(
+            "failed creating Pages key-mutation recovery journal {}",
+            guard.target.journal_path.display()
+        )
+    })?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    sync_parent_directory(&guard.target.journal_path)
+}
+
+fn read_key_mutation_journal(guard: &KeyMutationGuard) -> Result<Option<KeyMutationJournal>> {
+    require_key_mutation_guard(guard)?;
+    let metadata = match std::fs::symlink_metadata(&guard.target.journal_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() {
+        bail!(
+            "Pages key-mutation recovery journal is not a regular file: {}",
+            guard.target.journal_path.display()
+        );
+    }
+    #[cfg(unix)]
+    if metadata.nlink() != 1 {
+        bail!(
+            "Pages key-mutation recovery journal {} has {} hard links",
+            guard.target.journal_path.display(),
+            metadata.nlink()
+        );
+    }
+    if metadata.len() > KEY_MUTATION_JOURNAL_MAX_BYTES {
+        bail!(
+            "Pages key-mutation recovery journal exceeds its {} byte limit: {}",
+            KEY_MUTATION_JOURNAL_MAX_BYTES,
+            guard.target.journal_path.display()
+        );
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::open(&guard.target.journal_path)?
+        .take(KEY_MUTATION_JOURNAL_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    let journal: KeyMutationJournal = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "failed parsing Pages key-mutation recovery journal {}",
+            guard.target.journal_path.display()
+        )
+    })?;
+    if journal.format != KEY_MUTATION_JOURNAL_FORMAT {
+        bail!(
+            "unrecognized Pages key-mutation recovery journal format at {}",
+            guard.target.journal_path.display()
+        );
+    }
+    Ok(Some(journal))
+}
+
+fn optional_key_tree_evidence(path: &Path) -> Result<Option<TreeEvidence>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            inspect_key_publication_tree(path).map(Some)
+        }
+        Ok(_) => bail!(
+            "Pages key-mutation recovery path is not a real directory: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn remove_owned_key_mutation_tree(path: &Path, expected_digest: Option<&str>) -> Result<()> {
+    let Some(evidence) = optional_key_tree_evidence(path)? else {
+        return Ok(());
+    };
+    if let Some(expected_digest) = expected_digest
+        && evidence.digest != expected_digest
+    {
+        bail!(
+            "refusing to remove key-mutation tree {} because its digest drifted",
+            path.display()
+        );
+    }
+    std::fs::remove_dir_all(path).with_context(|| {
+        format!(
+            "failed removing owned Pages key-mutation tree {}",
+            path.display()
+        )
+    })?;
+    sync_parent_directory(path)
+}
+
+fn remove_key_mutation_journal(guard: &KeyMutationGuard) -> Result<()> {
+    require_key_mutation_guard(guard)?;
+    let metadata = match std::fs::symlink_metadata(&guard.target.journal_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() {
+        bail!(
+            "refusing to remove non-file key-mutation journal {}",
+            guard.target.journal_path.display()
+        );
+    }
+    std::fs::remove_file(&guard.target.journal_path)?;
+    sync_parent_directory(&guard.target.journal_path)
+}
+
 /// Result of listing key slots
 #[derive(Debug, Clone, Serialize)]
 pub struct KeyListResult {

@@ -491,25 +491,12 @@ jobs:
         id: publish_readiness
         shell: bash
         run: |
-          # NOTE (v0.6.10, post-v0.6.9 yank investigation): the previous
-          # check used `cargo package --locked --no-verify`. In CI, after
-          # the "Clone sibling dependencies" step warms cargo's git
-          # source cache, `--locked` triggers a "cannot update the lock
-          # file" error against the still-committed Cargo.lock — even
-          # though the manifest is registry-ready when checked locally
-          # (verified: v0.6.9 was published manually with the same
-          # manifest after the CI skip).
-          #
-          # The root cause is a cargo cache/lockfile coherence quirk
-          # specific to the sibling-clone pattern. Drop `--locked` from
-          # the pre-flight so cargo can refresh its internal git-source
-          # registry coherence; the lockfile on disk is still committed
-          # and used by downstream consumers. The actual `cargo publish`
-          # step below also drops `--locked` for the same reason — the
-          # crates.io package upload is bit-for-bit deterministic from
-          # the published Cargo.toml + Cargo.lock regardless.
+          # Registry publication can lag the binary release while the
+          # git-sourced dependency chain is not publishable under its crate
+          # names. Probe the exact tagged checkout and skip this optional
+          # channel truthfully when Cargo cannot assemble a registry package.
           set +e
-          cargo package --no-verify >"$RUNNER_TEMP/cargo-package.log" 2>&1
+          cargo package --locked --no-verify >"$RUNNER_TEMP/cargo-package.log" 2>&1
           status=$?
           set -e
           if [[ "$status" -eq 0 ]]; then
@@ -524,11 +511,8 @@ jobs:
 
       - name: Publish to crates.io
         if: ${{ env.CARGO_REGISTRY_TOKEN != '' && steps.publish_readiness.outputs.ready == 'true' }}
-        # Drop `--locked` for the same reason as the pre-flight check
-        # above. Lockfile coherence is enforced by the committed
-        # Cargo.lock; the upload is bit-deterministic from the package
-        # contents regardless of whether the publish step used --locked.
-        run: cargo publish --all-features
+        # Publish only the dependency graph proven by the tagged Cargo.lock.
+        run: cargo publish --locked --all-features
 
       - name: Warn when token is missing
         if: ${{ env.CARGO_REGISTRY_TOKEN == '' }}
