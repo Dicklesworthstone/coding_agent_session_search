@@ -23071,22 +23071,9 @@ fn record_poison_conversation(
     }
     records.insert(key, record);
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&path)
-        .with_context(|| format!("opening ingest quarantine file {}", path.display()))?;
-    for line in raw_preserved_lines {
-        writeln!(file, "{line}")
-            .with_context(|| format!("preserving ingest quarantine record {}", path.display()))?;
-    }
-    for record in records.values() {
-        writeln!(file, "{record}")
-            .with_context(|| format!("writing ingest quarantine record {}", path.display()))?;
-    }
-    file.sync_all()
-        .with_context(|| format!("syncing ingest quarantine record {}", path.display()))?;
+    let mut lines = raw_preserved_lines;
+    lines.extend(records.values().map(serde_json::Value::to_string));
+    write_poison_jsonl_atomically(&path, &lines)?;
     record_structured_poison_quarantine_state(
         data_dir,
         &conversation_id,
@@ -23251,18 +23238,7 @@ fn mark_stale_index_ingest_jsonl_retry_attempted(data_dir: &Path) -> Result<usiz
         return Ok(0);
     }
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&path)
-        .with_context(|| format!("opening ingest quarantine file {}", path.display()))?;
-    for line in retained_lines {
-        writeln!(file, "{line}")
-            .with_context(|| format!("rewriting ingest quarantine file {}", path.display()))?;
-    }
-    file.sync_all()
-        .with_context(|| format!("syncing ingest quarantine file {}", path.display()))?;
+    write_poison_jsonl_atomically(&path, &retained_lines)?;
     Ok(marked)
 }
 
@@ -23365,6 +23341,37 @@ fn clear_poison_jsonl_key_records(
     )
 }
 
+/// Read the keyed poison-ledger records used by operator-facing quarantine
+/// commands. The structured checkpoint can legitimately be missing after an
+/// earlier best-effort save failure, so list/clear must include these records
+/// rather than claiming the quarantine is empty while health remains degraded.
+pub(crate) fn operator_quarantine_poison_records(
+    data_dir: &Path,
+) -> Result<BTreeMap<(String, i64), serde_json::Value>> {
+    let quarantine_dir = data_dir.join("quarantine");
+    let mut records = BTreeMap::new();
+    for file_name in [WATCH_INGEST_POISON_FILE, INDEX_INGEST_POISON_FILE] {
+        let path = quarantine_dir.join(file_name);
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("reading ingest quarantine file {}", path.display()));
+            }
+        };
+        for line in contents.lines() {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                continue;
+            };
+            if let Some(key) = poison_record_key_from_value(&value) {
+                records.insert(key, value);
+            }
+        }
+    }
+    Ok(records)
+}
+
 /// Clear operator-selected quarantine keys from both poison ledgers. The
 /// structured checkpoint is handled by the caller so it can restore that
 /// checkpoint if either ledger rewrite fails.
@@ -23433,19 +23440,46 @@ fn clear_poison_jsonl_records_where(
         return Ok(0);
     }
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&path)
-        .with_context(|| format!("opening ingest quarantine file {}", path.display()))?;
-    for line in retained_lines {
-        writeln!(file, "{line}")
-            .with_context(|| format!("rewriting ingest quarantine file {}", path.display()))?;
-    }
-    file.sync_all()
-        .with_context(|| format!("syncing ingest quarantine file {}", path.display()))?;
+    write_poison_jsonl_atomically(&path, &retained_lines)?;
     Ok(cleared)
+}
+
+/// Replace one poison ledger without ever exposing a truncated or partially
+/// rewritten file. The temp file lives beside the destination so the final
+/// rename stays on the same filesystem and is atomic for readers.
+fn write_poison_jsonl_atomically(path: &Path, lines: &[String]) -> Result<()> {
+    let temp_path = unique_atomic_temp_path(path);
+    {
+        let file = create_new_atomic_sidecar_file(&temp_path).with_context(|| {
+            format!(
+                "creating temporary ingest quarantine file {}",
+                temp_path.display()
+            )
+        })?;
+        let mut writer = BufWriter::new(file);
+        for line in lines {
+            writeln!(writer, "{line}").with_context(|| {
+                format!(
+                    "writing temporary ingest quarantine file {}",
+                    temp_path.display()
+                )
+            })?;
+        }
+        writer.flush().with_context(|| {
+            format!(
+                "flushing temporary ingest quarantine file {}",
+                temp_path.display()
+            )
+        })?;
+        writer.get_ref().sync_all().with_context(|| {
+            format!(
+                "syncing temporary ingest quarantine file {}",
+                temp_path.display()
+            )
+        })?;
+    }
+    replace_file_from_temp(&temp_path, path)
+        .with_context(|| format!("replacing ingest quarantine file {}", path.display()))
 }
 
 fn clear_structured_poison_quarantine_records(

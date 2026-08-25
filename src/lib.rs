@@ -8657,14 +8657,15 @@ fn run_quarantine_retry_command(
 /// `clear` plan. Each entry reports its conversation_id, schema version,
 /// attempt count, last reason, the wall-clock timestamps, and whether it is
 /// retry-eligible under the current binary (version-stale/legacy).
-fn quarantine_entries_json(data_dir: &Path) -> Vec<serde_json::Value> {
+fn quarantine_entries_json(data_dir: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
     use crate::indexer::quarantine::QuarantineState;
     let state = QuarantineState::load(data_dir);
     let current_version = env!("CARGO_PKG_VERSION");
-    state
+    let mut entries = state
         .iter()
         .map(|(key, record)| {
-            serde_json::json!({
+            let identity = (key.conversation_id.clone(), i64::from(key.schema_version));
+            let entry = serde_json::json!({
                 "conversation_id": key.conversation_id,
                 "schema_version": key.schema_version,
                 "attempt_count": record.attempt_count,
@@ -8673,9 +8674,42 @@ fn quarantine_entries_json(data_dir: &Path) -> Vec<serde_json::Value> {
                 "last_attempt_at": record.last_attempt_at.to_rfc3339(),
                 "cass_version_at_quarantine": record.cass_version_at_quarantine,
                 "retry_eligible": record.is_version_stale_for_retry(current_version),
-            })
+            });
+            (identity, entry)
         })
-        .collect()
+        .collect::<BTreeMap<_, _>>();
+
+    for (identity, record) in crate::indexer::operator_quarantine_poison_records(data_dir)? {
+        entries.entry(identity.clone()).or_insert_with(|| {
+            let first_attempt_at = record
+                .get("first_quarantined_at_ms")
+                .and_then(serde_json::Value::as_i64)
+                .or_else(|| record.get("recorded_at_ms").and_then(serde_json::Value::as_i64))
+                .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+                .map(|timestamp| timestamp.to_rfc3339());
+            let last_attempt_at = record
+                .get("last_attempt_at_ms")
+                .and_then(serde_json::Value::as_i64)
+                .or_else(|| record.get("recorded_at_ms").and_then(serde_json::Value::as_i64))
+                .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+                .map(|timestamp| timestamp.to_rfc3339());
+            let cass_version = record
+                .get("cass_version_at_quarantine")
+                .and_then(serde_json::Value::as_str);
+            serde_json::json!({
+                "conversation_id": identity.0,
+                "schema_version": identity.1,
+                "attempt_count": record.get("attempt_count").and_then(serde_json::Value::as_u64).unwrap_or(1),
+                "last_reason": record.get("reason").and_then(serde_json::Value::as_str).unwrap_or("ingest-out-of-memory"),
+                "first_attempt_at": first_attempt_at,
+                "last_attempt_at": last_attempt_at,
+                "cass_version_at_quarantine": cass_version,
+                "retry_eligible": cass_version != Some(current_version),
+            })
+        });
+    }
+
+    Ok(entries.into_values().collect())
 }
 
 fn run_quarantine_list(
@@ -8683,7 +8717,13 @@ fn run_quarantine_list(
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
-    let entries = quarantine_entries_json(&data_dir);
+    let entries = quarantine_entries_json(&data_dir).map_err(|err| CliError {
+        code: 9,
+        kind: "quarantine",
+        message: format!("quarantine list failed: {err:#}"),
+        hint: Some("Check permissions on the quarantine files, then retry.".to_string()),
+        retryable: false,
+    })?;
     let summary = crate::indexer::conversation_ingest_quarantine_summary(&data_dir);
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
@@ -8759,24 +8799,36 @@ fn run_quarantine_clear(
         .map_err(|err| quarantine_apply_cli_error("clear", err))?;
     let mut state = QuarantineState::load(&data_dir);
 
+    // Health treats the structured checkpoint and both poison ledgers as one
+    // quarantine set. Clear must use the same union so a prior best-effort
+    // structured-save failure cannot leave an operator-invisible poison key.
+    let mut available_keys = state
+        .iter()
+        .map(|(key, _)| (key.conversation_id, i64::from(key.schema_version)))
+        .collect::<BTreeSet<_>>();
+    available_keys.extend(
+        crate::indexer::operator_quarantine_poison_records(&data_dir)
+            .map_err(|err| quarantine_apply_cli_error("clear", err))?
+            .into_keys(),
+    );
+
     // Collect the keys that match the optional conversation-id substring
     // filter. With no filter, every entry is targeted.
-    let matched: Vec<QuarantineKey> = state
-        .iter()
+    let matched = available_keys
+        .into_iter()
         .filter(|(key, _)| {
             filter
                 .as_deref()
-                .is_none_or(|needle| key.conversation_id.contains(needle))
+                .is_none_or(|needle| key.contains(needle))
         })
-        .map(|(key, _)| key)
-        .collect();
+        .collect::<Vec<_>>();
 
     let mut cleared = 0usize;
     if apply && !matched.is_empty() {
         let original_state = state.clone();
-        for key in &matched {
-            if state.clear(key) {
-                cleared += 1;
+        for (conversation_id, schema_version) in &matched {
+            if let Ok(schema_version) = u32::try_from(*schema_version) {
+                state.clear(&QuarantineKey::new(conversation_id, schema_version));
             }
         }
         state
@@ -8784,10 +8836,7 @@ fn run_quarantine_clear(
             .map_err(anyhow::Error::from)
             .map_err(|err| quarantine_apply_cli_error("clear", err))?;
 
-        let quarantine_keys = matched
-            .iter()
-            .map(|key| (key.conversation_id.clone(), i64::from(key.schema_version)))
-            .collect::<BTreeSet<_>>();
+        let quarantine_keys = matched.iter().cloned().collect::<BTreeSet<_>>();
         if let Err(ledger_error) = crate::indexer::clear_operator_quarantine_poison_records(
             &data_dir,
             &quarantine_keys,
@@ -8802,14 +8851,15 @@ fn run_quarantine_clear(
             };
             return Err(quarantine_apply_cli_error("clear", error));
         }
+        cleared = matched.len();
     }
 
     let matched_json: Vec<serde_json::Value> = matched
         .iter()
-        .map(|key| {
+        .map(|(conversation_id, schema_version)| {
             serde_json::json!({
-                "conversation_id": key.conversation_id,
-                "schema_version": key.schema_version,
+                "conversation_id": conversation_id,
+                "schema_version": schema_version,
             })
         })
         .collect();
