@@ -130,6 +130,7 @@ struct ValidatedKeyMutationJournal {
     journal: KeyMutationJournal,
     identity: crate::franken_sync::FileIdentity,
     size: u64,
+    handle: File,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -639,7 +640,7 @@ fn inspect_key_publication_tree(root: &Path) -> Result<TreeEvidence> {
                 "filesystem does not expose a stable identity for Pages key-publication root {}",
                 root.display()
             )
-    })?;
+        })?;
     let root_mode = key_publication_mode(&root_metadata);
     let canonical_root = root.canonicalize().with_context(|| {
         format!(
@@ -1359,6 +1360,7 @@ fn read_key_mutation_journal(
         journal,
         identity,
         size: opened_metadata.len(),
+        handle: file,
     }))
 }
 
@@ -1367,6 +1369,14 @@ fn require_validated_key_mutation_journal(
     validated: &ValidatedKeyMutationJournal,
 ) -> Result<()> {
     require_key_mutation_guard(guard)?;
+    let held_identity = crate::franken_sync::FileIdentity::from_file(&validated.handle)?
+        .ok_or_else(|| anyhow::anyhow!("filesystem stopped exposing a held journal identity"))?;
+    if held_identity != validated.identity || validated.handle.metadata()?.len() != validated.size {
+        bail!(
+            "held Pages key-mutation journal changed identity or size after validation: {}",
+            guard.target.journal_path.display()
+        );
+    }
     let metadata = std::fs::symlink_metadata(&guard.target.journal_path).with_context(|| {
         format!(
             "failed re-inspecting Pages key-mutation journal {}",
@@ -1456,7 +1466,10 @@ fn remove_owned_key_mutation_tree(
         );
     }
     let Some(evidence) = optional_key_tree_evidence(path)? else {
-        return Ok(());
+        bail!(
+            "owned Pages key-mutation cleanup path disappeared before verification: {}",
+            path.display()
+        );
     };
     if let Some(expected_digest) = expected_digest
         && evidence.digest != expected_digest
@@ -3535,6 +3548,32 @@ mod tests {
                 .file_type()
                 .is_dir()
         );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn committed_key_cleanup_retains_tree_when_journal_identity_changes() -> Result<()> {
+        let (temp_dir, archive_dir) = setup_test_archive();
+        let guard = open_key_mutation_lock(derive_key_mutation_target(&archive_dir)?)?;
+        let (staged, prior, _staging_ownership) =
+            stage_key_mutation_tree(&guard, KeyMutationStageMode::PreserveSite)?;
+        std::fs::write(staged.join("candidate-marker"), b"candidate")?;
+        let candidate = inspect_key_publication_tree(&staged)?;
+        let backup = random_key_mutation_sidecar_path(&archive_dir, "backup");
+        let journal =
+            write_key_mutation_journal(&guard, &staged, &backup, &prior, &candidate)?;
+        let parked_journal = temp_dir.path().join("parked-key-journal");
+        std::fs::rename(&guard.target.journal_path, &parked_journal)?;
+        std::fs::write(&guard.target.journal_path, b"{}")?;
+        std::fs::set_permissions(
+            &guard.target.journal_path,
+            std::fs::Permissions::from_mode(0o600),
+        )?;
+
+        cleanup_committed_key_mutation(&guard, &staged, &candidate.digest, &journal);
+
+        anyhow::ensure!(std::fs::symlink_metadata(&staged)?.file_type().is_dir());
         Ok(())
     }
 

@@ -188,6 +188,12 @@ struct BundlePublishJournal {
     candidate_sha256: String,
 }
 
+struct BundleStagingOwnership {
+    path: PathBuf,
+    identity: crate::franken_sync::FileIdentity,
+    handle: File,
+}
+
 /// Integrity entry for a single file
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntegrityEntry {
@@ -364,12 +370,12 @@ impl BundleBuilder {
         let final_site_dir = output_dir.join("site");
         let final_private_dir = output_dir.join("private");
         let mut retain_temp_on_replace_error = false;
-        let mut staging_identity = None;
+        let mut staging_ownership = None;
         let result = (|| -> Result<BundleResult> {
             progress("setup", "Creating directory structure...");
 
             // Stage the bundle under a unique temp root so reruns do not retain stale files.
-            staging_identity = Some(create_bundle_staging_root(&temp_output_dir)?);
+            staging_ownership = Some(create_bundle_staging_root(&temp_output_dir)?);
             let site_dir = temp_output_dir.join("site");
             let private_dir = temp_output_dir.join("private");
 
@@ -541,14 +547,14 @@ impl BundleBuilder {
 
         match result {
             Err(build_error) if !retain_temp_on_replace_error => {
-                let Some(staging_identity) = staging_identity.as_ref() else {
+                let Some(staging_ownership) = staging_ownership.as_ref() else {
                     return Err(build_error);
                 };
                 match cleanup_rejected_bundle_temp(
                     &temp_output_dir,
                     output_dir,
                     &publication_guard,
-                    staging_identity,
+                    staging_ownership,
                 ) {
                     Ok(()) => Err(build_error),
                     Err(cleanup_error) => Err(build_error.context(format!(
@@ -561,7 +567,7 @@ impl BundleBuilder {
     }
 }
 
-fn create_bundle_staging_root(path: &Path) -> Result<crate::franken_sync::FileIdentity> {
+fn create_bundle_staging_root(path: &Path) -> Result<BundleStagingOwnership> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -589,8 +595,12 @@ fn create_bundle_staging_root(path: &Path) -> Result<crate::franken_sync::FileId
         fs::create_dir(path)
             .with_context(|| format!("failed creating bundle staging root {}", path.display()))?;
     }
-    let handle = File::open(path)
-        .with_context(|| format!("failed opening bundle staging root {}", path.display()))?;
+    let handle = File::open(path).with_context(|| {
+        format!(
+            "filesystem cannot hold a stable directory handle for bundle staging root {}; preserved it without recursive cleanup",
+            path.display()
+        )
+    })?;
     let metadata = handle
         .metadata()
         .with_context(|| format!("failed inspecting bundle staging root {}", path.display()))?;
@@ -600,14 +610,44 @@ fn create_bundle_staging_root(path: &Path) -> Result<crate::franken_sync::FileId
             path.display()
         );
     }
-    crate::franken_sync::FileIdentity::from_file(&handle)
+    let identity = crate::franken_sync::FileIdentity::from_file(&handle)
         .with_context(|| format!("failed identifying bundle staging root {}", path.display()))?
         .ok_or_else(|| {
             anyhow!(
                 "filesystem does not expose a stable identity for bundle staging root {}",
                 path.display()
             )
-        })
+        })?;
+    let path_probe = File::open(path).with_context(|| {
+        format!(
+            "failed re-opening newly created bundle staging root {}",
+            path.display()
+        )
+    })?;
+    let path_identity = crate::franken_sync::FileIdentity::from_file(&path_probe)
+        .with_context(|| {
+            format!(
+                "failed re-identifying newly created bundle staging root {}",
+                path.display()
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow!(
+                "filesystem stopped exposing a stable pathname identity for bundle staging root {}",
+                path.display()
+            )
+        })?;
+    if path_identity != identity {
+        bail!(
+            "bundle staging root changed identity during exclusive creation; preserved it without cleanup: {}",
+            path.display()
+        );
+    }
+    Ok(BundleStagingOwnership {
+        path: path.to_path_buf(),
+        identity,
+        handle,
+    })
 }
 
 fn prepare_bundle_root_for_publish(path: &Path) -> Result<()> {
@@ -627,13 +667,13 @@ fn cleanup_rejected_bundle_temp(
     path: &Path,
     final_dir: &Path,
     guard: &PagesPublicationLockGuard,
-    expected_identity: &crate::franken_sync::FileIdentity,
+    ownership: &BundleStagingOwnership,
 ) -> Result<()> {
     require_pages_publication_lock(final_dir, guard)?;
     validate_owned_bundle_staging_path(final_dir, path)?;
-    require_bundle_staging_identity(path, expected_identity)?;
+    require_bundle_staging_identity(path, ownership)?;
     require_pages_publication_lock(final_dir, guard)?;
-    require_bundle_staging_identity(path, expected_identity)?;
+    require_bundle_staging_identity(path, ownership)?;
     match fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -645,8 +685,29 @@ fn cleanup_rejected_bundle_temp(
 
 fn require_bundle_staging_identity(
     path: &Path,
-    expected: &crate::franken_sync::FileIdentity,
+    ownership: &BundleStagingOwnership,
 ) -> Result<()> {
+    if ownership.path != path {
+        bail!(
+            "Pages bundle staging ownership for {} cannot authorize cleanup of {}",
+            ownership.path.display(),
+            path.display()
+        );
+    }
+    let held = crate::franken_sync::FileIdentity::from_file(&ownership.handle)
+        .context("failed re-identifying held Pages bundle staging-root handle")?
+        .ok_or_else(|| {
+            anyhow!(
+                "filesystem stopped exposing the held identity for Pages bundle staging root {}",
+                path.display()
+            )
+        })?;
+    if held != ownership.identity {
+        bail!(
+            "held Pages bundle staging-root identity changed before cleanup: {}",
+            path.display()
+        );
+    }
     let metadata = fs::symlink_metadata(path).with_context(|| {
         format!(
             "failed re-inspecting owned Pages bundle staging root {}",
@@ -678,7 +739,7 @@ fn require_bundle_staging_identity(
                 path.display()
             )
         })?;
-    if observed != *expected {
+    if observed != ownership.identity {
         bail!(
             "owned Pages bundle staging root changed identity before cleanup; preserved it without mutation: {}",
             path.display()
