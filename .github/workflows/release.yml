@@ -141,7 +141,7 @@ jobs:
           echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
 
       - name: Build release
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Smoke-test release binary (Unix)
         if: runner.os != 'Windows'

@@ -100,6 +100,11 @@ fn release_workflow_builds_and_publishes_the_exact_requested_tag() -> Result<(),
                 .to_string(),
         );
     }
+    if !workflow.contains(
+        "cargo build --locked --release --target ${{ matrix.target }}",
+    ) {
+        return Err("release binaries must be built from the tagged Cargo.lock".to_string());
+    }
     if workflow.contains("dtolnay/rust-toolchain@stable") {
         return Err("release workflow actions must be immutable-SHA pinned".to_string());
     }
