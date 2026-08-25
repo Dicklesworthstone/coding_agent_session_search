@@ -78878,6 +78878,23 @@ mod cli_read_db_tests {
     }
 
     #[test]
+    fn resume_agent_detection_accepts_native_windows_separators() {
+        for (path, expected) in [
+            (
+                r"C:\Users\ellis\.claude\projects\-repo\session.jsonl",
+                "claude",
+            ),
+            (r"C:\Users\ellis\.codex\sessions\session.jsonl", "codex"),
+            (r"C:\Users\ellis\.pi\agent\sessions\session.jsonl", "pi_agent"),
+            (r"C:\Users\ellis\.gemini\sessions\session.jsonl", "gemini"),
+        ] {
+            let detected = detect_resume_agent(Path::new(path), None)
+                .unwrap_or_else(|error| panic!("failed to detect {path}: {}", error.message));
+            assert_eq!(detected.slug, expected, "Windows path {path}");
+        }
+    }
+
+    #[test]
     fn resume_detects_opencode_session_from_source_path() {
         let path = PathBuf::from("/Users/ellis/.local/share/opencode/opencode.db/sess%2D42");
         let target = resolve_resume_target(&path, None).expect("resolve");
@@ -96127,7 +96144,13 @@ fn detect_resume_agent(path: &Path, agent_override: Option<&str>) -> CliResult<D
         });
     }
 
-    let path_str = path.to_string_lossy();
+    // Normalize separators and ASCII case before applying layout markers.
+    // Native Windows paths use `\` on a case-insensitive filesystem, while
+    // archived paths may retain the conventions of a different host.
+    let path_str = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
     // Path-substring detection. These match the real on-disk layouts
     // and are ordered longest-match-first where it matters.
     //
