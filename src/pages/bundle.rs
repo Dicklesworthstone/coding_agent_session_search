@@ -1346,6 +1346,7 @@ fn replace_dir_from_temp(
     }
 
     recover_interrupted_bundle_publish(final_dir)?;
+    let candidate = inspect_bundle_tree(temp_dir, "staged bundle path")?;
     if !ensure_replaceable_bundle_output_dir(final_dir)? {
         fs::rename(temp_dir, final_dir).with_context(|| {
             format!(
@@ -1354,6 +1355,7 @@ fn replace_dir_from_temp(
                 final_dir.display()
             )
         })?;
+        ensure_bundle_tree_matches(final_dir, "first published bundle", &candidate)?;
         sync_parent_directory(final_dir).with_context(|| {
             format!(
                 "completed bundle is live at {}, but its first publication could not be durably synced",
@@ -1363,13 +1365,24 @@ fn replace_dir_from_temp(
         return Ok(());
     }
 
-    let backup_dir = bundle_publish_in_progress_backup_path(final_dir);
-    // Every replacement candidate carries the same durable ownership marker,
-    // including the non-Linux rename-pair path. Recovery may only remove one
-    // of two simultaneously present trees when this marker identifies which
-    // tree is NEW; an unmarked deterministic sidecar could predate cass and
-    // must never be guessed away.
-    write_bundle_publish_marker(temp_dir)?;
+    let prior = inspect_bundle_tree(final_dir, "prior live bundle")?;
+    let backup_dir = unpredictable_bundle_publish_backup_path(final_dir)?;
+    if bundle_path_entry_exists(&backup_dir)? {
+        bail!(
+            "unpredictable Pages bundle backup path unexpectedly exists; preserved every generation: {}",
+            backup_dir.display()
+        );
+    }
+    let journal =
+        write_bundle_publish_journal(final_dir, &backup_dir, &prior, &candidate)?;
+    if bundle_path_entry_exists(&backup_dir)? {
+        bail!(
+            "journaled Pages bundle backup path {} appeared before publication; preserved every generation and the journal",
+            backup_dir.display()
+        );
+    }
+    ensure_bundle_tree_matches(final_dir, "prior live bundle", &prior)?;
+    ensure_bundle_tree_matches(temp_dir, "staged bundle path", &candidate)?;
 
     #[cfg(target_os = "linux")]
     {
@@ -1377,6 +1390,9 @@ fn replace_dir_from_temp(
             temp_dir,
             final_dir,
             &backup_dir,
+            &journal,
+            &prior,
+            &candidate,
             retain_temp_on_error,
         )? {
             return Ok(());
@@ -1387,133 +1403,180 @@ fn replace_dir_from_temp(
         temp_dir,
         final_dir,
         &backup_dir,
+        &journal,
+        &prior,
+        &candidate,
         retain_temp_on_error,
     )
 }
 
 fn recover_interrupted_bundle_publish(final_dir: &Path) -> Result<()> {
-    let backup_dir = bundle_publish_in_progress_backup_path(final_dir);
-    let final_exists = ensure_replaceable_bundle_output_dir(final_dir)?;
-    let final_has_marker = if final_exists {
-        bundle_publish_marker_exists(final_dir)?
-    } else {
-        false
+    let Some(journal) = read_bundle_publish_journal(final_dir)? else {
+        if let Some(unowned_backup) = first_unowned_bundle_publish_backup(final_dir, None)? {
+            bail!(
+                "unowned Pages bundle recovery artifact {} was preserved; refusing to infer ownership or modify live path {}",
+                unowned_backup.display(),
+                final_dir.display()
+            );
+        }
+        return Ok(());
     };
-    let backup_exists =
-        ensure_bundle_directory_entry(&backup_dir, "bundle publish recovery backup")?;
-    if !backup_exists {
-        if final_has_marker {
-            remove_bundle_publish_marker(final_dir).with_context(|| {
+    let backup_dir = validate_bundle_publish_journal(final_dir, &journal)?;
+    if let Some(unowned_backup) =
+        first_unowned_bundle_publish_backup(final_dir, Some(&backup_dir))?
+    {
+        bail!(
+            "Pages bundle publish journal identifies {}, but additional unowned recovery artifact {} also exists; preserved every generation",
+            backup_dir.display(),
+            unowned_backup.display()
+        );
+    }
+    let prior = journal_prior_evidence(&journal);
+    let candidate = journal_candidate_evidence(&journal);
+    let final_evidence = if ensure_replaceable_bundle_output_dir(final_dir)? {
+        Some(inspect_bundle_tree(
+            final_dir,
+            "interrupted bundle publish destination",
+        )?)
+    } else {
+        None
+    };
+    let backup_evidence = if bundle_path_entry_exists(&backup_dir)? {
+        Some(inspect_bundle_tree(
+            &backup_dir,
+            "journaled bundle publish backup",
+        )?)
+    } else {
+        None
+    };
+
+    match (final_evidence, backup_evidence) {
+        (None, Some(backup)) if backup == prior => {
+            if bundle_path_entry_exists(final_dir)? {
+                bail!(
+                    "journaled prior Pages bundle {} was ready to restore, but live path {} was concurrently repopulated; preserved every entry and the journal",
+                    backup_dir.display(),
+                    final_dir.display()
+                );
+            }
+            ensure_bundle_tree_matches(
+                &backup_dir,
+                "journaled prior Pages bundle",
+                &prior,
+            )?;
+            fs::rename(&backup_dir, final_dir).with_context(|| {
                 format!(
-                    "the published bundle is live at {}, but its completed publish marker could not be cleaned",
+                    "failed restoring journaled prior Pages bundle {} to missing live path {}; preserved the backup and journal",
+                    backup_dir.display(),
                     final_dir.display()
                 )
             })?;
-        }
-        return Ok(());
-    }
-    let backup_has_marker = bundle_publish_marker_exists(&backup_dir)?;
-
-    if !final_exists {
-        if backup_has_marker {
-            bail!(
-                "interrupted atomic bundle publish is missing its prior live handle {}; staged candidate containing private artifacts retained at {}",
-                final_dir.display(),
-                backup_dir.display()
-            );
-        }
-
-        fs::rename(&backup_dir, final_dir).with_context(|| {
-            format!(
-                "failed restoring the only prior live bundle from interrupted-publish backup {} to {}",
-                backup_dir.display(),
-                final_dir.display()
-            )
-        })?;
-        sync_parent_directory(final_dir).with_context(|| {
-            format!(
-                "restored the prior live bundle at {} from {}, but could not durably sync the recovery",
-                final_dir.display(),
-                backup_dir.display()
-            )
-        })?;
-        return Ok(());
-    }
-
-    match (final_has_marker, backup_has_marker) {
-        (true, false) => {
-            cleanup_prior_bundle_after_publish(&backup_dir, final_dir)?;
-            remove_bundle_publish_marker(final_dir).with_context(|| {
+            ensure_bundle_tree_matches(final_dir, "restored prior Pages bundle", &prior)?;
+            sync_parent_directory(final_dir).with_context(|| {
                 format!(
-                    "new bundle is live at {}, but its completed atomic-publish marker could not be cleaned",
-                    final_dir.display()
+                    "restored the prior Pages bundle at {}, but could not durably sync the recovery; journal retained at {}",
+                    final_dir.display(),
+                    bundle_publish_recovery_journal_path(final_dir).display()
                 )
-            })
+            })?;
+            remove_bundle_publish_journal(final_dir, &journal)
         }
-        (false, true) => cleanup_rejected_atomic_staged_bundle(&backup_dir, final_dir),
-        (false, false) => bail!(
-            "ambiguous interrupted bundle publish: live bundle {} and recovery sidecar {} are both unmarked; neither tree was removed",
+        (None, Some(_)) => bail!(
+            "journaled Pages bundle backup {} does not match the prior generation while live path {} is missing; preserved the backup and journal",
+            backup_dir.display(),
+            final_dir.display()
+        ),
+        (Some(live), Some(backup)) if live == candidate && backup == prior => {
+            ensure_bundle_tree_matches(
+                final_dir,
+                "journaled live candidate Pages bundle",
+                &candidate,
+            )?;
+            cleanup_journaled_bundle_tree_after_publish(
+                &backup_dir,
+                final_dir,
+                "journaled prior Pages bundle",
+                &prior,
+            )?;
+            remove_bundle_publish_journal(final_dir, &journal)
+        }
+        (Some(live), Some(backup)) if live == prior && backup == candidate => {
+            ensure_bundle_tree_matches(
+                final_dir,
+                "journaled prior live Pages bundle",
+                &prior,
+            )?;
+            cleanup_journaled_bundle_tree_after_publish(
+                &backup_dir,
+                final_dir,
+                "journaled rejected candidate Pages bundle",
+                &candidate,
+            )?;
+            remove_bundle_publish_journal(final_dir, &journal)
+        }
+        (Some(_), Some(_)) => bail!(
+            "journaled Pages bundle recovery found live {} and backup {}, but their exact tree evidence does not match a valid publish state; preserved both and the journal",
             final_dir.display(),
             backup_dir.display()
         ),
-        (true, true) => bail!(
-            "ambiguous interrupted bundle publish: both live bundle {} and recovery sidecar {} carry the in-progress marker; neither tree was removed",
+        (Some(live), None) if live == prior || live == candidate => {
+            ensure_bundle_tree_matches(
+                final_dir,
+                "journaled surviving Pages bundle",
+                &live,
+            )?;
+            remove_bundle_publish_journal(final_dir, &journal)
+        }
+        (Some(_), None) => bail!(
+            "Pages bundle publish journal remains at {}, but live tree {} matches neither journaled generation; preserved both",
+            bundle_publish_recovery_journal_path(final_dir).display(),
+            final_dir.display()
+        ),
+        (None, None) => bail!(
+            "Pages bundle publish journal remains at {}, but both live {} and journaled backup {} are missing; preserved the journal",
+            bundle_publish_recovery_journal_path(final_dir).display(),
             final_dir.display(),
             backup_dir.display()
         ),
     }
 }
 
-fn cleanup_rejected_atomic_staged_bundle(staged_dir: &Path, final_dir: &Path) -> Result<()> {
-    if !ensure_bundle_directory_entry(staged_dir, "rejected atomic staged bundle path")? {
-        bail!(
-            "prior live bundle remains at {}, but rejected staged bundle path disappeared before cleanup: {}",
-            final_dir.display(),
-            staged_dir.display()
-        );
-    }
-    fs::remove_dir_all(staged_dir).with_context(|| {
-        format!(
-            "prior live bundle remains at {}, but failed to remove rejected staged bundle containing private artifacts retained at {}",
-            final_dir.display(),
-            staged_dir.display()
-        )
-    })?;
-    sync_parent_directory(final_dir)
-}
-
-fn cleanup_prior_bundle_after_publish(backup_dir: &Path, final_dir: &Path) -> Result<()> {
-    // A closure rather than the bare `fs::remove_dir_all` fn item: the
-    // generic fn monomorphizes with one concrete lifetime and cannot satisfy
-    // the higher-ranked `for<'a> FnOnce(&'a Path)` bound.
-    cleanup_prior_bundle_after_publish_with(backup_dir, final_dir, |path| fs::remove_dir_all(path))
-}
-
-fn cleanup_prior_bundle_after_publish_with<F>(
-    backup_dir: &Path,
+fn cleanup_journaled_bundle_tree_after_publish(
+    tree_dir: &Path,
     final_dir: &Path,
+    label: &str,
+    expected: &BundleTreeEvidence,
+) -> Result<()> {
+    cleanup_journaled_bundle_tree_after_publish_with(
+        tree_dir,
+        final_dir,
+        label,
+        expected,
+        |path| fs::remove_dir_all(path),
+    )
+}
+
+fn cleanup_journaled_bundle_tree_after_publish_with<F>(
+    tree_dir: &Path,
+    final_dir: &Path,
+    label: &str,
+    expected: &BundleTreeEvidence,
     remove_dir: F,
 ) -> Result<()>
 where
     F: FnOnce(&Path) -> std::io::Result<()>,
 {
-    if !ensure_bundle_directory_entry(backup_dir, "prior bundle cleanup path")? {
-        bail!(
-            "new bundle is live at {}, but the prior bundle cleanup path disappeared before removal: {}",
-            final_dir.display(),
-            backup_dir.display()
-        );
-    }
-    remove_dir(backup_dir).with_context(|| {
+    ensure_bundle_tree_matches(tree_dir, label, expected)?;
+    remove_dir(tree_dir).with_context(|| {
         format!(
-            "new bundle is live at {}, but failed to remove the prior bundle containing private artifacts retained at {}",
+            "new bundle is live at {}, but failed to remove {label} containing private artifacts retained at {}",
             final_dir.display(),
-            backup_dir.display()
+            tree_dir.display()
         )
     })?;
     sync_parent_directory(final_dir).with_context(|| {
         format!(
-            "removed the prior bundle after publishing {}, but could not durably sync its parent directory",
+            "removed {label} after publishing {}, but could not durably sync its parent directory",
             final_dir.display()
         )
     })
@@ -1524,30 +1587,42 @@ fn try_publish_linux_bundle_via_atomic_exchange(
     temp_dir: &Path,
     final_dir: &Path,
     backup_dir: &Path,
+    journal: &BundlePublishJournal,
+    prior: &BundleTreeEvidence,
+    candidate: &BundleTreeEvidence,
     retain_temp_on_error: &mut bool,
 ) -> Result<bool> {
     fs::rename(temp_dir, backup_dir).with_context(|| {
         format!(
-            "failed moving staged bundle {} to deterministic atomic-exchange path {}",
+            "failed moving staged bundle {} to journaled atomic-exchange path {}",
             temp_dir.display(),
             backup_dir.display()
         )
     })?;
+    if let Err(error) = ensure_bundle_tree_matches(
+        backup_dir,
+        "journaled atomic-exchange candidate",
+        candidate,
+    ) {
+        *retain_temp_on_error = true;
+        return Err(error);
+    }
     if let Err(sync_error) = sync_parent_directory(backup_dir) {
         return match restore_linux_atomic_staged_candidate(
             backup_dir,
             temp_dir,
+            candidate,
             retain_temp_on_error,
         ) {
             Ok(()) => Err(sync_error).with_context(|| {
                 format!(
-                    "failed durably staging bundle at deterministic atomic-exchange path {}; restored candidate at {}",
+                    "failed durably staging bundle at journaled atomic-exchange path {}; restored candidate at {}",
                     backup_dir.display(),
                     temp_dir.display()
                 )
             }),
             Err(restore_error) => Err(anyhow!(
-                "failed durably staging bundle at deterministic atomic-exchange path {}: {sync_error:#}; failed restoring staged candidate to {}: {restore_error:#}",
+                "failed durably staging bundle at journaled atomic-exchange path {}: {sync_error:#}; failed restoring staged candidate to {}: {restore_error:#}",
                 backup_dir.display(),
                 temp_dir.display()
             )),
@@ -1565,16 +1640,24 @@ fn try_publish_linux_bundle_via_atomic_exchange(
                     backup_dir.display()
                 );
             }
-            if let Err(cleanup_error) = cleanup_prior_bundle_after_publish(backup_dir, final_dir) {
+            if let Err(error) = ensure_bundle_tree_matches(
+                final_dir,
+                "published Pages bundle candidate",
+                candidate,
+            ) {
+                *retain_temp_on_error = true;
+                return Err(error);
+            }
+            if let Err(cleanup_error) = cleanup_journaled_bundle_tree_after_publish(
+                backup_dir,
+                final_dir,
+                "journaled prior Pages bundle",
+                prior,
+            ) {
                 *retain_temp_on_error = true;
                 return Err(cleanup_error);
             }
-            remove_bundle_publish_marker(final_dir).with_context(|| {
-                format!(
-                    "new bundle is live at {}, but its completed atomic-publish marker could not be cleaned",
-                    final_dir.display()
-                )
-            })?;
+            remove_bundle_publish_journal(final_dir, journal)?;
             Ok(true)
         }
         Err(exchange_error)
@@ -1583,6 +1666,7 @@ fn try_publish_linux_bundle_via_atomic_exchange(
             restore_linux_atomic_staged_candidate(
                 backup_dir,
                 temp_dir,
+                candidate,
                 retain_temp_on_error,
             )
             .context(
@@ -1596,8 +1680,12 @@ fn try_publish_linux_bundle_via_atomic_exchange(
             Ok(false)
         }
         Err(exchange_error) => {
-            match restore_linux_atomic_staged_candidate(backup_dir, temp_dir, retain_temp_on_error)
-            {
+            match restore_linux_atomic_staged_candidate(
+                backup_dir,
+                temp_dir,
+                candidate,
+                retain_temp_on_error,
+            ) {
                 Ok(()) => Err(exchange_error).with_context(|| {
                     format!(
                         "failed atomically exchanging staged bundle {} with live bundle {}",
@@ -1620,17 +1708,26 @@ fn try_publish_linux_bundle_via_atomic_exchange(
 fn restore_linux_atomic_staged_candidate(
     backup_dir: &Path,
     temp_dir: &Path,
+    candidate: &BundleTreeEvidence,
     retain_temp_on_error: &mut bool,
 ) -> Result<()> {
     if let Err(restore_error) = fs::rename(backup_dir, temp_dir) {
         *retain_temp_on_error = true;
         bail!(
-            "failed restoring staged bundle from deterministic atomic-exchange path {} to {}; staged bundle containing private artifacts retained at {}: {}",
+            "failed restoring staged bundle from journaled atomic-exchange path {} to {}; staged bundle containing private artifacts retained at {}: {}",
             backup_dir.display(),
             temp_dir.display(),
             backup_dir.display(),
             restore_error
         );
+    }
+    if let Err(error) = ensure_bundle_tree_matches(
+        temp_dir,
+        "restored staged Pages bundle candidate",
+        candidate,
+    ) {
+        *retain_temp_on_error = true;
+        return Err(error);
     }
     sync_parent_directory(temp_dir).with_context(|| {
         format!(
@@ -1645,19 +1742,37 @@ fn replace_dir_from_temp_via_recoverable_rename_pair(
     temp_dir: &Path,
     final_dir: &Path,
     backup_dir: &Path,
+    journal: &BundlePublishJournal,
+    prior: &BundleTreeEvidence,
+    candidate: &BundleTreeEvidence,
     retain_temp_on_error: &mut bool,
 ) -> Result<()> {
+    ensure_bundle_tree_matches(final_dir, "prior live Pages bundle", prior)?;
+    ensure_bundle_tree_matches(temp_dir, "staged Pages bundle candidate", candidate)?;
+    if bundle_path_entry_exists(backup_dir)? {
+        bail!(
+            "journaled Pages bundle backup path appeared before rename-pair publication; preserved every generation: {}",
+            backup_dir.display()
+        );
+    }
     fs::rename(final_dir, backup_dir).with_context(|| {
         format!(
-            "failed parking live bundle {} at deterministic recovery path {}",
+            "failed parking live bundle {} at journaled recovery path {}",
             final_dir.display(),
             backup_dir.display()
         )
     })?;
+    if let Err(error) =
+        ensure_bundle_tree_matches(backup_dir, "journaled prior Pages bundle", prior)
+    {
+        *retain_temp_on_error = true;
+        return Err(error);
+    }
 
     if let Err(park_sync_error) = sync_parent_directory(final_dir) {
         return match fs::rename(backup_dir, final_dir) {
             Ok(()) => {
+                ensure_bundle_tree_matches(final_dir, "restored prior Pages bundle", prior)?;
                 sync_parent_directory(final_dir).with_context(|| {
                     format!(
                         "failed syncing recovery after restoring prior live bundle at {}",
@@ -1689,6 +1804,14 @@ fn replace_dir_from_temp_via_recoverable_rename_pair(
 
     match fs::rename(temp_dir, final_dir) {
         Ok(()) => {
+            if let Err(error) = ensure_bundle_tree_matches(
+                final_dir,
+                "published Pages bundle candidate",
+                candidate,
+            ) {
+                *retain_temp_on_error = true;
+                return Err(error);
+            }
             if let Err(sync_error) = sync_parent_directory(final_dir) {
                 *retain_temp_on_error = true;
                 bail!(
@@ -1698,19 +1821,20 @@ fn replace_dir_from_temp_via_recoverable_rename_pair(
                     backup_dir.display()
                 );
             }
-            if let Err(cleanup_error) = cleanup_prior_bundle_after_publish(backup_dir, final_dir) {
+            if let Err(cleanup_error) = cleanup_journaled_bundle_tree_after_publish(
+                backup_dir,
+                final_dir,
+                "journaled prior Pages bundle",
+                prior,
+            ) {
                 *retain_temp_on_error = true;
                 return Err(cleanup_error);
             }
-            remove_bundle_publish_marker(final_dir).with_context(|| {
-                format!(
-                    "new bundle is live at {}, but its completed rename-pair publish marker could not be cleaned",
-                    final_dir.display()
-                )
-            })
+            remove_bundle_publish_journal(final_dir, journal)
         }
         Err(publish_error) => match fs::rename(backup_dir, final_dir) {
             Ok(()) => {
+                ensure_bundle_tree_matches(final_dir, "restored prior Pages bundle", prior)?;
                 sync_parent_directory(final_dir)?;
                 Err(publish_error).with_context(|| {
                     format!(

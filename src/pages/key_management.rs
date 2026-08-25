@@ -40,7 +40,7 @@ use std::path::{Component, Path, PathBuf};
 use tracing::info;
 
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
 /// Argon2id default parameters
 #[cfg(not(test))]
@@ -904,6 +904,349 @@ fn remove_key_mutation_journal(guard: &KeyMutationGuard) -> Result<()> {
     sync_parent_directory(&guard.target.journal_path)
 }
 
+fn evidence_has_digest(evidence: &Option<TreeEvidence>, digest: &str) -> bool {
+    evidence
+        .as_ref()
+        .is_some_and(|evidence| evidence.digest == digest)
+}
+
+fn recover_interrupted_key_mutation(
+    guard: &KeyMutationGuard,
+) -> Result<RecoveredKeyMutation> {
+    let Some(journal) = read_key_mutation_journal(guard)? else {
+        return Ok(RecoveredKeyMutation::None);
+    };
+    let staged_root = direct_child_from_journal(
+        &guard.target.live_root,
+        &journal.staged_file_name,
+        "key-mutation staged path",
+    )?;
+    let backup_root = direct_child_from_journal(
+        &guard.target.live_root,
+        &journal.backup_file_name,
+        "key-mutation backup path",
+    )?;
+    if staged_root == guard.target.live_root
+        || backup_root == guard.target.live_root
+        || staged_root == backup_root
+    {
+        bail!("Pages key-mutation recovery journal aliases publication paths");
+    }
+
+    let live = optional_key_tree_evidence(&guard.target.live_root)?;
+    let staged = optional_key_tree_evidence(&staged_root)?;
+    let backup = optional_key_tree_evidence(&backup_root)?;
+
+    if evidence_has_digest(&live, &journal.prior_digest)
+        && evidence_has_digest(&staged, &journal.candidate_digest)
+        && backup.is_none()
+    {
+        remove_owned_key_mutation_tree(&staged_root, Some(&journal.candidate_digest))?;
+        remove_key_mutation_journal(guard)?;
+        return Ok(RecoveredKeyMutation::RolledBack);
+    }
+
+    if evidence_has_digest(&live, &journal.candidate_digest) {
+        let linux_prior = evidence_has_digest(&staged, &journal.prior_digest) && backup.is_none();
+        let rename_pair_prior = staged.is_none()
+            && evidence_has_digest(&backup, &journal.prior_digest);
+        if linux_prior {
+            remove_owned_key_mutation_tree(&staged_root, Some(&journal.prior_digest))?;
+        } else if rename_pair_prior {
+            remove_owned_key_mutation_tree(&backup_root, Some(&journal.prior_digest))?;
+        } else {
+            bail!(
+                "ambiguous completed Pages key mutation: live candidate is present but its exact prior generation is not owned by the recovery journal"
+            );
+        }
+        remove_key_mutation_journal(guard)?;
+        return Ok(RecoveredKeyMutation::Committed);
+    }
+
+    if live.is_none()
+        && evidence_has_digest(&backup, &journal.prior_digest)
+        && evidence_has_digest(&staged, &journal.candidate_digest)
+    {
+        std::fs::rename(&backup_root, &guard.target.live_root).with_context(|| {
+            format!(
+                "failed restoring prior Pages archive {} from key-mutation backup {}",
+                guard.target.live_root.display(),
+                backup_root.display()
+            )
+        })?;
+        sync_parent_directory(&guard.target.live_root)?;
+        let restored = inspect_key_publication_tree(&guard.target.live_root)?;
+        if restored.digest != journal.prior_digest {
+            bail!(
+                "restored Pages key-mutation generation at {} failed exact digest verification",
+                guard.target.live_root.display()
+            );
+        }
+        remove_owned_key_mutation_tree(&staged_root, Some(&journal.candidate_digest))?;
+        remove_key_mutation_journal(guard)?;
+        return Ok(RecoveredKeyMutation::RolledBack);
+    }
+
+    bail!(
+        "ambiguous interrupted Pages key mutation at {}; live, staged, and backup trees were preserved for inspection",
+        guard.target.live_root.display()
+    )
+}
+
+fn begin_key_mutation(requested_path: &Path) -> Result<KeyMutationGuard> {
+    let target = derive_key_mutation_target(requested_path)?;
+    let mut guard = open_key_mutation_lock(target)?;
+    let recovered = recover_interrupted_key_mutation(&guard)?;
+
+    if guard.target.site_relative.as_os_str().is_empty() {
+        match std::fs::symlink_metadata(guard.target.live_root.join("site")) {
+            Ok(metadata)
+                if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() =>
+            {
+                guard.target.site_relative = PathBuf::from("site");
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    let resolved_site = super::resolve_site_dir(&guard.target.live_root)?;
+    if resolved_site != guard.target.live_site_dir() {
+        bail!(
+            "Pages key-mutation target resolved inconsistently: expected {}, got {}",
+            guard.target.live_site_dir().display(),
+            resolved_site.display()
+        );
+    }
+    if recovered == RecoveredKeyMutation::Committed {
+        bail!(
+            "Recovered a previously committed Pages key mutation at {}; inspect the current key slots before requesting another mutation",
+            guard.target.live_root.display()
+        );
+    }
+    Ok(guard)
+}
+
+fn verify_published_key_tree(path: &Path, expected: &TreeEvidence) -> Result<()> {
+    let actual = inspect_key_publication_tree(path)?;
+    if &actual != expected {
+        bail!(
+            "published Pages key-mutation tree failed exact verification: expected digest {} ({} entries, {} bytes), got {} ({} entries, {} bytes)",
+            expected.digest,
+            expected.entries,
+            expected.bytes,
+            actual.digest,
+            actual.entries,
+            actual.bytes
+        );
+    }
+    Ok(())
+}
+
+fn cleanup_committed_key_mutation(
+    guard: &KeyMutationGuard,
+    prior_path: &Path,
+    prior_digest: &str,
+) {
+    if let Err(error) = remove_owned_key_mutation_tree(prior_path, Some(prior_digest)) {
+        tracing::warn!(
+            live_root = %guard.target.live_root.display(),
+            retained_prior = %prior_path.display(),
+            error = %format!("{error:#}"),
+            "Pages key mutation committed and verified, but its prior generation remains retained"
+        );
+        return;
+    }
+    if let Err(error) = remove_key_mutation_journal(guard) {
+        tracing::warn!(
+            live_root = %guard.target.live_root.display(),
+            journal = %guard.target.journal_path.display(),
+            error = %format!("{error:#}"),
+            "Pages key mutation committed and verified, but its recovery journal remains retained"
+        );
+    }
+}
+
+fn publish_staged_key_mutation(
+    guard: &KeyMutationGuard,
+    staged_root: &Path,
+    prior: &TreeEvidence,
+    candidate: &TreeEvidence,
+) -> Result<()> {
+    require_key_mutation_guard(guard)?;
+    let current = inspect_key_publication_tree(&guard.target.live_root)?;
+    if &current != prior {
+        bail!(
+            "Pages archive changed while its key mutation was staged; live generation was preserved"
+        );
+    }
+    verify_published_key_tree(staged_root, candidate)?;
+
+    let backup_root = random_key_mutation_sidecar_path(&guard.target.live_root, "backup");
+    if std::fs::symlink_metadata(&backup_root).is_ok() {
+        bail!(
+            "fresh Pages key-mutation backup path unexpectedly exists: {}",
+            backup_root.display()
+        );
+    }
+    write_key_mutation_journal(guard, staged_root, &backup_root, prior, candidate)?;
+    require_key_mutation_guard(guard)?;
+
+    #[cfg(target_os = "linux")]
+    {
+        match crate::indexer::atomic_exchange_paths(&guard.target.live_root, staged_root) {
+            Ok(()) => {
+                sync_parent_directory(&guard.target.live_root).with_context(|| {
+                    format!(
+                        "Pages key mutation is live at {}, but its atomic exchange could not be durably synced; prior generation retained at {}",
+                        guard.target.live_root.display(),
+                        staged_root.display()
+                    )
+                })?;
+                if let Err(verification_error) =
+                    verify_published_key_tree(&guard.target.live_root, candidate)
+                {
+                    crate::indexer::atomic_exchange_paths(&guard.target.live_root, staged_root)
+                        .context(
+                            "published Pages key tree failed verification and atomic rollback failed",
+                        )?;
+                    sync_parent_directory(&guard.target.live_root)?;
+                    verify_published_key_tree(&guard.target.live_root, prior)?;
+                    remove_owned_key_mutation_tree(staged_root, Some(&candidate.digest))?;
+                    remove_key_mutation_journal(guard)?;
+                    return Err(verification_error.context(
+                        "published Pages key tree failed verification; restored prior generation",
+                    ));
+                }
+                cleanup_committed_key_mutation(guard, staged_root, &prior.digest);
+                return Ok(());
+            }
+            Err(error) if crate::indexer::linux_atomic_exchange_is_unsupported(&error) => {
+                tracing::info!(
+                    live_root = %guard.target.live_root.display(),
+                    "atomic Pages key-mutation exchange is unsupported; using recoverable rename-pair publication"
+                );
+            }
+            Err(error) => return Err(error.context("failed atomically publishing Pages key mutation")),
+        }
+    }
+
+    std::fs::rename(&guard.target.live_root, &backup_root).with_context(|| {
+        format!(
+            "failed parking prior Pages archive {} at {}",
+            guard.target.live_root.display(),
+            backup_root.display()
+        )
+    })?;
+    if let Err(sync_error) = sync_parent_directory(&guard.target.live_root) {
+        match std::fs::rename(&backup_root, &guard.target.live_root) {
+            Ok(()) => {
+                sync_parent_directory(&guard.target.live_root)?;
+                remove_owned_key_mutation_tree(staged_root, Some(&candidate.digest))?;
+                remove_key_mutation_journal(guard)?;
+                return Err(sync_error.context(
+                    "failed durably parking prior Pages archive; restored prior generation",
+                ));
+            }
+            Err(restore_error) => bail!(
+                "failed syncing parked prior Pages archive: {sync_error}; restore also failed: {restore_error}; prior retained at {} and candidate at {}",
+                backup_root.display(),
+                staged_root.display()
+            ),
+        }
+    }
+
+    if let Err(publish_error) = std::fs::rename(staged_root, &guard.target.live_root) {
+        return match std::fs::rename(&backup_root, &guard.target.live_root) {
+            Ok(()) => {
+                sync_parent_directory(&guard.target.live_root)?;
+                remove_owned_key_mutation_tree(staged_root, Some(&candidate.digest))?;
+                remove_key_mutation_journal(guard)?;
+                Err(publish_error).context(
+                    "failed publishing staged Pages key mutation; restored prior generation",
+                )
+            }
+            Err(restore_error) => bail!(
+                "failed publishing staged Pages key mutation: {publish_error}; restore also failed: {restore_error}; prior retained at {} and candidate at {}",
+                backup_root.display(),
+                staged_root.display()
+            ),
+        };
+    }
+    sync_parent_directory(&guard.target.live_root).with_context(|| {
+        format!(
+            "Pages key mutation is live at {}, but publication could not be durably synced; prior generation retained at {}",
+            guard.target.live_root.display(),
+            backup_root.display()
+        )
+    })?;
+
+    if let Err(verification_error) = verify_published_key_tree(&guard.target.live_root, candidate) {
+        std::fs::rename(&guard.target.live_root, staged_root).with_context(|| {
+            format!(
+                "published Pages key tree failed verification and candidate could not be parked at {}",
+                staged_root.display()
+            )
+        })?;
+        std::fs::rename(&backup_root, &guard.target.live_root)
+            .context("published Pages key tree failed verification and prior restore failed")?;
+        sync_parent_directory(&guard.target.live_root)?;
+        verify_published_key_tree(&guard.target.live_root, prior)?;
+        remove_owned_key_mutation_tree(staged_root, Some(&candidate.digest))?;
+        remove_key_mutation_journal(guard)?;
+        return Err(verification_error
+            .context("published Pages key tree failed verification; restored prior generation"));
+    }
+
+    cleanup_committed_key_mutation(guard, &backup_root, &prior.digest);
+    Ok(())
+}
+
+fn publish_key_config_mutation(
+    guard: &KeyMutationGuard,
+    config: &EncryptionConfig,
+    recovery_secret: Option<&[u8]>,
+    remove_recovery_artifacts: bool,
+) -> Result<()> {
+    let (staged_root, prior) =
+        stage_key_mutation_tree(&guard.target, KeyMutationStageMode::PreserveSite)?;
+    let staged_site = guard.target.staged_site_dir(&staged_root);
+    let prepare_result = (|| -> Result<TreeEvidence> {
+        materialize_safe_required_file_symlinks(&staged_site)?;
+        write_json_pretty_atomically(&staged_site.join("config.json"), config)?;
+        let manifest = regenerate_integrity_manifest(&staged_site)?;
+        refresh_private_artifacts(
+            &staged_site,
+            config,
+            manifest.as_ref(),
+            recovery_secret,
+            remove_recovery_artifacts,
+        )?;
+        let verification = crate::pages::verify::verify_bundle(&staged_site, false)?;
+        if verification.status != "valid" {
+            bail!(
+                "staged Pages key mutation failed bundle verification with status {}",
+                verification.status
+            );
+        }
+        sync_tree(&staged_root)?;
+        inspect_key_publication_tree(&staged_root)
+    })();
+    let candidate = match prepare_result {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            return match remove_owned_key_mutation_tree(&staged_root, None) {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(error.context(format!(
+                    "failed cleaning rejected key-mutation candidate: {cleanup_error:#}"
+                ))),
+            };
+        }
+    };
+    publish_staged_key_mutation(guard, &staged_root, &prior, &candidate)
+}
+
 /// Result of listing key slots
 #[derive(Debug, Clone, Serialize)]
 pub struct KeyListResult {
@@ -986,8 +1329,8 @@ pub fn key_add_password(
     new_password: &str,
 ) -> Result<u8> {
     validate_password_input(new_password)?;
-    let archive_dir = super::resolve_site_dir(archive_dir)?;
-    let config_path = archive_dir.join("config.json");
+    let guard = begin_key_mutation(archive_dir)?;
+    let archive_dir = guard.target.live_site_dir();
     let mut config = load_config(&archive_dir)?;
     validate_supported_payload_format(&config)?;
 
@@ -999,15 +1342,8 @@ pub fn key_add_password(
     let slot_id = next_key_slot_id(&config.key_slots)?;
     let new_slot = create_password_slot(new_password, &dek, &config.export_id, slot_id)?;
 
-    materialize_safe_required_file_symlinks(&archive_dir)?;
     config.key_slots.push(new_slot);
-
-    // Write updated config
-    write_json_pretty_atomically(&config_path, &config)?;
-
-    // Update integrity.json if present
-    let manifest = regenerate_integrity_manifest(&archive_dir)?;
-    refresh_private_artifacts(&archive_dir, &config, manifest.as_ref(), None, false)?;
+    publish_key_config_mutation(&guard, &config, None, false)?;
 
     info!(slot_id, "Added password key slot");
     Ok(slot_id)
@@ -1018,8 +1354,8 @@ pub fn key_add_recovery(
     archive_dir: &Path,
     current_password: &str,
 ) -> Result<(u8, RecoverySecret)> {
-    let archive_dir = super::resolve_site_dir(archive_dir)?;
-    let config_path = archive_dir.join("config.json");
+    let guard = begin_key_mutation(archive_dir)?;
+    let archive_dir = guard.target.live_site_dir();
     let mut config = load_config(&archive_dir)?;
     validate_supported_payload_format(&config)?;
 
@@ -1034,18 +1370,10 @@ pub fn key_add_recovery(
     let slot_id = next_key_slot_id(&config.key_slots)?;
     let new_slot = create_recovery_slot(secret.as_bytes(), &dek, &config.export_id, slot_id)?;
 
-    materialize_safe_required_file_symlinks(&archive_dir)?;
     config.key_slots.push(new_slot);
-
-    // Write updated config
-    write_json_pretty_atomically(&config_path, &config)?;
-
-    // Update integrity.json if present
-    let manifest = regenerate_integrity_manifest(&archive_dir)?;
-    refresh_private_artifacts(
-        &archive_dir,
+    publish_key_config_mutation(
+        &guard,
         &config,
-        manifest.as_ref(),
         Some(secret.as_bytes()),
         false,
     )?;
@@ -1069,8 +1397,8 @@ pub fn key_revoke(
     current_password: &str,
     slot_id_to_revoke: u8,
 ) -> Result<RevokeResult> {
-    let archive_dir = super::resolve_site_dir(archive_dir)?;
-    let config_path = archive_dir.join("config.json");
+    let guard = begin_key_mutation(archive_dir)?;
+    let archive_dir = guard.target.live_site_dir();
     let mut config = load_config(&archive_dir)?;
     validate_supported_payload_format(&config)?;
 
@@ -1103,24 +1431,15 @@ pub fn key_revoke(
         .map(|s| s.slot_type == SlotType::Recovery)
         .unwrap_or(false);
 
-    materialize_safe_required_file_symlinks(&archive_dir)?;
-
     // Remove the slot (keeping IDs stable - they're part of the AAD binding)
     config.key_slots.retain(|s| s.id != slot_id_to_revoke);
-
-    // Write updated config
-    write_json_pretty_atomically(&config_path, &config)?;
-
-    // Update integrity.json if present
-    let manifest = regenerate_integrity_manifest(&archive_dir)?;
     let has_recovery_slot = config
         .key_slots
         .iter()
         .any(|slot| slot.slot_type == SlotType::Recovery);
-    refresh_private_artifacts(
-        &archive_dir,
+    publish_key_config_mutation(
+        &guard,
         &config,
-        manifest.as_ref(),
         None,
         revoked_slot_is_recovery || !has_recovery_slot,
     )?;
@@ -1141,7 +1460,8 @@ pub fn key_rotate(
     progress: impl Fn(f32),
 ) -> Result<RotateResult> {
     validate_password_input(new_password)?;
-    let archive_dir = super::resolve_site_dir(archive_dir)?;
+    let guard = begin_key_mutation(archive_dir)?;
+    let archive_dir = guard.target.live_site_dir();
     let config = load_config(&archive_dir)?;
     validate_supported_payload_format(&config)?;
     let old_export_id_raw = BASE64_STANDARD.decode(&config.export_id)?;
@@ -1172,30 +1492,7 @@ pub fn key_rotate(
     rng.fill_bytes(&mut new_export_id);
     rng.fill_bytes(&mut new_base_nonce);
 
-    let staged_site_dir = unique_atomic_sidecar_path(&archive_dir, "rotate", "site");
-    copy_site_except_runtime_state(&archive_dir, &staged_site_dir)?;
-
-    // 3. Re-encrypt payload with new DEK into the staged site
-    let (chunk_count, total_compressed_size) = encrypt_all_chunks(
-        &plaintext,
-        &new_dek,
-        &new_export_id,
-        &new_base_nonce,
-        config.payload.chunk_size,
-        &staged_site_dir.join("payload"),
-        |p| progress(0.5 + p * 0.5),
-    )?;
-
-    reencrypt_blobs_into_dir(
-        &archive_dir,
-        &staged_site_dir,
-        &old_dek,
-        &old_export_id,
-        &new_dek,
-        &new_export_id,
-    )?;
-
-    // 4. Create new key slots
+    // 3. Create replacement key slots before staging any publishable bytes.
     let mut new_slots = vec![create_password_slot(
         new_password,
         &new_dek,
@@ -1217,39 +1514,82 @@ pub fn key_rotate(
         recovery_secret_encoded = Some(secret.encoded().to_string());
     }
 
-    // 5. Write new config
-    let new_config = EncryptionConfig {
-        version: config.version,
-        export_id: BASE64_STANDARD.encode(new_export_id),
-        base_nonce: BASE64_STANDARD.encode(new_base_nonce),
-        compression: config.compression,
-        kdf_defaults: Argon2Params::default(),
-        payload: crate::pages::encrypt::PayloadMeta {
-            chunk_size: config.payload.chunk_size,
-            chunk_count,
-            total_compressed_size,
-            total_plaintext_size: plaintext.len() as u64,
-            files: (0..chunk_count)
-                .map(|i| format!("payload/chunk-{:05}.bin", i))
-                .collect(),
-        },
-        key_slots: new_slots.clone(),
-    };
-
-    write_json_pretty(&staged_site_dir.join("config.json"), &new_config)?;
-
-    // 6. Regenerate integrity.json for the staged site, then swap atomically
-    let manifest = crate::pages::bundle::generate_integrity_manifest(&staged_site_dir)?;
-    write_json_pretty(&staged_site_dir.join("integrity.json"), &manifest)?;
-    sync_tree(&staged_site_dir)?;
-    replace_dir_from_temp(&staged_site_dir, &archive_dir)?;
-    refresh_private_artifacts(
-        &archive_dir,
-        &new_config,
-        Some(&manifest),
-        recovery_secret_bytes.as_deref(),
-        !keep_recovery,
+    // 4. Stage the complete site/private generation and publish it through
+    // the same journaled transaction as add/revoke. Old payload and blob
+    // ciphertext are deliberately omitted from the staged copy.
+    let (staged_root, prior) = stage_key_mutation_tree(
+        &guard.target,
+        KeyMutationStageMode::ReplaceEncryptedPayload,
     )?;
+    let staged_site_dir = guard.target.staged_site_dir(&staged_root);
+    let prepare_result = (|| -> Result<TreeEvidence> {
+        let (chunk_count, total_compressed_size) = encrypt_all_chunks(
+            &plaintext,
+            &new_dek,
+            &new_export_id,
+            &new_base_nonce,
+            config.payload.chunk_size,
+            &staged_site_dir.join("payload"),
+            |p| progress(0.5 + p * 0.5),
+        )?;
+        reencrypt_blobs_into_dir(
+            &archive_dir,
+            &staged_site_dir,
+            &old_dek,
+            &old_export_id,
+            &new_dek,
+            &new_export_id,
+        )?;
+
+        let new_config = EncryptionConfig {
+            version: config.version,
+            export_id: BASE64_STANDARD.encode(new_export_id),
+            base_nonce: BASE64_STANDARD.encode(new_base_nonce),
+            compression: config.compression.clone(),
+            kdf_defaults: Argon2Params::default(),
+            payload: crate::pages::encrypt::PayloadMeta {
+                chunk_size: config.payload.chunk_size,
+                chunk_count,
+                total_compressed_size,
+                total_plaintext_size: plaintext.len() as u64,
+                files: (0..chunk_count)
+                    .map(|i| format!("payload/chunk-{i:05}.bin"))
+                    .collect(),
+            },
+            key_slots: new_slots.clone(),
+        };
+        write_json_pretty(&staged_site_dir.join("config.json"), &new_config)?;
+        let manifest = crate::pages::bundle::generate_integrity_manifest(&staged_site_dir)?;
+        write_json_pretty(&staged_site_dir.join("integrity.json"), &manifest)?;
+        refresh_private_artifacts(
+            &staged_site_dir,
+            &new_config,
+            Some(&manifest),
+            recovery_secret_bytes.as_deref(),
+            !keep_recovery,
+        )?;
+        let verification = crate::pages::verify::verify_bundle(&staged_site_dir, false)?;
+        if verification.status != "valid" {
+            bail!(
+                "staged Pages key rotation failed bundle verification with status {}",
+                verification.status
+            );
+        }
+        sync_tree(&staged_root)?;
+        inspect_key_publication_tree(&staged_root)
+    })();
+    let candidate = match prepare_result {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            return match remove_owned_key_mutation_tree(&staged_root, None) {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(error.context(format!(
+                    "failed cleaning rejected key-rotation candidate: {cleanup_error:#}"
+                ))),
+            };
+        }
+    };
+    publish_staged_key_mutation(&guard, &staged_root, &prior, &candidate)?;
 
     Ok(RotateResult {
         new_dek_created_at: chrono::Utc::now(),
