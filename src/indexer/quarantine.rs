@@ -163,6 +163,27 @@ impl QuarantineState {
         }
     }
 
+    /// Load quarantine state for an operator-facing inspection or mutation.
+    /// Unlike [`Self::load`], this refuses unreadable or malformed state so a
+    /// management command cannot mistake a damaged checkpoint for an empty
+    /// one and then overwrite the only remaining recovery metadata.
+    pub(crate) fn load_for_operator(data_dir: &Path) -> std::io::Result<Self> {
+        let path = Self::path(data_dir);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => return Err(error),
+        };
+        serde_json::from_str(&text).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid quarantine state {}: {error}", path.display()),
+            )
+        })
+    }
+
     /// Atomically write the quarantine state to disk via temp file + rename,
     /// so partial writes can never produce a corrupt quarantine_state.json.
     pub fn save(&self, data_dir: &Path) -> std::io::Result<()> {
@@ -413,6 +434,21 @@ mod tests {
             .expect("write malformed");
         let loaded = QuarantineState::load(dir.path());
         assert!(loaded.is_empty(), "malformed file must not block indexing");
+    }
+
+    #[test]
+    fn operator_load_refuses_malformed_checkpoint() {
+        let dir = tempdir().unwrap();
+        let missing = QuarantineState::load_for_operator(dir.path())
+            .expect("a missing operator checkpoint is an empty state");
+        assert!(missing.is_empty());
+
+        let path = dir.path().join(QuarantineState::FILENAME);
+        std::fs::write(&path, "not json").expect("write malformed checkpoint");
+        let error = QuarantineState::load_for_operator(dir.path())
+            .expect_err("operator load must not hide malformed state");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains(&path.display().to_string()));
     }
 
     #[test]

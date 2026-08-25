@@ -78,7 +78,7 @@ use crate::franken_sync::compat::{
     ConnectionExt, OpenFlags as FrankenOpenFlags, RowExt,
     open_with_flags as open_franken_with_flags,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base64::prelude::*;
 use chrono::Utc;
 use clap::{Arg, ArgAction, Command, CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
@@ -8570,7 +8570,8 @@ fn run_quarantine_retry_command(
     };
 
     if !apply {
-        let plan = crate::indexer::plan_quarantine_retry(&data_dir, &config);
+        let plan = crate::indexer::plan_quarantine_retry(&data_dir, &config)
+            .map_err(|err| quarantine_apply_cli_error("retry plan", err))?;
         let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
             if matches!(fmt, RobotFormat::Sessions) {
                 RobotFormat::Compact
@@ -8659,7 +8660,8 @@ fn run_quarantine_retry_command(
 /// retry-eligible under the current binary (version-stale/legacy).
 fn quarantine_entries_json(data_dir: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
     use crate::indexer::quarantine::QuarantineState;
-    let state = QuarantineState::load(data_dir);
+    let state = QuarantineState::load_for_operator(data_dir)
+        .context("loading quarantine state for operator list")?;
     let current_version = env!("CARGO_PKG_VERSION");
     let mut entries = state
         .iter()
@@ -8835,7 +8837,9 @@ fn run_quarantine_clear(
         .then(|| crate::indexer::acquire_quarantine_mutation_lock(&data_dir))
         .transpose()
         .map_err(|err| quarantine_apply_cli_error("clear", err))?;
-    let mut state = QuarantineState::load(&data_dir);
+    let mut state = QuarantineState::load_for_operator(&data_dir)
+        .map_err(anyhow::Error::from)
+        .map_err(|err| quarantine_apply_cli_error("clear", err))?;
 
     // Health treats the structured checkpoint and both poison ledgers as one
     // quarantine set. Clear must use the same union so a prior best-effort

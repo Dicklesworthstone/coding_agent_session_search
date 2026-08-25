@@ -24088,10 +24088,16 @@ fn targeted_quarantine_retry_inner(
 pub fn plan_quarantine_retry(
     data_dir: &Path,
     config: &quarantine_retry::RetryConfig,
-) -> quarantine_retry::RetryPlan {
-    let state = QuarantineState::load(data_dir);
+) -> Result<quarantine_retry::RetryPlan> {
+    let state = QuarantineState::load_for_operator(data_dir)
+        .context("loading quarantine state for retry plan")?;
     let source_missing = quarantine_source_missing_ids(data_dir);
-    quarantine_retry::plan_retry(&state, current_cass_version(), config, &source_missing)
+    Ok(quarantine_retry::plan_retry(
+        &state,
+        current_cass_version(),
+        config,
+        &source_missing,
+    ))
 }
 
 /// Holds the authoritative data-dir maintenance lock while a quarantine
@@ -24146,7 +24152,8 @@ pub fn run_quarantine_retry(
     let _mutation_guard = apply
         .then(|| acquire_quarantine_mutation_lock(data_dir))
         .transpose()?;
-    let mut state = QuarantineState::load(data_dir);
+    let mut state = QuarantineState::load_for_operator(data_dir)
+        .context("loading quarantine state for targeted retry")?;
     let current_version = current_cass_version();
     let source_missing = quarantine_source_missing_ids(data_dir);
     let now = chrono::Utc::now();
@@ -41256,7 +41263,7 @@ mod tests {
 
         let config = quarantine_retry::RetryConfig::default();
 
-        let dry = plan_quarantine_retry(&data_dir, &config);
+        let dry = plan_quarantine_retry(&data_dir, &config)?;
         anyhow::ensure!(dry.total_quarantined == 2);
         anyhow::ensure!(dry.planned_attempts == 1);
         anyhow::ensure!(
