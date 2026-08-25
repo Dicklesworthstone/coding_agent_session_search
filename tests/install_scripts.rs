@@ -1072,7 +1072,10 @@ fn verify_flag_rejects_a_binary_whose_version_probe_fails() {
 fn powershell_verify_contract_fails_closed_on_native_command_errors() {
     let script = fs::read_to_string("install.ps1").expect("read install.ps1");
     for required in [
+        "$LASTEXITCODE = $null",
         "$verifyExitCode = $LASTEXITCODE",
+        "if ($null -eq $verifyExitCode)",
+        "did not report an exit code",
         "if ($verifyExitCode -ne 0)",
         "exit $verifyExitCode",
         "Self-test complete",

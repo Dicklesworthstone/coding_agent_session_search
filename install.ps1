@@ -348,8 +348,16 @@ try {
   }
 
   if ($Verify) {
+    # Clear any exit code left by an earlier native command. If cass cannot
+    # report a fresh code, verification must fail closed rather than reusing a
+    # stale success (or passing $null to `exit`, which PowerShell treats as 0).
+    $LASTEXITCODE = $null
     & "$Dest\cass.exe" --version
     $verifyExitCode = $LASTEXITCODE
+    if ($null -eq $verifyExitCode) {
+      Write-Error "Self-test failed: $Dest\cass.exe --version did not report an exit code"
+      exit 1
+    }
     if ($verifyExitCode -ne 0) {
       Write-Error "Self-test failed: $Dest\cass.exe --version exited with code $verifyExitCode"
       exit $verifyExitCode

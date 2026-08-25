@@ -162,6 +162,7 @@ const MASTER_KEY_BACKUP_NOTE: &str =
 const BUNDLE_PUBLISH_JOURNAL_FORMAT: &str = "cass-pages-bundle-publish-v1";
 const BUNDLE_PUBLISH_JOURNAL_MAX_BYTES: u64 = 16 * 1024;
 const BUNDLE_PUBLISH_BACKUP_SCAN_LIMIT: usize = 65_536;
+const BUNDLE_TREE_EVIDENCE_ENTRY_LIMIT: usize = 1_000_000;
 const BUNDLE_TREE_EVIDENCE_DOMAIN: &[u8] = b"cass-pages-bundle-tree-v1\0";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1036,6 +1037,14 @@ fn update_bundle_evidence_path(hasher: &mut Sha256, kind: u8, path: &str) -> Res
 }
 
 fn inspect_bundle_tree(path: &Path, label: &str) -> Result<BundleTreeEvidence> {
+    inspect_bundle_tree_with_entry_limit(path, label, BUNDLE_TREE_EVIDENCE_ENTRY_LIMIT)
+}
+
+fn inspect_bundle_tree_with_entry_limit(
+    path: &Path,
+    label: &str,
+    entry_limit: usize,
+) -> Result<BundleTreeEvidence> {
     if !ensure_bundle_directory_entry(path, label)? {
         bail!("{label} does not exist: {}", path.display());
     }
@@ -1044,14 +1053,26 @@ fn inspect_bundle_tree(path: &Path, label: &str) -> Result<BundleTreeEvidence> {
     hasher.update(BUNDLE_TREE_EVIDENCE_DOMAIN);
     let mut file_count = 0_u64;
     let mut total_size_bytes = 0_u64;
+    let mut entry_count = 0_usize;
     let mut pending_directories = vec![path.to_path_buf()];
     let mut buffer = [0_u8; 64 * 1024];
 
     while let Some(directory) = pending_directories.pop() {
-        let mut entries = fs::read_dir(&directory)
-            .with_context(|| format!("failed reading {label} directory {}", directory.display()))?
-            .collect::<std::io::Result<Vec<_>>>()
-            .with_context(|| format!("failed walking {label} directory {}", directory.display()))?;
+        let read_dir = fs::read_dir(&directory)
+            .with_context(|| format!("failed reading {label} directory {}", directory.display()))?;
+        let mut entries = Vec::new();
+        for entry in read_dir {
+            if entry_count >= entry_limit {
+                bail!(
+                    "{label} exceeds the {entry_limit}-entry recovery-evidence bound; preserved the tree without mutation: {}",
+                    path.display()
+                );
+            }
+            entries.push(entry.with_context(|| {
+                format!("failed walking {label} directory {}", directory.display())
+            })?);
+            entry_count += 1;
+        }
         entries.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
         let mut child_directories = Vec::new();
 
@@ -3893,12 +3914,14 @@ mod tests {
         assert!(final_dir.join("site/new.txt").exists());
         assert!(!final_dir.join("site/old.txt").exists());
         assert!(
-            !bundle_publish_in_progress_backup_path(&final_dir).exists(),
-            "deterministic recovery sidecar should be cleaned up"
+            !bundle_publish_recovery_journal_path(&final_dir).exists(),
+            "completed publication journal should be cleaned up"
         );
         assert!(
-            !bundle_publish_marker_path(&final_dir).exists(),
-            "completed replacement marker should be cleaned up"
+            first_unowned_bundle_publish_backup(&final_dir, None)
+                .unwrap()
+                .is_none(),
+            "completed publication should not leave a recovery backup"
         );
     }
 
@@ -3920,7 +3943,12 @@ mod tests {
             fs::read_to_string(final_dir.join("site/new.txt")).unwrap(),
             "new"
         );
-        assert!(!bundle_publish_in_progress_backup_path(&final_dir).exists());
+        assert!(!bundle_publish_recovery_journal_path(&final_dir).exists());
+        assert!(
+            first_unowned_bundle_publish_backup(&final_dir, None)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -3928,12 +3956,15 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let final_dir = temp.path().join("bundle");
         let staged_dir = temp.path().join("bundle.staged");
-        let backup_dir = bundle_publish_in_progress_backup_path(&final_dir);
 
         fs::create_dir_all(final_dir.join("private")).unwrap();
         fs::write(final_dir.join("private/old-private.txt"), "old").unwrap();
         fs::create_dir_all(staged_dir.join("private")).unwrap();
         fs::write(staged_dir.join("private/new-private.txt"), "new").unwrap();
+        let prior = inspect_bundle_tree(&final_dir, "prior").unwrap();
+        let candidate = inspect_bundle_tree(&staged_dir, "candidate").unwrap();
+        let backup_dir = unpredictable_bundle_publish_backup_path(&final_dir).unwrap();
+        write_bundle_publish_journal(&final_dir, &backup_dir, &prior, &candidate).unwrap();
 
         // Failpoint state: the fallback publisher durably parked OLD, then
         // the process died before installing NEW at the live handle.
@@ -3952,6 +3983,7 @@ mod tests {
             "new",
             "recovery must not consume the next staged candidate"
         );
+        assert!(!bundle_publish_recovery_journal_path(&final_dir).exists());
     }
 
     #[test]
@@ -3959,17 +3991,15 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let final_dir = temp.path().join("bundle");
         let staged_dir = temp.path().join("bundle.staged");
-        let backup_dir = bundle_publish_in_progress_backup_path(&final_dir);
 
         fs::create_dir_all(final_dir.join("private")).unwrap();
         fs::write(final_dir.join("private/old-private.txt"), "old").unwrap();
         fs::create_dir_all(staged_dir.join("private")).unwrap();
         fs::write(staged_dir.join("private/new-private.txt"), "new").unwrap();
-        fs::write(
-            bundle_publish_marker_path(&staged_dir),
-            BUNDLE_PUBLISH_MARKER_CONTENT,
-        )
-        .unwrap();
+        let prior = inspect_bundle_tree(&final_dir, "prior").unwrap();
+        let candidate = inspect_bundle_tree(&staged_dir, "candidate").unwrap();
+        let backup_dir = unpredictable_bundle_publish_backup_path(&final_dir).unwrap();
+        write_bundle_publish_journal(&final_dir, &backup_dir, &prior, &candidate).unwrap();
 
         // Failpoint state: OLD was parked and NEW reached the live handle,
         // then the process died before removing OLD.
@@ -3984,14 +4014,14 @@ mod tests {
         );
         assert!(!final_dir.join("private/old-private.txt").exists());
         assert!(!backup_dir.exists());
-        assert!(!bundle_publish_marker_path(&final_dir).exists());
+        assert!(!bundle_publish_recovery_journal_path(&final_dir).exists());
     }
 
     #[test]
-    fn test_recover_interrupted_publish_preserves_unmarked_ambiguous_sidecar() {
+    fn test_recover_interrupted_publish_preserves_unowned_legacy_sidecar() {
         let temp = TempDir::new().unwrap();
         let final_dir = temp.path().join("bundle");
-        let backup_dir = bundle_publish_in_progress_backup_path(&final_dir);
+        let backup_dir = legacy_bundle_publish_in_progress_backup_path(&final_dir);
 
         fs::create_dir_all(final_dir.join("site")).unwrap();
         fs::write(final_dir.join("site/live.txt"), "live").unwrap();
@@ -3999,11 +4029,11 @@ mod tests {
         fs::write(backup_dir.join("unrelated/sentinel.txt"), "preserve").unwrap();
 
         let error = recover_interrupted_bundle_publish(&final_dir)
-            .expect_err("two unmarked trees must be preserved as ambiguous");
+            .expect_err("an unowned legacy sidecar must be preserved");
         let message = format!("{error:#}");
 
         assert!(
-            message.contains("both unmarked"),
+            message.contains("unowned Pages bundle recovery artifact"),
             "unexpected error: {message}"
         );
         assert_eq!(
@@ -4017,23 +4047,64 @@ mod tests {
     }
 
     #[test]
+    fn test_recover_missing_live_never_adopts_unowned_legacy_sidecar() {
+        let temp = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let backup_dir = legacy_bundle_publish_in_progress_backup_path(&final_dir);
+        fs::create_dir_all(backup_dir.join("unrelated")).unwrap();
+        fs::write(backup_dir.join("unrelated/sentinel.txt"), "preserve").unwrap();
+
+        let error = recover_interrupted_bundle_publish(&final_dir)
+            .expect_err("an unjournaled directory must never become the live bundle");
+
+        assert!(error.to_string().contains("refusing to infer ownership"));
+        assert!(!final_dir.exists());
+        assert_eq!(
+            fs::read_to_string(backup_dir.join("unrelated/sentinel.txt")).unwrap(),
+            "preserve"
+        );
+    }
+
+    #[test]
+    fn test_legacy_constant_marker_cannot_authorize_recursive_cleanup() {
+        let temp = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let backup_dir = legacy_bundle_publish_in_progress_backup_path(&final_dir);
+        fs::create_dir_all(final_dir.join("site")).unwrap();
+        fs::write(
+            final_dir.join(".cass-pages-publish-in-progress-v1"),
+            b"cass-pages-publish-in-progress-v1\n",
+        )
+        .unwrap();
+        fs::create_dir_all(backup_dir.join("unrelated")).unwrap();
+        fs::write(backup_dir.join("unrelated/sentinel.txt"), "preserve").unwrap();
+
+        recover_interrupted_bundle_publish(&final_dir)
+            .expect_err("a public legacy marker must not confer ownership");
+
+        assert!(final_dir.exists());
+        assert_eq!(
+            fs::read_to_string(backup_dir.join("unrelated/sentinel.txt")).unwrap(),
+            "preserve"
+        );
+    }
+
+    #[test]
     fn test_recover_interrupted_atomic_publish_before_exchange_keeps_prior_live() {
         let temp = TempDir::new().unwrap();
         let final_dir = temp.path().join("bundle");
         let staged_dir = temp.path().join("bundle.staged");
-        let exchange_dir = bundle_publish_in_progress_backup_path(&final_dir);
 
         fs::create_dir_all(final_dir.join("private")).unwrap();
         fs::write(final_dir.join("private/old-private.txt"), "old").unwrap();
         fs::create_dir_all(staged_dir.join("private")).unwrap();
         fs::write(staged_dir.join("private/new-private.txt"), "new").unwrap();
-        fs::write(
-            bundle_publish_marker_path(&staged_dir),
-            BUNDLE_PUBLISH_MARKER_CONTENT,
-        )
-        .unwrap();
+        let prior = inspect_bundle_tree(&final_dir, "prior").unwrap();
+        let candidate = inspect_bundle_tree(&staged_dir, "candidate").unwrap();
+        let exchange_dir = unpredictable_bundle_publish_backup_path(&final_dir).unwrap();
+        write_bundle_publish_journal(&final_dir, &exchange_dir, &prior, &candidate).unwrap();
 
-        // Failpoint state: NEW reached the deterministic exchange handle,
+        // Failpoint state: NEW reached the journaled exchange handle,
         // but the process died before the atomic exchange committed.
         fs::rename(&staged_dir, &exchange_dir).unwrap();
 
@@ -4045,27 +4116,29 @@ mod tests {
         );
         assert!(!final_dir.join("private/new-private.txt").exists());
         assert!(!exchange_dir.exists());
-        assert!(!bundle_publish_marker_path(&final_dir).exists());
+        assert!(!bundle_publish_recovery_journal_path(&final_dir).exists());
     }
 
     #[test]
     fn test_recover_interrupted_atomic_publish_immediately_after_exchange_keeps_new_live() {
         let temp = TempDir::new().unwrap();
         let final_dir = temp.path().join("bundle");
-        let exchange_dir = bundle_publish_in_progress_backup_path(&final_dir);
-
-        // Failpoint state immediately after exchange: NEW is live and carries
-        // the marker that moved with it; OLD is discoverable at the canonical
-        // exchange handle and carries no marker.
+        let staged_dir = temp.path().join("bundle.staged");
+        let parked_dir = temp.path().join("bundle.parked-for-test");
         fs::create_dir_all(final_dir.join("private")).unwrap();
-        fs::write(final_dir.join("private/new-private.txt"), "new").unwrap();
-        fs::write(
-            bundle_publish_marker_path(&final_dir),
-            BUNDLE_PUBLISH_MARKER_CONTENT,
-        )
-        .unwrap();
-        fs::create_dir_all(exchange_dir.join("private")).unwrap();
-        fs::write(exchange_dir.join("private/old-private.txt"), "old").unwrap();
+        fs::write(final_dir.join("private/old-private.txt"), "old").unwrap();
+        fs::create_dir_all(staged_dir.join("private")).unwrap();
+        fs::write(staged_dir.join("private/new-private.txt"), "new").unwrap();
+        let prior = inspect_bundle_tree(&final_dir, "prior").unwrap();
+        let candidate = inspect_bundle_tree(&staged_dir, "candidate").unwrap();
+        let exchange_dir = unpredictable_bundle_publish_backup_path(&final_dir).unwrap();
+        write_bundle_publish_journal(&final_dir, &exchange_dir, &prior, &candidate).unwrap();
+
+        // Failpoint state immediately after exchange: NEW is live and OLD is
+        // at the exact random path authenticated by the durable journal.
+        fs::rename(&final_dir, &parked_dir).unwrap();
+        fs::rename(&staged_dir, &final_dir).unwrap();
+        fs::rename(&parked_dir, &exchange_dir).unwrap();
 
         recover_interrupted_bundle_publish(&final_dir).unwrap();
 
@@ -4075,7 +4148,35 @@ mod tests {
         );
         assert!(!final_dir.join("private/old-private.txt").exists());
         assert!(!exchange_dir.exists());
-        assert!(!bundle_publish_marker_path(&final_dir).exists());
+        assert!(!bundle_publish_recovery_journal_path(&final_dir).exists());
+    }
+
+    #[test]
+    fn test_recovery_rejects_journaled_backup_after_content_mutation() {
+        let temp = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let staged_dir = temp.path().join("bundle.staged");
+        fs::create_dir_all(final_dir.join("private")).unwrap();
+        fs::write(final_dir.join("private/old-private.txt"), "old").unwrap();
+        fs::create_dir_all(staged_dir.join("private")).unwrap();
+        fs::write(staged_dir.join("private/new-private.txt"), "new").unwrap();
+        let prior = inspect_bundle_tree(&final_dir, "prior").unwrap();
+        let candidate = inspect_bundle_tree(&staged_dir, "candidate").unwrap();
+        let backup_dir = unpredictable_bundle_publish_backup_path(&final_dir).unwrap();
+        write_bundle_publish_journal(&final_dir, &backup_dir, &prior, &candidate).unwrap();
+        fs::rename(&final_dir, &backup_dir).unwrap();
+        fs::write(backup_dir.join("private/old-private.txt"), "tampered").unwrap();
+
+        let error = recover_interrupted_bundle_publish(&final_dir)
+            .expect_err("mutated journaled bytes must not be restored");
+
+        assert!(error.to_string().contains("does not match the prior generation"));
+        assert!(!final_dir.exists());
+        assert_eq!(
+            fs::read_to_string(backup_dir.join("private/old-private.txt")).unwrap(),
+            "tampered"
+        );
+        assert!(bundle_publish_recovery_journal_path(&final_dir).exists());
     }
 
     #[test]
@@ -4083,23 +4184,25 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let final_dir = temp.path().join("bundle");
         let staged_dir = temp.path().join("bundle.staged");
-        let backup_dir = bundle_publish_in_progress_backup_path(&final_dir);
 
         fs::create_dir_all(final_dir.join("site")).unwrap();
         fs::write(final_dir.join("site/old.txt"), "old").unwrap();
         fs::create_dir_all(staged_dir.join("site")).unwrap();
         fs::write(staged_dir.join("site/new.txt"), "new").unwrap();
-        fs::write(
-            bundle_publish_marker_path(&staged_dir),
-            BUNDLE_PUBLISH_MARKER_CONTENT,
-        )
-        .unwrap();
+        let prior = inspect_bundle_tree(&final_dir, "prior").unwrap();
+        let candidate = inspect_bundle_tree(&staged_dir, "candidate").unwrap();
+        let backup_dir = unpredictable_bundle_publish_backup_path(&final_dir).unwrap();
+        let journal =
+            write_bundle_publish_journal(&final_dir, &backup_dir, &prior, &candidate).unwrap();
 
         let mut retain_temp_on_error = false;
         replace_dir_from_temp_via_recoverable_rename_pair(
             &staged_dir,
             &final_dir,
             &backup_dir,
+            &journal,
+            &prior,
+            &candidate,
             &mut retain_temp_on_error,
         )
         .unwrap();
@@ -4110,24 +4213,31 @@ mod tests {
             "new"
         );
         assert!(!backup_dir.exists());
-        assert!(!bundle_publish_marker_path(&final_dir).exists());
+        assert!(!bundle_publish_recovery_journal_path(&final_dir).exists());
     }
 
     #[test]
     fn test_prior_private_bundle_cleanup_failure_names_every_retained_path() {
         let temp = TempDir::new().unwrap();
         let final_dir = temp.path().join("bundle");
-        let backup_dir = bundle_publish_in_progress_backup_path(&final_dir);
+        let backup_dir = temp.path().join("journaled-backup");
         fs::create_dir_all(final_dir.join("site")).unwrap();
         fs::create_dir_all(backup_dir.join("private")).unwrap();
         fs::write(backup_dir.join("private/recovery-material.txt"), "private").unwrap();
+        let expected = inspect_bundle_tree(&backup_dir, "prior").unwrap();
 
-        let error = cleanup_prior_bundle_after_publish_with(&backup_dir, &final_dir, |_| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "injected cleanup denial",
-            ))
-        })
+        let error = cleanup_journaled_bundle_tree_after_publish_with(
+            &backup_dir,
+            &final_dir,
+            "journaled prior Pages bundle",
+            &expected,
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected cleanup denial",
+                ))
+            },
+        )
         .expect_err("cleanup failure must fail the publication result");
         let message = format!("{error:#}");
 
@@ -4139,6 +4249,53 @@ mod tests {
     }
 
     #[test]
+    fn test_cleanup_refuses_mutated_tree_before_recursive_removal() {
+        let temp = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let backup_dir = temp.path().join("journaled-backup");
+        fs::create_dir_all(final_dir.join("site")).unwrap();
+        fs::create_dir_all(backup_dir.join("private")).unwrap();
+        let private_file = backup_dir.join("private/recovery-material.txt");
+        fs::write(&private_file, "private").unwrap();
+        let expected = inspect_bundle_tree(&backup_dir, "prior").unwrap();
+        fs::write(&private_file, "changed after journal").unwrap();
+        let remove_called = std::cell::Cell::new(false);
+
+        cleanup_journaled_bundle_tree_after_publish_with(
+            &backup_dir,
+            &final_dir,
+            "journaled prior Pages bundle",
+            &expected,
+            |_| {
+                remove_called.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("tree mutation must stop before recursive cleanup");
+
+        assert!(!remove_called.get());
+        assert_eq!(fs::read_to_string(private_file).unwrap(), "changed after journal");
+    }
+
+    #[test]
+    fn test_bundle_tree_evidence_entry_bound_fails_closed() {
+        let temp = TempDir::new().unwrap();
+        let tree = temp.path().join("bundle");
+        fs::create_dir_all(&tree).unwrap();
+        for (name, body) in [("a.txt", "a"), ("b.txt", "b"), ("c.txt", "c")] {
+            fs::write(tree.join(name), body).unwrap();
+        }
+
+        let error = inspect_bundle_tree_with_entry_limit(&tree, "bounded bundle", 2)
+            .expect_err("a tree beyond the evidence bound must fail closed");
+
+        assert!(error.to_string().contains("2-entry recovery-evidence bound"));
+        assert_eq!(fs::read_to_string(tree.join("a.txt")).unwrap(), "a");
+        assert_eq!(fs::read_to_string(tree.join("b.txt")).unwrap(), "b");
+        assert_eq!(fs::read_to_string(tree.join("c.txt")).unwrap(), "c");
+    }
+
+    #[test]
     #[cfg(unix)]
     fn test_recover_interrupted_bundle_publish_rejects_symlinked_backup() {
         use std::os::unix::fs::symlink;
@@ -4146,7 +4303,15 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
         let final_dir = temp.path().join("bundle");
-        let backup_dir = bundle_publish_in_progress_backup_path(&final_dir);
+        let staged_dir = temp.path().join("bundle.staged");
+        fs::create_dir_all(final_dir.join("site")).unwrap();
+        fs::write(final_dir.join("site/old.txt"), "old").unwrap();
+        fs::create_dir_all(staged_dir.join("site")).unwrap();
+        fs::write(staged_dir.join("site/new.txt"), "new").unwrap();
+        let prior = inspect_bundle_tree(&final_dir, "prior").unwrap();
+        let candidate = inspect_bundle_tree(&staged_dir, "candidate").unwrap();
+        let backup_dir = unpredictable_bundle_publish_backup_path(&final_dir).unwrap();
+        write_bundle_publish_journal(&final_dir, &backup_dir, &prior, &candidate).unwrap();
         fs::create_dir_all(outside.path().join("private")).unwrap();
         fs::write(outside.path().join("private/material.txt"), "private").unwrap();
         symlink(outside.path(), &backup_dir).unwrap();
@@ -4164,7 +4329,10 @@ mod tests {
             fs::read_to_string(outside.path().join("private/material.txt")).unwrap(),
             "private"
         );
-        assert!(!final_dir.exists());
+        assert_eq!(
+            fs::read_to_string(final_dir.join("site/old.txt")).unwrap(),
+            "old"
+        );
     }
 
     #[test]
