@@ -1178,14 +1178,7 @@ fn assert_pack_alias_runs(alias: &str) {
     let mut cmd = base_cmd();
     cmd.args([alias, "auth", "--json", "--data-dir"]);
     cmd.arg(fixture.path());
-    cmd.args([
-        "--limit",
-        "1",
-        "--max-evidence",
-        "1",
-        "--max-sessions",
-        "1",
-    ]);
+    cmd.args(["--limit", "1", "--max-evidence", "1", "--max-sessions", "1"]);
 
     let output = cmd.assert().success().get_output().clone();
     let stdout = String::from_utf8_lossy(&output.stdout);
