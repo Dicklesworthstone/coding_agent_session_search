@@ -17,7 +17,11 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ## [Unreleased]
 
-## [v0.7.0] -- 2026-08-24
+> crates.io `0.7.0` was published from commit `1f6cdcf9` on 2026-08-25.
+> Subsequent correctness and release-hardening changes on `main` target
+> `0.7.1`; do not tag a later commit as `v0.7.0`.
+
+## [v0.7.0] -- 2026-08-25
 
 > Note: this section accumulated since **v0.6.25**. `v0.6.26` was tagged
 > without moving its notes out of `[Unreleased]`, so the entries below cover

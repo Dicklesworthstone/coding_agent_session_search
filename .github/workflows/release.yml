@@ -519,10 +519,41 @@ jobs:
           echo "::warning::Skipping crates.io publish because the manifest is not registry-ready with the currently published dependency set."
           cat "$RUNNER_TEMP/cargo-package.log"
 
+      - name: Check whether this crate version is already published
+        id: registry_version
+        if: ${{ steps.publish_readiness.outputs.ready == 'true' }}
+        shell: bash
+        env:
+          PACKAGE_VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          crate_http_code="$(curl -sS \
+            -A 'cass-release-workflow/1.0 (https://github.com/Dicklesworthstone/coding_agent_session_search)' \
+            -o "$RUNNER_TEMP/crates-version.json" \
+            -w '%{http_code}' \
+            "https://crates.io/api/v1/crates/coding-agent-search/${PACKAGE_VERSION}")"
+          case "${crate_http_code}" in
+            200)
+              echo "already_published=true" >> "$GITHUB_OUTPUT"
+              echo "coding-agent-search ${PACKAGE_VERSION} is already on crates.io; publication is idempotently skipped."
+              ;;
+            404)
+              echo "already_published=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::crates.io version probe returned HTTP ${crate_http_code}."
+              cat "$RUNNER_TEMP/crates-version.json" || true
+              exit 1
+              ;;
+          esac
+
       - name: Publish to crates.io
-        if: ${{ env.CARGO_REGISTRY_TOKEN != '' && steps.publish_readiness.outputs.ready == 'true' }}
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' && steps.publish_readiness.outputs.ready == 'true' && steps.registry_version.outputs.already_published != 'true' }}
         # Publish only the dependency graph proven by the tagged Cargo.lock.
         run: cargo publish --locked --all-features
+
+      - name: Report existing crates.io version
+        if: ${{ steps.registry_version.outputs.already_published == 'true' }}
+        run: echo "coding-agent-search ${{ needs.release.outputs.version }} was already published; no registry mutation was needed."
 
       - name: Warn when token is missing
         if: ${{ env.CARGO_REGISTRY_TOKEN == '' }}

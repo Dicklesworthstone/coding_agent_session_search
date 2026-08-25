@@ -223,6 +223,9 @@ fn release_workflow_builds_and_publishes_the_exact_requested_tag() -> Result<(),
         "if [[ \"${API_VERSION}\" != \"1\" ]]",
         "$apiVersionJson = & $binary api-version --json",
         "if ($apiVersion.api_version -ne 1)",
+        "id: registry_version",
+        "already_published=true",
+        "steps.registry_version.outputs.already_published != 'true'",
     ] {
         if !workflow.contains(required) {
             return Err(format!(
