@@ -3547,7 +3547,7 @@ mod tests {
             Some(&staging_ownership),
             None,
         )
-            .expect_err("a replaced lock pathname must block destructive cleanup");
+        .expect_err("a replaced lock pathname must block destructive cleanup");
 
         anyhow::ensure!(format!("{error:#}").contains("was replaced"));
         anyhow::ensure!(std::fs::symlink_metadata(&staged)?.file_type().is_dir());
