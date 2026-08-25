@@ -1170,13 +1170,15 @@ fn pack_named_query_flag_attaches_to_query_positional() {
 }
 
 fn assert_pack_alias_runs(alias: &str) {
+    // The last direct shared-fixture consumer in this file (bead xwi3f): a
+    // CLI subprocess pointed at tests/fixtures/search_demo_data can rebuild
+    // derived lexical/sqlite assets in place and race every parallel test
+    // that copies the fixture mid-rebuild. Always search an isolated copy.
+    let fixture = isolated_search_demo_data().expect("isolated search demo fixture");
     let mut cmd = base_cmd();
+    cmd.args([alias, "auth", "--json", "--data-dir"]);
+    cmd.arg(fixture.path());
     cmd.args([
-        alias,
-        "auth",
-        "--json",
-        "--data-dir",
-        "tests/fixtures/search_demo_data",
         "--limit",
         "1",
         "--max-evidence",
