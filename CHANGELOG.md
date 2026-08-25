@@ -2134,7 +2134,9 @@ Initial development. Project scaffolding, architecture design, and first impleme
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.6.24...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.7.0...HEAD
+[v0.7.0]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.6.26...v0.7.0
+[v0.6.25]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.6.24...v0.6.25
 [v0.6.24]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.6.23...v0.6.24
 [v0.2.2]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.2.1...v0.2.2
 [v0.2.1]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.2.0...v0.2.1
