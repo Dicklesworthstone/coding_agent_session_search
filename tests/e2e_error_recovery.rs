@@ -389,8 +389,9 @@ fn test_export_handles_missing_source() {
         "verify_error",
         Some("Verify export returns appropriate error"),
     );
-    assert!(result.is_err(), "Export should fail for missing source");
-    let err_msg = result.err().expect("checked is_err above").to_string();
+    let err_msg = result
+        .expect_err("Export should fail for missing source")
+        .to_string();
     // Error should indicate the issue without panicking
     assert!(
         !err_msg.is_empty(),
@@ -708,10 +709,8 @@ fn test_permission_denied_export_directory() {
 
     // Phase 4: Verify appropriate error
     let start = tracker.start("verify_error", Some("Verify permission error is clear"));
-    assert!(result.is_err(), "Export to read-only directory should fail");
     let err_msg = result
-        .err()
-        .expect("checked is_err above")
+        .expect_err("Export to read-only directory should fail")
         .to_string()
         .to_lowercase();
     // Error message may vary by platform but should indicate write failure

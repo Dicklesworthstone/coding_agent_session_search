@@ -497,9 +497,9 @@ fn insert_redacted_swarm_entry(
     }
 }
 
-/// Apply the canonical ingestion-time secret policy before the swarm-specific
-/// path, identity, and PII policy. Swarm output includes live operational data
-/// that did not necessarily pass through ingestion, so relying on the latter
+/// Apply the swarm-specific path, identity, and PII policy before the canonical
+/// ingestion-time secret floor. Swarm output includes live operational data
+/// that did not necessarily pass through ingestion, so relying on the former
 /// privacy transforms alone would leak supported secret classes such as
 /// private-key blocks, raw JWTs, service tokens, and credential URLs.
 fn redact_swarm_scalar_with_engine(engine: &RedactionEngine, input: &str) -> RedactedString {
