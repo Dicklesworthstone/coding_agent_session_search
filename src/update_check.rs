@@ -7,6 +7,7 @@
 //! - Hourly check cadence (configurable)
 
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -58,18 +59,7 @@ impl UpdateState {
     /// Load state from disk (synchronous)
     pub fn load() -> Self {
         let path = state_path();
-        match std::fs::read_to_string(&path) {
-            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-            Err(_) => {
-                let legacy = legacy_state_path();
-                if legacy != path
-                    && let Ok(content) = std::fs::read_to_string(&legacy)
-                {
-                    return serde_json::from_str(&content).unwrap_or_default();
-                }
-                Self::default()
-            }
-        }
+        load_update_state_from_paths(&path, &legacy_state_path())
     }
 
     /// Load state from disk (asynchronous)
@@ -92,16 +82,7 @@ impl UpdateState {
     /// Save state to disk (synchronous)
     pub fn save(&self) -> Result<()> {
         let path = state_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating update state directory {}", parent.display()))?;
-        }
-        let json = serde_json::to_string_pretty(self)?;
-        let temp_path = write_update_state_temp_file(&path, json.as_bytes())
-            .with_context(|| format!("writing temporary update state for {}", path.display()))?;
-        replace_update_state_file_from_temp(&temp_path, &path)
-            .with_context(|| format!("replacing {}", path.display()))?;
-        Ok(())
+        save_update_state_to_path(self, &path)
     }
 
     /// Save state to disk (asynchronous)
@@ -198,7 +179,7 @@ async fn check_for_updates_async_impl(current_version: &str, force: bool) -> Opt
         return None;
     }
 
-    let mut state = UpdateState::load_async().await;
+    let state = UpdateState::load_async().await;
 
     // Respect check interval
     if !force && !state.should_check() {
@@ -214,19 +195,25 @@ async fn check_for_updates_async_impl(current_version: &str, force: bool) -> Opt
         }
     };
 
-    let info = build_update_info(current_version, release, &state);
-
     // Persist cadence after any *successful fetch* — including when the
     // release metadata is unusable (non-semver tag, untrusted URL) — so a
     // bad upstream release cannot bypass the hourly throttle and turn every
     // startup into a fresh network request. Transient network errors above
     // still skip persistence so they do not suppress future checks.
-    state.mark_checked();
-    if let Err(e) = state.save_async().await {
-        warn!("update check: failed to save state: {e}");
-    }
+    let current_state =
+        match asupersync::runtime::spawn_blocking(mark_update_check_complete).await {
+            Ok(current_state) => current_state,
+            Err(e) => {
+                warn!("update check: failed to save state: {e}");
+                // The state loaded before the network request may now be stale
+                // (for example, the user may have skipped this version while
+                // the request was in flight). Even when cadence persistence
+                // fails, use the freshest readable preference for the banner.
+                UpdateState::load_async().await
+            }
+        };
 
-    info
+    build_update_info(current_version, release, &current_state)
 }
 
 /// Force a check regardless of interval (for manual refresh)
@@ -236,9 +223,8 @@ pub async fn force_check(current_version: &str) -> Option<UpdateInfo> {
 
 /// Skip the specified version
 pub fn skip_version(version: &str) -> Result<()> {
-    let mut state = UpdateState::load();
-    state.skip_version(version);
-    state.save()
+    mutate_persisted_update_state(|state| state.skip_version(version))?;
+    Ok(())
 }
 
 /// Open a URL in the system's default browser
@@ -607,6 +593,30 @@ fn legacy_state_path() -> PathBuf {
     )
 }
 
+fn load_update_state_from_paths(path: &Path, legacy_path: &Path) -> UpdateState {
+    match std::fs::read_to_string(path) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Err(_) if legacy_path != path => std::fs::read_to_string(legacy_path)
+            .ok()
+            .and_then(|content| serde_json::from_str(&content).ok())
+            .unwrap_or_default(),
+        Err(_) => UpdateState::default(),
+    }
+}
+
+fn save_update_state_to_path(state: &UpdateState, path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating update state directory {}", parent.display()))?;
+    }
+    let json = serde_json::to_string_pretty(state).context("serializing update state")?;
+    let temp_path = write_update_state_temp_file(path, json.as_bytes())
+        .with_context(|| format!("writing temporary update state for {}", path.display()))?;
+    replace_update_state_file_from_temp(&temp_path, path)
+        .with_context(|| format!("replacing {}", path.display()))?;
+    Ok(())
+}
+
 fn write_update_state_temp_file(path: &Path, contents: &[u8]) -> std::io::Result<PathBuf> {
     for _ in 0..100 {
         let temp_path = unique_update_state_temp_path(path);
@@ -791,6 +801,55 @@ fn unique_update_state_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     ))
 }
 
+fn update_state_lock_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("update_state.json");
+    path.with_file_name(format!(".{file_name}.lock"))
+}
+
+/// Serialize the complete read-modify-write operation so a background update
+/// check cannot overwrite a concurrently persisted skip choice (and a skip
+/// write cannot regress the check cadence timestamp).
+fn mutate_persisted_update_state(
+    mutate: impl FnOnce(&mut UpdateState),
+) -> Result<UpdateState> {
+    let path = state_path();
+    mutate_persisted_update_state_at(&path, &legacy_state_path(), mutate)
+}
+
+fn mutate_persisted_update_state_at(
+    path: &Path,
+    legacy_path: &Path,
+    mutate: impl FnOnce(&mut UpdateState),
+) -> Result<UpdateState> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating update state directory {}", parent.display()))?;
+    }
+
+    let lock_path = update_state_lock_path(path);
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("opening update state lock {}", lock_path.display()))?;
+    lock_file
+        .lock_exclusive()
+        .with_context(|| format!("locking update state {}", lock_path.display()))?;
+
+    let mut state = load_update_state_from_paths(path, legacy_path);
+    mutate(&mut state);
+    save_update_state_to_path(&state, path)?;
+    Ok(state)
+}
+
+fn mark_update_check_complete() -> Result<UpdateState> {
+    mutate_persisted_update_state(UpdateState::mark_checked)
+}
+
 /// Current unix timestamp
 fn now_unix() -> i64 {
     i64::try_from(
@@ -813,7 +872,7 @@ pub fn check_for_updates_sync(current_version: &str) -> Option<UpdateInfo> {
         return None;
     }
 
-    let mut state = UpdateState::load();
+    let state = UpdateState::load();
 
     // Respect check interval
     if !state.should_check() {
@@ -830,19 +889,22 @@ pub fn check_for_updates_sync(current_version: &str) -> Option<UpdateInfo> {
         }
     };
 
-    let info = build_update_info(current_version, release, &state);
-
     // Persist cadence after any *successful fetch* — including when the
     // release metadata is unusable (non-semver tag, untrusted URL) — so a
     // bad upstream release cannot bypass the hourly throttle and turn every
     // startup into a fresh network request. Transient network errors above
     // still skip persistence so they do not suppress future checks.
-    state.mark_checked();
-    if let Err(e) = state.save() {
-        warn!("update check: failed to save state: {e}");
-    }
+    let current_state = match mark_update_check_complete() {
+        Ok(current_state) => current_state,
+        Err(e) => {
+            warn!("update check: failed to save state: {e}");
+            // Preserve any preference written while the request was in flight,
+            // even though this check could not persist its cadence timestamp.
+            UpdateState::load()
+        }
+    };
 
-    info
+    build_update_info(current_version, release, &current_state)
 }
 
 fn build_update_info(
@@ -1298,6 +1360,34 @@ mod tests {
             "successive sidecar names should differ",
         );
         Ok(())
+    }
+
+    #[test]
+    fn locked_state_mutations_preserve_independent_fields() {
+        let temp_dir = tempfile::TempDir::new().expect("temporary update state directory");
+        let path = temp_dir.path().join("update_state.json");
+
+        let initial = UpdateState {
+            last_check_ts: 17,
+            skipped_version: Some("1.2.3".to_string()),
+        };
+        save_update_state_to_path(&initial, &path).expect("seed update state");
+
+        let checked = mutate_persisted_update_state_at(
+            &path,
+            &path,
+            UpdateState::mark_checked,
+        )
+        .expect("persist check cadence");
+        assert!(checked.last_check_ts > 17);
+        assert_eq!(checked.skipped_version.as_deref(), Some("1.2.3"));
+
+        let check_timestamp = checked.last_check_ts;
+        mutate_persisted_update_state_at(&path, &path, |state| state.skip_version("2.0.0"))
+            .expect("persist skipped version");
+        let skipped = load_update_state_from_paths(&path, &path);
+        assert_eq!(skipped.last_check_ts, check_timestamp);
+        assert_eq!(skipped.skipped_version.as_deref(), Some("2.0.0"));
     }
 
     #[test]
