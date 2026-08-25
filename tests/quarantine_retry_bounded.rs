@@ -217,6 +217,123 @@ fn bounded_budget_drains_eligible_backlog_across_resumes_each_attempted_once() -
 }
 
 #[test]
+fn cli_list_and_clear_include_poison_only_quarantine_records() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let data_dir = dir.path().join("data");
+    let quarantine_dir = data_dir.join("quarantine");
+    fs::create_dir_all(&quarantine_dir)?;
+    let poison_path = quarantine_dir.join("index_ingest_poison.jsonl");
+    fs::write(
+        &poison_path,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "conversation_id": "poison-only",
+                "schema_version_at_quarantine": 1,
+                "first_quarantined_at_ms": 1_700_000_000_000_i64,
+                "last_attempt_at_ms": 1_700_000_001_000_i64,
+                "attempt_count": 3,
+                "cass_version_at_quarantine": "0.0.1-old",
+                "reason": "index-ingest-out-of-memory",
+            })
+        ),
+    )?;
+    ensure!(
+        QuarantineState::load(&data_dir).is_empty(),
+        "fixture must exercise a poison-ledger-only key"
+    );
+
+    let data_dir_arg = data_dir.to_str().context("UTF-8 data dir")?;
+    let run = |label: &str, args: &[&str]| {
+        let mut command = Command::new(cargo_bin("cass"));
+        command
+            .args(args)
+            .current_dir(dir.path())
+            .env("HOME", dir.path())
+            .env("XDG_DATA_HOME", dir.path().join("xdg-data"))
+            .env("XDG_CONFIG_HOME", dir.path().join("xdg-config"))
+            .env("XDG_CACHE_HOME", dir.path().join("xdg-cache"))
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("NO_COLOR", "1")
+            .env_remove("CLAUDE_CONFIG_DIR");
+        spawn_with_timeout_or_diag(command, label, Some(&data_dir), COMMAND_TIMEOUT)
+    };
+
+    let listed = run(
+        "quarantine-list-poison-only",
+        &["quarantine", "list", "--data-dir", data_dir_arg, "--json"],
+    );
+    ensure!(
+        listed.status.success(),
+        "poison-only list stderr: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let listed_json: serde_json::Value = serde_json::from_slice(&listed.stdout)?;
+    ensure!(
+        listed_json["quarantined_conversations"] == 1,
+        "list must include the poison-only key"
+    );
+    ensure!(
+        listed_json["entries"][0]["conversation_id"] == "poison-only",
+        "list must identify the poison-only key"
+    );
+
+    let dry = run(
+        "quarantine-clear-poison-only-dry-run",
+        &["quarantine", "clear", "--data-dir", data_dir_arg, "--json"],
+    );
+    ensure!(
+        dry.status.success(),
+        "poison-only clear dry-run stderr: {}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    let dry_json: serde_json::Value = serde_json::from_slice(&dry.stdout)?;
+    ensure!(dry_json["matched"] == 1, "dry-run must match poison-only key");
+    ensure!(dry_json["cleared"] == 0, "dry-run must not clear the key");
+    ensure!(
+        fs::read_to_string(&poison_path)?.contains("poison-only"),
+        "dry-run must leave the poison ledger unchanged"
+    );
+
+    let applied = run(
+        "quarantine-clear-poison-only-apply",
+        &[
+            "quarantine",
+            "clear",
+            "--data-dir",
+            data_dir_arg,
+            "--apply",
+            "--json",
+        ],
+    );
+    ensure!(
+        applied.status.success(),
+        "poison-only clear apply stderr: {}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let applied_json: serde_json::Value = serde_json::from_slice(&applied.stdout)?;
+    ensure!(applied_json["matched"] == 1, "apply must match one key");
+    ensure!(applied_json["cleared"] == 1, "apply must clear one key");
+    ensure!(
+        fs::read_to_string(&poison_path)?.is_empty(),
+        "apply must clear the poison-only ledger record"
+    );
+
+    let after = run(
+        "quarantine-list-after-poison-only-clear",
+        &["quarantine", "list", "--data-dir", data_dir_arg, "--json"],
+    );
+    ensure!(after.status.success(), "post-clear list must succeed");
+    let after_json: serde_json::Value = serde_json::from_slice(&after.stdout)?;
+    ensure!(
+        after_json["quarantined_conversations"] == 0,
+        "post-clear list must agree that the quarantine is empty"
+    );
+    Ok(())
+}
+
+#[test]
 fn cli_dry_run_plans_then_apply_reingests_exact_quarantine_key() -> anyhow::Result<()> {
     let dir = tempdir()?;
     let data_dir = dir.path().join("data");

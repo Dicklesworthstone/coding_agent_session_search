@@ -8684,13 +8684,21 @@ fn quarantine_entries_json(data_dir: &Path) -> anyhow::Result<Vec<serde_json::Va
             let first_attempt_at = record
                 .get("first_quarantined_at_ms")
                 .and_then(serde_json::Value::as_i64)
-                .or_else(|| record.get("recorded_at_ms").and_then(serde_json::Value::as_i64))
+                .or_else(|| {
+                    record
+                        .get("recorded_at_ms")
+                        .and_then(serde_json::Value::as_i64)
+                })
                 .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
                 .map(|timestamp| timestamp.to_rfc3339());
             let last_attempt_at = record
                 .get("last_attempt_at_ms")
                 .and_then(serde_json::Value::as_i64)
-                .or_else(|| record.get("recorded_at_ms").and_then(serde_json::Value::as_i64))
+                .or_else(|| {
+                    record
+                        .get("recorded_at_ms")
+                        .and_then(serde_json::Value::as_i64)
+                })
                 .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
                 .map(|timestamp| timestamp.to_rfc3339());
             let cass_version = record
@@ -8699,8 +8707,14 @@ fn quarantine_entries_json(data_dir: &Path) -> anyhow::Result<Vec<serde_json::Va
             serde_json::json!({
                 "conversation_id": identity.0,
                 "schema_version": identity.1,
-                "attempt_count": record.get("attempt_count").and_then(serde_json::Value::as_u64).unwrap_or(1),
-                "last_reason": record.get("reason").and_then(serde_json::Value::as_str).unwrap_or("ingest-out-of-memory"),
+                "attempt_count": record
+                    .get("attempt_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(1),
+                "last_reason": record
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("ingest-out-of-memory"),
                 "first_attempt_at": first_attempt_at,
                 "last_attempt_at": last_attempt_at,
                 "cass_version_at_quarantine": cass_version,
@@ -8828,7 +8842,10 @@ fn run_quarantine_clear(
         let original_state = state.clone();
         for (conversation_id, schema_version) in &matched {
             if let Ok(schema_version) = u32::try_from(*schema_version) {
-                state.clear(&QuarantineKey::new(conversation_id, schema_version));
+                state.clear(&QuarantineKey::new(
+                    conversation_id.clone(),
+                    schema_version,
+                ));
             }
         }
         state
@@ -8921,8 +8938,8 @@ fn run_quarantine_clear(
         return Ok(());
     }
     println!("Matching entries: {}", matched.len());
-    for key in matched.iter().take(20) {
-        println!("  {} (schema v{})", key.conversation_id, key.schema_version);
+    for (conversation_id, schema_version) in matched.iter().take(20) {
+        println!("  {conversation_id} (schema v{schema_version})");
     }
     if matched.len() > 20 {
         println!("  ... and {} more", matched.len() - 20);

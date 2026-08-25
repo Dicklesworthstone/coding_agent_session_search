@@ -23356,8 +23356,9 @@ pub(crate) fn operator_quarantine_poison_records(
             Ok(contents) => contents,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("reading ingest quarantine file {}", path.display()));
+                return Err(err).with_context(|| {
+                    format!("reading ingest quarantine file {}", path.display())
+                });
             }
         };
         for line in contents.lines() {
@@ -41711,6 +41712,11 @@ mod tests {
             )?;
         }
 
+        let operator_records = operator_quarantine_poison_records(&data_dir)?;
+        assert_eq!(operator_records.len(), 2);
+        assert!(operator_records.contains_key(&("selected".to_string(), 1)));
+        assert!(operator_records.contains_key(&("retained".to_string(), 1)));
+
         let selected = BTreeSet::from([("selected".to_string(), 1_i64)]);
         assert_eq!(
             clear_operator_quarantine_poison_records(&data_dir, &selected)?,
@@ -41723,6 +41729,15 @@ mod tests {
             assert!(!contents.contains("selected"));
             assert!(contents.contains("retained"));
         }
+        let sidecars = std::fs::read_dir(&quarantine_dir)?
+            .filter_map(std::result::Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.contains(".tmp."))
+            .collect::<Vec<_>>();
+        assert!(
+            sidecars.is_empty(),
+            "successful atomic poison-ledger rewrites left temp files: {sidecars:?}"
+        );
         Ok(())
     }
 
