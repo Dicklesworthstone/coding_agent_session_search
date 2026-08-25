@@ -23350,6 +23350,7 @@ pub(crate) fn operator_quarantine_poison_records(
 ) -> Result<BTreeMap<(String, i64), serde_json::Value>> {
     let quarantine_dir = data_dir.join("quarantine");
     let mut records = BTreeMap::new();
+    let current_version = current_cass_version();
     for file_name in [WATCH_INGEST_POISON_FILE, INDEX_INGEST_POISON_FILE] {
         let path = quarantine_dir.join(file_name);
         let contents = match fs::read_to_string(&path) {
@@ -23366,7 +23367,42 @@ pub(crate) fn operator_quarantine_poison_records(
                 continue;
             };
             if let Some(key) = poison_record_key_from_value(&value) {
-                records.insert(key, value);
+                match records.entry(key) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(value);
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        let existing = entry.get();
+                        let existing_is_current =
+                            poison_record_cass_version(existing) == Some(current_version);
+                        let candidate_is_current =
+                            poison_record_cass_version(&value) == Some(current_version);
+                        let existing_last_attempt = existing
+                            .get("last_attempt_at_ms")
+                            .and_then(serde_json::Value::as_i64)
+                            .or_else(|| {
+                                existing
+                                    .get("recorded_at_ms")
+                                    .and_then(serde_json::Value::as_i64)
+                            })
+                            .unwrap_or(i64::MIN);
+                        let candidate_last_attempt = value
+                            .get("last_attempt_at_ms")
+                            .and_then(serde_json::Value::as_i64)
+                            .or_else(|| {
+                                value
+                                    .get("recorded_at_ms")
+                                    .and_then(serde_json::Value::as_i64)
+                            })
+                            .unwrap_or(i64::MIN);
+                        if (candidate_is_current && !existing_is_current)
+                            || (candidate_is_current == existing_is_current
+                                && candidate_last_attempt > existing_last_attempt)
+                        {
+                            entry.insert(value);
+                        }
+                    }
+                }
             }
         }
     }
@@ -41702,6 +41738,16 @@ mod tests {
                         "conversation_id": "selected",
                         "schema_version_at_quarantine": 1,
                         "reason": reason,
+                        "cass_version_at_quarantine": if file_name == WATCH_INGEST_POISON_FILE {
+                            current_cass_version()
+                        } else {
+                            "0.0.1-old"
+                        },
+                        "last_attempt_at_ms": if file_name == WATCH_INGEST_POISON_FILE {
+                            10
+                        } else {
+                            20
+                        },
                     }),
                     serde_json::json!({
                         "conversation_id": "retained",
@@ -41716,6 +41762,13 @@ mod tests {
         assert_eq!(operator_records.len(), 2);
         assert!(operator_records.contains_key(&("selected".to_string(), 1)));
         assert!(operator_records.contains_key(&("retained".to_string(), 1)));
+        assert_eq!(
+            operator_records
+                .get(&("selected".to_string(), 1))
+                .and_then(poison_record_cass_version),
+            Some(current_cass_version()),
+            "current-version evidence must win over a newer stale mirror"
+        );
 
         let selected = BTreeSet::from([("selected".to_string(), 1_i64)]);
         assert_eq!(
