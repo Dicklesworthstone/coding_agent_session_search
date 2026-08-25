@@ -48,7 +48,7 @@ fn updates_disabled() -> bool {
 
 /// Persistent state for update checker
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct UpdateState {
+struct UpdateState {
     /// Unix timestamp of last successful check
     pub last_check_ts: i64,
     /// Version string that user chose to skip (e.g., "0.2.0")
@@ -57,13 +57,13 @@ pub struct UpdateState {
 
 impl UpdateState {
     /// Load state from disk (synchronous)
-    pub fn load() -> Self {
+    fn load() -> Self {
         let path = state_path();
         load_update_state_from_paths(&path, &legacy_state_path())
     }
 
     /// Load state from disk (asynchronous)
-    pub async fn load_async() -> Self {
+    async fn load_async() -> Self {
         let path = state_path();
         match asupersync::fs::read_to_string(&path).await {
             Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
@@ -80,13 +80,15 @@ impl UpdateState {
     }
 
     /// Save state to disk (synchronous)
-    pub fn save(&self) -> Result<()> {
+    #[cfg(test)]
+    fn save(&self) -> Result<()> {
         let path = state_path();
         save_update_state_to_path(self, &path)
     }
 
     /// Save state to disk (asynchronous)
-    pub async fn save_async(&self) -> Result<()> {
+    #[cfg(test)]
+    async fn save_async(&self) -> Result<()> {
         let path = state_path();
         if let Some(parent) = path.parent() {
             asupersync::fs::create_dir_all(parent)
@@ -103,7 +105,7 @@ impl UpdateState {
     }
 
     /// Check if enough time has passed since last check
-    pub fn should_check(&self) -> bool {
+    fn should_check(&self) -> bool {
         let now = now_unix();
         if self.last_check_ts <= 0 || self.last_check_ts > now {
             return true;
@@ -112,17 +114,17 @@ impl UpdateState {
     }
 
     /// Mark that we just checked
-    pub fn mark_checked(&mut self) {
+    fn mark_checked(&mut self) {
         self.last_check_ts = now_unix();
     }
 
     /// Skip a specific version
-    pub fn skip_version(&mut self, version: &str) {
+    fn skip_version(&mut self, version: &str) {
         self.skipped_version = Some(version.to_string());
     }
 
     /// Check if a version is skipped
-    pub fn is_skipped(&self, version: &str) -> bool {
+    fn is_skipped(&self, version: &str) -> bool {
         self.skipped_version.as_deref() == Some(version)
     }
 
@@ -647,6 +649,7 @@ fn write_update_state_temp_file_at(path: &Path, contents: &[u8]) -> std::io::Res
     file.sync_all()
 }
 
+#[cfg(test)]
 async fn write_update_state_temp_file_async(
     path: &Path,
     contents: &[u8],
@@ -669,6 +672,7 @@ async fn write_update_state_temp_file_async(
     ))
 }
 
+#[cfg(test)]
 async fn write_update_state_temp_file_at_async(
     path: &Path,
     contents: &[u8],
