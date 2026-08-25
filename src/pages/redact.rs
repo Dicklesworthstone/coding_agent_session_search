@@ -456,12 +456,19 @@ pub fn redact_swarm_text(input: &str) -> String {
 
 pub fn redact_swarm_json_value(value: &Value) -> Value {
     let engine = RedactionEngine::new(swarm_evidence_redaction_config());
-    // Structured credentials are frequently split across an object key and a
-    // bare value, so scalar-by-scalar text redaction cannot see the assignment
-    // context. Apply the canonical key-aware JSON policy first, then layer the
-    // swarm-specific path, host, and PII policy over the safe structure.
-    let secret_redacted = crate::indexer::redact_secrets::redact_json(value);
-    redact_swarm_json_value_with_engine(&engine, &secret_redacted)
+    // Order mirrors the scalar path (gh#419): swarm-specific patterns first so
+    // an inline assignment inside a string scalar -- `command`, `argv`, an
+    // evidence line -- keeps its precise marker instead of collapsing to the
+    // floor's generic "[REDACTED]".
+    //
+    // The canonical key-aware JSON policy still runs, just second, because it
+    // covers a case the scalar pass structurally cannot: credentials split
+    // across an object key and a bare value, where the value alone
+    // ("hunter2") matches no assignment pattern and only the key says it is a
+    // secret. Running it last keeps that guarantee while letting the specific
+    // rules label what they can actually see.
+    let swarm_redacted = redact_swarm_json_value_with_engine(&engine, value);
+    crate::indexer::redact_secrets::redact_json(&swarm_redacted)
 }
 
 fn insert_redacted_swarm_entry(
