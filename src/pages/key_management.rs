@@ -187,7 +187,31 @@ fn derive_key_mutation_target(requested_path: &Path) -> Result<KeyMutationTarget
                 requested_path.display()
             )
         })?;
-        (parent.to_path_buf(), PathBuf::from("site"))
+        let parent_private = parent.join("private");
+        let parent_journal = key_mutation_sidecar_path(
+            parent,
+            ".pages-key-mutation-in-progress.json",
+        );
+        let parent_lock = key_mutation_sidecar_path(parent, ".pages-publication.lock");
+        let parent_is_publication_root = [&parent_private, &parent_journal, &parent_lock]
+            .into_iter()
+            .try_fold(false, |found, path| {
+                match std::fs::symlink_metadata(path) {
+                    Ok(_) => Ok(true),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(found),
+                    Err(error) => Err(error).with_context(|| {
+                        format!(
+                            "failed inspecting Pages publication marker {}",
+                            path.display()
+                        )
+                    }),
+                }
+            })?;
+        if parent_is_publication_root {
+            (parent.to_path_buf(), PathBuf::from("site"))
+        } else {
+            (requested_path.to_path_buf(), PathBuf::new())
+        }
     } else {
         match std::fs::symlink_metadata(requested_path.join("site")) {
             Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
@@ -3137,6 +3161,23 @@ mod tests {
             std::fs::read(archive_dir.join("site/config.json"))? == config_before,
             "bundle/key lock contention changed the live key configuration"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn key_mutation_of_standalone_directory_named_site_preserves_its_siblings() -> Result<()> {
+        let (temp_dir, archive_dir) = setup_test_archive();
+        let standalone_parent = temp_dir.path().join("standalone-parent");
+        let standalone_site = standalone_parent.join("site");
+        std::fs::create_dir(&standalone_parent)?;
+        std::fs::rename(archive_dir.join("site"), &standalone_site)?;
+        let sibling = standalone_parent.join("unrelated.txt");
+        std::fs::write(&sibling, b"unrelated")?;
+
+        key_add_password(&standalone_site, "test-password", "new-password")?;
+
+        anyhow::ensure!(std::fs::read(&sibling)? == b"unrelated");
+        anyhow::ensure!(key_list(&standalone_site)?.active_slots == 2);
         Ok(())
     }
 

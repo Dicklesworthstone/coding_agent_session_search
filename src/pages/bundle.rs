@@ -1915,30 +1915,30 @@ fn replace_dir_from_temp_via_recoverable_rename_pair(
         Err(publish_error) => {
             require_pages_publication_lock(final_dir, guard)?;
             match fs::rename(backup_dir, final_dir) {
-            Ok(()) => {
-                ensure_bundle_tree_matches(final_dir, "restored prior Pages bundle", prior)?;
-                sync_parent_directory(final_dir)?;
-                Err(publish_error).with_context(|| {
-                    format!(
-                        "failed publishing staged bundle {} at {}; restored the prior live bundle",
+                Ok(()) => {
+                    ensure_bundle_tree_matches(final_dir, "restored prior Pages bundle", prior)?;
+                    sync_parent_directory(final_dir)?;
+                    Err(publish_error).with_context(|| {
+                        format!(
+                            "failed publishing staged bundle {} at {}; restored the prior live bundle",
+                            temp_dir.display(),
+                            final_dir.display()
+                        )
+                    })
+                }
+                Err(restore_error) => {
+                    *retain_temp_on_error = true;
+                    bail!(
+                        "failed publishing staged bundle {} at {}: {}; restore also failed: {}; prior bundle retained at {} and staged bundle retained at {}",
                         temp_dir.display(),
-                        final_dir.display()
-                    )
-                })
+                        final_dir.display(),
+                        publish_error,
+                        restore_error,
+                        backup_dir.display(),
+                        temp_dir.display()
+                    );
+                }
             }
-            Err(restore_error) => {
-                *retain_temp_on_error = true;
-                bail!(
-                    "failed publishing staged bundle {} at {}: {}; restore also failed: {}; prior bundle retained at {} and staged bundle retained at {}",
-                    temp_dir.display(),
-                    final_dir.display(),
-                    publish_error,
-                    restore_error,
-                    backup_dir.display(),
-                    temp_dir.display()
-                );
-            }
-        }
         }
     }
 }
@@ -3981,7 +3981,13 @@ mod tests {
 
         let guard = acquire_pages_publication_lock(&final_dir).unwrap();
         let mut retain_temp_on_error = false;
-        replace_dir_from_temp(&staged_dir, &final_dir, &guard, &mut retain_temp_on_error).unwrap();
+        replace_dir_from_temp(
+            &staged_dir,
+            &final_dir,
+            &guard,
+            &mut retain_temp_on_error,
+        )
+        .unwrap();
 
         assert!(!staged_dir.exists());
         assert!(final_dir.join("site/new.txt").exists());
@@ -4009,7 +4015,13 @@ mod tests {
 
         let guard = acquire_pages_publication_lock(&final_dir).unwrap();
         let mut retain_temp_on_error = false;
-        replace_dir_from_temp(&staged_dir, &final_dir, &guard, &mut retain_temp_on_error).unwrap();
+        replace_dir_from_temp(
+            &staged_dir,
+            &final_dir,
+            &guard,
+            &mut retain_temp_on_error,
+        )
+        .unwrap();
 
         assert!(!retain_temp_on_error);
         assert!(!staged_dir.exists());
