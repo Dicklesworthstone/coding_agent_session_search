@@ -19,9 +19,6 @@ use std::path::{Path, PathBuf};
 use super::archive_config::{ArchiveConfig, UnencryptedConfig};
 use super::docs::{DocLocation, GeneratedDoc};
 use super::encrypt::{EncryptionConfig, validate_supported_payload_format};
-use super::key_management::{
-    PagesPublicationLockGuard, acquire_pages_publication_lock, require_pages_publication_lock,
-};
 
 /// Files embedded from pages_assets at compile time
 const PAGES_ASSETS: &[(&str, &[u8])] = &[
@@ -188,10 +185,11 @@ struct BundlePublishJournal {
     candidate_sha256: String,
 }
 
-struct BundleStagingOwnership {
-    path: PathBuf,
-    identity: crate::franken_sync::FileIdentity,
-    handle: File,
+struct BundlePublishGuard {
+    final_dir: PathBuf,
+    lock_path: PathBuf,
+    lock_identity: crate::franken_sync::FileIdentity,
+    lock_file: File,
 }
 
 /// Integrity entry for a single file
@@ -330,11 +328,10 @@ impl BundleBuilder {
         let encrypted_dir = encrypted_dir.as_ref();
         let output_dir = output_dir.as_ref();
 
-        // Serialize the full build with key mutations and heal any interrupted
-        // publish before staging, so a parked prior generation returns to the
-        // live handle before the next candidate is derived.
-        let publication_guard = acquire_pages_publication_lock(output_dir)?;
-        recover_interrupted_bundle_publish_while_locked(output_dir, &publication_guard)?;
+        // Heal an interrupted fallback publish before doing potentially long
+        // archive validation/copying work, so a parked prior generation is
+        // returned to the live handle as soon as the next build starts.
+        recover_interrupted_bundle_publish(output_dir)?;
         ensure_replaceable_bundle_output_dir(output_dir)?;
 
         // Validate encrypted_dir has required files
@@ -370,12 +367,11 @@ impl BundleBuilder {
         let final_site_dir = output_dir.join("site");
         let final_private_dir = output_dir.join("private");
         let mut retain_temp_on_replace_error = false;
-        let mut staging_ownership = None;
         let result = (|| -> Result<BundleResult> {
             progress("setup", "Creating directory structure...");
 
             // Stage the bundle under a unique temp root so reruns do not retain stale files.
-            staging_ownership = Some(create_bundle_staging_root(&temp_output_dir)?);
+            create_bundle_staging_root(&temp_output_dir)?;
             let site_dir = temp_output_dir.join("site");
             let private_dir = temp_output_dir.join("private");
 
@@ -528,7 +524,6 @@ impl BundleBuilder {
             replace_dir_from_temp(
                 &temp_output_dir,
                 output_dir,
-                &publication_guard,
                 &mut retain_temp_on_replace_error,
             )
             .context("Failed to install completed bundle")?;
@@ -547,15 +542,7 @@ impl BundleBuilder {
 
         match result {
             Err(build_error) if !retain_temp_on_replace_error => {
-                let Some(staging_ownership) = staging_ownership.as_ref() else {
-                    return Err(build_error);
-                };
-                match cleanup_rejected_bundle_temp(
-                    &temp_output_dir,
-                    output_dir,
-                    &publication_guard,
-                    staging_ownership,
-                ) {
+                match cleanup_rejected_bundle_temp(&temp_output_dir) {
                     Ok(()) => Err(build_error),
                     Err(cleanup_error) => Err(build_error.context(format!(
                         "failed to remove rejected staged bundle: {cleanup_error:#}"
@@ -567,7 +554,7 @@ impl BundleBuilder {
     }
 }
 
-fn create_bundle_staging_root(path: &Path) -> Result<BundleStagingOwnership> {
+fn create_bundle_staging_root(path: &Path) -> Result<()> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -595,59 +582,7 @@ fn create_bundle_staging_root(path: &Path) -> Result<BundleStagingOwnership> {
         fs::create_dir(path)
             .with_context(|| format!("failed creating bundle staging root {}", path.display()))?;
     }
-    let handle = File::open(path).with_context(|| {
-        format!(
-            "filesystem cannot hold a stable directory handle for bundle staging root {}; preserved it without recursive cleanup",
-            path.display()
-        )
-    })?;
-    let metadata = handle
-        .metadata()
-        .with_context(|| format!("failed inspecting bundle staging root {}", path.display()))?;
-    if !metadata.file_type().is_dir() {
-        bail!(
-            "newly created bundle staging root is not a directory: {}",
-            path.display()
-        );
-    }
-    let identity = crate::franken_sync::FileIdentity::from_file(&handle)
-        .with_context(|| format!("failed identifying bundle staging root {}", path.display()))?
-        .ok_or_else(|| {
-            anyhow!(
-                "filesystem does not expose a stable identity for bundle staging root {}",
-                path.display()
-            )
-        })?;
-    let path_probe = File::open(path).with_context(|| {
-        format!(
-            "failed re-opening newly created bundle staging root {}",
-            path.display()
-        )
-    })?;
-    let path_identity = crate::franken_sync::FileIdentity::from_file(&path_probe)
-        .with_context(|| {
-            format!(
-                "failed re-identifying newly created bundle staging root {}",
-                path.display()
-            )
-        })?
-        .ok_or_else(|| {
-            anyhow!(
-                "filesystem stopped exposing a stable pathname identity for bundle staging root {}",
-                path.display()
-            )
-        })?;
-    if path_identity != identity {
-        bail!(
-            "bundle staging root changed identity during exclusive creation; preserved it without cleanup: {}",
-            path.display()
-        );
-    }
-    Ok(BundleStagingOwnership {
-        path: path.to_path_buf(),
-        identity,
-        handle,
-    })
+    Ok(())
 }
 
 fn prepare_bundle_root_for_publish(path: &Path) -> Result<()> {
@@ -663,17 +598,7 @@ fn prepare_bundle_root_for_publish(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cleanup_rejected_bundle_temp(
-    path: &Path,
-    final_dir: &Path,
-    guard: &PagesPublicationLockGuard,
-    ownership: &BundleStagingOwnership,
-) -> Result<()> {
-    require_pages_publication_lock(final_dir, guard)?;
-    validate_owned_bundle_staging_path(final_dir, path)?;
-    require_bundle_staging_identity(path, ownership)?;
-    require_pages_publication_lock(final_dir, guard)?;
-    require_bundle_staging_identity(path, ownership)?;
+fn cleanup_rejected_bundle_temp(path: &Path) -> Result<()> {
     match fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -681,111 +606,6 @@ fn cleanup_rejected_bundle_temp(
             Err(error).with_context(|| format!("failed removing staged bundle {}", path.display()))
         }
     }
-}
-
-fn require_bundle_staging_identity(
-    path: &Path,
-    ownership: &BundleStagingOwnership,
-) -> Result<()> {
-    if ownership.path != path {
-        bail!(
-            "Pages bundle staging ownership for {} cannot authorize cleanup of {}",
-            ownership.path.display(),
-            path.display()
-        );
-    }
-    let held = crate::franken_sync::FileIdentity::from_file(&ownership.handle)
-        .context("failed re-identifying held Pages bundle staging-root handle")?
-        .ok_or_else(|| {
-            anyhow!(
-                "filesystem stopped exposing the held identity for Pages bundle staging root {}",
-                path.display()
-            )
-        })?;
-    if held != ownership.identity {
-        bail!(
-            "held Pages bundle staging-root identity changed before cleanup: {}",
-            path.display()
-        );
-    }
-    let metadata = fs::symlink_metadata(path).with_context(|| {
-        format!(
-            "failed re-inspecting owned Pages bundle staging root {}",
-            path.display()
-        )
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-        bail!(
-            "owned Pages bundle staging root changed file type before cleanup: {}",
-            path.display()
-        );
-    }
-    let probe = File::open(path).with_context(|| {
-        format!(
-            "failed opening owned Pages bundle staging root before cleanup: {}",
-            path.display()
-        )
-    })?;
-    let observed = crate::franken_sync::FileIdentity::from_file(&probe)
-        .with_context(|| {
-            format!(
-                "failed re-identifying owned Pages bundle staging root {}",
-                path.display()
-            )
-        })?
-        .ok_or_else(|| {
-            anyhow!(
-                "filesystem stopped exposing a stable identity for owned Pages bundle staging root {}",
-                path.display()
-            )
-        })?;
-    if observed != ownership.identity {
-        bail!(
-            "owned Pages bundle staging root changed identity before cleanup; preserved it without mutation: {}",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-fn validate_owned_bundle_staging_path(final_dir: &Path, staging_dir: &Path) -> Result<()> {
-    if staging_dir.parent() != final_dir.parent() {
-        bail!(
-            "refusing to remove a Pages bundle staging path outside the live root's direct parent: {}",
-            staging_dir.display()
-        );
-    }
-    let live_name = final_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("pages_bundle");
-    let staging_name = staging_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow!("Pages bundle staging path has no UTF-8 file name"))?;
-    let prefix = format!(".{live_name}.tmp.");
-    let Some((random_nonce, counter)) = staging_name
-        .strip_prefix(&prefix)
-        .and_then(|suffix| suffix.split_once('.'))
-    else {
-        bail!(
-            "refusing to remove a path that is not an owned Pages bundle staging root: {}",
-            staging_dir.display()
-        );
-    };
-    if random_nonce.len() != 32
-        || !random_nonce
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        || counter.is_empty()
-        || !counter.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        bail!(
-            "refusing to remove a Pages bundle staging root with an invalid ownership nonce: {}",
-            staging_dir.display()
-        );
-    }
-    Ok(())
 }
 
 fn unique_bundle_dir(path: &Path, suffix: &str) -> Result<PathBuf> {
@@ -810,6 +630,175 @@ fn bundle_publish_recovery_journal_path(path: &Path) -> PathBuf {
     );
     journal_name.push(".pages-bundle-publish-in-progress.json");
     path.with_file_name(journal_name)
+}
+
+fn bundle_publish_lock_path(path: &Path) -> PathBuf {
+    let mut lock_name = std::ffi::OsString::from(".");
+    lock_name.push(
+        path.file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("pages_bundle")),
+    );
+    lock_name.push(".pages-bundle-publish.lock");
+    path.with_file_name(lock_name)
+}
+
+fn acquire_bundle_publish_guard(final_dir: &Path) -> Result<BundlePublishGuard> {
+    ensure_existing_parent_ancestors_are_real_dirs(final_dir, "bundle publish lock")?;
+    if let Some(parent) = final_dir
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed creating Pages bundle publish-lock parent {}",
+                parent.display()
+            )
+        })?;
+    }
+    let lock_path = bundle_publish_lock_path(final_dir);
+    let lock_exists = match fs::symlink_metadata(&lock_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            #[cfg(unix)]
+            if metadata.nlink() != 1 {
+                bail!(
+                    "Pages bundle publish lock {} has {} hard links; exclusive pathname ownership is not provable",
+                    lock_path.display(),
+                    metadata.nlink()
+                );
+            }
+            true
+        }
+        Ok(_) => bail!(
+            "Pages bundle publish lock is not a regular file: {}",
+            lock_path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed inspecting Pages bundle publish lock {}",
+                    lock_path.display()
+                )
+            });
+        }
+    };
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    if lock_exists {
+        options.create(false);
+    } else {
+        options.create_new(true);
+    }
+    #[cfg(unix)]
+    options.mode(0o600);
+    let lock_file = options.open(&lock_path).with_context(|| {
+        format!(
+            "failed opening Pages bundle publish lock {}",
+            lock_path.display()
+        )
+    })?;
+    let lock_identity = crate::franken_sync::FileIdentity::from_file(&lock_file)
+        .with_context(|| {
+            format!(
+                "failed identifying Pages bundle publish lock {}",
+                lock_path.display()
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow!(
+                "filesystem does not expose a stable identity for Pages bundle publish lock {}",
+                lock_path.display()
+            )
+        })?;
+    match fs2::FileExt::try_lock_exclusive(&lock_file) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => bail!(
+            "another Pages bundle publication is already active for {}; lock contention at {}",
+            final_dir.display(),
+            lock_path.display()
+        ),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed acquiring Pages bundle publish lock {}",
+                    lock_path.display()
+                )
+            });
+        }
+    }
+    let guard = BundlePublishGuard {
+        final_dir: final_dir.to_path_buf(),
+        lock_path,
+        lock_identity,
+        lock_file,
+    };
+    require_bundle_publish_guard(final_dir, &guard)?;
+    Ok(guard)
+}
+
+fn require_bundle_publish_guard(final_dir: &Path, guard: &BundlePublishGuard) -> Result<()> {
+    if guard.final_dir != final_dir {
+        bail!(
+            "Pages bundle publish guard for {} cannot authorize mutation of {}",
+            guard.final_dir.display(),
+            final_dir.display()
+        );
+    }
+    let held_identity = crate::franken_sync::FileIdentity::from_file(&guard.lock_file)
+        .context("failed re-identifying held Pages bundle publish lock")?
+        .ok_or_else(|| {
+            anyhow!(
+                "filesystem stopped exposing a stable identity for held Pages bundle publish lock {}",
+                guard.lock_path.display()
+            )
+        })?;
+    if held_identity != guard.lock_identity {
+        bail!(
+            "held Pages bundle publish lock {} changed identity",
+            guard.lock_path.display()
+        );
+    }
+    let metadata = fs::symlink_metadata(&guard.lock_path).with_context(|| {
+        format!(
+            "failed re-inspecting Pages bundle publish lock {}",
+            guard.lock_path.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "Pages bundle publish lock {} is no longer a regular file",
+            guard.lock_path.display()
+        );
+    }
+    #[cfg(unix)]
+    if metadata.nlink() != 1 {
+        bail!(
+            "Pages bundle publish lock {} has {} hard links; refused publication",
+            guard.lock_path.display(),
+            metadata.nlink()
+        );
+    }
+    let probe = File::open(&guard.lock_path).with_context(|| {
+        format!(
+            "failed re-opening Pages bundle publish lock {}",
+            guard.lock_path.display()
+        )
+    })?;
+    let path_identity = crate::franken_sync::FileIdentity::from_file(&probe)
+        .context("failed re-identifying Pages bundle publish lock pathname")?
+        .ok_or_else(|| {
+            anyhow!(
+                "filesystem stopped exposing a stable pathname identity for Pages bundle publish lock {}",
+                guard.lock_path.display()
+            )
+        })?;
+    if path_identity != guard.lock_identity {
+        bail!(
+            "Pages bundle publish lock pathname changed identity: {}",
+            guard.lock_path.display()
+        );
+    }
+    Ok(())
 }
 
 fn bundle_publish_backup_prefix(path: &Path) -> Result<String> {
@@ -921,20 +910,12 @@ fn read_bundle_publish_journal(final_dir: &Path) -> Result<Option<BundlePublishJ
         );
     }
     #[cfg(unix)]
-    {
-        if metadata.nlink() != 1 {
-            bail!(
-                "Pages bundle publish journal {} has {} hard links; preserved it because exclusive pathname ownership is not provable",
-                journal_path.display(),
-                metadata.nlink()
-            );
-        }
-        if metadata.permissions().mode() & 0o077 != 0 {
-            bail!(
-                "Pages bundle publish journal is not owner-only; preserved it without mutation: {}",
-                journal_path.display()
-            );
-        }
+    if metadata.nlink() != 1 {
+        bail!(
+            "Pages bundle publish journal {} has {} hard links; preserved it because exclusive pathname ownership is not provable",
+            journal_path.display(),
+            metadata.nlink()
+        );
     }
     if metadata.len() > BUNDLE_PUBLISH_JOURNAL_MAX_BYTES {
         bail!(
@@ -1019,19 +1000,11 @@ fn read_bundle_publish_journal(final_dir: &Path) -> Result<Option<BundlePublishJ
         );
     }
     #[cfg(unix)]
-    {
-        if observed_metadata.nlink() != 1 {
-            bail!(
-                "Pages bundle publish journal {} gained additional hard links while read; preserved it without mutation",
-                journal_path.display()
-            );
-        }
-        if observed_metadata.permissions().mode() & 0o077 != 0 {
-            bail!(
-                "Pages bundle publish journal permissions changed while read; preserved it without mutation: {}",
-                journal_path.display()
-            );
-        }
+    if observed_metadata.nlink() != 1 {
+        bail!(
+            "Pages bundle publish journal {} gained additional hard links while read; preserved it without mutation",
+            journal_path.display()
+        );
     }
 
     let journal: BundlePublishJournal = serde_json::from_slice(&bytes).with_context(|| {
@@ -1046,12 +1019,10 @@ fn read_bundle_publish_journal(final_dir: &Path) -> Result<Option<BundlePublishJ
 
 fn write_bundle_publish_journal(
     final_dir: &Path,
-    guard: &PagesPublicationLockGuard,
     backup_dir: &Path,
     prior: &BundleTreeEvidence,
     candidate: &BundleTreeEvidence,
 ) -> Result<BundlePublishJournal> {
-    require_pages_publication_lock(final_dir, guard)?;
     let backup_file_name = backup_dir
         .file_name()
         .and_then(|name| name.to_str())
@@ -1149,16 +1120,13 @@ fn write_bundle_publish_journal(
             journal_path.display()
         );
     }
-    require_pages_publication_lock(final_dir, guard)?;
     Ok(journal)
 }
 
 fn remove_bundle_publish_journal(
     final_dir: &Path,
-    guard: &PagesPublicationLockGuard,
     expected: &BundlePublishJournal,
 ) -> Result<()> {
-    require_pages_publication_lock(final_dir, guard)?;
     let journal_path = bundle_publish_recovery_journal_path(final_dir);
     let observed = read_bundle_publish_journal(final_dir)?.ok_or_else(|| {
         anyhow!(
@@ -1172,15 +1140,13 @@ fn remove_bundle_publish_journal(
             journal_path.display()
         );
     }
-    require_pages_publication_lock(final_dir, guard)?;
     fs::remove_file(&journal_path).with_context(|| {
         format!(
             "failed removing completed Pages bundle publish journal {}",
             journal_path.display()
         )
     })?;
-    sync_parent_directory(&journal_path)?;
-    require_pages_publication_lock(final_dir, guard)
+    sync_parent_directory(&journal_path)
 }
 
 fn first_unowned_bundle_publish_backup(
@@ -1569,7 +1535,6 @@ fn is_allowed_system_symlink_ancestor(_path: &Path) -> bool {
 fn replace_dir_from_temp(
     temp_dir: &Path,
     final_dir: &Path,
-    guard: &PagesPublicationLockGuard,
     retain_temp_on_error: &mut bool,
 ) -> Result<()> {
     *retain_temp_on_error = false;
@@ -1577,11 +1542,9 @@ fn replace_dir_from_temp(
         bail!("staged bundle path does not exist: {}", temp_dir.display());
     }
 
-    require_pages_publication_lock(final_dir, guard)?;
-    recover_interrupted_bundle_publish_while_locked(final_dir, guard)?;
+    recover_interrupted_bundle_publish(final_dir)?;
     let candidate = inspect_bundle_tree(temp_dir, "staged bundle path")?;
     if !ensure_replaceable_bundle_output_dir(final_dir)? {
-        require_pages_publication_lock(final_dir, guard)?;
         fs::rename(temp_dir, final_dir).with_context(|| {
             format!(
                 "failed renaming completed bundle {} into place at {}",
@@ -1589,10 +1552,6 @@ fn replace_dir_from_temp(
                 final_dir.display()
             )
         })?;
-        // From this point onward the candidate is live and the staging handle
-        // is intentionally absent. Any verification/durability error must
-        // preserve that state for diagnosis instead of attempting temp cleanup.
-        *retain_temp_on_error = true;
         ensure_bundle_tree_matches(final_dir, "first published bundle", &candidate)?;
         sync_parent_directory(final_dir).with_context(|| {
             format!(
@@ -1600,7 +1559,6 @@ fn replace_dir_from_temp(
                 final_dir.display()
             )
         })?;
-        *retain_temp_on_error = false;
         return Ok(());
     }
 
@@ -1612,13 +1570,8 @@ fn replace_dir_from_temp(
             backup_dir.display()
         );
     }
-    let journal = write_bundle_publish_journal(
-        final_dir,
-        guard,
-        &backup_dir,
-        &prior,
-        &candidate,
-    )?;
+    let journal =
+        write_bundle_publish_journal(final_dir, &backup_dir, &prior, &candidate)?;
     if bundle_path_entry_exists(&backup_dir)? {
         bail!(
             "journaled Pages bundle backup path {} appeared before publication; preserved every generation and the journal",
@@ -1633,7 +1586,6 @@ fn replace_dir_from_temp(
         if try_publish_linux_bundle_via_atomic_exchange(
             temp_dir,
             final_dir,
-            guard,
             &backup_dir,
             &journal,
             &prior,
@@ -1647,7 +1599,6 @@ fn replace_dir_from_temp(
     replace_dir_from_temp_via_recoverable_rename_pair(
         temp_dir,
         final_dir,
-        guard,
         &backup_dir,
         &journal,
         &prior,
@@ -1656,17 +1607,7 @@ fn replace_dir_from_temp(
     )
 }
 
-#[cfg(test)]
 fn recover_interrupted_bundle_publish(final_dir: &Path) -> Result<()> {
-    let guard = acquire_pages_publication_lock(final_dir)?;
-    recover_interrupted_bundle_publish_while_locked(final_dir, &guard)
-}
-
-fn recover_interrupted_bundle_publish_while_locked(
-    final_dir: &Path,
-    guard: &PagesPublicationLockGuard,
-) -> Result<()> {
-    require_pages_publication_lock(final_dir, guard)?;
     let Some(journal) = read_bundle_publish_journal(final_dir)? else {
         if let Some(unowned_backup) = first_unowned_bundle_publish_backup(final_dir, None)? {
             bail!(
@@ -1720,7 +1661,6 @@ fn recover_interrupted_bundle_publish_while_locked(
                 "journaled prior Pages bundle",
                 &prior,
             )?;
-            require_pages_publication_lock(final_dir, guard)?;
             fs::rename(&backup_dir, final_dir).with_context(|| {
                 format!(
                     "failed restoring journaled prior Pages bundle {} to missing live path {}; preserved the backup and journal",
@@ -1736,7 +1676,7 @@ fn recover_interrupted_bundle_publish_while_locked(
                     bundle_publish_recovery_journal_path(final_dir).display()
                 )
             })?;
-            remove_bundle_publish_journal(final_dir, guard, &journal)
+            remove_bundle_publish_journal(final_dir, &journal)
         }
         (None, Some(_)) => bail!(
             "journaled Pages bundle backup {} does not match the prior generation while live path {} is missing; preserved the backup and journal",
@@ -1752,11 +1692,10 @@ fn recover_interrupted_bundle_publish_while_locked(
             cleanup_journaled_bundle_tree_after_publish(
                 &backup_dir,
                 final_dir,
-                guard,
                 "journaled prior Pages bundle",
                 &prior,
             )?;
-            remove_bundle_publish_journal(final_dir, guard, &journal)
+            remove_bundle_publish_journal(final_dir, &journal)
         }
         (Some(live), Some(backup)) if live == prior && backup == candidate => {
             ensure_bundle_tree_matches(
@@ -1767,11 +1706,10 @@ fn recover_interrupted_bundle_publish_while_locked(
             cleanup_journaled_bundle_tree_after_publish(
                 &backup_dir,
                 final_dir,
-                guard,
                 "journaled rejected candidate Pages bundle",
                 &candidate,
             )?;
-            remove_bundle_publish_journal(final_dir, guard, &journal)
+            remove_bundle_publish_journal(final_dir, &journal)
         }
         (Some(_), Some(_)) => bail!(
             "journaled Pages bundle recovery found live {} and backup {}, but their exact tree evidence does not match a valid publish state; preserved both and the journal",
@@ -1784,7 +1722,7 @@ fn recover_interrupted_bundle_publish_while_locked(
                 "journaled surviving Pages bundle",
                 &live,
             )?;
-            remove_bundle_publish_journal(final_dir, guard, &journal)
+            remove_bundle_publish_journal(final_dir, &journal)
         }
         (Some(_), None) => bail!(
             "Pages bundle publish journal remains at {}, but live tree {} matches neither journaled generation; preserved both",
@@ -1803,14 +1741,12 @@ fn recover_interrupted_bundle_publish_while_locked(
 fn cleanup_journaled_bundle_tree_after_publish(
     tree_dir: &Path,
     final_dir: &Path,
-    guard: &PagesPublicationLockGuard,
     label: &str,
     expected: &BundleTreeEvidence,
 ) -> Result<()> {
     cleanup_journaled_bundle_tree_after_publish_with(
         tree_dir,
         final_dir,
-        guard,
         label,
         expected,
         |path| fs::remove_dir_all(path),
@@ -1820,7 +1756,6 @@ fn cleanup_journaled_bundle_tree_after_publish(
 fn cleanup_journaled_bundle_tree_after_publish_with<F>(
     tree_dir: &Path,
     final_dir: &Path,
-    guard: &PagesPublicationLockGuard,
     label: &str,
     expected: &BundleTreeEvidence,
     remove_dir: F,
@@ -1828,9 +1763,7 @@ fn cleanup_journaled_bundle_tree_after_publish_with<F>(
 where
     F: FnOnce(&Path) -> std::io::Result<()>,
 {
-    require_pages_publication_lock(final_dir, guard)?;
     ensure_bundle_tree_matches(tree_dir, label, expected)?;
-    require_pages_publication_lock(final_dir, guard)?;
     remove_dir(tree_dir).with_context(|| {
         format!(
             "new bundle is live at {}, but failed to remove {label} containing private artifacts retained at {}",
@@ -1843,22 +1776,19 @@ where
             "removed {label} after publishing {}, but could not durably sync its parent directory",
             final_dir.display()
         )
-    })?;
-    require_pages_publication_lock(final_dir, guard)
+    })
 }
 
 #[cfg(target_os = "linux")]
 fn try_publish_linux_bundle_via_atomic_exchange(
     temp_dir: &Path,
     final_dir: &Path,
-    guard: &PagesPublicationLockGuard,
     backup_dir: &Path,
     journal: &BundlePublishJournal,
     prior: &BundleTreeEvidence,
     candidate: &BundleTreeEvidence,
     retain_temp_on_error: &mut bool,
 ) -> Result<bool> {
-    require_pages_publication_lock(final_dir, guard)?;
     fs::rename(temp_dir, backup_dir).with_context(|| {
         format!(
             "failed moving staged bundle {} to journaled atomic-exchange path {}",
@@ -1878,8 +1808,6 @@ fn try_publish_linux_bundle_via_atomic_exchange(
         return match restore_linux_atomic_staged_candidate(
             backup_dir,
             temp_dir,
-            final_dir,
-            guard,
             candidate,
             retain_temp_on_error,
         ) {
@@ -1898,7 +1826,6 @@ fn try_publish_linux_bundle_via_atomic_exchange(
         };
     }
 
-    require_pages_publication_lock(final_dir, guard)?;
     match crate::indexer::atomic_exchange_paths(final_dir, backup_dir) {
         Ok(()) => {
             if let Err(sync_error) = sync_parent_directory(final_dir) {
@@ -1921,14 +1848,13 @@ fn try_publish_linux_bundle_via_atomic_exchange(
             if let Err(cleanup_error) = cleanup_journaled_bundle_tree_after_publish(
                 backup_dir,
                 final_dir,
-                guard,
                 "journaled prior Pages bundle",
                 prior,
             ) {
                 *retain_temp_on_error = true;
                 return Err(cleanup_error);
             }
-            remove_bundle_publish_journal(final_dir, guard, journal)?;
+            remove_bundle_publish_journal(final_dir, journal)?;
             Ok(true)
         }
         Err(exchange_error)
@@ -1937,8 +1863,6 @@ fn try_publish_linux_bundle_via_atomic_exchange(
             restore_linux_atomic_staged_candidate(
                 backup_dir,
                 temp_dir,
-                final_dir,
-                guard,
                 candidate,
                 retain_temp_on_error,
             )
@@ -1956,8 +1880,6 @@ fn try_publish_linux_bundle_via_atomic_exchange(
             match restore_linux_atomic_staged_candidate(
                 backup_dir,
                 temp_dir,
-                final_dir,
-                guard,
                 candidate,
                 retain_temp_on_error,
             ) {
@@ -1983,12 +1905,9 @@ fn try_publish_linux_bundle_via_atomic_exchange(
 fn restore_linux_atomic_staged_candidate(
     backup_dir: &Path,
     temp_dir: &Path,
-    final_dir: &Path,
-    guard: &PagesPublicationLockGuard,
     candidate: &BundleTreeEvidence,
     retain_temp_on_error: &mut bool,
 ) -> Result<()> {
-    require_pages_publication_lock(final_dir, guard)?;
     if let Err(restore_error) = fs::rename(backup_dir, temp_dir) {
         *retain_temp_on_error = true;
         bail!(
@@ -2019,14 +1938,12 @@ fn restore_linux_atomic_staged_candidate(
 fn replace_dir_from_temp_via_recoverable_rename_pair(
     temp_dir: &Path,
     final_dir: &Path,
-    guard: &PagesPublicationLockGuard,
     backup_dir: &Path,
     journal: &BundlePublishJournal,
     prior: &BundleTreeEvidence,
     candidate: &BundleTreeEvidence,
     retain_temp_on_error: &mut bool,
 ) -> Result<()> {
-    require_pages_publication_lock(final_dir, guard)?;
     ensure_bundle_tree_matches(final_dir, "prior live Pages bundle", prior)?;
     ensure_bundle_tree_matches(temp_dir, "staged Pages bundle candidate", candidate)?;
     if bundle_path_entry_exists(backup_dir)? {
@@ -2035,7 +1952,6 @@ fn replace_dir_from_temp_via_recoverable_rename_pair(
             backup_dir.display()
         );
     }
-    require_pages_publication_lock(final_dir, guard)?;
     fs::rename(final_dir, backup_dir).with_context(|| {
         format!(
             "failed parking live bundle {} at journaled recovery path {}",
@@ -2051,7 +1967,6 @@ fn replace_dir_from_temp_via_recoverable_rename_pair(
     }
 
     if let Err(park_sync_error) = sync_parent_directory(final_dir) {
-        require_pages_publication_lock(final_dir, guard)?;
         return match fs::rename(backup_dir, final_dir) {
             Ok(()) => {
                 ensure_bundle_tree_matches(final_dir, "restored prior Pages bundle", prior)?;
@@ -2084,7 +1999,6 @@ fn replace_dir_from_temp_via_recoverable_rename_pair(
         };
     }
 
-    require_pages_publication_lock(final_dir, guard)?;
     match fs::rename(temp_dir, final_dir) {
         Ok(()) => {
             if let Err(error) = ensure_bundle_tree_matches(
@@ -2107,43 +2021,39 @@ fn replace_dir_from_temp_via_recoverable_rename_pair(
             if let Err(cleanup_error) = cleanup_journaled_bundle_tree_after_publish(
                 backup_dir,
                 final_dir,
-                guard,
                 "journaled prior Pages bundle",
                 prior,
             ) {
                 *retain_temp_on_error = true;
                 return Err(cleanup_error);
             }
-            remove_bundle_publish_journal(final_dir, guard, journal)
+            remove_bundle_publish_journal(final_dir, journal)
         }
-        Err(publish_error) => {
-            require_pages_publication_lock(final_dir, guard)?;
-            match fs::rename(backup_dir, final_dir) {
-                Ok(()) => {
-                    ensure_bundle_tree_matches(final_dir, "restored prior Pages bundle", prior)?;
-                    sync_parent_directory(final_dir)?;
-                    Err(publish_error).with_context(|| {
-                        format!(
-                            "failed publishing staged bundle {} at {}; restored the prior live bundle",
-                            temp_dir.display(),
-                            final_dir.display()
-                        )
-                    })
-                }
-                Err(restore_error) => {
-                    *retain_temp_on_error = true;
-                    bail!(
-                        "failed publishing staged bundle {} at {}: {}; restore also failed: {}; prior bundle retained at {} and staged bundle retained at {}",
+        Err(publish_error) => match fs::rename(backup_dir, final_dir) {
+            Ok(()) => {
+                ensure_bundle_tree_matches(final_dir, "restored prior Pages bundle", prior)?;
+                sync_parent_directory(final_dir)?;
+                Err(publish_error).with_context(|| {
+                    format!(
+                        "failed publishing staged bundle {} at {}; restored the prior live bundle",
                         temp_dir.display(),
-                        final_dir.display(),
-                        publish_error,
-                        restore_error,
-                        backup_dir.display(),
-                        temp_dir.display()
-                    );
-                }
+                        final_dir.display()
+                    )
+                })
             }
-        }
+            Err(restore_error) => {
+                *retain_temp_on_error = true;
+                bail!(
+                    "failed publishing staged bundle {} at {}: {}; restore also failed: {}; prior bundle retained at {} and staged bundle retained at {}",
+                    temp_dir.display(),
+                    final_dir.display(),
+                    publish_error,
+                    restore_error,
+                    backup_dir.display(),
+                    temp_dir.display()
+                );
+            }
+        },
     }
 }
 
@@ -3182,16 +3092,6 @@ mod tests {
         serde_json::to_writer_pretty(BufWriter::new(file), &config).unwrap();
     }
 
-    fn write_test_bundle_publish_journal(
-        final_dir: &Path,
-        backup_dir: &Path,
-        prior: &BundleTreeEvidence,
-        candidate: &BundleTreeEvidence,
-    ) -> BundlePublishJournal {
-        let guard = acquire_pages_publication_lock(final_dir).unwrap();
-        write_bundle_publish_journal(final_dir, &guard, backup_dir, prior, candidate).unwrap()
-    }
-
     fn encrypted_config_for_files(files: Vec<&str>) -> EncryptionConfig {
         use base64::prelude::*;
         let chunk_count = files.len();
@@ -3486,7 +3386,7 @@ mod tests {
 
         let temp = TempDir::new()?;
         let staging_root = temp.path().join("bundle.staged");
-        let _staging_identity = create_bundle_staging_root(&staging_root)?;
+        create_bundle_staging_root(&staging_root)?;
 
         let staged_mode = fs::metadata(&staging_root)?.permissions().mode();
         if staged_mode & 0o077 != 0 {
@@ -4183,15 +4083,8 @@ mod tests {
         fs::create_dir_all(staged_dir.join("site")).unwrap();
         fs::write(staged_dir.join("site/new.txt"), "new").unwrap();
 
-        let guard = acquire_pages_publication_lock(&final_dir).unwrap();
         let mut retain_temp_on_error = false;
-        replace_dir_from_temp(
-            &staged_dir,
-            &final_dir,
-            &guard,
-            &mut retain_temp_on_error,
-        )
-        .unwrap();
+        replace_dir_from_temp(&staged_dir, &final_dir, &mut retain_temp_on_error).unwrap();
 
         assert!(!staged_dir.exists());
         assert!(final_dir.join("site/new.txt").exists());
@@ -4217,15 +4110,8 @@ mod tests {
         fs::create_dir_all(staged_dir.join("site")).unwrap();
         fs::write(staged_dir.join("site/new.txt"), "new").unwrap();
 
-        let guard = acquire_pages_publication_lock(&final_dir).unwrap();
         let mut retain_temp_on_error = false;
-        replace_dir_from_temp(
-            &staged_dir,
-            &final_dir,
-            &guard,
-            &mut retain_temp_on_error,
-        )
-        .unwrap();
+        replace_dir_from_temp(&staged_dir, &final_dir, &mut retain_temp_on_error).unwrap();
 
         assert!(!retain_temp_on_error);
         assert!(!staged_dir.exists());
@@ -4242,61 +4128,6 @@ mod tests {
     }
 
     #[test]
-    fn test_rejected_stage_cleanup_refuses_unowned_recursive_target() {
-        let temp = TempDir::new().unwrap();
-        let final_dir = temp.path().join("bundle");
-        let unowned_dir = temp.path().join(".bundle.tmp.not-a-random-nonce.0");
-        let unowned_identity = create_bundle_staging_root(&unowned_dir).unwrap();
-        let sentinel = unowned_dir.join("sentinel.txt");
-        fs::write(&sentinel, "preserve").unwrap();
-        let guard = acquire_pages_publication_lock(&final_dir).unwrap();
-
-        let error = cleanup_rejected_bundle_temp(
-            &unowned_dir,
-            &final_dir,
-            &guard,
-            &unowned_identity,
-        )
-        .expect_err("an unowned path must never reach recursive stage cleanup");
-
-        assert!(error.to_string().contains("invalid ownership nonce"));
-        assert_eq!(fs::read_to_string(sentinel).unwrap(), "preserve");
-    }
-
-    #[test]
-    fn test_rejected_stage_cleanup_refuses_replaced_owned_path() {
-        let temp = TempDir::new().unwrap();
-        let final_dir = temp.path().join("bundle");
-        let staging_dir = unique_bundle_dir(&final_dir, "tmp").unwrap();
-        let staging_identity = create_bundle_staging_root(&staging_dir).unwrap();
-        fs::write(staging_dir.join("owned.txt"), "owned").unwrap();
-        let displaced_dir = temp.path().join("displaced-owned-stage");
-        fs::rename(&staging_dir, &displaced_dir).unwrap();
-        fs::create_dir(&staging_dir).unwrap();
-        let replacement_sentinel = staging_dir.join("replacement.txt");
-        fs::write(&replacement_sentinel, "preserve replacement").unwrap();
-        let guard = acquire_pages_publication_lock(&final_dir).unwrap();
-
-        let error = cleanup_rejected_bundle_temp(
-            &staging_dir,
-            &final_dir,
-            &guard,
-            &staging_identity,
-        )
-        .expect_err("a replaced staging pathname must never be recursively removed");
-
-        assert!(error.to_string().contains("changed identity"));
-        assert_eq!(
-            fs::read_to_string(replacement_sentinel).unwrap(),
-            "preserve replacement"
-        );
-        assert_eq!(
-            fs::read_to_string(displaced_dir.join("owned.txt")).unwrap(),
-            "owned"
-        );
-    }
-
-    #[test]
     fn test_recover_interrupted_bundle_publish_restores_parked_only_live_bundle() {
         let temp = TempDir::new().unwrap();
         let final_dir = temp.path().join("bundle");
@@ -4309,7 +4140,7 @@ mod tests {
         let prior = inspect_bundle_tree(&final_dir, "prior").unwrap();
         let candidate = inspect_bundle_tree(&staged_dir, "candidate").unwrap();
         let backup_dir = unpredictable_bundle_publish_backup_path(&final_dir).unwrap();
-        write_test_bundle_publish_journal(&final_dir, &backup_dir, &prior, &candidate);
+        write_bundle_publish_journal(&final_dir, &backup_dir, &prior, &candidate).unwrap();
 
         // Failpoint state: the fallback publisher durably parked OLD, then
         // the process died before installing NEW at the live handle.
@@ -4344,7 +4175,7 @@ mod tests {
         let prior = inspect_bundle_tree(&final_dir, "prior").unwrap();
         let candidate = inspect_bundle_tree(&staged_dir, "candidate").unwrap();
         let backup_dir = unpredictable_bundle_publish_backup_path(&final_dir).unwrap();
-        write_test_bundle_publish_journal(&final_dir, &backup_dir, &prior, &candidate);
+        write_bundle_publish_journal(&final_dir, &backup_dir, &prior, &candidate).unwrap();
 
         // Failpoint state: OLD was parked and NEW reached the live handle,
         // then the process died before removing OLD.
@@ -4447,7 +4278,7 @@ mod tests {
         let prior = inspect_bundle_tree(&final_dir, "prior").unwrap();
         let candidate = inspect_bundle_tree(&staged_dir, "candidate").unwrap();
         let exchange_dir = unpredictable_bundle_publish_backup_path(&final_dir).unwrap();
-        write_test_bundle_publish_journal(&final_dir, &exchange_dir, &prior, &candidate);
+        write_bundle_publish_journal(&final_dir, &exchange_dir, &prior, &candidate).unwrap();
 
         // Failpoint state: NEW reached the journaled exchange handle,
         // but the process died before the atomic exchange committed.
@@ -4477,7 +4308,7 @@ mod tests {
         let prior = inspect_bundle_tree(&final_dir, "prior").unwrap();
         let candidate = inspect_bundle_tree(&staged_dir, "candidate").unwrap();
         let exchange_dir = unpredictable_bundle_publish_backup_path(&final_dir).unwrap();
-        write_test_bundle_publish_journal(&final_dir, &exchange_dir, &prior, &candidate);
+        write_bundle_publish_journal(&final_dir, &exchange_dir, &prior, &candidate).unwrap();
 
         // Failpoint state immediately after exchange: NEW is live and OLD is
         // at the exact random path authenticated by the durable journal.
@@ -4508,7 +4339,7 @@ mod tests {
         let prior = inspect_bundle_tree(&final_dir, "prior").unwrap();
         let candidate = inspect_bundle_tree(&staged_dir, "candidate").unwrap();
         let backup_dir = unpredictable_bundle_publish_backup_path(&final_dir).unwrap();
-        write_test_bundle_publish_journal(&final_dir, &backup_dir, &prior, &candidate);
+        write_bundle_publish_journal(&final_dir, &backup_dir, &prior, &candidate).unwrap();
         fs::rename(&final_dir, &backup_dir).unwrap();
         fs::write(backup_dir.join("private/old-private.txt"), "tampered").unwrap();
 
@@ -4525,32 +4356,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
-    fn test_recovery_rejects_non_owner_only_publish_journal() {
-        let temp = TempDir::new().unwrap();
-        let final_dir = temp.path().join("bundle");
-        let staged_dir = temp.path().join("bundle.staged");
-        fs::create_dir_all(final_dir.join("site")).unwrap();
-        fs::write(final_dir.join("site/old.txt"), "old").unwrap();
-        fs::create_dir_all(staged_dir.join("site")).unwrap();
-        fs::write(staged_dir.join("site/new.txt"), "new").unwrap();
-        let prior = inspect_bundle_tree(&final_dir, "prior").unwrap();
-        let candidate = inspect_bundle_tree(&staged_dir, "candidate").unwrap();
-        let backup_dir = unpredictable_bundle_publish_backup_path(&final_dir).unwrap();
-        write_test_bundle_publish_journal(&final_dir, &backup_dir, &prior, &candidate);
-        let journal_path = bundle_publish_recovery_journal_path(&final_dir);
-        fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o644)).unwrap();
-
-        let error = recover_interrupted_bundle_publish(&final_dir)
-            .expect_err("a public recovery journal must not authorize publication mutations");
-
-        assert!(error.to_string().contains("not owner-only"));
-        assert_eq!(fs::read_to_string(final_dir.join("site/old.txt")).unwrap(), "old");
-        assert!(journal_path.exists(), "rejected journal must be preserved");
-        assert!(!backup_dir.exists());
-    }
-
-    #[test]
     fn test_recoverable_rename_pair_replaces_and_cleans_prior_bundle() {
         let temp = TempDir::new().unwrap();
         let final_dir = temp.path().join("bundle");
@@ -4563,21 +4368,13 @@ mod tests {
         let prior = inspect_bundle_tree(&final_dir, "prior").unwrap();
         let candidate = inspect_bundle_tree(&staged_dir, "candidate").unwrap();
         let backup_dir = unpredictable_bundle_publish_backup_path(&final_dir).unwrap();
-        let guard = acquire_pages_publication_lock(&final_dir).unwrap();
-        let journal = write_bundle_publish_journal(
-            &final_dir,
-            &guard,
-            &backup_dir,
-            &prior,
-            &candidate,
-        )
-        .unwrap();
+        let journal =
+            write_bundle_publish_journal(&final_dir, &backup_dir, &prior, &candidate).unwrap();
 
         let mut retain_temp_on_error = false;
         replace_dir_from_temp_via_recoverable_rename_pair(
             &staged_dir,
             &final_dir,
-            &guard,
             &backup_dir,
             &journal,
             &prior,
@@ -4605,11 +4402,9 @@ mod tests {
         fs::write(backup_dir.join("private/recovery-material.txt"), "private").unwrap();
         let expected = inspect_bundle_tree(&backup_dir, "prior").unwrap();
 
-        let guard = acquire_pages_publication_lock(&final_dir).unwrap();
         let error = cleanup_journaled_bundle_tree_after_publish_with(
             &backup_dir,
             &final_dir,
-            &guard,
             "journaled prior Pages bundle",
             &expected,
             |_| {
@@ -4642,11 +4437,9 @@ mod tests {
         fs::write(&private_file, "changed after journal").unwrap();
         let remove_called = std::cell::Cell::new(false);
 
-        let guard = acquire_pages_publication_lock(&final_dir).unwrap();
         cleanup_journaled_bundle_tree_after_publish_with(
             &backup_dir,
             &final_dir,
-            &guard,
             "journaled prior Pages bundle",
             &expected,
             |_| {
@@ -4694,7 +4487,7 @@ mod tests {
         let prior = inspect_bundle_tree(&final_dir, "prior").unwrap();
         let candidate = inspect_bundle_tree(&staged_dir, "candidate").unwrap();
         let backup_dir = unpredictable_bundle_publish_backup_path(&final_dir).unwrap();
-        write_test_bundle_publish_journal(&final_dir, &backup_dir, &prior, &candidate);
+        write_bundle_publish_journal(&final_dir, &backup_dir, &prior, &candidate).unwrap();
         fs::create_dir_all(outside.path().join("private")).unwrap();
         fs::write(outside.path().join("private/material.txt"), "private").unwrap();
         symlink(outside.path(), &backup_dir).unwrap();
@@ -4733,15 +4526,9 @@ mod tests {
         fs::write(outside.path().join("site/new.txt"), "new").unwrap();
         symlink(outside.path(), &staged_dir).unwrap();
 
-        let guard = acquire_pages_publication_lock(&final_dir).unwrap();
         let mut retain_temp_on_error = false;
-        let error = replace_dir_from_temp(
-            &staged_dir,
-            &final_dir,
-            &guard,
-            &mut retain_temp_on_error,
-        )
-        .expect_err("a symlinked staged bundle must fail closed");
+        let error = replace_dir_from_temp(&staged_dir, &final_dir, &mut retain_temp_on_error)
+            .expect_err("a symlinked staged bundle must fail closed");
 
         assert!(error.to_string().contains("must not be a symlink"));
         assert!(
@@ -4773,15 +4560,9 @@ mod tests {
         fs::write(staged_dir.join("site/new.txt"), "new").unwrap();
         symlink(temp.path().join("missing-target"), &final_dir).unwrap();
 
-        let guard = acquire_pages_publication_lock(&final_dir).unwrap();
         let mut retain_temp_on_error = false;
-        let err = replace_dir_from_temp(
-            &staged_dir,
-            &final_dir,
-            &guard,
-            &mut retain_temp_on_error,
-        )
-        .unwrap_err();
+        let err =
+            replace_dir_from_temp(&staged_dir, &final_dir, &mut retain_temp_on_error).unwrap_err();
         assert!(
             err.to_string().contains("must not be a symlink"),
             "unexpected error: {err:#}"

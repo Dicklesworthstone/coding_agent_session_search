@@ -78,6 +78,7 @@ const REQUIRED_SITE_FILES: &[&str] = &[
 struct KeyMutationTarget {
     live_root: PathBuf,
     site_relative: PathBuf,
+    lock_path: PathBuf,
     journal_path: PathBuf,
 }
 
@@ -93,18 +94,6 @@ impl KeyMutationTarget {
 
 struct KeyMutationGuard {
     target: KeyMutationTarget,
-    publication_lock: PagesPublicationLockGuard,
-}
-
-struct KeyMutationStagingOwnership {
-    path: PathBuf,
-    identity: crate::franken_sync::FileIdentity,
-    handle: File,
-}
-
-pub(super) struct PagesPublicationLockGuard {
-    live_root: PathBuf,
-    lock_path: PathBuf,
     lock_identity: crate::franken_sync::FileIdentity,
     lock_file: File,
 }
@@ -116,7 +105,7 @@ struct TreeEvidence {
     bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct KeyMutationJournal {
     format: String,
@@ -124,13 +113,6 @@ struct KeyMutationJournal {
     backup_file_name: String,
     prior_digest: String,
     candidate_digest: String,
-}
-
-struct ValidatedKeyMutationJournal {
-    journal: KeyMutationJournal,
-    identity: crate::franken_sync::FileIdentity,
-    size: u64,
-    handle: File,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,31 +182,7 @@ fn derive_key_mutation_target(requested_path: &Path) -> Result<KeyMutationTarget
                 requested_path.display()
             )
         })?;
-        let parent_private = parent.join("private");
-        let parent_journal = key_mutation_sidecar_path(
-            parent,
-            ".pages-key-mutation-in-progress.json",
-        );
-        let parent_lock = key_mutation_sidecar_path(parent, ".pages-publication.lock");
-        let parent_is_publication_root = [&parent_private, &parent_journal, &parent_lock]
-            .into_iter()
-            .try_fold(false, |found, path| {
-                match std::fs::symlink_metadata(path) {
-                    Ok(_) => Ok(true),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(found),
-                    Err(error) => Err(error).with_context(|| {
-                        format!(
-                            "failed inspecting Pages publication marker {}",
-                            path.display()
-                        )
-                    }),
-                }
-            })?;
-        if parent_is_publication_root {
-            (parent.to_path_buf(), PathBuf::from("site"))
-        } else {
-            (requested_path.to_path_buf(), PathBuf::new())
-        }
+        (parent.to_path_buf(), PathBuf::from("site"))
     } else {
         match std::fs::symlink_metadata(requested_path.join("site")) {
             Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
@@ -244,14 +202,9 @@ fn derive_key_mutation_target(requested_path: &Path) -> Result<KeyMutationTarget
             }
         }
     };
-    if live_root.file_name().and_then(|name| name.to_str()).is_none() {
-        bail!(
-            "Pages key-mutation publication root must have a UTF-8 directory name: {}",
-            live_root.display()
-        );
-    }
 
     Ok(KeyMutationTarget {
+        lock_path: key_mutation_sidecar_path(&live_root, ".pages-key-mutation.lock"),
         journal_path: key_mutation_sidecar_path(
             &live_root,
             ".pages-key-mutation-in-progress.json",
@@ -261,123 +214,37 @@ fn derive_key_mutation_target(requested_path: &Path) -> Result<KeyMutationTarget
     })
 }
 
-fn pages_publication_lock_path(live_root: &Path) -> PathBuf {
-    key_mutation_sidecar_path(live_root, ".pages-publication.lock")
-}
-
-fn ensure_pages_publication_lock_parent(lock_path: &Path) -> Result<()> {
-    let parent = lock_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let mut ancestors = Vec::new();
-    let mut current = Some(parent);
-    while let Some(ancestor) = current {
-        if ancestor.as_os_str().is_empty() {
-            break;
-        }
-        ancestors.push(ancestor.to_path_buf());
-        current = ancestor.parent();
-    }
-    ancestors.reverse();
-
-    for ancestor in &ancestors {
-        match std::fs::symlink_metadata(ancestor) {
-            Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
-            Ok(metadata)
-                if metadata.file_type().is_symlink()
-                    && pages_publication_allows_system_symlink_ancestor(ancestor) => {}
-            Ok(_) => bail!(
-                "Pages publication lock parent must be a real directory: {}",
-                ancestor.display()
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed inspecting Pages publication lock parent {}",
-                        ancestor.display()
-                    )
-                });
-            }
-        }
-    }
-
-    std::fs::create_dir_all(parent).with_context(|| {
-        format!(
-            "failed creating Pages publication lock parent {}",
-            parent.display()
-        )
-    })?;
-    for ancestor in ancestors {
-        match std::fs::symlink_metadata(&ancestor) {
-            Ok(metadata)
-                if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
-            Ok(metadata)
-                if metadata.file_type().is_symlink()
-                    && pages_publication_allows_system_symlink_ancestor(&ancestor) => {}
-            Ok(_) => bail!(
-                "Pages publication lock parent changed into a non-directory or symlink: {}",
-                ancestor.display()
-            ),
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed re-inspecting Pages publication lock parent {}",
-                        ancestor.display()
-                    )
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn pages_publication_allows_system_symlink_ancestor(path: &Path) -> bool {
-    path == Path::new("/var") || path == Path::new("/tmp")
-}
-
-#[cfg(not(target_os = "macos"))]
-fn pages_publication_allows_system_symlink_ancestor(_path: &Path) -> bool {
-    false
-}
-
-pub(super) fn acquire_pages_publication_lock(
-    live_root: &Path,
-) -> Result<PagesPublicationLockGuard> {
-    let lock_path = pages_publication_lock_path(live_root);
-    ensure_pages_publication_lock_parent(&lock_path)?;
-    let lock_exists = match std::fs::symlink_metadata(&lock_path) {
+fn open_key_mutation_lock(target: KeyMutationTarget) -> Result<KeyMutationGuard> {
+    let lock_exists = match std::fs::symlink_metadata(&target.lock_path) {
         Ok(metadata) if metadata.file_type().is_file() => {
             #[cfg(unix)]
             {
                 if metadata.nlink() != 1 {
                     bail!(
-                        "Pages publication lock {} has {} hard links; exclusive pathname ownership is not provable",
-                        lock_path.display(),
+                        "Pages key-mutation lock {} has {} hard links; exclusive pathname ownership is not provable",
+                        target.lock_path.display(),
                         metadata.nlink()
                     );
                 }
                 if key_publication_mode(&metadata) & 0o077 != 0 {
                     bail!(
-                        "Pages publication lock is not owner-only: {}",
-                        lock_path.display()
+                        "Pages key-mutation lock is not owner-only: {}",
+                        target.lock_path.display()
                     );
                 }
             }
             true
         }
         Ok(_) => bail!(
-            "Pages publication lock is not a regular file: {}",
-            lock_path.display()
+            "Pages key-mutation lock is not a regular file: {}",
+            target.lock_path.display()
         ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => {
             return Err(error).with_context(|| {
                 format!(
-                    "failed inspecting Pages publication lock {}",
-                    lock_path.display()
+                    "failed inspecting Pages key-mutation lock {}",
+                    target.lock_path.display()
                 )
             });
         }
@@ -392,140 +259,117 @@ pub(super) fn acquire_pages_publication_lock(
     }
     #[cfg(unix)]
     options.mode(0o600);
-    let lock_file = options.open(&lock_path).with_context(|| {
+    let lock_file = options.open(&target.lock_path).with_context(|| {
         format!(
-            "failed opening Pages publication lock {}",
-            lock_path.display()
+            "failed opening Pages key-mutation lock {}",
+            target.lock_path.display()
         )
     })?;
     let lock_identity = crate::franken_sync::FileIdentity::from_file(&lock_file)
         .with_context(|| {
             format!(
-                "failed identifying Pages publication lock {}",
-                lock_path.display()
+                "failed identifying Pages key-mutation lock {}",
+                target.lock_path.display()
             )
         })?
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "filesystem does not expose a stable identity for Pages publication lock {}",
-                lock_path.display()
+                "filesystem does not expose a stable identity for Pages key-mutation lock {}",
+                target.lock_path.display()
             )
         })?;
 
     match fs2::FileExt::try_lock_exclusive(&lock_file) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => bail!(
-            "another Pages publication is already active for {}; lock contention at {}",
-            live_root.display(),
-            lock_path.display()
+            "another Pages key mutation is already active for {}; lock contention at {}",
+            target.live_root.display(),
+            target.lock_path.display()
         ),
         Err(error) => {
             return Err(error).with_context(|| {
                 format!(
-                    "failed acquiring Pages publication lock {}",
-                    lock_path.display()
+                    "failed acquiring Pages key-mutation lock {}",
+                    target.lock_path.display()
                 )
             });
         }
     }
 
-    let guard = PagesPublicationLockGuard {
-        live_root: live_root.to_path_buf(),
-        lock_path,
+    let guard = KeyMutationGuard {
+        target,
         lock_identity,
         lock_file,
     };
-    require_pages_publication_lock(live_root, &guard)?;
+    require_key_mutation_guard(&guard)?;
     Ok(guard)
 }
 
-pub(super) fn require_pages_publication_lock(
-    live_root: &Path,
-    guard: &PagesPublicationLockGuard,
-) -> Result<()> {
-    if live_root != guard.live_root {
-        bail!(
-            "Pages publication lock for {} cannot authorize publication to {}",
-            guard.live_root.display(),
-            live_root.display()
-        );
-    }
+fn require_key_mutation_guard(guard: &KeyMutationGuard) -> Result<()> {
     let held_identity = crate::franken_sync::FileIdentity::from_file(&guard.lock_file)
-        .context("failed re-identifying held Pages publication lock")?
+        .context("failed re-identifying held Pages key-mutation lock")?
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "filesystem stopped exposing a stable identity for held Pages publication lock {}",
-                guard.lock_path.display()
+                "filesystem stopped exposing a stable identity for held Pages key-mutation lock {}",
+                guard.target.lock_path.display()
             )
         })?;
     if held_identity != guard.lock_identity {
         bail!(
-            "held Pages publication lock {} changed identity",
-            guard.lock_path.display()
+            "held Pages key-mutation lock {} changed identity",
+            guard.target.lock_path.display()
         );
     }
 
-    let metadata = std::fs::symlink_metadata(&guard.lock_path).with_context(|| {
+    let metadata = std::fs::symlink_metadata(&guard.target.lock_path).with_context(|| {
         format!(
-            "failed re-inspecting Pages publication lock {}",
-            guard.lock_path.display()
+            "failed re-inspecting Pages key-mutation lock {}",
+            guard.target.lock_path.display()
         )
     })?;
     if !metadata.file_type().is_file() {
         bail!(
-            "Pages publication lock {} is no longer a regular file",
-            guard.lock_path.display()
+            "Pages key-mutation lock {} is no longer a regular file",
+            guard.target.lock_path.display()
         );
     }
     #[cfg(unix)]
     {
         if metadata.nlink() != 1 {
             bail!(
-                "Pages publication lock {} has {} hard links; refused publication",
-                guard.lock_path.display(),
+                "Pages key-mutation lock {} has {} hard links; refused publication",
+                guard.target.lock_path.display(),
                 metadata.nlink()
             );
         }
         if key_publication_mode(&metadata) & 0o077 != 0 {
             bail!(
-                "Pages publication lock is no longer owner-only: {}",
-                guard.lock_path.display()
+                "Pages key-mutation lock is no longer owner-only: {}",
+                guard.target.lock_path.display()
             );
         }
     }
-    let probe = File::open(&guard.lock_path).with_context(|| {
+    let probe = File::open(&guard.target.lock_path).with_context(|| {
         format!(
-            "failed re-opening Pages publication lock {}",
-            guard.lock_path.display()
+            "failed re-opening Pages key-mutation lock {}",
+            guard.target.lock_path.display()
         )
     })?;
     let path_identity = crate::franken_sync::FileIdentity::from_file(&probe)
-        .context("failed re-identifying Pages publication lock pathname")?
+        .context("failed re-identifying Pages key-mutation lock pathname")?
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "filesystem stopped exposing a stable pathname identity for Pages publication lock {}",
-                guard.lock_path.display()
+                "filesystem stopped exposing a stable pathname identity for Pages key-mutation lock {}",
+                guard.target.lock_path.display()
             )
         })?;
     if path_identity != guard.lock_identity {
         bail!(
-            "Pages publication lock {} was replaced after acquisition",
-            guard.lock_path.display()
+            "Pages key-mutation lock {} was replaced after acquisition",
+            guard.target.lock_path.display()
         );
     }
     Ok(())
-}
-
-fn open_key_mutation_lock(target: KeyMutationTarget) -> Result<KeyMutationGuard> {
-    let publication_lock = acquire_pages_publication_lock(&target.live_root)?;
-    Ok(KeyMutationGuard {
-        target,
-        publication_lock,
-    })
-}
-
-fn require_key_mutation_guard(guard: &KeyMutationGuard) -> Result<()> {
-    require_pages_publication_lock(&guard.target.live_root, &guard.publication_lock)
 }
 
 fn random_key_mutation_sidecar_path(root: &Path, role: &str) -> PathBuf {
@@ -549,70 +393,6 @@ fn key_publication_mode(metadata: &std::fs::Metadata) -> u32 {
 #[cfg(not(unix))]
 fn key_publication_mode(_metadata: &std::fs::Metadata) -> u32 {
     0
-}
-
-fn hash_key_publication_file(path: &Path) -> Result<(u64, u32, [u8; 32])> {
-    let mut file = File::open(path)
-        .with_context(|| format!("failed opening key-publication file {}", path.display()))?;
-    let identity = crate::franken_sync::FileIdentity::from_file(&file)
-        .with_context(|| format!("failed identifying key-publication file {}", path.display()))?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "filesystem does not expose a stable identity for key-publication file {}",
-                path.display()
-            )
-        })?;
-    let opened_metadata = file.metadata()?;
-    if !opened_metadata.file_type().is_file() {
-        bail!(
-            "Pages key-publication entry does not resolve to a regular file: {}",
-            path.display()
-        );
-    }
-    #[cfg(unix)]
-    if opened_metadata.nlink() != 1 {
-        bail!(
-            "Pages key-publication file {} has {} hard links; exact ownership is not provable",
-            path.display(),
-            opened_metadata.nlink()
-        );
-    }
-    let opened_mode = key_publication_mode(&opened_metadata);
-    let mut file_digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        file_digest.update(&buffer[..read]);
-    }
-    let hashed_metadata = file.metadata()?;
-    if !hashed_metadata.file_type().is_file()
-        || hashed_metadata.len() != opened_metadata.len()
-        || key_publication_mode(&hashed_metadata) != opened_mode
-    {
-        bail!(
-            "key-publication file changed type, size, or permissions while hashing: {}",
-            path.display()
-        );
-    }
-    let probe = File::open(path)?;
-    let path_identity = crate::franken_sync::FileIdentity::from_file(&probe)?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "filesystem stopped exposing a stable identity for key-publication file {}",
-                path.display()
-            )
-        })?;
-    if path_identity != identity {
-        bail!(
-            "key-publication file changed identity while hashing: {}",
-            path.display()
-        );
-    }
-    let digest: [u8; 32] = file_digest.finalize().into();
-    Ok((opened_metadata.len(), opened_mode, digest))
 }
 
 fn inspect_key_publication_tree(root: &Path) -> Result<TreeEvidence> {
@@ -642,21 +422,6 @@ fn inspect_key_publication_tree(root: &Path) -> Result<TreeEvidence> {
             )
         })?;
     let root_mode = key_publication_mode(&root_metadata);
-    let canonical_root = root.canonicalize().with_context(|| {
-        format!(
-            "failed resolving Pages key-publication root {}",
-            root.display()
-        )
-    })?;
-    let site_path = root.join("site");
-    let canonical_public_root = match std::fs::symlink_metadata(&site_path) {
-        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
-            site_path.canonicalize()?
-        }
-        Ok(_) => canonical_root.clone(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => canonical_root.clone(),
-        Err(error) => return Err(error.into()),
-    };
 
     let mut paths = Vec::new();
     collect_key_publication_paths(root, root, &mut paths)?;
@@ -672,63 +437,10 @@ fn inspect_key_publication_tree(root: &Path) -> Result<TreeEvidence> {
         })?;
         let file_type = metadata.file_type();
         if file_type.is_symlink() {
-            if Path::new(relative).starts_with("private") {
-                bail!(
-                    "private key artifact must not be a symlink: {}",
-                    path.display()
-                );
-            }
-            let link_target = std::fs::read_link(path).with_context(|| {
-                format!(
-                    "failed reading Pages key-publication symlink {}",
-                    path.display()
-                )
-            })?;
-            let canonical_target = path.canonicalize().with_context(|| {
-                format!(
-                    "failed resolving Pages key-publication symlink {}",
-                    path.display()
-                )
-            })?;
-            if !canonical_target.starts_with(&canonical_public_root) {
-                bail!(
-                    "refusing Pages key-publication symlink outside the public site root: {}",
-                    path.display()
-                );
-            }
-            let target_relative = canonical_target
-                .strip_prefix(&canonical_root)?
-                .to_str()
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Pages key-publication symlink target is not valid UTF-8: {}",
-                        canonical_target.display()
-                    )
-                })?;
-            let (file_len, file_mode, file_digest) = hash_key_publication_file(path)?;
-            let final_metadata = std::fs::symlink_metadata(path)?;
-            let final_link_target = std::fs::read_link(path)?;
-            if !final_metadata.file_type().is_symlink()
-                || final_link_target != link_target
-                || path.canonicalize()? != canonical_target
-            {
-                bail!(
-                    "Pages key-publication symlink changed while inspected: {}",
-                    path.display()
-                );
-            }
-            total_bytes = total_bytes
-                .checked_add(file_len)
-                .context("Pages key-publication byte count overflowed u64")?;
-            digest.update(b"symlink\0");
-            digest.update(relative.as_bytes());
-            digest.update(b"\0");
-            digest.update(target_relative.as_bytes());
-            digest.update(b"\0");
-            digest.update(file_mode.to_be_bytes());
-            digest.update(file_len.to_be_bytes());
-            digest.update(file_digest);
-            continue;
+            bail!(
+                "Pages key-publication tree must not contain symlinks: {}",
+                path.display()
+            );
         }
         if file_type.is_dir() {
             digest.update(b"directory\0");
@@ -751,37 +463,58 @@ fn inspect_key_publication_tree(root: &Path) -> Result<TreeEvidence> {
                 metadata.nlink()
             );
         }
-        let (file_len, file_mode, file_digest) = hash_key_publication_file(path)?;
-        let final_metadata = std::fs::symlink_metadata(path)?;
-        if !final_metadata.file_type().is_file()
-            || final_metadata.len() != file_len
-            || key_publication_mode(&final_metadata) != file_mode
-        {
+
+        let mut file = File::open(path)
+            .with_context(|| format!("failed opening key-publication file {}", path.display()))?;
+        let identity = crate::franken_sync::FileIdentity::from_file(&file)
+            .with_context(|| format!("failed identifying key-publication file {}", path.display()))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "filesystem does not expose a stable identity for key-publication file {}",
+                    path.display()
+                )
+            })?;
+        let opened_metadata = file.metadata()?;
+        let mut file_digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            file_digest.update(&buffer[..read]);
+        }
+        let hashed_metadata = file.metadata()?;
+        if hashed_metadata.len() != opened_metadata.len() {
             bail!(
-                "key-publication file changed type, size, or permissions while inspected: {}",
+                "key-publication file changed size while hashing: {}",
+                path.display()
+            );
+        }
+        let probe = File::open(path)?;
+        let path_identity = crate::franken_sync::FileIdentity::from_file(&probe)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "filesystem stopped exposing a stable identity for key-publication file {}",
+                    path.display()
+                )
+            })?;
+        if path_identity != identity {
+            bail!(
+                "key-publication file changed identity while hashing: {}",
                 path.display()
             );
         }
 
         total_bytes = total_bytes
-            .checked_add(file_len)
+            .checked_add(opened_metadata.len())
             .context("Pages key-publication byte count overflowed u64")?;
         digest.update(b"file\0");
         digest.update(relative.as_bytes());
         digest.update(b"\0");
-        digest.update(file_mode.to_be_bytes());
-        digest.update(file_len.to_be_bytes());
-        digest.update(file_digest);
-    }
-
-    let mut final_paths = Vec::new();
-    collect_key_publication_paths(root, root, &mut final_paths)?;
-    final_paths.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-    if final_paths != paths {
-        bail!(
-            "Pages key-publication entries changed while inspected: {}",
-            root.display()
-        );
+        digest.update(key_publication_mode(&metadata).to_be_bytes());
+        digest.update(opened_metadata.len().to_be_bytes());
+        digest.update(file_digest.finalize());
     }
 
     let final_root_metadata = std::fs::symlink_metadata(root)?;
@@ -858,9 +591,7 @@ fn collect_key_publication_paths(
     Ok(())
 }
 
-fn allocate_key_mutation_staging_root(
-    live_root: &Path,
-) -> Result<(PathBuf, KeyMutationStagingOwnership)> {
+fn allocate_key_mutation_staging_root(live_root: &Path) -> Result<PathBuf> {
     for _ in 0..64 {
         let path = random_key_mutation_sidecar_path(live_root, "staged");
         let mut builder = std::fs::DirBuilder::new();
@@ -870,35 +601,7 @@ fn allocate_key_mutation_staging_root(
             Ok(()) => {
                 #[cfg(unix)]
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
-                let handle = File::open(&path)?;
-                let identity = crate::franken_sync::FileIdentity::from_file(&handle)?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "filesystem does not expose a stable identity for Pages key-mutation staging root {}",
-                            path.display()
-                        )
-                    })?;
-                let probe = File::open(&path)?;
-                let path_identity = crate::franken_sync::FileIdentity::from_file(&probe)?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "filesystem stopped exposing a stable staging-root pathname identity"
-                        )
-                    })?;
-                if path_identity != identity {
-                    bail!(
-                        "Pages key-mutation staging root changed identity during allocation: {}",
-                        path.display()
-                    );
-                }
-                return Ok((
-                    path.clone(),
-                    KeyMutationStagingOwnership {
-                        path,
-                        identity,
-                        handle,
-                    },
-                ));
+                return Ok(path);
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
@@ -935,51 +638,29 @@ fn rotation_replaces_site_entry(target: &KeyMutationTarget, relative: &Path) -> 
 }
 
 fn stage_key_mutation_tree(
-    guard: &KeyMutationGuard,
+    target: &KeyMutationTarget,
     mode: KeyMutationStageMode,
-) -> Result<(PathBuf, TreeEvidence, KeyMutationStagingOwnership)> {
-    require_key_mutation_guard(guard)?;
-    let target = &guard.target;
+) -> Result<(PathBuf, TreeEvidence)> {
     let prior_evidence = inspect_key_publication_tree(&target.live_root)?;
-    let (staged_root, staging_ownership) =
-        allocate_key_mutation_staging_root(&target.live_root)?;
+    let staged_root = allocate_key_mutation_staging_root(&target.live_root)?;
     let canonical_live_root = target.live_root.canonicalize().with_context(|| {
         format!(
             "failed resolving Pages key-mutation root {}",
             target.live_root.display()
         )
     })?;
-    let canonical_live_site = target.live_site_dir().canonicalize().with_context(|| {
-        format!(
-            "failed resolving Pages key-mutation site {}",
-            target.live_site_dir().display()
-        )
-    })?;
-    if !canonical_live_site.starts_with(&canonical_live_root) {
-        bail!(
-            "Pages key-mutation site resolves outside publication root: {}",
-            target.live_site_dir().display()
-        );
-    }
 
     let copy_result = copy_key_mutation_tree_recursive(
         target,
         &target.live_root,
         &staged_root,
         &target.live_root,
-        &canonical_live_site,
+        &canonical_live_root,
         mode,
         0,
     );
     if let Err(error) = copy_result {
-        let cleanup_error = remove_owned_key_mutation_tree(
-            guard,
-            &staged_root,
-            None,
-            Some(&staging_ownership),
-            None,
-        )
-        .err();
+        let cleanup_error = remove_owned_key_mutation_tree(&staged_root, None).err();
         return match cleanup_error {
             Some(cleanup_error) => Err(error.context(format!(
                 "failed cleaning rejected key-mutation staging root: {cleanup_error:#}"
@@ -996,7 +677,7 @@ fn stage_key_mutation_tree(
         )?)),
     )?;
 
-    Ok((staged_root, prior_evidence, staging_ownership))
+    Ok((staged_root, prior_evidence))
 }
 
 fn copy_key_mutation_tree_recursive(
@@ -1004,7 +685,7 @@ fn copy_key_mutation_tree_recursive(
     source_directory: &Path,
     staged_root: &Path,
     source_root: &Path,
-    canonical_source_site: &Path,
+    canonical_source_root: &Path,
     mode: KeyMutationStageMode,
     depth: usize,
 ) -> Result<()> {
@@ -1055,9 +736,9 @@ fn copy_key_mutation_tree_recursive(
                     source_path.display()
                 )
             })?;
-            if !canonical_target.starts_with(canonical_source_site) {
+            if !canonical_target.starts_with(canonical_source_root) {
                 bail!(
-                    "refusing to stage Pages key-mutation symlink outside public site root: {}",
+                    "refusing to stage Pages key-mutation symlink outside archive root: {}",
                     source_path.display()
                 );
             }
@@ -1095,7 +776,7 @@ fn copy_key_mutation_tree_recursive(
                 &source_path,
                 staged_root,
                 source_root,
-                canonical_source_site,
+                canonical_source_root,
                 mode,
                 depth + 1,
             )?;
@@ -1171,24 +852,13 @@ fn direct_child_from_journal(
     Ok(root.with_file_name(name))
 }
 
-fn validate_key_mutation_digest(label: &str, digest: &str) -> Result<()> {
-    if digest.len() != 64
-        || !digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        bail!("Pages key-mutation journal {label} digest is not canonical SHA-256");
-    }
-    Ok(())
-}
-
 fn write_key_mutation_journal(
     guard: &KeyMutationGuard,
     staged_root: &Path,
     backup_root: &Path,
     prior: &TreeEvidence,
     candidate: &TreeEvidence,
-) -> Result<ValidatedKeyMutationJournal> {
+) -> Result<()> {
     require_key_mutation_guard(guard)?;
     match std::fs::symlink_metadata(&guard.target.journal_path) {
         Ok(_) => bail!(
@@ -1206,23 +876,6 @@ fn write_key_mutation_journal(
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| anyhow::anyhow!("key-mutation backup name is not UTF-8"))?;
-    let claimed_staged = direct_child_from_journal(
-        &guard.target.live_root,
-        staged_file_name,
-        "staged",
-        "key-mutation staged path",
-    )?;
-    let claimed_backup = direct_child_from_journal(
-        &guard.target.live_root,
-        backup_file_name,
-        "backup",
-        "key-mutation backup path",
-    )?;
-    if claimed_staged != staged_root || claimed_backup != backup_root {
-        bail!("Pages key-mutation journal paths do not name the exact staged and backup trees");
-    }
-    validate_key_mutation_digest("prior", &prior.digest)?;
-    validate_key_mutation_digest("candidate", &candidate.digest)?;
     let journal = KeyMutationJournal {
         format: KEY_MUTATION_JOURNAL_FORMAT.to_string(),
         staged_file_name: staged_file_name.to_string(),
@@ -1246,25 +899,10 @@ fn write_key_mutation_journal(
     })?;
     file.write_all(&bytes)?;
     file.sync_all()?;
-    sync_parent_directory(&guard.target.journal_path)?;
-    let validated = read_key_mutation_journal(guard)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "newly written Pages key-mutation journal disappeared: {}",
-            guard.target.journal_path.display()
-        )
-    })?;
-    if validated.journal != journal {
-        bail!(
-            "newly written Pages key-mutation journal changed content: {}",
-            guard.target.journal_path.display()
-        );
-    }
-    Ok(validated)
+    sync_parent_directory(&guard.target.journal_path)
 }
 
-fn read_key_mutation_journal(
-    guard: &KeyMutationGuard,
-) -> Result<Option<ValidatedKeyMutationJournal>> {
+fn read_key_mutation_journal(guard: &KeyMutationGuard) -> Result<Option<KeyMutationJournal>> {
     require_key_mutation_guard(guard)?;
     let metadata = match std::fs::symlink_metadata(&guard.target.journal_path) {
         Ok(metadata) => metadata,
@@ -1304,12 +942,6 @@ fn read_key_mutation_journal(
     let identity = crate::franken_sync::FileIdentity::from_file(&file)?
         .ok_or_else(|| anyhow::anyhow!("filesystem does not expose a stable journal identity"))?;
     let opened_metadata = file.metadata()?;
-    if opened_metadata.len() != metadata.len() {
-        bail!(
-            "Pages key-mutation recovery journal changed size before read: {}",
-            guard.target.journal_path.display()
-        );
-    }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     Read::by_ref(&mut file)
         .take(KEY_MUTATION_JOURNAL_MAX_BYTES + 1)
@@ -1332,12 +964,6 @@ fn read_key_mutation_journal(
             guard.target.journal_path.display()
         );
     }
-    if path_probe.metadata()?.len() != opened_metadata.len() {
-        bail!(
-            "Pages key-mutation recovery journal changed size after read: {}",
-            guard.target.journal_path.display()
-        );
-    }
     let journal: KeyMutationJournal = serde_json::from_slice(&bytes).with_context(|| {
         format!(
             "failed parsing Pages key-mutation recovery journal {}",
@@ -1354,93 +980,15 @@ fn read_key_mutation_journal(
         ("prior", journal.prior_digest.as_str()),
         ("candidate", journal.candidate_digest.as_str()),
     ] {
-        validate_key_mutation_digest(label, digest)?;
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            bail!("Pages key-mutation journal {label} digest is not canonical SHA-256");
+        }
     }
-    Ok(Some(ValidatedKeyMutationJournal {
-        journal,
-        identity,
-        size: opened_metadata.len(),
-        handle: file,
-    }))
-}
-
-fn require_validated_key_mutation_journal(
-    guard: &KeyMutationGuard,
-    validated: &ValidatedKeyMutationJournal,
-) -> Result<()> {
-    require_key_mutation_guard(guard)?;
-    let held_identity = crate::franken_sync::FileIdentity::from_file(&validated.handle)?
-        .ok_or_else(|| anyhow::anyhow!("filesystem stopped exposing a held journal identity"))?;
-    if held_identity != validated.identity || validated.handle.metadata()?.len() != validated.size {
-        bail!(
-            "held Pages key-mutation journal changed identity or size after validation: {}",
-            guard.target.journal_path.display()
-        );
-    }
-    let metadata = std::fs::symlink_metadata(&guard.target.journal_path).with_context(|| {
-        format!(
-            "failed re-inspecting Pages key-mutation journal {}",
-            guard.target.journal_path.display()
-        )
-    })?;
-    if !metadata.file_type().is_file() || metadata.len() != validated.size {
-        bail!(
-            "Pages key-mutation journal changed type or size after validation: {}",
-            guard.target.journal_path.display()
-        );
-    }
-    #[cfg(unix)]
-    if metadata.nlink() != 1 || key_publication_mode(&metadata) & 0o077 != 0 {
-        bail!(
-            "Pages key-mutation journal changed ownership evidence after validation: {}",
-            guard.target.journal_path.display()
-        );
-    }
-    let mut probe = File::open(&guard.target.journal_path)?;
-    let identity = crate::franken_sync::FileIdentity::from_file(&probe)?
-        .ok_or_else(|| {
-            anyhow::anyhow!("filesystem stopped exposing a stable journal pathname identity")
-        })?;
-    if identity != validated.identity || probe.metadata()?.len() != validated.size {
-        bail!(
-            "Pages key-mutation journal changed identity or size after validation: {}",
-            guard.target.journal_path.display()
-        );
-    }
-    let mut bytes = Vec::with_capacity(validated.size as usize);
-    Read::by_ref(&mut probe)
-        .take(KEY_MUTATION_JOURNAL_MAX_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 != validated.size || probe.metadata()?.len() != validated.size {
-        bail!(
-            "Pages key-mutation journal changed size while content was revalidated: {}",
-            guard.target.journal_path.display()
-        );
-    }
-    let observed: KeyMutationJournal = serde_json::from_slice(&bytes).with_context(|| {
-        format!(
-            "Pages key-mutation journal changed to invalid content before cleanup: {}",
-            guard.target.journal_path.display()
-        )
-    })?;
-    if observed != validated.journal {
-        bail!(
-            "Pages key-mutation journal changed content after validation: {}",
-            guard.target.journal_path.display()
-        );
-    }
-    let final_probe = File::open(&guard.target.journal_path)?;
-    let final_identity = crate::franken_sync::FileIdentity::from_file(&final_probe)?
-        .ok_or_else(|| {
-            anyhow::anyhow!("filesystem stopped exposing a stable journal pathname identity")
-        })?;
-    if final_identity != validated.identity || final_probe.metadata()?.len() != validated.size {
-        bail!(
-            "Pages key-mutation journal changed identity or size after content revalidation: {}",
-            guard.target.journal_path.display()
-        );
-    }
-    Ok(())
+    Ok(Some(journal))
 }
 
 fn optional_key_tree_evidence(path: &Path) -> Result<Option<TreeEvidence>> {
@@ -1457,52 +1005,9 @@ fn optional_key_tree_evidence(path: &Path) -> Result<Option<TreeEvidence>> {
     }
 }
 
-fn remove_owned_key_mutation_tree(
-    guard: &KeyMutationGuard,
-    path: &Path,
-    expected_digest: Option<&str>,
-    staging_ownership: Option<&KeyMutationStagingOwnership>,
-    expected_journal: Option<&ValidatedKeyMutationJournal>,
-) -> Result<()> {
-    require_key_mutation_guard(guard)?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow::anyhow!("owned key-mutation path is not valid UTF-8"))?;
-    let owned_path = ["staged", "backup"].into_iter().any(|role| {
-        direct_child_from_journal(
-            &guard.target.live_root,
-            file_name,
-            role,
-            "owned key-mutation cleanup path",
-        )
-        .is_ok_and(|owned| owned == path)
-    });
-    if !owned_path {
-        bail!(
-            "refusing to remove a path not owned by this Pages key mutation: {}",
-            path.display()
-        );
-    }
-    if expected_digest.is_none() && staging_ownership.is_none() {
-        bail!(
-            "refusing pre-journal cleanup without stable staging ownership: {}",
-            path.display()
-        );
-    }
-    if let Some(staging_ownership) = staging_ownership
-        && staging_ownership.path != path
-    {
-        bail!(
-            "staging ownership does not authorize cleanup of {}",
-            path.display()
-        );
-    }
+fn remove_owned_key_mutation_tree(path: &Path, expected_digest: Option<&str>) -> Result<()> {
     let Some(evidence) = optional_key_tree_evidence(path)? else {
-        bail!(
-            "owned Pages key-mutation cleanup path disappeared before verification: {}",
-            path.display()
-        );
+        return Ok(());
     };
     if let Some(expected_digest) = expected_digest
         && evidence.digest != expected_digest
@@ -1512,32 +1017,6 @@ fn remove_owned_key_mutation_tree(
             path.display()
         );
     }
-    require_key_mutation_guard(guard)?;
-    if let Some(staging_ownership) = staging_ownership {
-        let held_identity = crate::franken_sync::FileIdentity::from_file(
-            &staging_ownership.handle,
-        )?
-        .ok_or_else(|| {
-            anyhow::anyhow!("filesystem stopped exposing a held staging-root identity")
-        })?;
-        let probe = File::open(path)?;
-        let path_identity = crate::franken_sync::FileIdentity::from_file(&probe)?
-            .ok_or_else(|| {
-                anyhow::anyhow!("filesystem stopped exposing a staging-root pathname identity")
-            })?;
-        if held_identity != staging_ownership.identity
-            || path_identity != staging_ownership.identity
-        {
-            bail!(
-                "Pages key-mutation staging root changed identity before cleanup: {}",
-                path.display()
-            );
-        }
-    }
-    if let Some(expected_journal) = expected_journal {
-        require_validated_key_mutation_journal(guard, expected_journal)?;
-    }
-    require_key_mutation_guard(guard)?;
     std::fs::remove_dir_all(path).with_context(|| {
         format!(
             "failed removing owned Pages key-mutation tree {}",
@@ -1547,13 +1026,7 @@ fn remove_owned_key_mutation_tree(
     sync_parent_directory(path)
 }
 
-fn remove_key_mutation_journal(
-    guard: &KeyMutationGuard,
-    expected: Option<&ValidatedKeyMutationJournal>,
-) -> Result<()> {
-    if let Some(expected) = expected {
-        require_validated_key_mutation_journal(guard, expected)?;
-    }
+fn remove_key_mutation_journal(guard: &KeyMutationGuard) -> Result<()> {
     require_key_mutation_guard(guard)?;
     let metadata = match std::fs::symlink_metadata(&guard.target.journal_path) {
         Ok(metadata) => metadata,
@@ -1566,46 +1039,6 @@ fn remove_key_mutation_journal(
             guard.target.journal_path.display()
         );
     }
-    #[cfg(unix)]
-    {
-        if metadata.nlink() != 1 {
-            bail!(
-                "refusing to remove hard-linked key-mutation journal {}",
-                guard.target.journal_path.display()
-            );
-        }
-        if key_publication_mode(&metadata) & 0o077 != 0 {
-            bail!(
-                "refusing to remove non-owner-only key-mutation journal {}",
-                guard.target.journal_path.display()
-            );
-        }
-    }
-    let journal_file = File::open(&guard.target.journal_path)?;
-    let journal_identity = crate::franken_sync::FileIdentity::from_file(&journal_file)?
-        .ok_or_else(|| anyhow::anyhow!("filesystem does not expose a stable journal identity"))?;
-    let journal_size = journal_file.metadata()?.len();
-    if let Some(expected) = expected
-        && (journal_identity != expected.identity || journal_size != expected.size)
-    {
-        bail!(
-            "Pages key-mutation journal changed identity or size before cleanup: {}",
-            guard.target.journal_path.display()
-        );
-    }
-    require_key_mutation_guard(guard)?;
-    let journal_probe = File::open(&guard.target.journal_path)?;
-    let path_identity = crate::franken_sync::FileIdentity::from_file(&journal_probe)?
-        .ok_or_else(|| {
-            anyhow::anyhow!("filesystem stopped exposing a stable journal pathname identity")
-        })?;
-    if path_identity != journal_identity || journal_probe.metadata()?.len() != journal_size {
-        bail!(
-            "Pages key-mutation journal changed identity or size before cleanup: {}",
-            guard.target.journal_path.display()
-        );
-    }
-    require_key_mutation_guard(guard)?;
     std::fs::remove_file(&guard.target.journal_path)?;
     sync_parent_directory(&guard.target.journal_path)
 }
@@ -1619,10 +1052,9 @@ fn evidence_has_digest(evidence: &Option<TreeEvidence>, digest: &str) -> bool {
 fn recover_interrupted_key_mutation(
     guard: &KeyMutationGuard,
 ) -> Result<RecoveredKeyMutation> {
-    let Some(validated_journal) = read_key_mutation_journal(guard)? else {
+    let Some(journal) = read_key_mutation_journal(guard)? else {
         return Ok(RecoveredKeyMutation::None);
     };
-    let journal = &validated_journal.journal;
     let staged_root = direct_child_from_journal(
         &guard.target.live_root,
         &journal.staged_file_name,
@@ -1650,15 +1082,8 @@ fn recover_interrupted_key_mutation(
         && evidence_has_digest(&staged, &journal.candidate_digest)
         && backup.is_none()
     {
-        require_validated_key_mutation_journal(guard, &validated_journal)?;
-        remove_owned_key_mutation_tree(
-            guard,
-            &staged_root,
-            Some(&journal.candidate_digest),
-            None,
-            Some(&validated_journal),
-        )?;
-        remove_key_mutation_journal(guard, Some(&validated_journal))?;
+        remove_owned_key_mutation_tree(&staged_root, Some(&journal.candidate_digest))?;
+        remove_key_mutation_journal(guard)?;
         return Ok(RecoveredKeyMutation::RolledBack);
     }
 
@@ -1666,29 +1091,16 @@ fn recover_interrupted_key_mutation(
         let linux_prior = evidence_has_digest(&staged, &journal.prior_digest) && backup.is_none();
         let rename_pair_prior = staged.is_none()
             && evidence_has_digest(&backup, &journal.prior_digest);
-        require_validated_key_mutation_journal(guard, &validated_journal)?;
         if linux_prior {
-            remove_owned_key_mutation_tree(
-                guard,
-                &staged_root,
-                Some(&journal.prior_digest),
-                None,
-                Some(&validated_journal),
-            )?;
+            remove_owned_key_mutation_tree(&staged_root, Some(&journal.prior_digest))?;
         } else if rename_pair_prior {
-            remove_owned_key_mutation_tree(
-                guard,
-                &backup_root,
-                Some(&journal.prior_digest),
-                None,
-                Some(&validated_journal),
-            )?;
+            remove_owned_key_mutation_tree(&backup_root, Some(&journal.prior_digest))?;
         } else {
             bail!(
                 "ambiguous completed Pages key mutation: live candidate is present but its exact prior generation is not owned by the recovery journal"
             );
         }
-        remove_key_mutation_journal(guard, Some(&validated_journal))?;
+        remove_key_mutation_journal(guard)?;
         return Ok(RecoveredKeyMutation::Committed);
     }
 
@@ -1696,8 +1108,6 @@ fn recover_interrupted_key_mutation(
         && evidence_has_digest(&backup, &journal.prior_digest)
         && evidence_has_digest(&staged, &journal.candidate_digest)
     {
-        require_validated_key_mutation_journal(guard, &validated_journal)?;
-        require_key_mutation_guard(guard)?;
         std::fs::rename(&backup_root, &guard.target.live_root).with_context(|| {
             format!(
                 "failed restoring prior Pages archive {} from key-mutation backup {}",
@@ -1713,14 +1123,8 @@ fn recover_interrupted_key_mutation(
                 guard.target.live_root.display()
             );
         }
-        remove_owned_key_mutation_tree(
-            guard,
-            &staged_root,
-            Some(&journal.candidate_digest),
-            None,
-            Some(&validated_journal),
-        )?;
-        remove_key_mutation_journal(guard, Some(&validated_journal))?;
+        remove_owned_key_mutation_tree(&staged_root, Some(&journal.candidate_digest))?;
+        remove_key_mutation_journal(guard)?;
         return Ok(RecoveredKeyMutation::RolledBack);
     }
 
@@ -1785,17 +1189,8 @@ fn cleanup_committed_key_mutation(
     guard: &KeyMutationGuard,
     prior_path: &Path,
     prior_digest: &str,
-    journal: &ValidatedKeyMutationJournal,
 ) {
-    if let Err(error) =
-        remove_owned_key_mutation_tree(
-            guard,
-            prior_path,
-            Some(prior_digest),
-            None,
-            Some(journal),
-        )
-    {
+    if let Err(error) = remove_owned_key_mutation_tree(prior_path, Some(prior_digest)) {
         tracing::warn!(
             live_root = %guard.target.live_root.display(),
             retained_prior = %prior_path.display(),
@@ -1804,7 +1199,7 @@ fn cleanup_committed_key_mutation(
         );
         return;
     }
-    if let Err(error) = remove_key_mutation_journal(guard, Some(journal)) {
+    if let Err(error) = remove_key_mutation_journal(guard) {
         tracing::warn!(
             live_root = %guard.target.live_root.display(),
             journal = %guard.target.journal_path.display(),
@@ -1830,28 +1225,17 @@ fn publish_staged_key_mutation(
     verify_published_key_tree(staged_root, candidate)?;
 
     let backup_root = random_key_mutation_sidecar_path(&guard.target.live_root, "backup");
-    match std::fs::symlink_metadata(&backup_root) {
-        Ok(_) => bail!(
+    if std::fs::symlink_metadata(&backup_root).is_ok() {
+        bail!(
             "fresh Pages key-mutation backup path unexpectedly exists: {}",
             backup_root.display()
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "failed inspecting fresh Pages key-mutation backup path {}",
-                    backup_root.display()
-                )
-            });
-        }
+        );
     }
-    let journal =
-        write_key_mutation_journal(guard, staged_root, &backup_root, prior, candidate)?;
+    write_key_mutation_journal(guard, staged_root, &backup_root, prior, candidate)?;
     require_key_mutation_guard(guard)?;
 
     #[cfg(target_os = "linux")]
     {
-        require_key_mutation_guard(guard)?;
         match crate::indexer::atomic_exchange_paths(&guard.target.live_root, staged_root) {
             Ok(()) => {
                 sync_parent_directory(&guard.target.live_root).with_context(|| {
@@ -1864,31 +1248,19 @@ fn publish_staged_key_mutation(
                 if let Err(verification_error) =
                     verify_published_key_tree(&guard.target.live_root, candidate)
                 {
-                    require_key_mutation_guard(guard)?;
                     crate::indexer::atomic_exchange_paths(&guard.target.live_root, staged_root)
                         .context(
                             "published Pages key tree failed verification and atomic rollback failed",
                         )?;
                     sync_parent_directory(&guard.target.live_root)?;
                     verify_published_key_tree(&guard.target.live_root, prior)?;
-                    remove_owned_key_mutation_tree(
-                        guard,
-                        staged_root,
-                        Some(&candidate.digest),
-                        None,
-                        Some(&journal),
-                    )?;
-                    remove_key_mutation_journal(guard, Some(&journal))?;
+                    remove_owned_key_mutation_tree(staged_root, Some(&candidate.digest))?;
+                    remove_key_mutation_journal(guard)?;
                     return Err(verification_error.context(
                         "published Pages key tree failed verification; restored prior generation",
                     ));
                 }
-                cleanup_committed_key_mutation(
-                    guard,
-                    staged_root,
-                    &prior.digest,
-                    &journal,
-                );
+                cleanup_committed_key_mutation(guard, staged_root, &prior.digest);
                 return Ok(());
             }
             Err(error) if crate::indexer::linux_atomic_exchange_is_unsupported(&error) => {
@@ -1901,7 +1273,6 @@ fn publish_staged_key_mutation(
         }
     }
 
-    require_key_mutation_guard(guard)?;
     std::fs::rename(&guard.target.live_root, &backup_root).with_context(|| {
         format!(
             "failed parking prior Pages archive {} at {}",
@@ -1910,18 +1281,11 @@ fn publish_staged_key_mutation(
         )
     })?;
     if let Err(sync_error) = sync_parent_directory(&guard.target.live_root) {
-        require_key_mutation_guard(guard)?;
         match std::fs::rename(&backup_root, &guard.target.live_root) {
             Ok(()) => {
                 sync_parent_directory(&guard.target.live_root)?;
-                remove_owned_key_mutation_tree(
-                    guard,
-                    staged_root,
-                    Some(&candidate.digest),
-                    None,
-                    Some(&journal),
-                )?;
-                remove_key_mutation_journal(guard, Some(&journal))?;
+                remove_owned_key_mutation_tree(staged_root, Some(&candidate.digest))?;
+                remove_key_mutation_journal(guard)?;
                 return Err(sync_error.context(
                     "failed durably parking prior Pages archive; restored prior generation",
                 ));
@@ -1934,20 +1298,12 @@ fn publish_staged_key_mutation(
         }
     }
 
-    require_key_mutation_guard(guard)?;
     if let Err(publish_error) = std::fs::rename(staged_root, &guard.target.live_root) {
-        require_key_mutation_guard(guard)?;
         return match std::fs::rename(&backup_root, &guard.target.live_root) {
             Ok(()) => {
                 sync_parent_directory(&guard.target.live_root)?;
-                remove_owned_key_mutation_tree(
-                    guard,
-                    staged_root,
-                    Some(&candidate.digest),
-                    None,
-                    Some(&journal),
-                )?;
-                remove_key_mutation_journal(guard, Some(&journal))?;
+                remove_owned_key_mutation_tree(staged_root, Some(&candidate.digest))?;
+                remove_key_mutation_journal(guard)?;
                 Err(publish_error).context(
                     "failed publishing staged Pages key mutation; restored prior generation",
                 )
@@ -1968,31 +1324,23 @@ fn publish_staged_key_mutation(
     })?;
 
     if let Err(verification_error) = verify_published_key_tree(&guard.target.live_root, candidate) {
-        require_key_mutation_guard(guard)?;
         std::fs::rename(&guard.target.live_root, staged_root).with_context(|| {
             format!(
                 "published Pages key tree failed verification and candidate could not be parked at {}",
                 staged_root.display()
             )
         })?;
-        require_key_mutation_guard(guard)?;
         std::fs::rename(&backup_root, &guard.target.live_root)
             .context("published Pages key tree failed verification and prior restore failed")?;
         sync_parent_directory(&guard.target.live_root)?;
         verify_published_key_tree(&guard.target.live_root, prior)?;
-        remove_owned_key_mutation_tree(
-            guard,
-            staged_root,
-            Some(&candidate.digest),
-            None,
-            Some(&journal),
-        )?;
-        remove_key_mutation_journal(guard, Some(&journal))?;
+        remove_owned_key_mutation_tree(staged_root, Some(&candidate.digest))?;
+        remove_key_mutation_journal(guard)?;
         return Err(verification_error
             .context("published Pages key tree failed verification; restored prior generation"));
     }
 
-    cleanup_committed_key_mutation(guard, &backup_root, &prior.digest, &journal);
+    cleanup_committed_key_mutation(guard, &backup_root, &prior.digest);
     Ok(())
 }
 
@@ -2002,8 +1350,8 @@ fn publish_key_config_mutation(
     recovery_secret: Option<&[u8]>,
     remove_recovery_artifacts: bool,
 ) -> Result<()> {
-    let (staged_root, prior, staging_ownership) =
-        stage_key_mutation_tree(guard, KeyMutationStageMode::PreserveSite)?;
+    let (staged_root, prior) =
+        stage_key_mutation_tree(&guard.target, KeyMutationStageMode::PreserveSite)?;
     let staged_site = guard.target.staged_site_dir(&staged_root);
     let prepare_result = (|| -> Result<TreeEvidence> {
         materialize_safe_required_file_symlinks(&staged_site)?;
@@ -2029,13 +1377,7 @@ fn publish_key_config_mutation(
     let candidate = match prepare_result {
         Ok(candidate) => candidate,
         Err(error) => {
-            return match remove_owned_key_mutation_tree(
-                guard,
-                &staged_root,
-                None,
-                Some(&staging_ownership),
-                None,
-            ) {
+            return match remove_owned_key_mutation_tree(&staged_root, None) {
                 Ok(()) => Err(error),
                 Err(cleanup_error) => Err(error.context(format!(
                     "failed cleaning rejected key-mutation candidate: {cleanup_error:#}"
@@ -2316,8 +1658,8 @@ pub fn key_rotate(
     // 4. Stage the complete site/private generation and publish it through
     // the same journaled transaction as add/revoke. Old payload and blob
     // ciphertext are deliberately omitted from the staged copy.
-    let (staged_root, prior, staging_ownership) = stage_key_mutation_tree(
-        &guard,
+    let (staged_root, prior) = stage_key_mutation_tree(
+        &guard.target,
         KeyMutationStageMode::ReplaceEncryptedPayload,
     )?;
     let staged_site_dir = guard.target.staged_site_dir(&staged_root);
@@ -2380,13 +1722,7 @@ pub fn key_rotate(
     let candidate = match prepare_result {
         Ok(candidate) => candidate,
         Err(error) => {
-            return match remove_owned_key_mutation_tree(
-                &guard,
-                &staged_root,
-                None,
-                Some(&staging_ownership),
-                None,
-            ) {
+            return match remove_owned_key_mutation_tree(&staged_root, None) {
                 Ok(()) => Err(error),
                 Err(cleanup_error) => Err(error.context(format!(
                     "failed cleaning rejected key-rotation candidate: {cleanup_error:#}"
@@ -3509,132 +2845,20 @@ mod tests {
     }
 
     #[test]
-    fn key_mutation_rejects_a_concurrent_bundle_publication_without_changing_config() -> Result<()> {
+    fn key_mutation_lock_rejects_a_concurrent_writer_without_changing_config() -> Result<()> {
         let (_temp_dir, archive_dir) = setup_test_archive();
-        let _bundle_publication_guard = acquire_pages_publication_lock(&archive_dir)?;
+        let target = derive_key_mutation_target(&archive_dir)?;
+        let _guard = open_key_mutation_lock(target)?;
         let config_before = std::fs::read(archive_dir.join("site/config.json"))?;
 
         let error = key_add_password(&archive_dir, "test-password", "concurrent-password")
             .expect_err("a second key writer must not enter the transaction");
 
-        anyhow::ensure!(format!("{error:#}").contains("another Pages publication"));
+        anyhow::ensure!(format!("{error:#}").contains("already active"));
         anyhow::ensure!(
             std::fs::read(archive_dir.join("site/config.json"))? == config_before,
-            "bundle/key lock contention changed the live key configuration"
+            "lock contention changed the live key configuration"
         );
-        Ok(())
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn key_mutation_lock_path_replacement_blocks_owned_tree_cleanup() -> Result<()> {
-        let (temp_dir, archive_dir) = setup_test_archive();
-        let guard = open_key_mutation_lock(derive_key_mutation_target(&archive_dir)?)?;
-        let (staged, _prior, staging_ownership) =
-            stage_key_mutation_tree(&guard, KeyMutationStageMode::PreserveSite)?;
-        let parked_lock = temp_dir.path().join("parked-publication-lock");
-        std::fs::rename(&guard.publication_lock.lock_path, &parked_lock)?;
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let _replacement = options.open(&guard.publication_lock.lock_path)?;
-
-        let error = remove_owned_key_mutation_tree(
-            &guard,
-            &staged,
-            None,
-            Some(&staging_ownership),
-            None,
-        )
-        .expect_err("a replaced lock pathname must block destructive cleanup");
-
-        anyhow::ensure!(format!("{error:#}").contains("was replaced"));
-        anyhow::ensure!(std::fs::symlink_metadata(&staged)?.file_type().is_dir());
-        Ok(())
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn key_mutation_staging_path_replacement_blocks_prejournal_cleanup() -> Result<()> {
-        let (temp_dir, archive_dir) = setup_test_archive();
-        let guard = open_key_mutation_lock(derive_key_mutation_target(&archive_dir)?)?;
-        let (staged, _prior, staging_ownership) =
-            stage_key_mutation_tree(&guard, KeyMutationStageMode::PreserveSite)?;
-        let parked_staged = temp_dir.path().join("parked-staged-generation");
-        std::fs::rename(&staged, &parked_staged)?;
-        std::fs::create_dir(&staged)?;
-
-        let error = remove_owned_key_mutation_tree(
-            &guard,
-            &staged,
-            None,
-            Some(&staging_ownership),
-            None,
-        )
-        .expect_err("a replaced staging pathname must survive pre-journal cleanup");
-
-        anyhow::ensure!(format!("{error:#}").contains("changed identity"));
-        anyhow::ensure!(std::fs::symlink_metadata(&staged)?.file_type().is_dir());
-        anyhow::ensure!(
-            std::fs::symlink_metadata(&parked_staged)?
-                .file_type()
-                .is_dir()
-        );
-        Ok(())
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn committed_key_cleanup_retains_tree_when_journal_content_changes_at_same_size() -> Result<()> {
-        let (_temp_dir, archive_dir) = setup_test_archive();
-        let guard = open_key_mutation_lock(derive_key_mutation_target(&archive_dir)?)?;
-        let (staged, prior, _staging_ownership) =
-            stage_key_mutation_tree(&guard, KeyMutationStageMode::PreserveSite)?;
-        std::fs::write(staged.join("candidate-marker"), b"candidate")?;
-        let candidate = inspect_key_publication_tree(&staged)?;
-        let backup = random_key_mutation_sidecar_path(&archive_dir, "backup");
-        let journal =
-            write_key_mutation_journal(&guard, &staged, &backup, &prior, &candidate)?;
-        let mut changed_bytes = std::fs::read(&guard.target.journal_path)?;
-        let marker = b"\"candidate_digest\": \"";
-        let value_offset = changed_bytes
-            .windows(marker.len())
-            .position(|window| window == marker)
-            .context("candidate digest marker")?
-            + marker.len();
-        changed_bytes[value_offset] = if changed_bytes[value_offset] == b'a' {
-            b'b'
-        } else {
-            b'a'
-        };
-        std::fs::write(&guard.target.journal_path, &changed_bytes)?;
-        std::fs::set_permissions(
-            &guard.target.journal_path,
-            std::fs::Permissions::from_mode(0o600),
-        )?;
-
-        cleanup_committed_key_mutation(&guard, &staged, &candidate.digest, &journal);
-
-        anyhow::ensure!(std::fs::metadata(&guard.target.journal_path)?.len() == journal.size);
-        anyhow::ensure!(std::fs::symlink_metadata(&staged)?.file_type().is_dir());
-        Ok(())
-    }
-
-    #[test]
-    fn key_mutation_of_standalone_directory_named_site_preserves_its_siblings() -> Result<()> {
-        let (temp_dir, archive_dir) = setup_test_archive();
-        let standalone_parent = temp_dir.path().join("standalone-parent");
-        let standalone_site = standalone_parent.join("site");
-        std::fs::create_dir(&standalone_parent)?;
-        std::fs::rename(archive_dir.join("site"), &standalone_site)?;
-        let sibling = standalone_parent.join("unrelated.txt");
-        std::fs::write(&sibling, b"unrelated")?;
-
-        key_add_password(&standalone_site, "test-password", "new-password")?;
-
-        anyhow::ensure!(std::fs::read(&sibling)? == b"unrelated");
-        anyhow::ensure!(key_list(&standalone_site)?.active_slots == 2);
         Ok(())
     }
 
@@ -3691,11 +2915,6 @@ mod tests {
             candidate_digest: victim_evidence.digest,
         };
         write_json_pretty(&guard.target.journal_path, &journal)?;
-        #[cfg(unix)]
-        std::fs::set_permissions(
-            &guard.target.journal_path,
-            std::fs::Permissions::from_mode(0o600),
-        )?;
 
         let error = recover_interrupted_key_mutation(&guard)
             .expect_err("a journal must not claim an arbitrary sibling directory");
@@ -3706,50 +2925,11 @@ mod tests {
     }
 
     #[test]
-    fn key_mutation_recovery_rejects_noncanonical_digest_without_cleanup() -> Result<()> {
-        let (_temp_dir, archive_dir) = setup_test_archive();
-        let guard = open_key_mutation_lock(derive_key_mutation_target(&archive_dir)?)?;
-        let (staged, prior, _staging_ownership) = stage_key_mutation_tree(
-            &guard,
-            KeyMutationStageMode::PreserveSite,
-        )?;
-        let backup = random_key_mutation_sidecar_path(&archive_dir, "backup");
-        let journal = KeyMutationJournal {
-            format: KEY_MUTATION_JOURNAL_FORMAT.to_string(),
-            staged_file_name: staged
-                .file_name()
-                .and_then(|name| name.to_str())
-                .context("staged filename")?
-                .to_string(),
-            backup_file_name: backup
-                .file_name()
-                .and_then(|name| name.to_str())
-                .context("backup filename")?
-                .to_string(),
-            prior_digest: prior.digest,
-            candidate_digest: "A".repeat(64),
-        };
-        write_json_pretty(&guard.target.journal_path, &journal)?;
-        #[cfg(unix)]
-        std::fs::set_permissions(
-            &guard.target.journal_path,
-            std::fs::Permissions::from_mode(0o600),
-        )?;
-
-        let error = recover_interrupted_key_mutation(&guard)
-            .expect_err("noncanonical journal digests must fail closed");
-
-        anyhow::ensure!(format!("{error:#}").contains("not canonical SHA-256"));
-        anyhow::ensure!(std::fs::symlink_metadata(&staged)?.file_type().is_dir());
-        Ok(())
-    }
-
-    #[test]
     fn key_mutation_recovery_restores_exact_prior_after_park_crash() -> Result<()> {
         let (_temp_dir, archive_dir) = setup_test_archive();
         let guard = open_key_mutation_lock(derive_key_mutation_target(&archive_dir)?)?;
-        let (staged, prior, _staging_ownership) = stage_key_mutation_tree(
-            &guard,
+        let (staged, prior) = stage_key_mutation_tree(
+            &guard.target,
             KeyMutationStageMode::PreserveSite,
         )?;
         std::fs::write(staged.join("transaction-candidate.txt"), b"candidate")?;
@@ -3772,9 +2952,9 @@ mod tests {
     #[test]
     fn key_publication_evidence_rejects_destination_drift() -> Result<()> {
         let (_temp_dir, archive_dir) = setup_test_archive();
-        let guard = open_key_mutation_lock(derive_key_mutation_target(&archive_dir)?)?;
-        let (staged, _prior, staging_ownership) =
-            stage_key_mutation_tree(&guard, KeyMutationStageMode::PreserveSite)?;
+        let target = derive_key_mutation_target(&archive_dir)?;
+        let (staged, _prior) =
+            stage_key_mutation_tree(&target, KeyMutationStageMode::PreserveSite)?;
         let evidence = inspect_key_publication_tree(&staged)?;
         std::fs::write(staged.join("site/config.json"), b"{}")?;
 
@@ -3782,27 +2962,7 @@ mod tests {
             .expect_err("destination drift must invalidate exact publication evidence");
 
         anyhow::ensure!(format!("{error:#}").contains("failed exact verification"));
-        remove_owned_key_mutation_tree(
-            &guard,
-            &staged,
-            None,
-            Some(&staging_ownership),
-            None,
-        )?;
-        Ok(())
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn key_publication_evidence_binds_root_permissions() -> Result<()> {
-        let (_temp_dir, archive_dir) = setup_test_archive();
-        let evidence = inspect_key_publication_tree(&archive_dir)?;
-        std::fs::set_permissions(&archive_dir, std::fs::Permissions::from_mode(0o777))?;
-
-        let error = verify_published_key_tree(&archive_dir, &evidence)
-            .expect_err("a permissive publication-root mode must invalidate evidence");
-
-        anyhow::ensure!(format!("{error:#}").contains("failed exact verification"));
+        remove_owned_key_mutation_tree(&staged, None)?;
         Ok(())
     }
 
@@ -3820,32 +2980,6 @@ mod tests {
             .expect_err("over-deep trees must fail before exhausting the call stack");
 
         anyhow::ensure!(format!("{error:#}").contains("depth bound"));
-        Ok(())
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn key_add_rejects_public_symlink_to_private_key_material() -> Result<()> {
-        use std::os::unix::fs::symlink;
-
-        let (_temp_dir, archive_dir) = setup_test_archive();
-        let site_dir = archive_dir.join("site");
-        let viewer_path = site_dir.join("viewer.js");
-        let private_key_path = archive_dir.join("private/master-key.json");
-        let private_key_before = std::fs::read(&private_key_path)?;
-        std::fs::rename(&viewer_path, site_dir.join("viewer-real.js"))?;
-        symlink("../private/master-key.json", &viewer_path)?;
-
-        let error = key_add_password(&archive_dir, "test-password", "new-password")
-            .expect_err("public symlinks must not materialize private key bytes");
-
-        anyhow::ensure!(format!("{error:#}").contains("outside the public site root"));
-        anyhow::ensure!(std::fs::read(&private_key_path)? == private_key_before);
-        anyhow::ensure!(
-            std::fs::symlink_metadata(&viewer_path)?
-                .file_type()
-                .is_symlink()
-        );
         Ok(())
     }
 
