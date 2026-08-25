@@ -1396,7 +1396,7 @@ fn require_validated_key_mutation_journal(
             guard.target.journal_path.display()
         );
     }
-    let probe = File::open(&guard.target.journal_path)?;
+    let mut probe = File::open(&guard.target.journal_path)?;
     let identity = crate::franken_sync::FileIdentity::from_file(&probe)?
         .ok_or_else(|| {
             anyhow::anyhow!("filesystem stopped exposing a stable journal pathname identity")
@@ -1404,6 +1404,39 @@ fn require_validated_key_mutation_journal(
     if identity != validated.identity || probe.metadata()?.len() != validated.size {
         bail!(
             "Pages key-mutation journal changed identity or size after validation: {}",
+            guard.target.journal_path.display()
+        );
+    }
+    let mut bytes = Vec::with_capacity(validated.size as usize);
+    Read::by_ref(&mut probe)
+        .take(KEY_MUTATION_JOURNAL_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != validated.size || probe.metadata()?.len() != validated.size {
+        bail!(
+            "Pages key-mutation journal changed size while content was revalidated: {}",
+            guard.target.journal_path.display()
+        );
+    }
+    let observed: KeyMutationJournal = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "Pages key-mutation journal changed to invalid content before cleanup: {}",
+            guard.target.journal_path.display()
+        )
+    })?;
+    if observed != validated.journal {
+        bail!(
+            "Pages key-mutation journal changed content after validation: {}",
+            guard.target.journal_path.display()
+        );
+    }
+    let final_probe = File::open(&guard.target.journal_path)?;
+    let final_identity = crate::franken_sync::FileIdentity::from_file(&final_probe)?
+        .ok_or_else(|| {
+            anyhow::anyhow!("filesystem stopped exposing a stable journal pathname identity")
+        })?;
+    if final_identity != validated.identity || final_probe.metadata()?.len() != validated.size {
+        bail!(
+            "Pages key-mutation journal changed identity or size after content revalidation: {}",
             guard.target.journal_path.display()
         );
     }
@@ -3553,8 +3586,8 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn committed_key_cleanup_retains_tree_when_journal_identity_changes() -> Result<()> {
-        let (temp_dir, archive_dir) = setup_test_archive();
+    fn committed_key_cleanup_retains_tree_when_journal_content_changes_at_same_size() -> Result<()> {
+        let (_temp_dir, archive_dir) = setup_test_archive();
         let guard = open_key_mutation_lock(derive_key_mutation_target(&archive_dir)?)?;
         let (staged, prior, _staging_ownership) =
             stage_key_mutation_tree(&guard, KeyMutationStageMode::PreserveSite)?;
@@ -3563,9 +3596,19 @@ mod tests {
         let backup = random_key_mutation_sidecar_path(&archive_dir, "backup");
         let journal =
             write_key_mutation_journal(&guard, &staged, &backup, &prior, &candidate)?;
-        let parked_journal = temp_dir.path().join("parked-key-journal");
-        std::fs::rename(&guard.target.journal_path, &parked_journal)?;
-        std::fs::write(&guard.target.journal_path, b"{}")?;
+        let mut changed_bytes = std::fs::read(&guard.target.journal_path)?;
+        let marker = b"\"candidate_digest\": \"";
+        let value_offset = changed_bytes
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .context("candidate digest marker")?
+            + marker.len();
+        changed_bytes[value_offset] = if changed_bytes[value_offset] == b'a' {
+            b'b'
+        } else {
+            b'a'
+        };
+        std::fs::write(&guard.target.journal_path, &changed_bytes)?;
         std::fs::set_permissions(
             &guard.target.journal_path,
             std::fs::Permissions::from_mode(0o600),
@@ -3573,6 +3616,7 @@ mod tests {
 
         cleanup_committed_key_mutation(&guard, &staged, &candidate.digest, &journal);
 
+        anyhow::ensure!(std::fs::metadata(&guard.target.journal_path)?.len() == journal.size);
         anyhow::ensure!(std::fs::symlink_metadata(&staged)?.file_type().is_dir());
         Ok(())
     }
