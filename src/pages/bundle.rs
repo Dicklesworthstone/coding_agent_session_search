@@ -1528,6 +1528,10 @@ fn replace_dir_from_temp(
                 final_dir.display()
             )
         })?;
+        // From this point onward the candidate is live and the staging handle
+        // is intentionally absent. Any verification/durability error must
+        // preserve that state for diagnosis instead of attempting temp cleanup.
+        *retain_temp_on_error = true;
         ensure_bundle_tree_matches(final_dir, "first published bundle", &candidate)?;
         sync_parent_directory(final_dir).with_context(|| {
             format!(
@@ -1535,6 +1539,7 @@ fn replace_dir_from_temp(
                 final_dir.display()
             )
         })?;
+        *retain_temp_on_error = false;
         return Ok(());
     }
 
@@ -3420,7 +3425,7 @@ mod tests {
 
         let temp = TempDir::new()?;
         let staging_root = temp.path().join("bundle.staged");
-        create_bundle_staging_root(&staging_root)?;
+        let _staging_identity = create_bundle_staging_root(&staging_root)?;
 
         let staged_mode = fs::metadata(&staging_root)?.permissions().mode();
         if staged_mode & 0o077 != 0 {

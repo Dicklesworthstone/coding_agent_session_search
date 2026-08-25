@@ -1418,6 +1418,7 @@ fn remove_owned_key_mutation_tree(
     guard: &KeyMutationGuard,
     path: &Path,
     expected_digest: Option<&str>,
+    staging_ownership: Option<&KeyMutationStagingOwnership>,
     expected_journal: Option<&ValidatedKeyMutationJournal>,
 ) -> Result<()> {
     require_key_mutation_guard(guard)?;
@@ -1440,6 +1441,20 @@ fn remove_owned_key_mutation_tree(
             path.display()
         );
     }
+    if expected_digest.is_none() && staging_ownership.is_none() {
+        bail!(
+            "refusing pre-journal cleanup without stable staging ownership: {}",
+            path.display()
+        );
+    }
+    if let Some(staging_ownership) = staging_ownership
+        && staging_ownership.path != path
+    {
+        bail!(
+            "staging ownership does not authorize cleanup of {}",
+            path.display()
+        );
+    }
     let Some(evidence) = optional_key_tree_evidence(path)? else {
         return Ok(());
     };
@@ -1452,9 +1467,31 @@ fn remove_owned_key_mutation_tree(
         );
     }
     require_key_mutation_guard(guard)?;
+    if let Some(staging_ownership) = staging_ownership {
+        let held_identity = crate::franken_sync::FileIdentity::from_file(
+            &staging_ownership.handle,
+        )?
+        .ok_or_else(|| {
+            anyhow::anyhow!("filesystem stopped exposing a held staging-root identity")
+        })?;
+        let probe = File::open(path)?;
+        let path_identity = crate::franken_sync::FileIdentity::from_file(&probe)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("filesystem stopped exposing a staging-root pathname identity")
+            })?;
+        if held_identity != staging_ownership.identity
+            || path_identity != staging_ownership.identity
+        {
+            bail!(
+                "Pages key-mutation staging root changed identity before cleanup: {}",
+                path.display()
+            );
+        }
+    }
     if let Some(expected_journal) = expected_journal {
         require_validated_key_mutation_journal(guard, expected_journal)?;
     }
+    require_key_mutation_guard(guard)?;
     std::fs::remove_dir_all(path).with_context(|| {
         format!(
             "failed removing owned Pages key-mutation tree {}",
@@ -1522,6 +1559,7 @@ fn remove_key_mutation_journal(
             guard.target.journal_path.display()
         );
     }
+    require_key_mutation_guard(guard)?;
     std::fs::remove_file(&guard.target.journal_path)?;
     sync_parent_directory(&guard.target.journal_path)
 }
@@ -1571,6 +1609,7 @@ fn recover_interrupted_key_mutation(
             guard,
             &staged_root,
             Some(&journal.candidate_digest),
+            None,
             Some(&validated_journal),
         )?;
         remove_key_mutation_journal(guard, Some(&validated_journal))?;
@@ -1587,6 +1626,7 @@ fn recover_interrupted_key_mutation(
                 guard,
                 &staged_root,
                 Some(&journal.prior_digest),
+                None,
                 Some(&validated_journal),
             )?;
         } else if rename_pair_prior {
@@ -1594,6 +1634,7 @@ fn recover_interrupted_key_mutation(
                 guard,
                 &backup_root,
                 Some(&journal.prior_digest),
+                None,
                 Some(&validated_journal),
             )?;
         } else {
@@ -1630,6 +1671,7 @@ fn recover_interrupted_key_mutation(
             guard,
             &staged_root,
             Some(&journal.candidate_digest),
+            None,
             Some(&validated_journal),
         )?;
         remove_key_mutation_journal(guard, Some(&validated_journal))?;
@@ -1700,7 +1742,13 @@ fn cleanup_committed_key_mutation(
     journal: &ValidatedKeyMutationJournal,
 ) {
     if let Err(error) =
-        remove_owned_key_mutation_tree(guard, prior_path, Some(prior_digest), Some(journal))
+        remove_owned_key_mutation_tree(
+            guard,
+            prior_path,
+            Some(prior_digest),
+            None,
+            Some(journal),
+        )
     {
         tracing::warn!(
             live_root = %guard.target.live_root.display(),
@@ -1781,6 +1829,7 @@ fn publish_staged_key_mutation(
                         guard,
                         staged_root,
                         Some(&candidate.digest),
+                        None,
                         Some(&journal),
                     )?;
                     remove_key_mutation_journal(guard, Some(&journal))?;
@@ -1823,6 +1872,7 @@ fn publish_staged_key_mutation(
                     guard,
                     staged_root,
                     Some(&candidate.digest),
+                    None,
                     Some(&journal),
                 )?;
                 remove_key_mutation_journal(guard, Some(&journal))?;
@@ -1848,6 +1898,7 @@ fn publish_staged_key_mutation(
                     guard,
                     staged_root,
                     Some(&candidate.digest),
+                    None,
                     Some(&journal),
                 )?;
                 remove_key_mutation_journal(guard, Some(&journal))?;
@@ -1887,6 +1938,7 @@ fn publish_staged_key_mutation(
             guard,
             staged_root,
             Some(&candidate.digest),
+            None,
             Some(&journal),
         )?;
         remove_key_mutation_journal(guard, Some(&journal))?;
@@ -1904,7 +1956,7 @@ fn publish_key_config_mutation(
     recovery_secret: Option<&[u8]>,
     remove_recovery_artifacts: bool,
 ) -> Result<()> {
-    let (staged_root, prior) =
+    let (staged_root, prior, staging_ownership) =
         stage_key_mutation_tree(guard, KeyMutationStageMode::PreserveSite)?;
     let staged_site = guard.target.staged_site_dir(&staged_root);
     let prepare_result = (|| -> Result<TreeEvidence> {
@@ -1931,7 +1983,13 @@ fn publish_key_config_mutation(
     let candidate = match prepare_result {
         Ok(candidate) => candidate,
         Err(error) => {
-            return match remove_owned_key_mutation_tree(guard, &staged_root, None, None) {
+            return match remove_owned_key_mutation_tree(
+                guard,
+                &staged_root,
+                None,
+                Some(&staging_ownership),
+                None,
+            ) {
                 Ok(()) => Err(error),
                 Err(cleanup_error) => Err(error.context(format!(
                     "failed cleaning rejected key-mutation candidate: {cleanup_error:#}"
@@ -2212,7 +2270,7 @@ pub fn key_rotate(
     // 4. Stage the complete site/private generation and publish it through
     // the same journaled transaction as add/revoke. Old payload and blob
     // ciphertext are deliberately omitted from the staged copy.
-    let (staged_root, prior) = stage_key_mutation_tree(
+    let (staged_root, prior, staging_ownership) = stage_key_mutation_tree(
         &guard,
         KeyMutationStageMode::ReplaceEncryptedPayload,
     )?;
@@ -2276,7 +2334,13 @@ pub fn key_rotate(
     let candidate = match prepare_result {
         Ok(candidate) => candidate,
         Err(error) => {
-            return match remove_owned_key_mutation_tree(&guard, &staged_root, None, None) {
+            return match remove_owned_key_mutation_tree(
+                &guard,
+                &staged_root,
+                None,
+                Some(&staging_ownership),
+                None,
+            ) {
                 Ok(()) => Err(error),
                 Err(cleanup_error) => Err(error.context(format!(
                     "failed cleaning rejected key-rotation candidate: {cleanup_error:#}"
@@ -3420,7 +3484,7 @@ mod tests {
     fn key_mutation_lock_path_replacement_blocks_owned_tree_cleanup() -> Result<()> {
         let (temp_dir, archive_dir) = setup_test_archive();
         let guard = open_key_mutation_lock(derive_key_mutation_target(&archive_dir)?)?;
-        let (staged, _prior) =
+        let (staged, _prior, staging_ownership) =
             stage_key_mutation_tree(&guard, KeyMutationStageMode::PreserveSite)?;
         let parked_lock = temp_dir.path().join("parked-publication-lock");
         std::fs::rename(&guard.publication_lock.lock_path, &parked_lock)?;
@@ -3430,11 +3494,47 @@ mod tests {
         options.mode(0o600);
         let _replacement = options.open(&guard.publication_lock.lock_path)?;
 
-        let error = remove_owned_key_mutation_tree(&guard, &staged, None, None)
+        let error = remove_owned_key_mutation_tree(
+            &guard,
+            &staged,
+            None,
+            Some(&staging_ownership),
+            None,
+        )
             .expect_err("a replaced lock pathname must block destructive cleanup");
 
         anyhow::ensure!(format!("{error:#}").contains("was replaced"));
         anyhow::ensure!(std::fs::symlink_metadata(&staged)?.file_type().is_dir());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn key_mutation_staging_path_replacement_blocks_prejournal_cleanup() -> Result<()> {
+        let (temp_dir, archive_dir) = setup_test_archive();
+        let guard = open_key_mutation_lock(derive_key_mutation_target(&archive_dir)?)?;
+        let (staged, _prior, staging_ownership) =
+            stage_key_mutation_tree(&guard, KeyMutationStageMode::PreserveSite)?;
+        let parked_staged = temp_dir.path().join("parked-staged-generation");
+        std::fs::rename(&staged, &parked_staged)?;
+        std::fs::create_dir(&staged)?;
+
+        let error = remove_owned_key_mutation_tree(
+            &guard,
+            &staged,
+            None,
+            Some(&staging_ownership),
+            None,
+        )
+        .expect_err("a replaced staging pathname must survive pre-journal cleanup");
+
+        anyhow::ensure!(format!("{error:#}").contains("changed identity"));
+        anyhow::ensure!(std::fs::symlink_metadata(&staged)?.file_type().is_dir());
+        anyhow::ensure!(
+            std::fs::symlink_metadata(&parked_staged)?
+                .file_type()
+                .is_dir()
+        );
         Ok(())
     }
 
@@ -3526,7 +3626,7 @@ mod tests {
     fn key_mutation_recovery_rejects_noncanonical_digest_without_cleanup() -> Result<()> {
         let (_temp_dir, archive_dir) = setup_test_archive();
         let guard = open_key_mutation_lock(derive_key_mutation_target(&archive_dir)?)?;
-        let (staged, prior) = stage_key_mutation_tree(
+        let (staged, prior, _staging_ownership) = stage_key_mutation_tree(
             &guard,
             KeyMutationStageMode::PreserveSite,
         )?;
@@ -3565,7 +3665,7 @@ mod tests {
     fn key_mutation_recovery_restores_exact_prior_after_park_crash() -> Result<()> {
         let (_temp_dir, archive_dir) = setup_test_archive();
         let guard = open_key_mutation_lock(derive_key_mutation_target(&archive_dir)?)?;
-        let (staged, prior) = stage_key_mutation_tree(
+        let (staged, prior, _staging_ownership) = stage_key_mutation_tree(
             &guard,
             KeyMutationStageMode::PreserveSite,
         )?;
@@ -3590,7 +3690,7 @@ mod tests {
     fn key_publication_evidence_rejects_destination_drift() -> Result<()> {
         let (_temp_dir, archive_dir) = setup_test_archive();
         let guard = open_key_mutation_lock(derive_key_mutation_target(&archive_dir)?)?;
-        let (staged, _prior) =
+        let (staged, _prior, staging_ownership) =
             stage_key_mutation_tree(&guard, KeyMutationStageMode::PreserveSite)?;
         let evidence = inspect_key_publication_tree(&staged)?;
         std::fs::write(staged.join("site/config.json"), b"{}")?;
@@ -3599,7 +3699,13 @@ mod tests {
             .expect_err("destination drift must invalidate exact publication evidence");
 
         anyhow::ensure!(format!("{error:#}").contains("failed exact verification"));
-        remove_owned_key_mutation_tree(&guard, &staged, None, None)?;
+        remove_owned_key_mutation_tree(
+            &guard,
+            &staged,
+            None,
+            Some(&staging_ownership),
+            None,
+        )?;
         Ok(())
     }
 
