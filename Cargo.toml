@@ -272,8 +272,8 @@ debug = "line-tables-only"
 strip = false
 
 # The dependency graph is pinned to the asupersync 0.4.x line (0.4.9). Keep
-# frankensqlite plus frankensearch and franken-agent-detection revs aligned so
-# Cargo.lock does not reintroduce a parallel asupersync 0.3.x stack.
+# the frankensqlite, frankensearch, and franken-agent-detection registry pins
+# aligned so Cargo.lock does not reintroduce a parallel asupersync 0.3.x stack.
 #
 # If you need to build against a local checkout of asupersync (sibling
 # at ../asupersync) during runtime-level hacking, add the following
