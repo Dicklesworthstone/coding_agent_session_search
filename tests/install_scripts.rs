@@ -87,11 +87,6 @@ fn release_workflow_builds_and_publishes_the_exact_requested_tag() -> Result<(),
         "DISPATCH_TAG: ${{ inputs.tag }}",
         "git rev-parse --verify \"${RAW_TAG}^{commit}\"",
         "Checked-out commit (${CHECKED_OUT_COMMIT}) does not match ${RAW_TAG} (${TAG_COMMIT}).",
-        "releases/download/__RELEASE_TAG__/install.sh",
-        "--version \"__RELEASE_TAG__\" --easy-mode --verify",
-        "releases/download/__RELEASE_TAG__/install.ps1",
-        "-Version '__RELEASE_TAG__' -EasyMode -Verify",
-        "s/__RELEASE_TAG__/${TAG}/g",
     ] {
         if !workflow.contains(required) {
             return Err(format!(

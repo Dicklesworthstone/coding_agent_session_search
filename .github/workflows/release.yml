@@ -427,10 +427,10 @@ jobs:
           ### Quick Install (recommended)
           ```bash
           # Linux/macOS
-          curl -fsSL "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/download/__RELEASE_TAG__/install.sh" | bash -s -- --version "__RELEASE_TAG__" --easy-mode --verify
+          curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/coding_agent_session_search/main/install.sh" | bash -s -- --easy-mode --verify
 
           # Windows (PowerShell)
-          & ([scriptblock]::Create((irm "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/download/__RELEASE_TAG__/install.ps1"))) -Version '__RELEASE_TAG__' -EasyMode -Verify
+          & ([scriptblock]::Create((irm "https://raw.githubusercontent.com/Dicklesworthstone/coding_agent_session_search/main/install.ps1"))) -EasyMode -Verify
           ```
 
           ### Package Managers
@@ -449,10 +449,7 @@ jobs:
           sha256sum -c SHA256SUMS.txt
           ```
           EOF
-          sed -i \
-            -e 's/^          //' \
-            -e "s/__RELEASE_TAG__/${TAG}/g" \
-            "$RUNNER_TEMP/release-body.md"
+          sed -i 's/^          //' "$RUNNER_TEMP/release-body.md"
 
           # Create the release with all artifacts attached atomically
           # Using gh CLI directly avoids softprops/action-gh-release v2.5.0 draft

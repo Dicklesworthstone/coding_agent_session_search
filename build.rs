@@ -163,14 +163,18 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensearch",
         crate_package_name: "frankensearch",
         manifest_package_field: None,
-        expected_git: "https://github.com/Dicklesworthstone/frankensearch",
-        // Pins the frankensearch rev carrying the pure-Rust `native` feature
-        // and the explicit `cass-compat` -> `lexical-tantivy` foreign-index
-        // surface. The latter keeps CASS schema-v8 access independent from
-        // FrankenSearch's swappable generic lexical backend (cass #308,
-        // bd-8nqz.5).
-        expected_rev: "22859f74056c31fd3a713bacecd4a1f22f0cf82d",
-        expected_version: "0.3.2",
+        // Registry pin (gh#416). 0.4.0 is the first crates.io release carrying
+        // the pure-Rust `native` feature and the explicit `cass-compat` ->
+        // `lexical-tantivy` foreign-index surface (which keeps CASS schema-v8
+        // access independent from FrankenSearch's swappable generic lexical
+        // backend — cass #308, bd-8nqz.5). Registry 0.3.2 was a stale
+        // same-version twin of an older tree (no quill/cass-compat/native);
+        // the exact `=0.4.0` pin exists so resolution can never reach it.
+        // Empty `expected_git` signals `validate_manifest_dependency_spec`
+        // to skip git/rev checks.
+        expected_git: "",
+        expected_rev: "",
+        expected_version: "0.4.0",
         // cass #308: the ort/ONNX `fastembed` stack was removed; semantic
         // embedding + reranking are now pure-Rust via frankensearch's `native`
         // feature, kept always-on here (no AVX/ONNX static-init hazard, so no
