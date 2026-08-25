@@ -11132,11 +11132,31 @@ impl FrankenStorage {
         workspace_id: Option<i64>,
         conv: &Conversation,
     ) -> Result<InsertOutcome> {
+        self.insert_conversation_tree_with_analytics(agent_id, workspace_id, conv, None)
+    }
+
+    /// [`Self::insert_conversation_tree`] with an explicit analytics
+    /// disposition.
+    ///
+    /// `defer_analytics: None` follows the ambient default (env overrides plus
+    /// the index-run process default). That ambient state is process-global —
+    /// a concurrently running index pass holds it at `true` for its whole
+    /// duration — so any caller that ASSERTS on inline analytics side effects
+    /// (tests above all) must pin `Some(false)` here instead of reading state
+    /// another thread can flip mid-call.
+    pub fn insert_conversation_tree_with_analytics(
+        &self,
+        agent_id: i64,
+        workspace_id: Option<i64>,
+        conv: &Conversation,
+        defer_analytics: Option<bool>,
+    ) -> Result<InsertOutcome> {
         let normalized_conv = normalized_conversation_for_storage(conv);
         let conv = normalized_conv.as_ref();
         self.ensure_source_for_conversation(conv)?;
         let defer_lexical_updates = defer_storage_lexical_updates_enabled();
-        let defer_analytics_updates = defer_analytics_updates_enabled();
+        let defer_analytics_updates =
+            defer_analytics.unwrap_or_else(defer_analytics_updates_enabled);
         let conversation_key = conversation_merge_key(agent_id, conv);
         let mut tx = self.conn.transaction()?;
         let existing = franken_find_existing_conversation_with_tail_by_key(
@@ -13585,6 +13605,19 @@ impl FrankenStorage {
         &self,
         conversations: &[(i64, Option<i64>, &Conversation)],
     ) -> Result<Vec<InsertOutcome>> {
+        self.insert_conversations_batched_with_analytics(conversations, None)
+    }
+
+    /// [`Self::insert_conversations_batched`] with an explicit analytics
+    /// disposition; see
+    /// [`Self::insert_conversation_tree_with_analytics`] for why callers that
+    /// assert on analytics side effects must pin `Some(false)` rather than
+    /// reading the process-global ambient default.
+    pub fn insert_conversations_batched_with_analytics(
+        &self,
+        conversations: &[(i64, Option<i64>, &Conversation)],
+        defer_analytics: Option<bool>,
+    ) -> Result<Vec<InsertOutcome>> {
         if conversations.is_empty() {
             return Ok(Vec::new());
         }
@@ -13592,7 +13625,8 @@ impl FrankenStorage {
         self.ensure_sources_for_batch(conversations)?;
 
         let defer_lexical_updates = defer_storage_lexical_updates_enabled();
-        let defer_analytics_updates = defer_analytics_updates_enabled();
+        let defer_analytics_updates =
+            defer_analytics.unwrap_or_else(defer_analytics_updates_enabled);
 
         let pricing_table = PricingTable::franken_load(&self.conn).unwrap_or_else(|e| {
             tracing::warn!(target: "cass::analytics::pricing", error = %e, "failed to load pricing table");
@@ -22502,7 +22536,7 @@ mod tests {
         };
 
         let outcomes = storage
-            .insert_conversations_batched(&[(agent_id, None, &conv)])
+            .insert_conversations_batched_with_analytics(&[(agent_id, None, &conv)], Some(false))
             .unwrap();
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].inserted_indices.len(), 3);
@@ -22979,7 +23013,7 @@ mod tests {
         };
 
         storage
-            .insert_conversations_batched(&[(agent_id, None, &conv)])
+            .insert_conversations_batched_with_analytics(&[(agent_id, None, &conv)], Some(false))
             .unwrap();
 
         // Save original analytics state
@@ -23198,7 +23232,10 @@ mod tests {
         let conv1 = make_conv("since-day1", day1_ts, 2);
         let conv2 = make_conv("since-day2", day2_ts, 5);
         storage
-            .insert_conversations_batched(&[(agent_id, None, &conv1), (agent_id, None, &conv2)])
+            .insert_conversations_batched_with_analytics(
+                &[(agent_id, None, &conv1), (agent_id, None, &conv2)],
+                Some(false),
+            )
             .unwrap();
 
         let conn = storage.raw();
@@ -23690,20 +23727,25 @@ mod tests {
         let workspace = PathBuf::from("/ws/profiled-storage-remote");
         let workspace_id = storage.ensure_workspace(&workspace, None).unwrap();
 
+        // Pin inline analytics explicitly: the ambient default is process-global
+        // and a parallel test driving an index run defers analytics for its
+        // whole duration, which turned this assertion into a cross-test race.
         storage
-            .insert_conversation_tree(
+            .insert_conversation_tree_with_analytics(
                 agent_id,
                 Some(workspace_id),
                 &make_profiled_storage_remote_conversation(0, 3),
+                Some(false),
             )
             .unwrap();
         storage.conn.execute("DELETE FROM daily_stats").unwrap();
 
         storage
-            .insert_conversation_tree(
+            .insert_conversation_tree_with_analytics(
                 agent_id,
                 Some(workspace_id),
                 &make_profiled_storage_remote_conversation(1, 2),
+                Some(false),
             )
             .unwrap();
 
@@ -33275,7 +33317,7 @@ mod tests {
         };
 
         let outcomes = storage
-            .insert_conversations_batched(&[(agent_id, None, &conv)])
+            .insert_conversations_batched_with_analytics(&[(agent_id, None, &conv)], Some(false))
             .unwrap();
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].inserted_indices, vec![0, 1]);
