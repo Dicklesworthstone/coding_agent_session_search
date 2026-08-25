@@ -32,11 +32,15 @@ use base64::prelude::*;
 use chrono::{DateTime, Utc};
 use flate2::{Compression, write::DeflateEncoder};
 use rand::Rng;
-use serde::Serialize;
-use std::fs::File;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use tracing::info;
+
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 /// Argon2id default parameters
 #[cfg(not(test))]
@@ -55,6 +59,9 @@ const ARGON2_PARALLELISM: u32 = 1;
 /// Schema version for encryption
 const SCHEMA_VERSION: u8 = 2;
 const MAX_ARCHIVE_CHUNKS: u64 = u32::MAX as u64;
+const KEY_MUTATION_JOURNAL_FORMAT: &str = "cass-pages-key-mutation-v1";
+const KEY_MUTATION_JOURNAL_MAX_BYTES: u64 = 16 * 1024;
+const KEY_MUTATION_TREE_ENTRY_LIMIT: usize = 1_000_000;
 const REQUIRED_SITE_FILES: &[&str] = &[
     "index.html",
     "config.json",
@@ -65,6 +72,61 @@ const REQUIRED_SITE_FILES: &[&str] = &[
     "robots.txt",
     ".nojekyll",
 ];
+
+#[derive(Debug, Clone)]
+struct KeyMutationTarget {
+    live_root: PathBuf,
+    site_relative: PathBuf,
+    lock_path: PathBuf,
+    journal_path: PathBuf,
+}
+
+impl KeyMutationTarget {
+    fn live_site_dir(&self) -> PathBuf {
+        self.live_root.join(&self.site_relative)
+    }
+
+    fn staged_site_dir(&self, staged_root: &Path) -> PathBuf {
+        staged_root.join(&self.site_relative)
+    }
+}
+
+#[derive(Debug)]
+struct KeyMutationGuard {
+    target: KeyMutationTarget,
+    lock_identity: crate::franken_sync::FileIdentity,
+    lock_file: File,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TreeEvidence {
+    digest: String,
+    entries: usize,
+    bytes: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyMutationJournal {
+    format: String,
+    staged_file_name: String,
+    backup_file_name: String,
+    prior_digest: String,
+    candidate_digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveredKeyMutation {
+    None,
+    RolledBack,
+    Committed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyMutationStageMode {
+    PreserveSite,
+    ReplaceEncryptedPayload,
+}
 
 fn max_encryptable_plaintext_bytes(chunk_size: usize) -> u64 {
     MAX_ARCHIVE_CHUNKS.saturating_mul(chunk_size as u64)
@@ -95,6 +157,369 @@ fn ensure_can_write_archive_chunk(chunk_index: u32, chunk_size: usize) -> Result
 fn validate_password_input(password: &str) -> Result<()> {
     if password.is_empty() || password.trim().is_empty() {
         bail!("Password cannot be empty or whitespace-only");
+    }
+    Ok(())
+}
+
+fn key_mutation_sidecar_path(root: &Path, suffix: &str) -> PathBuf {
+    let root_name = root
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("pages-archive"));
+    let mut sidecar_name = std::ffi::OsString::from(".");
+    sidecar_name.push(root_name);
+    sidecar_name.push(suffix);
+    root.with_file_name(sidecar_name)
+}
+
+fn derive_key_mutation_target(requested_path: &Path) -> Result<KeyMutationTarget> {
+    let (live_root, site_relative) = if requested_path
+        .file_name()
+        .is_some_and(|name| name == "site")
+    {
+        let parent = requested_path.parent().ok_or_else(|| {
+            anyhow::anyhow!(
+                "site directory has no parent publication root: {}",
+                requested_path.display()
+            )
+        })?;
+        (parent.to_path_buf(), PathBuf::from("site"))
+    } else {
+        match std::fs::symlink_metadata(requested_path.join("site")) {
+            Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+                (requested_path.to_path_buf(), PathBuf::from("site"))
+            }
+            Ok(_) => (requested_path.to_path_buf(), PathBuf::new()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (requested_path.to_path_buf(), PathBuf::new())
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed inspecting Pages key-mutation site under {}",
+                        requested_path.display()
+                    )
+                });
+            }
+        }
+    };
+
+    Ok(KeyMutationTarget {
+        lock_path: key_mutation_sidecar_path(&live_root, ".pages-key-mutation.lock"),
+        journal_path: key_mutation_sidecar_path(
+            &live_root,
+            ".pages-key-mutation-in-progress.json",
+        ),
+        live_root,
+        site_relative,
+    })
+}
+
+fn open_key_mutation_lock(target: KeyMutationTarget) -> Result<KeyMutationGuard> {
+    let lock_exists = match std::fs::symlink_metadata(&target.lock_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            #[cfg(unix)]
+            if metadata.nlink() != 1 {
+                bail!(
+                    "Pages key-mutation lock {} has {} hard links; exclusive pathname ownership is not provable",
+                    target.lock_path.display(),
+                    metadata.nlink()
+                );
+            }
+            true
+        }
+        Ok(_) => bail!(
+            "Pages key-mutation lock is not a regular file: {}",
+            target.lock_path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed inspecting Pages key-mutation lock {}",
+                    target.lock_path.display()
+                )
+            });
+        }
+    };
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    if lock_exists {
+        options.create(false);
+    } else {
+        options.create_new(true);
+    }
+    #[cfg(unix)]
+    options.mode(0o600);
+    let lock_file = options.open(&target.lock_path).with_context(|| {
+        format!(
+            "failed opening Pages key-mutation lock {}",
+            target.lock_path.display()
+        )
+    })?;
+    let lock_identity = crate::franken_sync::FileIdentity::from_file(&lock_file)
+        .with_context(|| {
+            format!(
+                "failed identifying Pages key-mutation lock {}",
+                target.lock_path.display()
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "filesystem does not expose a stable identity for Pages key-mutation lock {}",
+                target.lock_path.display()
+            )
+        })?;
+
+    match fs2::FileExt::try_lock_exclusive(&lock_file) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => bail!(
+            "another Pages key mutation is already active for {}; lock contention at {}",
+            target.live_root.display(),
+            target.lock_path.display()
+        ),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed acquiring Pages key-mutation lock {}",
+                    target.lock_path.display()
+                )
+            });
+        }
+    }
+
+    let guard = KeyMutationGuard {
+        target,
+        lock_identity,
+        lock_file,
+    };
+    require_key_mutation_guard(&guard)?;
+    Ok(guard)
+}
+
+fn require_key_mutation_guard(guard: &KeyMutationGuard) -> Result<()> {
+    let held_identity = crate::franken_sync::FileIdentity::from_file(&guard.lock_file)
+        .context("failed re-identifying held Pages key-mutation lock")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "filesystem stopped exposing a stable identity for held Pages key-mutation lock {}",
+                guard.target.lock_path.display()
+            )
+        })?;
+    if held_identity != guard.lock_identity {
+        bail!(
+            "held Pages key-mutation lock {} changed identity",
+            guard.target.lock_path.display()
+        );
+    }
+
+    let metadata = std::fs::symlink_metadata(&guard.target.lock_path).with_context(|| {
+        format!(
+            "failed re-inspecting Pages key-mutation lock {}",
+            guard.target.lock_path.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "Pages key-mutation lock {} is no longer a regular file",
+            guard.target.lock_path.display()
+        );
+    }
+    #[cfg(unix)]
+    if metadata.nlink() != 1 {
+        bail!(
+            "Pages key-mutation lock {} has {} hard links; refused publication",
+            guard.target.lock_path.display(),
+            metadata.nlink()
+        );
+    }
+    let probe = File::open(&guard.target.lock_path).with_context(|| {
+        format!(
+            "failed re-opening Pages key-mutation lock {}",
+            guard.target.lock_path.display()
+        )
+    })?;
+    let path_identity = crate::franken_sync::FileIdentity::from_file(&probe)
+        .context("failed re-identifying Pages key-mutation lock pathname")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "filesystem stopped exposing a stable pathname identity for Pages key-mutation lock {}",
+                guard.target.lock_path.display()
+            )
+        })?;
+    if path_identity != guard.lock_identity {
+        bail!(
+            "Pages key-mutation lock {} was replaced after acquisition",
+            guard.target.lock_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn random_key_mutation_sidecar_path(root: &Path, role: &str) -> PathBuf {
+    let mut random = [0_u8; 16];
+    rand::rng().fill_bytes(&mut random);
+    let root_name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("pages-archive");
+    root.with_file_name(format!(
+        ".{root_name}.pages-key-{role}.{}",
+        hex::encode(random)
+    ))
+}
+
+#[cfg(unix)]
+fn key_publication_mode(metadata: &std::fs::Metadata) -> u32 {
+    metadata.permissions().mode() & 0o777
+}
+
+#[cfg(not(unix))]
+fn key_publication_mode(_metadata: &std::fs::Metadata) -> u32 {
+    0
+}
+
+fn inspect_key_publication_tree(root: &Path) -> Result<TreeEvidence> {
+    let root_metadata = std::fs::symlink_metadata(root).with_context(|| {
+        format!(
+            "failed inspecting Pages key-publication tree {}",
+            root.display()
+        )
+    })?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.file_type().is_dir() {
+        bail!(
+            "Pages key-publication tree must be a real directory: {}",
+            root.display()
+        );
+    }
+
+    let mut paths = Vec::new();
+    collect_key_publication_paths(root, root, &mut paths)?;
+    paths.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+
+    let mut digest = Sha256::new();
+    let mut total_bytes = 0_u64;
+    for (relative, path) in &paths {
+        let metadata = std::fs::symlink_metadata(path).with_context(|| {
+            format!("failed inspecting key-publication entry {}", path.display())
+        })?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            bail!(
+                "Pages key-publication tree must not contain symlinks: {}",
+                path.display()
+            );
+        }
+        if file_type.is_dir() {
+            digest.update(b"directory\0");
+            digest.update(relative.as_bytes());
+            digest.update(b"\0");
+            digest.update(key_publication_mode(&metadata).to_be_bytes());
+            continue;
+        }
+        if !file_type.is_file() {
+            bail!(
+                "Pages key-publication tree contains a non-regular entry: {}",
+                path.display()
+            );
+        }
+        #[cfg(unix)]
+        if metadata.nlink() != 1 {
+            bail!(
+                "Pages key-publication file {} has {} hard links; exact ownership is not provable",
+                path.display(),
+                metadata.nlink()
+            );
+        }
+
+        let mut file = File::open(path)
+            .with_context(|| format!("failed opening key-publication file {}", path.display()))?;
+        let identity = crate::franken_sync::FileIdentity::from_file(&file)
+            .with_context(|| format!("failed identifying key-publication file {}", path.display()))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "filesystem does not expose a stable identity for key-publication file {}",
+                    path.display()
+                )
+            })?;
+        let opened_metadata = file.metadata()?;
+        let mut file_digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            file_digest.update(&buffer[..read]);
+        }
+        let hashed_metadata = file.metadata()?;
+        if hashed_metadata.len() != opened_metadata.len() {
+            bail!(
+                "key-publication file changed size while hashing: {}",
+                path.display()
+            );
+        }
+        let probe = File::open(path)?;
+        let path_identity = crate::franken_sync::FileIdentity::from_file(&probe)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "filesystem stopped exposing a stable identity for key-publication file {}",
+                    path.display()
+                )
+            })?;
+        if path_identity != identity {
+            bail!(
+                "key-publication file changed identity while hashing: {}",
+                path.display()
+            );
+        }
+
+        total_bytes = total_bytes
+            .checked_add(opened_metadata.len())
+            .context("Pages key-publication byte count overflowed u64")?;
+        digest.update(b"file\0");
+        digest.update(relative.as_bytes());
+        digest.update(b"\0");
+        digest.update(key_publication_mode(&metadata).to_be_bytes());
+        digest.update(opened_metadata.len().to_be_bytes());
+        digest.update(file_digest.finalize());
+    }
+
+    Ok(TreeEvidence {
+        digest: hex::encode(digest.finalize()),
+        entries: paths.len(),
+        bytes: total_bytes,
+    })
+}
+
+fn collect_key_publication_paths(
+    root: &Path,
+    directory: &Path,
+    paths: &mut Vec<(String, PathBuf)>,
+) -> Result<()> {
+    for entry in std::fs::read_dir(directory)
+        .with_context(|| format!("failed reading key-publication tree {}", directory.display()))?
+    {
+        if paths.len() >= KEY_MUTATION_TREE_ENTRY_LIMIT {
+            bail!(
+                "Pages key-publication tree exceeds the {}-entry validation bound",
+                KEY_MUTATION_TREE_ENTRY_LIMIT
+            );
+        }
+        let entry = entry?;
+        let path = entry.path();
+        let relative_path = path.strip_prefix(root)?;
+        let relative = relative_path.to_str().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Pages key-publication entry is not valid UTF-8: {}",
+                relative_path.display()
+            )
+        })?;
+        paths.push((relative.replace('\\', "/"), path.clone()));
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+            collect_key_publication_paths(root, &path, paths)?;
+        }
     }
     Ok(())
 }

@@ -348,7 +348,13 @@ try {
   }
 
   if ($Verify) {
-    & "$Dest\cass.exe" --version | Write-Host
+    & "$Dest\cass.exe" --version
+    $verifyExitCode = $LASTEXITCODE
+    if ($verifyExitCode -ne 0) {
+      Write-Error "Self-test failed: $Dest\cass.exe --version exited with code $verifyExitCode"
+      exit $verifyExitCode
+    }
+    Write-Host "Self-test complete"
   }
 } finally {
   if (Test-Path $tmp) {

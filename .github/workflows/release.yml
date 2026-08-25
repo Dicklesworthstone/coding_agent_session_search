@@ -16,6 +16,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # A manual dispatch names the immutable tag to build. Every checkout below
+  # must use that tag rather than the branch from which the dispatch was
+  # launched, or the release could publish branch bytes under an older tag.
+  RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -91,29 +95,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Clone sibling dependencies
-        shell: bash
-        run: |
-          # Path dependencies reference sibling directories (../repo).
-          # Keep the asupersync sibling checkout aligned with the crates.io
-          # version pinned in Cargo.toml.
-          # Windows runners: enable long-path support. frankensqlite's default branch carries
-          # perf test-artifact paths that exceed the 260-char MAX_PATH limit and break the clone
-          # checkout ("Filename too long"). core.longpaths is Windows-only; a harmless no-op elsewhere.
-          git config --global core.longpaths true
-          git clone https://github.com/Dicklesworthstone/asupersync.git ../asupersync
-          # -f: asupersync has two docs/analysis paths that collide on case-insensitive
-          # filesystems (Windows/macOS runners), so the full-clone checkout leaves one looking
-          # "locally modified" and a plain `checkout <sha>` aborts. The colliding file is
-          # docs-only and irrelevant to the build; Linux (case-sensitive) is unaffected.
-          git -C ../asupersync checkout --quiet -f v0.3.4
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
-          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
+        with:
+          ref: ${{ env.RELEASE_REF }}
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
         with:
           targets: ${{ matrix.target }}
 
@@ -288,25 +274,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Clone sibling dependencies
-        shell: bash
-        run: |
-          # Keep the asupersync sibling checkout aligned with the crates.io
-          # version pinned in Cargo.toml.
-          # Windows runners: enable long-path support. frankensqlite's default branch carries
-          # perf test-artifact paths that exceed the 260-char MAX_PATH limit and break the clone
-          # checkout ("Filename too long"). core.longpaths is Windows-only; a harmless no-op elsewhere.
-          git config --global core.longpaths true
-          git clone https://github.com/Dicklesworthstone/asupersync.git ../asupersync
-          # -f: asupersync has two docs/analysis paths that collide on case-insensitive
-          # filesystems (Windows/macOS runners), so the full-clone checkout leaves one looking
-          # "locally modified" and a plain `checkout <sha>` aborts. The colliding file is
-          # docs-only and irrelevant to the build; Linux (case-sensitive) is unaffected.
-          git -C ../asupersync checkout --quiet -f v0.3.4
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
-          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
+        with:
+          ref: ${{ env.RELEASE_REF }}
 
       - name: Download all artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -317,14 +286,26 @@ jobs:
       - name: Extract version from tag
         id: version
         shell: bash
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             RAW_TAG="${GITHUB_REF#refs/tags/}"
           else
-            RAW_TAG="${{ inputs.tag }}"
+            RAW_TAG="${DISPATCH_TAG}"
           fi
           if [[ -z "${RAW_TAG}" ]]; then
             echo "Tag is required."
+            exit 1
+          fi
+          if [[ ! "${RAW_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Tag must be a v-prefixed semantic version (for example, v0.7.0)."
+            exit 1
+          fi
+          TAG_COMMIT="$(git rev-parse --verify "${RAW_TAG}^{commit}")"
+          CHECKED_OUT_COMMIT="$(git rev-parse HEAD)"
+          if [[ "${CHECKED_OUT_COMMIT}" != "${TAG_COMMIT}" ]]; then
+            echo "Checked-out commit (${CHECKED_OUT_COMMIT}) does not match ${RAW_TAG} (${TAG_COMMIT})."
             exit 1
           fi
           VERSION="${RAW_TAG#v}"
@@ -500,27 +481,11 @@ jobs:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Clone sibling dependencies
-        run: |
-          # Keep the asupersync sibling checkout aligned with the crates.io
-          # version pinned in Cargo.toml.
-          # Windows runners: enable long-path support. frankensqlite's default branch carries
-          # perf test-artifact paths that exceed the 260-char MAX_PATH limit and break the clone
-          # checkout ("Filename too long"). core.longpaths is Windows-only; a harmless no-op elsewhere.
-          git config --global core.longpaths true
-          git clone https://github.com/Dicklesworthstone/asupersync.git ../asupersync
-          # -f: asupersync has two docs/analysis paths that collide on case-insensitive
-          # filesystems (Windows/macOS runners), so the full-clone checkout leaves one looking
-          # "locally modified" and a plain `checkout <sha>` aborts. The colliding file is
-          # docs-only and irrelevant to the build; Linux (case-sensitive) is unaffected.
-          git -C ../asupersync checkout --quiet -f v0.3.4
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
-          git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
+        with:
+          ref: ${{ env.RELEASE_REF }}
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
 
       - name: Check crates.io publish readiness
         id: publish_readiness

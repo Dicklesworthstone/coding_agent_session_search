@@ -405,7 +405,13 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   install -m 0755 "$BIN" "$DEST/$INSTALL_BASENAME"
   ok "Installed to $DEST/$INSTALL_BASENAME (source build)"
   maybe_add_path
-  if [ "$VERIFY" -eq 1 ]; then "$DEST/$INSTALL_BASENAME" --version || true; ok "Self-test complete"; fi
+  if [ "$VERIFY" -eq 1 ]; then
+    if ! "$DEST/$INSTALL_BASENAME" --version; then
+      err "Self-test failed: $DEST/$INSTALL_BASENAME --version exited non-zero"
+      exit 1
+    fi
+    ok "Self-test complete"
+  fi
   if [ "$QUICKSTART" -eq 1 ]; then info "Running index --full (quickstart)"; "$DEST/$INSTALL_BASENAME" index --full || warn "index --full failed"; fi
   ok "Done. Run: cass"
   exit 0
@@ -486,7 +492,10 @@ ok "Installed to $DEST/$INSTALL_BASENAME"
 maybe_add_path
 
 if [ "$VERIFY" -eq 1 ]; then
-  "$DEST/$INSTALL_BASENAME" --version || true
+  if ! "$DEST/$INSTALL_BASENAME" --version; then
+    err "Self-test failed: $DEST/$INSTALL_BASENAME --version exited non-zero"
+    exit 1
+  fi
   ok "Self-test complete"
 fi
 

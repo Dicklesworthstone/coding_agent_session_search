@@ -913,7 +913,7 @@ fn load_federated_search_manifest_internal(
 }
 
 pub fn searchable_index_exists(index_path: &Path) -> bool {
-    // A Quill index announces itself with its CURRENT pointer; `meta.json` is
+    // A Quill index announces itself with its MANIFEST; `meta.json` is
     // the Tantivy-era marker and is still accepted so a not-yet-migrated
     // directory is recognized as an index (and therefore rebuilt) rather than
     // being mistaken for an empty one.
@@ -967,6 +967,13 @@ pub fn validate_searchable_index_contract(index_path: &Path) -> Result<()> {
 }
 
 pub fn searchable_index_modified_time(index_path: &Path) -> Option<SystemTime> {
+    // Prefer the active engine's publication authority. The remaining paths
+    // support legacy Tantivy generations and federated lexical bundles.
+    let quill_manifest = index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER);
+    if quill_manifest.exists() {
+        return fs::metadata(quill_manifest).and_then(|m| m.modified()).ok();
+    }
+
     let meta_path = index_path.join("meta.json");
     if meta_path.exists() {
         return fs::metadata(meta_path).and_then(|m| m.modified()).ok();
@@ -2356,6 +2363,27 @@ mod tests {
         assert!(
             u64::from_str_radix(&fingerprint[..16], 16).is_ok(),
             "daemon parses the first 16 chars as hex; got {fingerprint:?}"
+        );
+    }
+
+    /// Status falls back to the lexical publication timestamp when the
+    /// canonical DB has no recorded indexing time. After the Quill flip, a
+    /// standard published index has `MANIFEST` rather than Tantivy's
+    /// `meta.json`; overlooking that marker made the fallback falsely return
+    /// `None` for the current engine.
+    #[test]
+    fn searchable_index_modified_time_recognizes_a_published_quill_index() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut index = TantivyIndex::open_or_create(dir.path()).expect("create index");
+        index.commit().expect("commit");
+
+        assert!(
+            !dir.path().join("meta.json").exists(),
+            "the regression requires a Quill-only publication"
+        );
+        assert!(
+            searchable_index_modified_time(dir.path()).is_some(),
+            "a published Quill MANIFEST must provide the status fallback timestamp"
         );
     }
 

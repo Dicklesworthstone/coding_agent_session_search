@@ -526,13 +526,20 @@ pub fn run_self_update(version: &str) -> ! {
             ])
             .status();
         match status {
-            Ok(s) => std::process::exit(s.code().unwrap_or(0)),
+            Ok(s) => std::process::exit(installer_process_exit_code(s)),
             Err(e) => {
                 eprintln!("Failed to run installer: {}", e);
                 std::process::exit(1);
             }
         }
     }
+}
+
+/// Preserve a normal installer exit code, but fail closed when the child was
+/// terminated without one (for example by a signal or Windows job teardown).
+#[cfg(any(test, target_os = "windows"))]
+fn installer_process_exit_code(status: std::process::ExitStatus) -> i32 {
+    status.code().unwrap_or(1)
 }
 
 /// Get the base URL for release API. Overridable for testing via the
@@ -926,6 +933,17 @@ pub fn spawn_update_check(
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    #[cfg(unix)]
+    fn installer_status_without_an_exit_code_fails_closed() {
+        let status = std::process::Command::new("sh")
+            .args(["-c", "kill -TERM $$"])
+            .status()
+            .expect("run signalled child process");
+        assert_eq!(status.code(), None);
+        assert_eq!(installer_process_exit_code(status), 1);
+    }
 
     #[test]
     fn test_release_asset_url_uses_immutable_release_downloads() {

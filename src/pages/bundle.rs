@@ -159,8 +159,30 @@ pub(crate) const PAGES_VENDOR_ASSETS: &[PinnedVendorAsset] = &[
 
 const MASTER_KEY_BACKUP_NOTE: &str =
     "This file contains the wrapped DEK. Keep it with your recovery secret.";
-const BUNDLE_PUBLISH_MARKER_NAME: &str = ".cass-pages-publish-in-progress-v1";
-const BUNDLE_PUBLISH_MARKER_CONTENT: &[u8] = b"cass-pages-publish-in-progress-v1\n";
+const BUNDLE_PUBLISH_JOURNAL_FORMAT: &str = "cass-pages-bundle-publish-v1";
+const BUNDLE_PUBLISH_JOURNAL_MAX_BYTES: u64 = 16 * 1024;
+const BUNDLE_PUBLISH_BACKUP_SCAN_LIMIT: usize = 65_536;
+const BUNDLE_TREE_EVIDENCE_DOMAIN: &[u8] = b"cass-pages-bundle-tree-v1\0";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BundleTreeEvidence {
+    file_count: u64,
+    total_size_bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BundlePublishJournal {
+    format: String,
+    backup_file_name: String,
+    prior_file_count: u64,
+    prior_size_bytes: u64,
+    prior_sha256: String,
+    candidate_file_count: u64,
+    candidate_size_bytes: u64,
+    candidate_sha256: String,
+}
 
 /// Integrity entry for a single file
 #[derive(Debug, Clone, Serialize, Deserialize)]

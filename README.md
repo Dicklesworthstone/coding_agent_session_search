@@ -283,7 +283,7 @@ The deterministic hash embedder is available only when explicitly selected, such
 | **Semantic** | Vector similarity | Conceptual queries, "find similar" |
 | **Hybrid** (default) | Reciprocal Rank Fusion with lexical fail-open | Balanced precision and recall |
 
-**Lexical Search**: Uses Tantivy's BM25 implementation with edge n-grams for prefix matching. Best when you know the exact terms you're looking for. The lexical index is derived from SQLite; if it is missing, stale, or incompatible, cass reports the state and rebuilds through the normal indexing path from the canonical database.
+**Lexical Search**: Uses Quill's BM25 implementation with prefix matching. Best when you know the exact terms you're looking for. The lexical index is derived from SQLite; if it is missing, stale, or incompatible, cass reports the state and rebuilds through the normal indexing path from the canonical database.
 
 **Semantic Search**: Computes vector similarity between query and indexed MiniLM embeddings. Finds conceptually related content even without exact term overlap. Explicit semantic mode requires the MiniLM model and a compatible MiniLM vector index; it never substitutes same-dimensional hash vectors.
 
@@ -707,7 +707,7 @@ Remote: ~/.claude/projects/
     ↓ (rsync over SSH)
 Local: ~/.local/share/coding-agent-search/remotes/<source>/<path>/
     ↓ (connector scan)
-Index: agent_search.db + tantivy_index/
+Index: agent_search.db + index/v9-quill/
 ```
 
 Where `<path>` is a filesystem-safe version of the remote path (e.g., `.claude_projects`).
@@ -1713,7 +1713,7 @@ Cycle through modes with `F12`:
 
 ### Score Components
 
-- **Text Relevance (BM25)**: Tantivy's implementation of Okapi BM25, considering:
+- **Text Relevance (BM25)**: Quill's implementation of Okapi BM25, considering:
   - Term frequency in document
   - Inverse document frequency across corpus
   - Document length normalization
@@ -2130,7 +2130,7 @@ To achieve sub-60ms latency on large datasets, `cass` implements a multi-tier ca
 
 1. **Sharded LRU Cache**: The `prefix_cache` is split into shards (default 256 entries each) to reduce mutex contention during concurrent reads/writes from the async searcher.
 2. **Bloom Filter Pre-checks**: Each cached hit stores a 64-bit Bloom filter mask of its content tokens. When a user types more characters, we check the mask first. If the new token isn't in the mask, we reject the cache entry immediately without a string comparison.
-3. **Predictive Warming**: A background `WarmJob` thread watches the input. When the user pauses typing, it triggers a lightweight "warm-up" query against the Tantivy reader to pre-load relevant index segments into the OS page cache.
+3. **Predictive Warming**: A background `WarmJob` thread watches the input. When the user pauses typing, it triggers a lightweight query against the lexical reader to pre-load relevant index segments into the OS page cache.
 
 ## 🔌 The Connector Interface (Polymorphism)
 The system is designed for extensibility via the `Connector` trait (`src/connectors/mod.rs`). This allows `cass` to treat disparate log formats as a uniform stream of events.
@@ -2333,10 +2333,10 @@ Data integrity is paramount. `cass` treats the SQLite database (`src/storage/sql
 
 ### Schema Version Tracking
 
-Every Tantivy index stores a `schema_hash.json` file containing the schema version:
+Every lexical generation stores a `schema_hash.json` file containing the schema fingerprint:
 
 ```json
-{"schema_hash":"tantivy-schema-v4-edge-ngram-agent-string"}
+{"schema_hash":"quill-fslx-schema-v9-hyphen-cjk-bigrams-bounded-content-prefix-preview-stored-content-external"}
 ```
 
 ### Automatic Recovery Scenarios
@@ -2376,7 +2376,7 @@ Manual rebuild commands are for first setup, explicit operator refresh, or cases
 `cass` maintains multiple layers of redundancy to recover from corruption or schema changes:
 
 **Schema Hash Versioning**:
-Each Tantivy index stores a `schema_hash.json` file containing a hash of the current schema definition. On startup:
+Each lexical generation stores a `schema_hash.json` file containing a hash of the current schema definition. On startup:
 1. If hash matches → open existing index
 2. If hash differs → schema changed, trigger rebuild
 3. If file missing/corrupted → assume stale, trigger rebuild
@@ -2387,15 +2387,15 @@ This ensures that version upgrades with schema changes can rebuild the lexical d
 | Condition | Detection | Action |
 |-----------|-----------|--------|
 | Schema version change | Hash mismatch in `schema_hash.json` | Full rebuild |
-| Missing `meta.json` | Tantivy can't open index | Rebuild and publish a fresh derivative |
-| Corrupted index files | `Index::open_in_dir()` fails | Rebuild and publish a fresh derivative |
+| Missing Quill publication manifest | Quill can't open index | Rebuild and publish a fresh derivative |
+| Corrupted index files | Lexical reader open fails | Rebuild and publish a fresh derivative |
 | Explicit request | `--force-rebuild` flag | Rebuild derived search assets from the canonical SQLite archive |
 
 **SQLite as Ground Truth**:
-The SQLite database serves as the authoritative data store. Lexical rebuilds reconstruct the Tantivy index from SQLite:
+The SQLite database serves as the authoritative data store. Lexical rebuilds reconstruct the Quill index from SQLite:
 ```rust
 // Iterate all conversations from SQLite
-// Re-index each message into fresh Tantivy index
+// Re-index each message into a fresh Quill index
 // Progress tracked via IndexingProgress for UI feedback
 ```
 
@@ -3104,7 +3104,7 @@ Update check state is stored in the data directory:
 **Expected interface contract**
 - `frankensqlite` (`fsqlite`): `Connection`, `params!`, and `compat::{ConnectionExt, RowExt}` with `row.get_typed(...)`.
 - `franken-agent-detection`: `AgentDetectOptions` and `detect_installed_agents(...)`.
-- `frankensearch`: the explicit `lexical_tantivy::{cass_open_search_reader, ReloadPolicy}` CASS compatibility surface, plus `ModelCategory` and `ModelTier`.
+- `frankensearch`: the Quill CASS document/reader/writer surface used by the active lexical backend, the retained `lexical_tantivy` compatibility surface used by legacy federated assembly and differential checks, plus `ModelCategory` and `ModelTier`.
 - `frankentui`: `ftui::Frame`, `GraphemePool`, `Style`, `ftui-runtime`, `ftui-tty`, and the `ftui-extras` features enabled by cass.
 - `asupersync`: `runtime::RuntimeBuilder` and `http::h1::HttpClient::builder()`.
 - `toon` (`tru`): `toon::encode(...)`.
@@ -3190,12 +3190,12 @@ lto = true              # Link-time optimization across all crates
 codegen-units = 1       # Single codegen unit for better optimization
 strip = true            # Remove debug symbols from binary
 panic = "abort"         # Smaller panic handling (no unwinding)
-opt-level = "z"         # Optimize for size over speed
+opt-level = 3           # Maximum runtime optimization
 ```
 
 **Trade-offs**:
 - Build time is significantly longer (~3-5x)
-- Binary size is ~40-50% smaller
+- LTO and a single codegen unit prioritize runtime optimization at the cost of build time
 - No stack traces on panic (use debug builds for development)
 
 ### CI Pipeline & Artifacts

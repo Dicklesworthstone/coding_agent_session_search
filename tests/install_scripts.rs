@@ -71,6 +71,42 @@ fn install_sh_has_no_baseline_artifact_selection() -> Result<(), String> {
     Ok(())
 }
 
+#[test]
+fn release_workflow_builds_and_publishes_the_exact_requested_tag() -> Result<(), String> {
+    let workflow =
+        fs::read_to_string(".github/workflows/release.yml").map_err(|err| err.to_string())?;
+
+    let exact_ref_checkouts = workflow.matches("ref: ${{ env.RELEASE_REF }}").count();
+    if exact_ref_checkouts != 3 {
+        return Err(format!(
+            "build, release, and crates publish must all checkout RELEASE_REF; found {exact_ref_checkouts} exact-ref checkouts"
+        ));
+    }
+    for required in [
+        "RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}",
+        "DISPATCH_TAG: ${{ inputs.tag }}",
+        "git rev-parse --verify \"${RAW_TAG}^{commit}\"",
+        "Checked-out commit (${CHECKED_OUT_COMMIT}) does not match ${RAW_TAG} (${TAG_COMMIT}).",
+    ] {
+        if !workflow.contains(required) {
+            return Err(format!(
+                "release workflow is missing exact-tag integrity guard: {required}"
+            ));
+        }
+    }
+    if workflow.contains("Clone sibling dependencies") {
+        return Err(
+            "release workflow must not clone unused sibling repositories before Cargo builds"
+                .to_string(),
+        );
+    }
+    if workflow.contains("dtolnay/rust-toolchain@stable") {
+        return Err("release workflow actions must be immutable-SHA pinned".to_string());
+    }
+
+    Ok(())
+}
+
 fn file_sha256_hex(path: &std::path::Path) -> String {
     let mut file = fs::File::open(path).expect("open file for sha256");
     let mut hasher = Sha256::new();
@@ -974,4 +1010,76 @@ fn verify_flag_runs_self_test() {
         "verify should run the binary and show output, got: {}",
         stdout
     );
+}
+
+#[test]
+#[serial]
+#[cfg_attr(not(target_os = "linux"), ignore)]
+fn verify_flag_rejects_a_binary_whose_version_probe_fails() {
+    let artifact_dir = tempfile::TempDir::new().unwrap();
+    let payload_dir = tempfile::TempDir::new().unwrap();
+    let payload_cass = payload_dir.path().join("cass");
+    make_executable_script(&payload_cass, "#!/bin/sh\nexit 42\n");
+
+    let tar_path = artifact_dir.path().join("cass-linux-amd64.tar.gz");
+    let tar_status = Command::new("tar")
+        .arg("-czf")
+        .arg(&tar_path)
+        .arg("-C")
+        .arg(payload_dir.path())
+        .arg("cass")
+        .status()
+        .expect("create failing-binary tarball");
+    assert!(tar_status.success(), "test tarball should be created");
+
+    let checksum = file_sha256_hex(&tar_path);
+    let dest = tempfile::TempDir::new().unwrap();
+    let home = isolated_home();
+    let tmp_root = isolated_install_tmp_root();
+    let output = install_sh_command(&tmp_root)
+        .arg("--version")
+        .arg("vtest")
+        .arg("--dest")
+        .arg(dest.path())
+        .arg("--easy-mode")
+        .arg("--verify")
+        .env("HOME", home.path())
+        .env("ARTIFACT_URL", format!("file://{}", tar_path.display()))
+        .env("CHECKSUM", checksum)
+        .output()
+        .expect("run install.sh with a failing version probe");
+
+    assert!(
+        !output.status.success(),
+        "--verify must fail when the installed binary exits non-zero"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Self-test failed"),
+        "verification failure should be explicit, got: {combined}"
+    );
+    assert!(
+        !combined.contains("Self-test complete"),
+        "installer must not claim a failed self-test completed"
+    );
+}
+
+#[test]
+fn powershell_verify_contract_fails_closed_on_native_command_errors() {
+    let script = fs::read_to_string("install.ps1").expect("read install.ps1");
+    for required in [
+        "$verifyExitCode = $LASTEXITCODE",
+        "if ($verifyExitCode -ne 0)",
+        "exit $verifyExitCode",
+        "Self-test complete",
+    ] {
+        assert!(
+            script.contains(required),
+            "PowerShell verification is missing: {required}"
+        );
+    }
 }
