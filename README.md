@@ -3082,7 +3082,7 @@ Update check state is stored in the data directory:
 
 ## Dependency Source Contract
 
-`cass` pins dependency identities in [`Cargo.toml`](Cargo.toml): exact registry version requirements for crates.io-only dependencies and git revisions for source dependencies. Immutable remote `[patch.crates-io]` entries may unify transitive source identity; local sibling-path overrides stay commented out by default and must never be committed active.
+`cass` pins dependency identities in [`Cargo.toml`](Cargo.toml): exact registry version requirements for every dependency — since gh#416 closed, nothing in the graph resolves from git. Immutable remote `[patch.crates-io]` entries may unify transitive source identity; local sibling-path overrides stay commented out by default and must never be committed active.
 
 | Dependency | Pinned source |
 |------------|-----------------|
