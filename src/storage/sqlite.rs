@@ -8243,7 +8243,7 @@ impl FrankenStorage {
         Ok(false)
     }
 
-    /// Reclassify OMP sessions indexed by pre-0.2 FAD releases as `pi_agent`.
+    /// Reclassify OMP sessions that pre-0.2 FAD releases indexed as `pi_agent`.
     ///
     /// Older detector releases scanned OMP config roots and configured remote
     /// mirrors through the Pi Agent connector. FAD 0.2 gives OMP a dedicated
@@ -8376,7 +8376,11 @@ impl FrankenStorage {
                 version: None,
                 kind: AgentKind::Cli,
             })?;
-            let legacy_agent_id = legacy_agent_id.expect("positive legacy count requires agent id");
+            let legacy_agent_id = legacy_agent_id.ok_or_else(|| {
+                anyhow!(
+                    "legacy OMP reclassification selected {legacy_count} conversation(s), but the pi_agent row disappeared"
+                )
+            })?;
             let mut conflicting_rows = 0usize;
             let mut seen_legacy_paths = HashSet::new();
             let mut seen_legacy_external_ids = HashSet::new();

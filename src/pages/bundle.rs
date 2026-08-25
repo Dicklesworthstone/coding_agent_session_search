@@ -364,11 +364,12 @@ impl BundleBuilder {
         let final_site_dir = output_dir.join("site");
         let final_private_dir = output_dir.join("private");
         let mut retain_temp_on_replace_error = false;
+        let mut staging_identity = None;
         let result = (|| -> Result<BundleResult> {
             progress("setup", "Creating directory structure...");
 
             // Stage the bundle under a unique temp root so reruns do not retain stale files.
-            create_bundle_staging_root(&temp_output_dir)?;
+            staging_identity = Some(create_bundle_staging_root(&temp_output_dir)?);
             let site_dir = temp_output_dir.join("site");
             let private_dir = temp_output_dir.join("private");
 
@@ -540,7 +541,15 @@ impl BundleBuilder {
 
         match result {
             Err(build_error) if !retain_temp_on_replace_error => {
-                match cleanup_rejected_bundle_temp(&temp_output_dir) {
+                let Some(staging_identity) = staging_identity.as_ref() else {
+                    return Err(build_error);
+                };
+                match cleanup_rejected_bundle_temp(
+                    &temp_output_dir,
+                    output_dir,
+                    &publication_guard,
+                    staging_identity,
+                ) {
                     Ok(()) => Err(build_error),
                     Err(cleanup_error) => Err(build_error.context(format!(
                         "failed to remove rejected staged bundle: {cleanup_error:#}"
@@ -552,7 +561,7 @@ impl BundleBuilder {
     }
 }
 
-fn create_bundle_staging_root(path: &Path) -> Result<()> {
+fn create_bundle_staging_root(path: &Path) -> Result<crate::franken_sync::FileIdentity> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -580,7 +589,25 @@ fn create_bundle_staging_root(path: &Path) -> Result<()> {
         fs::create_dir(path)
             .with_context(|| format!("failed creating bundle staging root {}", path.display()))?;
     }
-    Ok(())
+    let handle = File::open(path)
+        .with_context(|| format!("failed opening bundle staging root {}", path.display()))?;
+    let metadata = handle
+        .metadata()
+        .with_context(|| format!("failed inspecting bundle staging root {}", path.display()))?;
+    if !metadata.file_type().is_dir() {
+        bail!(
+            "newly created bundle staging root is not a directory: {}",
+            path.display()
+        );
+    }
+    crate::franken_sync::FileIdentity::from_file(&handle)
+        .with_context(|| format!("failed identifying bundle staging root {}", path.display()))?
+        .ok_or_else(|| {
+            anyhow!(
+                "filesystem does not expose a stable identity for bundle staging root {}",
+                path.display()
+            )
+        })
 }
 
 fn prepare_bundle_root_for_publish(path: &Path) -> Result<()> {
@@ -596,7 +623,17 @@ fn prepare_bundle_root_for_publish(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cleanup_rejected_bundle_temp(path: &Path) -> Result<()> {
+fn cleanup_rejected_bundle_temp(
+    path: &Path,
+    final_dir: &Path,
+    guard: &PagesPublicationLockGuard,
+    expected_identity: &crate::franken_sync::FileIdentity,
+) -> Result<()> {
+    require_pages_publication_lock(final_dir, guard)?;
+    validate_owned_bundle_staging_path(final_dir, path)?;
+    require_bundle_staging_identity(path, expected_identity)?;
+    require_pages_publication_lock(final_dir, guard)?;
+    require_bundle_staging_identity(path, expected_identity)?;
     match fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -604,6 +641,90 @@ fn cleanup_rejected_bundle_temp(path: &Path) -> Result<()> {
             Err(error).with_context(|| format!("failed removing staged bundle {}", path.display()))
         }
     }
+}
+
+fn require_bundle_staging_identity(
+    path: &Path,
+    expected: &crate::franken_sync::FileIdentity,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "failed re-inspecting owned Pages bundle staging root {}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        bail!(
+            "owned Pages bundle staging root changed file type before cleanup: {}",
+            path.display()
+        );
+    }
+    let probe = File::open(path).with_context(|| {
+        format!(
+            "failed opening owned Pages bundle staging root before cleanup: {}",
+            path.display()
+        )
+    })?;
+    let observed = crate::franken_sync::FileIdentity::from_file(&probe)
+        .with_context(|| {
+            format!(
+                "failed re-identifying owned Pages bundle staging root {}",
+                path.display()
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow!(
+                "filesystem stopped exposing a stable identity for owned Pages bundle staging root {}",
+                path.display()
+            )
+        })?;
+    if observed != *expected {
+        bail!(
+            "owned Pages bundle staging root changed identity before cleanup; preserved it without mutation: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn validate_owned_bundle_staging_path(final_dir: &Path, staging_dir: &Path) -> Result<()> {
+    if staging_dir.parent() != final_dir.parent() {
+        bail!(
+            "refusing to remove a Pages bundle staging path outside the live root's direct parent: {}",
+            staging_dir.display()
+        );
+    }
+    let live_name = final_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("pages_bundle");
+    let staging_name = staging_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("Pages bundle staging path has no UTF-8 file name"))?;
+    let prefix = format!(".{live_name}.tmp.");
+    let Some((random_nonce, counter)) = staging_name
+        .strip_prefix(&prefix)
+        .and_then(|suffix| suffix.split_once('.'))
+    else {
+        bail!(
+            "refusing to remove a path that is not an owned Pages bundle staging root: {}",
+            staging_dir.display()
+        );
+    };
+    if random_nonce.len() != 32
+        || !random_nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || counter.is_empty()
+        || !counter.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        bail!(
+            "refusing to remove a Pages bundle staging root with an invalid ownership nonce: {}",
+            staging_dir.display()
+        );
+    }
+    Ok(())
 }
 
 fn unique_bundle_dir(path: &Path, suffix: &str) -> Result<PathBuf> {
@@ -4051,6 +4172,61 @@ mod tests {
             first_unowned_bundle_publish_backup(&final_dir, None)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn test_rejected_stage_cleanup_refuses_unowned_recursive_target() {
+        let temp = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let unowned_dir = temp.path().join(".bundle.tmp.not-a-random-nonce.0");
+        let unowned_identity = create_bundle_staging_root(&unowned_dir).unwrap();
+        let sentinel = unowned_dir.join("sentinel.txt");
+        fs::write(&sentinel, "preserve").unwrap();
+        let guard = acquire_pages_publication_lock(&final_dir).unwrap();
+
+        let error = cleanup_rejected_bundle_temp(
+            &unowned_dir,
+            &final_dir,
+            &guard,
+            &unowned_identity,
+        )
+        .expect_err("an unowned path must never reach recursive stage cleanup");
+
+        assert!(error.to_string().contains("invalid ownership nonce"));
+        assert_eq!(fs::read_to_string(sentinel).unwrap(), "preserve");
+    }
+
+    #[test]
+    fn test_rejected_stage_cleanup_refuses_replaced_owned_path() {
+        let temp = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let staging_dir = unique_bundle_dir(&final_dir, "tmp").unwrap();
+        let staging_identity = create_bundle_staging_root(&staging_dir).unwrap();
+        fs::write(staging_dir.join("owned.txt"), "owned").unwrap();
+        let displaced_dir = temp.path().join("displaced-owned-stage");
+        fs::rename(&staging_dir, &displaced_dir).unwrap();
+        fs::create_dir(&staging_dir).unwrap();
+        let replacement_sentinel = staging_dir.join("replacement.txt");
+        fs::write(&replacement_sentinel, "preserve replacement").unwrap();
+        let guard = acquire_pages_publication_lock(&final_dir).unwrap();
+
+        let error = cleanup_rejected_bundle_temp(
+            &staging_dir,
+            &final_dir,
+            &guard,
+            &staging_identity,
+        )
+        .expect_err("a replaced staging pathname must never be recursively removed");
+
+        assert!(error.to_string().contains("changed identity"));
+        assert_eq!(
+            fs::read_to_string(replacement_sentinel).unwrap(),
+            "preserve replacement"
+        );
+        assert_eq!(
+            fs::read_to_string(displaced_dir.join("owned.txt")).unwrap(),
+            "owned"
         );
     }
 
