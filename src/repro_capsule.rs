@@ -504,9 +504,14 @@ mod tests {
         let env = out["capsule"]["env_summary"]
             .as_object()
             .expect("redacted env object");
+        // gh#419: swarm-specific patterns label before the canonical floor,
+        // so a secret-bearing `key=value` OBJECT KEY carries the precise
+        // `[SECRET_ENV_REDACTED]` marker (plus `#N` collision suffixes), not
+        // the generic `[REDACTED]`. Bare sensitive keys (`password`, `pin`)
+        // still get canonical `[REDACTED]` value replacement, asserted above.
         let mut collision_values = env
             .iter()
-            .filter(|(key, _)| key.starts_with("[REDACTED]"))
+            .filter(|(key, _)| key.starts_with("[SECRET_ENV_REDACTED]"))
             .map(|(_, value)| value.as_str().unwrap_or_default())
             .collect::<Vec<_>>();
         collision_values.sort_unstable();
