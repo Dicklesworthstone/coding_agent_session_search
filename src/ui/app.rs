@@ -22743,8 +22743,14 @@ fn load_local_export_raw_messages(
     let reader = BufReader::new(file);
     let mut messages = Vec::new();
     let mut session_start = None;
+    // GH #427: apply the indexer's per-line policy. A record that fails to
+    // decode is skipped (and logged) rather than aborting the export; only a
+    // file with no decodable record at all is rejected, so the indexed
+    // fallback still engages for genuinely non-JSONL paths.
+    let mut skipped: usize = 0;
+    let mut first_parse_error: Option<String> = None;
 
-    for (line_number, line_result) in reader.lines().enumerate() {
+    for (line_index, line_result) in reader.lines().enumerate() {
         let line = line_result.map_err(|err| {
             format!(
                 "Failed to read session: {err}. The session file may be truncated or contain invalid UTF-8."
@@ -22753,12 +22759,25 @@ fn load_local_export_raw_messages(
         if line.trim().is_empty() {
             continue;
         }
-        let message = serde_json::from_str::<serde_json::Value>(&line).map_err(|err| {
-            format!(
-                "Failed to parse session JSONL at line {}: {err}",
-                line_number + 1
-            )
-        })?;
+        let message = match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(message) => message,
+            Err(err) => {
+                let line_number = line_index + 1;
+                tracing::warn!(
+                    source_path = %session_path.display(),
+                    line_no = line_number,
+                    error = %err,
+                    "session JSONL line failed to parse; skipping (GH #427)"
+                );
+                skipped += 1;
+                if first_parse_error.is_none() {
+                    first_parse_error = Some(format!(
+                        "Failed to parse session JSONL at line {line_number}: {err}"
+                    ));
+                }
+                continue;
+            }
+        };
         if let Some(ts) = crate::extract_message_timestamp(&message)
             && session_start.is_none_or(|start| ts < start)
         {
@@ -22767,7 +22786,57 @@ fn load_local_export_raw_messages(
         messages.push(message);
     }
 
+    if messages.is_empty()
+        && let Some(first) = first_parse_error
+    {
+        return Err(format!(
+            "{first} (none of the {skipped} non-empty line(s) decoded as JSON)"
+        ));
+    }
+    if skipped > 0 {
+        tracing::warn!(
+            source_path = %session_path.display(),
+            skipped,
+            decoded = messages.len(),
+            "export skipped malformed JSONL record(s); rendered the rest (GH #427)"
+        );
+    }
+
     Ok((messages, None, session_start))
+}
+
+#[cfg(test)]
+mod gh427_tui_export_loader_tests {
+    use super::load_local_export_raw_messages;
+
+    #[test]
+    fn truncated_record_is_skipped_and_rest_is_exported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            "{\"role\":\"user\",\"content\":\"first\"}\n{\"role\":\"assistant\",\"content\":\"cut\n{\"role\":\"assistant\",\"content\":\"third\"}\n",
+        )
+        .unwrap();
+
+        let (messages, title, _) = load_local_export_raw_messages(&path)
+            .expect("one malformed line must not fail the export");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["content"], "first");
+        assert_eq!(messages[1]["content"], "third");
+        assert!(title.is_none());
+    }
+
+    #[test]
+    fn file_without_any_json_record_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.jsonl");
+        std::fs::write(&path, "just text\n").unwrap();
+
+        let err = load_local_export_raw_messages(&path).unwrap_err();
+        assert!(err.contains("at line 1"), "{err}");
+        assert!(err.contains("none of the 1"), "{err}");
+    }
 }
 
 fn load_indexed_export_view(

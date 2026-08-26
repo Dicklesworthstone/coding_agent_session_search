@@ -92538,28 +92538,51 @@ fn read_followup_file_lines(path: &Path) -> CliResult<Vec<String>> {
         })
 }
 
-fn parse_followup_jsonl_messages(
+/// One JSONL record that the direct-file export/view loader could not decode
+/// and therefore skipped (GH #427). `line_number` is 1-based.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SkippedJsonlLine {
+    pub(crate) line_number: usize,
+    pub(crate) error: String,
+}
+
+/// How many skipped records are named individually on stderr before the
+/// remainder is summarised as a count.
+const MAX_REPORTED_SKIPPED_JSONL_LINES: usize = 5;
+
+/// Parse a JSONL session file for export/view, applying the same per-line
+/// policy as the indexer (GH #427): a record that fails to decode is skipped
+/// and reported instead of aborting the whole session. Only when *no* record
+/// decodes is the file rejected, so a genuinely non-JSONL path still falls
+/// back to the indexed copy exactly as before.
+pub(crate) fn parse_followup_jsonl_messages_tolerant(
     path: &Path,
-) -> CliResult<(Vec<serde_json::Value>, Option<i64>, Option<i64>)> {
+) -> CliResult<(
+    Vec<serde_json::Value>,
+    Option<i64>,
+    Option<i64>,
+    Vec<SkippedJsonlLine>,
+)> {
     let lines = read_followup_file_lines(path)?;
     let mut messages = Vec::new();
     let mut session_start = None;
     let mut session_end = None;
+    let mut skipped: Vec<SkippedJsonlLine> = Vec::new();
 
-    for (line_number, line) in lines.into_iter().enumerate() {
+    for (line_index, line) in lines.into_iter().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let msg = serde_json::from_str::<serde_json::Value>(&line).map_err(|e| CliError {
-            code: 9,
-            kind: CliErrorKind::SessionParse.kind_str(),
-            message: format!("Failed to parse session JSONL at line {}: {e}", line_number + 1),
-            hint: Some(
-                "The local JSONL session is malformed; use the indexed copy or repair the session file."
-                    .into(),
-            ),
-            retryable: false,
-        })?;
+        let msg = match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(msg) => msg,
+            Err(err) => {
+                skipped.push(SkippedJsonlLine {
+                    line_number: line_index + 1,
+                    error: err.to_string(),
+                });
+                continue;
+            }
+        };
         if let Some(ts) = extract_message_timestamp(&msg) {
             if session_start.is_none_or(|start| ts < start) {
                 session_start = Some(ts);
@@ -92571,7 +92594,144 @@ fn parse_followup_jsonl_messages(
         messages.push(msg);
     }
 
+    if messages.is_empty()
+        && let Some(first) = skipped.first()
+    {
+        return Err(CliError {
+            code: 9,
+            kind: CliErrorKind::SessionParse.kind_str(),
+            message: format!(
+                "Failed to parse session JSONL at line {}: {}",
+                first.line_number, first.error
+            ),
+            hint: Some(format!(
+                "None of the {} non-empty line(s) in {} decoded as JSON; use the indexed copy or repair the session file.",
+                skipped.len(),
+                path.display()
+            )),
+            retryable: false,
+        });
+    }
+
+    Ok((messages, session_start, session_end, skipped))
+}
+
+/// Surface skipped records on stderr (stdout stays data-only) and in the
+/// trace log, mirroring the indexer's `malformed-json-line` diagnostic.
+fn report_skipped_jsonl_lines(path: &Path, decoded: usize, skipped: &[SkippedJsonlLine]) {
+    if skipped.is_empty() {
+        return;
+    }
+    for line in skipped {
+        tracing::warn!(
+            source_path = %path.display(),
+            line_no = line.line_number,
+            error = %line.error,
+            "session JSONL line failed to parse; skipping (GH #427)"
+        );
+    }
+    eprintln!(
+        "warning: skipped {} malformed JSONL record(s) in {}; rendered the remaining {} record(s) (cass index applies the same per-line policy)",
+        skipped.len(),
+        path.display(),
+        decoded
+    );
+    for line in skipped.iter().take(MAX_REPORTED_SKIPPED_JSONL_LINES) {
+        eprintln!("warning:   line {}: {}", line.line_number, line.error);
+    }
+    if skipped.len() > MAX_REPORTED_SKIPPED_JSONL_LINES {
+        eprintln!(
+            "warning:   ... and {} more",
+            skipped.len() - MAX_REPORTED_SKIPPED_JSONL_LINES
+        );
+    }
+}
+
+fn parse_followup_jsonl_messages(
+    path: &Path,
+) -> CliResult<(Vec<serde_json::Value>, Option<i64>, Option<i64>)> {
+    let (messages, session_start, session_end, skipped) =
+        parse_followup_jsonl_messages_tolerant(path)?;
+    report_skipped_jsonl_lines(path, messages.len(), &skipped);
     Ok((messages, session_start, session_end))
+}
+
+#[cfg(test)]
+mod gh427_tolerant_jsonl_tests {
+    use super::*;
+
+    fn write_session(dir: &tempfile::TempDir, name: &str, body: &str) -> PathBuf {
+        let path = dir.path().join(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn one_truncated_record_is_skipped_and_reported_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_session(
+            &dir,
+            "rollout.jsonl",
+            concat!(
+                "{\"role\":\"user\",\"content\":\"first\",\"timestamp\":\"2026-08-25T00:00:01Z\"}\n",
+                "{\"role\":\"assistant\",\"content\":\"cut mid-str\n",
+                "\n",
+                "{\"role\":\"assistant\",\"content\":\"third\",\"timestamp\":\"2026-08-25T00:00:03Z\"}\n",
+            ),
+        );
+
+        let (messages, start, end, skipped) = parse_followup_jsonl_messages_tolerant(&path)
+            .expect("one malformed line must not abort the session");
+
+        assert_eq!(messages.len(), 2, "the surrounding valid records are kept");
+        assert_eq!(messages[0]["content"], "first");
+        assert_eq!(messages[1]["content"], "third");
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].line_number, 2, "line numbers are 1-based");
+        assert!(
+            !skipped[0].error.is_empty(),
+            "the decode error is preserved for the warning"
+        );
+        assert!(start.is_some() && end.is_some() && start <= end);
+
+        // The reporting wrapper keeps the original return shape.
+        let (messages, _, _) = parse_followup_jsonl_messages(&path).unwrap();
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn file_with_no_decodable_record_is_still_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_session(&dir, "not-jsonl.txt", "plain text\nmore text\n");
+
+        let err = parse_followup_jsonl_messages_tolerant(&path)
+            .expect_err("a file with zero decodable records is not a JSONL session");
+        assert_eq!(err.code, 9);
+        assert_eq!(err.kind, CliErrorKind::SessionParse.kind_str());
+        assert!(
+            err.message.contains("at line 1"),
+            "the first failing line is named: {}",
+            err.message
+        );
+        assert!(
+            err.hint.as_deref().is_some_and(|h| h.contains("None of the 2")),
+            "hint counts the undecodable lines: {:?}",
+            err.hint
+        );
+    }
+
+    #[test]
+    fn fully_valid_file_reports_no_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_session(
+            &dir,
+            "ok.jsonl",
+            "{\"role\":\"user\",\"content\":\"a\"}\n{\"role\":\"assistant\",\"content\":\"b\"}\n",
+        );
+        let (messages, _, _, skipped) = parse_followup_jsonl_messages_tolerant(&path).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(skipped.is_empty());
+    }
 }
 
 fn infer_followup_agent_and_workspace(path: &Path) -> (Option<String>, Option<String>) {
