@@ -177,16 +177,13 @@ fn analytics_models_with_invalid_since_returns_actionable_error() {
     let (exit, stdout, stderr) =
         run_cass_analytics_models(&dir, &["--since", "this is not a valid date"], &[]);
     eprintln!("[vz9t8_6_test] invalid_since exit={exit}");
-    // Cass should reject the bad date with a non-zero exit AND an actionable
-    // hint. Soft-accept exit=0 if cass treats it as no-filter (lenient parsing).
-    if exit != 0 {
-        let combined = format!("{stdout}\n{stderr}");
-        assert!(
-            combined.to_lowercase().contains("date")
-                || combined.to_lowercase().contains("since")
-                || combined.to_lowercase().contains("time")
-                || combined.to_lowercase().contains("invalid"),
-            "expected actionable hint mentioning date/since/time/invalid; got: {combined}"
-        );
-    }
+    assert_ne!(exit, 0, "invalid --since must not become an unfiltered query");
+    let combined = format!("{stdout}\n{stderr}");
+    assert!(
+        combined.to_lowercase().contains("date")
+            || combined.to_lowercase().contains("since")
+            || combined.to_lowercase().contains("time")
+            || combined.to_lowercase().contains("invalid"),
+        "expected actionable hint mentioning date/since/time/invalid; got: {combined}"
+    );
 }

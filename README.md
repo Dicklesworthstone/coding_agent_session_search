@@ -2509,10 +2509,16 @@ cass analytics rebuild --since 2026-08-20 # from a date
 
 The window is widened to the start of the UTC day containing the cutoff,
 because rollups are bucketed by day and hour. Progress is logged per 10k
-messages (`analytics_rebuild_progress`). `--until`, `--agent`, `--workspace`
+messages (`analytics_rebuild_progress`). Across analytics commands, `--days`
+and `--since` are mutually exclusive, and malformed or reversed time bounds
+return a usage error instead of silently running an unfiltered query.
+`--until`, `--agent`, `--workspace`
 and `--source` are query-time filters and are rejected here rather than
-silently ignored; `--since`/`--days` do not apply to Track B
-(`--track b`/`all`), which always rebuilds fully from the `token_usage` ledger.
+silently ignored. `--track b` also rejects `--since`/`--days`; with `--track
+all`, the window applies to Track A while Track B still rebuilds the complete
+`token_usage` ledger. `cass analytics validate` likewise rejects every query
+filter because its invariant checks always cover the complete analytics
+database.
 
 ---
 

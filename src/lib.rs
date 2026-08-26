@@ -17086,6 +17086,19 @@ fn run_analytics(cmd: AnalyticsCommand, db_path: Option<PathBuf>, cli: &Cli) -> 
         AnalyticsCommand::Validate { common, .. } => ("validate", common),
     };
 
+    // Reject malformed or contradictory query bounds before opening storage.
+    // Rebuild and validate have their own stricter maintenance-command rules.
+    if matches!(
+        &cmd,
+        AnalyticsCommand::Status { .. }
+            | AnalyticsCommand::Tokens { .. }
+            | AnalyticsCommand::Tools { .. }
+            | AnalyticsCommand::AnalyticsModels { .. }
+            | AnalyticsCommand::Incidents { .. }
+    ) {
+        analytics_filter_from_common(common)?;
+    }
+
     // Build a summary of the active filters for _meta.
     let filters = analytics_build_filters(common);
 
@@ -18108,7 +18121,7 @@ fn run_analytics_tools(
 }
 
 #[cfg(test)]
-mod analytics_rebuild_since_tests {
+mod analytics_filter_validation_tests {
     use super::*;
 
     fn common() -> AnalyticsCommon {
@@ -18185,10 +18198,57 @@ mod analytics_rebuild_since_tests {
         assert!(err.message.contains("--agent"), "{}", err.message);
     }
 
-    /// The window only applies to Track A, so the JSON payload must advertise
-    /// `since_ms`/`since_day_id` exactly when Track A ran with one — never for
-    /// a Track-B-only run, where automation would otherwise read a window as
-    /// honored (GH #412).
+    #[test]
+    fn ambiguous_and_invalid_query_time_bounds_are_usage_errors() {
+        let mut conflicting = common();
+        conflicting.days = Some(7);
+        conflicting.since = Some("2026-01-01".into());
+        let err = analytics_filter_from_common(&conflicting).unwrap_err();
+        assert_eq!(err.code, 2);
+        assert!(err.message.contains("--days"), "{}", err.message);
+        assert!(err.message.contains("--since"), "{}", err.message);
+
+        let mut invalid_until = common();
+        invalid_until.until = Some("not-a-date".into());
+        let err = analytics_filter_from_common(&invalid_until).unwrap_err();
+        assert_eq!(err.code, 2);
+        assert!(err.message.contains("--until"), "{}", err.message);
+
+        let mut reversed = common();
+        reversed.since = Some("2026-02-01".into());
+        reversed.until = Some("2026-01-01".into());
+        let err = analytics_filter_from_common(&reversed).unwrap_err();
+        assert_eq!(err.code, 2);
+        assert!(err.message.contains("later than --until"), "{}", err.message);
+    }
+
+    #[test]
+    fn maintenance_commands_reject_filters_they_cannot_apply() {
+        let mut ambiguous_rebuild = common();
+        ambiguous_rebuild.days = Some(7);
+        ambiguous_rebuild.since = Some("2026-01-01".into());
+        let err = analytics_rebuild_since_ms(&ambiguous_rebuild).unwrap_err();
+        assert_eq!(err.code, 2);
+        assert!(err.message.contains("cannot be used together"));
+
+        assert!(validate_analytics_rebuild_window(AnalyticsTrack::A, Some(1)).is_ok());
+        assert!(validate_analytics_rebuild_window(AnalyticsTrack::All, Some(1)).is_ok());
+        let err = validate_analytics_rebuild_window(AnalyticsTrack::B, Some(1)).unwrap_err();
+        assert_eq!(err.code, 2);
+        assert!(err.message.contains("--track b"), "{}", err.message);
+
+        let mut validate = common();
+        validate.agent = vec!["claude_code".into()];
+        validate.days = Some(7);
+        let err = reject_analytics_validate_filters(&validate).unwrap_err();
+        assert_eq!(err.code, 2);
+        assert!(err.message.contains("--days"), "{}", err.message);
+        assert!(err.message.contains("--agent"), "{}", err.message);
+    }
+
+    /// The window only applies to Track A, so the JSON payload advertises
+    /// `since_ms`/`since_day_id` when Track A ran with one. Track-B-only
+    /// window requests are rejected instead of being silently ignored (GH #412).
     #[test]
     fn payload_advertises_window_only_when_track_a_used_it() {
         use crate::storage::sqlite::{FrankenStorage, SqliteStorage};
@@ -18200,25 +18260,29 @@ mod analytics_rebuild_since_tests {
         let mut windowed = common();
         windowed.days = Some(2);
 
-        for (track, expect_window) in [
-            (AnalyticsTrack::A, true),
-            (AnalyticsTrack::All, true),
-            (AnalyticsTrack::B, false),
-        ] {
+        for track in [AnalyticsTrack::A, AnalyticsTrack::All] {
             let payload = run_analytics_rebuild(&windowed, false, track, Some(&db_path))
                 .unwrap_or_else(|e| panic!("{track:?}: {}", e.message));
             let has_ms = payload.get("since_ms").is_some();
             let has_day = payload.get("since_day_id").is_some();
-            assert_eq!(has_ms, expect_window, "{track:?}: {payload}");
-            assert_eq!(has_day, expect_window, "{track:?}: {payload}");
-            if expect_window {
-                // Both fields describe the same day-aligned cutoff.
-                let ms = payload["since_ms"].as_i64().unwrap();
-                let day = payload["since_day_id"].as_i64().unwrap();
-                assert_eq!(SqliteStorage::millis_from_day_id(day), ms, "{payload}");
-                assert_eq!(SqliteStorage::day_id_from_millis(ms), day, "{payload}");
-            }
+            assert!(has_ms, "{track:?}: {payload}");
+            assert!(has_day, "{track:?}: {payload}");
+            // Both fields describe the same day-aligned cutoff.
+            let ms = payload["since_ms"].as_i64().unwrap();
+            let day = payload["since_day_id"].as_i64().unwrap();
+            assert_eq!(SqliteStorage::millis_from_day_id(day), ms, "{payload}");
+            assert_eq!(SqliteStorage::day_id_from_millis(ms), day, "{payload}");
         }
+
+        let err = run_analytics_rebuild(
+            &windowed,
+            false,
+            AnalyticsTrack::B,
+            Some(&db_path),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, 2);
+        assert!(err.message.contains("--track b"), "{}", err.message);
 
         // No window requested => never advertised, whichever track ran.
         let payload = run_analytics_rebuild(&common(), false, AnalyticsTrack::All, Some(&db_path))
