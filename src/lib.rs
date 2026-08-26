@@ -92714,7 +92714,9 @@ mod gh427_tolerant_jsonl_tests {
             err.message
         );
         assert!(
-            err.hint.as_deref().is_some_and(|h| h.contains("None of the 2")),
+            err.hint
+                .as_deref()
+                .is_some_and(|h| h.contains("None of the 2")),
             "hint counts the undecodable lines: {:?}",
             err.hint
         );

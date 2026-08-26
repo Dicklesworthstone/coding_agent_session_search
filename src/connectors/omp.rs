@@ -403,14 +403,15 @@ fn has_xdg_omp_layout_marker(parts: &[String]) -> bool {
             && window[2] == "omp"
             && window[3] == "profiles"
             && normalize_profile_name(&window[4]).is_some()
-    }) || parts.windows(3).any(|window| {
-        window[0] == "omp" && window[1] == "sessions" && window[2].starts_with('-')
-    }) || parts.windows(4).any(|window| {
-        window[0] == "omp"
-            && window[1] == "profiles"
-            && normalize_profile_name(&window[2]).is_some()
-            && window[3] == "sessions"
-    })
+    }) || parts
+        .windows(3)
+        .any(|window| window[0] == "omp" && window[1] == "sessions" && window[2].starts_with('-'))
+        || parts.windows(4).any(|window| {
+            window[0] == "omp"
+                && window[1] == "profiles"
+                && normalize_profile_name(&window[2]).is_some()
+                && window[3] == "sessions"
+        })
 }
 
 /// Durable OMP evidence encoded in an archived transcript path.

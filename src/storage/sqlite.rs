@@ -17213,7 +17213,7 @@ impl FrankenStorage {
         // an interrupted run leaves a prefix that the next full rebuild
         // simply re-derives.
         {
-            let tx = self.conn.transaction()?;
+            let mut tx = self.conn.transaction()?;
             match scope {
                 None => {
                     tx.execute("DELETE FROM message_metrics")?;
@@ -17380,7 +17380,7 @@ impl FrankenStorage {
             kept += entries.len() as i64;
             if !entries.is_empty() {
                 // GH #424: one short write transaction per chunk.
-                let tx = self.conn.transaction()?;
+                let mut tx = self.conn.transaction()?;
                 total_inserted += franken_insert_message_metrics_batched_in_tx(&tx, &entries)?;
                 let (hourly, daily, models_daily) =
                     franken_flush_analytics_rollups_in_tx(&tx, &rollup_agg)?;
@@ -23383,7 +23383,10 @@ mod tests {
         let full = storage
             .rebuild_analytics_since_with_chunk_size(None, 2)
             .unwrap();
-        assert_eq!(full.message_metrics_rows, 6, "3 + 3 real rows, orphan dropped");
+        assert_eq!(
+            full.message_metrics_rows, 6,
+            "3 + 3 real rows, orphan dropped"
+        );
         assert_eq!(metrics_count(day1), 3);
         assert_eq!(metrics_count(day2), 3);
         let orphan_metrics: i64 = conn
