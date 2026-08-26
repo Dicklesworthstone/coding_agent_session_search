@@ -92099,8 +92099,7 @@ mod response_schema_tests {
         // RCH may place TMPDIR beneath the checkout. Establish a fixture-local
         // repository boundary so ambient parent .gitignore rules cannot turn
         // this no-config case into a repository-policy test.
-        std::fs::create_dir_all(temp.path().join(".git"))
-            .expect("create repo boundary");
+        std::fs::create_dir_all(temp.path().join(".git")).expect("create repo boundary");
         let data_dir = temp.path().join("cass-data");
         std::fs::create_dir_all(&data_dir).expect("create data dir");
 
