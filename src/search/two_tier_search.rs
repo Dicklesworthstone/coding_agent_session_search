@@ -101,16 +101,10 @@ fn open_complete_fs_index_with_retry(
     dir: &Path,
     config: &FsTwoTierConfig,
 ) -> std::result::Result<(FsTwoTierIndex, usize), FsSearchError> {
-    let paths = FsTwoTierIndexPaths::new(fs_index_artifact_path(
-        dir,
-        VECTOR_INDEX_FAST_FILENAME,
-    ))
-    .with_quality_index(fs_index_artifact_path(
-        dir,
-        VECTOR_INDEX_QUALITY_FILENAME,
-    ))
-    .with_fast_ann(fs_index_artifact_path(dir, VECTOR_ANN_FAST_FILENAME))
-    .with_quality_ann(fs_index_artifact_path(dir, VECTOR_ANN_QUALITY_FILENAME));
+    let paths = FsTwoTierIndexPaths::new(fs_index_artifact_path(dir, VECTOR_INDEX_FAST_FILENAME))
+        .with_quality_index(fs_index_artifact_path(dir, VECTOR_INDEX_QUALITY_FILENAME))
+        .with_fast_ann(fs_index_artifact_path(dir, VECTOR_ANN_FAST_FILENAME))
+        .with_quality_ann(fs_index_artifact_path(dir, VECTOR_ANN_QUALITY_FILENAME));
     let mut retries = 0;
     let mut backoff = FSVI_REOPEN_INITIAL_BACKOFF;
     let clone_config = || config.clone();
@@ -1106,8 +1100,7 @@ mod tests {
         fast_writer.write_record("s:session-0", &[1.0, 0.0])?;
         fast_writer.finish()?;
 
-        let mut quality_writer =
-            frankensearch::VectorIndex::create(&quality_path, "quality", 2)?;
+        let mut quality_writer = frankensearch::VectorIndex::create(&quality_path, "quality", 2)?;
         quality_writer.write_record("s:session-0", &[1.0, 0.0])?;
         quality_writer.finish()?;
 
