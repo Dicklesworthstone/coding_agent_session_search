@@ -21,6 +21,23 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 > Subsequent correctness and release-hardening changes on `main` target
 > `0.7.1`; do not tag a later commit as `v0.7.0`.
 
+## [v0.7.1] -- 2026-08-25
+
+### Fixed
+
+- Hardened first-class OMP v18 ownership and resume behavior for relocated XDG
+  stores, named profiles, copied archives, and Pi-family ambiguity. Legacy
+  identity reclassification now uses the same provider-qualified path evidence.
+- Made nested analytics-deferral guards concurrency-safe and preserved explicit
+  analytics update dispositions during indexing.
+- Tightened lesson and repro-capsule secret redaction, including valid `=`
+  characters in email local parts without swallowing known metadata prefixes.
+- Hardened bounded quarantine retry and recovery, Pages bundle verification and
+  publication, semantic fail-open readiness, installer argument and checksum
+  behavior, and update-check state locking.
+- Pinned the release toolchain to `nightly-2026-08-20` and tightened
+  exact-version release and package verification.
+
 ## [v0.7.0] -- 2026-08-25
 
 > Note: this section accumulated since **v0.6.25**. `v0.6.26` was tagged
@@ -2138,7 +2155,8 @@ Initial development. Project scaffolding, architecture design, and first impleme
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.7.1...HEAD
+[v0.7.1]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.7.0...v0.7.1
 [v0.7.0]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.6.26...v0.7.0
 [v0.6.25]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.6.24...v0.6.25
 [v0.6.24]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.6.23...v0.6.24

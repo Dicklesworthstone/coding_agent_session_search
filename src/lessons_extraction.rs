@@ -772,8 +772,7 @@ mod tests {
         );
         let (out, report) = redact(input);
         assert_eq!(
-            out,
-            "<email> uri=mailto:<email> owner=<email>",
+            out, "<email> uri=mailto:<email> owner=<email>",
             "valid '=' characters inside mailbox local parts must not leak partial identities"
         );
         assert_eq!(report.emails, 3);
