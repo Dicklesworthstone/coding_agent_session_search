@@ -2910,9 +2910,10 @@ mod tests {
             candidate_digest: victim_evidence.digest,
         };
         write_json_pretty(&guard.target.journal_path, &journal)?;
-        // Recovery refuses non-owner-only journals before reading them; this
-        // hand-crafted spoof must pass that gate to reach the staged-prefix
-        // refusal it pins.
+        // On Unix, recovery refuses non-owner-only journals before reading
+        // them; this hand-crafted spoof must pass that gate to reach the
+        // staged-prefix refusal it pins. Windows has no mode-bit gate.
+        #[cfg(unix)]
         std::fs::set_permissions(
             &guard.target.journal_path,
             <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
