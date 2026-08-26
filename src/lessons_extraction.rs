@@ -52,16 +52,18 @@ static HOME_PATH_RE: Lazy<Regex> = Lazy::new(|| {
 /// over full RFC mailbox validation and also finds addresses after prefixes
 /// such as `owner=` and `mailto:`.
 ///
-/// `=` is deliberately NOT in the local-part class even though RFC mailboxes
-/// permit it: with it, a `key=value` prefix like `owner=` lexes into the
-/// local part and the replacement eats the key, so
-/// `owner=alice@example.com` became `<email>` instead of `owner=<email>`.
+/// `=` remains in the local-part class because it is valid mailbox content.
+/// [`replace_emails_counted`] distinguishes recognized metadata prefixes from
+/// real local parts so `owner=alice@example.com` keeps `owner=`, while
+/// `alice=tag@example.com` is redacted in full.
 static EMAIL_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r"(?i)[a-z0-9.!#$%&'*+/?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+",
+        r"(?i)[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+",
     )
     .expect("durable lesson email regex")
 });
+
+const EMAIL_METADATA_PREFIXES: &[&str] = &["author", "contact", "email", "maintainer", "owner"];
 
 /// Long hex material which may be a content digest, secret, or opaque local
 /// identifier. Short git shas remain useful and are deliberately retained.
@@ -185,6 +187,30 @@ fn replace_all_counted(
     pattern.replace_all(&input, replacement).into_owned()
 }
 
+fn replace_emails_counted(input: String, counter: &mut usize) -> String {
+    let replacements = EMAIL_RE.find_iter(&input).count();
+    if replacements == 0 {
+        return input;
+    }
+    *counter = counter.saturating_add(replacements);
+    EMAIL_RE
+        .replace_all(&input, |captures: &regex::Captures<'_>| {
+            let matched = captures.get(0).map_or("", |value| value.as_str());
+            let local_part = matched.split_once('@').map_or(matched, |(local, _)| local);
+            let metadata_prefix = local_part.split_once('=').and_then(|(prefix, _)| {
+                EMAIL_METADATA_PREFIXES
+                    .iter()
+                    .any(|candidate| prefix.eq_ignore_ascii_case(candidate))
+                    .then_some(prefix)
+            });
+            metadata_prefix.map_or_else(
+                || "<email>".to_string(),
+                |prefix| format!("{prefix}=<email>"),
+            )
+        })
+        .into_owned()
+}
+
 /// Redact a single text field: removes home-path usernames, e-mails, and opaque
 /// digests, preserving the original whitespace layout. Returns the redacted
 /// string and a per-class [`RedactionReport`].
@@ -200,7 +226,7 @@ pub fn redact(input: &str) -> (String, RedactionReport) {
     }
     let output = secret_redacted.into_owned();
     let output = replace_all_counted(output, &HOME_PATH_RE, "<home>", &mut report.home_paths);
-    let output = replace_all_counted(output, &EMAIL_RE, "<email>", &mut report.emails);
+    let output = replace_emails_counted(output, &mut report.emails);
     let output = replace_all_counted(output, &OPAQUE_HEX_RE, "<digest>", &mut report.digests);
     (output, report)
 }
@@ -735,6 +761,22 @@ mod tests {
         assert_eq!(report.home_paths, 2);
         assert_eq!(report.emails, 1);
         assert_eq!(report.digests, 1);
+    }
+
+    #[test]
+    fn redact_removes_equals_in_email_local_parts_without_losing_known_metadata_keys() {
+        let input = concat!(
+            "direct=alice=tag@example.com ",
+            "uri=mailto:ops=alerts@example.com ",
+            "owner=alice=tag@example.com"
+        );
+        let (out, report) = redact(input);
+        assert_eq!(
+            out,
+            "<email> uri=mailto:<email> owner=<email>",
+            "valid '=' characters inside mailbox local parts must not leak partial identities"
+        );
+        assert_eq!(report.emails, 3);
     }
 
     // ---- classification ---------------------------------------------------

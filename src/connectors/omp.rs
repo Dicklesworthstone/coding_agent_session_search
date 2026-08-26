@@ -389,9 +389,9 @@ fn has_xdg_omp_layout_marker(parts: &[String]) -> bool {
     // path was the first victim — bead roq9y). The durable anchor is the
     // store-INTERNAL chain: `omp/sessions/<sanitized cwd>` (safe-dirname
     // encoding always yields a `-`-prefixed component for the absolute cwd)
-    // or `omp/profiles/<valid profile name>`. Requiring that third component
-    // keeps the anti-theft rule intact — a stray `omp` ancestor with
-    // arbitrary children still classifies as nothing.
+    // or `omp/profiles/<valid profile name>/sessions`. Requiring the complete
+    // store-internal chain keeps the anti-theft rule intact — a stray `omp`
+    // ancestor with arbitrary children still classifies as nothing.
     parts.windows(4).any(|window| {
         window[0] == ".local"
             && window[1] == "share"
@@ -405,10 +405,11 @@ fn has_xdg_omp_layout_marker(parts: &[String]) -> bool {
             && normalize_profile_name(&window[4]).is_some()
     }) || parts.windows(3).any(|window| {
         window[0] == "omp" && window[1] == "sessions" && window[2].starts_with('-')
-    }) || parts.windows(3).any(|window| {
+    }) || parts.windows(4).any(|window| {
         window[0] == "omp"
             && window[1] == "profiles"
             && normalize_profile_name(&window[2]).is_some()
+            && window[3] == "sessions"
     })
 }
 
@@ -421,7 +422,7 @@ fn has_xdg_omp_layout_marker(parts: &[String]) -> bool {
 pub(crate) enum OmpArchivePathClass {
     /// A canonical `.omp` config layout or a production remote-mirror slot.
     ConfigOrMirror,
-    /// The conventional `~/.local/share/omp` XDG layout.
+    /// The OMP XDG app layout, including a relocated `XDG_DATA_HOME`.
     Xdg,
 }
 
@@ -1016,6 +1017,12 @@ mod tests {
         assert!(has_omp_layout_marker(Path::new(
             "/home/dev/.local/share/omp/profiles/work/sessions/project/session.jsonl"
         )));
+        assert!(has_omp_layout_marker(Path::new(
+            "/srv/custom-data/omp/sessions/-home-dev-project/session.jsonl"
+        )));
+        assert!(has_omp_layout_marker(Path::new(
+            "/srv/custom-data/omp/profiles/work/sessions/-home-dev-project/session.jsonl"
+        )));
         assert!(!has_omp_layout_marker(Path::new(
             "/home/dev/.pi/agent/sessions/project/session.jsonl"
         )));
@@ -1024,6 +1031,9 @@ mod tests {
         )));
         assert!(!has_omp_layout_marker(Path::new(
             "/srv/omp/sessions/project/session.jsonl"
+        )));
+        assert!(!has_omp_layout_marker(Path::new(
+            "/srv/omp/profiles/work/docs/session.jsonl"
         )));
         assert!(has_omp_layout_marker(Path::new(
             r"C:\Users\dev\.omp\agent\sessions\project\session.jsonl"
