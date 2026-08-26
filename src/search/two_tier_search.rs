@@ -48,7 +48,7 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -74,6 +74,10 @@ const FSVI_REOPEN_MAX_RETRIES: usize = 7;
 const FSVI_REOPEN_INITIAL_BACKOFF: Duration = Duration::from_millis(2);
 const FSVI_REOPEN_MAX_BACKOFF: Duration = Duration::from_millis(64);
 
+fn fs_index_artifact_path(dir: &Path, filename: &str) -> PathBuf {
+    dir.join(filename)
+}
+
 fn is_transient_fsvi_reader_lock(error: &FsSearchError) -> bool {
     matches!(
         error,
@@ -97,15 +101,22 @@ fn open_complete_fs_index_with_retry(
     dir: &Path,
     config: &FsTwoTierConfig,
 ) -> std::result::Result<(FsTwoTierIndex, usize), FsSearchError> {
-    let paths = FsTwoTierIndexPaths::new(dir.join(VECTOR_INDEX_FAST_FILENAME))
-        .with_quality_index(dir.join(VECTOR_INDEX_QUALITY_FILENAME))
-        .with_fast_ann(dir.join(VECTOR_ANN_FAST_FILENAME))
-        .with_quality_ann(dir.join(VECTOR_ANN_QUALITY_FILENAME));
+    let paths = FsTwoTierIndexPaths::new(fs_index_artifact_path(
+        dir,
+        VECTOR_INDEX_FAST_FILENAME,
+    ))
+    .with_quality_index(fs_index_artifact_path(
+        dir,
+        VECTOR_INDEX_QUALITY_FILENAME,
+    ))
+    .with_fast_ann(fs_index_artifact_path(dir, VECTOR_ANN_FAST_FILENAME))
+    .with_quality_ann(fs_index_artifact_path(dir, VECTOR_ANN_QUALITY_FILENAME));
     let mut retries = 0;
     let mut backoff = FSVI_REOPEN_INITIAL_BACKOFF;
+    let clone_config = || config.clone();
 
     loop {
-        match FsTwoTierIndex::open_with_paths(&paths, config.clone()) {
+        match FsTwoTierIndex::open_with_paths(&paths, clone_config()) {
             Ok(index) => return Ok((index, retries)),
             Err(error)
                 if retries < FSVI_REOPEN_MAX_RETRIES && is_transient_fsvi_reader_lock(&error) =>
@@ -1086,25 +1097,21 @@ mod tests {
     }
 
     #[test]
-    fn completed_index_reopen_retries_a_transient_writer_lock() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let fast_path = dir.path().join(VECTOR_INDEX_FAST_FILENAME);
-        let quality_path = dir.path().join(VECTOR_INDEX_QUALITY_FILENAME);
+    fn completed_index_reopen_retries_a_transient_writer_lock() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let fast_path = fs_index_artifact_path(dir.path(), VECTOR_INDEX_FAST_FILENAME);
+        let quality_path = fs_index_artifact_path(dir.path(), VECTOR_INDEX_QUALITY_FILENAME);
 
-        let mut fast_writer = frankensearch::VectorIndex::create(&fast_path, "fast", 2).unwrap();
-        fast_writer
-            .write_record("s:session-0", &[1.0, 0.0])
-            .unwrap();
-        fast_writer.finish().unwrap();
+        let mut fast_writer = frankensearch::VectorIndex::create(&fast_path, "fast", 2)?;
+        fast_writer.write_record("s:session-0", &[1.0, 0.0])?;
+        fast_writer.finish()?;
 
         let mut quality_writer =
-            frankensearch::VectorIndex::create(&quality_path, "quality", 2).unwrap();
-        quality_writer
-            .write_record("s:session-0", &[1.0, 0.0])
-            .unwrap();
-        quality_writer.finish().unwrap();
+            frankensearch::VectorIndex::create(&quality_path, "quality", 2)?;
+        quality_writer.write_record("s:session-0", &[1.0, 0.0])?;
+        quality_writer.finish()?;
 
-        let live_writer = frankensearch::VectorIndex::open_writer(&fast_path).unwrap();
+        let live_writer = frankensearch::VectorIndex::open_writer(&fast_path)?;
         let start = Arc::new(std::sync::Barrier::new(2));
         let release_start = Arc::clone(&start);
         let releaser = std::thread::spawn(move || {
@@ -1120,19 +1127,22 @@ mod tests {
             ..TwoTierConfig::default()
         };
         let (index, retries) =
-            open_complete_fs_index_with_retry(dir.path(), &config.to_fs_config()).unwrap();
-        releaser.join().unwrap();
+            open_complete_fs_index_with_retry(dir.path(), &config.to_fs_config())?;
+        releaser
+            .join()
+            .map_err(|_| anyhow::anyhow!("writer-release thread panicked"))?;
 
-        assert!(
+        anyhow::ensure!(
             retries > 0,
             "the live writer should force at least one retry"
         );
-        assert!(index.has_quality_index());
-        assert_eq!(index.doc_count(), 1);
+        anyhow::ensure!(index.has_quality_index(), "quality tier must be present");
+        anyhow::ensure!(index.doc_count() == 1, "reopened index lost its document");
+        Ok(())
     }
 
     #[test]
-    fn transient_reader_lock_classification_is_narrow() {
+    fn transient_reader_lock_classification_is_narrow() -> Result<()> {
         let transient = FsSearchError::InvalidConfig {
             field: "fsvi.map_lock".to_string(),
             value: "/tmp/vector.fast.idx".to_string(),
@@ -1149,9 +1159,19 @@ mod tests {
             reason: "operation would block".to_string(),
         };
 
-        assert!(is_transient_fsvi_reader_lock(&transient));
-        assert!(!is_transient_fsvi_reader_lock(&live_reader));
-        assert!(!is_transient_fsvi_reader_lock(&malformed));
+        anyhow::ensure!(
+            is_transient_fsvi_reader_lock(&transient),
+            "shared-reader contention must be retryable"
+        );
+        anyhow::ensure!(
+            !is_transient_fsvi_reader_lock(&live_reader),
+            "exclusive-writer contention must not be retried"
+        );
+        anyhow::ensure!(
+            !is_transient_fsvi_reader_lock(&malformed),
+            "non-lock configuration failures must not be retried"
+        );
+        Ok(())
     }
 
     #[test]
@@ -1490,7 +1510,7 @@ mod tests {
     }
 
     #[test]
-    fn test_refinement_scores_are_normalized() {
+    fn test_refinement_scores_are_normalized() -> Result<()> {
         let config = TwoTierConfig {
             fast_dimension: 8,
             quality_dimension: 8,
@@ -1506,7 +1526,7 @@ mod tests {
                 quality_embedding: vec![f16::from_f32(10.0 + i as f32); config.quality_dimension],
             })
             .collect();
-        let index = TwoTierIndex::build("fast-8", "quality-8", &config, entries).unwrap();
+        let index = TwoTierIndex::build("fast-8", "quality-8", &config, entries)?;
 
         let fast_embedder: Arc<dyn Embedder> = Arc::new(ConstantEmbedder {
             dim: config.fast_dimension,
@@ -1519,14 +1539,15 @@ mod tests {
         let searcher = TwoTierSearcher::new(&index, fast_embedder, Some(daemon), config);
         let phases: Vec<SearchPhase> = searcher.search("query", 5).collect();
 
-        assert_eq!(phases.len(), 2);
-        let SearchPhase::Refined { results, .. } = &phases[1] else {
-            panic!("expected refined phase");
+        anyhow::ensure!(phases.len() == 2, "expected initial and refined phases");
+        let Some(SearchPhase::Refined { results, .. }) = phases.get(1) else {
+            anyhow::bail!("expected refined phase");
         };
-        assert!(
+        anyhow::ensure!(
             results.iter().all(|r| (0.0..=1.0).contains(&r.score)),
             "expected normalized refined scores, got {:?}",
             results.iter().map(|r| r.score).collect::<Vec<_>>()
         );
+        Ok(())
     }
 }
