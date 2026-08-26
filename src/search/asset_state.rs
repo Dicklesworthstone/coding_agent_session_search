@@ -782,21 +782,16 @@ fn apply_semantic_identity_invalidation(
     let storage = match FrankenStorage::open_readonly(db_path) {
         Ok(storage) => storage,
         Err(err) => {
-            // This check only runs after the caller vouched db_available (the
-            // !db_available arm returned before the probe). The invalidation
-            // marker is an enhancement on top of an already-searchable state,
-            // so a failed re-open must trust the caller's availability signal
-            // rather than flip that state to error — inspect_semantic_assets'
-            // contract is that it never re-probes a database the caller
-            // already probed (pinned by
-            // inspect_search_assets_trusts_db_probe_for_semantic_metadata_probe).
-            tracing::debug!(
-                target: "cass::search::asset_state",
-                db_path = %db_path.display(),
-                error = %err,
-                "skipping semantic identity invalidation check; trusting caller's db availability signal"
-            );
-            return availability;
+            // `db_available` is a point-in-time observation, not proof that
+            // this later marker read succeeded. If the marker cannot be
+            // checked, using the semantic index could expose stale
+            // agent/source identity metadata after a Pi/OMP reclassification.
+            // Mark semantic loading unavailable so hybrid search truthfully
+            // falls back to lexical; explicit semantic search must not return
+            // results from an index whose identity safety is unknown.
+            return SemanticAvailability::LoadFailed {
+                context: format!("checking semantic identity invalidation marker: {err}"),
+            };
         }
     };
     match storage.semantic_identity_rebuild_required(identity_tier) {
@@ -3201,7 +3196,7 @@ mod tests {
     }
 
     #[test]
-    fn inspect_search_assets_trusts_db_probe_for_semantic_metadata_probe() {
+    fn inspect_search_assets_fails_semantic_closed_when_identity_marker_is_unreadable() {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
@@ -3212,9 +3207,8 @@ mod tests {
 
         // The availability probe validates the artifact it finds (it no
         // longer trusts bare file existence), so the fixture must be a real
-        // hash vector index. The contract under test is unchanged: the DB
-        // itself (an unopenable directory here) must not be re-opened when
-        // the caller already probed it.
+        // hash vector index. `db_available` only records an earlier probe: an
+        // unreadable identity marker must still disable semantic search.
         let embedder = HashEmbedder::default();
         let vector_path = vector_index_path(temp.path(), embedder.id());
         std::fs::create_dir_all(vector_path.parent().expect("vector parent"))
@@ -3246,11 +3240,18 @@ mod tests {
             compute_lexical_fingerprint: false,
             inspect_semantic: true,
         })
-        .expect("semantic metadata probe should trust the existing DB availability signal");
+        .expect("semantic metadata inspection should degrade without failing the whole snapshot");
 
-        assert_eq!(snapshot.semantic.status, "hash_fallback");
-        assert_eq!(snapshot.semantic.availability, "hash_fallback");
-        assert!(snapshot.semantic.can_search);
+        assert_eq!(snapshot.semantic.status, "error");
+        assert_eq!(snapshot.semantic.availability, "load_failed");
+        assert!(!snapshot.semantic.can_search);
+        assert_eq!(snapshot.semantic.fallback_mode, Some("lexical"));
+        assert!(
+            snapshot
+                .semantic
+                .summary
+                .contains("checking semantic identity invalidation marker")
+        );
     }
 
     #[test]
