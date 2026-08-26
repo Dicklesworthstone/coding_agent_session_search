@@ -2672,11 +2672,10 @@ pub enum AnalyticsCommand {
     },
 }
 
-/// Shared flags for all analytics subcommands.
+/// Shared argument surface for analytics subcommands.
 ///
-/// Provides a single, reusable argument model so every analytics
-/// command has identical time-range, dimensional-filter, and output
-/// behavior.
+/// Query commands honor the time-range and dimensional filters. Whole-database
+/// maintenance commands reject filters they cannot truthfully apply.
 #[derive(Debug, Clone, clap::Args)]
 pub struct AnalyticsCommon {
     // ---- Time range ----
@@ -2753,33 +2752,64 @@ fn analytics_source_filter_from_common_input(source: Option<&str>) -> analytics:
     }
 }
 
-impl From<&AnalyticsCommon> for analytics::AnalyticsFilter {
-    fn from(common: &AnalyticsCommon) -> Self {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
+fn parse_analytics_datetime_flag(flag: &str, raw: &str) -> CliResult<i64> {
+    parse_datetime_str(raw).ok_or_else(|| {
+        CliError::usage(
+            format!("could not parse {flag} value {raw:?}"),
+            Some(
+                "Use an ISO date (YYYY-MM-DD), a keyword (today/yesterday), or a relative offset (-7d, -24h)."
+                    .into(),
+            ),
+        )
+    })
+}
 
-        let since_ms: Option<i64> = if let Some(d) = common.days {
-            Some(now_ms - (d as i64) * 86_400_000)
-        } else {
-            common.since.as_deref().and_then(parse_datetime_str)
-        };
-
-        let until_ms: Option<i64> = common.until.as_deref().and_then(parse_datetime_str);
-
-        analytics::AnalyticsFilter {
-            since_ms,
-            until_ms,
-            agents: common
-                .agent
-                .iter()
-                .map(|agent| normalized_analytics_agent_arg(agent))
-                .collect(),
-            source: analytics_source_filter_from_common_input(common.source.as_deref()),
-            workspace_ids: vec![],
-        }
+fn analytics_filter_from_common(common: &AnalyticsCommon) -> CliResult<analytics::AnalyticsFilter> {
+    if common.days.is_some() && common.since.is_some() {
+        return Err(CliError::usage(
+            "--days and --since cannot be used together",
+            Some("Choose either a rolling --days window or an explicit --since bound.".into()),
+        ));
     }
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let since_ms = match (common.days, common.since.as_deref()) {
+        (Some(days), None) => Some(
+            now_ms.saturating_sub(i64::from(days).saturating_mul(86_400_000)),
+        ),
+        (None, Some(raw)) => Some(parse_analytics_datetime_flag("--since", raw)?),
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("conflicting analytics time bounds rejected above"),
+    };
+    let until_ms = common
+        .until
+        .as_deref()
+        .map(|raw| parse_analytics_datetime_flag("--until", raw))
+        .transpose()?;
+
+    if let (Some(since), Some(until)) = (since_ms, until_ms)
+        && since > until
+    {
+        return Err(CliError::usage(
+            "analytics time range is empty because --since is later than --until",
+            Some("Choose an --until value at or after --since.".into()),
+        ));
+    }
+
+    Ok(analytics::AnalyticsFilter {
+        since_ms,
+        until_ms,
+        agents: common
+            .agent
+            .iter()
+            .map(|agent| normalized_analytics_agent_arg(agent))
+            .collect(),
+        source: analytics_source_filter_from_common_input(common.source.as_deref()),
+        workspace_ids: vec![],
+    })
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -17178,6 +17208,29 @@ fn analytics_build_filters(common: &AnalyticsCommon) -> Vec<String> {
     f
 }
 
+fn analytics_filter_flag_names(common: &AnalyticsCommon) -> Vec<&'static str> {
+    let mut flags = Vec::new();
+    if common.since.is_some() {
+        flags.push("--since");
+    }
+    if common.until.is_some() {
+        flags.push("--until");
+    }
+    if common.days.is_some() {
+        flags.push("--days");
+    }
+    if !common.agent.is_empty() {
+        flags.push("--agent");
+    }
+    if !common.workspace.is_empty() {
+        flags.push("--workspace");
+    }
+    if common.source.is_some() {
+        flags.push("--source");
+    }
+    flags
+}
+
 fn resolve_analytics_workspace_ids(
     conn: &crate::franken_sync::Connection,
     workspace_paths: &[String],
@@ -17228,7 +17281,7 @@ fn analytics_query_filter(
     conn: &crate::franken_sync::Connection,
     common: &AnalyticsCommon,
 ) -> CliResult<analytics::AnalyticsFilter> {
-    let mut filter = analytics::AnalyticsFilter::from(common);
+    let mut filter = analytics_filter_from_common(common)?;
     filter.workspace_ids = resolve_analytics_workspace_ids(conn, &common.workspace)?;
     Ok(filter)
 }
@@ -17813,19 +17866,10 @@ fn run_analytics_tokens(
 /// populated with no way to tell. Refusing is better than the previous
 /// behavior of accepting and ignoring them (GH #412).
 fn analytics_rebuild_since_ms(common: &AnalyticsCommon) -> CliResult<Option<i64>> {
-    let mut unsupported: Vec<&str> = Vec::new();
-    if common.until.is_some() {
-        unsupported.push("--until");
-    }
-    if !common.agent.is_empty() {
-        unsupported.push("--agent");
-    }
-    if !common.workspace.is_empty() {
-        unsupported.push("--workspace");
-    }
-    if common.source.is_some() {
-        unsupported.push("--source");
-    }
+    let unsupported: Vec<&str> = analytics_filter_flag_names(common)
+        .into_iter()
+        .filter(|flag| !matches!(*flag, "--since" | "--days"))
+        .collect();
     if !unsupported.is_empty() {
         return Err(CliError::usage(
             format!(
@@ -17836,6 +17880,13 @@ fn analytics_rebuild_since_ms(common: &AnalyticsCommon) -> CliResult<Option<i64>
                 "Use --since <date|-Nd> or --days N to limit the rebuild to recent days, or omit filters for a full rebuild."
                     .into(),
             ),
+        ));
+    }
+
+    if common.days.is_some() && common.since.is_some() {
+        return Err(CliError::usage(
+            "--days and --since cannot be used together",
+            Some("Choose either a rolling --days window or an explicit --since bound.".into()),
         ));
     }
 
@@ -17851,16 +17902,24 @@ fn analytics_rebuild_since_ms(common: &AnalyticsCommon) -> CliResult<Option<i64>
 
     match common.since.as_deref() {
         None => Ok(None),
-        Some(raw) => parse_datetime_str(raw).map(Some).ok_or_else(|| {
-            CliError::usage(
-                format!("could not parse --since value {raw:?}"),
-                Some(
-                    "Use an ISO date (YYYY-MM-DD), a keyword (today/yesterday), or a relative offset (-7d, -24h)."
-                        .into(),
-                ),
-            )
-        }),
+        Some(raw) => parse_analytics_datetime_flag("--since", raw).map(Some),
     }
+}
+
+fn validate_analytics_rebuild_window(
+    track: AnalyticsTrack,
+    since_ms: Option<i64>,
+) -> CliResult<()> {
+    if track == AnalyticsTrack::B && since_ms.is_some() {
+        return Err(CliError::usage(
+            "analytics rebuild --track b does not support --since or --days",
+            Some(
+                "Track B always rebuilds the complete token_usage ledger; omit the window or use --track a/all."
+                    .into(),
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Human-readable UTC day label for the rebuild cutoff (day-aligned, matching
@@ -17887,6 +17946,11 @@ fn run_analytics_rebuild(
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<serde_json::Value> {
     use crate::storage::sqlite::FrankenStorage;
+
+    // Validate flags before touching storage so usage errors cannot be masked by
+    // a missing or locked database.
+    let since_ms = analytics_rebuild_since_ms(common)?;
+    validate_analytics_rebuild_window(track, since_ms)?;
 
     let data_dir = resolve_data_dir(&common.data_dir, db_path_override);
     let db_path = db_path_override
@@ -17920,9 +17984,6 @@ fn run_analytics_rebuild(
     let mut tracks_rebuilt: Vec<&str> = Vec::new();
     let mut payload = serde_json::Map::new();
 
-    // GH #412: `--since` / `--days` used to be parsed and then dropped on the
-    // floor, so a "cheap daily refresh" silently became a full rescan.
-    let since_ms = analytics_rebuild_since_ms(common)?;
     // The window only ever applies to Track A; advertising it in the JSON
     // payload for a Track-B-only run would tell automation a window was
     // honored when it was not.
@@ -18283,6 +18344,21 @@ fn analytics_perf_json(
     })
 }
 
+fn reject_analytics_validate_filters(common: &AnalyticsCommon) -> CliResult<()> {
+    let unsupported = analytics_filter_flag_names(common);
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+
+    Err(CliError::usage(
+        format!(
+            "analytics validate does not support {}: validation checks the complete analytics database",
+            unsupported.join(", ")
+        ),
+        Some("Remove query-only filters and rerun analytics validate.".into()),
+    ))
+}
+
 /// Run `cass analytics validate` — rollup invariant checks and drift detection.
 fn run_analytics_validate(
     common: &AnalyticsCommon,
@@ -18291,6 +18367,10 @@ fn run_analytics_validate(
 ) -> CliResult<serde_json::Value> {
     use crate::storage::sqlite::FrankenStorage;
     use std::collections::BTreeSet;
+
+    // Validation is global. Reject filters before opening the database instead
+    // of ignoring them and falsely listing them under `_meta.filters_applied`.
+    reject_analytics_validate_filters(common)?;
 
     let config = if fix {
         analytics::ValidateConfig::deep()
