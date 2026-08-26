@@ -4249,6 +4249,76 @@ fn doctor_json_reports_interrupted_operation_state_without_deleting_artifacts() 
 }
 
 #[test]
+fn doctor_json_keeps_conversation_id_distinct_from_source_path() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    seed_healthy_empty_index(test_home, &data_dir);
+
+    let source_path = test_home.join(".codex/sessions/project/one.jsonl");
+    fs::create_dir_all(source_path.parent().expect("source parent")).expect("source dir");
+    fs::write(
+        &source_path,
+        b"{\"type\":\"message\",\"text\":\"fixture\"}\n",
+    )
+    .expect("write source fixture");
+
+    let db_path = data_dir.join("agent_search.db");
+    let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).expect("open db");
+    let agent_id = ensure_codex_agent(&conn);
+    let source_path_text = source_path.to_string_lossy().into_owned();
+    conn.execute_compat(
+        "INSERT INTO conversations (id, agent_id, source_id, external_id, title, source_path, started_at)
+         VALUES (9001, ?1, 'local', 'typed-identity-fixture', 'typed identity fixture', ?2, 1700000000000)",
+        coding_agent_search::franken_sync::params![agent_id, source_path_text.as_str()],
+    )
+    .expect("insert conversation");
+    drop(conn);
+
+    let out = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor --json");
+    assert!(
+        out.status.success(),
+        "doctor fixture failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("doctor json");
+    let receipt = payload["raw_mirror_backfill"]["receipts"]
+        .as_array()
+        .expect("backfill receipts")
+        .iter()
+        .find(|receipt| receipt["conversation_id"].as_i64() == Some(9001))
+        .expect("conversation receipt");
+    assert_eq!(receipt["conversation_id"].as_i64(), Some(9001));
+    assert_eq!(
+        receipt["redacted_source_path"].as_str(),
+        Some("[external]/one.jsonl")
+    );
+    assert_eq!(
+        receipt["source_stat_snapshot"]["exists"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        receipt["source_stat_snapshot"]["file_type"].as_str(),
+        Some("file")
+    );
+    assert_ne!(
+        receipt["redacted_source_path"].as_str(),
+        Some("9001"),
+        "a numeric conversation row id must never be rendered as a filesystem path"
+    );
+}
+
+#[test]
 fn doctor_json_reports_missing_upstream_source_as_coverage_risk_not_data_loss() {
     let temp = tempfile::tempdir().expect("tempdir");
     let test_home = temp.path();

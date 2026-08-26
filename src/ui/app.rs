@@ -23279,6 +23279,7 @@ pub fn run_tui_ftui(
     inline_config: Option<InlineTuiConfig>,
     macro_config: MacroConfig,
     data_dir_override: Option<PathBuf>,
+    db_path_override: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     use ftui::ProgramConfig;
     use ftui::core::capability_override::{CapabilityOverride, push_override};
@@ -23339,7 +23340,7 @@ pub fn run_tui_ftui(
     }
     let data_dir = data_dir_override.unwrap_or_else(crate::default_data_dir);
     model.data_dir = data_dir.clone();
-    model.db_path = data_dir.join("agent_search.db");
+    model.db_path = db_path_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     model.refresh_doctor_hud_summary_from_cached_state();
     if model.db_path.exists() {
         match crate::storage::sqlite::FrankenStorage::open_readonly(&model.db_path) {
