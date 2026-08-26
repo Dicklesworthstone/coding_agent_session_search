@@ -782,10 +782,21 @@ fn apply_semantic_identity_invalidation(
     let storage = match FrankenStorage::open_readonly(db_path) {
         Ok(storage) => storage,
         Err(err) => {
-            return SemanticAvailability::DatabaseUnavailable {
-                db_path: db_path.to_path_buf(),
-                error: format!("checking semantic identity invalidation: {err}"),
-            };
+            // This check only runs after the caller vouched db_available (the
+            // !db_available arm returned before the probe). The invalidation
+            // marker is an enhancement on top of an already-searchable state,
+            // so a failed re-open must trust the caller's availability signal
+            // rather than flip that state to error — inspect_semantic_assets'
+            // contract is that it never re-probes a database the caller
+            // already probed (pinned by
+            // inspect_search_assets_trusts_db_probe_for_semantic_metadata_probe).
+            tracing::debug!(
+                target: "cass::search::asset_state",
+                db_path = %db_path.display(),
+                error = %err,
+                "skipping semantic identity invalidation check; trusting caller's db availability signal"
+            );
+            return availability;
         }
     };
     match storage.semantic_identity_rebuild_required(identity_tier) {
