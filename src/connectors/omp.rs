@@ -397,12 +397,13 @@ fn has_xdg_omp_layout_marker(parts: &[String]) -> bool {
             && window[1] == "share"
             && window[2] == "omp"
             && window[3] == "sessions"
-    }) || parts.windows(5).any(|window| {
+    }) || parts.windows(6).any(|window| {
         window[0] == ".local"
             && window[1] == "share"
             && window[2] == "omp"
             && window[3] == "profiles"
             && normalize_profile_name(&window[4]).is_some()
+            && window[5] == "sessions"
     }) || parts
         .windows(3)
         .any(|window| window[0] == "omp" && window[1] == "sessions" && window[2].starts_with('-'))
@@ -1035,6 +1036,9 @@ mod tests {
         )));
         assert!(!has_omp_layout_marker(Path::new(
             "/srv/omp/profiles/work/docs/session.jsonl"
+        )));
+        assert!(!has_omp_layout_marker(Path::new(
+            "/home/dev/.local/share/omp/profiles/work/docs/session.jsonl"
         )));
         assert!(has_omp_layout_marker(Path::new(
             r"C:\Users\dev\.omp\agent\sessions\project\session.jsonl"
