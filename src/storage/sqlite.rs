@@ -19270,15 +19270,6 @@ mod tests {
         EnvGuard { key, previous }
     }
 
-    fn unset_env_var(key: &'static str) -> EnvGuard {
-        let previous = dotenvy::var(key).ok();
-        // SAFETY: test helper toggles a process-local env var for isolation.
-        unsafe {
-            std::env::remove_var(key);
-        }
-        EnvGuard { key, previous }
-    }
-
     #[test]
     #[serial]
     fn storage_env_flags_are_truthy_only() {
