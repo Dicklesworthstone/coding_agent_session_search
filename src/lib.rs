@@ -92562,9 +92562,7 @@ const MAX_REPORTED_SKIPPED_JSONL_LINES: usize = 5;
 /// and reported instead of aborting the whole session. Only when *no* record
 /// decodes is the file rejected, so a genuinely non-JSONL path still falls
 /// back to the indexed copy exactly as before.
-pub(crate) fn parse_followup_jsonl_messages_tolerant(
-    path: &Path,
-) -> CliResult<TolerantJsonlParse> {
+pub(crate) fn parse_followup_jsonl_messages_tolerant(path: &Path) -> CliResult<TolerantJsonlParse> {
     let lines = read_followup_file_lines(path)?;
     let mut messages = Vec::new();
     let mut session_start = None;
