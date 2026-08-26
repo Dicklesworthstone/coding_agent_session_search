@@ -17122,8 +17122,23 @@ impl FrankenStorage {
     /// Pagination is keyset (`WHERE m.id > last_id`), so the cost is linear in
     /// the number of rescanned rows rather than quadratic as the previous
     /// `LIMIT/OFFSET` form was. A progress event is logged per chunk.
+    ///
+    /// GH #424: the keyset runs over `messages` alone and resolves the
+    /// `conversations` / `agents` dimensions from in-memory maps; every chunk
+    /// commits on its own. See [`Self::rebuild_analytics_since_with_chunk_size`].
     pub fn rebuild_analytics_since(&self, since_ms: Option<i64>) -> Result<AnalyticsRebuildResult> {
+        self.rebuild_analytics_since_with_chunk_size(since_ms, ANALYTICS_REBUILD_CHUNK_SIZE)
+    }
+
+    /// [`Self::rebuild_analytics_since`] with an explicit keyset chunk size
+    /// (rows fetched per `SELECT`, and the unit of commit).
+    pub(crate) fn rebuild_analytics_since_with_chunk_size(
+        &self,
+        since_ms: Option<i64>,
+        chunk_size: usize,
+    ) -> Result<AnalyticsRebuildResult> {
         let start = Instant::now();
+        let chunk_size = i64::try_from(chunk_size.max(1)).unwrap_or(i64::MAX);
 
         // Day-aligned scope. `None` => full rebuild.
         let scope = since_ms.map(|ms| {
@@ -17133,22 +17148,14 @@ impl FrankenStorage {
             (cutoff_day, cutoff_hour, cutoff_ms)
         });
 
-        let total_messages: i64 = match scope {
-            None => {
-                self.conn
-                    .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
-                        row.get_typed(0)
-                    })?
-            }
-            Some((_, _, cutoff_ms)) => self.conn.query_row_map(
-                "SELECT COUNT(*)
-                 FROM messages m
-                 JOIN conversations c ON m.conversation_id = c.id
-                 WHERE COALESCE(m.created_at, c.started_at, 0) >= ?1",
-                fparams![cutoff_ms],
-                |row| row.get_typed(0),
-            )?,
-        };
+        // The keyset walk below visits every `messages` row in both modes
+        // (the day cutoff is applied in Rust), so the progress denominator
+        // is the whole table.
+        let total_messages: i64 =
+            self.conn
+                .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                    row.get_typed(0)
+                })?;
         tracing::info!(
             target: "cass::analytics",
             total_messages,
@@ -17156,37 +17163,87 @@ impl FrankenStorage {
             "analytics_rebuild_start"
         );
 
-        let mut tx = self.conn.transaction()?;
+        // GH #424: resolve the dimension tables once, in memory, instead of
+        // JOINing `conversations` (plus the agents subquery) into every
+        // chunk. frankensqlite 0.3.8 materializes `JOIN ... ORDER BY ...
+        // LIMIT` in full before applying the limit, which measured ~635 s per
+        // 10k-row chunk on a 652k-message archive; the single-table keyset
+        // costs ~0.2 s. Both maps are tiny next to `messages`: one entry per
+        // conversation and one per agent.
+        let agent_slugs: HashMap<i64, String> = self
+            .conn
+            .query_map_collect("SELECT id, slug FROM agents", fparams![], |row| {
+                Ok((row.get_typed(0)?, row.get_typed(1)?))
+            })?
+            .into_iter()
+            .collect();
+        let conversation_dims: HashMap<i64, AnalyticsConversationDim> = self
+            .conn
+            .query_map_collect(
+                "SELECT id, started_at, source_id, workspace_id, agent_id FROM conversations",
+                fparams![],
+                |row| {
+                    let id: i64 = row.get_typed(0)?;
+                    let agent_id: Option<i64> = row.get_typed(4)?;
+                    Ok((
+                        id,
+                        AnalyticsConversationDim {
+                            started_at: row.get_typed(1)?,
+                            source_id: row.get_typed(2)?,
+                            workspace_id: row.get_typed(3)?,
+                            // Same degradation as the former correlated
+                            // subquery: NULL or dangling agent_id -> 'unknown',
+                            // matching the FTS / lexical rebuild paths.
+                            agent_slug: agent_id
+                                .and_then(|agent_id| agent_slugs.get(&agent_id).cloned())
+                                .unwrap_or_else(|| "unknown".to_string()),
+                        },
+                    ))
+                },
+            )?
+            .into_iter()
+            .collect();
 
-        match scope {
-            None => {
-                tx.execute("DELETE FROM message_metrics")?;
-                tx.execute("DELETE FROM usage_hourly")?;
-                tx.execute("DELETE FROM usage_daily")?;
-                tx.execute("DELETE FROM usage_models_daily")?;
+        // Scope reset, committed on its own. GH #424 (second finding): one
+        // write transaction spanning the whole rebuild made every successive
+        // chunk slower on the engine (+~8 s per 10k-row chunk, extrapolating
+        // to ~4.5 h for 652k rows); committing per chunk holds the cost flat
+        // (~30 min on that archive). The trade-off is that a reader during
+        // the rebuild sees a partially rebuilt rollup instead of the old one;
+        // an interrupted run leaves a prefix that the next full rebuild
+        // simply re-derives.
+        {
+            let tx = self.conn.transaction()?;
+            match scope {
+                None => {
+                    tx.execute("DELETE FROM message_metrics")?;
+                    tx.execute("DELETE FROM usage_hourly")?;
+                    tx.execute("DELETE FROM usage_daily")?;
+                    tx.execute("DELETE FROM usage_models_daily")?;
+                }
+                Some((cutoff_day, cutoff_hour, _)) => {
+                    tx.execute_compat(
+                        "DELETE FROM message_metrics WHERE day_id >= ?1",
+                        fparams![cutoff_day],
+                    )?;
+                    tx.execute_compat(
+                        "DELETE FROM usage_hourly WHERE hour_id >= ?1",
+                        fparams![cutoff_hour],
+                    )?;
+                    tx.execute_compat(
+                        "DELETE FROM usage_daily WHERE day_id >= ?1",
+                        fparams![cutoff_day],
+                    )?;
+                    tx.execute_compat(
+                        "DELETE FROM usage_models_daily WHERE day_id >= ?1",
+                        fparams![cutoff_day],
+                    )?;
+                }
             }
-            Some((cutoff_day, cutoff_hour, _)) => {
-                tx.execute_compat(
-                    "DELETE FROM message_metrics WHERE day_id >= ?1",
-                    fparams![cutoff_day],
-                )?;
-                tx.execute_compat(
-                    "DELETE FROM usage_hourly WHERE hour_id >= ?1",
-                    fparams![cutoff_hour],
-                )?;
-                tx.execute_compat(
-                    "DELETE FROM usage_daily WHERE day_id >= ?1",
-                    fparams![cutoff_day],
-                )?;
-                tx.execute_compat(
-                    "DELETE FROM usage_models_daily WHERE day_id >= ?1",
-                    fparams![cutoff_day],
-                )?;
-            }
+            tx.commit()?;
         }
 
-        const CHUNK_SIZE: i64 = 10_000;
-        // Keyset cursor: the largest message id processed so far. Starts
+        // Keyset cursor: the largest message id fetched so far. Starts
         // below every representable rowid so nothing is skipped even if an
         // id is zero or negative.
         let mut last_id: i64 = i64::MIN;
@@ -17194,97 +17251,74 @@ impl FrankenStorage {
         // every row (including any pre-1970 negative timestamp), so it uses
         // `i64::MIN` rather than 0.
         let cutoff_ms: i64 = scope.map_or(i64::MIN, |(_, _, ms)| ms);
+        // Rows fetched (progress against `total_messages`) vs rows inside
+        // the rebuild window.
         let mut processed: i64 = 0;
+        let mut kept: i64 = 0;
         let mut total_inserted: usize = 0;
         let mut usage_hourly_rows: usize = 0;
         let mut usage_daily_rows: usize = 0;
         let mut usage_models_daily_rows: usize = 0;
 
         loop {
-            #[allow(clippy::type_complexity)]
-            let rows: Vec<(
-                i64,
-                String,
-                String,
-                Option<serde_json::Value>,
-                Option<i64>,
-                Option<i64>,
-                String,
-                Option<i64>,
-                String,
-            )> = tx.query_map_collect(
-                // Avoid the 3-table JOIN with LIMIT/OFFSET that triggers
-                // frankensqlite's materialization fallback (see 860acb12).
-                // Inline the agent slug lookup as a correlated subquery and
-                // fall back to 'unknown' for NULL agent_id, matching the
-                // FTS / lexical rebuild paths.
-                "SELECT m.id, m.idx, m.role, m.content, m.extra_json, m.extra_bin,
-                        m.created_at,
-                        c.id AS conv_id, c.started_at AS conv_started_at,
-                        c.source_id, c.workspace_id,
-                        COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown') AS agent_slug
+            let rows: Vec<AnalyticsMessageRow> = self.conn.query_map_collect(
+                "SELECT m.id, m.role, m.content, m.extra_json, m.extra_bin,
+                        m.created_at, m.conversation_id
                  FROM messages m
-                 JOIN conversations c ON m.conversation_id = c.id
                  WHERE m.id > ?1
-                   AND COALESCE(m.created_at, c.started_at, 0) >= ?2
                  ORDER BY m.id
-                 LIMIT ?3",
-                fparams![last_id, cutoff_ms, CHUNK_SIZE],
+                 LIMIT ?2",
+                fparams![last_id, chunk_size],
                 |row| {
-                    let msg_id: i64 = row.get_typed(0)?;
-                    let role: String = row.get_typed(2)?;
-                    let content: String = row.get_typed(3)?;
                     let extra_json = row
-                        .get_typed::<Option<String>>(4)?
+                        .get_typed::<Option<String>>(3)?
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .or_else(|| {
-                            row.get_typed::<Option<Vec<u8>>>(5)
+                            row.get_typed::<Option<Vec<u8>>>(4)
                                 .ok()
                                 .flatten()
                                 .and_then(|b| rmp_serde::from_slice(&b).ok())
                         });
-                    let msg_ts: Option<i64> = row.get_typed(6)?;
-                    let conv_started_at: Option<i64> = row.get_typed(8)?;
-                    let source_id: String = row.get_typed(9)?;
-                    let workspace_id: Option<i64> = row.get_typed(10)?;
-                    let agent_slug: String = row.get_typed(11)?;
-                    let effective_ts = msg_ts.or(conv_started_at).unwrap_or(0);
-
-                    Ok((
-                        msg_id,
-                        role,
-                        content,
+                    Ok(AnalyticsMessageRow {
+                        id: row.get_typed(0)?,
+                        role: row.get_typed(1)?,
+                        content: row.get_typed(2)?,
                         extra_json,
-                        Some(effective_ts),
-                        workspace_id,
-                        source_id,
-                        conv_started_at,
-                        agent_slug,
-                    ))
+                        created_at: row.get_typed(5)?,
+                        conversation_id: row.get_typed(6)?,
+                    })
                 },
             )?;
 
-            if rows.is_empty() {
+            let Some(last_row) = rows.last() else {
                 break;
-            }
+            };
+            let fetched = rows.len();
+            // Advance by the last *fetched* id, not the last kept one, so a
+            // chunk consisting entirely of out-of-window rows can never
+            // stall the cursor.
+            last_id = last_row.id;
 
-            let chunk_len = rows.len();
-            let mut entries = Vec::with_capacity(chunk_len);
+            let mut entries = Vec::with_capacity(fetched);
             let mut rollup_agg = AnalyticsRollupAggregator::new();
 
-            for (
-                msg_id,
-                role,
-                content,
-                extra_json,
-                effective_ts,
-                workspace_id,
-                source_id,
-                _conv_started_at,
-                agent_slug,
-            ) in &rows
-            {
-                let ts = effective_ts.unwrap_or(0);
+            for row in &rows {
+                let Some(dim) = conversation_dims.get(&row.conversation_id) else {
+                    // The former inner JOIN dropped messages whose
+                    // conversation row is gone; keep that behaviour.
+                    continue;
+                };
+                let ts = row.created_at.or(dim.started_at).unwrap_or(0);
+                if ts < cutoff_ms {
+                    continue;
+                }
+                let msg_id = &row.id;
+                let role = &row.role;
+                let content = &row.content;
+                let extra_json = &row.extra_json;
+                let workspace_id = &dim.workspace_id;
+                let source_id = &dim.source_id;
+                let agent_slug = &dim.agent_slug;
                 let day_id = Self::day_id_from_millis(ts);
                 let hour_id = Self::hour_id_from_millis(ts);
                 let content_chars = content.len() as i64;
@@ -17343,17 +17377,19 @@ impl FrankenStorage {
                 entries.push(entry);
             }
 
-            total_inserted += franken_insert_message_metrics_batched_in_tx(&tx, &entries)?;
-            let (hourly, daily, models_daily) =
-                franken_flush_analytics_rollups_in_tx(&tx, &rollup_agg)?;
-            usage_hourly_rows += hourly;
-            usage_daily_rows += daily;
-            usage_models_daily_rows += models_daily;
-            // Rows are ordered by m.id, so the last row carries the cursor.
-            if let Some((max_id, ..)) = rows.last() {
-                last_id = *max_id;
+            kept += entries.len() as i64;
+            if !entries.is_empty() {
+                // GH #424: one short write transaction per chunk.
+                let tx = self.conn.transaction()?;
+                total_inserted += franken_insert_message_metrics_batched_in_tx(&tx, &entries)?;
+                let (hourly, daily, models_daily) =
+                    franken_flush_analytics_rollups_in_tx(&tx, &rollup_agg)?;
+                tx.commit()?;
+                usage_hourly_rows += hourly;
+                usage_daily_rows += daily;
+                usage_models_daily_rows += models_daily;
             }
-            processed += chunk_len as i64;
+            processed += fetched as i64;
 
             // Per-chunk progress at INFO so a multi-hour rebuild is
             // distinguishable from a hang (GH #412).
@@ -17366,21 +17402,20 @@ impl FrankenStorage {
             tracing::info!(
                 target: "cass::analytics",
                 processed,
+                kept,
                 total = total_messages,
                 last_id,
-                chunk = chunk_len,
+                chunk = fetched,
                 inserted = total_inserted,
                 elapsed_secs = format!("{elapsed_secs:.1}"),
                 msgs_per_sec = format!("{rate:.0}"),
                 "analytics_rebuild_progress"
             );
 
-            if (chunk_len as i64) < CHUNK_SIZE {
+            if (fetched as i64) < chunk_size {
                 break;
             }
         }
-
-        tx.commit()?;
 
         let elapsed = start.elapsed();
         let elapsed_ms = elapsed.as_millis() as u64;
@@ -17479,9 +17514,15 @@ impl FrankenStorage {
         let mut raw_entries_flushed = 0_usize;
         let mut expanded_entries_flushed = 0_usize;
         let message_scan_sql = if use_message_metrics {
-            "SELECT m.idx, mm.content_chars
+            // GH #424 (third finding): the former `JOIN message_metrics` page
+            // cost ~8 s per call on frankensqlite 0.3.8 regardless of the
+            // conversation's size — the join was materialized before the
+            // index lookup applied — so the step ran for hours across a few
+            // hundred conversations. Page the keyset over `messages` alone
+            // (second column = message id) and resolve `content_chars` by
+            // primary-key point lookup below; content pages stay untouched.
+            "SELECT m.idx, m.id
              FROM messages m INDEXED BY sqlite_autoindex_messages_1
-             JOIN message_metrics mm ON mm.message_id = m.id
              WHERE m.conversation_id = ?1
                AND m.idx > ?2
              ORDER BY m.idx
@@ -17504,6 +17545,15 @@ impl FrankenStorage {
             .conn
             .prepare(message_scan_sql)
             .with_context(|| "preparing daily_stats bounded message scan")?;
+        let metrics_lookup_statement = if use_message_metrics {
+            Some(
+                self.conn
+                    .prepare("SELECT content_chars FROM message_metrics WHERE message_id = ?1")
+                    .with_context(|| "preparing daily_stats message_metrics point lookup")?,
+            )
+        } else {
+            None
+        };
 
         loop {
             // Avoid the 2-table JOIN with LIMIT that triggers frankensqlite's
@@ -17610,6 +17660,10 @@ impl FrankenStorage {
                     let mut next_message_idx = cursor_message_idx;
                     let mut page_rows = 0_usize;
                     let mut aggregate = StatsAggregator::new();
+                    // GH #424: with `message_metrics` as the source the page
+                    // yields message ids; `content_chars` is resolved by
+                    // point lookup once the scan has completed.
+                    let mut pending_metric_ids: Vec<i64> = Vec::new();
                     let scan_params = [
                         SqliteValue::from(conversation_id),
                         SqliteValue::from(page_start_message_idx),
@@ -17618,17 +17672,21 @@ impl FrankenStorage {
                     let scan_result =
                         message_scan_statement.query_with_params_for_each(&scan_params, |row| {
                             let message_idx: i64 = row.get_typed(0)?;
-                            let content_len: i64 = row.get_typed(1)?;
+                            let second_column: i64 = row.get_typed(1)?;
                             next_message_idx = message_idx;
                             page_rows = page_rows.saturating_add(1);
-                            aggregate.record_delta(
-                                &agent_slug,
-                                &source_id,
-                                day_id,
-                                0,
-                                1,
-                                content_len,
-                            );
+                            if use_message_metrics {
+                                pending_metric_ids.push(second_column);
+                            } else {
+                                aggregate.record_delta(
+                                    &agent_slug,
+                                    &source_id,
+                                    day_id,
+                                    0,
+                                    1,
+                                    second_column,
+                                );
+                            }
                             Ok(())
                         });
                     match scan_result {
@@ -17656,6 +17714,31 @@ impl FrankenStorage {
                     }
                     if page_rows == 0 {
                         break;
+                    }
+                    if let Some(lookup) = metrics_lookup_statement.as_ref() {
+                        for message_id in pending_metric_ids {
+                            let rows = lookup
+                                .query_with_params(&[SqliteValue::from(message_id)])
+                                .with_context(|| {
+                                    format!(
+                                        "daily_stats phase=message_metrics_lookup conversation_id={conversation_id} message_id={message_id}"
+                                    )
+                                })?;
+                            // A message without a metrics row is dropped,
+                            // exactly as the former inner JOIN did.
+                            let Some(row) = rows.first() else {
+                                continue;
+                            };
+                            let content_len: i64 = row.get_typed(0)?;
+                            aggregate.record_delta(
+                                &agent_slug,
+                                &source_id,
+                                day_id,
+                                0,
+                                1,
+                                content_len,
+                            );
+                        }
                     }
 
                     messages_processed = messages_processed.saturating_add(page_rows);
@@ -18775,6 +18858,31 @@ fn sql_like_match_bytes(val: &[u8], pat: &[u8]) -> bool {
         }
         c => !val.is_empty() && val[0] == c && sql_like_match_bytes(&val[1..], &pat[1..]),
     }
+}
+
+/// Default keyset chunk for `rebuild_analytics_since`: rows fetched per
+/// `SELECT` and committed per transaction (GH #424).
+const ANALYTICS_REBUILD_CHUNK_SIZE: usize = 10_000;
+
+/// Per-conversation dimensions resolved once per analytics rebuild instead
+/// of being JOINed into every keyset chunk (GH #424).
+struct AnalyticsConversationDim {
+    started_at: Option<i64>,
+    source_id: String,
+    workspace_id: Option<i64>,
+    /// Resolved agent slug, `'unknown'` when the conversation has no agent
+    /// or its agent row is missing.
+    agent_slug: String,
+}
+
+/// One `messages` row of an analytics-rebuild keyset chunk (GH #424).
+struct AnalyticsMessageRow {
+    id: i64,
+    role: String,
+    content: String,
+    extra_json: Option<serde_json::Value>,
+    created_at: Option<i64>,
+    conversation_id: i64,
 }
 
 fn rebuild_batch_size_env(var: &str, default: usize) -> usize {
@@ -23163,6 +23271,132 @@ mod tests {
 
     /// GH #412: `rebuild_analytics_since` must rebuild only the day-aligned
     /// window, leave older rollups untouched, and be idempotent.
+    /// GH #424: the keyset runs over `messages` alone with the day cutoff
+    /// applied in Rust. A chunk made entirely of out-of-window rows must
+    /// still advance the cursor, and a message whose conversation row is
+    /// gone must be dropped (the former inner JOIN's behaviour) rather than
+    /// failing the rebuild.
+    #[test]
+    fn rebuild_analytics_keyset_advances_past_filtered_rows_and_drops_orphans() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "claude_code".into(),
+            name: "Claude Code".into(),
+            version: Some("1.0".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let day1_ts = 1_770_551_400_000_i64;
+        let day2_ts = day1_ts + 3 * 86_400_000;
+        let day1 = SqliteStorage::day_id_from_millis(day1_ts);
+        let day2 = SqliteStorage::day_id_from_millis(day2_ts);
+
+        let make_conv = |ext: &str, ts: i64, n: usize| Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some(ext.into()),
+            title: None,
+            source_path: PathBuf::from(format!("/tmp/{ext}.jsonl")),
+            started_at: Some(ts),
+            ended_at: Some(ts + 60_000),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: (0..n)
+                .map(|i| Message {
+                    id: None,
+                    idx: i as i64,
+                    role: if i % 2 == 0 {
+                        MessageRole::User
+                    } else {
+                        MessageRole::Agent
+                    },
+                    author: None,
+                    created_at: Some(ts + (i as i64) * 1_000),
+                    content: format!("message {i} of {ext}"),
+                    extra_json: serde_json::Value::Null,
+                    snippets: vec![],
+                })
+                .collect(),
+            source_id: "local".into(),
+            origin_host: None,
+        };
+        // Day-1 conversation first so its (older) rows fill the first
+        // keyset chunks entirely with out-of-window messages.
+        let conv1 = make_conv("keyset-day1", day1_ts, 3);
+        let conv2 = make_conv("keyset-day2", day2_ts, 3);
+        storage
+            .insert_conversations_batched_with_analytics(
+                &[(agent_id, None, &conv1), (agent_id, None, &conv2)],
+                false,
+            )
+            .unwrap();
+
+        let conn = storage.raw();
+        let metrics_count = |day: i64| -> i64 {
+            conn.query_row_map(
+                "SELECT COUNT(*) FROM message_metrics WHERE day_id = ?1",
+                fparams![day],
+                |row| row.get_typed(0),
+            )
+            .unwrap()
+        };
+        let daily_count = |day: i64| -> i64 {
+            conn.query_row_map(
+                "SELECT COALESCE(SUM(message_count), 0) FROM usage_daily WHERE day_id = ?1",
+                fparams![day],
+                |row| row.get_typed(0),
+            )
+            .unwrap()
+        };
+
+        conn.execute("DELETE FROM message_metrics").unwrap();
+        conn.execute("DELETE FROM usage_hourly").unwrap();
+        conn.execute("DELETE FROM usage_daily").unwrap();
+        conn.execute("DELETE FROM usage_models_daily").unwrap();
+
+        // Chunk size 2: chunk 1 = two day-1 rows (all filtered), chunk 2 =
+        // last day-1 row + first day-2 row, chunk 3 = remaining day-2 rows.
+        let result = storage
+            .rebuild_analytics_since_with_chunk_size(Some(day2_ts), 2)
+            .unwrap();
+        assert_eq!(result.message_metrics_rows, 3);
+        assert_eq!(metrics_count(day1), 0, "out-of-window rows stay out");
+        assert_eq!(metrics_count(day2), 3);
+        assert_eq!(daily_count(day2), 3);
+
+        // An orphaned message (conversation row gone) is dropped, not fatal.
+        conn.execute_compat(
+            "INSERT INTO messages (conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
+             VALUES (?1, 0, 'user', NULL, ?2, 'orphan', NULL, NULL)",
+            fparams![999_999_i64, day2_ts],
+        )
+        .unwrap();
+        let full = storage
+            .rebuild_analytics_since_with_chunk_size(None, 2)
+            .unwrap();
+        assert_eq!(full.message_metrics_rows, 6, "3 + 3 real rows, orphan dropped");
+        assert_eq!(metrics_count(day1), 3);
+        assert_eq!(metrics_count(day2), 3);
+        let orphan_metrics: i64 = conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM message_metrics mm
+                 WHERE NOT EXISTS (SELECT 1 FROM messages m JOIN conversations c ON c.id = m.conversation_id WHERE m.id = mm.message_id)",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(orphan_metrics, 0);
+    }
+
     #[test]
     fn rebuild_analytics_since_rebuilds_only_recent_days() {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
