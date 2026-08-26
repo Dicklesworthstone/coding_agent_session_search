@@ -48,8 +48,9 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use half::f16;
@@ -60,7 +61,63 @@ use super::embedder::Embedder;
 
 // Frankensearch types for vector storage and search delegation.
 use frankensearch::TwoTierConfig as FsTwoTierConfig;
-use frankensearch::{TwoTierIndex as FsTwoTierIndex, VectorHit as FsVectorHit};
+use frankensearch::index::{
+    VECTOR_ANN_FAST_FILENAME, VECTOR_ANN_QUALITY_FILENAME, VECTOR_INDEX_FAST_FILENAME,
+    VECTOR_INDEX_QUALITY_FILENAME,
+};
+use frankensearch::{
+    SearchError as FsSearchError, TwoTierIndex as FsTwoTierIndex,
+    TwoTierIndexPaths as FsTwoTierIndexPaths, VectorHit as FsVectorHit,
+};
+
+const FSVI_REOPEN_MAX_RETRIES: usize = 7;
+const FSVI_REOPEN_INITIAL_BACKOFF: Duration = Duration::from_millis(2);
+const FSVI_REOPEN_MAX_BACKOFF: Duration = Duration::from_millis(64);
+
+fn is_transient_fsvi_reader_lock(error: &FsSearchError) -> bool {
+    matches!(
+        error,
+        FsSearchError::InvalidConfig { field, reason, .. }
+            if field == "fsvi.map_lock"
+                && reason.contains("shared reader")
+                && reason.contains("operation would block")
+    )
+}
+
+/// Strictly reopen both tiers after the builder has already published them.
+///
+/// Frankensearch's discovered-path open deliberately degrades an unavailable
+/// quality tier to fast-only. That is correct for serving an existing index,
+/// but not for this build path: every non-empty CASS build just wrote both
+/// tiers and reports `IndexStatus::Complete`. Explicit paths preserve that
+/// invariant and let us retry only the transient reader-lock handoff observed
+/// on remote/shared filesystems immediately after the publisher drops its
+/// exclusive mapping.
+fn open_complete_fs_index_with_retry(
+    dir: &Path,
+    config: &FsTwoTierConfig,
+) -> std::result::Result<(FsTwoTierIndex, usize), FsSearchError> {
+    let paths = FsTwoTierIndexPaths::new(dir.join(VECTOR_INDEX_FAST_FILENAME))
+        .with_quality_index(dir.join(VECTOR_INDEX_QUALITY_FILENAME))
+        .with_fast_ann(dir.join(VECTOR_ANN_FAST_FILENAME))
+        .with_quality_ann(dir.join(VECTOR_ANN_QUALITY_FILENAME));
+    let mut retries = 0;
+    let mut backoff = FSVI_REOPEN_INITIAL_BACKOFF;
+
+    loop {
+        match FsTwoTierIndex::open_with_paths(&paths, config.clone()) {
+            Ok(index) => return Ok((index, retries)),
+            Err(error)
+                if retries < FSVI_REOPEN_MAX_RETRIES && is_transient_fsvi_reader_lock(&error) =>
+            {
+                std::thread::sleep(backoff);
+                retries += 1;
+                backoff = backoff.saturating_mul(2).min(FSVI_REOPEN_MAX_BACKOFF);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 /// Configuration for two-tier search.
 #[derive(Debug, Clone)]
@@ -331,9 +388,51 @@ impl TwoTierIndex {
                 .map_err(|e| anyhow::anyhow!("failed to add record {doc_id_str}: {e}"))?;
         }
 
-        let fs_index = builder
-            .finish()
-            .map_err(|e| anyhow::anyhow!("failed to finish fs index: {e}"))?;
+        let fs_index = match builder.finish() {
+            Ok(index) if index.has_quality_index() => index,
+            Ok(index) => {
+                // `TwoTierIndex::open` treats a discovered quality tier as
+                // optional and can therefore return fast-only when the
+                // just-published quality file has a transient map-lock. A
+                // completed CASS build wrote quality vectors for every row,
+                // so accepting that degraded result would make our metadata
+                // lie. Drop its fast-tier reader before the strict reopen.
+                drop(index);
+                let (index, retries) = open_complete_fs_index_with_retry(
+                    tmpdir.path(),
+                    &fs_config,
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "frankensearch finished without the required quality tier and the strict reopen failed: {error}"
+                    )
+                })?;
+                warn!(
+                    retries,
+                    "reopened a completed two-tier index after its initial quality-tier open degraded"
+                );
+                index
+            }
+            Err(error) if is_transient_fsvi_reader_lock(&error) => {
+                let finish_error = error.to_string();
+                let (index, retries) = open_complete_fs_index_with_retry(
+                    tmpdir.path(),
+                    &fs_config,
+                )
+                .map_err(|reopen_error| {
+                    anyhow::anyhow!(
+                        "failed to finish fs index ({finish_error}); strict reopen of the published tiers also failed: {reopen_error}"
+                    )
+                })?;
+                warn!(
+                    retries,
+                    finish_error = %finish_error,
+                    "reopened a completed two-tier index after a transient publication lock handoff"
+                );
+                index
+            }
+            Err(error) => return Err(anyhow::anyhow!("failed to finish fs index: {error}")),
+        };
 
         // frankensearch persists records sorted by doc_id hash/doc_id, so hit indices
         // are in fast-index order rather than cass insertion order. Rebuild our side
@@ -984,6 +1083,75 @@ mod tests {
             index.metadata.status,
             IndexStatus::Complete { .. }
         ));
+    }
+
+    #[test]
+    fn completed_index_reopen_retries_a_transient_writer_lock() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fast_path = dir.path().join(VECTOR_INDEX_FAST_FILENAME);
+        let quality_path = dir.path().join(VECTOR_INDEX_QUALITY_FILENAME);
+
+        let mut fast_writer = frankensearch::VectorIndex::create(&fast_path, "fast", 2).unwrap();
+        fast_writer
+            .write_record("s:session-0", &[1.0, 0.0])
+            .unwrap();
+        fast_writer.finish().unwrap();
+
+        let mut quality_writer =
+            frankensearch::VectorIndex::create(&quality_path, "quality", 2).unwrap();
+        quality_writer
+            .write_record("s:session-0", &[1.0, 0.0])
+            .unwrap();
+        quality_writer.finish().unwrap();
+
+        let live_writer = frankensearch::VectorIndex::open_writer(&fast_path).unwrap();
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let release_start = Arc::clone(&start);
+        let releaser = std::thread::spawn(move || {
+            release_start.wait();
+            std::thread::sleep(Duration::from_millis(20));
+            drop(live_writer);
+        });
+        start.wait();
+
+        let config = TwoTierConfig {
+            fast_dimension: 2,
+            quality_dimension: 2,
+            ..TwoTierConfig::default()
+        };
+        let (index, retries) =
+            open_complete_fs_index_with_retry(dir.path(), &config.to_fs_config()).unwrap();
+        releaser.join().unwrap();
+
+        assert!(
+            retries > 0,
+            "the live writer should force at least one retry"
+        );
+        assert!(index.has_quality_index());
+        assert_eq!(index.doc_count(), 1);
+    }
+
+    #[test]
+    fn transient_reader_lock_classification_is_narrow() {
+        let transient = FsSearchError::InvalidConfig {
+            field: "fsvi.map_lock".to_string(),
+            value: "/tmp/vector.fast.idx".to_string(),
+            reason: "cannot acquire shared reader lock: operation would block".to_string(),
+        };
+        let live_reader = FsSearchError::InvalidConfig {
+            field: "fsvi.map_lock".to_string(),
+            value: "/tmp/vector.fast.idx".to_string(),
+            reason: "cannot acquire exclusive writer lock: operation would block".to_string(),
+        };
+        let malformed = FsSearchError::InvalidConfig {
+            field: "fsvi.header".to_string(),
+            value: "bad".to_string(),
+            reason: "operation would block".to_string(),
+        };
+
+        assert!(is_transient_fsvi_reader_lock(&transient));
+        assert!(!is_transient_fsvi_reader_lock(&live_reader));
+        assert!(!is_transient_fsvi_reader_lock(&malformed));
     }
 
     #[test]
