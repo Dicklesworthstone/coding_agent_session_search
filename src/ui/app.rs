@@ -41290,6 +41290,43 @@ not jsonl",
     /// buffers should match exactly.)
     const PERF_BUFFER_CELL_BUDGET: usize = 120 * 40;
 
+    fn sampled_elapsed_micros(mut operation: impl FnMut()) -> Vec<u128> {
+        const SAMPLE_COUNT: usize = 12;
+
+        // Keep one-time allocator and renderer initialization outside the measured
+        // samples. The minimum of each window approximates uninterrupted elapsed
+        // time while ignoring an occasional scheduler preemption on a shared worker.
+        operation();
+        (0..SAMPLE_COUNT)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                operation();
+                start.elapsed().as_micros()
+            })
+            .collect()
+    }
+
+    fn assert_no_sustained_render_growth(label: &str, operation: impl FnMut()) {
+        let samples_us = sampled_elapsed_micros(operation);
+        let midpoint = samples_us.len() / 2;
+        let early_best_us = samples_us[..midpoint]
+            .iter()
+            .copied()
+            .min()
+            .expect("performance sample window must not be empty")
+            .max(1_000);
+        let late_best_us = samples_us[midpoint..]
+            .iter()
+            .copied()
+            .min()
+            .expect("performance sample window must not be empty");
+
+        assert!(
+            late_best_us <= early_best_us * 3,
+            "{label} best render cost grew from {early_best_us}us to {late_best_us}us; samples={samples_us:?}"
+        );
+    }
+
     #[test]
     fn perf_guard_search_surface_render_time() {
         let app = app_with_hits(10);
@@ -41377,25 +41414,13 @@ not jsonl",
 
     #[test]
     fn perf_guard_repeated_render_deterministic_timing() {
-        // Rendering the same state 5 times should not show increasing cost
-        // (would indicate a leak or accumulating state).
+        // Compare the best timings from two ordered windows. A single first/last
+        // comparison confuses scheduler preemption with accumulating render work.
         let app = app_with_hits(10);
-        let mut times_ms = Vec::with_capacity(5);
-        for _ in 0..5 {
-            let start = std::time::Instant::now();
+        assert_no_sustained_render_growth("search surface", || {
             let _ =
                 render_at_degradation(&app, 120, 40, ftui::render::budget::DegradationLevel::Full);
-            times_ms.push(start.elapsed().as_millis());
-        }
-        // Last render should not be >3x the first (generous margin for CI variability).
-        let first = times_ms[0].max(1);
-        let last = times_ms[4];
-        assert!(
-            last <= first * 3,
-            "render cost grew from {}ms to {}ms over 5 iterations — possible leak",
-            first,
-            last
-        );
+        });
     }
 
     // -- Markdown theming profiling (2dccg.3.4) ------------------------------
@@ -41602,15 +41627,20 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
         let hit = make_test_hit();
         let styles = StyleContext::from_options(StyleOptions::default());
 
-        let start = std::time::Instant::now();
         let lines = app.build_messages_lines(&hit, 120, &styles);
-        let elapsed = start.elapsed();
+        let samples_us = sampled_elapsed_micros(|| {
+            let _ = app.build_messages_lines(&hit, 120, &styles);
+        });
+        let best_us = samples_us
+            .iter()
+            .copied()
+            .min()
+            .expect("performance samples must not be empty");
 
         assert!(!lines.is_empty());
         assert!(
-            elapsed.as_millis() < 10,
-            "build_messages_lines (10 plain messages) took {:?} — should be <10ms",
-            elapsed
+            best_us < 10_000,
+            "build_messages_lines (10 plain messages) best sample was {best_us}us — should be <10000us; samples={samples_us:?}"
         );
     }
 
@@ -41633,21 +41663,10 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
     #[test]
     fn perf_profile_markdown_no_accumulation() {
         let app = app_with_markdown_detail(10);
-        let mut times = Vec::with_capacity(5);
-        for _ in 0..5 {
-            let start = std::time::Instant::now();
+        assert_no_sustained_render_growth("markdown detail surface", || {
             let _ =
                 render_at_degradation(&app, 120, 40, ftui::render::budget::DegradationLevel::Full);
-            times.push(start.elapsed().as_millis());
-        }
-        let first = times[0].max(1);
-        let last = times[4];
-        assert!(
-            last <= first * 3,
-            "markdown render cost grew from {}ms to {}ms — possible leak",
-            first,
-            last
-        );
+        });
     }
 
     /// Theme toggle correctly invalidates markdown rendering (new colors).
