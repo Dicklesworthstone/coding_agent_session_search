@@ -30744,9 +30744,13 @@ mod tests {
         )?;
         let old_lookup =
             conversation_external_lookup_key(&remote.source_id, pi_agent_id, remote_external_id);
+        // Identity resolution reads conversation_external_tail_lookup now —
+        // franken_find_external_conversation_lookup delegates to it and the
+        // legacy conversation_external_lookup table is retained only for
+        // migration/purge SQL, so inserts populate the tail table alone.
         let old_lookup_exists: i64 = storage.conn.query_row_map(
             "SELECT EXISTS(
-                 SELECT 1 FROM conversation_external_lookup WHERE lookup_key = ?1
+                 SELECT 1 FROM conversation_external_tail_lookup WHERE lookup_key = ?1
              )",
             fparams![old_lookup.as_str()],
             |row| row.get_typed(0),
