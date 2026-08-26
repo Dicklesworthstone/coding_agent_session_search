@@ -382,6 +382,16 @@ fn has_sanitized_omp_mirror_marker(parts: &[String]) -> bool {
 }
 
 fn has_xdg_omp_layout_marker(parts: &[String]) -> bool {
+    // `XDG_DATA_HOME` is user-configurable, so the default `.local/share`
+    // prefix cannot be the anchor: a relocated data home holds the same
+    // `omp/{sessions,profiles}` app layout under an arbitrary parent, and
+    // pinning the default prefix made those stores undetectable (the resume
+    // path was the first victim — bead roq9y). The durable anchor is the
+    // store-INTERNAL chain: `omp/sessions/<sanitized cwd>` (safe-dirname
+    // encoding always yields a `-`-prefixed component for the absolute cwd)
+    // or `omp/profiles/<valid profile name>`. Requiring that third component
+    // keeps the anti-theft rule intact — a stray `omp` ancestor with
+    // arbitrary children still classifies as nothing.
     parts.windows(4).any(|window| {
         window[0] == ".local"
             && window[1] == "share"
@@ -393,6 +403,12 @@ fn has_xdg_omp_layout_marker(parts: &[String]) -> bool {
             && window[2] == "omp"
             && window[3] == "profiles"
             && normalize_profile_name(&window[4]).is_some()
+    }) || parts.windows(3).any(|window| {
+        window[0] == "omp" && window[1] == "sessions" && window[2].starts_with('-')
+    }) || parts.windows(3).any(|window| {
+        window[0] == "omp"
+            && window[1] == "profiles"
+            && normalize_profile_name(&window[2]).is_some()
     })
 }
 
