@@ -2869,7 +2869,14 @@ mod tests {
         let error = key_add_password(&archive_dir, "test-password", "new-password")
             .expect_err("a private-artifact symlink must reject the staged transaction");
 
-        anyhow::ensure!(format!("{error:#}").contains("must not be a symlink"));
+        // The refusal moved from the per-artifact staging step to the
+        // whole-tree publication gate (8960afb9); the pinned semantics are
+        // unchanged — a symlinked private artifact rejects the transaction
+        // and every prior byte survives, asserted below.
+        anyhow::ensure!(
+            format!("{error:#}").contains("must not contain symlinks"),
+            "unexpected rejection: {error:#}"
+        );
         anyhow::ensure!(std::fs::read(&config_path)? == config_before);
         anyhow::ensure!(std::fs::read(&integrity_path)? == integrity_before);
         anyhow::ensure!(std::fs::read(&protected_path)? == protected_before);
@@ -2903,11 +2910,21 @@ mod tests {
             candidate_digest: victim_evidence.digest,
         };
         write_json_pretty(&guard.target.journal_path, &journal)?;
+        // Recovery refuses non-owner-only journals before reading them; this
+        // hand-crafted spoof must pass that gate to reach the staged-prefix
+        // refusal it pins.
+        std::fs::set_permissions(
+            &guard.target.journal_path,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )?;
 
         let error = recover_interrupted_key_mutation(&guard)
             .expect_err("a journal must not claim an arbitrary sibling directory");
 
-        anyhow::ensure!(format!("{error:#}").contains("owned staged prefix"));
+        anyhow::ensure!(
+            format!("{error:#}").contains("owned staged prefix"),
+            "unexpected rejection: {error:#}"
+        );
         anyhow::ensure!(std::fs::read(victim.join("keep.txt"))? == b"must survive");
         Ok(())
     }
@@ -3302,17 +3319,24 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn test_key_add_password_materializes_in_tree_symlinked_required_asset() -> Result<()> {
+    fn test_key_add_password_refuses_in_tree_symlinked_required_asset() -> Result<()> {
+        // 8960afb9 retired the old materialize-the-symlink convenience: the
+        // key-publication gate now refuses ANY symlink in the tree, matching
+        // the export/verify posture. A correct-password mutation over a
+        // symlinked required asset must refuse and leave the symlink alone.
         let (_temp_dir, archive_dir) = setup_test_archive();
         let site_dir = super::super::resolve_site_dir(&archive_dir)?;
         replace_viewer_with_in_tree_symlink(&site_dir);
 
-        key_add_password(&archive_dir, "test-password", "new-password")?;
+        let error = key_add_password(&archive_dir, "test-password", "new-password")
+            .expect_err("a symlinked required asset must refuse the key mutation");
 
-        anyhow::ensure!(verify_bundle(&archive_dir, false)?.status == "valid");
+        anyhow::ensure!(
+            format!("{error:#}").contains("must not contain symlinks"),
+            "unexpected rejection: {error:#}"
+        );
         let viewer_metadata = std::fs::symlink_metadata(site_dir.join("viewer.js"))?;
-        anyhow::ensure!(viewer_metadata.file_type().is_file());
-        anyhow::ensure!(!viewer_metadata.file_type().is_symlink());
+        anyhow::ensure!(viewer_metadata.file_type().is_symlink());
         Ok(())
     }
 
@@ -3340,22 +3364,22 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn test_key_rotate_materializes_in_tree_symlinked_required_asset() {
+    fn test_key_rotate_refuses_in_tree_symlinked_required_asset() {
+        // Same posture as key add (8960afb9): rotation refuses a symlinked
+        // required asset instead of materializing it, and the tree survives.
         let (_temp_dir, archive_dir) = setup_test_archive();
         let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
         replace_viewer_with_in_tree_symlink(&site_dir);
-        let expected_viewer = std::fs::read(site_dir.join("viewer-real.js")).unwrap();
 
-        key_rotate(&archive_dir, "test-password", "new-password", true, |_| {}).unwrap();
+        let error = key_rotate(&archive_dir, "test-password", "new-password", true, |_| {})
+            .expect_err("a symlinked required asset must refuse the key rotation");
 
-        let viewer_metadata = std::fs::symlink_metadata(site_dir.join("viewer.js")).unwrap();
-        assert!(viewer_metadata.file_type().is_file());
-        assert!(!viewer_metadata.file_type().is_symlink());
-        assert_eq!(
-            std::fs::read(site_dir.join("viewer.js")).unwrap(),
-            expected_viewer
+        assert!(
+            format!("{error:#}").contains("must not contain symlinks"),
+            "unexpected rejection: {error:#}"
         );
-        assert_eq!(verify_bundle(&archive_dir, false).unwrap().status, "valid");
+        let viewer_metadata = std::fs::symlink_metadata(site_dir.join("viewer.js")).unwrap();
+        assert!(viewer_metadata.file_type().is_symlink());
     }
 
     #[test]
