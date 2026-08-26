@@ -4,7 +4,7 @@
   "payload": {
     "path": "payload/data.db",
     "format": "sqlite",
-    "size_bytes": 17
+    "size_bytes": 16
   },
   "warning": "UNENCRYPTED - All content is publicly readable"
 }

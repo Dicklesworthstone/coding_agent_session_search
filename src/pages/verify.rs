@@ -1943,9 +1943,17 @@ mod tests {
         copy_fixture("unencrypted", &site_dir).unwrap();
 
         let result = verify_bundle(&site_dir, true).unwrap();
-        assert!(result.checks.config_schema.passed);
-        assert!(result.checks.payload_manifest.passed);
-        assert_eq!(result.status, "valid");
+        assert!(
+            result.checks.config_schema.passed,
+            "config schema: {:?}",
+            result.checks.config_schema
+        );
+        assert!(
+            result.checks.payload_manifest.passed,
+            "payload manifest: {:?}",
+            result.checks.payload_manifest
+        );
+        assert_eq!(result.status, "valid", "checks: {:?}", result.checks);
     }
 
     #[test]
@@ -2511,25 +2519,30 @@ mod tests {
         // Copy valid fixture
         copy_fixture("valid", &site_dir).unwrap();
 
-        // Create integrity.json
+        // Create integrity.json over EVERY file in the site: the integrity
+        // check's coverage rule flags any uncovered file, and the prepared
+        // site contains more than REQUIRED_FILES (payload chunks, the
+        // materialized vendor/ assets, ...). Walking the tree keeps this
+        // manifest builder honest as the bundle contract grows.
         let mut files = BTreeMap::new();
-        for file in REQUIRED_FILES {
-            let hash = compute_file_hash(&site_dir.join(file)).unwrap();
-            let size = fs::metadata(site_dir.join(file)).unwrap().len();
-            files.insert(file.to_string(), IntegrityEntry { sha256: hash, size });
+        for entry in walkdir::WalkDir::new(&site_dir) {
+            let entry = entry.unwrap();
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let rel = entry
+                .path()
+                .strip_prefix(&site_dir)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel == "integrity.json" {
+                continue;
+            }
+            let hash = compute_file_hash(entry.path()).unwrap();
+            let size = fs::metadata(entry.path()).unwrap().len();
+            files.insert(rel, IntegrityEntry { sha256: hash, size });
         }
-        // Add payload chunk
-        let chunk_hash = compute_file_hash(&site_dir.join("payload/chunk-00000.bin")).unwrap();
-        let chunk_size = fs::metadata(site_dir.join("payload/chunk-00000.bin"))
-            .unwrap()
-            .len();
-        files.insert(
-            "payload/chunk-00000.bin".to_string(),
-            IntegrityEntry {
-                sha256: chunk_hash,
-                size: chunk_size,
-            },
-        );
 
         let manifest = IntegrityManifest {
             version: 1,
