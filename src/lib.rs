@@ -92546,6 +92546,13 @@ pub(crate) struct SkippedJsonlLine {
     pub(crate) error: String,
 }
 
+type TolerantJsonlParse = (
+    Vec<serde_json::Value>,
+    Option<i64>,
+    Option<i64>,
+    Vec<SkippedJsonlLine>,
+);
+
 /// How many skipped records are named individually on stderr before the
 /// remainder is summarised as a count.
 const MAX_REPORTED_SKIPPED_JSONL_LINES: usize = 5;
@@ -92557,12 +92564,7 @@ const MAX_REPORTED_SKIPPED_JSONL_LINES: usize = 5;
 /// back to the indexed copy exactly as before.
 pub(crate) fn parse_followup_jsonl_messages_tolerant(
     path: &Path,
-) -> CliResult<(
-    Vec<serde_json::Value>,
-    Option<i64>,
-    Option<i64>,
-    Vec<SkippedJsonlLine>,
-)> {
+) -> CliResult<TolerantJsonlParse> {
     let lines = read_followup_file_lines(path)?;
     let mut messages = Vec::new();
     let mut session_start = None;
