@@ -2543,7 +2543,11 @@ mod tests {
         .unwrap();
 
         let result = verify_bundle(&site_dir, false).unwrap();
-        assert!(result.checks.integrity.passed);
+        assert!(
+            result.checks.integrity.passed,
+            "integrity check failed: {:?}",
+            result.checks.integrity
+        );
     }
 
     #[test]
