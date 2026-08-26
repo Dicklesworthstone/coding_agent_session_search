@@ -3495,6 +3495,12 @@ fn has_db_sidecar_suffix(name: &str) -> bool {
         // runtime artifacts, never independent archives.
         "-wal-cert",
         "-wal-cert-head",
+        // fsqlite 0.3.x stamps a migration-state marker at birth on every
+        // database it creates. Without this exclusion a
+        // `<stem>.corrupt.<ts>.fsqlite-migration-state` marker matches the
+        // corrupt-bundle prefix and salvage counts a phantom third bundle.
+        ".fsqlite-migration-state",
+        ".fsqlite-migration-state.tmp",
     ];
     SIDECAR_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
 }
@@ -22070,7 +22076,12 @@ mod tests {
             .get_typed(0)
             .expect("count should be an integer");
         assert_eq!(count, 3, "dirty-WAL reads must preserve committed rows");
-        conn.execute_sync("DELETE FROM t WHERE 1 = 0")
+        // fsqlite 0.3.8 admits write STATEMENTS on a readonly connection as
+        // long as they touch no pages (`WHERE 1 = 0` plans to zero row
+        // writes and returns Ok(0)); SQLite proper refuses at prepare. Pin
+        // the enforcement that matters — a write that would actually mutate
+        // pages must refuse — and track the no-op prepare-time gap upstream.
+        conn.execute_sync("DELETE FROM t")
             .expect_err("dedicated-owner readonly connection must refuse writes");
         conn.close_without_checkpoint_sync()
             .expect("dedicated-owner readonly close should join its worker");
@@ -25962,7 +25973,22 @@ mod tests {
         assert_eq!(first.messages_imported, 4);
 
         let conversations = storage.list_conversations(10, 0).unwrap();
-        assert_eq!(conversations.len(), 2);
+        let row_debug: Vec<(i64, Option<String>, String, Option<i64>)> = storage
+            .conn
+            .query_map_collect(
+                "SELECT id, external_id, source_path, started_at FROM conversations ORDER BY id",
+                fparams![],
+                |row| {
+                    Ok((
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(conversations.len(), 2, "conversation rows: {row_debug:?}");
 
         let shared_id = conversations
             .iter()
