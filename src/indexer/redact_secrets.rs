@@ -1313,11 +1313,16 @@ mod tests {
         let repeated_secret =
             "Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature";
         let repeated_note = "same assistant boilerplate without secrets";
+        // The field name must NOT be a sensitive key: gh#419's key-aware
+        // walker replaces values under sensitive keys (`token`, `secret`, …)
+        // wholesale without ever consulting redact_text, so such values can
+        // never exercise the memo cache this test pins. A neutral key routes
+        // the candidate-bearing scalar through the cached text path.
         let value = json!({
             "events": [
-                {"token": repeated_secret, "note": repeated_note},
-                {"token": repeated_secret, "note": repeated_note},
-                {"token": repeated_secret, "note": repeated_note},
+                {"line": repeated_secret, "note": repeated_note},
+                {"line": repeated_secret, "note": repeated_note},
+                {"line": repeated_secret, "note": repeated_note},
             ],
             "footer": repeated_note,
         });
