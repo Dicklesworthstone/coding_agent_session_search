@@ -2987,14 +2987,12 @@ fn analytics_subcommands_emit_uniform_json_envelope() {
         .expect("create cass db");
     drop(storage);
 
-    let shared: Vec<&str> = vec![
+    let shared_query: Vec<&str> = vec![
         "--json",
         "--since",
         "2026-01-01",
         "--until",
         "2026-01-31",
-        "--days",
-        "7",
         "--agent",
         "claude",
         "--workspace",
@@ -3028,7 +3026,24 @@ fn analytics_subcommands_emit_uniform_json_envelope() {
     let lock_sensitive_commands = ["analytics/rebuild"];
 
     for (expected_command, mut args) in cases {
-        args.extend_from_slice(&shared);
+        match expected_command {
+            // Rebuild is a whole-rollup operation. It supports a lower time
+            // bound for Track A but rejects query-only dimensional filters.
+            "analytics/rebuild" => args.extend_from_slice(&[
+                "--json",
+                "--since",
+                "2026-01-01",
+                "--data-dir",
+                data_dir_str.as_str(),
+            ]),
+            // Validation checks global invariants and cannot apply query filters.
+            "analytics/validate" => args.extend_from_slice(&[
+                "--json",
+                "--data-dir",
+                data_dir_str.as_str(),
+            ]),
+            _ => args.extend_from_slice(&shared_query),
+        }
         let mut cmd = base_cmd(tmp_home.path());
         cmd.args(&args);
         let output = cmd.output().expect("failed to execute command");
@@ -3145,10 +3160,17 @@ fn analytics_subcommands_emit_uniform_json_envelope() {
         let filters = json["_meta"]["filters_applied"]
             .as_array()
             .expect("filters_applied array");
-        assert!(
-            !filters.is_empty(),
-            "filters_applied should include shared filters for {expected_command}"
-        );
+        if expected_command == "analytics/validate" {
+            assert!(
+                filters.is_empty(),
+                "analytics/validate must not claim query filters were applied: {json}"
+            );
+        } else {
+            assert!(
+                !filters.is_empty(),
+                "filters_applied should include supported filters for {expected_command}"
+            );
+        }
     }
 }
 
