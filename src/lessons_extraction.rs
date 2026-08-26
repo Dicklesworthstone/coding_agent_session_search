@@ -51,9 +51,14 @@ static HOME_PATH_RE: Lazy<Regex> = Lazy::new(|| {
 /// Practical e-mail matcher for redaction. It intentionally favors privacy
 /// over full RFC mailbox validation and also finds addresses after prefixes
 /// such as `owner=` and `mailto:`.
+///
+/// `=` is deliberately NOT in the local-part class even though RFC mailboxes
+/// permit it: with it, a `key=value` prefix like `owner=` lexes into the
+/// local part and the replacement eats the key, so
+/// `owner=alice@example.com` became `<email>` instead of `owner=<email>`.
 static EMAIL_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r"(?i)[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+",
+        r"(?i)[a-z0-9.!#$%&'*+/?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+",
     )
     .expect("durable lesson email regex")
 });

@@ -33351,6 +33351,7 @@ mod tests {
             "watch_startup:count_total_messages",
             "watch_startup:published_index_validate",
             "watch_startup:scan_entry",
+            "watch_startup:reclassify_legacy_omp",
         ];
         for sub_phase in documented_sub_phases {
             assert!(
