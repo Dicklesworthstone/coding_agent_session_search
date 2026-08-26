@@ -23374,12 +23374,16 @@ mod tests {
         assert_eq!(daily_count(day2), 3);
 
         // An orphaned message (conversation row gone) is dropped, not fatal.
+        // FK enforcement is on by default; disable it only to plant the
+        // orphan the way real-world damage would leave it.
+        conn.execute("PRAGMA foreign_keys = OFF").unwrap();
         conn.execute_compat(
             "INSERT INTO messages (conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
              VALUES (?1, 0, 'user', NULL, ?2, 'orphan', NULL, NULL)",
             fparams![999_999_i64, day2_ts],
         )
         .unwrap();
+        conn.execute("PRAGMA foreign_keys = ON").unwrap();
         let full = storage
             .rebuild_analytics_since_with_chunk_size(None, 2)
             .unwrap();
