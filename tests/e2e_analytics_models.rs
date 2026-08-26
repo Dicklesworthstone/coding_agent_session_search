@@ -177,7 +177,10 @@ fn analytics_models_with_invalid_since_returns_actionable_error() {
     let (exit, stdout, stderr) =
         run_cass_analytics_models(&dir, &["--since", "this is not a valid date"], &[]);
     eprintln!("[vz9t8_6_test] invalid_since exit={exit}");
-    assert_ne!(exit, 0, "invalid --since must not become an unfiltered query");
+    assert_ne!(
+        exit, 0,
+        "invalid --since must not become an unfiltered query"
+    );
     let combined = format!("{stdout}\n{stderr}");
     assert!(
         combined.to_lowercase().contains("date")

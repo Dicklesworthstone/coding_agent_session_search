@@ -3037,11 +3037,9 @@ fn analytics_subcommands_emit_uniform_json_envelope() {
                 data_dir_str.as_str(),
             ]),
             // Validation checks global invariants and cannot apply query filters.
-            "analytics/validate" => args.extend_from_slice(&[
-                "--json",
-                "--data-dir",
-                data_dir_str.as_str(),
-            ]),
+            "analytics/validate" => {
+                args.extend_from_slice(&["--json", "--data-dir", data_dir_str.as_str()])
+            }
             _ => args.extend_from_slice(&shared_query),
         }
         let mut cmd = base_cmd(tmp_home.path());

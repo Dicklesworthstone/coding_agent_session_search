@@ -2777,9 +2777,9 @@ fn analytics_filter_from_common(common: &AnalyticsCommon) -> CliResult<analytics
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
     let since_ms = match (common.days, common.since.as_deref()) {
-        (Some(days), None) => Some(
-            now_ms.saturating_sub(i64::from(days).saturating_mul(86_400_000)),
-        ),
+        (Some(days), None) => {
+            Some(now_ms.saturating_sub(i64::from(days).saturating_mul(86_400_000)))
+        }
         (None, Some(raw)) => Some(parse_analytics_datetime_flag("--since", raw)?),
         (None, None) => None,
         (Some(_), Some(_)) => unreachable!("conflicting analytics time bounds rejected above"),
@@ -18219,7 +18219,11 @@ mod analytics_filter_validation_tests {
         reversed.until = Some("2026-01-01".into());
         let err = analytics_filter_from_common(&reversed).unwrap_err();
         assert_eq!(err.code, 2);
-        assert!(err.message.contains("later than --until"), "{}", err.message);
+        assert!(
+            err.message.contains("later than --until"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]
@@ -18274,13 +18278,8 @@ mod analytics_filter_validation_tests {
             assert_eq!(SqliteStorage::day_id_from_millis(ms), day, "{payload}");
         }
 
-        let err = run_analytics_rebuild(
-            &windowed,
-            false,
-            AnalyticsTrack::B,
-            Some(&db_path),
-        )
-        .unwrap_err();
+        let err =
+            run_analytics_rebuild(&windowed, false, AnalyticsTrack::B, Some(&db_path)).unwrap_err();
         assert_eq!(err.code, 2);
         assert!(err.message.contains("--track b"), "{}", err.message);
 
