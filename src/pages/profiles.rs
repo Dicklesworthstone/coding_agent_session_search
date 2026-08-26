@@ -553,8 +553,11 @@ mod tests {
         // Team should have fewer than public
         assert!(team.custom_patterns.len() < public.custom_patterns.len());
 
-        // Personal should have the fewest
-        assert!(personal.custom_patterns.len() <= 6);
+        // Personal should have the fewest. Assert the ordering rather than a
+        // hard count: the pattern catalog grows (AWS session tokens, database
+        // passwords, ...) and a magic cap turned every legitimate personal-tier
+        // addition into a red test without protecting the actual contract.
+        assert!(personal.custom_patterns.len() < team.custom_patterns.len());
     }
 
     #[test]
