@@ -16914,13 +16914,43 @@ fn incremental_semantic_embed(
 ///
 /// Returns `(storage, rebuilt, opened_fresh_for_full)`. `rebuilt` and
 /// `opened_fresh_for_full` are retained for progress metadata compatibility;
-/// this path now fails closed on existing unreadable/incompatible archives
-/// instead of backing them up and creating an empty replacement.
+/// this path now fails closed on non-empty unreadable/incompatible archives
+/// instead of backing them up and creating an empty replacement. An existing
+/// zero-byte main file is an interrupted fresh initialization, not an archive:
+/// resume schema creation in place without deleting or replacing the path.
 fn open_storage_for_index(
     db_path: &Path,
     full_index: bool,
 ) -> Result<(FrankenStorage, bool, bool)> {
-    if db_path.exists() {
+    let existing_archive_bytes = match fs::metadata(db_path) {
+        Ok(metadata) => Some(metadata.len()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "inspecting canonical archive before index: {}",
+                    db_path.display()
+                )
+            });
+        }
+    };
+
+    if existing_archive_bytes == Some(0) {
+        return match FrankenStorage::open(db_path) {
+            Ok(storage) => Ok((storage, false, full_index)),
+            Err(err) if anyhow_chain_indicates_retryable_storage_contention(&err) => {
+                Err(anyhow::anyhow!(
+                    "canonical db is busy/locked while resuming interrupted initialization; refusing to replace it: {err}"
+                ))
+            }
+            Err(err) => Err(canonical_archive_unhealthy_for_index_error(
+                db_path,
+                &format!("resuming interrupted zero-byte initialization failed: {err:#}"),
+            )),
+        };
+    }
+
+    if existing_archive_bytes.is_some() {
         match non_destructive_meta_schema_version(db_path) {
             Ok(Some(version)) if version > crate::storage::sqlite::CURRENT_SCHEMA_VERSION => {
                 return Err(canonical_archive_unhealthy_for_index_error(
@@ -16946,7 +16976,7 @@ fn open_storage_for_index(
         }
     }
 
-    if db_path.exists() {
+    if existing_archive_bytes.is_some() {
         match crate::storage::sqlite::open_current_schema_storage_with_timeout(
             db_path,
             Duration::from_secs(10),
@@ -16961,7 +16991,7 @@ fn open_storage_for_index(
         }
     }
 
-    if db_path.exists() {
+    if existing_archive_bytes.is_some() {
         match FrankenStorage::open(db_path) {
             Ok(storage) => Ok((storage, false, false)),
             Err(err) if anyhow_chain_indicates_retryable_storage_contention(&err) => {
@@ -43232,6 +43262,32 @@ mod tests {
             saturating_u32_from_i64(i64::from(u32::MAX) + 1234),
             u32::MAX
         );
+    }
+
+    #[test]
+    fn open_storage_for_index_resumes_zero_byte_interrupted_initialization() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("interrupted-initialization.db");
+        std::fs::File::create(&db_path).unwrap();
+        assert_eq!(std::fs::metadata(&db_path).unwrap().len(), 0);
+
+        let (storage, rebuilt, opened_fresh_for_full) =
+            open_storage_for_index(&db_path, true).unwrap();
+        assert!(!rebuilt);
+        assert!(opened_fresh_for_full);
+        assert_eq!(
+            storage.schema_version().unwrap(),
+            crate::storage::sqlite::CURRENT_SCHEMA_VERSION
+        );
+        storage.close().unwrap();
+
+        let reopened = FrankenStorage::open_readonly(&db_path).unwrap();
+        assert_eq!(
+            reopened.schema_version().unwrap(),
+            crate::storage::sqlite::CURRENT_SCHEMA_VERSION,
+            "resumed initialization must persist a read-only-openable canonical archive"
+        );
+        reopened.close_without_checkpoint().unwrap();
     }
 
     #[test]
