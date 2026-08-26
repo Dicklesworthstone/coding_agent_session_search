@@ -2463,6 +2463,8 @@ fn tui_pty_record_macro_creates_file() {
 
 #[test]
 fn tui_typing_writes_latency_trace() -> Result<(), String> {
+    const LATENCY_QUERY: &str = "latencyprobe";
+
     let _guard_lock = tui_flow_guard();
     let trace = trace_id();
     let tracker = tracker_for("tui_typing_writes_latency_trace");
@@ -2507,12 +2509,21 @@ fn tui_typing_writes_latency_trace() -> Result<(), String> {
         }),
         "Did not observe rendered search input before latency typing interaction"
     );
-
-    let before_query_len = captured.lock().expect("capture lock").len();
-    send_key_sequence(&mut *writer, b"hello");
     assert!(
-        wait_for_output_growth(&captured, before_query_len, 24, Duration::from_secs(6)),
-        "Did not observe output growth after live query typing in latency PTY"
+        wait_for_rendered_output(
+            &captured,
+            PTY_STARTUP_TIMEOUT,
+            rendered_contains_hello_fixture_content,
+        ),
+        "Did not observe the completed startup search before latency typing interaction"
+    );
+
+    send_key_sequence(&mut *writer, LATENCY_QUERY.as_bytes());
+    assert!(
+        wait_for_rendered_output(&captured, Duration::from_secs(6), |rendered| {
+            rendered.contains(LATENCY_QUERY)
+        }),
+        "Did not observe the typed latency query in the rendered search field"
     );
     let before_submit_len = captured.lock().expect("capture lock").len();
     send_key_sequence(&mut *writer, b"\r");
@@ -2521,14 +2532,10 @@ fn tui_typing_writes_latency_trace() -> Result<(), String> {
         wait_for_output_growth(&captured, before_submit_len, 24, Duration::from_secs(6)),
         "Did not observe output growth after explicit query submission in latency PTY"
     );
-    if !wait_for_rendered_output(
-        &captured,
-        Duration::from_secs(8),
-        rendered_contains_hello_fixture_content,
-    ) {
-        return Err(
-            "Did not observe fixture search result before latency trace shutdown".to_string(),
-        );
+    if !wait_for_rendered_output(&captured, Duration::from_secs(8), |rendered| {
+        rendered.contains("No results match your query")
+    }) {
+        return Err("Did not observe the latency query's zero-result frame before shutdown".into());
     }
     // The trace is flushed on shutdown; make sure the frame containing the
     // result has had a chance to reach the latency recorder before ESC closes
@@ -2586,6 +2593,7 @@ fn tui_typing_writes_latency_trace() -> Result<(), String> {
                 .and_then(|value| value.as_u64())
                 .unwrap_or_default()
                 > 1
+                && sample.get("query").and_then(|value| value.as_str()) == Some(LATENCY_QUERY)
                 && sample
                     .get("input_to_first_visible_us")
                     .and_then(|value| value.as_u64())

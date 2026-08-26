@@ -5370,6 +5370,10 @@ pub struct CassApp {
     state_file_io_lock: Arc<Mutex<()>>,
     /// When query/filters changed (for debounced search, 60ms).
     pub search_dirty_since: Option<Instant>,
+    /// First query/filter input contributing to the next search request.
+    /// Kept separate from `search_dirty_since`, which advances on every edit
+    /// so the debounce window remains anchored to the most recent input.
+    search_input_started_at: Option<Instant>,
     /// Current spinner frame index.
     pub spinner_frame: usize,
     /// Active loading indicator context for async/deferred operations.
@@ -5632,6 +5636,7 @@ impl Default for CassApp {
             state_file_io_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             state_file_io_lock: Arc::new(Mutex::new(())),
             search_dirty_since: None,
+            search_input_started_at: None,
             spinner_frame: 0,
             loading_context: None,
             saved_views: Vec::new(),
@@ -7211,6 +7216,7 @@ impl CassApp {
         query: String,
         progressive: bool,
         requested_limit: usize,
+        input_started_at: Option<Instant>,
     ) {
         let Some(recorder) = self.latency_trace.as_ref() else {
             return;
@@ -7221,9 +7227,15 @@ impl CassApp {
                 query,
                 progressive,
                 requested_limit,
-                self.search_dirty_since,
+                input_started_at,
             );
         }
+    }
+
+    fn mark_search_input_dirty(&mut self) {
+        let now = Instant::now();
+        self.search_input_started_at.get_or_insert(now);
+        self.search_dirty_since = Some(now);
     }
 
     fn trace_search_results_applied(
@@ -16947,7 +16959,7 @@ impl super::ftui_adapter::Model for CassApp {
                     self.cursor_pos = cursor + text.len();
                 }
                 self.dirty_since = Some(Instant::now());
-                self.search_dirty_since = Some(Instant::now());
+                self.mark_search_input_dirty();
                 self.history_cursor = None;
                 Self::delayed_tick(SEARCH_DEBOUNCE)
             }
@@ -16956,7 +16968,7 @@ impl super::ftui_adapter::Model for CassApp {
                 self.query.clear();
                 self.cursor_pos = 0;
                 self.dirty_since = Some(Instant::now());
-                self.search_dirty_since = Some(Instant::now());
+                self.mark_search_input_dirty();
                 self.history_cursor = None;
                 Self::delayed_tick(SEARCH_DEBOUNCE)
             }
@@ -16967,7 +16979,7 @@ impl super::ftui_adapter::Model for CassApp {
                     self.push_undo("Line kill");
                     self.query.drain(..pos);
                     self.cursor_pos = 0;
-                    self.search_dirty_since = Some(Instant::now());
+                    self.mark_search_input_dirty();
                     return Self::delayed_tick(SEARCH_DEBOUNCE);
                 }
                 ftui::Cmd::none()
@@ -16979,7 +16991,7 @@ impl super::ftui_adapter::Model for CassApp {
                     self.push_undo("Forward kill");
                     self.query.truncate(pos);
                     self.cursor_pos = pos;
-                    self.search_dirty_since = Some(Instant::now());
+                    self.mark_search_input_dirty();
                     return Self::delayed_tick(SEARCH_DEBOUNCE);
                 }
                 ftui::Cmd::none()
@@ -16999,7 +17011,7 @@ impl super::ftui_adapter::Model for CassApp {
                     self.query.drain(new_end..cursor);
                     self.cursor_pos = new_end;
                     self.dirty_since = Some(Instant::now());
-                    self.search_dirty_since = Some(Instant::now());
+                    self.mark_search_input_dirty();
                     self.history_cursor = None;
                     return Self::delayed_tick(SEARCH_DEBOUNCE);
                 }
@@ -17026,8 +17038,8 @@ impl super::ftui_adapter::Model for CassApp {
                 self.history_cursor = None;
                 // Preserve the earliest input timestamp so explicit submits can
                 // still report end-to-end typing latency in the trace.
-                if self.search_dirty_since.is_none() {
-                    self.search_dirty_since = Some(Instant::now());
+                if self.search_input_started_at.is_none() {
+                    self.mark_search_input_dirty();
                 }
                 ftui::Cmd::msg(CassMsg::SearchRequested)
             }
@@ -17035,6 +17047,7 @@ impl super::ftui_adapter::Model for CassApp {
                 // Clear debounce state so we don't double-fire.
                 let generation = self.search_generation.wrapping_add(1);
                 let params = self.build_search_params(SearchPass::Interactive, 0);
+                let input_started_at = self.search_input_started_at.take();
                 let progressive = self
                     .progressive_search_service
                     .as_ref()
@@ -17044,6 +17057,7 @@ impl super::ftui_adapter::Model for CassApp {
                     params.query.clone(),
                     progressive,
                     params.limit,
+                    input_started_at,
                 );
                 self.search_dirty_since = None;
                 self.search_error_message = None;
@@ -17322,7 +17336,7 @@ impl super::ftui_adapter::Model for CassApp {
                     self.push_undo("Delete forward");
                     self.query.drain(pos..next);
                     self.cursor_pos = pos;
-                    self.search_dirty_since = Some(std::time::Instant::now());
+                    self.mark_search_input_dirty();
                     return Self::delayed_tick(SEARCH_DEBOUNCE);
                 }
                 ftui::Cmd::none()
@@ -20149,7 +20163,7 @@ impl super::ftui_adapter::Model for CassApp {
                             }
                         }
                         if changed {
-                            self.search_dirty_since = Some(Instant::now());
+                            self.mark_search_input_dirty();
                             self.cached_detail = None;
                         }
                         ftui::Cmd::none()
@@ -27102,8 +27116,42 @@ mod tests {
     fn search_requested_clears_dirty_state() {
         let mut app = CassApp::default();
         app.search_dirty_since = Some(Instant::now());
+        app.search_input_started_at = Some(Instant::now());
         let _ = app.update(CassMsg::SearchRequested);
         assert!(app.search_dirty_since.is_none());
+        assert!(app.search_input_started_at.is_none());
+    }
+
+    #[test]
+    fn latency_trace_preserves_first_input_while_debounce_tracks_latest_input() {
+        let mut app = CassApp::default();
+        let recorder = Arc::new(Mutex::new(TuiLatencyRecorder::new(PathBuf::from(
+            "trace.json",
+        ))));
+        app.latency_trace = Some(Arc::clone(&recorder));
+
+        let first_input = Instant::now() - Duration::from_secs(1);
+        let previous_dirty = Instant::now() - Duration::from_millis(500);
+        app.search_input_started_at = Some(first_input);
+        app.search_dirty_since = Some(previous_dirty);
+
+        let _ = app.update(CassMsg::QueryChanged("x".to_string()));
+
+        assert_eq!(app.search_input_started_at, Some(first_input));
+        assert!(app.search_dirty_since.is_some_and(|dirty| dirty > previous_dirty));
+
+        let _ = app.update(CassMsg::SearchRequested);
+
+        assert!(app.search_input_started_at.is_none());
+        assert!(app.search_dirty_since.is_none());
+        let trace = recorder.lock().expect("latency recorder lock");
+        assert_eq!(
+            trace
+                .active
+                .get(&1)
+                .and_then(|sample| sample.input_started_at),
+            Some(first_input)
+        );
     }
 
     #[test]
