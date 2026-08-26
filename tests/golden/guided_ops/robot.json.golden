@@ -89,7 +89,7 @@
       "policy": "strict-swarm-evidence + drop-private-session-text",
       "private_session_text_dropped": true,
       "raw_session_content_included": false,
-      "strings_seen": 9
+      "strings_seen": 17
     },
     "schema_version": "cass.guided_ops.redaction_report.v1"
   },
@@ -498,7 +498,7 @@
         "policy": "strict-swarm-evidence + drop-private-session-text",
         "private_session_text_dropped": true,
         "raw_session_content_included": false,
-        "strings_seen": 9
+        "strings_seen": 17
       },
       "rerun": {
         "capsule_id": "capsule-blake3:2b10a8075a81cd681e448e7fe9780ec92256288e3776a7046457d3f705b25be8",
