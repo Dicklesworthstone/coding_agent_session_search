@@ -17243,9 +17243,10 @@ impl FrankenStorage {
             tx.commit()?;
         }
 
-        // Keyset cursor: the largest message id fetched so far. Starts
-        // below every representable rowid so nothing is skipped even if an
-        // id is zero or negative.
+        // Keyset cursor: the largest message id fetched so far. The first
+        // page omits the lower bound so the full signed SQLite key domain,
+        // including `i64::MIN`, is reachable; later pages use `id > last_id`.
+        let mut first_page = true;
         let mut last_id: i64 = i64::MIN;
         // Lower bound on the effective timestamp. A full rebuild must admit
         // every row (including any pre-1970 negative timestamp), so it uses
@@ -17261,34 +17262,47 @@ impl FrankenStorage {
         let mut usage_models_daily_rows: usize = 0;
 
         loop {
-            let rows: Vec<AnalyticsMessageRow> = self.conn.query_map_collect(
-                "SELECT m.id, m.role, m.content, m.extra_json, m.extra_bin,
-                        m.created_at, m.conversation_id
-                 FROM messages m
-                 WHERE m.id > ?1
-                 ORDER BY m.id
-                 LIMIT ?2",
-                fparams![last_id, chunk_size],
-                |row| {
-                    let extra_json = row
-                        .get_typed::<Option<String>>(3)?
-                        .and_then(|s| serde_json::from_str(&s).ok())
-                        .or_else(|| {
-                            row.get_typed::<Option<Vec<u8>>>(4)
-                                .ok()
-                                .flatten()
-                                .and_then(|b| rmp_serde::from_slice(&b).ok())
-                        });
-                    Ok(AnalyticsMessageRow {
-                        id: row.get_typed(0)?,
-                        role: row.get_typed(1)?,
-                        content: row.get_typed(2)?,
-                        extra_json,
-                        created_at: row.get_typed(5)?,
-                        conversation_id: row.get_typed(6)?,
-                    })
-                },
-            )?;
+            let decode_row = |row: &FrankenRow| {
+                let extra_json = row
+                    .get_typed::<Option<String>>(3)?
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .or_else(|| {
+                        row.get_typed::<Option<Vec<u8>>>(4)
+                            .ok()
+                            .flatten()
+                            .and_then(|b| rmp_serde::from_slice(&b).ok())
+                    });
+                Ok(AnalyticsMessageRow {
+                    id: row.get_typed(0)?,
+                    role: row.get_typed(1)?,
+                    content: row.get_typed(2)?,
+                    extra_json,
+                    created_at: row.get_typed(5)?,
+                    conversation_id: row.get_typed(6)?,
+                })
+            };
+            let rows: Vec<AnalyticsMessageRow> = if first_page {
+                self.conn.query_map_collect(
+                    "SELECT m.id, m.role, m.content, m.extra_json, m.extra_bin,
+                            m.created_at, m.conversation_id
+                     FROM messages m
+                     ORDER BY m.id
+                     LIMIT ?1",
+                    fparams![chunk_size],
+                    decode_row,
+                )?
+            } else {
+                self.conn.query_map_collect(
+                    "SELECT m.id, m.role, m.content, m.extra_json, m.extra_bin,
+                            m.created_at, m.conversation_id
+                     FROM messages m
+                     WHERE m.id > ?1
+                     ORDER BY m.id
+                     LIMIT ?2",
+                    fparams![last_id, chunk_size],
+                    decode_row,
+                )?
+            };
 
             let Some(last_row) = rows.last() else {
                 break;
@@ -17298,6 +17312,7 @@ impl FrankenStorage {
             // chunk consisting entirely of out-of-window rows can never
             // stall the cursor.
             last_id = last_row.id;
+            first_page = false;
 
             let mut entries = Vec::with_capacity(fetched);
             let mut rollup_agg = AnalyticsRollupAggregator::new();
@@ -23373,6 +23388,20 @@ mod tests {
         assert_eq!(metrics_count(day2), 3);
         assert_eq!(daily_count(day2), 3);
 
+        let day1_conversation_id: i64 = conn
+            .query_row_map(
+                "SELECT id FROM conversations WHERE external_id = ?1",
+                fparams!["keyset-day1"],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        conn.execute_compat(
+            "INSERT INTO messages (id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
+             VALUES (?1, ?2, 3, 'user', NULL, ?3, 'minimum id', NULL, NULL)",
+            fparams![i64::MIN, day1_conversation_id, day1_ts + 3_000],
+        )
+        .unwrap();
+
         // An orphaned message (conversation row gone) is dropped, not fatal.
         // FK enforcement is on by default; disable it only to plant the
         // orphan the way real-world damage would leave it.
@@ -23388,10 +23417,10 @@ mod tests {
             .rebuild_analytics_since_with_chunk_size(None, 2)
             .unwrap();
         assert_eq!(
-            full.message_metrics_rows, 6,
-            "3 + 3 real rows, orphan dropped"
+            full.message_metrics_rows, 7,
+            "the minimum-id row and six ordinary rows are rebuilt; the orphan is dropped"
         );
-        assert_eq!(metrics_count(day1), 3);
+        assert_eq!(metrics_count(day1), 4);
         assert_eq!(metrics_count(day2), 3);
         let orphan_metrics: i64 = conn
             .query_row_map(
