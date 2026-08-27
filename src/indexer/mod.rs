@@ -13152,6 +13152,7 @@ fn run_batch_index_with_connector_factories(
         convs: Vec<NormalizedConversation>,
         is_discovered: bool,
         scan_succeeded: bool,
+        active_source_skipped: bool,
         scan_error: Option<String>,
     }
 
@@ -13183,6 +13184,7 @@ fn run_batch_index_with_connector_factories(
                 let mut convs = Vec::new();
                 let mut is_discovered = false;
                 let mut scan_succeeded = true;
+                let mut active_source_skipped = false;
                 let mut scan_errors = Vec::new();
                 let with_scan_tick = |ctx: crate::connectors::ScanContext| {
                     match &scan_progress_tick {
@@ -13226,6 +13228,7 @@ fn run_batch_index_with_connector_factories(
                     match conn.scan(&ctx) {
                         Ok(mut local_convs) => {
                             let local_origin = Origin::local();
+                            let conversations_before_active_filter = local_convs.len();
                             local_convs.retain(|conv| {
                                 !should_skip_active_session_source(
                                     active_source_filter.as_ref(),
@@ -13233,6 +13236,8 @@ fn run_batch_index_with_connector_factories(
                                     &conv.source_path,
                                 )
                             });
+                            active_source_skipped |=
+                                local_convs.len() < conversations_before_active_filter;
                             for conversation in &mut local_convs {
                                 ingest_diagnostics.observe_conversation(conversation);
                             }
@@ -13294,6 +13299,7 @@ fn run_batch_index_with_connector_factories(
                         );
                         match conn.scan(&ctx) {
                             Ok(mut remote_convs) => {
+                                let conversations_before_active_filter = remote_convs.len();
                                 remote_convs.retain(|conv| {
                                     !should_skip_active_session_source(
                                         active_source_filter.as_ref(),
@@ -13301,6 +13307,8 @@ fn run_batch_index_with_connector_factories(
                                         &conv.source_path,
                                     )
                                 });
+                                active_source_skipped |=
+                                    remote_convs.len() < conversations_before_active_filter;
                                 for conversation in &mut remote_convs {
                                     ingest_diagnostics.observe_conversation(conversation);
                                 }
@@ -13368,6 +13376,7 @@ fn run_batch_index_with_connector_factories(
                     convs,
                     is_discovered,
                     scan_succeeded,
+                    active_source_skipped,
                     scan_error,
                 })
             })
@@ -13380,11 +13389,6 @@ fn run_batch_index_with_connector_factories(
     let discovered_names: Vec<String> = pending_batches
         .iter()
         .filter(|pending| pending.is_discovered)
-        .map(|pending| pending.name.to_string())
-        .collect();
-    let scanned_connectors: BTreeSet<String> = pending_batches
-        .iter()
-        .filter(|pending| pending.is_discovered && pending.scan_succeeded)
         .map(|pending| pending.name.to_string())
         .collect();
     let scan_had_errors = pending_batches
@@ -13433,9 +13437,8 @@ fn run_batch_index_with_connector_factories(
     }
 
     let index_start = std::time::Instant::now();
-    let mut last_scan_ts_save = std::time::Instant::now();
     let mut ingest_outcome = NonWatchIngestOutcome::default();
-    let preserve_scan_watermark = scan_watermark_preservation_active() || scan_had_errors;
+    let mut scanned_connectors = BTreeSet::new();
     for pending in pending_batches {
         let batch_outcome = ingest_non_watch_batch_with_oom_split(
             storage,
@@ -13448,24 +13451,35 @@ fn run_batch_index_with_connector_factories(
             progress_bump,
         )?;
         ingest_outcome = ingest_outcome.accumulate(batch_outcome);
-        // Periodically persist scan_start_ts so that if the process is killed,
-        // the next run does a delta scan instead of a full rescan (infinite-OOM-loop fix).
-        if !preserve_scan_watermark && last_scan_ts_save.elapsed() >= Duration::from_secs(10) {
-            if let Err(e) = persist::with_ephemeral_writer(
+        // #426: this connector's complete scan has now been persisted. Advance
+        // only its watermark at this transaction boundary. The former timed
+        // global watermark ran while other pre-parsed connector batches were
+        // still pending, so termination could permanently skip those rows.
+        let connector_watermark_safe = pending.is_discovered
+            && pending.scan_succeeded
+            && !pending.active_source_skipped
+            && !scan_path_exclusions_active();
+        if connector_watermark_safe {
+            scanned_connectors.insert(pending.name.to_string());
+            if let Err(error) = persist::with_ephemeral_writer(
                 storage,
-                false,
-                "updating batch incremental last_scan_ts",
-                |writer| writer.set_last_scan_ts(scan_start_ts),
+                !opts.watch,
+                "updating completed batch connector scan watermark",
+                |writer| writer.set_connector_last_scan_ts(pending.name, scan_start_ts),
             ) {
-                tracing::warn!("batch incremental last_scan_ts save failed: {}", e);
+                tracing::warn!(
+                    connector = pending.name,
+                    error = %error,
+                    "completed batch connector watermark save failed; final metadata persistence or the next run will retry"
+                );
             }
-            last_scan_ts_save = std::time::Instant::now();
-        } else if preserve_scan_watermark && last_scan_ts_save.elapsed() >= Duration::from_secs(10)
-        {
+        } else if pending.is_discovered && pending.scan_succeeded {
             tracing::debug!(
-                "preserving batch incremental last_scan_ts because scan exclusions or active source skips are active"
+                connector = pending.name,
+                active_source_skipped = pending.active_source_skipped,
+                path_exclusions_active = scan_path_exclusions_active(),
+                "preserving this completed batch connector's watermark while allowing unrelated connectors to advance"
             );
-            last_scan_ts_save = std::time::Instant::now();
         }
         tracing::info!(
             connector = pending.name,
@@ -15414,7 +15428,11 @@ pub fn run_index(
         let preserve_scan_watermark = scan_watermark_preservation_active();
         let performed_scan_for_global_watermark =
             performed_scan && !preserve_scan_watermark && !scan_had_errors;
-        let performed_scan_for_connector_watermarks = performed_scan && !preserve_scan_watermark;
+        // `scanned_connectors` already excludes the exact connector that
+        // skipped an active source (and excludes every connector when path
+        // exclusions are configured). Persist the remaining safe connector
+        // watermarks even when one unrelated connector must stay behind.
+        let performed_scan_for_connector_watermarks = performed_scan;
         if performed_scan && preserve_scan_watermark {
             tracing::info!(
                 db_path = %opts.db_path.display(),
@@ -39809,6 +39827,7 @@ mod tests {
             scan_ms: 1,
             is_discovered,
             scan_succeeded: true,
+            active_source_skipped: false,
         })
         .expect("done message should send");
     }
@@ -41212,6 +41231,7 @@ mod tests {
             scan_ms: 42,
             is_discovered: true,
             scan_succeeded: true,
+            active_source_skipped: false,
         })
         .unwrap();
         drop(tx);
@@ -41267,6 +41287,7 @@ mod tests {
             scan_ms: 42,
             is_discovered: true,
             scan_succeeded: false,
+            active_source_skipped: false,
         })
         .map_err(|_| anyhow::anyhow!("done message should send"))?;
         drop(tx);
@@ -41327,6 +41348,7 @@ mod tests {
             scan_ms: 42,
             is_discovered: true,
             scan_succeeded: true,
+            active_source_skipped: false,
         })
         .map_err(|_| anyhow::anyhow!("done message should send"))?;
         drop(tx);
