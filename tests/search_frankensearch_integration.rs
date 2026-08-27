@@ -112,38 +112,46 @@ fn cass_selects_only_the_explicit_tantivy_compatibility_surface() {
         "CASS must not select the facade's swappable generic lexical feature: {dependency}"
     );
 
-    let pinned_revision = dependency
-        .split_once("rev = \"")
+    // gh#416: frankensearch resolves from crates.io behind an EXACT version
+    // pin (the registry holds stale same-version twins from an older tree, so
+    // a caret req could resolve wrong source; `=` fences that off). The old
+    // form of this contract pinned a git revision — that shape is now itself
+    // a defect, checked below via the absence of any git source.
+    let pinned_version = dependency
+        .split_once("version = \"=")
         .and_then(|(_, suffix)| suffix.split_once('"'))
-        .map(|(revision, _)| revision)
-        .expect("frankensearch dependency must pin an exact git revision");
+        .map(|(version, _)| version.to_owned())
+        .expect("frankensearch dependency must pin an exact registry version (= prefix)");
+    assert!(
+        !dependency.contains("git ="),
+        "frankensearch must not resolve from git; crates.io publishing forbids it: {dependency}"
+    );
     let lockfile = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"),
     )
     .expect("read Cargo.lock");
-    let expected_source = format!(
-        "source = \"git+https://github.com/Dicklesworthstone/frankensearch?rev={pinned_revision}#{pinned_revision}\""
+    let expected_lock = format!(
+        "name = \"frankensearch\"\nversion = \"{pinned_version}\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\""
     );
     assert!(
-        lockfile.contains(&expected_source),
-        "Cargo.lock must resolve the exact FrankenSearch revision from Cargo.toml: \
-         {pinned_revision}"
+        lockfile.contains(&expected_lock),
+        "Cargo.lock must resolve frankensearch {pinned_version} from the crates.io registry"
     );
     let build_contract =
         std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("build.rs"))
             .expect("read build.rs");
     assert!(
-        build_contract.contains(&format!("expected_rev: \"{pinned_revision}\"")),
-        "build.rs must enforce the same exact FrankenSearch revision as Cargo.toml"
+        build_contract.contains(&format!("expected_version: \"{pinned_version}\"")),
+        "build.rs must enforce the same exact FrankenSearch version as Cargo.toml"
     );
     let readme =
         std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
             .expect("read README.md");
     assert!(
-        readme.contains(&pinned_revision[..8])
+        readme.contains(&format!("={pinned_version}"))
             && readme.contains("cass-compat")
             && readme.contains("lexical-tantivy"),
-        "README dependency contract must name the pinned revision and explicit compatibility lane"
+        "README dependency contract must name the pinned registry version and explicit compatibility lane"
     );
     assert!(
         lockfile.contains("name = \"frankensearch-lexical\""),
