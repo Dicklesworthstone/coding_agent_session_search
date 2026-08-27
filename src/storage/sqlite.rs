@@ -27360,7 +27360,24 @@ mod tests {
             .join("fixtures")
             .join("search_demo_data")
             .join("agent_search.db");
-        let storage = FrankenStorage::open_readonly(&fixture_db).unwrap();
+        // Never open the checked-in fixture in place: FrankenSQLite maintains
+        // machine-local namespace identity records beside every opened DB.
+        // A dirty local tree can already contain those ignored sidecars while
+        // a clean remote checkout cannot, masking first-contact failures and
+        // making the test depend on source-tree writability.
+        let fixture_dir = TempDir::new().unwrap();
+        let staged_db = fixture_dir.path().join("agent_search.db");
+        std::fs::copy(&fixture_db, &staged_db).unwrap();
+        for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+            let mut sidecar = staged_db.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            assert!(
+                !PathBuf::from(sidecar).exists(),
+                "freshly staged fixture must begin without machine-local namespace sidecars"
+            );
+        }
+
+        let storage = FrankenStorage::open_readonly(&staged_db).unwrap();
 
         let footprints = storage
             .list_conversation_footprints_for_lexical_rebuild()
