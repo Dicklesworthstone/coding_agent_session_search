@@ -109,6 +109,62 @@ fn tui_headless_handles_empty_data_dir() {
 }
 
 #[test]
+fn tui_headless_global_db_uses_db_parent_for_derived_assets() {
+    let tmp = TempDir::new().unwrap();
+    let custom_db = tmp.path().join("custom/archive.db");
+    let default_data_dir = tmp.path().join(".local/share/coding-agent-search");
+
+    let mut cmd = base_cmd(tmp.path());
+    cmd.args(["--db", custom_db.to_str().unwrap(), "tui", "--once"]);
+    cmd.assert().success();
+
+    let custom_data_dir = custom_db.parent().unwrap();
+    assert!(
+        custom_db.is_file(),
+        "TUI should initialize the global --db path"
+    );
+    assert!(
+        custom_data_dir.join("index").is_dir(),
+        "derived TUI assets should live beside a custom --db"
+    );
+    assert!(
+        !default_data_dir.exists(),
+        "a custom --db must not initialize the default data directory"
+    );
+}
+
+#[test]
+fn tui_headless_explicit_data_dir_wins_for_derived_assets() {
+    let tmp = TempDir::new().unwrap();
+    let explicit_data_dir = tmp.path().join("explicit-data");
+    let custom_db = tmp.path().join("custom/archive.db");
+
+    let mut cmd = base_cmd(tmp.path());
+    cmd.args([
+        "--db",
+        custom_db.to_str().unwrap(),
+        "tui",
+        "--once",
+        "--data-dir",
+        explicit_data_dir.to_str().unwrap(),
+    ]);
+    cmd.assert().success();
+
+    assert!(
+        custom_db.is_file(),
+        "TUI should retain the global --db path"
+    );
+    assert!(
+        explicit_data_dir.join("index").is_dir(),
+        "explicit TUI --data-dir should receive derived assets"
+    );
+    assert!(
+        !custom_db.parent().unwrap().join("index").exists(),
+        "the custom database parent must not override explicit --data-dir"
+    );
+}
+
+#[test]
 fn tui_headless_no_panic_on_empty_dataset() {
     // Test: TUI doesn't panic when index exists but is empty
     let tmp = TempDir::new().unwrap();

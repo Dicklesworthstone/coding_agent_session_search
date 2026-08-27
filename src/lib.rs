@@ -6726,7 +6726,7 @@ async fn execute_cli(
 
     match &command {
         Commands::Tui { data_dir, .. } => {
-            let log_dir = data_dir.clone().unwrap_or_else(default_data_dir);
+            let log_dir = resolve_data_dir(data_dir, cli.db.as_ref());
             std::fs::create_dir_all(&log_dir).ok();
 
             let file_appender = tracing_appender::rolling::daily(&log_dir, "cass.log");
@@ -6765,8 +6765,13 @@ async fn execute_cli(
                 refresh,
             } = command.clone()
             {
+                let tui_data_dir = resolve_data_dir(&data_dir, cli.db.as_ref());
+                let tui_db_path = cli
+                    .db
+                    .clone()
+                    .unwrap_or_else(|| tui_data_dir.join("agent_search.db"));
                 if refresh {
-                    refresh_index_inline(cli.db.clone(), data_dir.clone());
+                    refresh_index_inline(cli.db.clone(), Some(tui_data_dir.clone()));
                 }
                 info!(once, inline, ui_height, %anchor, record_macro = ?record_macro, play_macro = ?play_macro, "launching ftui runtime");
 
@@ -6784,7 +6789,6 @@ async fn execute_cli(
                     None
                 };
 
-                let tui_data_dir = data_dir.clone().unwrap_or_else(default_data_dir);
                 if reset_state {
                     let state_path = tui_data_dir.join("tui_state.json");
                     match std::fs::remove_file(&state_path) {
@@ -6812,20 +6816,24 @@ async fn execute_cli(
                     once && !inline && !stdout_is_tty && dotenvy::var("TUI_HEADLESS").is_ok();
 
                 if non_tty_headless_once {
-                    prepare_headless_once_tui_artifacts(&tui_data_dir, asciicast.as_deref())
-                        .map_err(|e| CliError {
-                            code: 9,
-                            kind: CliErrorKind::TuiHeadlessOnce.kind_str(),
-                            message: format!(
-                                "headless --once TUI bootstrap failed for {}: {e}",
-                                tui_data_dir.display()
-                            ),
-                            hint: Some(
-                                "Ensure the data directory is writable and retry the command."
-                                    .to_string(),
-                            ),
-                            retryable: false,
-                        })?;
+                    prepare_headless_once_tui_artifacts(
+                        &tui_data_dir,
+                        &tui_db_path,
+                        asciicast.as_deref(),
+                    )
+                    .map_err(|e| CliError {
+                        code: 9,
+                        kind: CliErrorKind::TuiHeadlessOnce.kind_str(),
+                        message: format!(
+                            "headless --once TUI bootstrap failed for {}: {e}",
+                            tui_data_dir.display()
+                        ),
+                        hint: Some(
+                            "Ensure the data directory is writable and retry the command."
+                                .to_string(),
+                        ),
+                        retryable: false,
+                    })?;
                     info!(
                         data_dir = %tui_data_dir.display(),
                         asciicast = ?asciicast,
@@ -6839,7 +6847,12 @@ async fn execute_cli(
                     let run_result = if let Some(path) = asciicast {
                         tui_asciicast::run_tui_with_asciicast(&path, !once)
                     } else {
-                        ui::app::run_tui_ftui(inline_config, macro_config, Some(tui_data_dir))
+                        ui::app::run_tui_ftui(
+                            inline_config,
+                            macro_config,
+                            Some(tui_data_dir),
+                            Some(tui_db_path),
+                        )
                     };
 
                     if let Err(e) = run_result {
@@ -21615,6 +21628,7 @@ fn warn_tui_terminal_profile(stderr_is_tty: bool) {
 
 fn prepare_headless_once_tui_artifacts(
     data_dir: &Path,
+    db_path: &Path,
     asciicast_path: Option<&Path>,
 ) -> Result<()> {
     std::fs::create_dir_all(data_dir).map_err(|e| {
@@ -21624,7 +21638,16 @@ fn prepare_headless_once_tui_artifacts(
         )
     })?;
 
-    let db_path = data_dir.join("agent_search.db");
+    if let Some(parent) = db_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            anyhow::anyhow!(
+                "create headless --once database parent {}: {e}",
+                parent.display()
+            )
+        })?;
+    }
     {
         let _conn = crate::franken_sync::Connection::open(db_path.to_string_lossy().as_ref())
             .map_err(|e| {
