@@ -3251,6 +3251,7 @@ fn command_accepts_leading_structured_flag(command: &str) -> bool {
             | "fleet"
             | "guide"
             | "health"
+            | "selftest"
             | "import"
             | "index"
             | "introspect"
@@ -6152,6 +6153,7 @@ const CANONICAL_TOP_LEVEL_COMMANDS: &[&str] = &[
     "status",
     "state",
     "health",
+    "selftest",
     "diag",
     "storage",
     "dedup",
@@ -8114,6 +8116,10 @@ async fn execute_cli(
                         binary_only,
                         robot_meta,
                     )?;
+                }
+                Commands::Selftest { json } => {
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
+                    run_selftest(structured_format)?;
                 }
                 Commands::Onboarding { data_dir, json } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
@@ -22200,6 +22206,7 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Introspect { .. }) => "introspect".to_string(),
         Some(Commands::RobotDocs { topic }) => format!("robot-docs:{topic:?}"),
         Some(Commands::Health { .. }) => "health".to_string(),
+        Some(Commands::Selftest { .. }) => "selftest".to_string(),
         Some(Commands::Onboarding { .. }) => "onboarding".to_string(),
         Some(Commands::Guide { .. }) => "guide".to_string(),
         Some(Commands::Doctor { .. }) => "doctor".to_string(),
@@ -24050,7 +24057,9 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
             | ScheduleCommand::Status { json, .. }
             | ScheduleCommand::Run { json, .. },
         ) => resolve_subcommand_structured_format(cli, *json).is_some(),
-        Commands::Health { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
+        Commands::Health { json, .. } | Commands::Selftest { json } => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
         Commands::Onboarding { json, .. } => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
@@ -24442,7 +24451,7 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
         "  Use -v/--verbose with --json to enable INFO logs if needed",
         "",
         "Agent preflight: triage | ready | preflight",
-        "Core subcommands: search | pack | sessions | stats | view | index | health | swarm | capabilities | introspect | robot-docs <topic>",
+        "Core subcommands: search | pack | sessions | stats | view | index | health | selftest | swarm | capabilities | introspect | robot-docs <topic>",
         "Topics: commands | env | paths | schemas | guide | exit-codes | examples | contracts | wrap | sources",
         "Exit codes: 0 ok; 1 health; 2 usage; 3 missing index/db; 7 lock/busy",
         "More: cass capabilities --json | cass robot-docs examples | cass robot-docs exit-codes",
@@ -24532,6 +24541,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             // full advertised surface instead of the ~10-command slice.
             "  cass health [--json]             Minimal readiness probe (<50ms, exit 0=healthy, 1=unhealthy).".to_string(),
             "    --binary-only     Report the same readiness verdict but exit 0 unless the executable itself fails (binary promotion gates).".to_string(),
+            "  cass selftest [--json]           Archive-independent executable probe for package and binary-promotion gates.".to_string(),
             "  cass doctor [--json] [--fix]     Legacy spelling: --json realizes read-only check; --fix realizes safe-auto-run.".to_string(),
             "                    doctor JSON includes source_inventory; missing upstream provider files are".to_string(),
             "                    source coverage/prune-risk warnings, not proof that archived cass rows are lost.".to_string(),
@@ -77835,6 +77845,94 @@ fn run_support_bundle(
     Ok(())
 }
 
+/// Archive-independent executable probe for package and binary-promotion gates.
+///
+/// This deliberately does not resolve a data directory or database override.
+/// The probe exercises the linked frankensqlite engine against an in-memory
+/// database, including a write and typed read, so a stale, corrupt, locked, or
+/// multi-gigabyte archive cannot affect its cost or exit status (#398).
+fn run_selftest(output_format: Option<RobotFormat>) -> CliResult<()> {
+    let start = Instant::now();
+    let database_probe = (|| -> std::result::Result<i64, crate::franken_sync::FrankenError> {
+        let conn = crate::franken_sync::Connection::open(":memory:")?;
+        conn.execute_batch(
+            "CREATE TABLE cass_selftest_probe (value INTEGER NOT NULL); \
+             INSERT INTO cass_selftest_probe (value) VALUES (42);",
+        )?;
+        conn.query_row("SELECT value FROM cass_selftest_probe LIMIT 1;")?
+            .get_typed::<i64>(0)
+    })();
+
+    let (functional, check_status, detail, probe_error) = match database_probe {
+        Ok(42) => (
+            true,
+            "pass",
+            "opened an in-memory frankensqlite database and round-tripped a typed value"
+                .to_string(),
+            None,
+        ),
+        Ok(value) => {
+            let message = format!("in-memory database returned {value}, expected 42");
+            (false, "fail", message.clone(), Some(message))
+        }
+        Err(error) => {
+            let message = format!("in-memory frankensqlite probe failed: {error}");
+            (false, "fail", message.clone(), Some(message))
+        }
+    };
+    let latency_ms = start.elapsed().as_millis() as u64;
+
+    let structured_format = output_format.or_else(robot_format_from_env).map(|format| {
+        if matches!(format, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            format
+        }
+    });
+    if let Some(format) = structured_format {
+        output_structured_value(
+            serde_json::json!({
+                "schema_version": 1,
+                "status": if functional { "ok" } else { "error" },
+                "functional": functional,
+                "archive_accessed": false,
+                "version": env!("CARGO_PKG_VERSION"),
+                "contract_version": CONTRACT_VERSION,
+                "latency_ms": latency_ms,
+                "checks": [{
+                    "name": "frankensqlite-in-memory-roundtrip",
+                    "status": check_status,
+                    "detail": detail,
+                }],
+            }),
+            format,
+        )?;
+    } else if functional {
+        println!("✓ cass executable self-test passed ({latency_ms}ms)");
+        println!("  frankensqlite in-memory round-trip: pass");
+        println!("  configured archive accessed: no");
+    } else {
+        println!("✗ cass executable self-test failed ({latency_ms}ms)");
+        println!("  {detail}");
+        println!("  configured archive accessed: no");
+    }
+
+    if functional {
+        Ok(())
+    } else {
+        Err(CliError {
+            code: 1,
+            kind: CliErrorKind::Health.kind_str(),
+            message: probe_error.unwrap_or_else(|| "executable self-test failed".to_string()),
+            hint: Some(
+                "Reinstall the cass binary from a checksum-verified release artifact."
+                    .to_string(),
+            ),
+            retryable: false,
+        })
+    }
+}
+
 /// Minimal health check (<50ms). Exit 0=healthy, 1=unhealthy.
 /// Designed for agent pre-flight checks before complex operations.
 ///
@@ -92021,6 +92119,45 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 },
                 "db_path": { "type": "string" }
             }
+        }),
+    );
+
+    schemas.insert(
+        "selftest".to_string(),
+        json!({
+            "type": "object",
+            "description": "Archive-independent executable probe. This command never resolves, reads, or writes the configured cass archive.",
+            "properties": {
+                "schema_version": { "type": "integer", "const": 1 },
+                "status": { "type": "string", "enum": ["ok", "error"] },
+                "functional": { "type": "boolean" },
+                "archive_accessed": { "type": "boolean", "const": false },
+                "version": { "type": "string" },
+                "contract_version": { "type": "string" },
+                "latency_ms": { "type": "integer" },
+                "checks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "status": { "type": "string", "enum": ["pass", "fail"] },
+                            "detail": { "type": "string" }
+                        },
+                        "required": ["name", "status", "detail"]
+                    }
+                }
+            },
+            "required": [
+                "schema_version",
+                "status",
+                "functional",
+                "archive_accessed",
+                "version",
+                "contract_version",
+                "latency_ms",
+                "checks"
+            ]
         }),
     );
 
@@ -112095,6 +112232,7 @@ mod subcommand_robot_output_tests {
                 vec!["cass", "search", "needle", "--json"],
                 vec!["cass", "index", "--json"],
                 vec!["cass", "health", "--json"],
+                vec!["cass", "selftest", "--json"],
                 vec!["cass", "sessions", "--json"],
                 vec!["cass", "timeline", "--json"],
                 vec!["cass", "analytics", "status", "--json"],
@@ -112123,6 +112261,7 @@ mod subcommand_robot_output_tests {
                     Commands::Search { json, .. }
                     | Commands::Index { json, .. }
                     | Commands::Health { json, .. }
+                    | Commands::Selftest { json }
                     | Commands::Sessions { json, .. }
                     | Commands::Timeline { json, .. }
                     | Commands::Pages { json, .. }
