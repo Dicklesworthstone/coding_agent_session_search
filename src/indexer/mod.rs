@@ -22274,18 +22274,16 @@ fn ingest_batch_detailed(
     // (per-message ticks during redaction/map, per-chunk ticks during write)
     // and flag `persist_in_progress` for the watchdog's defense-in-depth
     // grace — one giant conversation legitimately persists for minutes.
-    let batch_result = {
-        let _persist_in_progress = PersistInProgressGuard::engage(progress.as_deref());
-        persist::persist_conversations_batched_with_raw_mirror_links(
-            storage,
-            t_index,
-            data_dir,
-            convs,
-            lexical_strategy,
-            defer_checkpoints,
-            persist::PersistHeartbeat::new(progress.as_deref(), progress_bump),
-        )
-    };
+    let persist_in_progress = PersistInProgressGuard::engage(progress.as_deref());
+    let batch_result = persist::persist_conversations_batched_with_raw_mirror_links(
+        storage,
+        t_index,
+        data_dir,
+        convs,
+        lexical_strategy,
+        defer_checkpoints,
+        persist::PersistHeartbeat::new(progress.as_deref(), progress_bump),
+    );
     let batch_outcome = match batch_result {
         Ok(batch_outcome) => batch_outcome,
         Err(error) => {
@@ -22304,6 +22302,11 @@ fn ingest_batch_detailed(
     // checkpoint debt that scale with it) at a safe between-transactions
     // boundary.
     persist::maybe_checkpoint_bulk_ingest_wal(storage, defer_checkpoints);
+    // #425: a threshold-sized TRUNCATE can spend minutes in synchronous
+    // engine work without an observable counter. Keep the watchdog's bounded
+    // persist/finalize grace through the checkpoint, then clear it before the
+    // normal progress publication below.
+    drop(persist_in_progress);
 
     // Update progress counter for all conversations at once
     if let Some(p) = progress {
@@ -27623,18 +27626,16 @@ pub mod persist {
         }
     }
 
-    /// GH#320: WAL-size threshold (bytes) above which bulk ingest issues a
-    /// passive checkpoint between batches. `0` disables the bound and
-    /// restores the fully-deferred pre-#320 behavior.
+    /// GH#320/#425: WAL-size threshold (bytes) above which bulk ingest resets
+    /// the WAL between batches. `0` disables the bound and restores the
+    /// fully-deferred pre-#320 behavior.
     ///
     /// Rationale: bulk-import mode defers checkpoints so the hot insert loop
-    /// never stalls on backfill I/O, but a corpus-sized WAL (1-2 GB+ on
-    /// large fleets) drags a proportional slice of pager state into memory
-    /// and makes the single post-publish TRUNCATE checkpoint — the #319/#321
-    /// wedge window — enormous. A passive checkpoint at a batch boundary
-    /// never blocks on readers or writers (it backfills what it safely can
-    /// and returns), so this bounds both costs while keeping checkpoint I/O
-    /// amortized to once per ~half-GB of WAL.
+    /// never stalls on backfill I/O, but a corpus-sized WAL (1-2 GB+ on large
+    /// fleets) drags a proportional slice of pager state into memory and makes
+    /// the single post-publish TRUNCATE checkpoint — the #319/#321 wedge
+    /// window — enormous. A between-batches single-connection TRUNCATE now
+    /// resets the WAL instead of repeatedly backfilling it without shrinking.
     pub(super) const BULK_INGEST_WAL_CHECKPOINT_DEFAULT_BYTES: u64 = 512 * 1024 * 1024;
 
     fn bulk_ingest_wal_checkpoint_threshold_bytes() -> u64 {
@@ -27644,12 +27645,66 @@ pub mod persist {
             .unwrap_or(BULK_INGEST_WAL_CHECKPOINT_DEFAULT_BYTES)
     }
 
-    /// Issue a best-effort `PRAGMA wal_checkpoint(PASSIVE)` on the primary
-    /// storage connection when the bulk-ingest WAL has outgrown the
-    /// configured threshold. Only active in deferred-checkpoint (non-watch)
-    /// mode; watch mode already runs with a small autocheckpoint. Failures
-    /// are logged and swallowed: a missed checkpoint only means the WAL
-    /// stays large until the next boundary or the finalize TRUNCATE.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum BulkIngestWalCheckpointMode {
+        Passive,
+        Full,
+        Restart,
+        Truncate,
+    }
+
+    impl BulkIngestWalCheckpointMode {
+        fn from_env() -> Self {
+            let Ok(raw) = dotenvy::var("CASS_INDEX_INGEST_WAL_CHECKPOINT_MODE") else {
+                return Self::Truncate;
+            };
+            match raw.trim().to_ascii_uppercase().as_str() {
+                "PASSIVE" => Self::Passive,
+                "FULL" => Self::Full,
+                "RESTART" => Self::Restart,
+                "TRUNCATE" => Self::Truncate,
+                invalid => {
+                    tracing::warn!(
+                        value = invalid,
+                        "invalid CASS_INDEX_INGEST_WAL_CHECKPOINT_MODE; using TRUNCATE"
+                    );
+                    Self::Truncate
+                }
+            }
+        }
+
+        const fn sql(self) -> &'static str {
+            match self {
+                Self::Passive => "PRAGMA wal_checkpoint(PASSIVE);",
+                Self::Full => "PRAGMA wal_checkpoint(FULL);",
+                Self::Restart => "PRAGMA wal_checkpoint(RESTART);",
+                Self::Truncate => "PRAGMA wal_checkpoint(TRUNCATE);",
+            }
+        }
+
+        const fn label(self) -> &'static str {
+            match self {
+                Self::Passive => "PASSIVE",
+                Self::Full => "FULL",
+                Self::Restart => "RESTART",
+                Self::Truncate => "TRUNCATE",
+            }
+        }
+    }
+
+    /// Reset an oversized bulk-ingest WAL from a true single-connection state.
+    ///
+    /// #425 showed that PASSIVE backfilled the complete WAL at every batch but
+    /// never reset its write position because the cached ephemeral writer kept
+    /// fsqlite's process-local connection count at two. Before checkpointing,
+    /// close that idle writer and execute one primary-connection read to bring
+    /// its MVCC commit clock past the writer's last commit. Then switch the
+    /// storage permanently to the primary writer and issue TRUNCATE (default).
+    /// Reopening a second writer after the reset would recreate both defects.
+    ///
+    /// Only active in deferred-checkpoint (non-watch) mode. Failures remain
+    /// nonfatal, but a non-shrinking externally pinned WAL is not retried until
+    /// it grows by another threshold, avoiding an O(WAL) backfill every batch.
     pub(super) fn maybe_checkpoint_bulk_ingest_wal(
         storage: &FrankenStorage,
         defer_checkpoints: bool,
@@ -27670,11 +27725,47 @@ pub mod persist {
             Ok(metadata) => metadata.len(),
             Err(_) => return,
         };
-        if wal_bytes < threshold {
+        let retry_at_bytes = storage.bulk_checkpoint_retry_at_bytes();
+        if wal_bytes < threshold || (retry_at_bytes > 0 && wal_bytes < retry_at_bytes) {
             return;
         }
+
+        let cached_writer_closed = storage.close_idle_cached_ephemeral_writer();
+        if storage.cached_ephemeral_writer_in_use() {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                wal_bytes,
+                "bulk ingest WAL reset reached a non-quiescent writer boundary; deferring instead of checkpointing with two live connections"
+            );
+            storage.set_bulk_checkpoint_retry_at_bytes(wal_bytes.saturating_add(threshold));
+            return;
+        }
+        // fsqlite #384 / cass #425: after the cached writer committed, the
+        // long-lived primary may still hold an older pager clock. Any real
+        // primary read refreshes it. TRUNCATE without this read can make every
+        // later write fail BusySnapshot even though the checkpoint succeeded.
+        if let Err(err) = storage
+            .raw()
+            .query("SELECT value FROM meta WHERE key = 'schema_version';")
+        {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                wal_bytes,
+                cached_writer_closed,
+                error = %err,
+                "bulk ingest WAL reset skipped because the primary MVCC clock could not be refreshed"
+            );
+            storage.set_bulk_checkpoint_retry_at_bytes(wal_bytes.saturating_add(threshold));
+            return;
+        }
+
+        // This transition is intentionally one-way for the lifetime of the
+        // storage handle. A new writer opened after the reset can inherit the
+        // pre-reset clock and raises the process-local connection count again.
+        storage.enable_bulk_single_connection();
+        let mode = BulkIngestWalCheckpointMode::from_env();
         let started = std::time::Instant::now();
-        match storage.raw().query("PRAGMA wal_checkpoint(PASSIVE);") {
+        match storage.raw().query(mode.sql()) {
             Ok(rows) => {
                 let status = rows.first().map(|row| {
                     (
@@ -27684,23 +27775,65 @@ pub mod persist {
                     )
                 });
                 let (busy, log_frames, checkpointed_frames) = status.unwrap_or((-1, -1, -1));
-                tracing::info!(
-                    db_path = %db_path.display(),
-                    wal_bytes,
-                    threshold_bytes = threshold,
-                    busy,
-                    log_frames,
-                    checkpointed_frames,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "bulk ingest passive WAL checkpoint (#320 memory/WAL bound)"
-                );
+                let wal_bytes_after = match std::fs::metadata(std::path::Path::new(&wal_path)) {
+                    Ok(metadata) => metadata.len(),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+                    Err(err) => {
+                        tracing::warn!(
+                            db_path = %db_path.display(),
+                            error = %err,
+                            "could not measure the bulk-ingest WAL after checkpoint; conservatively treating it as unshrunk"
+                        );
+                        wal_bytes
+                    }
+                };
+                let shrank = wal_bytes_after < wal_bytes;
+                storage.set_bulk_checkpoint_retry_at_bytes(if shrank {
+                    0
+                } else {
+                    wal_bytes.saturating_add(threshold)
+                });
+                if shrank {
+                    tracing::info!(
+                        db_path = %db_path.display(),
+                        wal_bytes_before = wal_bytes,
+                        wal_bytes_after,
+                        threshold_bytes = threshold,
+                        checkpoint_mode = mode.label(),
+                        cached_writer_closed,
+                        busy,
+                        log_frames,
+                        checkpointed_frames,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "bulk ingest WAL checkpoint reset the WAL (#320/#425 memory bound)"
+                    );
+                } else {
+                    tracing::warn!(
+                        db_path = %db_path.display(),
+                        wal_bytes_before = wal_bytes,
+                        wal_bytes_after,
+                        threshold_bytes = threshold,
+                        checkpoint_mode = mode.label(),
+                        cached_writer_closed,
+                        busy,
+                        log_frames,
+                        checkpointed_frames,
+                        retry_at_bytes = storage.bulk_checkpoint_retry_at_bytes(),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "bulk ingest WAL checkpoint did not shrink the WAL; an external reader may be pinning it"
+                    );
+                }
             }
             Err(err) => {
-                tracing::debug!(
+                storage.set_bulk_checkpoint_retry_at_bytes(wal_bytes.saturating_add(threshold));
+                tracing::warn!(
                     db_path = %db_path.display(),
                     wal_bytes,
+                    checkpoint_mode = mode.label(),
+                    cached_writer_closed,
+                    retry_at_bytes = storage.bulk_checkpoint_retry_at_bytes(),
                     error = %err,
-                    "bulk ingest passive WAL checkpoint failed; will retry at a later batch boundary"
+                    "bulk ingest WAL checkpoint failed; retry deferred until the WAL grows by another threshold"
                 );
             }
         }
@@ -27742,6 +27875,32 @@ pub mod persist {
         // with the short-lived writer so watch-mode observability and follow-up
         // policy transitions still reflect the active ingestion mode.
         apply_index_writer_checkpoint_policy(storage, defer_checkpoints);
+
+        if storage.bulk_single_connection_enabled() {
+            if !storage.ephemeral_writer_preflight_verified() {
+                storage
+                    .raw()
+                    .execute("UPDATE meta SET value = value WHERE key = 'schema_version'")
+                    .with_context(|| {
+                        format!(
+                            "primary writer preflight failed for {context} after the bulk WAL reset at {}",
+                            db_path.display()
+                        )
+                    })?;
+                storage.mark_ephemeral_writer_preflight_verified();
+            }
+            apply_index_writer_busy_timeout(storage);
+            apply_index_writer_checkpoint_policy(storage, defer_checkpoints);
+            if let Err(err) = storage.raw().execute("PRAGMA foreign_keys = OFF") {
+                tracing::debug!(
+                    error = %err,
+                    context,
+                    "failed to disable FK enforcement on primary single-connection writer"
+                );
+            }
+            return f(storage);
+        }
+
         let (writer, reusable) = storage.acquire_cached_ephemeral_writer().with_context(|| {
             format!(
                 "opening short-lived frankensqlite writer for {context}: {}",
@@ -29487,6 +29646,87 @@ pub mod persist {
                 .unwrap();
 
             assert_eq!(count, 1, "temp table should persist on the reused writer");
+        }
+
+        #[test]
+        #[serial]
+        fn gh425_bulk_checkpoint_resets_wal_and_stays_on_the_primary_writer() {
+            let _threshold = set_env("CASS_INDEX_INGEST_WAL_CHECKPOINT_BYTES", "1");
+            let _mode = set_env("CASS_INDEX_INGEST_WAL_CHECKPOINT_MODE", "TRUNCATE");
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("gh425-single-writer.db");
+            let storage = create_franken_db(&db_path);
+
+            // A TEMP table is connection-local and therefore an exact witness
+            // for whether post-reset writes use this primary connection.
+            storage
+                .raw()
+                .execute("CREATE TEMP TABLE gh425_primary_only(value INTEGER NOT NULL);")
+                .unwrap();
+            with_ephemeral_writer(&storage, true, "gh425 seed cached writer", |writer| {
+                writer
+                    .raw()
+                    .execute("CREATE TABLE gh425_payload(value INTEGER NOT NULL);")?;
+                writer
+                    .raw()
+                    .execute("INSERT INTO gh425_payload(value) VALUES (1);")?;
+                Ok(())
+            })
+            .unwrap();
+
+            let mut wal_path = db_path.clone().into_os_string();
+            wal_path.push("-wal");
+            let wal_path = PathBuf::from(wal_path);
+            let wal_bytes_before = std::fs::metadata(&wal_path)
+                .expect("seed write must create a WAL")
+                .len();
+            assert!(wal_bytes_before > 1);
+            assert!(!storage.bulk_single_connection_enabled());
+
+            maybe_checkpoint_bulk_ingest_wal(&storage, true);
+
+            let wal_bytes_after = std::fs::metadata(&wal_path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            assert!(
+                wal_bytes_after < wal_bytes_before,
+                "TRUNCATE must shrink the in-run WAL: before={wal_bytes_before}, after={wal_bytes_after}"
+            );
+            assert!(storage.bulk_single_connection_enabled());
+
+            with_ephemeral_writer(&storage, true, "gh425 post-reset primary write", |writer| {
+                // This INSERT can succeed only on the original primary: a
+                // newly opened or cached second connection cannot see its TEMP
+                // table. It also proves the MVCC clock refresh prevented the
+                // planted post-TRUNCATE BusySnapshot failure.
+                writer
+                    .raw()
+                    .execute("INSERT INTO gh425_primary_only(value) VALUES (2);")?;
+                Ok(())
+            })
+            .unwrap();
+            let primary_count: i64 = storage
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM gh425_primary_only;", &[], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap();
+            assert_eq!(primary_count, 1);
+        }
+
+        #[test]
+        fn gh425_checkpoint_never_steals_an_in_use_ephemeral_writer() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("gh425-in-use-writer.db");
+            let storage = create_franken_db(&db_path);
+
+            with_ephemeral_writer(&storage, false, "gh425 in-use witness", |_writer| {
+                assert!(storage.cached_ephemeral_writer_in_use());
+                assert!(!storage.close_idle_cached_ephemeral_writer());
+                assert!(storage.cached_ephemeral_writer_in_use());
+                Ok(())
+            })
+            .unwrap();
         }
 
         #[test]

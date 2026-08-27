@@ -5117,6 +5117,13 @@ impl FrankenStorage {
         true
     }
 
+    pub(crate) fn cached_ephemeral_writer_in_use(&self) -> bool {
+        matches!(
+            &*self.cached_ephemeral_writer.lock(),
+            CachedEphemeralWriter::InUse
+        )
+    }
+
     fn cached_agent_id(&self, key: &EnsuredAgentKey) -> Option<i64> {
         self.ensured_agents.lock().get(key).copied()
     }

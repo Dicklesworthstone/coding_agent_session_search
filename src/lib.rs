@@ -24591,6 +24591,8 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_TRACE_MAX_BYTES=<N>                 hard trace-file byte ceiling (default 16777216; clamped 4096..1073741824)".to_string(),
             "  CASS_TRACE_MAX_EVENTS=<N>                hard diagnostic-event ceiling (default 50000; clamped 16..10000000)".to_string(),
             "  CASS_INDEX_NO_PROGRESS_EVENTS=1          suppress NDJSON events from `cass index --json`".to_string(),
+            "  CASS_INDEX_INGEST_WAL_CHECKPOINT_BYTES=<N>  reset a deferred bulk-ingest WAL after N bytes (default 536870912; 0 disables)".to_string(),
+            "  CASS_INDEX_INGEST_WAL_CHECKPOINT_MODE=PASSIVE|FULL|RESTART|TRUNCATE  in-run bulk WAL checkpoint mode (default TRUNCATE)".to_string(),
             "  CASS_AUTO_REFRESH=0                      disable stale-on-read catch-up (detached `cass index --background` after a stale search/pack/TUI launch)".to_string(),
             "  CASS_AUTO_REFRESH_COOLDOWN_SECS=<N>      min seconds between auto-spawned catch-up runs (default 300)".to_string(),
             "  CASS_BACKGROUND_NICE=<N>                 nice value for `cass index --background` (default 15)".to_string(),
@@ -85567,6 +85569,16 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
             "CASS_INDEX_NO_PROGRESS_EVENTS",
             Some("0"),
             "Suppress NDJSON progress events from cass index --json when set to 1.",
+        ),
+        env_var_capability(
+            "CASS_INDEX_INGEST_WAL_CHECKPOINT_BYTES",
+            Some("536870912"),
+            "Reset a deferred bulk-ingest WAL after it reaches this many bytes; 0 disables the in-run bound.",
+        ),
+        env_var_capability(
+            "CASS_INDEX_INGEST_WAL_CHECKPOINT_MODE",
+            Some("TRUNCATE"),
+            "Checkpoint mode for the single-connection in-run bulk WAL reset: PASSIVE, FULL, RESTART, or TRUNCATE.",
         ),
         env_var_capability(
             "CASS_AUTO_REFRESH",
