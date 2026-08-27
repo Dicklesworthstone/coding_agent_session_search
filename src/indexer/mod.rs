@@ -4692,8 +4692,7 @@ fn flush_streamed_lexical_rebuild_batch(
     indexed_docs: &mut usize,
     messages_since_commit: &mut usize,
     message_bytes_since_commit: &mut usize,
-    current_batch_conversation_limit: &mut usize,
-    batch_conversation_limit: usize,
+    current_batch_conversation_limit: usize,
     page_size: i64,
     perf_profile: Option<&mut LexicalRebuildPerfProfile>,
 ) -> Result<()> {
@@ -4720,7 +4719,7 @@ fn flush_streamed_lexical_rebuild_batch(
         lexical_rebuild_flow_limiter,
         chunk_flow_reservation_bytes,
     );
-    let chunk_limit = *current_batch_conversation_limit;
+    let chunk_limit = current_batch_conversation_limit;
     let prepare_started = perf_profile.as_ref().map(|_| Instant::now());
     let prepared_docs =
         lexical_rebuild_prepare_prebuilt_doc_refs(pending_batch, lexical_rebuild_worker_pool);
@@ -4763,7 +4762,6 @@ fn flush_streamed_lexical_rebuild_batch(
     pending_batch.clear();
     *pending_batch_message_count = 0;
     *pending_batch_message_bytes = 0;
-    *current_batch_conversation_limit = batch_conversation_limit;
     Ok(())
 }
 
@@ -5998,8 +5996,7 @@ fn flush_streamed_lexical_rebuild_batch_for_planned_shard_boundary(
     indexed_docs: &mut usize,
     messages_since_commit: &mut usize,
     message_bytes_since_commit: &mut usize,
-    current_batch_conversation_limit: &mut usize,
-    batch_conversation_limit: usize,
+    current_batch_conversation_limit: usize,
     page_size: i64,
     perf_profile: Option<&mut LexicalRebuildPerfProfile>,
 ) -> Result<bool> {
@@ -6007,7 +6004,6 @@ fn flush_streamed_lexical_rebuild_batch_for_planned_shard_boundary(
         return Ok(false);
     }
 
-    let preserved_batch_conversation_limit = *current_batch_conversation_limit;
     tracing::info!(
         planned_shard_index,
         shard_conversations = pending_batch.len(),
@@ -6025,11 +6021,9 @@ fn flush_streamed_lexical_rebuild_batch_for_planned_shard_boundary(
         messages_since_commit,
         message_bytes_since_commit,
         current_batch_conversation_limit,
-        batch_conversation_limit,
         page_size,
         perf_profile,
     )?;
-    *current_batch_conversation_limit = preserved_batch_conversation_limit;
     Ok(true)
 }
 
@@ -12171,7 +12165,8 @@ fn spawn_connector_producer(
                 .cloned()
                 .map(ScanRoot::local)
                 .collect();
-            let mut ingest_diagnostics = capture_connector_sources_before_parse(
+            let (mut ingest_diagnostics, preparse_active_source_skipped) =
+                capture_connector_sources_before_parse(
                 conn.as_ref(),
                 &ctx,
                 &config.data_dir,
@@ -12180,6 +12175,7 @@ fn spawn_connector_producer(
                 local_since_ts,
                 config.active_source_filter.as_ref(),
             );
+            active_source_skipped |= preparse_active_source_skipped;
             match conn.scan_with_callback(&ctx, &mut |mut conversation| {
                 if should_skip_active_session_source(
                     config.active_source_filter.as_ref(),
@@ -12275,7 +12271,8 @@ fn spawn_connector_producer(
             ));
             let mut batch_sender =
                 StreamingBatchSender::new(&tx, config.flow_limiter.clone(), name, is_discovered);
-            let mut ingest_diagnostics = capture_connector_sources_before_parse(
+            let (mut ingest_diagnostics, preparse_active_source_skipped) =
+                capture_connector_sources_before_parse(
                 conn.as_ref(),
                 &ctx,
                 &config.data_dir,
@@ -12284,6 +12281,7 @@ fn spawn_connector_producer(
                 root_since_ts,
                 config.active_source_filter.as_ref(),
             );
+            active_source_skipped |= preparse_active_source_skipped;
             match conn.scan_with_callback(&ctx, &mut |mut conversation| {
                 if should_skip_active_session_source(
                     config.active_source_filter.as_ref(),
@@ -13216,7 +13214,8 @@ fn run_batch_index_with_connector_factories(
                         .cloned()
                         .map(ScanRoot::local)
                         .collect();
-                    let mut ingest_diagnostics = capture_connector_sources_before_parse(
+                    let (mut ingest_diagnostics, preparse_active_source_skipped) =
+                        capture_connector_sources_before_parse(
                         conn.as_ref(),
                         &ctx,
                         &data_dir,
@@ -13225,6 +13224,7 @@ fn run_batch_index_with_connector_factories(
                         local_since_ts,
                         active_source_filter.as_ref(),
                     );
+                    active_source_skipped |= preparse_active_source_skipped;
                     match conn.scan(&ctx) {
                         Ok(mut local_convs) => {
                             let local_origin = Origin::local();
@@ -13288,7 +13288,8 @@ fn run_batch_index_with_connector_factories(
                             vec![root.clone()],
                             root_since_ts,
                         ));
-                        let mut ingest_diagnostics = capture_connector_sources_before_parse(
+                        let (mut ingest_diagnostics, preparse_active_source_skipped) =
+                            capture_connector_sources_before_parse(
                             conn.as_ref(),
                             &ctx,
                             &data_dir,
@@ -13297,6 +13298,7 @@ fn run_batch_index_with_connector_factories(
                             root_since_ts,
                             active_source_filter.as_ref(),
                         );
+                        active_source_skipped |= preparse_active_source_skipped;
                         match conn.scan(&ctx) {
                             Ok(mut remote_convs) => {
                                 let conversations_before_active_filter = remote_convs.len();
@@ -13994,7 +13996,7 @@ pub fn run_index(
     if legacy_omp_upgrade.conversations_reclassified > 0 {
         tracing::info!(
             conversations = legacy_omp_upgrade.conversations_reclassified,
-            "reclassified legacy Pi-labeled OMP conversations and rebuilt analytics"
+            "reclassified legacy Pi-labeled OMP conversations and scheduled derived-asset rebuilds"
         );
     }
     complete_preflight_phase!();
@@ -14583,6 +14585,8 @@ pub fn run_index(
                 .saturating_add(imported_omp_upgrade.conversations_reclassified);
             legacy_omp_upgrade.lexical_rebuild_required |=
                 imported_omp_upgrade.lexical_rebuild_required;
+            legacy_omp_upgrade.analytics_rebuild_required |=
+                imported_omp_upgrade.analytics_rebuild_required;
             needs_rebuild |= imported_omp_upgrade.lexical_rebuild_required;
         }
         let rebuild_from_canonical_only =
@@ -15107,9 +15111,48 @@ pub fn run_index(
     };
 
     if legacy_omp_upgrade.lexical_rebuild_required {
+        if !exact_completed_lexical_checkpoint {
+            anyhow::bail!(
+                "legacy OMP identity upgrade cannot mark lexical publication complete without an exact completed lexical checkpoint"
+            );
+        }
         storage
-            .complete_legacy_omp_reclassification()
-            .with_context(|| "finalizing legacy OMP identity upgrade after lexical publish")?;
+            .mark_legacy_omp_lexical_publish_complete()
+            .with_context(|| "recording legacy OMP lexical publication")?;
+    }
+    if legacy_omp_upgrade.analytics_rebuild_required {
+        if crate::storage::sqlite::explicit_analytics_rebuild_deferred() {
+            tracing::warn!(
+                db_path = %opts.db_path.display(),
+                "legacy OMP analytics rebuild remains pending because CASS_DEFER_ANALYTICS_UPDATES is enabled; the completed lexical publication will not be repeated"
+            );
+        } else {
+            index_run_lock
+                .set_phase(initial_lock_mode, "analytics:legacy_omp")
+                .with_context(|| "publishing legacy OMP analytics phase in index-run status")?;
+            let report_analytics_heartbeat = || {
+                if let Some(progress) = opts.progress.as_ref() {
+                    progress.tick_activity();
+                }
+                bump_index_run_lock_progress_atomic(&progress_bump);
+            };
+            let report_analytics_progress = |processed: i64, total: i64| {
+                if let Some(progress) = opts.progress.as_ref() {
+                    let processed = usize::try_from(processed.max(0)).unwrap_or(usize::MAX);
+                    let total = usize::try_from(total.max(0)).unwrap_or(usize::MAX);
+                    progress.set_phase_progress(INDEX_PHASE_PREPARING, processed, total);
+                }
+                report_analytics_heartbeat();
+            };
+            storage
+                .rebuild_legacy_omp_analytics_with_progress(
+                    Some(&report_analytics_progress),
+                    Some(&report_analytics_heartbeat),
+                )
+                .with_context(|| {
+                    "rebuilding legacy OMP analytics after lexical publication with resumable progress"
+                })?;
+        }
     }
 
     if stale_index_ingest_quarantine_retry_attempted && scan_watermark_preservation_active() {
@@ -21667,8 +21710,7 @@ fn rebuild_tantivy_from_db_with_options(
                         &mut indexed_docs,
                         &mut messages_since_commit,
                         &mut message_bytes_since_commit,
-                        &mut current_batch_conversation_limit,
-                        batch_conversation_limit,
+                        current_batch_conversation_limit,
                         page_size,
                         perf_profile.as_mut(),
                     )?;
@@ -21711,8 +21753,7 @@ fn rebuild_tantivy_from_db_with_options(
                         &mut indexed_docs,
                         &mut messages_since_commit,
                         &mut message_bytes_since_commit,
-                        &mut current_batch_conversation_limit,
-                        batch_conversation_limit,
+                        current_batch_conversation_limit,
                         page_size,
                         perf_profile.as_mut(),
                     )?;
@@ -21919,8 +21960,7 @@ fn rebuild_tantivy_from_db_with_options(
                             &mut indexed_docs,
                             &mut messages_since_commit,
                             &mut message_bytes_since_commit,
-                            &mut current_batch_conversation_limit,
-                            batch_conversation_limit,
+                            current_batch_conversation_limit,
                             page_size,
                             perf_profile.as_mut(),
                         )? {
@@ -21998,8 +22038,7 @@ fn rebuild_tantivy_from_db_with_options(
                                 &mut indexed_docs,
                                 &mut messages_since_commit,
                                 &mut message_bytes_since_commit,
-                                &mut current_batch_conversation_limit,
-                                batch_conversation_limit,
+                                current_batch_conversation_limit,
                                 page_size,
                                 perf_profile.as_mut(),
                             )?;
@@ -22040,8 +22079,7 @@ fn rebuild_tantivy_from_db_with_options(
                                 &mut indexed_docs,
                                 &mut messages_since_commit,
                                 &mut message_bytes_since_commit,
-                                &mut current_batch_conversation_limit,
-                                batch_conversation_limit,
+                                current_batch_conversation_limit,
                                 page_size,
                                 perf_profile.as_mut(),
                             )?;
@@ -22089,8 +22127,7 @@ fn rebuild_tantivy_from_db_with_options(
         &mut indexed_docs,
         &mut messages_since_commit,
         &mut message_bytes_since_commit,
-        &mut current_batch_conversation_limit,
-        batch_conversation_limit,
+        current_batch_conversation_limit,
         page_size,
         perf_profile.as_mut(),
     )?;
@@ -25079,7 +25116,8 @@ fn reindex_paths_with_semantic_delta(
             since_ts,
         );
 
-        let mut ingest_diagnostics = capture_connector_sources_before_parse(
+        let (mut ingest_diagnostics, preparse_active_source_skipped) =
+            capture_connector_sources_before_parse(
             conn.as_ref(),
             &ctx,
             &opts.data_dir,
@@ -25123,7 +25161,9 @@ fn reindex_paths_with_semantic_delta(
                 "skipped active watch sources and preserved watermarks for retry"
             );
         }
-        let preserve_this_watch_watermark = preserve_watch_watermark || active_sources_skipped > 0;
+        let preserve_this_watch_watermark = preserve_watch_watermark
+            || preparse_active_source_skipped
+            || active_sources_skipped > 0;
 
         for conversation in &mut convs {
             ingest_diagnostics.observe_conversation(conversation);
@@ -26604,7 +26644,8 @@ fn capture_connector_sources_before_parse(
     fallback_roots: &[ScanRoot],
     since_ts: Option<i64>,
     active_source_filter: &ActiveSessionSourceFilter,
-) -> ConnectorIngestRun {
+) -> (ConnectorIngestRun, bool) {
+    let mut active_source_skipped = false;
     let (observed_sources, discovery_error) = match connector.discover_source_files(ctx) {
         Ok(sources) if !sources.is_empty() => {
             let primary_source_count = sources
@@ -26623,38 +26664,30 @@ fn capture_connector_sources_before_parse(
                     "deferring large primary source raw-mirror capture to per-conversation streaming path"
                 );
             }
-            for source in &sources {
+            let mut observed_sources = Vec::with_capacity(sources.len());
+            for source in sources {
                 if should_skip_active_session_source(
                     active_source_filter,
                     &source.origin.source_id,
                     &source.source_path,
                 ) {
+                    active_source_skipped = true;
                     continue;
                 }
                 if defer_primary_sources
                     && source.role == crate::connectors::DiscoveredSourceRole::PrimarySessionLog
                 {
+                    observed_sources.push(source);
                     continue;
                 }
-                capture_discovered_source_file_before_parse(data_dir, provider, source);
+                capture_discovered_source_file_before_parse(data_dir, provider, &source);
+                observed_sources.push(source);
             }
-            (
-                sources
-                    .into_iter()
-                    .filter(|source| {
-                        !should_skip_active_session_source(
-                            active_source_filter,
-                            &source.origin.source_id,
-                            &source.source_path,
-                        )
-                    })
-                    .collect(),
-                None,
-            )
+            (observed_sources, None)
         }
         Ok(_) => {
             for root in fallback_roots {
-                capture_scan_sources_before_parse(
+                active_source_skipped |= capture_scan_sources_before_parse(
                     data_dir,
                     provider,
                     root,
@@ -26671,7 +26704,7 @@ fn capture_connector_sources_before_parse(
                 "provider source discovery failed; falling back to legacy explicit-root preparse capture"
             );
             for root in fallback_roots {
-                capture_scan_sources_before_parse(
+                active_source_skipped |= capture_scan_sources_before_parse(
                     data_dir,
                     provider,
                     root,
@@ -26686,7 +26719,7 @@ fn capture_connector_sources_before_parse(
     if let Some(error) = discovery_error {
         run.observe_scan_error(&ctx.data_dir, &error);
     }
-    run
+    (run, active_source_skipped)
 }
 
 fn should_skip_raw_mirror_capture_for_logical_source(path: &Path) -> bool {
@@ -26828,15 +26861,17 @@ fn capture_scan_sources_before_parse(
     root: &ScanRoot,
     since_ts: Option<i64>,
     active_source_filter: &ActiveSessionSourceFilter,
-) {
+) -> bool {
+    let mut active_source_skipped = false;
     for capture_root in preparse_capture_roots(provider, root, since_ts) {
-        capture_scan_root_file_before_parse(
+        active_source_skipped |= capture_scan_root_file_before_parse(
             data_dir,
             provider,
             &capture_root,
             active_source_filter,
         );
     }
+    active_source_skipped
 }
 
 fn preparse_capture_roots(provider: &str, root: &ScanRoot, since_ts: Option<i64>) -> Vec<ScanRoot> {
@@ -26874,12 +26909,12 @@ fn capture_scan_root_file_before_parse(
     provider: &str,
     root: &ScanRoot,
     active_source_filter: &ActiveSessionSourceFilter,
-) {
+) -> bool {
     if !root.path.is_file() {
-        return;
+        return false;
     }
     if should_skip_active_session_source(active_source_filter, &root.origin.source_id, &root.path) {
-        return;
+        return true;
     }
     match crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
         data_dir,
@@ -26910,6 +26945,7 @@ fn capture_scan_root_file_before_parse(
             );
         }
     }
+    false
 }
 
 fn attach_raw_mirror_capture(data_dir: &Path, conv: &mut NormalizedConversation) {
@@ -27768,7 +27804,19 @@ pub mod persist {
             return;
         }
 
-        let cached_writer_closed = storage.close_idle_cached_ephemeral_writer();
+        let cached_writer_closed = match storage.close_idle_cached_ephemeral_writer() {
+            Ok(closed) => closed,
+            Err(err) => {
+                tracing::warn!(
+                    db_path = %db_path.display(),
+                    wal_bytes,
+                    error = %err,
+                    "bulk ingest WAL reset skipped because the cached writer could not be closed"
+                );
+                storage.set_bulk_checkpoint_retry_at_bytes(wal_bytes.saturating_add(threshold));
+                return;
+            }
+        };
         if storage.cached_ephemeral_writer_in_use() {
             tracing::warn!(
                 db_path = %db_path.display(),
@@ -29783,7 +29831,7 @@ pub mod persist {
 
             with_ephemeral_writer(&storage, false, "gh425 in-use witness", |_writer| {
                 assert!(storage.cached_ephemeral_writer_in_use());
-                assert!(!storage.close_idle_cached_ephemeral_writer());
+                assert!(!storage.close_idle_cached_ephemeral_writer().unwrap());
                 assert!(storage.cached_ephemeral_writer_in_use());
                 Ok(())
             })
@@ -32598,6 +32646,57 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn gh426_preparse_active_source_marks_connector_incomplete_without_a_conversation() {
+        let _active_skip_reset = ActiveSessionSkipReset;
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let provider_root = temp.path().join("provider-root");
+        std::fs::create_dir_all(&provider_root).expect("provider root");
+        let source_path = provider_root.join("still-open.jsonl");
+        std::fs::write(&source_path, b"partial source\n").expect("active source");
+        let active_paths = std::env::join_paths([source_path.as_os_str()]).expect("active path");
+        let _active_guard = set_env(
+            "CASS_TEST_ACTIVE_SESSION_SOURCE_PATHS",
+            active_paths.to_string_lossy().as_ref(),
+        );
+
+        let root = ScanRoot::local(provider_root);
+        let connector = FailingDiscoveryConnector {
+            sources: vec![discovered_test_source(
+                &root,
+                source_path,
+                crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+            )],
+        };
+        let ctx = crate::connectors::ScanContext::with_roots(
+            temp.path().to_path_buf(),
+            vec![root],
+            None,
+        );
+        let active_filter = ActiveSessionSourceFilter::default();
+
+        let (_ingest_run, active_source_skipped) = capture_connector_sources_before_parse(
+            &connector,
+            &ctx,
+            &data_dir,
+            "synthetic",
+            &[],
+            None,
+            &active_filter,
+        );
+
+        assert!(
+            active_source_skipped,
+            "preparse discovery must preserve this connector's watermark even when parsing yields no conversation"
+        );
+        assert!(
+            raw_mirror_manifest_values(&data_dir).is_empty(),
+            "an actively written source must not be captured as a stable raw artifact"
+        );
+    }
+
+    #[test]
     fn raw_mirror_capture_rejects_relative_discovered_source_paths() {
         let temp = TempDir::new().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
@@ -35408,7 +35507,8 @@ mod tests {
     }
 
     #[test]
-    fn flush_streamed_lexical_rebuild_batch_releases_flow_reservation_bytes() {
+    fn gh382_flush_streamed_lexical_rebuild_batch_preserves_controller_limit_and_releases_flow_reservation_bytes(
+    ) {
         let tmp = TempDir::new().unwrap();
         let index_path = tmp.path().join("tantivy");
         let mut t_index = TantivyIndex::open_or_create(&index_path).unwrap();
@@ -35480,7 +35580,7 @@ mod tests {
         let mut indexed_docs = 0usize;
         let mut messages_since_commit = 0usize;
         let mut message_bytes_since_commit = 0usize;
-        let mut current_batch_conversation_limit = 8usize;
+        let current_batch_conversation_limit = 3usize;
 
         flush_streamed_lexical_rebuild_batch(
             &mut pending_batch,
@@ -35492,8 +35592,7 @@ mod tests {
             &mut indexed_docs,
             &mut messages_since_commit,
             &mut message_bytes_since_commit,
-            &mut current_batch_conversation_limit,
-            8,
+            current_batch_conversation_limit,
             8,
             None,
         )
@@ -35504,6 +35603,10 @@ mod tests {
         assert_eq!(indexed_docs, 2);
         assert_eq!(messages_since_commit, total_messages);
         assert_eq!(message_bytes_since_commit, total_message_bytes);
+        assert_eq!(
+            current_batch_conversation_limit, 3,
+            "a batch flush must preserve the responsiveness controller's live limit"
+        );
     }
 
     #[test]
@@ -35579,7 +35682,7 @@ mod tests {
         let mut indexed_docs = 0usize;
         let mut messages_since_commit = 0usize;
         let mut message_bytes_since_commit = 0usize;
-        let mut current_batch_conversation_limit = 3usize;
+        let current_batch_conversation_limit = 3usize;
 
         let flushed = flush_streamed_lexical_rebuild_batch_for_planned_shard_boundary(
             Some(4),
@@ -35593,8 +35696,7 @@ mod tests {
             &mut indexed_docs,
             &mut messages_since_commit,
             &mut message_bytes_since_commit,
-            &mut current_batch_conversation_limit,
-            8,
+            current_batch_conversation_limit,
             8,
             None,
         )
@@ -39872,6 +39974,88 @@ mod tests {
         Box::new(DeferredBatchConnector)
     }
 
+    static BATCH_WATERMARK_FIXTURE_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+    struct BatchWatermarkFixtureRootReset;
+
+    impl Drop for BatchWatermarkFixtureRootReset {
+        fn drop(&mut self) {
+            *BATCH_WATERMARK_FIXTURE_ROOT
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = None;
+        }
+    }
+
+    fn batch_watermark_fixture_conversation(
+        agent_slug: &str,
+        file_name: &str,
+    ) -> NormalizedConversation {
+        let root = BATCH_WATERMARK_FIXTURE_ROOT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .expect("batch watermark fixture root should be configured");
+        let mut conversation = norm_conv(
+            Some(file_name),
+            vec![norm_msg(0, 1_700_000_000_000)],
+        );
+        conversation.agent_slug = agent_slug.to_string();
+        conversation.source_path = root.join(file_name);
+        conversation
+    }
+
+    struct ActiveBatchWatermarkConnector;
+
+    impl Connector for ActiveBatchWatermarkConnector {
+        fn detect(&self) -> DetectionResult {
+            DetectionResult {
+                detected: true,
+                evidence: vec!["active-batch-watermark-fixture".to_string()],
+                root_paths: Vec::new(),
+            }
+        }
+
+        fn scan(
+            &self,
+            _ctx: &crate::connectors::ScanContext,
+        ) -> anyhow::Result<Vec<NormalizedConversation>> {
+            Ok(vec![batch_watermark_fixture_conversation(
+                "claude",
+                "active.jsonl",
+            )])
+        }
+    }
+
+    fn active_batch_watermark_connector_factory() -> Box<dyn Connector + Send> {
+        Box::new(ActiveBatchWatermarkConnector)
+    }
+
+    struct SafeBatchWatermarkConnector;
+
+    impl Connector for SafeBatchWatermarkConnector {
+        fn detect(&self) -> DetectionResult {
+            DetectionResult {
+                detected: true,
+                evidence: vec!["safe-batch-watermark-fixture".to_string()],
+                root_paths: Vec::new(),
+            }
+        }
+
+        fn scan(
+            &self,
+            _ctx: &crate::connectors::ScanContext,
+        ) -> anyhow::Result<Vec<NormalizedConversation>> {
+            Ok(vec![batch_watermark_fixture_conversation(
+                "codex",
+                "safe.jsonl",
+            )])
+        }
+    }
+
+    fn safe_batch_watermark_connector_factory() -> Box<dyn Connector + Send> {
+        Box::new(SafeBatchWatermarkConnector)
+    }
+
     struct WatermarkSensitiveRemoteConnector;
 
     impl WatermarkSensitiveRemoteConnector {
@@ -41261,6 +41445,63 @@ mod tests {
             BTreeSet::from(["claude".to_string()])
         );
         assert!(!mutations.scan_had_errors);
+    }
+
+    #[test]
+    fn gh426_active_source_skip_only_withholds_its_own_connector_watermark() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path)?;
+        ensure_fts_schema(&storage);
+        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir)?)?;
+        let (tx, rx) = bounded(4);
+        let scan_start_ts = 1_700_000_123_456_i64;
+
+        tx.send(IndexMessage::Done {
+            connector_name: "claude",
+            scan_ms: 1,
+            is_discovered: true,
+            scan_succeeded: true,
+            active_source_skipped: true,
+        })
+        .map_err(|_| anyhow::anyhow!("active-source Done message should send"))?;
+        tx.send(IndexMessage::Done {
+            connector_name: "codex",
+            scan_ms: 1,
+            is_discovered: true,
+            scan_succeeded: true,
+            active_source_skipped: false,
+        })
+        .map_err(|_| anyhow::anyhow!("safe Done message should send"))?;
+        drop(tx);
+
+        let (_discovered, outcome) = run_streaming_consumer(
+            rx,
+            2,
+            &storage,
+            &data_dir,
+            Some(&mut index),
+            Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
+            &None,
+            LexicalPopulationStrategy::IncrementalInline,
+            Some(scan_start_ts),
+            None,
+        )?;
+
+        assert_eq!(
+            outcome.scanned_connectors,
+            BTreeSet::from(["codex".to_string()]),
+            "one active source must not freeze unrelated connector watermarks"
+        );
+        assert_eq!(storage.get_connector_last_scan_ts("claude")?, None);
+        assert_eq!(
+            storage.get_connector_last_scan_ts("codex")?,
+            Some(scan_start_ts)
+        );
+        Ok(())
     }
 
     #[test]
@@ -43717,6 +43958,77 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
         result
+    }
+
+    #[test]
+    #[serial]
+    fn gh426_batch_watermarks_only_fully_persisted_connectors_without_active_sources() -> Result<()>
+    {
+        let _active_skip_reset = ActiveSessionSkipReset;
+        let _fixture_reset = BatchWatermarkFixtureRootReset;
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        let fixture_root = tmp.path().join("sessions");
+        std::fs::create_dir_all(&data_dir)?;
+        std::fs::create_dir_all(&fixture_root)?;
+        let active_path = fixture_root.join("active.jsonl");
+        let safe_path = fixture_root.join("safe.jsonl");
+        std::fs::write(&active_path, b"active\n")?;
+        std::fs::write(&safe_path, b"safe\n")?;
+        *BATCH_WATERMARK_FIXTURE_ROOT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(fixture_root);
+
+        let active_paths = std::env::join_paths([active_path.as_os_str()])?;
+        let _active_guard = set_env(
+            "CASS_TEST_ACTIVE_SESSION_SOURCE_PATHS",
+            active_paths.to_string_lossy().as_ref(),
+        );
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path)?;
+        ensure_fts_schema(&storage);
+        let opts = IndexOptions {
+            full: false,
+            force_rebuild: false,
+            watch: false,
+            watch_once_paths: None,
+            db_path,
+            data_dir,
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_interval_secs: 30,
+        };
+        let scan_start_ts = 1_700_000_654_321_i64;
+
+        let outcome = run_batch_index_with_connector_factories(
+            &storage,
+            None,
+            &opts,
+            None,
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            Vec::new(),
+            vec![
+                ("claude", active_batch_watermark_connector_factory),
+                ("codex", safe_batch_watermark_connector_factory),
+            ],
+            scan_start_ts,
+            None,
+        )?;
+
+        assert_eq!(
+            outcome.scanned_connectors,
+            BTreeSet::from(["codex".to_string()]),
+            "the active Claude source must not freeze the completed Codex connector"
+        );
+        assert_eq!(storage.get_connector_last_scan_ts("claude")?, None);
+        assert_eq!(
+            storage.get_connector_last_scan_ts("codex")?,
+            Some(scan_start_ts),
+            "batch mode must persist each safe connector watermark only after its rows commit"
+        );
+        Ok(())
     }
 
     #[test]

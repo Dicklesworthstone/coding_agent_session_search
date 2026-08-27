@@ -3690,6 +3690,16 @@ pub const CURRENT_SCHEMA_VERSION: i64 = 20;
 pub(crate) const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
 const LEGACY_OMP_RECLASSIFICATION_META_KEY: &str = "legacy_omp_reclassification_v2";
 const PREVIOUS_LEGACY_OMP_RECLASSIFICATION_META_KEY: &str = "legacy_omp_reclassification_v1";
+const LEGACY_OMP_LEXICAL_PUBLISHED_META_KEY: &str =
+    "legacy_omp_reclassification_lexical_published_v1";
+const LEGACY_OMP_ANALYTICS_REBUILT_META_KEY: &str =
+    "legacy_omp_reclassification_analytics_rebuilt_v1";
+const LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY: &str =
+    "legacy_omp_reclassification_analytics_cursor_context_v1";
+const LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY: &str =
+    "legacy_omp_reclassification_analytics_cursor_last_id_v1";
+const LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY: &str =
+    "legacy_omp_reclassification_analytics_cursor_processed_v1";
 const SEMANTIC_FAST_IDENTITY_REBUILD_META_KEY: &str = "semantic_fast_identity_rebuild_v1";
 const SEMANTIC_QUALITY_IDENTITY_REBUILD_META_KEY: &str = "semantic_quality_identity_rebuild_v1";
 
@@ -3712,6 +3722,7 @@ impl SemanticIdentityTier {
 pub struct LegacyOmpReclassificationResult {
     pub conversations_reclassified: usize,
     pub lexical_rebuild_required: bool,
+    pub analytics_rebuild_required: bool,
 }
 
 /// Result of checking schema compatibility.
@@ -5099,7 +5110,11 @@ impl FrankenStorage {
     /// writer was actually closed. An in-use writer is never stolen; callers
     /// invoke this only at a between-batches boundary where `InUse` would be a
     /// programming error rather than a state to race.
-    pub(crate) fn close_idle_cached_ephemeral_writer(&self) -> bool {
+    ///
+    /// A close error restores the still-live connection to the cache. Callers
+    /// must not enter a single-connection-only checkpoint path unless this
+    /// method confirms that the close completed.
+    pub(crate) fn close_idle_cached_ephemeral_writer(&self) -> Result<bool> {
         let cached_writer = {
             let mut cached = self.cached_ephemeral_writer.lock();
             match std::mem::replace(&mut *cached, CachedEphemeralWriter::Uninitialized) {
@@ -5111,10 +5126,24 @@ impl FrankenStorage {
             }
         };
         let Some(mut cached_writer) = cached_writer else {
-            return false;
+            return Ok(false);
         };
-        cached_writer.conn.close_best_effort_in_place();
-        true
+        if let Err(error) =
+            close_franken_in_place_with_busy_retry(&mut cached_writer.conn, false)
+        {
+            let mut cached = self.cached_ephemeral_writer.lock();
+            debug_assert!(
+                matches!(&*cached, CachedEphemeralWriter::Uninitialized),
+                "cached writer state changed while an idle writer was closing"
+            );
+            if matches!(&*cached, CachedEphemeralWriter::Uninitialized) {
+                *cached = CachedEphemeralWriter::Cached(cached_writer);
+            }
+            return Err(error).with_context(|| {
+                "closing idle cached frankensqlite writer before bulk WAL checkpoint"
+            });
+        }
+        Ok(true)
     }
 
     pub(crate) fn cached_ephemeral_writer_in_use(&self) -> bool {
@@ -8607,6 +8636,7 @@ impl FrankenStorage {
         } else {
             None
         };
+        let pending_state_matches_context = state.as_deref() == Some(pending_state.as_str());
         let assets_were_pending = state.as_deref().is_some_and(|value| {
             value == "analytics_pending" || value.starts_with("analytics_pending:")
         }) || previous_state.as_deref() == Some("analytics_pending");
@@ -8799,6 +8829,16 @@ impl FrankenStorage {
                 "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
                 fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY, pending_state.as_str()],
             )?;
+            tx.execute_compat(
+                "DELETE FROM meta WHERE key IN (?1, ?2, ?3, ?4, ?5)",
+                fparams![
+                    LEGACY_OMP_LEXICAL_PUBLISHED_META_KEY,
+                    LEGACY_OMP_ANALYTICS_REBUILT_META_KEY,
+                    LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY,
+                    LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY,
+                    LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY
+                ],
+            )?;
             // Semantic doc ids embed both the numeric agent id and a hash of
             // source_id. Reclassification changes those filter identities in
             // place without changing message rowids, so neither the semantic
@@ -8903,6 +8943,18 @@ impl FrankenStorage {
                 "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
                 fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY, pending_state.as_str()],
             )?;
+            if !pending_state_matches_context {
+                tx.execute_compat(
+                    "DELETE FROM meta WHERE key IN (?1, ?2, ?3, ?4, ?5)",
+                    fparams![
+                        LEGACY_OMP_LEXICAL_PUBLISHED_META_KEY,
+                        LEGACY_OMP_ANALYTICS_REBUILT_META_KEY,
+                        LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY,
+                        LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY,
+                        LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY
+                    ],
+                )?;
+            }
             for semantic_tier in [SemanticIdentityTier::Fast, SemanticIdentityTier::Quality] {
                 tx.execute_compat(
                     "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
@@ -8913,12 +8965,27 @@ impl FrankenStorage {
             tx.commit()?;
         }
 
-        self.rebuild_analytics()
-            .with_context(|| "rebuilding analytics after legacy OMP identity upgrade")?;
-        self.rebuild_token_daily_stats()
-            .with_context(|| "rebuilding token rollups after legacy OMP identity upgrade")?;
-        self.rebuild_daily_stats()
-            .with_context(|| "rebuilding daily stats after legacy OMP identity upgrade")?;
+        // #424: the identity transaction is preflight-critical; rebuilding a
+        // multi-million-row derived analytics surface is not. Persist the two
+        // derived phases independently so the indexer can publish lexical
+        // state first, drive analytics progress through its watchdog, and
+        // resume without repeating a phase that already completed.
+        let lexical_published = self.legacy_omp_phase_matches_context(
+            LEGACY_OMP_LEXICAL_PUBLISHED_META_KEY,
+            &ownership_context,
+        )?;
+        let analytics_rebuilt = self.legacy_omp_phase_matches_context(
+            LEGACY_OMP_ANALYTICS_REBUILT_META_KEY,
+            &ownership_context,
+        )?;
+        if lexical_published && analytics_rebuilt {
+            // Recover an older/non-atomic state where both durable phase
+            // markers landed but the aggregate `complete:` marker did not.
+            // Re-recording analytics performs the idempotent atomic promotion
+            // and retires any stale message-metrics cursor.
+            self.record_legacy_omp_phase_complete(LEGACY_OMP_ANALYTICS_REBUILT_META_KEY)?;
+            return Ok(LegacyOmpReclassificationResult::default());
+        }
 
         Ok(LegacyOmpReclassificationResult {
             conversations_reclassified: legacy_count,
@@ -8926,13 +8993,29 @@ impl FrankenStorage {
             // rebuilding derived assets. If a prior run stopped in that
             // window, `legacy_count` is already zero on retry, but the live
             // lexical generation still carries the old `pi_agent` identity.
-            lexical_rebuild_required: legacy_count > 0 || assets_were_pending,
+            lexical_rebuild_required: legacy_count > 0 || !lexical_published,
+            analytics_rebuild_required: legacy_count > 0 || !analytics_rebuilt,
         })
     }
 
-    /// Mark the OMP identity upgrade complete after the indexer has published
-    /// a lexical generation rebuilt from the canonical SQLite archive.
-    pub fn complete_legacy_omp_reclassification(&self) -> Result<()> {
+    fn legacy_omp_phase_matches_context(&self, key: &str, context: &str) -> Result<bool> {
+        let recorded: Option<String> = self
+            .conn
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams![key],
+                |row| row.get_typed(0),
+            )
+            .optional()?;
+        Ok(recorded.as_deref() == Some(context))
+    }
+
+    fn record_legacy_omp_phase_complete(&self, phase_key: &str) -> Result<()> {
+        if phase_key != LEGACY_OMP_LEXICAL_PUBLISHED_META_KEY
+            && phase_key != LEGACY_OMP_ANALYTICS_REBUILT_META_KEY
+        {
+            bail!("unknown legacy OMP derived phase key {phase_key:?}");
+        }
         let state: Option<String> = self
             .conn
             .query_row_map(
@@ -8942,7 +9025,7 @@ impl FrankenStorage {
             )
             .optional()?;
         let Some(state) = state else {
-            bail!("cannot complete legacy OMP reclassification without a pending marker");
+            bail!("cannot complete a legacy OMP derived phase without a pending marker");
         };
         if state.starts_with("complete:") {
             return Ok(());
@@ -8952,14 +9035,111 @@ impl FrankenStorage {
                 "cannot complete legacy OMP reclassification from unexpected marker state {state:?}"
             );
         };
-        let complete_state = format!("complete:{context}");
-        self.conn.execute_compat(
+        let lexical_published = phase_key == LEGACY_OMP_LEXICAL_PUBLISHED_META_KEY
+            || self.legacy_omp_phase_matches_context(
+                LEGACY_OMP_LEXICAL_PUBLISHED_META_KEY,
+                context,
+            )?;
+        let analytics_rebuilt = phase_key == LEGACY_OMP_ANALYTICS_REBUILT_META_KEY
+            || self.legacy_omp_phase_matches_context(
+                LEGACY_OMP_ANALYTICS_REBUILT_META_KEY,
+                context,
+            )?;
+
+        // The phase marker, overall completion marker, and analytics cursor
+        // retirement are one durable state transition. A failure cannot leave
+        // `complete:<context>` paired with a stale resume cursor, nor can it
+        // advertise a phase whose own cleanup did not commit.
+        let mut tx = self.conn.transaction()?;
+        tx.execute_compat(
             "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
-            fparams![
-                LEGACY_OMP_RECLASSIFICATION_META_KEY,
-                complete_state.as_str()
-            ],
+            fparams![phase_key, context],
         )?;
+        if phase_key == LEGACY_OMP_ANALYTICS_REBUILT_META_KEY {
+            tx.execute_compat(
+                "DELETE FROM meta WHERE key IN (?1, ?2, ?3)",
+                fparams![
+                    LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY,
+                    LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY,
+                    LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY
+                ],
+            )?;
+        }
+        if lexical_published && analytics_rebuilt {
+            let complete_state = format!("complete:{context}");
+            tx.execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams![
+                    LEGACY_OMP_RECLASSIFICATION_META_KEY,
+                    complete_state.as_str()
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Record that the canonical SQLite-to-lexical publication for the legacy
+    /// OMP identity rewrite completed. Analytics may still be pending.
+    pub fn mark_legacy_omp_lexical_publish_complete(&self) -> Result<()> {
+        self.record_legacy_omp_phase_complete(LEGACY_OMP_LEXICAL_PUBLISHED_META_KEY)
+    }
+
+    fn legacy_omp_pending_context(&self) -> Result<Option<String>> {
+        let state: Option<String> = self
+            .conn
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
+                |row| row.get_typed(0),
+            )
+            .optional()?;
+        let Some(state) = state else {
+            bail!("cannot rebuild legacy OMP analytics without a migration marker");
+        };
+        if state.starts_with("complete:") {
+            return Ok(None);
+        }
+        let Some(context) = state.strip_prefix("analytics_pending:") else {
+            bail!("cannot rebuild legacy OMP analytics from unexpected marker state {state:?}");
+        };
+        Ok(Some(context.to_string()))
+    }
+
+    /// Rebuild every analytics derivative invalidated by the legacy OMP
+    /// identity rewrite, reporting message-keyset progress to the owning
+    /// indexer watchdog. The durable completion marker is written only after
+    /// all three derived tables finish successfully.
+    pub(crate) fn rebuild_legacy_omp_analytics_with_progress(
+        &self,
+        progress: Option<&dyn Fn(i64, i64)>,
+        heartbeat: Option<&dyn Fn()>,
+    ) -> Result<()> {
+        let Some(context) = self.legacy_omp_pending_context()? else {
+            return Ok(());
+        };
+        if let Some(heartbeat) = heartbeat {
+            heartbeat();
+        }
+        self.rebuild_analytics_since_with_chunk_size_and_progress(
+            None,
+            ANALYTICS_REBUILD_CHUNK_SIZE,
+            progress,
+            heartbeat,
+            Some(context.as_str()),
+        )
+        .with_context(|| "rebuilding analytics after legacy OMP identity upgrade")?;
+        if let Some(heartbeat) = heartbeat {
+            heartbeat();
+        }
+        self.rebuild_token_daily_stats_with_progress(heartbeat)
+            .with_context(|| "rebuilding token rollups after legacy OMP identity upgrade")?;
+        if let Some(heartbeat) = heartbeat {
+            heartbeat();
+        }
+        self.rebuild_daily_stats_with_progress(heartbeat)
+            .with_context(|| "rebuilding daily stats after legacy OMP identity upgrade")?;
+        self.record_legacy_omp_phase_complete(LEGACY_OMP_ANALYTICS_REBUILT_META_KEY)?;
         Ok(())
     }
 
@@ -14904,6 +15084,10 @@ fn defer_analytics_updates_enabled() -> bool {
     )
 }
 
+pub(crate) fn explicit_analytics_rebuild_deferred() -> bool {
+    env_flag_enabled("CASS_DEFER_ANALYTICS_UPDATES")
+}
+
 fn resolve_defer_analytics_updates(
     explicit_defer: bool,
     explicit_inline: bool,
@@ -17267,15 +17451,28 @@ impl FrankenStorage {
     /// live `token_daily_stats` table is replaced only by the final atomic
     /// swap, so readers never observe a half-rebuilt rollup.
     pub fn rebuild_token_daily_stats(&self) -> Result<usize> {
+        self.rebuild_token_daily_stats_with_progress(None)
+    }
+
+    fn rebuild_token_daily_stats_with_progress(
+        &self,
+        heartbeat: Option<&dyn Fn()>,
+    ) -> Result<usize> {
         const CONVERSATION_BATCH_SIZE: usize = 1_000;
         const TOKEN_USAGE_BATCH_SIZE: usize = 10_000;
 
+        if let Some(heartbeat) = heartbeat {
+            heartbeat();
+        }
         let ledger = token_daily_stats_ledger_fingerprint(&self.conn)?;
         tracing::info!(
             target: "cass::analytics",
             total_usage_rows = ledger.row_count,
             "token_daily_stats_rebuild_start"
         );
+        if let Some(heartbeat) = heartbeat {
+            heartbeat();
+        }
 
         // A cursor is only meaningful together with the stage table it
         // describes; a cursor whose stage is gone (manual cleanup, partial
@@ -17432,6 +17629,9 @@ impl FrankenStorage {
                             estimated_cost_usd.unwrap_or(0.0),
                         );
                     }
+                    if let Some(heartbeat) = heartbeat {
+                        heartbeat();
+                    }
                 }
 
                 aggregate.record_session(
@@ -17464,6 +17664,9 @@ impl FrankenStorage {
                 rows_created,
                 "token_daily_stats_rebuild_checkpoint"
             );
+            if let Some(heartbeat) = heartbeat {
+                heartbeat();
+            }
         }
 
         // Per-batch commits mean the scan is not one snapshot: a concurrent
@@ -17513,6 +17716,9 @@ impl FrankenStorage {
             fparams![TOKEN_DAILY_STATS_REBUILD_CURSOR_KEY],
         )?;
         tx.commit()?;
+        if let Some(heartbeat) = heartbeat {
+            heartbeat();
+        }
 
         tracing::info!(
             target: "cass::analytics",
@@ -17566,6 +17772,23 @@ impl FrankenStorage {
         since_ms: Option<i64>,
         chunk_size: usize,
     ) -> Result<AnalyticsRebuildResult> {
+        self.rebuild_analytics_since_with_chunk_size_and_progress(
+            since_ms,
+            chunk_size,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn rebuild_analytics_since_with_chunk_size_and_progress(
+        &self,
+        since_ms: Option<i64>,
+        chunk_size: usize,
+        progress: Option<&dyn Fn(i64, i64)>,
+        heartbeat: Option<&dyn Fn()>,
+        resume_context: Option<&str>,
+    ) -> Result<AnalyticsRebuildResult> {
         let start = Instant::now();
         let chunk_size = i64::try_from(chunk_size.max(1)).unwrap_or(i64::MAX);
 
@@ -17576,10 +17799,16 @@ impl FrankenStorage {
             let cutoff_hour = Self::hour_id_from_millis(cutoff_ms);
             (cutoff_day, cutoff_hour, cutoff_ms)
         });
+        if resume_context.is_some() && scope.is_some() {
+            bail!("the legacy OMP resume cursor is valid only for a full analytics rebuild");
+        }
 
         // The keyset walk below visits every `messages` row in both modes
         // (the day cutoff is applied in Rust), so the progress denominator
         // is the whole table.
+        if let Some(heartbeat) = heartbeat {
+            heartbeat();
+        }
         let total_messages: i64 =
             self.conn
                 .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
@@ -17591,6 +17820,12 @@ impl FrankenStorage {
             since_ms = scope.map(|(_, _, ms)| ms),
             "analytics_rebuild_start"
         );
+        if let Some(progress) = progress {
+            progress(0, total_messages);
+        }
+        if let Some(heartbeat) = heartbeat {
+            heartbeat();
+        }
 
         // GH #424: resolve the dimension tables once, in memory, instead of
         // JOINing `conversations` (plus the agents subquery) into every
@@ -17606,6 +17841,9 @@ impl FrankenStorage {
             })?
             .into_iter()
             .collect();
+        if let Some(heartbeat) = heartbeat {
+            heartbeat();
+        }
         let conversation_dims: HashMap<i64, AnalyticsConversationDim> = self
             .conn
             .query_map_collect(
@@ -17632,6 +17870,58 @@ impl FrankenStorage {
             )?
             .into_iter()
             .collect();
+        if let Some(heartbeat) = heartbeat {
+            heartbeat();
+        }
+
+        // Outer `Option`: whether a complete cursor belongs to this migration
+        // context. The inner optional id uses `None` as the explicit
+        // pre-first-row sentinel, distinct from a legitimate `i64::MIN` id.
+        // Persisting `processed` avoids a second range COUNT on resume.
+        let resume_cursor: Option<(Option<i64>, i64)> = if let Some(context) = resume_context {
+            let recorded_context: Option<String> = self
+                .conn
+                .query_row_map(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    fparams![LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY],
+                    |row| row.get_typed(0),
+                )
+                .optional()?;
+            let recorded_last_id: Option<String> = self
+                .conn
+                .query_row_map(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    fparams![LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY],
+                    |row| row.get_typed(0),
+                )
+                .optional()?;
+            let recorded_processed: Option<String> = self
+                .conn
+                .query_row_map(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    fparams![LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY],
+                    |row| row.get_typed(0),
+                )
+                .optional()?;
+            if recorded_context.as_deref() == Some(context) {
+                match (
+                    recorded_last_id,
+                    recorded_processed.and_then(|value| value.parse::<i64>().ok()),
+                ) {
+                    (Some(last_id), Some(0)) if last_id == "start" => Some((None, 0)),
+                    (Some(last_id), Some(processed))
+                        if processed > 0 && processed <= total_messages =>
+                    {
+                        last_id.parse::<i64>().ok().map(|last_id| (Some(last_id), processed))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // Scope reset, committed on its own. GH #424 (second finding): one
         // write transaction spanning the whole rebuild made every successive
@@ -17641,7 +17931,7 @@ impl FrankenStorage {
         // the rebuild sees a partially rebuilt rollup instead of the old one;
         // an interrupted run leaves a prefix that the next full rebuild
         // simply re-derives.
-        {
+        if resume_cursor.is_none() {
             let mut tx = self.conn.transaction()?;
             match scope {
                 None => {
@@ -17669,21 +17959,60 @@ impl FrankenStorage {
                     )?;
                 }
             }
+            if resume_context.is_none() {
+                // Any ordinary full or scoped rebuild changes the live
+                // message-metrics/usage surfaces outside the OMP cursor's
+                // transaction chain. Retaining that cursor would make a later
+                // migration resume add already-rebuilt rollup deltas again.
+                // Invalidate it atomically with this reset; the migration then
+                // restarts from a known-empty scope instead of double-counting.
+                tx.execute_compat(
+                    "DELETE FROM meta WHERE key IN (?1, ?2, ?3)",
+                    fparams![
+                        LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY,
+                        LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY,
+                        LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY
+                    ],
+                )?;
+            }
+            if let Some(context) = resume_context {
+                tx.execute_compat(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                    fparams![LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY, context],
+                )?;
+                tx.execute_compat(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                    fparams![
+                        LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY,
+                        "start"
+                    ],
+                )?;
+                tx.execute_compat(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, '0')",
+                    fparams![LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY],
+                )?;
+            }
             tx.commit()?;
         }
 
         // Keyset cursor: the largest message id fetched so far. The first
         // page omits the lower bound so the full signed SQLite key domain,
         // including `i64::MIN`, is reachable; later pages use `id > last_id`.
-        let mut first_page = true;
-        let mut last_id: i64 = i64::MIN;
+        let (resumed_last_id, mut processed) = resume_cursor.unwrap_or((None, 0));
+        let starting_processed = processed;
+        if starting_processed > 0
+            && let Some(progress) = progress
+        {
+            progress(starting_processed, total_messages);
+        }
+        let mut last_id = resumed_last_id.unwrap_or(i64::MIN);
+        let mut first_page = resumed_last_id.is_none();
         // Lower bound on the effective timestamp. A full rebuild must admit
         // every row (including any pre-1970 negative timestamp), so it uses
         // `i64::MIN` rather than 0.
         let cutoff_ms: i64 = scope.map_or(i64::MIN, |(_, _, ms)| ms);
         // Rows fetched (progress against `total_messages`) vs rows inside
         // the rebuild window.
-        let mut processed: i64 = 0;
         let mut kept: i64 = 0;
         let mut total_inserted: usize = 0;
         let mut usage_hourly_rows: usize = 0;
@@ -17822,24 +18151,47 @@ impl FrankenStorage {
             }
 
             kept += entries.len() as i64;
-            if !entries.is_empty() {
+            let next_processed = processed.saturating_add(fetched as i64);
+            if !entries.is_empty() || resume_context.is_some() {
                 // GH #424: one short write transaction per chunk.
                 let mut tx = self.conn.transaction()?;
-                total_inserted += franken_insert_message_metrics_batched_in_tx(&tx, &entries)?;
-                let (hourly, daily, models_daily) =
-                    franken_flush_analytics_rollups_in_tx(&tx, &rollup_agg)?;
+                if !entries.is_empty() {
+                    total_inserted +=
+                        franken_insert_message_metrics_batched_in_tx(&tx, &entries)?;
+                    let (hourly, daily, models_daily) =
+                        franken_flush_analytics_rollups_in_tx(&tx, &rollup_agg)?;
+                    usage_hourly_rows += hourly;
+                    usage_daily_rows += daily;
+                    usage_models_daily_rows += models_daily;
+                }
+                if resume_context.is_some() {
+                    // Commit the cursor in the same transaction as the rows
+                    // and rollup deltas. A crash can therefore replay neither
+                    // too little nor a double-counted chunk.
+                    tx.execute_compat(
+                        "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                        fparams![
+                            LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY,
+                            last_id.to_string()
+                        ],
+                    )?;
+                    tx.execute_compat(
+                        "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                        fparams![
+                            LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY,
+                            next_processed.to_string()
+                        ],
+                    )?;
+                }
                 tx.commit()?;
-                usage_hourly_rows += hourly;
-                usage_daily_rows += daily;
-                usage_models_daily_rows += models_daily;
             }
-            processed += fetched as i64;
+            processed = next_processed;
 
             // Per-chunk progress at INFO so a multi-hour rebuild is
             // distinguishable from a hang (GH #412).
             let elapsed_secs = start.elapsed().as_secs_f64();
             let rate = if elapsed_secs > 0.0 {
-                processed as f64 / elapsed_secs
+                processed.saturating_sub(starting_processed) as f64 / elapsed_secs
             } else {
                 0.0
             };
@@ -17855,6 +18207,12 @@ impl FrankenStorage {
                 msgs_per_sec = format!("{rate:.0}"),
                 "analytics_rebuild_progress"
             );
+            if let Some(progress) = progress {
+                progress(processed, total_messages);
+            }
+            if let Some(heartbeat) = heartbeat {
+                heartbeat();
+            }
 
             if (fetched as i64) < chunk_size {
                 break;
@@ -17892,6 +18250,13 @@ impl FrankenStorage {
 
     /// Rebuild all daily stats from scratch.
     pub fn rebuild_daily_stats(&self) -> Result<DailyStatsRebuildResult> {
+        self.rebuild_daily_stats_with_progress(None)
+    }
+
+    fn rebuild_daily_stats_with_progress(
+        &self,
+        heartbeat: Option<&dyn Fn()>,
+    ) -> Result<DailyStatsRebuildResult> {
         const DAILY_STATS_REBUILD_CONVERSATION_BATCH_SIZE: usize = 1_000;
         const DAILY_STATS_REBUILD_MESSAGE_BATCH_SIZE: usize = 10_000;
 
@@ -17904,6 +18269,9 @@ impl FrankenStorage {
             DAILY_STATS_REBUILD_MESSAGE_BATCH_SIZE,
         );
 
+        if let Some(heartbeat) = heartbeat {
+            heartbeat();
+        }
         let total_messages: i64 = self
             .conn
             .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
@@ -17925,6 +18293,9 @@ impl FrankenStorage {
             use_message_metrics,
             "daily_stats rebuild selected message source"
         );
+        if let Some(heartbeat) = heartbeat {
+            heartbeat();
+        }
 
         // Build into a connection-local staging table and commit every bounded
         // aggregate batch. Holding one write transaction for the entire archive
@@ -18083,6 +18454,9 @@ impl FrankenStorage {
                     )
                 })?;
             }
+            if let Some(heartbeat) = heartbeat {
+                heartbeat();
+            }
             if conversation_batch_count.is_multiple_of(25) {
                 tracing::info!(
                     target: "cass::perf::daily_stats",
@@ -18160,7 +18534,7 @@ impl FrankenStorage {
                         break;
                     }
                     if let Some(lookup) = metrics_lookup_statement.as_ref() {
-                        for message_id in pending_metric_ids {
+                        for (lookup_idx, message_id) in pending_metric_ids.into_iter().enumerate() {
                             let rows = lookup
                                 .query_with_params(&[SqliteValue::from(message_id)])
                                 .with_context(|| {
@@ -18168,6 +18542,11 @@ impl FrankenStorage {
                                         "daily_stats phase=message_metrics_lookup conversation_id={conversation_id} message_id={message_id}"
                                     )
                                 })?;
+                            if (lookup_idx + 1).is_multiple_of(1_000)
+                                && let Some(heartbeat) = heartbeat
+                            {
+                                heartbeat();
+                            }
                             // A message without a metrics row is dropped,
                             // exactly as the former inner JOIN did.
                             let Some(row) = rows.first() else {
@@ -18212,6 +18591,9 @@ impl FrankenStorage {
                                 "daily_stats phase=message_stage_commit conversation_id={conversation_id} cursor_message_idx={cursor_message_idx}"
                             )
                         })?;
+                    }
+                    if let Some(heartbeat) = heartbeat {
+                        heartbeat();
                     }
                     if message_batch_count.is_multiple_of(50) {
                         tracing::info!(
@@ -18272,6 +18654,9 @@ impl FrankenStorage {
         publish_tx
             .commit()
             .with_context(|| "daily_stats phase=publish_commit")?;
+        if let Some(heartbeat) = heartbeat {
+            heartbeat();
+        }
         self.conn
             .execute("DELETE FROM daily_stats_rebuild_stage")
             .with_context(|| "daily_stats phase=clear_stage_after_publish")?;
@@ -19855,6 +20240,24 @@ mod tests {
         assert!(resolve_defer_analytics_updates(true, false, false));
         assert!(resolve_defer_analytics_updates(true, true, false));
         assert!(!resolve_defer_analytics_updates(false, true, true));
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_omp_analytics_deferral_ignores_the_indexers_ambient_guard() {
+        let _disabled = set_env_var("CASS_DEFER_ANALYTICS_UPDATES", "0");
+        let ambient_guard = defer_analytics_updates_guard();
+        assert!(
+            !explicit_analytics_rebuild_deferred(),
+            "the indexer's ambient ingest guard must not suppress its required post-publish OMP rebuild"
+        );
+        drop(ambient_guard);
+
+        let _enabled = set_env_var("CASS_DEFER_ANALYTICS_UPDATES", "1");
+        assert!(
+            explicit_analytics_rebuild_deferred(),
+            "the documented operator override must leave OMP analytics pending"
+        );
     }
 
     #[test]
@@ -23997,6 +24400,192 @@ mod tests {
             )
             .unwrap();
         assert_eq!(orphan_metrics, 0);
+    }
+
+    /// GH #424: each message-metrics chunk and its cursor must commit as one
+    /// unit. An interrupted OMP migration resumes after the last committed
+    /// message without replaying additive usage rollups, while an unrelated
+    /// analytics rebuild invalidates the cursor and safely starts over.
+    #[test]
+    fn gh424_legacy_omp_analytics_cursor_resumes_without_double_counting() -> anyhow::Result<()> {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new()?;
+        let storage = SqliteStorage::open(&dir.path().join("test.db"))?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "omp".into(),
+            name: "Oh My Pi".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let base_ts = 1_770_551_400_000_i64;
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "omp".into(),
+            workspace: None,
+            external_id: Some("gh424-resume".into()),
+            title: Some("GH 424 resume fixture".into()),
+            source_path: PathBuf::from("/tmp/gh424-resume.jsonl"),
+            started_at: Some(base_ts),
+            ended_at: Some(base_ts + 5_000),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({"source":"omp"}),
+            messages: (0..5)
+                .map(|idx| Message {
+                    id: None,
+                    idx,
+                    role: if idx.is_multiple_of(2) {
+                        MessageRole::User
+                    } else {
+                        MessageRole::Agent
+                    },
+                    author: None,
+                    created_at: Some(base_ts + idx * 1_000),
+                    content: format!("OMP analytics resume message {idx}"),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                })
+                .collect(),
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        storage.insert_conversations_batched_with_analytics(
+            &[(agent_id, None, &conversation)],
+            false,
+        )?;
+        let message_ids: Vec<i64> = storage.conn.query_map_collect(
+            "SELECT id FROM messages ORDER BY id",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(message_ids.len(), 5);
+
+        let context = "gh424-test-context";
+        let scoped_resume_error = storage
+            .rebuild_analytics_since_with_chunk_size_and_progress(
+                Some(base_ts),
+                2,
+                None,
+                None,
+                Some(context),
+            )
+            .expect_err("a full-archive cursor must not be applied to a scoped rebuild");
+        assert!(
+            scoped_resume_error
+                .to_string()
+                .contains("valid only for a full analytics rebuild"),
+            "unexpected scoped-resume error: {scoped_resume_error:#}"
+        );
+        let interrupt_after_first_chunk = |processed: i64, _total: i64| {
+            assert!(processed == 0 || processed >= 2);
+            if processed >= 2 {
+                panic!("GH #424 planted interruption after first committed chunk");
+            }
+        };
+        let heartbeat_count = std::cell::Cell::new(0_usize);
+        let heartbeat = || heartbeat_count.set(heartbeat_count.get().saturating_add(1));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            storage.rebuild_analytics_since_with_chunk_size_and_progress(
+                None,
+                2,
+                Some(&interrupt_after_first_chunk),
+                Some(&heartbeat),
+                Some(context),
+            )
+        }));
+        assert!(
+            interrupted.is_err(),
+            "the planted interruption must stop the first rebuild"
+        );
+        assert!(
+            heartbeat_count.get() >= 4,
+            "the watchdog must be refreshed around the count and dimension-map phases before the first chunk completes"
+        );
+
+        let cursor_context: String = storage.conn.query_row_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            fparams![LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY],
+            |row| row.get_typed(0),
+        )?;
+        let cursor_last_id: String = storage.conn.query_row_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            fparams![LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY],
+            |row| row.get_typed(0),
+        )?;
+        let cursor_processed: String = storage.conn.query_row_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            fparams![LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(cursor_context, context);
+        assert_eq!(cursor_last_id, message_ids[1].to_string());
+        assert_eq!(cursor_processed, "2");
+        let partial_metrics: i64 = storage.conn.query_row_map(
+            "SELECT COUNT(*) FROM message_metrics",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(partial_metrics, 2);
+
+        storage.rebuild_analytics_since_with_chunk_size_and_progress(
+            None,
+            2,
+            None,
+            Some(&heartbeat),
+            Some(context),
+        )?;
+        let resumed_metrics: i64 = storage.conn.query_row_map(
+            "SELECT COUNT(*) FROM message_metrics",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(resumed_metrics, 5);
+
+        type UsageSnapshotRow = (i64, String, i64, String, i64, i64, i64, i64);
+        let usage_snapshot = || -> anyhow::Result<Vec<UsageSnapshotRow>> {
+            storage.conn.query_map_collect(
+                "SELECT day_id, agent_slug, workspace_id, source_id,
+                        message_count, user_message_count,
+                        assistant_message_count, content_tokens_est_total
+                 FROM usage_daily
+                 ORDER BY day_id, agent_slug, workspace_id, source_id",
+                fparams![],
+                |row| {
+                    Ok((
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                        row.get_typed(4)?,
+                        row.get_typed(5)?,
+                        row.get_typed(6)?,
+                        row.get_typed(7)?,
+                    ))
+                },
+            )
+        };
+        let resumed_usage = usage_snapshot()?;
+
+        // A clean rebuild is the oracle for additive rollups. It must match
+        // the interrupted/resumed result exactly and retire the foreign
+        // migration cursor rather than leaving a future double-count trap.
+        storage.rebuild_analytics_since_with_chunk_size(None, 2)?;
+        assert_eq!(usage_snapshot()?, resumed_usage);
+        for cursor_key in [
+            LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY,
+            LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY,
+            LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY,
+        ] {
+            let rows: i64 = storage.conn.query_row_map(
+                "SELECT COUNT(*) FROM meta WHERE key = ?1",
+                fparams![cursor_key],
+                |row| row.get_typed(0),
+            )?;
+            assert_eq!(rows, 0, "ordinary rebuild must invalidate {cursor_key}");
+        }
+        Ok(())
     }
 
     #[test]
@@ -30652,6 +31241,7 @@ mod tests {
             LegacyOmpReclassificationResult {
                 conversations_reclassified: 1,
                 lexical_rebuild_required: true,
+                analytics_rebuild_required: true,
             }
         );
         assert_eq!(
@@ -30670,6 +31260,7 @@ mod tests {
             LegacyOmpReclassificationResult {
                 conversations_reclassified: 0,
                 lexical_rebuild_required: true,
+                analytics_rebuild_required: true,
             }
         );
 
@@ -30697,12 +31288,65 @@ mod tests {
             fparams![],
             |row| row.get_typed(0),
         )?;
-        assert_eq!(metrics_slug, "omp");
+        assert_eq!(
+            metrics_slug, "pi_agent",
+            "canonical identity migration must not block on the deferred analytics rebuild"
+        );
 
-        // Completing the marker is deliberately separate from the identity
-        // transaction: the indexer calls this only after the canonical
-        // SQLite-to-lexical publish succeeds.
-        storage.complete_legacy_omp_reclassification()?;
+        // The lexical publish can finish while an operator explicitly defers
+        // analytics. A retry must retain only the analytics work; otherwise
+        // every startup would repeat the expensive authoritative lexical
+        // rebuild that already published successfully.
+        storage.mark_legacy_omp_lexical_publish_complete()?;
+        assert_eq!(
+            storage.reclassify_legacy_omp_conversations()?,
+            LegacyOmpReclassificationResult {
+                conversations_reclassified: 0,
+                lexical_rebuild_required: false,
+                analytics_rebuild_required: true,
+            }
+        );
+        let progress_events = std::cell::Cell::new(0_usize);
+        let heartbeat_events = std::cell::Cell::new(0_usize);
+        let record_progress = |_processed: i64, _total: i64| {
+            progress_events.set(progress_events.get().saturating_add(1));
+        };
+        let record_heartbeat = || {
+            heartbeat_events.set(heartbeat_events.get().saturating_add(1));
+        };
+        storage.rebuild_legacy_omp_analytics_with_progress(
+            Some(&record_progress),
+            Some(&record_heartbeat),
+        )?;
+        assert!(
+            progress_events.get() >= 2,
+            "message-metrics rebuild must report start and committed progress"
+        );
+        assert!(
+            heartbeat_events.get() >= 2,
+            "token and daily rollup phases must keep the index watchdog alive"
+        );
+        let rebuilt_metrics_slug: String = storage.conn.query_row_map(
+            "SELECT agent_slug FROM message_metrics LIMIT 1",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(rebuilt_metrics_slug, "omp");
+        for cursor_key in [
+            LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY,
+            LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY,
+            LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY,
+        ] {
+            let cursor_rows: i64 = storage.conn.query_row_map(
+                "SELECT COUNT(*) FROM meta WHERE key = ?1",
+                fparams![cursor_key],
+                |row| row.get_typed(0),
+            )?;
+            assert_eq!(
+                cursor_rows, 0,
+                "completed analytics must atomically retire cursor {cursor_key}"
+            );
+        }
         assert!(storage.semantic_identity_rebuild_required(SemanticIdentityTier::Fast)?);
         assert!(storage.semantic_identity_rebuild_required(SemanticIdentityTier::Quality)?);
         storage.complete_semantic_identity_rebuild(SemanticIdentityTier::Fast)?;
@@ -30741,6 +31385,7 @@ mod tests {
             LegacyOmpReclassificationResult {
                 conversations_reclassified: 1,
                 lexical_rebuild_required: true,
+                analytics_rebuild_required: true,
             }
         );
         assert_eq!(storage.get_last_embedded_message_id()?, None);
@@ -30829,6 +31474,7 @@ mod tests {
             LegacyOmpReclassificationResult {
                 conversations_reclassified: 2,
                 lexical_rebuild_required: true,
+                analytics_rebuild_required: true,
             }
         );
         let omp_agent_id: i64 = storage.conn.query_row_map(
@@ -31249,6 +31895,7 @@ mod tests {
             LegacyOmpReclassificationResult {
                 conversations_reclassified: 1,
                 lexical_rebuild_required: true,
+                analytics_rebuild_required: true,
             },
             "an identical remote path and external id on another source must not collapse provenance"
         );
@@ -31401,6 +32048,7 @@ mod tests {
             LegacyOmpReclassificationResult {
                 conversations_reclassified: 1,
                 lexical_rebuild_required: true,
+                analytics_rebuild_required: true,
             }
         );
         let (source_id, origin_host, agent_slug): (String, Option<String>, String) =
@@ -31615,6 +32263,7 @@ mod tests {
             LegacyOmpReclassificationResult {
                 conversations_reclassified: 2,
                 lexical_rebuild_required: true,
+                analytics_rebuild_required: true,
             },
             "the v2 classifier must run even when the narrower v1 migration was complete"
         );
@@ -31822,6 +32471,7 @@ mod tests {
                 LegacyOmpReclassificationResult {
                     conversations_reclassified: 1,
                     lexical_rebuild_required: true,
+                    analytics_rebuild_required: true,
                 },
                 "a changed ownership context must invalidate the completed fast path"
             );
@@ -31837,7 +32487,8 @@ mod tests {
         // The current-XDG guard has restored the pre-scan empty value.
         // Completion must promote the stored scan context, not hash this
         // changed environment after the lexical publish.
-        storage.complete_legacy_omp_reclassification()?;
+        storage.rebuild_legacy_omp_analytics_with_progress(None, None)?;
+        storage.mark_legacy_omp_lexical_publish_complete()?;
         let completed_state: String = storage.conn.query_row_map(
             "SELECT value FROM meta WHERE key = ?1",
             fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
@@ -31887,6 +32538,7 @@ mod tests {
             LegacyOmpReclassificationResult {
                 conversations_reclassified: 0,
                 lexical_rebuild_required: true,
+                analytics_rebuild_required: true,
             },
             "versioning the path classifier must not forget a crash between the v1 identity swap and lexical publish"
         );
@@ -31900,7 +32552,38 @@ mod tests {
                 && rebound_pending.len() > "analytics_pending:".len(),
             "the context-free v1 pending state must be rebound before rebuilding: {rebound_pending:?}"
         );
-        storage.complete_legacy_omp_reclassification()?;
+        let rebound_context = rebound_pending
+            .strip_prefix("analytics_pending:")
+            .expect("pending marker has a context");
+        for phase_key in [
+            LEGACY_OMP_LEXICAL_PUBLISHED_META_KEY,
+            LEGACY_OMP_ANALYTICS_REBUILT_META_KEY,
+        ] {
+            storage.conn.execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams![phase_key, rebound_context],
+            )?;
+        }
+        storage.conn.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams![
+                LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY,
+                rebound_context
+            ],
+        )?;
+        storage.conn.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, 'start')",
+            fparams![LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY],
+        )?;
+        storage.conn.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, '0')",
+            fparams![LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY],
+        )?;
+        assert_eq!(
+            storage.reclassify_legacy_omp_conversations()?,
+            LegacyOmpReclassificationResult::default(),
+            "both phase markers must self-heal a missing aggregate completion marker"
+        );
         let completed: String = storage.conn.query_row_map(
             "SELECT value FROM meta WHERE key = ?1",
             fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
@@ -31911,6 +32594,18 @@ mod tests {
             rebound_pending.replacen("analytics_pending:", "complete:", 1),
             "completion must promote the stored pending context exactly"
         );
+        for cursor_key in [
+            LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY,
+            LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY,
+            LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY,
+        ] {
+            let rows: i64 = storage.conn.query_row_map(
+                "SELECT COUNT(*) FROM meta WHERE key = ?1",
+                fparams![cursor_key],
+                |row| row.get_typed(0),
+            )?;
+            assert_eq!(rows, 0, "self-healing completion must retire {cursor_key}");
+        }
         Ok(())
     }
 
