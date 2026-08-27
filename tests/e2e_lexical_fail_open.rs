@@ -25,9 +25,12 @@ use coding_agent_search::indexer::semantic::{
 use coding_agent_search::search::semantic_manifest::{SemanticShardManifest, TierKind};
 use coding_agent_search::storage::sqlite::FrankenStorage;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tempfile::TempDir;
+use walkdir::WalkDir;
 
 mod util;
 
@@ -46,6 +49,46 @@ fn seed_codex_session(codex_home: &std::path::Path, filename: &str, keyword: &st
     // Full user + assistant corpus so the post-index search has
     // content to match on either turn.
     util::seed_codex_session(codex_home, filename, keyword, true);
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DataTreeEntry {
+    Directory,
+    File(Vec<u8>),
+    Symlink(PathBuf),
+}
+
+fn data_tree_snapshot(root: &Path) -> BTreeMap<PathBuf, DataTreeEntry> {
+    WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .map(|entry| entry.unwrap_or_else(|err| panic!("walk {}: {err}", root.display())))
+        .map(|entry| {
+            let relative = entry
+                .path()
+                .strip_prefix(root)
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "strip data-dir prefix {} from {}: {err}",
+                        root.display(),
+                        entry.path().display()
+                    )
+                })
+                .to_path_buf();
+            let value = if entry.file_type().is_dir() {
+                DataTreeEntry::Directory
+            } else if entry.file_type().is_symlink() {
+                DataTreeEntry::Symlink(fs::read_link(entry.path()).unwrap_or_else(|err| {
+                    panic!("read symlink {}: {err}", entry.path().display())
+                }))
+            } else {
+                DataTreeEntry::File(fs::read(entry.path()).unwrap_or_else(|err| {
+                    panic!("read data-tree file {}: {err}", entry.path().display())
+                }))
+            };
+            (relative, value)
+        })
+        .collect()
 }
 
 fn run_fresh_index(home: &Path, data_dir: &Path) {
@@ -268,6 +311,78 @@ fn run_lexical_search(home: &Path, data_dir: &Path, query: &str) -> Value {
             String::from_utf8_lossy(&output.stdout)
         )
     })
+}
+
+#[test]
+fn no_maintenance_lexical_search_is_byte_stable_across_the_real_cli_path() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_no_maintenance_data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    seed_codex_session(
+        &codex_home,
+        "rollout-no-maintenance-byte-stability.jsonl",
+        "nomaintenancebyteprobe immutable archive proof",
+    );
+    run_fresh_index(home, &data_dir);
+
+    let before = data_tree_snapshot(&data_dir);
+    let mut search = cass_cmd(home);
+    search
+        .args([
+            "search",
+            "nomaintenancebyteprobe",
+            "--json",
+            "--robot-meta",
+            "--mode",
+            "lexical",
+            "--no-maintenance",
+            "--limit",
+            "10",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .timeout(Duration::from_secs(20));
+    let output = search
+        .output()
+        .expect("run real cass search --no-maintenance subprocess");
+    assert!(
+        output.status.success(),
+        "strict read-only lexical search must succeed. stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
+        panic!(
+            "strict read-only search output must be JSON: {err}\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    let hits = payload
+        .get("hits")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("strict read-only search must return a hits array: {payload}"));
+    assert!(
+        !hits.is_empty(),
+        "strict read-only search needs a positive matching hit; payload: {payload}"
+    );
+    assert_eq!(
+        payload
+            .get("_meta")
+            .and_then(|meta| meta.get("search_mode"))
+            .and_then(Value::as_str),
+        Some("lexical"),
+        "robot metadata must truthfully report the realized lexical tier"
+    );
+
+    assert_eq!(
+        before,
+        data_tree_snapshot(&data_dir),
+        "search --no-maintenance must not add, remove, or change any data-dir directory, file, symlink, SQLite sidecar, checkpoint, lock, or search artifact"
+    );
 }
 
 #[test]
