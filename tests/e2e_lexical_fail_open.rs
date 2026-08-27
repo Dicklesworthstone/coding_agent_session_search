@@ -78,21 +78,22 @@ fn data_tree_snapshot(root: &Path) -> BTreeMap<PathBuf, DataTreeEntry> {
                     )
                 })
                 .to_path_buf();
-            let value = if entry.file_type().is_dir() {
-                DataTreeEntry::Directory
-            } else if entry.file_type().is_symlink() {
-                DataTreeEntry::Symlink(fs::read_link(entry.path()).unwrap_or_else(|err| {
-                    panic!("read symlink {}: {err}", entry.path().display())
-                }))
-            } else {
-                let bytes = fs::read(entry.path()).unwrap_or_else(|err| {
-                    panic!("read data-tree file {}: {err}", entry.path().display())
-                });
-                DataTreeEntry::File {
-                    size_bytes: bytes.len(),
-                    digest: blake3::hash(&bytes),
-                }
-            };
+            let value =
+                if entry.file_type().is_dir() {
+                    DataTreeEntry::Directory
+                } else if entry.file_type().is_symlink() {
+                    DataTreeEntry::Symlink(fs::read_link(entry.path()).unwrap_or_else(|err| {
+                        panic!("read symlink {}: {err}", entry.path().display())
+                    }))
+                } else {
+                    let bytes = fs::read(entry.path()).unwrap_or_else(|err| {
+                        panic!("read data-tree file {}: {err}", entry.path().display())
+                    });
+                    DataTreeEntry::File {
+                        size_bytes: bytes.len(),
+                        digest: blake3::hash(&bytes),
+                    }
+                };
             (relative, value)
         })
         .collect()
@@ -116,13 +117,7 @@ fn run_fresh_index(home: &Path, data_dir: &Path) {
 fn run_forced_full_index(home: &Path, data_dir: &Path) {
     let mut index = cass_cmd(home);
     index
-        .args([
-            "index",
-            "--full",
-            "--force-rebuild",
-            "--json",
-            "--data-dir",
-        ])
+        .args(["index", "--full", "--force-rebuild", "--json", "--data-dir"])
         .arg(data_dir)
         .timeout(Duration::from_secs(120));
     let output = index
@@ -491,7 +486,10 @@ fn no_maintenance_hybrid_search_with_semantic_assets_is_byte_stable() {
     let meta = payload
         .get("_meta")
         .unwrap_or_else(|| panic!("strict hash-hybrid search needs robot metadata: {payload}"));
-    assert_eq!(meta.get("search_mode").and_then(Value::as_str), Some("hybrid"));
+    assert_eq!(
+        meta.get("search_mode").and_then(Value::as_str),
+        Some("hybrid")
+    );
     assert_eq!(
         meta.get("semantic_refinement").and_then(Value::as_bool),
         Some(true),

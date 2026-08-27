@@ -28,7 +28,10 @@ use std::time::{Duration, Instant};
 
 #[macro_use]
 mod util;
-use util::e2e_log::{E2eCommandEnvironment, E2ePerformanceMetrics, PhaseTracker};
+// `cass_std_cmd` (the only consumer) is compiled on Linux only.
+#[cfg(target_os = "linux")]
+use util::e2e_log::E2eCommandEnvironment;
+use util::e2e_log::{E2ePerformanceMetrics, PhaseTracker};
 
 // =============================================================================
 // E2E Logger Support

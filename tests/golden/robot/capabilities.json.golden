@@ -376,6 +376,17 @@
           ]
         },
         {
+          "name": "background",
+          "description": "Run as a low-priority background job: lowers this process's CPU priority (nice, default 15; CASS_BACKGROUND_NICE) and I/O priority (ionice idle class on Linux; CASS_BACKGROUND_IONICE_CLASS) before indexing. This is what stale-on-read catch-up, `cass schedule`, and the daemon's periodic refresh use. Has no effect on what gets indexed",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "robot-format",
           "description": "Output format for robot mode (overrides --json when specified)",
           "arg_type": "option",
@@ -782,6 +793,17 @@
         {
           "name": "refresh",
           "description": "Run an incremental `cass index` pass before the search so new conversations created since the last index are matched. No-op when the index is already current; indexing errors are logged and the search runs against the existing index (non-fatal)",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "no-maintenance",
+          "description": "Execute search as a strict read-only operation. Never refresh a checkpoint, launch or join lexical maintenance, or spawn detached catch-up work. Conflicts with --refresh and --daemon because daemon auto-spawn creates runtime state",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -3180,6 +3202,12 @@
         }
       ],
       "has_json_output": false
+    },
+    {
+      "name": "schedule",
+      "description": "Keep the index fresh automatically via the OS scheduler (launchd / systemd user timers)",
+      "arguments": [],
+      "has_json_output": false
     }
   ],
   "exit_codes": [
@@ -3388,6 +3416,51 @@
       "name": "CASS_INDEX_NO_PROGRESS_EVENTS",
       "default": "0",
       "description": "Suppress NDJSON progress events from cass index --json when set to 1."
+    },
+    {
+      "name": "CASS_INDEX_INGEST_WAL_CHECKPOINT_BYTES",
+      "default": "536870912",
+      "description": "Reset a deferred bulk-ingest WAL after it reaches this many bytes; 0 disables the in-run bound."
+    },
+    {
+      "name": "CASS_INDEX_INGEST_WAL_CHECKPOINT_MODE",
+      "default": "TRUNCATE",
+      "description": "Checkpoint mode for the single-connection in-run bulk WAL reset: PASSIVE, FULL, RESTART, or TRUNCATE."
+    },
+    {
+      "name": "CASS_AUTO_REFRESH",
+      "default": "1",
+      "description": "Stale-on-read catch-up: search/pack/TUI may spawn a detached low-priority `cass index --background` when the index is stale, partial, or behind. Set 0 to disable globally; `search --no-maintenance` always disables it for that request."
+    },
+    {
+      "name": "CASS_AUTO_REFRESH_COOLDOWN_SECS",
+      "default": "300",
+      "description": "Minimum seconds between two auto-spawned catch-up index runs per data dir."
+    },
+    {
+      "name": "CASS_BACKGROUND_NICE",
+      "default": "15",
+      "description": "nice value `cass index --background` applies to itself (0..=19)."
+    },
+    {
+      "name": "CASS_BACKGROUND_IONICE_CLASS",
+      "default": "3",
+      "description": "ionice class `cass index --background` applies to itself on Linux (3 = idle)."
+    },
+    {
+      "name": "CASS_RESPONSIVENESS_MIN_USER_IDLE_SECS",
+      "default": "0",
+      "description": "Require this many seconds of console idle time (macOS HIDIdleTime) before scheduled semantic backfill / nightly schedule jobs run; 0 disables, unknown idle fails open."
+    },
+    {
+      "name": "CASS_DAEMON_INDEX_INTERVAL_SECS",
+      "default": "0",
+      "description": "While the semantic daemon is resident, spawn a detached incremental `cass index --background` every N seconds (0 = off; 900 recommended). Skipped under severe load and while another index run holds the lock."
+    },
+    {
+      "name": "CASS_SCHEDULE_MAX_BACKFILL_BATCHES",
+      "default": "200",
+      "description": "Upper bound on `cass models backfill --scheduled` batches one nightly `cass schedule run` will execute."
     },
     {
       "name": "CASS_INDEX_STALL_DETECT_SECS",

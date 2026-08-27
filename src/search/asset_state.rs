@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use fs2::FileExt;
 
 use crate::indexer::{
     LEXICAL_REBUILD_PAGE_SIZE_PUBLIC, LexicalRebuildCheckpoint,
@@ -281,8 +280,8 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
                 }
                 false
             }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => true,
-            Err(err) if windows_lock_conflict(&err) => true,
+            Err(std::fs::TryLockError::WouldBlock) => true,
+            Err(std::fs::TryLockError::Error(err)) if windows_lock_conflict(&err) => true,
             Err(_) => false,
         }
     };

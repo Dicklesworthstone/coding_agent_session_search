@@ -36,10 +36,13 @@ schemas: (auto-generated from contract)
       - total_sessions: integer
   api-version:
     - api_version: integer
+    - build_commit: string
     - contract_version: string
     - crate_version: string
   capabilities:
     - api_version: integer
+    - build_commit: string
+    - build_commit_date: string
     - commands: array
     - connectors: array
     - contract_version: string
@@ -2797,6 +2800,7 @@ schemas: (auto-generated from contract)
       - status: string
       - surface: string
     - errors: array
+    - exit_policy: string
     - explanation: ?
     - health_level: string
     - healthy: boolean
@@ -2917,6 +2921,9 @@ schemas: (auto-generated from contract)
         - conversations: ?
         - counts_skipped: boolean
         - exists: boolean
+        - integrity: string
+        - integrity_detail: ?
+        - integrity_hint: ?
         - messages: ?
         - open_error: ?
         - open_retryable: boolean
@@ -3167,6 +3174,7 @@ schemas: (auto-generated from contract)
       - hits_clamped: boolean
       - index_freshness: object
         - age_seconds: ?
+        - auto_refresh: ?
         - exists: boolean
         - fresh: boolean
         - last_indexed_at: ?
@@ -3284,6 +3292,9 @@ schemas: (auto-generated from contract)
       - conversations: ?
       - counts_skipped: boolean
       - exists: boolean
+      - integrity: string
+      - integrity_detail: ?
+      - integrity_hint: ?
       - messages: ?
       - open_error: ?
       - open_retryable: boolean
@@ -3664,6 +3675,9 @@ schemas: (auto-generated from contract)
       - conversations: ?
       - counts_skipped: boolean
       - exists: boolean
+      - integrity: string
+      - integrity_detail: ?
+      - integrity_hint: ?
       - messages: ?
       - open_error: ?
       - open_retryable: boolean
@@ -4017,6 +4031,9 @@ schemas: (auto-generated from contract)
         - conversations: ?
         - counts_skipped: boolean
         - exists: boolean
+        - integrity: string
+        - integrity_detail: ?
+        - integrity_hint: ?
         - messages: ?
         - open_error: ?
         - open_retryable: boolean

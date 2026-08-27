@@ -262,7 +262,7 @@
   "topology_budget": {
     "schema_version": "1",
     "topology": {
-      "source": "linux_sysfs",
+      "source": "fallback",
       "topology_class": "many_core_single_socket",
       "logical_cpus": 128,
       "physical_cores": 64,
@@ -270,13 +270,13 @@
       "numa_nodes": 1,
       "llc_groups": 8,
       "smt_threads_per_core": 2,
-      "memory_total_bytes": "[LIVE_BYTES]",
-      "memory_available_bytes": "[LIVE_BYTES]"
+      "memory_total_bytes": null,
+      "memory_available_bytes": null
     },
     "reserved_core_policy": {
       "reserved_cores": "[LIVE_COUNTER]",
-      "policy": "max(default, locality*2_on_large_hosts, smt_width, logical/12) capped at 16",
-      "reason": "reserve 16 of 128 logical CPUs for interactive work, IO, and NUMA/LLC service headroom"
+      "policy": "current conservative default",
+      "reason": "topology could not be derived, so cass preserves existing worker and RAM defaults"
     },
     "advisory_budgets": {
       "shard_builders": "[LIVE_COUNTER]",
@@ -295,12 +295,11 @@
       "cache_cap_bytes": "[LIVE_BYTES]",
       "max_inflight_bytes": "[LIVE_BYTES]"
     },
-    "fallback_active": false,
-    "decision_reason": "planned from ManyCoreSingleSocket: 128 logical CPUs, 64 physical cores, 1 socket(s), 1 NUMA node(s), 8 LLC group(s)",
+    "fallback_active": true,
+    "decision_reason": "using conservative defaults: linux sysfs topology is unavailable on this platform",
     "proof_notes": [
-      "advisory only: live controllers keep current conservative settings until explicitly wired",
-      "CPU budgets prefer physical cores and LLC/NUMA locality over SMT oversubscription",
-      "RAM caps scale only when MemAvailable is large enough to preserve broad host headroom"
+      "fallback is intentionally isomorphic to current defaults for live rebuild budgets",
+      "no /sys-derived CPU locality assumptions are made in fallback mode"
     ]
   },
   "daemon_runtime": {

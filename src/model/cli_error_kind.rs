@@ -517,10 +517,10 @@ mod tests {
     /// drift immediately at CI time.
     #[test]
     fn variant_count_matches_audited_lib_rs_kind_literals() {
-        // 91 unique kinds at landing time (commit before the pack
-        // landed). If lib.rs grows a new kind, bump this count AND
+        // 92 unique kinds after the `schedule` background-indexing kind
+        // landed. If lib.rs grows a new kind, bump this count AND
         // add the variant + arms above.
-        const AUDITED_KIND_COUNT: usize = 91;
+        const AUDITED_KIND_COUNT: usize = 92;
         assert_eq!(
             ErrorKind::all_variants().len(),
             AUDITED_KIND_COUNT,

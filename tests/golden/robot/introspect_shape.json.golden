@@ -61034,6 +61034,85 @@
                                       "type": "string"
                                     }
                                   }
+                                },
+                                "auto_refresh": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "description": {
+                                      "type": "string"
+                                    },
+                                    "properties": {
+                                      "type": "object",
+                                      "properties": {
+                                        "outcome": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "trigger": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "pid": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
+                                        "reason": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
+                                        "remaining_secs": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
+                                        "error": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
                                 }
                               }
                             }

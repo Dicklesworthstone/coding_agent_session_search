@@ -22,6 +22,7 @@ commands:
     --aggregate F1,F2 Server-side aggregation by fields (agent,workspace,date,match_type)
                       Returns buckets with counts. Reduces tokens by ~99% for overview queries
     --mode lexical|semantic|hybrid  Search mode (default: hybrid; hybrid fails open to lexical when semantic assets are unavailable)
+    --no-maintenance  Strict read-only search: never joins/spawns index maintenance or a daemon; conflicts with --refresh and --daemon
     --robot-meta     Include readiness, requested/realized mode, semantic refinement, fallback tier/reason, cursor, and timing metadata
   cass pack <query> [--robot] [--max-tokens N] [--limit N]
     Build a deterministic, cited answer pack for agent handoffs without external summarization.
@@ -121,5 +122,6 @@ commands:
   cass analytics [status|tokens|tools|models|rebuild|validate] [--json]  Token / tool / model analytics.
   cass import [...]                Import conversation data from external sources.
   cass daemon [...]                Run the semantic model daemon (Unix only).
+  cass schedule [install|uninstall|status|run] [--json]  Keep the index fresh via launchd / systemd user timers (incremental every 15 min + nightly full index & semantic backfill at low priority).
   cass completions <shell>         Emit shell completion script for bash | zsh | fish | powershell.
   cass man                         Emit man page (roff) for the cass binary.

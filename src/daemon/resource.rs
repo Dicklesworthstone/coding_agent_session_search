@@ -228,8 +228,10 @@ mod tests {
     #[test]
     fn test_resource_monitor_creation() {
         let monitor = ResourceMonitor::new();
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         assert!(monitor.pid > 0);
+        #[cfg(not(unix))]
+        let _ = monitor;
     }
 
     #[test]

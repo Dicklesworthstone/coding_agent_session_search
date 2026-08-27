@@ -755,6 +755,17 @@
           ]
         },
         {
+          "name": "background",
+          "description": "Run as a low-priority background job: lowers this process's CPU priority (nice, default 15; CASS_BACKGROUND_NICE) and I/O priority (ionice idle class on Linux; CASS_BACKGROUND_IONICE_CLASS) before indexing. This is what stale-on-read catch-up, `cass schedule`, and the daemon's periodic refresh use. Has no effect on what gets indexed",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "robot-format",
           "description": "Output format for robot mode (overrides --json when specified)",
           "arg_type": "option",
@@ -1161,6 +1172,17 @@
         {
           "name": "refresh",
           "description": "Run an incremental `cass index` pass before the search so new conversations created since the last index are matched. No-op when the index is already current; indexing errors are logged and the search runs against the existing index (non-fatal)",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "no-maintenance",
+          "description": "Execute search as a strict read-only operation. Never refresh a checkpoint, launch or join lexical maintenance, or spawn detached catch-up work. Conflicts with --refresh and --daemon because daemon auto-spawn creates runtime state",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -3558,6 +3580,12 @@
           "required": false
         }
       ],
+      "has_json_output": false
+    },
+    {
+      "name": "schedule",
+      "description": "Keep the index fresh automatically via the OS scheduler (launchd / systemd user timers)",
+      "arguments": [],
       "has_json_output": false
     }
   ],
@@ -32004,6 +32032,45 @@
                 },
                 "pending_sessions": {
                   "type": "integer"
+                },
+                "auto_refresh": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "description": "Present when a stale/partial/behind index triggered stale-on-read catch-up evaluation (indexer::background_refresh). `outcome` is one of spawned | disabled | index_run_active | cooldown | guard_busy | spawn_failed.",
+                  "properties": {
+                    "outcome": {
+                      "type": "string"
+                    },
+                    "trigger": {
+                      "type": "string"
+                    },
+                    "pid": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "reason": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "remaining_secs": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "error": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  }
                 }
               }
             },

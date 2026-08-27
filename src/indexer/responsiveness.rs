@@ -1623,6 +1623,7 @@ pub(crate) fn process_resident_memory_bytes() -> Option<u64> {
 }
 
 #[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn proc_kib_field_bytes(contents: &str, prefix: &str) -> Option<u64> {
     for line in contents.lines() {
         if let Some(rest) = line.strip_prefix(prefix) {
