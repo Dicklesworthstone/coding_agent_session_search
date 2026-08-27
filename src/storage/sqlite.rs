@@ -525,18 +525,7 @@ fn doctor_lock_file_pid_is_current_process(file: &fs::File) -> bool {
 }
 
 fn doctor_mutation_lock_error_is_active(err: &std::io::Error) -> bool {
-    if err.kind() == std::io::ErrorKind::WouldBlock {
-        return true;
-    }
-
-    #[cfg(windows)]
-    {
-        err.raw_os_error() == Some(33)
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+    err.kind() == std::io::ErrorKind::WouldBlock
 }
 
 fn acquire_doctor_mutation_db_open_guard(

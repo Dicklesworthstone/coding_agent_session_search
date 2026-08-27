@@ -55278,18 +55278,7 @@ fn doctor_probe_mutation_lock(data_dir: &Path) -> DoctorMutationLockObservation 
 }
 
 fn doctor_lock_probe_error_is_active(err: &std::io::Error) -> bool {
-    if err.kind() == std::io::ErrorKind::WouldBlock {
-        return true;
-    }
-
-    #[cfg(windows)]
-    {
-        err.raw_os_error() == Some(33)
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+    err.kind() == std::io::ErrorKind::WouldBlock
 }
 
 fn doctor_acquire_mutation_lock(
