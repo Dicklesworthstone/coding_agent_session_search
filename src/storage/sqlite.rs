@@ -2208,6 +2208,83 @@ pub(crate) struct FtsShadowParity {
     pub(crate) detail: Option<String>,
 }
 
+/// Bounded, read-only parity evidence for the canonical FTS doctor dry-run.
+///
+/// `exact_status` is `None` when either row-ID domain exceeds the comparison
+/// cap. Callers must surface that state as `indeterminate`: matching prefixes
+/// are not proof that the complete domains match. The mutating doctor path
+/// deliberately continues to use [`FtsShadowParity`] and its exact scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FtsDryRunParity {
+    pub(crate) exact_status: Option<FtsShadowParityStatus>,
+    pub(crate) canonical_messages: i64,
+    pub(crate) indexable_messages: i64,
+    pub(crate) indexed_messages: Option<i64>,
+    pub(crate) inspection_complete: bool,
+    pub(crate) comparison_cap: usize,
+    pub(crate) canonical_ids_examined: usize,
+    pub(crate) indexed_ids_examined: usize,
+    pub(crate) observed_missing_canonical_rowids_at_least: usize,
+    pub(crate) observed_excess_fts_rowids_at_least: usize,
+    pub(crate) detail: Option<String>,
+}
+
+impl FtsDryRunParity {
+    pub(crate) const fn status_as_str(&self) -> &'static str {
+        match self.exact_status {
+            Some(status) => status.as_str(),
+            None => "indeterminate",
+        }
+    }
+}
+
+fn classify_fts_shadow_parity(
+    indexable_messages: i64,
+    indexed_messages: i64,
+    intersection_messages: i64,
+    missing_messages: i64,
+    excess_messages: i64,
+) -> (FtsShadowParityStatus, Option<String>) {
+    match indexed_messages.cmp(&indexable_messages) {
+        std::cmp::Ordering::Less => {
+            if excess_messages > 0 {
+                (
+                    FtsShadowParityStatus::Divergent,
+                    Some(format!(
+                        "FTS contains {excess_messages} non-canonical rowids while {missing_messages} canonical rowids are missing (intersection={intersection_messages})"
+                    )),
+                )
+            } else {
+                (FtsShadowParityStatus::Partial, None)
+            }
+        }
+        std::cmp::Ordering::Equal => {
+            if missing_messages > 0 || excess_messages > 0 {
+                (
+                    FtsShadowParityStatus::Divergent,
+                    Some(format!(
+                        "equal counts conceal rowid divergence (missing_canonical_rowids={missing_messages}, excess_fts_rowids={excess_messages}, intersection={intersection_messages})"
+                    )),
+                )
+            } else {
+                (FtsShadowParityStatus::Healthy, None)
+            }
+        }
+        std::cmp::Ordering::Greater => {
+            if missing_messages > 0 {
+                (
+                    FtsShadowParityStatus::Divergent,
+                    Some(format!(
+                        "FTS has {excess_messages} excess non-canonical rowids while {missing_messages} canonical rowids are missing (intersection={intersection_messages})"
+                    )),
+                )
+            } else {
+                (FtsShadowParityStatus::Excess, None)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct HistoricalSalvageOutcome {
     pub bundles_considered: usize,
@@ -12212,7 +12289,6 @@ impl FrankenStorage {
         Ok(())
     }
 
-    #[cfg(test)]
     fn fetch_indexable_message_id_parity_page(
         &self,
         after: Option<i64>,
@@ -12242,7 +12318,6 @@ impl FrankenStorage {
         .with_context(|| "streaming bounded canonical message IDs for exact FTS parity")
     }
 
-    #[cfg(test)]
     fn fetch_fts_docsize_id_parity_page(
         &self,
         after: Option<i64>,
@@ -12407,6 +12482,163 @@ impl FrankenStorage {
             .with_context(|| "counting exact canonical FTS messages by parent index runs")
     }
 
+    /// Inspect enough row IDs to make small shadows exact while bounding work
+    /// on multi-million-row archives. Counts remain exact and cheap; row-ID
+    /// comparison stops after `comparison_cap` IDs from each domain.
+    pub(crate) fn inspect_search_fallback_fts_parity_dry_run(
+        &self,
+        comparison_cap: usize,
+    ) -> Result<FtsDryRunParity> {
+        anyhow::ensure!(
+            comparison_cap > 0,
+            "FTS dry-run comparison cap must be positive"
+        );
+        let canonical_messages =
+            self.conn
+                .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                    row.get_typed::<i64>(0)
+                })?;
+        let indexable_messages = self.count_fts_indexable_messages()?;
+        let fts_schema_rows = self.conn.query_row_map(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages'",
+            fparams![],
+            |row| row.get_typed::<i64>(0),
+        )?;
+
+        let terminal = |status, indexed_messages, detail| FtsDryRunParity {
+            exact_status: Some(status),
+            canonical_messages,
+            indexable_messages,
+            indexed_messages,
+            inspection_complete: true,
+            comparison_cap,
+            canonical_ids_examined: 0,
+            indexed_ids_examined: 0,
+            observed_missing_canonical_rowids_at_least: 0,
+            observed_excess_fts_rowids_at_least: 0,
+            detail,
+        };
+        if fts_schema_rows == 0 {
+            return Ok(terminal(FtsShadowParityStatus::Absent, None, None));
+        }
+        if fts_schema_rows != 1 {
+            return Ok(terminal(
+                FtsShadowParityStatus::Unqueryable,
+                None,
+                Some(format!(
+                    "sqlite_master contains {fts_schema_rows} fts_messages rows; expected exactly one"
+                )),
+            ));
+        }
+
+        let indexed_messages = match self.conn.query_row_map(
+            "SELECT COUNT(*) FROM fts_messages_docsize",
+            fparams![],
+            |row| row.get_typed::<i64>(0),
+        ) {
+            Ok(count) => count,
+            Err(err) => {
+                return Ok(terminal(
+                    FtsShadowParityStatus::Unqueryable,
+                    None,
+                    Some(format!("counting fts_messages_docsize failed: {err}")),
+                ));
+            }
+        };
+        anyhow::ensure!(
+            indexed_messages >= 0,
+            "invalid FTS docsize count: {indexed_messages}"
+        );
+
+        let page_limit = i64::try_from(comparison_cap).unwrap_or(i64::MAX);
+        let canonical_ids = self.fetch_indexable_message_id_parity_page(None, page_limit)?;
+        let indexed_ids = self.fetch_fts_docsize_id_parity_page(None, page_limit)?;
+        let canonical_complete = indexable_messages <= page_limit;
+        let indexed_complete = indexed_messages <= page_limit;
+        if canonical_complete {
+            anyhow::ensure!(
+                i64::try_from(canonical_ids.len()).ok() == Some(indexable_messages),
+                "bounded canonical FTS dry-run returned {} IDs for an exact {indexable_messages}-row domain",
+                canonical_ids.len()
+            );
+        }
+        if indexed_complete {
+            anyhow::ensure!(
+                i64::try_from(indexed_ids.len()).ok() == Some(indexed_messages),
+                "bounded FTS dry-run returned {} IDs for an exact {indexed_messages}-row shadow",
+                indexed_ids.len()
+            );
+        }
+
+        let mut canonical_index = 0usize;
+        let mut indexed_index = 0usize;
+        let mut observed_missing = 0usize;
+        let mut observed_excess = 0usize;
+        while let (Some(canonical_id), Some(indexed_id)) = (
+            canonical_ids.get(canonical_index),
+            indexed_ids.get(indexed_index),
+        ) {
+            match canonical_id.cmp(indexed_id) {
+                std::cmp::Ordering::Less => {
+                    observed_missing = observed_missing.saturating_add(1);
+                    canonical_index = canonical_index.saturating_add(1);
+                }
+                std::cmp::Ordering::Equal => {
+                    canonical_index = canonical_index.saturating_add(1);
+                    indexed_index = indexed_index.saturating_add(1);
+                }
+                std::cmp::Ordering::Greater => {
+                    observed_excess = observed_excess.saturating_add(1);
+                    indexed_index = indexed_index.saturating_add(1);
+                }
+            }
+        }
+        if indexed_complete {
+            observed_missing = observed_missing
+                .saturating_add(canonical_ids.len().saturating_sub(canonical_index));
+        }
+        if canonical_complete {
+            observed_excess =
+                observed_excess.saturating_add(indexed_ids.len().saturating_sub(indexed_index));
+        }
+
+        let inspection_complete = canonical_complete && indexed_complete;
+        let (exact_status, detail) = if inspection_complete {
+            let missing_messages = i64::try_from(observed_missing).unwrap_or(i64::MAX);
+            let excess_messages = i64::try_from(observed_excess).unwrap_or(i64::MAX);
+            let intersection_messages = indexable_messages.saturating_sub(missing_messages);
+            let (status, detail) = classify_fts_shadow_parity(
+                indexable_messages,
+                indexed_messages,
+                intersection_messages,
+                missing_messages,
+                excess_messages,
+            );
+            (Some(status), detail)
+        } else {
+            (
+                None,
+                Some(format!(
+                    "bounded dry-run stopped after at most {comparison_cap} row IDs per domain; exact parity is deferred to --yes before any mutation"
+                )),
+            )
+        };
+
+        Ok(FtsDryRunParity {
+            exact_status,
+            canonical_messages,
+            indexable_messages,
+            indexed_messages: Some(indexed_messages),
+            inspection_complete,
+            comparison_cap,
+            canonical_ids_examined: canonical_ids.len(),
+            indexed_ids_examined: indexed_ids.len(),
+            observed_missing_canonical_rowids_at_least: observed_missing,
+            observed_excess_fts_rowids_at_least: observed_excess,
+            detail,
+        })
+    }
+
     pub(crate) fn inspect_search_fallback_fts_parity(&self) -> Result<FtsShadowParity> {
         let canonical_messages =
             self.conn
@@ -12473,44 +12705,13 @@ impl FrankenStorage {
         );
         let missing_messages = indexable_messages.saturating_sub(intersection_messages);
         let excess_messages = indexed_messages.saturating_sub(intersection_messages);
-        let (status, detail) = match indexed_messages.cmp(&indexable_messages) {
-            std::cmp::Ordering::Less => {
-                if excess_messages > 0 {
-                    (
-                        FtsShadowParityStatus::Divergent,
-                        Some(format!(
-                            "FTS contains {excess_messages} non-canonical rowids while {missing_messages} canonical rowids are missing (intersection={intersection_messages})"
-                        )),
-                    )
-                } else {
-                    (FtsShadowParityStatus::Partial, None)
-                }
-            }
-            std::cmp::Ordering::Equal => {
-                if missing_messages > 0 || excess_messages > 0 {
-                    (
-                        FtsShadowParityStatus::Divergent,
-                        Some(format!(
-                            "equal counts conceal rowid divergence (missing_canonical_rowids={missing_messages}, excess_fts_rowids={excess_messages}, intersection={intersection_messages})"
-                        )),
-                    )
-                } else {
-                    (FtsShadowParityStatus::Healthy, None)
-                }
-            }
-            std::cmp::Ordering::Greater => {
-                if missing_messages > 0 {
-                    (
-                        FtsShadowParityStatus::Divergent,
-                        Some(format!(
-                            "FTS has {excess_messages} excess non-canonical rowids while {missing_messages} canonical rowids are missing (intersection={intersection_messages})"
-                        )),
-                    )
-                } else {
-                    (FtsShadowParityStatus::Excess, None)
-                }
-            }
-        };
+        let (status, detail) = classify_fts_shadow_parity(
+            indexable_messages,
+            indexed_messages,
+            intersection_messages,
+            missing_messages,
+            excess_messages,
+        );
         Ok(FtsShadowParity {
             status,
             canonical_messages,
@@ -20433,6 +20634,86 @@ mod tests {
                 .as_deref()
                 .is_some_and(|detail| detail.contains("equal counts conceal rowid divergence"))
         );
+    }
+
+    #[test]
+    fn gh345_fts_dry_run_caps_rowid_work_without_claiming_late_divergence_is_healthy() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("fts-capped-dry-run.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        seed_atomic_fts_rebuild_fixture(&storage);
+
+        let small = storage
+            .inspect_search_fallback_fts_parity_dry_run(1)
+            .expect("inspect a one-row shadow exactly at the dry-run cap");
+        assert!(small.inspection_complete);
+        assert_eq!(small.exact_status, Some(FtsShadowParityStatus::Healthy));
+
+        let conversation_id: i64 = storage
+            .raw()
+            .query_row_map("SELECT id FROM conversations LIMIT 1", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        for idx in 1_i64..6 {
+            storage
+                .raw()
+                .execute_compat(
+                    "INSERT INTO messages(conversation_id, idx, role, content)
+                     VALUES(?1, ?2, 'assistant', ?3)",
+                    fparams![conversation_id, idx, format!("late divergence row {idx}")],
+                )
+                .unwrap();
+        }
+        storage.rebuild_fts().unwrap();
+        let last_message_id: i64 = storage
+            .raw()
+            .query_row_map("SELECT MAX(id) FROM messages", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        storage
+            .raw()
+            .execute_compat(
+                "DELETE FROM fts_messages_docsize WHERE id = ?1",
+                fparams![last_message_id],
+            )
+            .unwrap();
+        storage
+            .raw()
+            .execute_compat(
+                "INSERT INTO fts_messages_docsize(id, sz)
+                 SELECT ?1, sz FROM fts_messages_docsize ORDER BY id LIMIT 1",
+                fparams![9_999_999_i64],
+            )
+            .unwrap();
+
+        let capped = storage
+            .inspect_search_fallback_fts_parity_dry_run(2)
+            .expect("bounded dry-run must stop before the planted late divergence");
+        assert!(!capped.inspection_complete);
+        assert_eq!(capped.exact_status, None);
+        assert_eq!(capped.status_as_str(), "indeterminate");
+        assert_eq!(capped.canonical_ids_examined, 2);
+        assert_eq!(capped.indexed_ids_examined, 2);
+        assert_eq!(capped.observed_missing_canonical_rowids_at_least, 0);
+        assert_eq!(capped.observed_excess_fts_rowids_at_least, 0);
+
+        let exact = storage
+            .inspect_search_fallback_fts_parity()
+            .expect("the mutating path's full preflight must find late divergence");
+        assert_eq!(exact.status, FtsShadowParityStatus::Divergent);
+
+        let completed = storage
+            .inspect_search_fallback_fts_parity_dry_run(6)
+            .expect("a cap covering both domains should classify them exactly");
+        assert!(completed.inspection_complete);
+        assert_eq!(
+            completed.exact_status,
+            Some(FtsShadowParityStatus::Divergent)
+        );
+        assert_eq!(completed.observed_missing_canonical_rowids_at_least, 1);
+        assert_eq!(completed.observed_excess_fts_rowids_at_least, 1);
     }
 
     #[test]

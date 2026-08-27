@@ -27,13 +27,16 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::storage::sqlite::{
-    FrankenStorage, FtsConsistencyRepair, FtsShadowParity, FtsShadowParityStatus,
+    FrankenStorage, FtsConsistencyRepair, FtsDryRunParity, FtsShadowParity, FtsShadowParityStatus,
 };
 use crate::{CliError, CliResult, RobotFormat, default_data_dir};
 
 /// Page size for streaming conversations during reconstruction. Keeps memory
 /// bounded on multi-GB archives (the exact failure surface from #285/#266).
 const RECOVER_CONVERSATION_PAGE: i64 = 256;
+/// Maximum canonical and FTS row IDs inspected by a read-only dry-run. The
+/// mutating path still performs exact parity validation before changing data.
+const FTS_DRY_RUN_ROWID_COMPARISON_CAP: usize = 4_096;
 
 fn now_unix_ms() -> i64 {
     SystemTime::now()
@@ -409,8 +412,8 @@ fn fts_parity_json(parity: &FtsShadowParity) -> serde_json::Value {
     })
 }
 
-fn planned_fts_repair(parity: &FtsShadowParity) -> &'static str {
-    match parity.status {
+fn planned_fts_repair(status: FtsShadowParityStatus) -> &'static str {
+    match status {
         FtsShadowParityStatus::Absent => "failure_atomic_recreate",
         FtsShadowParityStatus::Healthy => "verify_and_record_generation",
         FtsShadowParityStatus::Partial => "resumable_incremental_catch_up",
@@ -421,8 +424,8 @@ fn planned_fts_repair(parity: &FtsShadowParity) -> &'static str {
     }
 }
 
-fn fts_repair_is_applicable(parity: &FtsShadowParity) -> bool {
-    match parity.status {
+fn fts_repair_is_applicable(status: FtsShadowParityStatus) -> bool {
+    match status {
         FtsShadowParityStatus::Absent
         | FtsShadowParityStatus::Healthy
         | FtsShadowParityStatus::Partial => true,
@@ -432,20 +435,44 @@ fn fts_repair_is_applicable(parity: &FtsShadowParity) -> bool {
     }
 }
 
-fn fts_rebuild_dry_run_envelope(db_path: &Path, parity: &FtsShadowParity) -> serde_json::Value {
-    let applicable = fts_repair_is_applicable(parity);
+fn fts_dry_run_parity_json(parity: &FtsDryRunParity) -> serde_json::Value {
+    serde_json::json!({
+        "status": parity.status_as_str(),
+        "canonical_messages": parity.canonical_messages,
+        "indexable_messages": parity.indexable_messages,
+        "indexed_messages": parity.indexed_messages,
+        "inspection_complete": parity.inspection_complete,
+        "comparison_cap": parity.comparison_cap,
+        "canonical_ids_examined": parity.canonical_ids_examined,
+        "indexed_ids_examined": parity.indexed_ids_examined,
+        "observed_missing_canonical_rowids_at_least": parity.observed_missing_canonical_rowids_at_least,
+        "observed_excess_fts_rowids_at_least": parity.observed_excess_fts_rowids_at_least,
+        "detail": parity.detail,
+    })
+}
+
+fn fts_rebuild_dry_run_envelope(db_path: &Path, parity: &FtsDryRunParity) -> serde_json::Value {
+    let applicable = parity.exact_status.map(fts_repair_is_applicable);
+    let planned_action = parity
+        .exact_status
+        .map(planned_fts_repair)
+        .unwrap_or("exact_parity_inspection_deferred_to_apply");
+    let apply_command = match applicable {
+        Some(true) | None => Some("cass doctor --rebuild-canonical-fts --yes --json"),
+        Some(false) => None,
+    };
     serde_json::json!({
         "schema_version": 1,
         "doctor_contract_version": 1,
         "kind": "rebuild_canonical_fts_dry_run",
         "dry_run": true,
         "db_path": db_path.display().to_string(),
-        "parity": fts_parity_json(parity),
-        "planned_action": planned_fts_repair(parity),
+        "parity": fts_dry_run_parity_json(parity),
+        "planned_action": planned_action,
         "would_mutate": applicable,
         "canonical_rows_modified": false,
-        "apply_command": applicable.then_some("cass doctor --rebuild-canonical-fts --yes --json"),
-        "note": "Read-only inspection only; --yes never overrides --dry-run.",
+        "apply_command": apply_command,
+        "note": "Read-only bounded inspection only; an indeterminate result never means healthy. The --yes path performs exact parity validation before any mutation, and --yes never overrides --dry-run.",
     })
 }
 
@@ -565,31 +592,42 @@ pub fn run_doctor_rebuild_canonical_fts(
             ));
         }
     };
-    let before = storage.inspect_search_fallback_fts_parity().map_err(|e| {
-        storage_error(
-            format!("inspecting canonical/FTS5 row parity: {e:#}"),
-            Some(
-                "Preserve the canonical archive bundle and run 'cass doctor check --json' before retrying.",
-            ),
-        )
-    })?;
-
     if dry_run {
+        let before = storage
+            .inspect_search_fallback_fts_parity_dry_run(FTS_DRY_RUN_ROWID_COMPARISON_CAP)
+            .map_err(|e| {
+                storage_error(
+                    format!("performing bounded canonical/FTS5 row-parity inspection: {e:#}"),
+                    Some(
+                        "Preserve the canonical archive bundle and run 'cass doctor check --json' before retrying.",
+                    ),
+                )
+            })?;
         let envelope = fts_rebuild_dry_run_envelope(&db_path, &before);
         if structured_format.is_some() {
             print_json(&envelope)?;
         } else {
             println!(
-                "Canonical FTS5 dry-run: status={}, planned_action={}, canonical={}, indexable={}, indexed={:?}",
-                before.status.as_str(),
-                planned_fts_repair(&before),
+                "Canonical FTS5 dry-run: status={}, inspection_complete={}, canonical={}, indexable={}, indexed={:?}, rowid_cap={}",
+                before.status_as_str(),
+                before.inspection_complete,
                 before.canonical_messages,
                 before.indexable_messages,
-                before.indexed_messages
+                before.indexed_messages,
+                before.comparison_cap,
             );
         }
         return Ok(());
     }
+
+    let before = storage.inspect_search_fallback_fts_parity().map_err(|e| {
+        storage_error(
+            format!("inspecting exact canonical/FTS5 row parity before repair: {e:#}"),
+            Some(
+                "Preserve the canonical archive bundle and run 'cass doctor check --json' before retrying.",
+            ),
+        )
+    })?;
 
     let repair = storage
         .ensure_search_fallback_fts_consistency()
@@ -801,6 +839,26 @@ pub fn run_doctor_cleanup_interrupted_artifacts(
 mod tests {
     use super::*;
     use crate::franken_sync::compat::{ConnectionExt as _, ParamValue, RowExt as _};
+
+    fn exact_dry_run_parity(parity: FtsShadowParity) -> FtsDryRunParity {
+        FtsDryRunParity {
+            exact_status: Some(parity.status),
+            canonical_messages: parity.canonical_messages,
+            indexable_messages: parity.indexable_messages,
+            indexed_messages: parity.indexed_messages,
+            inspection_complete: true,
+            comparison_cap: FTS_DRY_RUN_ROWID_COMPARISON_CAP,
+            canonical_ids_examined: usize::try_from(parity.indexable_messages.max(0))
+                .unwrap_or(usize::MAX),
+            indexed_ids_examined: parity
+                .indexed_messages
+                .and_then(|count| usize::try_from(count.max(0)).ok())
+                .unwrap_or(0),
+            observed_missing_canonical_rowids_at_least: 0,
+            observed_excess_fts_rowids_at_least: 0,
+            detail: parity.detail,
+        }
+    }
 
     fn write_message(storage: &FrankenStorage, conversation_id: i64, idx: i64, raw_line: &str) {
         // Store the verbatim line via the historical-raw-json sentinel wrapper
@@ -1130,6 +1188,7 @@ mod tests {
             indexed_messages: Some(2),
             detail: Some("equal counts conceal rowid divergence".to_string()),
         };
+        let parity = exact_dry_run_parity(parity);
         let envelope = fts_rebuild_dry_run_envelope(Path::new("/tmp/divergent.db"), &parity);
         assert_eq!(
             envelope["planned_action"],
@@ -1149,6 +1208,7 @@ mod tests {
             indexed_messages: None,
             detail: Some("counting fts_messages_docsize failed".to_string()),
         };
+        let parity = exact_dry_run_parity(parity);
         let envelope = fts_rebuild_dry_run_envelope(Path::new("/tmp/unqueryable.db"), &parity);
         assert_eq!(
             envelope["planned_action"],
@@ -1156,6 +1216,35 @@ mod tests {
         );
         assert_eq!(envelope["would_mutate"], false);
         assert_eq!(envelope["apply_command"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn gh345_indeterminate_fts_dry_run_defers_exact_parity_without_claiming_mutation() {
+        let parity = FtsDryRunParity {
+            exact_status: None,
+            canonical_messages: 2_000_000,
+            indexable_messages: 2_000_000,
+            indexed_messages: Some(39_000),
+            inspection_complete: false,
+            comparison_cap: FTS_DRY_RUN_ROWID_COMPARISON_CAP,
+            canonical_ids_examined: FTS_DRY_RUN_ROWID_COMPARISON_CAP,
+            indexed_ids_examined: FTS_DRY_RUN_ROWID_COMPARISON_CAP,
+            observed_missing_canonical_rowids_at_least: 0,
+            observed_excess_fts_rowids_at_least: 0,
+            detail: Some("bounded comparison reached its cap".to_string()),
+        };
+        let envelope = fts_rebuild_dry_run_envelope(Path::new("/tmp/large.db"), &parity);
+        assert_eq!(envelope["parity"]["status"], "indeterminate");
+        assert_eq!(envelope["parity"]["inspection_complete"], false);
+        assert_eq!(
+            envelope["planned_action"],
+            "exact_parity_inspection_deferred_to_apply"
+        );
+        assert_eq!(envelope["would_mutate"], serde_json::Value::Null);
+        assert_eq!(
+            envelope["apply_command"],
+            "cass doctor --rebuild-canonical-fts --yes --json"
+        );
     }
 
     /// GH #362: a single whitespace-delimited token beyond the FTS5 u16

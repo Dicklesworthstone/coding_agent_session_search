@@ -29,8 +29,15 @@
 //!   delayed on CPU in the last 10s). This is the best single "how
 //!   unresponsive does the machine feel" signal available from the kernel.
 //!
-//! On non-Linux platforms the reader always reports healthy, so the governor
-//! reduces to a no-op.
+//! On macOS only the load-average signal is available (`sysctl -n vm.loadavg`);
+//! there is no PSI equivalent. On other platforms the reader always reports
+//! healthy, so the governor reduces to a no-op.
+//!
+//! Scheduled maintenance (`cass schedule run`, `cass models backfill
+//! --scheduled`, the daemon's periodic index spawn) can additionally require
+//! console idle time via `CASS_RESPONSIVENESS_MIN_USER_IDLE_SECS` — see
+//! [`user_idle_gate`]. That gate is deliberately *not* consulted by foreground
+//! indexing: a human who typed `cass index` wants it to run now.
 
 use std::collections::VecDeque;
 use std::sync::{
@@ -456,14 +463,14 @@ pub(crate) trait HealthReader: Send + Sync {
 }
 
 pub(crate) struct ProcHealthReader {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     ncpu: usize,
 }
 
 impl ProcHealthReader {
     pub fn new() -> Self {
         Self {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             ncpu: available_parallelism(),
         }
     }
@@ -486,7 +493,26 @@ impl HealthReader for ProcHealthReader {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    // macOS has no `/proc`, but the 1-minute load average is one `sysctl`
+    // away. Without this the governor reported "healthy" unconditionally on
+    // Apple hardware, so background/scheduled indexing had no idle signal at
+    // all there (the whole point of running it "when the machine is quiet").
+    #[cfg(target_os = "macos")]
+    fn snapshot(&self) -> HealthSnapshot {
+        let load_per_core = read_loadavg().map(|l1| {
+            if self.ncpu == 0 {
+                l1
+            } else {
+                l1 / self.ncpu as f32
+            }
+        });
+        HealthSnapshot {
+            load_per_core,
+            psi_cpu_some_avg10: None,
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn snapshot(&self) -> HealthSnapshot {
         HealthSnapshot {
             load_per_core: None,
@@ -500,6 +526,136 @@ fn read_loadavg() -> Option<f32> {
     let raw = std::fs::read_to_string("/proc/loadavg").ok()?;
     let first = raw.split_whitespace().next()?;
     first.parse::<f32>().ok()
+}
+
+/// macOS: `sysctl -n vm.loadavg` prints `{ 1.23 1.45 1.50 }`.
+#[cfg(target_os = "macos")]
+fn read_loadavg() -> Option<f32> {
+    let output = std::process::Command::new("sysctl")
+        .args(["-n", "vm.loadavg"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    macos_loadavg_1m_from_sysctl(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parse the 1-minute field out of `sysctl -n vm.loadavg` output
+/// (`{ 1.23 1.45 1.50 }`). Tolerates missing braces.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn macos_loadavg_1m_from_sysctl(raw: &str) -> Option<f32> {
+    raw.split(|c: char| c.is_whitespace() || c == '{' || c == '}')
+        .find(|token| !token.is_empty())
+        .and_then(|token| token.parse::<f32>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+/// Seconds since the last keyboard/mouse input from the console user, when
+/// the platform exposes it. Used as an *optional* gate for scheduled
+/// background maintenance ("only when the human has stepped away"), never for
+/// foreground throttling. `None` means "unknown", which callers must treat as
+/// "do not gate".
+///
+/// * macOS: `ioreg -c IOHIDSystem` reports `HIDIdleTime` in nanoseconds.
+/// * Linux / others: no portable console-idle signal without a display server
+///   dependency; returns `None`. (Load/PSI already cover "machine busy".)
+pub(crate) fn user_idle_seconds() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("ioreg")
+            .args(["-c", "IOHIDSystem", "-d", "4", "-r"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        macos_hid_idle_seconds_from_ioreg(&String::from_utf8_lossy(&output.stdout))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// Parse `"HIDIdleTime" = <nanoseconds>` out of `ioreg` output.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn macos_hid_idle_seconds_from_ioreg(raw: &str) -> Option<u64> {
+    raw.lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            if !key.contains("HIDIdleTime") {
+                return None;
+            }
+            value.trim().parse::<u64>().ok()
+        })
+        .min()
+        .map(|nanos| nanos / 1_000_000_000)
+}
+
+/// Immediate (no sampler warm-up) machine-pressure verdict for one-shot
+/// scheduled jobs. The live governor needs several ticks before its capacity
+/// figure means anything; a `cass schedule run` process lives for one job and
+/// wants an answer now.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+pub(crate) struct MachinePressure {
+    pub load_per_core: Option<f32>,
+    pub psi_cpu_some_avg10: Option<f32>,
+    /// Above the step-down threshold (`CASS_RESPONSIVENESS_MAX_LOAD_PER_CORE`
+    /// / `..._MAX_PSI_AVG10`).
+    pub pressured: bool,
+    /// Above the severe threshold.
+    pub severe: bool,
+}
+
+pub(crate) fn machine_pressure_now() -> MachinePressure {
+    let cfg = GovernorConfig::from_env();
+    let snapshot = ProcHealthReader::new().snapshot();
+    machine_pressure_for(&snapshot, &cfg)
+}
+
+pub(crate) fn machine_pressure_for(
+    snapshot: &HealthSnapshot,
+    cfg: &GovernorConfig,
+) -> MachinePressure {
+    MachinePressure {
+        load_per_core: snapshot.load_per_core,
+        psi_cpu_some_avg10: snapshot.psi_cpu_some_avg10,
+        pressured: snapshot.is_pressured(cfg),
+        severe: snapshot.is_severe(cfg),
+    }
+}
+
+/// Optional "human has stepped away" gate for scheduled maintenance.
+/// `CASS_RESPONSIVENESS_MIN_USER_IDLE_SECS=<N>` (default `0` = disabled)
+/// requires at least `N` seconds of console idle time before scheduled
+/// semantic backfill / scheduled index jobs run. When the platform cannot
+/// report idle time the gate passes (fail open) so a Linux headless box is
+/// never wedged by a signal it does not have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct UserIdleGate {
+    pub required_secs: u64,
+    pub observed_secs: Option<u64>,
+    pub satisfied: bool,
+}
+
+pub(crate) fn user_idle_gate() -> UserIdleGate {
+    let required_secs = env_u64("CASS_RESPONSIVENESS_MIN_USER_IDLE_SECS").unwrap_or(0);
+    let observed_secs = if required_secs == 0 {
+        None
+    } else {
+        user_idle_seconds()
+    };
+    user_idle_gate_for(required_secs, observed_secs)
+}
+
+pub(crate) fn user_idle_gate_for(required_secs: u64, observed_secs: Option<u64>) -> UserIdleGate {
+    let satisfied = required_secs == 0 || observed_secs.is_none_or(|idle| idle >= required_secs);
+    UserIdleGate {
+        required_secs,
+        observed_secs,
+        satisfied,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1351,6 +1507,10 @@ fn env_u32(key: &str) -> Option<u32> {
     dotenvy::var(key).ok().and_then(|v| v.trim().parse().ok())
 }
 
+fn env_u64(key: &str) -> Option<u64> {
+    dotenvy::var(key).ok().and_then(|v| v.trim().parse().ok())
+}
+
 fn env_f32(key: &str) -> Option<f32> {
     dotenvy::var(key).ok().and_then(|v| v.trim().parse().ok())
 }
@@ -1559,6 +1719,61 @@ fn macos_rss_kib_to_bytes(text: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    /// macOS load-average parser is pure so it runs on Linux CI too.
+    #[test]
+    fn macos_sysctl_loadavg_parser_reads_one_minute_field() {
+        assert_eq!(
+            macos_loadavg_1m_from_sysctl("{ 1.23 1.45 1.50 }\n"),
+            Some(1.23)
+        );
+        assert_eq!(macos_loadavg_1m_from_sysctl("0.07 0.10 0.12"), Some(0.07));
+        assert_eq!(macos_loadavg_1m_from_sysctl(""), None);
+        assert_eq!(macos_loadavg_1m_from_sysctl("{ }"), None);
+        assert_eq!(macos_loadavg_1m_from_sysctl("{ nan 1 1 }"), None);
+        assert_eq!(macos_loadavg_1m_from_sysctl("{ -1 1 1 }"), None);
+    }
+
+    #[test]
+    fn macos_ioreg_hid_idle_parser_converts_nanoseconds_and_takes_min() {
+        let sample = "+-o IOHIDSystem  <class IOHIDSystem>\n\
+             |   {\n\
+             |     \"HIDIdleTime\" = 125000000000\n\
+             |     \"HIDParameters\" = {\"Foo\"=1}\n\
+             |   }\n\
+             +-o IOHIDSystem2\n\
+             |     \"HIDIdleTime\" = 3000000000\n";
+        assert_eq!(macos_hid_idle_seconds_from_ioreg(sample), Some(3));
+        assert_eq!(macos_hid_idle_seconds_from_ioreg("no idle here"), None);
+        assert_eq!(
+            macos_hid_idle_seconds_from_ioreg("\"HIDIdleTime\" = notanumber"),
+            None
+        );
+    }
+
+    #[test]
+    fn user_idle_gate_is_disabled_at_zero_and_fails_open_without_signal() {
+        let disabled = user_idle_gate_for(0, Some(1));
+        assert!(disabled.satisfied);
+        assert_eq!(disabled.required_secs, 0);
+
+        let unknown = user_idle_gate_for(600, None);
+        assert!(unknown.satisfied, "unknown idle must fail open");
+
+        let active = user_idle_gate_for(600, Some(30));
+        assert!(!active.satisfied);
+        assert_eq!(active.observed_secs, Some(30));
+
+        let away = user_idle_gate_for(600, Some(600));
+        assert!(away.satisfied);
+    }
+
+    #[test]
+    fn user_idle_seconds_probe_never_panics() {
+        // Platform-dependent: Some(_) on macOS with a console session, None
+        // elsewhere. Either is acceptable; the probe must simply not fail.
+        let _ = user_idle_seconds();
+    }
 
     /// #294: the macOS `vm_stat` parser turns reclaimable page counts into bytes
     /// using the reported page size, so the host-memory-reserve throttle (which

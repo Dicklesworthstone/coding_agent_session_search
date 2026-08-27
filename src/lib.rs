@@ -60,6 +60,7 @@ pub mod resource_plan;
 pub mod robot_budget_envelope;
 pub mod root_cause_projection;
 pub mod root_cause_taxonomy;
+pub mod schedule;
 pub mod search;
 pub mod search_defaults;
 pub mod search_quality_eval;
@@ -456,6 +457,15 @@ pub enum Commands {
         /// Emit per-ingest-batch NDJSON timing and lookup counters on stderr for perf bisection.
         #[arg(long, default_value_t = false)]
         robot_trace_ingest: bool,
+
+        /// Run as a low-priority background job: lowers this process's CPU
+        /// priority (nice, default 15; CASS_BACKGROUND_NICE) and I/O priority
+        /// (ionice idle class on Linux; CASS_BACKGROUND_IONICE_CLASS) before
+        /// indexing. This is what stale-on-read catch-up, `cass schedule`, and
+        /// the daemon's periodic refresh use. Has no effect on what gets
+        /// indexed.
+        #[arg(long, default_value_t = false)]
+        background: bool,
     },
     /// Generate shell completions to stdout
     Completions {
@@ -1644,6 +1654,80 @@ pub enum Commands {
         /// Override data dir for model storage
         #[arg(long)]
         data_dir: Option<PathBuf>,
+    },
+
+    /// Keep the index fresh automatically via the OS scheduler (launchd / systemd user timers)
+    #[command(subcommand)]
+    Schedule(ScheduleCommand),
+}
+
+/// `cass schedule` — register low-priority background index jobs with the
+/// operating system's scheduler so the index is never stale when you search.
+#[derive(Subcommand, Debug, Clone)]
+pub enum ScheduleCommand {
+    /// Register the incremental (every N minutes) and nightly (full index +
+    /// semantic backfill) jobs with launchd (macOS) or systemd user timers (Linux)
+    Install {
+        /// Minutes between incremental index passes
+        #[arg(long, default_value_t = crate::schedule::DEFAULT_INTERVAL_MINS)]
+        interval_mins: u32,
+        /// Local hour (0-23) for the nightly full index + semantic backfill
+        #[arg(long, default_value_t = crate::schedule::DEFAULT_NIGHTLY_HOUR, value_parser = clap::value_parser!(u8).range(0..=23))]
+        nightly_hour: u8,
+        /// Minute (0-59) for the nightly job
+        #[arg(long, default_value_t = crate::schedule::DEFAULT_NIGHTLY_MINUTE, value_parser = clap::value_parser!(u8).range(0..=59))]
+        nightly_minute: u8,
+        /// Register only the incremental job (skip the nightly full index)
+        #[arg(long, default_value_t = false)]
+        no_nightly: bool,
+        /// Nightly job indexes only; never runs semantic backfill
+        #[arg(long, default_value_t = false)]
+        no_semantic: bool,
+        /// Render the unit files and commands without writing or registering anything
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Data dir the scheduled jobs target (baked into the units)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
+    /// Unregister the jobs and remove the unit files cass wrote
+    Uninstall {
+        /// Report what would be removed without touching anything
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
+    /// Show registered jobs, scheduler state, and the last run of each job
+    Status {
+        /// Override data dir
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
+    /// Execute one job now (this is what the scheduler units invoke)
+    Run {
+        /// Which job to run
+        #[arg(long, value_enum)]
+        job: crate::schedule::ScheduleJob,
+        /// Override data dir
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Skip semantic backfill in the nightly job
+        #[arg(long, default_value_t = false)]
+        no_semantic: bool,
+        /// Ignore load / console-idle gates and run regardless
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
     },
 }
 
@@ -3161,6 +3245,7 @@ fn command_accepts_leading_structured_flag(command: &str) -> bool {
             | "release-verify"
             | "resume"
             | "robot-docs"
+            | "schedule"
             | "search"
             | "sessions"
             | "sources"
@@ -3190,6 +3275,14 @@ fn data_dir_insertion_index(rest: &[String], command_index: usize) -> Option<usi
         "sources" => rest
             .get(command_index + 1)
             .is_some_and(|action| action.eq_ignore_ascii_case("artifact-manifest"))
+            .then_some(command_index + 2),
+        "schedule" => rest
+            .get(command_index + 1)
+            .is_some_and(|action| {
+                ["install", "status", "run"]
+                    .iter()
+                    .any(|candidate| action.eq_ignore_ascii_case(candidate))
+            })
             .then_some(command_index + 2),
         "models" => rest
             .get(command_index + 1)
@@ -5063,6 +5156,7 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         // Added flags
         "watch-once",
         "watch-interval",
+        "background",
         "semantic",
         "embedder",
         "idempotency-key",
@@ -6075,6 +6169,7 @@ const CANONICAL_TOP_LEVEL_COMMANDS: &[&str] = &[
     "pages",
     "import",
     "daemon",
+    "schedule",
     "upgrade",
     "completions",
     "man",
@@ -6776,6 +6871,13 @@ async fn execute_cli(
                     .unwrap_or_else(|| tui_data_dir.join("agent_search.db"));
                 if refresh {
                     refresh_index_inline(cli.db.clone(), Some(tui_data_dir.clone()));
+                } else if let Some(outcome) =
+                    maybe_auto_refresh_index_after_read(&tui_data_dir, &tui_db_path, None)
+                {
+                    // Stale-on-launch catch-up runs detached; the TUI opens
+                    // immediately on the existing index and can reload
+                    // (Ctrl+Shift+R / command palette) once it lands.
+                    info!(?outcome, "tui: auto-refresh evaluated");
                 }
                 info!(once, inline, ui_height, %anchor, record_macro = ?record_macro, play_macro = ?play_macro, "launching ftui runtime");
 
@@ -6909,6 +7011,7 @@ async fn execute_cli(
                     progress_interval_ms,
                     no_progress_events,
                     robot_trace_ingest,
+                    background,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
                     run_index_with_data(
@@ -6928,6 +7031,7 @@ async fn execute_cli(
                         progress_interval_ms,
                         no_progress_events,
                         robot_trace_ingest,
+                        background,
                     )?;
                 }
                 Commands::Search {
@@ -8488,6 +8592,9 @@ async fn execute_cli(
                     data_dir,
                 } => {
                     run_daemon(socket, idle_timeout, max_connections, data_dir)?;
+                }
+                Commands::Schedule(subcmd) => {
+                    run_schedule_command(subcmd, cli)?;
                 }
                 _ => {}
             }
@@ -19638,6 +19745,10 @@ fn error_chain_indicates_archive_health_blocked(chain: &str) -> bool {
     chain.contains("will not replace or truncate the SQLite source of truth")
 }
 
+fn error_chain_indicates_unsupported_quill_writer_admission(chain: &str) -> bool {
+    chain.contains("cross-process Quill writer admission requires flock semantics")
+}
+
 fn index_storage_contention_cli_error(chain: &str) -> CliError {
     CliError {
         code: 7,
@@ -19690,6 +19801,21 @@ fn index_orphan_fk_cleanup_cli_error(chain: &str) -> CliError {
     }
 }
 
+fn index_unsupported_quill_writer_admission_cli_error(chain: &str) -> CliError {
+    CliError {
+        code: 9,
+        kind: CliErrorKind::Index.kind_str(),
+        message: format!(
+            "indexing is unsupported on this platform because Quill cannot acquire its cross-process writer lock: {chain}"
+        ),
+        hint: Some(
+            "This build cannot create or update the Quill lexical index on this platform. Use a supported Unix build, or update CASS after frankensearch#39 ships Windows writer admission. Retrying the same command will not help."
+                .to_string(),
+        ),
+        retryable: false,
+    }
+}
+
 #[cfg(test)]
 mod index_error_mapping_tests {
     use super::*;
@@ -19731,6 +19857,36 @@ mod index_error_mapping_tests {
         assert_eq!(err.code, 14);
         assert_eq!(err.kind, CliErrorKind::Storage.kind_str());
         assert!(err.retryable);
+    }
+
+    #[test]
+    fn unsupported_quill_writer_admission_is_non_retryable_and_actionable() {
+        let chain = "open Quill writer | verify writer-lock support at C:\\cass\\index: cross-process Quill writer admission requires flock semantics";
+
+        assert!(error_chain_indicates_unsupported_quill_writer_admission(
+            chain
+        ));
+        let err = index_unsupported_quill_writer_admission_cli_error(chain);
+
+        assert_eq!(err.code, 9);
+        assert_eq!(err.kind, CliErrorKind::Index.kind_str());
+        assert!(!err.retryable);
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("Retrying the same command will not help")),
+            "hint must prevent an infinite retry loop: {err:?}"
+        );
+    }
+
+    #[test]
+    fn unrelated_quill_errors_are_not_misclassified_as_platform_gaps() {
+        assert!(!error_chain_indicates_unsupported_quill_writer_admission(
+            "open Quill writer | another writer currently holds the admission lock"
+        ));
+        assert!(!error_chain_indicates_unsupported_quill_writer_admission(
+            "open Quill reader | unsupported manifest version 99"
+        ));
     }
 }
 
@@ -20684,6 +20840,64 @@ fn lexical_manifest_indexed_doc_count(index_path: &Path) -> Option<u64> {
         }
         _ => None,
     }
+}
+
+/// Stale-on-read catch-up (see `indexer::background_refresh`).
+///
+/// Read paths (search, pack, TUI launch) call this *after* they have what
+/// they need from the current index. If the index is stale/partial/behind,
+/// a detached low-priority `cass index --background` is spawned so the next
+/// read is fresh; the current read is never blocked or altered.
+///
+/// `precomputed` lets `--robot-meta` callers reuse the freshness block they
+/// already built; otherwise the health-grade probe (no DB open) is used.
+/// Returns the outcome JSON for robot metadata, or `None` when nothing was
+/// attempted (policy off, scratch dir, headless test, index fresh).
+fn maybe_auto_refresh_index_after_read(
+    data_dir: &Path,
+    db_path: &Path,
+    precomputed: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    use crate::indexer::background_refresh;
+
+    if !background_refresh::AutoRefreshPolicy::from_env().enabled {
+        return None;
+    }
+    // Scratch/test data dirs are ephemeral by definition; a detached child
+    // indexing a tempdir after the test that created it has moved on is
+    // pure noise (and a flake generator). Headless TUI harnesses likewise.
+    if auto_refresh_is_scratch_data_dir(data_dir) || dotenvy::var("TUI_HEADLESS").is_ok() {
+        return None;
+    }
+    let owned;
+    let freshness = match precomputed {
+        Some(value) => value,
+        None => {
+            let meta = state_meta_json_for_health(data_dir, db_path, DEFAULT_STALE_THRESHOLD_SECS);
+            owned = state_index_freshness(&meta)?;
+            &owned
+        }
+    };
+    let trigger = background_refresh::catch_up_reason(freshness)?;
+    let outcome =
+        background_refresh::maybe_spawn_background_index_refresh(data_dir, db_path, trigger);
+    let mut value = serde_json::to_value(&outcome).unwrap_or(serde_json::Value::Null);
+    if let serde_json::Value::Object(map) = &mut value {
+        map.insert(
+            "trigger".to_string(),
+            serde_json::Value::String(trigger.to_string()),
+        );
+    }
+    Some(value)
+}
+
+/// True when `data_dir` lives under the platform temp dir (or `CASS_DATA_DIR`
+/// explicitly points at one). Auto-refresh never fires there.
+fn auto_refresh_is_scratch_data_dir(data_dir: &Path) -> bool {
+    let temp = std::env::temp_dir();
+    let canon_temp = std::fs::canonicalize(&temp).unwrap_or(temp);
+    let canon_dir = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    canon_dir.starts_with(&canon_temp) || canon_dir.starts_with("/tmp")
 }
 
 fn state_index_freshness(state: &serde_json::Value) -> Option<serde_json::Value> {
@@ -21898,6 +22112,7 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Pages { .. }) => "pages".to_string(),
         #[cfg(unix)]
         Some(Commands::Daemon { .. }) => "daemon".to_string(),
+        Some(Commands::Schedule(..)) => "schedule".to_string(),
         Some(Commands::Import(..)) => "import".to_string(),
         Some(Commands::Analytics(..)) => "analytics".to_string(),
         None => "(default)".to_string(),
@@ -23719,6 +23934,12 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         } => resolve_subcommand_structured_format(cli, *json).is_some() || *robot_meta,
         Commands::Pack { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Index { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
+        Commands::Schedule(
+            ScheduleCommand::Install { json, .. }
+            | ScheduleCommand::Uninstall { json, .. }
+            | ScheduleCommand::Status { json, .. }
+            | ScheduleCommand::Run { json, .. },
+        ) => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Health { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Onboarding { json, .. } => {
             resolve_subcommand_structured_format(cli, *json).is_some()
@@ -24255,6 +24476,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass analytics [status|tokens|tools|models|rebuild|validate] [--json]  Token / tool / model analytics.".to_string(),
             "  cass import [...]                Import conversation data from external sources.".to_string(),
             "  cass daemon [...]                Run the semantic model daemon (Unix only).".to_string(),
+            "  cass schedule [install|uninstall|status|run] [--json]  Keep the index fresh via launchd / systemd user timers (incremental every 15 min + nightly full index & semantic backfill at low priority).".to_string(),
             "  cass completions <shell>         Emit shell completion script for bash | zsh | fish | powershell.".to_string(),
             "  cass man                         Emit man page (roff) for the cass binary.".to_string(),
         ],
@@ -24278,6 +24500,13 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_TRACE_MAX_BYTES=<N>                 hard trace-file byte ceiling (default 16777216; clamped 4096..1073741824)".to_string(),
             "  CASS_TRACE_MAX_EVENTS=<N>                hard diagnostic-event ceiling (default 50000; clamped 16..10000000)".to_string(),
             "  CASS_INDEX_NO_PROGRESS_EVENTS=1          suppress NDJSON events from `cass index --json`".to_string(),
+            "  CASS_AUTO_REFRESH=0                      disable stale-on-read catch-up (detached `cass index --background` after a stale search/pack/TUI launch)".to_string(),
+            "  CASS_AUTO_REFRESH_COOLDOWN_SECS=<N>      min seconds between auto-spawned catch-up runs (default 300)".to_string(),
+            "  CASS_BACKGROUND_NICE=<N>                 nice value for `cass index --background` (default 15)".to_string(),
+            "  CASS_BACKGROUND_IONICE_CLASS=<N>         ionice class for `cass index --background` on Linux (default 3 = idle)".to_string(),
+            "  CASS_DAEMON_INDEX_INTERVAL_SECS=<N>      resident daemon spawns an incremental background index every N s (default 0 = off)".to_string(),
+            "  CASS_SCHEDULE_MAX_BACKFILL_BATCHES=<N>   cap on semantic backfill batches per nightly `cass schedule run` (default 200)".to_string(),
+            "  CASS_RESPONSIVENESS_MIN_USER_IDLE_SECS=<N>  require console idle time before scheduled backfill/nightly jobs (default 0 = off; macOS only, fails open)".to_string(),
             "  CASS_RESPONSIVENESS_DISABLE=1            pin indexer fan-out at 100% (skip governor)".to_string(),
             "  CASS_RESPONSIVENESS_MIN_CAPACITY_PCT=<N> floor for governor shrink (default 25, range 10..100)".to_string(),
             "  CASS_RESPONSIVENESS_MAX_LOAD_PER_CORE=<F>  loadavg/core threshold for step-down (default 1.25)".to_string(),
@@ -27690,6 +27919,16 @@ fn run_cli_search(
         None
     };
     let index_freshness = state_meta.as_ref().and_then(state_index_freshness);
+    // Stale-on-read catch-up: never blocks this search; a detached
+    // low-priority `cass index --background` makes the *next* search fresh.
+    let auto_refresh =
+        maybe_auto_refresh_index_after_read(&data_dir, &db_path, index_freshness.as_ref());
+    let index_freshness = index_freshness.map(|mut freshness| {
+        if let (Some(outcome), serde_json::Value::Object(map)) = (&auto_refresh, &mut freshness) {
+            map.insert("auto_refresh".to_string(), outcome.clone());
+        }
+        freshness
+    });
     // qfswx: project the `.14.1` storage-integrity verdict for --robot-meta
     // (Some only when state_meta is, i.e. with --robot-meta) so search agrees
     // with doctor/status on the canonical StorageState vocabulary. Computed
@@ -28010,6 +28249,11 @@ fn run_cli_pack(
         .clone()
         .unwrap_or_else(|| data_dir.join("agent_search.db"));
     let db_exists = db_path.exists();
+    // Stale-on-read catch-up: pack reads the same lexical assets as search,
+    // so a stale index here also schedules a detached incremental refresh.
+    if let Some(outcome) = maybe_auto_refresh_index_after_read(&data_dir, &db_path, None) {
+        tracing::debug!(?outcome, "pack: auto-refresh evaluated");
+    }
 
     let mut filters = SearchFilters::default();
     if !agents.is_empty() {
@@ -84808,6 +85052,41 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
             "Suppress NDJSON progress events from cass index --json when set to 1.",
         ),
         env_var_capability(
+            "CASS_AUTO_REFRESH",
+            Some("1"),
+            "Stale-on-read catch-up: when search/pack/TUI sees a stale, partial, or behind index, spawn a detached low-priority `cass index --background` so the next read is fresh. Set 0 to disable.",
+        ),
+        env_var_capability(
+            "CASS_AUTO_REFRESH_COOLDOWN_SECS",
+            Some("300"),
+            "Minimum seconds between two auto-spawned catch-up index runs per data dir.",
+        ),
+        env_var_capability(
+            "CASS_BACKGROUND_NICE",
+            Some("15"),
+            "nice value `cass index --background` applies to itself (0..=19).",
+        ),
+        env_var_capability(
+            "CASS_BACKGROUND_IONICE_CLASS",
+            Some("3"),
+            "ionice class `cass index --background` applies to itself on Linux (3 = idle).",
+        ),
+        env_var_capability(
+            "CASS_RESPONSIVENESS_MIN_USER_IDLE_SECS",
+            Some("0"),
+            "Require this many seconds of console idle time (macOS HIDIdleTime) before scheduled semantic backfill / nightly schedule jobs run; 0 disables, unknown idle fails open.",
+        ),
+        env_var_capability(
+            "CASS_DAEMON_INDEX_INTERVAL_SECS",
+            Some("0"),
+            "While the semantic daemon is resident, spawn a detached incremental `cass index --background` every N seconds (0 = off; 900 recommended). Skipped under severe load and while another index run holds the lock.",
+        ),
+        env_var_capability(
+            "CASS_SCHEDULE_MAX_BACKFILL_BATCHES",
+            Some("200"),
+            "Upper bound on `cass models backfill --scheduled` batches one nightly `cass schedule run` will execute.",
+        ),
+        env_var_capability(
             "CASS_INDEX_STALL_DETECT_SECS",
             Some("120"),
             "Seconds without measured phase progress before cass index emits diagnostics; 0 disables detection.",
@@ -86938,7 +87217,19 @@ fn response_schema_index_freshness() -> serde_json::Value {
             "stale": { "type": "boolean" },
             "stale_threshold_seconds": { "type": "integer" },
             "rebuilding": { "type": "boolean" },
-            "pending_sessions": { "type": "integer" }
+            "pending_sessions": { "type": "integer" },
+            "auto_refresh": {
+                "type": ["object", "null"],
+                "description": "Present when a stale/partial/behind index triggered stale-on-read catch-up evaluation (indexer::background_refresh). `outcome` is one of spawned | disabled | index_run_active | cooldown | guard_busy | spawn_failed.",
+                "properties": {
+                    "outcome": { "type": "string" },
+                    "trigger": { "type": "string" },
+                    "pid": { "type": ["integer", "null"] },
+                    "reason": { "type": ["string", "null"] },
+                    "remaining_secs": { "type": ["integer", "null"] },
+                    "error": { "type": ["string", "null"] }
+                }
+            }
         }
     })
 }
@@ -94916,9 +95207,21 @@ fn run_index_with_data(
     progress_interval_ms: u64,
     no_progress_events: bool,
     robot_trace_ingest: bool,
+    background: bool,
 ) -> CliResult<()> {
     use crate::franken_sync::compat::{ConnectionExt, RowExt};
     use std::time::Instant;
+
+    if background {
+        let applied = crate::indexer::background_refresh::apply_background_priority();
+        info!(
+            nice = applied.nice,
+            nice_applied = applied.nice_applied,
+            ionice_class = applied.ionice_class,
+            ionice_applied = applied.ionice_applied,
+            "cass index --background: lowered process priority"
+        );
+    }
 
     let data_dir = resolve_data_dir(&data_dir_override, db_override.as_ref());
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
@@ -95531,6 +95834,9 @@ fn run_index_with_data(
             }
             if error_chain_indicates_retryable_storage_contention(&chain) {
                 return index_storage_contention_cli_error(&chain);
+            }
+            if error_chain_indicates_unsupported_quill_writer_admission(&chain) {
+                return index_unsupported_quill_writer_admission_cli_error(&chain);
             }
             CliError {
                 code: 9,
@@ -106706,6 +107012,7 @@ fn run_sources_sync(
             2000,  // progress_interval_ms (default)
             false, // no_progress_events
             false, // robot_trace_ingest
+            false, // background
         )?;
     }
 
@@ -106894,6 +107201,7 @@ fn run_sources_reingest(
         2000,  // progress_interval_ms (default)
         false, // no_progress_events
         false, // robot_trace_ingest
+        false, // background
     )?;
 
     if is_robot {
@@ -110072,6 +110380,7 @@ fn run_daemon(
     let data_dir = data_dir.unwrap_or_else(default_data_dir);
     let mut config = resolved_daemon_config(socket, idle_timeout, max_connections);
     config.served_generation = crate::daemon::published_lexical_generation(&data_dir);
+    config.data_dir = Some(data_dir.clone());
 
     let models = ModelManager::new(&data_dir);
     let daemon = ModelDaemon::new(config, models);
@@ -110083,6 +110392,298 @@ fn run_daemon(
         hint: None,
         retryable: false,
     })
+}
+
+fn schedule_error_to_cli(err: crate::schedule::ScheduleError) -> CliError {
+    use crate::schedule::ScheduleError;
+    match err {
+        ScheduleError::Unsupported(message) => CliError {
+            code: 10,
+            kind: CliErrorKind::Schedule.kind_str(),
+            message,
+            hint: Some(
+                "Windows and other platforms: register `cass schedule run --job incremental --data-dir <dir>` with your scheduler manually; the job is idempotent and exit 7 means another index run was already active."
+                    .to_string(),
+            ),
+            retryable: false,
+        },
+        ScheduleError::Io(message) => CliError {
+            code: 14,
+            kind: CliErrorKind::Schedule.kind_str(),
+            message,
+            hint: Some("Check permissions on the unit directory and data dir.".to_string()),
+            retryable: true,
+        },
+        ScheduleError::Command(message) => CliError {
+            code: 10,
+            kind: CliErrorKind::Schedule.kind_str(),
+            message,
+            hint: Some(
+                "Re-run with --dry-run to inspect the unit files, or run the failing launchctl/systemctl command by hand for its full error."
+                    .to_string(),
+            ),
+            retryable: true,
+        },
+    }
+}
+
+/// Resolve the absolute cass binary the scheduler units should invoke.
+fn schedule_binary_path() -> CliResult<PathBuf> {
+    let exe = std::env::current_exe().map_err(|e| CliError {
+        code: 14,
+        kind: CliErrorKind::Schedule.kind_str(),
+        message: format!("cannot resolve the running cass binary: {e}"),
+        hint: None,
+        retryable: false,
+    })?;
+    Ok(std::fs::canonicalize(&exe).unwrap_or(exe))
+}
+
+fn run_schedule_command(subcmd: ScheduleCommand, cli: &Cli) -> CliResult<()> {
+    use crate::schedule::{self, RunConfig, ScheduleSpec};
+    use colored::Colorize;
+
+    match subcmd {
+        ScheduleCommand::Install {
+            interval_mins,
+            nightly_hour,
+            nightly_minute,
+            no_nightly,
+            no_semantic,
+            dry_run,
+            data_dir,
+            json,
+        } => {
+            let structured_format = resolve_subcommand_structured_format(cli, json);
+            let resolved_data_dir = resolve_data_dir(&data_dir, cli.db.as_ref());
+            let spec = ScheduleSpec {
+                interval_mins: interval_mins.max(1),
+                nightly_hour,
+                nightly_minute,
+                nightly: !no_nightly,
+                semantic: !no_semantic,
+                binary: schedule_binary_path()?,
+                data_dir: std::fs::canonicalize(&resolved_data_dir).unwrap_or(resolved_data_dir),
+                db_path: cli.db.clone(),
+            };
+            let report = schedule::install(&spec, dry_run).map_err(schedule_error_to_cli)?;
+            if let Some(fmt) = structured_format {
+                let payload = serde_json::to_value(&report).unwrap_or_default();
+                return output_structured_value(payload, fmt);
+            }
+            let verb = if dry_run {
+                "Would register"
+            } else {
+                "Registered"
+            };
+            println!(
+                "{} cass background index jobs with {}",
+                verb.green().bold(),
+                report.platform.as_str().bold()
+            );
+            println!(
+                "  incremental: every {} min → {}",
+                spec.interval_mins,
+                "cass index --background".dimmed()
+            );
+            if spec.nightly {
+                println!(
+                    "  nightly:     {:02}:{:02} local → {}",
+                    spec.nightly_hour,
+                    spec.nightly_minute,
+                    if spec.semantic {
+                        "cass index --full --background + models backfill --scheduled".dimmed()
+                    } else {
+                        "cass index --full --background".dimmed()
+                    }
+                );
+            }
+            println!("  data dir:    {}", spec.data_dir.display());
+            println!(
+                "  logs:        {}",
+                schedule::schedule_dir(&spec.data_dir).display()
+            );
+            for unit in &report.units {
+                println!("  unit:        {}", unit.path.display());
+                if dry_run {
+                    println!("{}", "-".repeat(72).dimmed());
+                    print!("{}", unit.contents);
+                    println!("{}", "-".repeat(72).dimmed());
+                }
+            }
+            for command in &report.commands {
+                let status = match (command.executed, command.exit_code) {
+                    (false, _) => "(dry-run)".dimmed().to_string(),
+                    (true, Some(0)) => "ok".green().to_string(),
+                    (true, code) => format!("exit {code:?}").yellow().to_string(),
+                };
+                println!("  {} {}", command.argv.join(" ").dimmed(), status);
+            }
+            for warning in &report.warnings {
+                println!("  {} {}", "note:".yellow().bold(), warning);
+            }
+            Ok(())
+        }
+        ScheduleCommand::Uninstall { dry_run, json } => {
+            let structured_format = resolve_subcommand_structured_format(cli, json);
+            let report = schedule::uninstall(dry_run).map_err(schedule_error_to_cli)?;
+            if let Some(fmt) = structured_format {
+                let payload = serde_json::to_value(&report).unwrap_or_default();
+                return output_structured_value(payload, fmt);
+            }
+            let verb = if dry_run { "Would remove" } else { "Removed" };
+            println!(
+                "{} cass scheduler jobs ({})",
+                verb.green().bold(),
+                report.platform.as_str()
+            );
+            for path in &report.removed {
+                println!("  {} {}", "removed".dimmed(), path.display());
+            }
+            for path in &report.missing {
+                println!("  {} {}", "absent ".dimmed(), path.display());
+            }
+            Ok(())
+        }
+        ScheduleCommand::Status { data_dir, json } => {
+            let structured_format = resolve_subcommand_structured_format(cli, json);
+            let resolved_data_dir = resolve_data_dir(&data_dir, cli.db.as_ref());
+            let report = schedule::status(&resolved_data_dir);
+            if let Some(fmt) = structured_format {
+                let payload = serde_json::to_value(&report).unwrap_or_default();
+                return output_structured_value(payload, fmt);
+            }
+            println!(
+                "{} ({})",
+                "cass schedule status".bold(),
+                report.platform.as_str()
+            );
+            if report.units.is_empty() {
+                println!("  no scheduler integration on this platform");
+            }
+            for unit in &report.units {
+                let state = match (unit.installed, unit.loaded) {
+                    (false, _) => "not installed".dimmed().to_string(),
+                    (true, Some(true)) => "installed, loaded".green().to_string(),
+                    (true, Some(false)) => "installed, NOT loaded".yellow().to_string(),
+                    (true, None) => "installed".to_string(),
+                };
+                println!("  {:<12} {}", unit.job.as_str(), state);
+            }
+            let describe = |label: &str, run: &Option<schedule::JobReport>| {
+                if let Some(run) = run {
+                    let when =
+                        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(run.finished_ms)
+                            .map(|t| t.to_rfc3339())
+                            .unwrap_or_else(|| run.finished_ms.to_string());
+                    let outcome = match (&run.skipped_reason, run.ok) {
+                        (Some(reason), _) => format!("skipped: {reason}").yellow().to_string(),
+                        (None, true) => "ok".green().to_string(),
+                        (None, false) => "FAILED".red().to_string(),
+                    };
+                    println!("  last {label:<10} {when}  {outcome}");
+                    for step in &run.steps {
+                        let s = match (&step.skipped_reason, step.ok) {
+                            (Some(reason), _) => format!("skipped ({reason})").dimmed().to_string(),
+                            (None, true) => {
+                                format!("ok {}ms", step.duration_ms).green().to_string()
+                            }
+                            (None, false) => format!("exit {:?}", step.exit_code).red().to_string(),
+                        };
+                        println!("      {:<24} {}", step.name, s);
+                    }
+                } else {
+                    println!("  last {label:<10} {}", "never".dimmed());
+                }
+            };
+            describe("incremental", &report.state.last_incremental);
+            describe("nightly", &report.state.last_nightly);
+            if let Some(auto) = &report.auto_refresh {
+                let when =
+                    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(auto.last_spawn_ms)
+                        .map(|t| t.to_rfc3339())
+                        .unwrap_or_else(|| auto.last_spawn_ms.to_string());
+                println!(
+                    "  auto-refresh last spawn {when} (pid {}, {})",
+                    auto.last_pid, auto.last_reason
+                );
+            }
+            println!("  logs: {}", report.log_dir.display());
+            Ok(())
+        }
+        ScheduleCommand::Run {
+            job,
+            data_dir,
+            no_semantic,
+            force,
+            json,
+        } => {
+            let structured_format = resolve_subcommand_structured_format(cli, json);
+            let resolved_data_dir = resolve_data_dir(&data_dir, cli.db.as_ref());
+            let db_path = cli
+                .db
+                .clone()
+                .unwrap_or_else(|| resolved_data_dir.join("agent_search.db"));
+            let max_backfill_batches = dotenvy::var("CASS_SCHEDULE_MAX_BACKFILL_BATCHES")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .unwrap_or(schedule::DEFAULT_MAX_BACKFILL_BATCHES);
+            let cfg = RunConfig {
+                binary: schedule_binary_path()?,
+                data_dir: resolved_data_dir,
+                db_path,
+                semantic: !no_semantic,
+                max_backfill_batches,
+            };
+            let report = if force {
+                schedule::run_job_unconditionally(job, &cfg)
+            } else {
+                schedule::run_job(job, &cfg)
+            };
+            if let Some(fmt) = structured_format {
+                let payload = serde_json::to_value(&report).unwrap_or_default();
+                output_structured_value(payload, fmt)?;
+            } else {
+                let outcome = match (&report.skipped_reason, report.ok) {
+                    (Some(reason), _) => format!("skipped: {reason}").yellow().to_string(),
+                    (None, true) => "ok".green().to_string(),
+                    (None, false) => "FAILED".red().to_string(),
+                };
+                println!(
+                    "{} {} → {} ({} ms)",
+                    "cass schedule run".bold(),
+                    job.as_str(),
+                    outcome,
+                    report.finished_ms.saturating_sub(report.started_ms)
+                );
+                for step in &report.steps {
+                    let s = match (&step.skipped_reason, step.ok) {
+                        (Some(reason), _) => format!("skipped ({reason})").dimmed().to_string(),
+                        (None, true) => format!("ok {}ms", step.duration_ms).green().to_string(),
+                        (None, false) => format!("exit {:?}", step.exit_code).red().to_string(),
+                    };
+                    println!("  {:<24} {}", step.name, s);
+                }
+            }
+            if report.ok {
+                Ok(())
+            } else {
+                Err(CliError {
+                    code: 9,
+                    kind: CliErrorKind::Schedule.kind_str(),
+                    message: format!(
+                        "scheduled {} job had failing steps; see {}",
+                        job.as_str(),
+                        schedule::job_log_path(&cfg.data_dir, job).display()
+                    ),
+                    hint: Some(
+                        "Run `cass schedule status` for the per-step breakdown.".to_string(),
+                    ),
+                    retryable: true,
+                })
+            }
+        }
+    }
 }
 
 #[cfg(all(test, unix))]

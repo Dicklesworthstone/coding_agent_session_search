@@ -1,3 +1,4 @@
+pub mod background_refresh;
 pub(crate) mod lexical_generation;
 pub(crate) mod memoization;
 pub(crate) mod parallel_wal_shadow;
@@ -7833,11 +7834,24 @@ impl LexicalRebuildPipelineBudgetSnapshot {
         commit_interval_messages: usize,
         commit_interval_message_bytes: usize,
     ) -> Self {
+        let max_message_bytes_in_flight = max_message_bytes_in_flight.max(2);
+        // A reservation equal to the entire cap can be admitted only when no
+        // other prepared page or sink packet retains any bytes. Ordered page
+        // preparation does not guarantee that zero-inflight moment, so
+        // cap-equality is a deadlocking configuration (GH#413). This generic
+        // constructor lacks the channel geometry needed for a tighter split;
+        // reserve half the cap so one equal-size predecessor and its successor
+        // can coexist. The runtime constructor below divides by every bounded
+        // channel slot and therefore remains more conservative.
+        let batch_fetch_message_bytes_limit = batch_fetch_message_bytes_limit
+            .max(1)
+            .min(max_message_bytes_in_flight / 2)
+            .max(1);
         Self {
             page_conversation_limit: page_conversation_limit.max(1),
             batch_fetch_message_limit: batch_fetch_message_limit.max(1),
-            batch_fetch_message_bytes_limit: batch_fetch_message_bytes_limit.max(1),
-            max_message_bytes_in_flight: max_message_bytes_in_flight.max(1),
+            batch_fetch_message_bytes_limit,
+            max_message_bytes_in_flight,
             commit_interval_conversations: commit_interval_conversations.max(1),
             commit_interval_messages: commit_interval_messages.max(1),
             commit_interval_message_bytes: commit_interval_message_bytes.max(1),
@@ -8145,19 +8159,46 @@ fn lexical_rebuild_runtime_pipeline_budget_snapshot(
     commit_interval_messages: usize,
     commit_interval_message_bytes: usize,
 ) -> LexicalRebuildPipelineBudgetSnapshot {
-    let batch_fetch_message_bytes_limit = batch_fetch_message_bytes_limit.max(1);
+    let configured_batch_fetch_message_bytes_limit = batch_fetch_message_bytes_limit.max(1);
+    let max_message_bytes_in_flight = lexical_rebuild_pipeline_max_message_bytes_in_flight(
+        configured_batch_fetch_message_bytes_limit,
+        pipeline_channel_size,
+    );
+    let (batch_fetch_message_bytes_limit, max_message_bytes_in_flight) =
+        bounded_lexical_rebuild_page_reservation_limits(
+            configured_batch_fetch_message_bytes_limit,
+            max_message_bytes_in_flight,
+            pipeline_channel_size,
+        );
     LexicalRebuildPipelineBudgetSnapshot::new(
         page_conversation_limit,
         batch_fetch_message_limit,
         batch_fetch_message_bytes_limit,
-        lexical_rebuild_pipeline_max_message_bytes_in_flight(
-            batch_fetch_message_bytes_limit,
-            pipeline_channel_size,
-        ),
+        max_message_bytes_in_flight,
         commit_interval_conversations,
         commit_interval_messages,
         commit_interval_message_bytes,
     )
+}
+
+fn bounded_lexical_rebuild_page_reservation_limits(
+    configured_batch_fetch_message_bytes_limit: usize,
+    max_message_bytes_in_flight: usize,
+    pipeline_channel_size: usize,
+) -> (usize, usize) {
+    let reservation_slots = pipeline_channel_size.saturating_add(1).max(2);
+    let max_message_bytes_in_flight = max_message_bytes_in_flight.max(reservation_slots);
+    // The responsiveness governor may clamp the derived in-flight cap below
+    // the configured per-page fetch ceiling. Re-establish the derivation
+    // invariant after that clamp: one page may consume at most its equal share
+    // of the bounded channel plus the active sink slot. This prevents
+    // `request == cap`, which otherwise waits forever whenever any earlier
+    // page retains bytes (GH#413), while preserving explicit smaller limits.
+    let batch_fetch_message_bytes_limit = configured_batch_fetch_message_bytes_limit
+        .max(1)
+        .min(max_message_bytes_in_flight / reservation_slots)
+        .max(1);
+    (batch_fetch_message_bytes_limit, max_message_bytes_in_flight)
 }
 
 fn lexical_rebuild_pipeline_channel_size() -> usize {
@@ -8251,6 +8292,13 @@ fn should_commit_lexical_rebuild(
     conversations_since_commit >= commit_interval_conversations
         || messages_since_commit >= commit_interval_messages
         || message_bytes_since_commit >= commit_interval_message_bytes
+}
+
+fn pending_lexical_rebuild_batch_reached_runtime_limit(
+    pending_conversations: usize,
+    current_batch_conversation_limit: usize,
+) -> bool {
+    pending_conversations >= current_batch_conversation_limit.max(1)
 }
 
 fn apply_lexical_rebuild_budget_transition(
@@ -21461,7 +21509,10 @@ fn rebuild_tantivy_from_db_with_options(
                     ),
                 );
 
-                if pending_batch.len() >= current_batch_conversation_limit {
+                if pending_lexical_rebuild_batch_reached_runtime_limit(
+                    pending_batch.len(),
+                    current_batch_conversation_limit,
+                ) {
                     flush_streamed_lexical_rebuild_batch(
                         &mut pending_batch,
                         &mut pending_batch_message_count,
@@ -21774,6 +21825,41 @@ fn rebuild_tantivy_from_db_with_options(
                                 pending_batch_message_bytes,
                             ),
                         );
+                        // A responsiveness transition can lower the live sink
+                        // threshold while the sink already holds more packets
+                        // than the new limit. No packet may arrive afterward:
+                        // page-prep can be waiting for the retained bytes in
+                        // this very batch. Re-check on the idle tick, not only
+                        // inside `finish_conversation!`, so the transition
+                        // itself cannot strand an over-limit batch (GH#413).
+                        if !pending_batch.is_empty()
+                            && pending_lexical_rebuild_batch_reached_runtime_limit(
+                                pending_batch.len(),
+                                current_batch_conversation_limit,
+                            )
+                        {
+                            tracing::info!(
+                                pending_conversations = pending_batch.len(),
+                                current_batch_conversation_limit,
+                                pending_message_bytes = pending_batch_message_bytes,
+                                "lexical rebuild sink exceeded its live batch limit after a runtime budget transition; flushing retained packets (GH#413)"
+                            );
+                            flush_streamed_lexical_rebuild_batch(
+                                &mut pending_batch,
+                                &mut pending_batch_message_count,
+                                &mut pending_batch_message_bytes,
+                                Some(lexical_rebuild_flow_limiter.as_ref()),
+                                lexical_rebuild_worker_pool.as_deref(),
+                                &mut t_index,
+                                &mut indexed_docs,
+                                &mut messages_since_commit,
+                                &mut message_bytes_since_commit,
+                                &mut current_batch_conversation_limit,
+                                batch_conversation_limit,
+                                page_size,
+                                perf_profile.as_mut(),
+                            )?;
+                        }
                         // GH#413: the sink retains the byte reservations of
                         // every packet in `pending_batch` until a flush, but
                         // the only flush triggers were conversation COUNT and
@@ -37890,6 +37976,68 @@ mod tests {
             lexical_rebuild_first_budget_promotion_wait(),
             Duration::from_millis(5_000)
         );
+    }
+
+    #[test]
+    fn gh413_lexical_rebuild_page_reservation_keeps_headroom_after_cap_clamp() {
+        let (page_reservation, inflight_cap) =
+            bounded_lexical_rebuild_page_reservation_limits(512, 512, 4);
+
+        assert_eq!(inflight_cap, 512);
+        assert_eq!(page_reservation, 102);
+        assert!(
+            page_reservation < inflight_cap,
+            "a page reservation equal to the cap can only run at zero inflight bytes"
+        );
+
+        let limiter = StreamingByteLimiter::new(inflight_cap);
+        let retained = limiter.acquire(38).unwrap();
+        let (reserved, _wait_duration, waited) =
+            limiter.acquire_with_wait(page_reservation).unwrap();
+        assert_eq!(reserved, page_reservation);
+        assert!(
+            !waited,
+            "the next page must remain admissible while an ordered predecessor retains bytes"
+        );
+        limiter.release(reserved);
+        limiter.release(retained);
+    }
+
+    #[test]
+    fn gh413_lexical_rebuild_budget_snapshot_normalizes_cap_equal_reservations() {
+        let budget = LexicalRebuildPipelineBudgetSnapshot::new(32, 64, 512, 512, 16, 128, 4_096);
+
+        assert_eq!(budget.max_message_bytes_in_flight, 512);
+        assert_eq!(budget.batch_fetch_message_bytes_limit, 256);
+        assert!(
+            budget.batch_fetch_message_bytes_limit < budget.max_message_bytes_in_flight,
+            "directly constructed budgets must not reintroduce the cap-equality deadlock"
+        );
+
+        let limiter = StreamingByteLimiter::new(budget.max_message_bytes_in_flight);
+        let predecessor = limiter
+            .acquire(budget.batch_fetch_message_bytes_limit)
+            .unwrap();
+        let (successor, _wait_duration, waited) = limiter
+            .acquire_with_wait(budget.batch_fetch_message_bytes_limit)
+            .unwrap();
+        assert!(!waited, "one predecessor must not strand its successor");
+        limiter.release(successor);
+        limiter.release(predecessor);
+    }
+
+    #[test]
+    fn gh413_lexical_rebuild_pending_batch_is_rechecked_after_runtime_limit_shrinks() {
+        let retained_conversations = 128;
+
+        assert!(!pending_lexical_rebuild_batch_reached_runtime_limit(
+            retained_conversations,
+            256,
+        ));
+        assert!(pending_lexical_rebuild_batch_reached_runtime_limit(
+            retained_conversations,
+            32,
+        ));
     }
 
     #[test]

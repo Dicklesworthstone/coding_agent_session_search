@@ -301,6 +301,9 @@ pub(crate) enum SemanticBackfillSchedulerReason {
     CapacityBelowFloor,
     ThreadBudgetZero,
     BatchBudgetZero,
+    /// The console user is active and the operator asked scheduled work to
+    /// wait for `CASS_RESPONSIVENESS_MIN_USER_IDLE_SECS` of idle time.
+    UserActive,
 }
 
 impl SemanticBackfillSchedulerReason {
@@ -320,6 +323,9 @@ impl SemanticBackfillSchedulerReason {
             }
             Self::ThreadBudgetZero => "semantic backfill thread budget is zero",
             Self::BatchBudgetZero => "semantic backfill batch budget is zero",
+            Self::UserActive => {
+                "console user is active (CASS_RESPONSIVENESS_MIN_USER_IDLE_SECS); retry after the idle delay"
+            }
         }
     }
 }
@@ -330,6 +336,10 @@ pub(crate) struct SemanticBackfillSchedulerSignals {
     pub lexical_repair_active: bool,
     pub force: bool,
     pub operator_disabled: bool,
+    /// Console user is active and `CASS_RESPONSIVENESS_MIN_USER_IDLE_SECS`
+    /// asks scheduled work to wait. Always `false` when the gate is disabled
+    /// or the platform cannot report idle time (fail open).
+    pub user_active: bool,
 }
 
 impl SemanticBackfillSchedulerSignals {
@@ -339,6 +349,7 @@ impl SemanticBackfillSchedulerSignals {
             lexical_repair_active: env_truthy("CASS_SEMANTIC_BACKFILL_LEXICAL_REPAIR_ACTIVE"),
             force: env_truthy("CASS_SEMANTIC_BACKFILL_FORCE"),
             operator_disabled: env_truthy("CASS_SEMANTIC_BACKFILL_DISABLE"),
+            user_active: !responsiveness::user_idle_gate().satisfied,
         }
     }
 }
@@ -476,6 +487,14 @@ pub(crate) fn semantic_backfill_scheduler_decision_for_capacity(
             decision,
             SemanticBackfillSchedulerState::Paused,
             SemanticBackfillSchedulerReason::CapacityBelowFloor,
+            paused_delay_ms,
+        );
+    }
+    if signals.user_active && !signals.force {
+        return stopped_scheduler_decision(
+            decision,
+            SemanticBackfillSchedulerState::Paused,
+            SemanticBackfillSchedulerReason::UserActive,
             paused_delay_ms,
         );
     }
@@ -3704,7 +3723,29 @@ mod tests {
             lexical_repair_active: false,
             force: false,
             operator_disabled: false,
+            user_active: false,
         }
+    }
+
+    #[test]
+    fn semantic_backfill_scheduler_waits_for_console_idle_unless_forced() {
+        let policy = SemanticPolicy::compiled_defaults();
+        let active = SemanticBackfillSchedulerSignals {
+            user_active: true,
+            ..default_scheduler_signals()
+        };
+        let decision = semantic_backfill_scheduler_decision_for_capacity(&policy, 64, &active, 100);
+        assert!(!decision.should_run());
+        assert_eq!(decision.state, SemanticBackfillSchedulerState::Paused);
+        assert_eq!(decision.reason, SemanticBackfillSchedulerReason::UserActive);
+
+        let forced = SemanticBackfillSchedulerSignals {
+            user_active: true,
+            force: true,
+            ..default_scheduler_signals()
+        };
+        let decision = semantic_backfill_scheduler_decision_for_capacity(&policy, 64, &forced, 100);
+        assert!(decision.should_run());
     }
 
     struct EnvVarGuard {

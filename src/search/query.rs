@@ -8759,28 +8759,44 @@ impl SearchClient {
         newest_first: bool,
         field_mask: FieldMask,
     ) -> Result<Vec<SearchHit>> {
+        #[derive(Debug)]
+        struct ConversationTailCandidate {
+            conversation_id: i64,
+            title: String,
+            agent: String,
+            workspace: String,
+            source_path: String,
+            browse_created_at: Option<i64>,
+            last_message_idx: Option<i64>,
+            source_id: String,
+            origin_kind: String,
+            origin_host: Option<String>,
+        }
+
         let order = if newest_first { "DESC" } else { "ASC" };
         let title_expr = if field_mask.wants_title() {
             "c.title"
         } else {
             "''"
         };
-        // Replace INNER JOIN agents with a correlated subquery: (a) avoids
-        // frankensqlite's multi-table-JOIN-with-LIMIT/OFFSET materialization
-        // fallback on every paginated search, and (b) stops silently dropping
-        // search hits whose conversation has a NULL agent_id (legacy V1 rows)
-        // by degrading to 'unknown' consistently with e1c08e7c / 8a0c547c.
-        // The agent filter below becomes an EXISTS guard instead of a slug
-        // equality on the joined column.
+        // Empty-query browsing is conversation-oriented. Do not join and sort
+        // the full messages table: V17 deliberately removed the global
+        // messages(created_at) index from the ingest hot path, so that query
+        // materialized millions of message rows before applying a tiny TUI
+        // LIMIT (GH#395). First choose a bounded page of conversations from
+        // the compact tail-state cache, then hydrate exactly one indexed tail
+        // message per selected conversation below.
+        let browse_created_at_sql = "COALESCE(ts.last_message_created_at, c.last_message_created_at, ts.ended_at, c.ended_at, c.started_at)";
+        let last_message_idx_sql = "COALESCE(ts.last_message_idx, c.last_message_idx)";
         let normalized_source_sql =
             normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
         let mut sql = format!(
-            "SELECT c.id, {title_expr}, m.content, \
+            "SELECT c.id, {title_expr}, \
                  COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown'), \
-                 w.path, c.source_path, m.created_at, m.idx, \
+                 w.path, c.source_path, {browse_created_at_sql}, {last_message_idx_sql}, \
                  {normalized_source_sql}, c.origin_host, s.kind
-             FROM messages m
-             JOIN conversations c ON m.conversation_id = c.id
+             FROM conversations c
+             LEFT JOIN conversation_tail_state ts ON ts.conversation_id = c.id
              LEFT JOIN workspaces w ON c.workspace_id = w.id
              LEFT JOIN sources s ON c.source_id = s.id
              WHERE 1=1"
@@ -8806,11 +8822,11 @@ impl SearchClient {
         }
 
         if let Some(created_from) = filters.created_from {
-            sql.push_str(" AND m.created_at >= ?");
+            sql.push_str(&format!(" AND {browse_created_at_sql} >= ?"));
             params.push(ParamValue::from(created_from));
         }
         if let Some(created_to) = filters.created_to {
-            sql.push_str(" AND m.created_at <= ?");
+            sql.push_str(&format!(" AND {browse_created_at_sql} <= ?"));
             params.push(ParamValue::from(created_to));
         }
 
@@ -8835,12 +8851,12 @@ impl SearchClient {
         }
 
         sql.push_str(&format!(
-            " ORDER BY CASE WHEN m.created_at IS NULL THEN 1 ELSE 0 END, m.created_at {order}, m.id {order} LIMIT ? OFFSET ?"
+            " ORDER BY CASE WHEN {browse_created_at_sql} IS NULL THEN 1 ELSE 0 END, {browse_created_at_sql} {order}, c.id {order} LIMIT ? OFFSET ?"
         ));
         params.push(ParamValue::from(limit as i64));
         params.push(ParamValue::from(offset as i64));
 
-        let rows: Vec<SearchHit> =
+        let candidates: Vec<ConversationTailCandidate> =
             conn.query_map_collect(&sql, &params, |row: &crate::franken_sync::Row| {
                 let conversation_id: i64 = row.get_typed(0)?;
                 let title: String = if field_mask.wants_title() {
@@ -8848,17 +8864,16 @@ impl SearchClient {
                 } else {
                     String::new()
                 };
-                let raw_content: String = row.get_typed(2)?;
-                let agent: String = row.get_typed(3)?;
-                let workspace: Option<String> = row.get_typed(4)?;
-                let source_path: String = row.get_typed(5)?;
-                let created_at: Option<i64> = row.get_typed(6)?;
-                let idx: Option<i64> = row.get_typed(7)?;
+                let agent: String = row.get_typed(2)?;
+                let workspace: Option<String> = row.get_typed(3)?;
+                let source_path: String = row.get_typed(4)?;
+                let browse_created_at: Option<i64> = row.get_typed(5)?;
+                let last_message_idx: Option<i64> = row.get_typed(6)?;
                 let raw_source_id: String = row
-                    .get_typed::<Option<String>>(8)?
+                    .get_typed::<Option<String>>(7)?
                     .unwrap_or_else(default_source_id);
-                let origin_host: Option<String> = row.get_typed(9)?;
-                let raw_origin_kind: Option<String> = row.get_typed(10)?;
+                let origin_host: Option<String> = row.get_typed(8)?;
+                let raw_origin_kind: Option<String> = row.get_typed(9)?;
                 let source_id = normalized_search_hit_source_id_parts(
                     raw_source_id.as_str(),
                     raw_origin_kind.as_deref().unwrap_or_default(),
@@ -8868,41 +8883,102 @@ impl SearchClient {
                     source_id.as_str(),
                     raw_origin_kind.as_deref(),
                 );
-                let line_number = idx
-                    .and_then(|i| usize::try_from(i).ok())
-                    .map(|i| i.saturating_add(1));
-                let snippet = if field_mask.wants_snippet() {
-                    snippet_from_content(&raw_content)
-                } else {
-                    String::new()
-                };
-                let content = if field_mask.needs_content() {
-                    raw_content.clone()
-                } else {
-                    String::new()
-                };
-                let content_hash =
-                    stable_hit_hash(&raw_content, &source_path, line_number, created_at);
-                Ok(SearchHit {
+
+                Ok(ConversationTailCandidate {
+                    conversation_id,
                     title,
-                    snippet,
-                    content,
-                    content_hash,
-                    conversation_id: Some(conversation_id),
-                    score: 0.0,
-                    source_path,
                     agent,
                     workspace: workspace.unwrap_or_default(),
-                    workspace_original: None,
-                    created_at,
-                    line_number,
-                    match_type: MatchType::Exact,
+                    source_path,
+                    browse_created_at,
+                    last_message_idx,
                     source_id,
                     origin_kind,
                     origin_host,
                 })
             })?;
-        Ok(rows)
+
+        let mut hits = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let exact_tail_sql = candidate.last_message_idx.map(|_| {
+                "SELECT content, created_at, idx
+                 FROM messages
+                 WHERE conversation_id = ?1 AND idx = ?2
+                 LIMIT 1"
+            });
+            let tail_params = if let Some(last_message_idx) = candidate.last_message_idx {
+                vec![
+                    ParamValue::from(candidate.conversation_id),
+                    ParamValue::from(last_message_idx),
+                ]
+            } else {
+                vec![ParamValue::from(candidate.conversation_id)]
+            };
+            let fallback_tail_sql = "SELECT content, created_at, idx
+                 FROM messages
+                 WHERE conversation_id = ?1
+                 ORDER BY idx DESC
+                 LIMIT 1";
+            let mut tail_rows: Vec<(String, Option<i64>, Option<i64>)> = conn.query_map_collect(
+                exact_tail_sql.unwrap_or(fallback_tail_sql),
+                &tail_params,
+                |row: &crate::franken_sync::Row| {
+                    Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
+                },
+            )?;
+            if tail_rows.is_empty() && exact_tail_sql.is_some() {
+                tail_rows = conn.query_map_collect(
+                    fallback_tail_sql,
+                    &[ParamValue::from(candidate.conversation_id)],
+                    |row: &crate::franken_sync::Row| {
+                        Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
+                    },
+                )?;
+            }
+            let Some((raw_content, message_created_at, idx)) = tail_rows.into_iter().next() else {
+                continue;
+            };
+
+            let created_at = message_created_at.or(candidate.browse_created_at);
+            let line_number = idx
+                .and_then(|i| usize::try_from(i).ok())
+                .map(|i| i.saturating_add(1));
+            let snippet = if field_mask.wants_snippet() {
+                snippet_from_content(&raw_content)
+            } else {
+                String::new()
+            };
+            let content = if field_mask.needs_content() {
+                raw_content.clone()
+            } else {
+                String::new()
+            };
+            let content_hash = stable_hit_hash(
+                &raw_content,
+                &candidate.source_path,
+                line_number,
+                created_at,
+            );
+            hits.push(SearchHit {
+                title: candidate.title,
+                snippet,
+                content,
+                content_hash,
+                conversation_id: Some(candidate.conversation_id),
+                score: 0.0,
+                source_path: candidate.source_path,
+                agent: candidate.agent,
+                workspace: candidate.workspace,
+                workspace_original: None,
+                created_at,
+                line_number,
+                match_type: MatchType::Exact,
+                source_id: candidate.source_id,
+                origin_kind: candidate.origin_kind,
+                origin_host: candidate.origin_host,
+            });
+        }
+        Ok(hits)
     }
 }
 
@@ -13368,7 +13444,7 @@ mod tests {
     }
 
     #[test]
-    fn search_client_hydrates_one_lazy_connection_from_multiple_workers() -> Result<()> {
+    fn gh395_browse_by_date_hydrates_one_lazy_connection_from_multiple_workers() -> Result<()> {
         fn assert_send_sync<T: Send + Sync>() {}
 
         assert_send_sync::<SearchSqliteConnection>();
@@ -13389,14 +13465,25 @@ mod tests {
                      source_id TEXT,
                      origin_host TEXT,
                      title TEXT,
-                     source_path TEXT NOT NULL
+                     source_path TEXT NOT NULL,
+                     started_at INTEGER,
+                     ended_at INTEGER,
+                     last_message_idx INTEGER,
+                     last_message_created_at INTEGER
                  );
                  CREATE TABLE messages (
                      id INTEGER PRIMARY KEY,
                      conversation_id INTEGER NOT NULL,
                      idx INTEGER NOT NULL,
                      content TEXT NOT NULL,
-                     created_at INTEGER
+                     created_at INTEGER,
+                     UNIQUE(conversation_id, idx)
+                 );
+                 CREATE TABLE conversation_tail_state (
+                     conversation_id INTEGER PRIMARY KEY,
+                     ended_at INTEGER,
+                     last_message_idx INTEGER,
+                     last_message_created_at INTEGER
                  );
                  INSERT INTO sources(id, kind) VALUES('local', 'local');
                  INSERT INTO agents(id, slug) VALUES(1, 'codex');
@@ -13407,7 +13494,10 @@ mod tests {
                      1, 1, 1, 'local', NULL, 'worker-owned archive', '/tmp/cross-worker.jsonl'
                  );
                  INSERT INTO messages(id, conversation_id, idx, content, created_at)
-                 VALUES(1, 1, 0, 'cross worker hydration sentinel', 42);",
+                 VALUES(1, 1, 0, 'cross worker hydration sentinel', 42);
+                 INSERT INTO conversation_tail_state(
+                     conversation_id, ended_at, last_message_idx, last_message_created_at
+                 ) VALUES(1, 42, 0, 42);",
             )?;
         }
 
@@ -14056,7 +14146,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_backend_respects_source_filter() -> Result<()> {
+    fn gh395_browse_by_date_respects_source_filter() -> Result<()> {
         let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
@@ -14069,14 +14159,25 @@ mod tests {
                 source_id TEXT,
                 origin_host TEXT,
                 title TEXT,
-                source_path TEXT
+                source_path TEXT,
+                started_at INTEGER,
+                ended_at INTEGER,
+                last_message_idx INTEGER,
+                last_message_created_at INTEGER
              );
              CREATE TABLE messages (
                 id INTEGER PRIMARY KEY,
                 conversation_id INTEGER,
                 idx INTEGER,
                 content TEXT,
-                created_at INTEGER
+                created_at INTEGER,
+                UNIQUE(conversation_id, idx)
+             );
+             CREATE TABLE conversation_tail_state (
+                conversation_id INTEGER PRIMARY KEY,
+                ended_at INTEGER,
+                last_message_idx INTEGER,
+                last_message_created_at INTEGER
              );
              CREATE VIRTUAL TABLE fts_messages USING fts5(
                 content,
@@ -14100,6 +14201,13 @@ mod tests {
         conn.execute("INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path) VALUES(2, 1, 2, 'laptop', 'dev@laptop', 'remote title', '/tmp/remote.jsonl')")?;
         conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(1, 1, 0, 'auth token failure', 42)")?;
         conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(2, 2, 0, 'auth token failure', 43)")?;
+        conn.execute(
+            "INSERT INTO conversation_tail_state(
+                 conversation_id, ended_at, last_message_idx, last_message_created_at
+             ) VALUES
+                (1, 42, 0, 42),
+                (2, 43, 0, 43)",
+        )?;
         conn.execute_compat(
             "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -14834,7 +14942,7 @@ mod tests {
     }
 
     #[test]
-    fn browse_by_date_treats_null_workspace_and_source_as_local() -> Result<()> {
+    fn gh395_browse_by_date_treats_null_workspace_and_source_as_local() -> Result<()> {
         let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
@@ -14845,7 +14953,11 @@ mod tests {
                 source_id TEXT,
                 origin_host TEXT,
                 title TEXT,
-                source_path TEXT NOT NULL
+                source_path TEXT NOT NULL,
+                started_at INTEGER,
+                ended_at INTEGER,
+                last_message_idx INTEGER,
+                last_message_created_at INTEGER
              );
              CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL);
              CREATE TABLE messages (
@@ -14853,7 +14965,14 @@ mod tests {
                 conversation_id INTEGER NOT NULL,
                 idx INTEGER,
                 content TEXT NOT NULL,
-                created_at INTEGER
+                created_at INTEGER,
+                UNIQUE(conversation_id, idx)
+             );
+             CREATE TABLE conversation_tail_state (
+                conversation_id INTEGER PRIMARY KEY,
+                ended_at INTEGER,
+                last_message_idx INTEGER,
+                last_message_created_at INTEGER
              );
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);",
         )?;
@@ -14864,7 +14983,14 @@ mod tests {
         )?;
         conn.execute(
             "INSERT INTO messages(id, conversation_id, idx, content, created_at)
-             VALUES(1, 1, 0, 'browse auth token failure', 123)",
+             VALUES
+                (1, 1, 0, 'older non-tail message', 122),
+                (2, 1, 1, 'browse auth token failure', 123)",
+        )?;
+        conn.execute(
+            "INSERT INTO conversation_tail_state(
+                 conversation_id, ended_at, last_message_idx, last_message_created_at
+             ) VALUES(1, 123, 1, 123)",
         )?;
 
         let client = SearchClient {
@@ -14899,6 +15025,8 @@ mod tests {
         assert_eq!(hits[0].workspace, "");
         assert_eq!(hits[0].source_id, "local");
         assert_eq!(hits[0].origin_kind, "local");
+        assert_eq!(hits[0].content, "browse auth token failure");
+        assert_eq!(hits[0].line_number, Some(2));
 
         Ok(())
     }
@@ -16145,7 +16273,7 @@ mod tests {
     }
 
     #[test]
-    fn browse_by_date_snippet_only_uses_full_content_for_hit_identity() -> Result<()> {
+    fn gh395_browse_by_date_snippet_only_uses_full_content_for_hit_identity() -> Result<()> {
         let conn = SearchSqliteFixture::in_memory()?;
         conn.execute_batch(
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
@@ -16156,7 +16284,11 @@ mod tests {
                 source_id TEXT,
                 origin_host TEXT,
                 title TEXT,
-                source_path TEXT NOT NULL
+                source_path TEXT NOT NULL,
+                started_at INTEGER,
+                ended_at INTEGER,
+                last_message_idx INTEGER,
+                last_message_created_at INTEGER
              );
              CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL);
              CREATE TABLE messages (
@@ -16164,14 +16296,23 @@ mod tests {
                 conversation_id INTEGER NOT NULL,
                 idx INTEGER,
                 content TEXT NOT NULL,
-                created_at INTEGER
+                created_at INTEGER,
+                UNIQUE(conversation_id, idx)
+             );
+             CREATE TABLE conversation_tail_state (
+                conversation_id INTEGER PRIMARY KEY,
+                ended_at INTEGER,
+                last_message_idx INTEGER,
+                last_message_created_at INTEGER
              );
              CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);",
         )?;
         conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
         conn.execute(
             "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(1, 1, NULL, 'local', NULL, 'browse title', '/tmp/browse-shared.jsonl')",
+             VALUES
+                (1, 1, NULL, 'local', NULL, 'first browse title', '/tmp/browse-shared.jsonl'),
+                (2, 1, NULL, 'local', NULL, 'second browse title', '/tmp/browse-shared.jsonl')",
         )?;
         let shared_prefix = "shared-prefix ".repeat(48);
         let first = format!("{shared_prefix}first browse-only tail");
@@ -16188,13 +16329,20 @@ mod tests {
         )?;
         conn.execute_with_params(
             "INSERT INTO messages(id, conversation_id, idx, content, created_at)
-             VALUES(?1, 1, ?2, ?3, ?4)",
+             VALUES(?1, 2, ?2, ?3, ?4)",
             &[
                 fsqlite_types::value::SqliteValue::Integer(2),
-                fsqlite_types::value::SqliteValue::Integer(1),
+                fsqlite_types::value::SqliteValue::Integer(0),
                 fsqlite_types::value::SqliteValue::Text(second.clone().into()),
                 fsqlite_types::value::SqliteValue::Integer(102),
             ],
+        )?;
+        conn.execute(
+            "INSERT INTO conversation_tail_state(
+                 conversation_id, ended_at, last_message_idx, last_message_created_at
+             ) VALUES
+                (1, 101, 0, 101),
+                (2, 102, 0, 102)",
         )?;
 
         let client = SearchClient {
@@ -16224,6 +16372,8 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().all(|hit| hit.content.is_empty()));
         assert!(hits.iter().all(|hit| !hit.snippet.is_empty()));
+        assert_eq!(hits[0].conversation_id, Some(2));
+        assert_eq!(hits[1].conversation_id, Some(1));
         assert_ne!(hits[0].content_hash, hits[1].content_hash);
 
         Ok(())

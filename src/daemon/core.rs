@@ -185,6 +185,14 @@ pub struct DaemonConfig {
     /// Lexical generation visible when this daemon started. Advisory runtime
     /// metadata only, used to diagnose stale searchers after atomic publish.
     pub served_generation: Option<u64>,
+    /// While resident, spawn a detached low-priority incremental
+    /// `cass index --background` every this often (0 = never). The spawn goes
+    /// through `indexer::background_refresh`, so the normal index lock,
+    /// cooldown, and `CASS_AUTO_REFRESH=0` opt-out all apply, and it is
+    /// skipped while the machine is under severe load.
+    pub index_interval: Duration,
+    /// Data dir the periodic index targets (`None` = platform default).
+    pub data_dir: Option<PathBuf>,
 }
 
 impl Default for DaemonConfig {
@@ -198,6 +206,8 @@ impl Default for DaemonConfig {
             nice_value: 10,                       // Low priority
             ionice_class: 2,                      // Best-effort
             served_generation: None,
+            index_interval: Duration::from_secs(0), // Off unless configured
+            data_dir: None,
         }
     }
 }
@@ -247,7 +257,29 @@ impl DaemonConfig {
             cfg.ionice_class = n;
         }
 
+        if let Ok(val) = dotenvy::var("CASS_DAEMON_INDEX_INTERVAL_SECS")
+            && let Ok(secs) = val.trim().parse::<u64>()
+        {
+            cfg.index_interval = Duration::from_secs(secs);
+        }
+
         cfg
+    }
+}
+
+/// Decide whether the resident daemon should kick a periodic index refresh on
+/// this tick. Pure so it is testable without a socket.
+pub(crate) fn periodic_index_due(
+    interval: Duration,
+    last_spawn: Option<Instant>,
+    now: Instant,
+) -> bool {
+    if interval.is_zero() {
+        return false;
+    }
+    match last_spawn {
+        None => true,
+        Some(last) => now.saturating_duration_since(last) >= interval,
     }
 }
 
@@ -278,6 +310,33 @@ impl ModelDaemon {
             last_activity: RwLock::new(Instant::now()),
             worker_handle: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Spawn (or skip, with a reason) one detached incremental index pass.
+    fn spawn_periodic_index(&self) {
+        use crate::indexer::{background_refresh, responsiveness};
+
+        let pressure = responsiveness::machine_pressure_now();
+        if pressure.severe {
+            info!(
+                load_per_core = ?pressure.load_per_core,
+                psi = ?pressure.psi_cpu_some_avg10,
+                "daemon periodic index skipped: machine under severe load"
+            );
+            return;
+        }
+        let data_dir = self
+            .config
+            .data_dir
+            .clone()
+            .unwrap_or_else(crate::default_data_dir);
+        let db_path = data_dir.join("agent_search.db");
+        let outcome = background_refresh::maybe_spawn_background_index_refresh(
+            &data_dir,
+            &db_path,
+            "daemon-periodic",
+        );
+        info!(?outcome, "daemon periodic index evaluated");
     }
 
     /// Create daemon with default config and models from data directory.
@@ -382,6 +441,11 @@ impl ModelDaemon {
 
         write_daemon_run_lock_metadata(&mut lock_file, self.config.served_generation)?;
         let mut last_lock_heartbeat = Instant::now();
+        // Periodic index refresh: `None` means "never spawned yet", so the
+        // first tick after startup fires (the daemon was auto-spawned by a
+        // search, which is exactly when a stale index hurts).
+        let mut last_index_spawn: Option<Instant> = None;
+        let mut last_index_check = Instant::now();
 
         // Apply resource limits
         if !self.resources.apply_nice(self.config.nice_value) {
@@ -463,6 +527,24 @@ impl ModelDaemon {
                         warn!(error = %error, "Failed to refresh daemon run-lock heartbeat");
                     } else {
                         last_lock_heartbeat = Instant::now();
+                    }
+                }
+
+                // Periodic background index (Layer 3 of "keep the index
+                // fresh"): checked at most once a second; the actual spawn is
+                // a detached `cass index --background` child so the daemon's
+                // own memory/latency profile is untouched.
+                if last_index_check.elapsed() >= Duration::from_secs(1) {
+                    last_index_check = Instant::now();
+                    if periodic_index_due(
+                        self.config.index_interval,
+                        last_index_spawn,
+                        Instant::now(),
+                    ) {
+                        // Record the attempt regardless of outcome so a
+                        // cooldown/lock skip does not turn into a 1 Hz retry.
+                        last_index_spawn = Some(Instant::now());
+                        self.spawn_periodic_index();
                     }
                 }
 
@@ -918,6 +1000,30 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[test]
+    fn periodic_index_is_off_at_zero_and_fires_on_first_tick_then_per_interval() {
+        let now = Instant::now();
+        assert!(!periodic_index_due(Duration::ZERO, None, now));
+        assert!(periodic_index_due(Duration::from_secs(900), None, now));
+        assert!(!periodic_index_due(
+            Duration::from_secs(900),
+            Some(now),
+            now + Duration::from_secs(899)
+        ));
+        assert!(periodic_index_due(
+            Duration::from_secs(900),
+            Some(now),
+            now + Duration::from_secs(900)
+        ));
+    }
+
+    #[test]
+    fn daemon_config_defaults_leave_periodic_index_off() {
+        let cfg = DaemonConfig::default();
+        assert!(cfg.index_interval.is_zero());
+        assert!(cfg.data_dir.is_none());
+    }
 
     fn test_data_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
