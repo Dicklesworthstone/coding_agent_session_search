@@ -2367,10 +2367,28 @@
             },
             "total_blob_bytes": {
               "type": "integer"
+            },
+            "amplified_source_count": {
+              "type": "integer"
+            },
+            "amplified_source_referenced_bytes": {
+              "type": "integer"
+            },
+            "amplified_source_excess_bytes": {
+              "type": "integer"
+            },
+            "max_source_amplification_ratio_milli": {
+              "type": "null"
             }
           }
         },
         "manifests": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "amplified_sources": {
           "type": "array",
           "items": {
             "type": "unknown"

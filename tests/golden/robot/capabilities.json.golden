@@ -1764,6 +1764,37 @@
       "has_json_output": true
     },
     {
+      "name": "selftest",
+      "description": "Verify this executable without reading or writing the configured archive. Intended for package installation and binary-promotion gates",
+      "arguments": [
+        {
+          "name": "json",
+          "description": "Output a stable machine-readable result (`--robot` also works)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
       "name": "onboarding",
       "description": "First-run source onboarding + readiness wizard. Read-only: explains what CASS found, what it will index, what is missing, and the single safest next command. Scriptable via `--json`; never launches a bare TUI",
       "arguments": [
@@ -3426,6 +3457,11 @@
       "name": "CASS_INDEX_INGEST_WAL_CHECKPOINT_MODE",
       "default": "TRUNCATE",
       "description": "Checkpoint mode for the single-connection in-run bulk WAL reset: PASSIVE, FULL, RESTART, or TRUNCATE."
+    },
+    {
+      "name": "CASS_DEFER_ANALYTICS_UPDATES",
+      "default": "0",
+      "description": "Set to 1 to defer derived analytics writes during indexing. A legacy OMP identity migration keeps its analytics phase and durable cursor pending until a later index run with this unset."
     },
     {
       "name": "CASS_AUTO_REFRESH",

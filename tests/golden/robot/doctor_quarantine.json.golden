@@ -2618,7 +2618,17 @@
           "status",
           "blob_checksum_status",
           "manifest_checksum_status",
-          "invalid_reason"
+          "invalid_reason",
+          "amplified_sources.evidence_kind",
+          "amplified_sources.providers",
+          "amplified_sources.source_id",
+          "amplified_sources.redacted_original_path",
+          "amplified_sources.original_path_blake3",
+          "amplified_sources.version_count",
+          "amplified_sources.referenced_blob_bytes",
+          "amplified_sources.current_source_size_bytes",
+          "amplified_sources.excess_bytes",
+          "amplified_sources.amplification_ratio_milli"
         ],
         "redacted_by_default_fields": [
           "root_path",
@@ -2706,9 +2716,14 @@
       "invalid_manifest_count": 0,
       "interrupted_capture_count": 0,
       "duplicate_blob_reference_count": 0,
-      "total_blob_bytes": 0
+      "total_blob_bytes": 0,
+      "amplified_source_count": 0,
+      "amplified_source_referenced_bytes": 0,
+      "amplified_source_excess_bytes": 0,
+      "max_source_amplification_ratio_milli": null
     },
     "manifests": [],
+    "amplified_sources": [],
     "warnings": [],
     "notes": [
       "Raw mirror blobs are precious evidence and are never automatic cleanup candidates.",

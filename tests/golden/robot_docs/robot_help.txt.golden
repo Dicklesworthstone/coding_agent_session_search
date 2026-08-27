@@ -38,7 +38,7 @@ OUTPUT:
   Use -v/--verbose with --json to enable INFO logs if needed
 
 Agent preflight: triage | ready | preflight
-Core subcommands: search | pack | sessions | stats | view | index | health | swarm | capabilities | introspect | robot-docs <topic>
+Core subcommands: search | pack | sessions | stats | view | index | health | selftest | swarm | capabilities | introspect | robot-docs <topic>
 Topics: commands | env | paths | schemas | guide | exit-codes | examples | contracts | wrap | sources
 Exit codes: 0 ok; 1 health; 2 usage; 3 missing index/db; 7 lock/busy
 More: cass capabilities --json | cass robot-docs examples | cass robot-docs exit-codes

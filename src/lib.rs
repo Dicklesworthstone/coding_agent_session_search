@@ -931,6 +931,13 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         binary_only: bool,
     },
+    /// Verify this executable without reading or writing the configured archive.
+    /// Intended for package installation and binary-promotion gates.
+    Selftest {
+        /// Output a stable machine-readable result (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
     /// First-run source onboarding + readiness wizard. Read-only: explains what
     /// CASS found, what it will index, what is missing, and the single safest
     /// next command. Scriptable via `--json`; never launches a bare TUI.
@@ -3244,6 +3251,7 @@ fn command_accepts_leading_structured_flag(command: &str) -> bool {
             | "fleet"
             | "guide"
             | "health"
+            | "selftest"
             | "import"
             | "index"
             | "introspect"
@@ -6145,6 +6153,7 @@ const CANONICAL_TOP_LEVEL_COMMANDS: &[&str] = &[
     "status",
     "state",
     "health",
+    "selftest",
     "diag",
     "storage",
     "dedup",
@@ -6680,10 +6689,11 @@ pub async fn run_with_parsed(parsed: ParsedCli) -> CliResult<()> {
 
 /// Run startup-sensitive commands before constructing the async runtime.
 ///
-/// `cass health --json` is documented as a <50ms fast-readiness surface. Even
-/// the current-thread runtime setup is visible in subprocess latency tests, so
-/// keep this command on a synchronous path and leave the general async runner
-/// for commands that actually need it.
+/// `cass health --json` is documented as a <50ms fast-readiness surface and
+/// `cass selftest --json` is a binary-promotion probe that must not pay archive
+/// or runtime startup costs. Even current-thread runtime setup is visible in
+/// subprocess latency tests, so keep both commands on this synchronous path
+/// and leave the general async runner for commands that actually need it.
 pub fn try_run_with_parsed_fast(parsed: ParsedCli) -> Result<CliResult<()>, Box<ParsedCli>> {
     let ParsedCli {
         cli,
@@ -6692,21 +6702,18 @@ pub fn try_run_with_parsed_fast(parsed: ParsedCli) -> Result<CliResult<()>, Box<
         heuristic_note,
     } = parsed;
 
-    let Some(Commands::Health {
-        data_dir,
-        robot_meta,
-        stale_threshold,
-        binary_only,
-        json,
-    }) = cli.command.clone()
-    else {
+    let command = cli.command.clone();
+    if !matches!(
+        command.as_ref(),
+        Some(Commands::Health { .. } | Commands::Selftest { .. })
+    ) {
         return Err(Box::new(ParsedCli {
             cli,
             raw_args,
             parse_note,
             heuristic_note,
         }));
-    };
+    }
 
     let stdout_is_tty = io::stdout().is_terminal();
     let stderr_is_tty = io::stderr().is_terminal();
@@ -6734,15 +6741,30 @@ pub fn try_run_with_parsed_fast(parsed: ParsedCli) -> Result<CliResult<()>, Box<
         eprintln!("Tip: Run 'cass --help' for proper syntax.");
     }
 
-    let structured_format = resolve_subcommand_structured_format(&cli, json);
-    let result = run_health(
-        &data_dir,
-        cli.db.clone(),
-        structured_format,
-        stale_threshold,
-        binary_only,
-        robot_meta,
-    );
+    let result = match command.expect("fast command was matched above") {
+        Commands::Health {
+            data_dir,
+            robot_meta,
+            stale_threshold,
+            binary_only,
+            json,
+        } => {
+            let structured_format = resolve_subcommand_structured_format(&cli, json);
+            run_health(
+                &data_dir,
+                cli.db.clone(),
+                structured_format,
+                stale_threshold,
+                binary_only,
+                robot_meta,
+            )
+        }
+        Commands::Selftest { json } => {
+            let structured_format = resolve_subcommand_structured_format(&cli, json);
+            run_selftest(structured_format)
+        }
+        _ => unreachable!("non-fast command passed the fast-command guard"),
+    };
 
     if let Some(path) = &cli.trace_file {
         let duration_ms = start_instant.elapsed().as_millis();
@@ -8094,6 +8116,10 @@ async fn execute_cli(
                         binary_only,
                         robot_meta,
                     )?;
+                }
+                Commands::Selftest { json } => {
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
+                    run_selftest(structured_format)?;
                 }
                 Commands::Onboarding { data_dir, json } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
@@ -22180,6 +22206,7 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Introspect { .. }) => "introspect".to_string(),
         Some(Commands::RobotDocs { topic }) => format!("robot-docs:{topic:?}"),
         Some(Commands::Health { .. }) => "health".to_string(),
+        Some(Commands::Selftest { .. }) => "selftest".to_string(),
         Some(Commands::Onboarding { .. }) => "onboarding".to_string(),
         Some(Commands::Guide { .. }) => "guide".to_string(),
         Some(Commands::Doctor { .. }) => "doctor".to_string(),
@@ -24030,7 +24057,9 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
             | ScheduleCommand::Status { json, .. }
             | ScheduleCommand::Run { json, .. },
         ) => resolve_subcommand_structured_format(cli, *json).is_some(),
-        Commands::Health { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
+        Commands::Health { json, .. } | Commands::Selftest { json } => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
         Commands::Onboarding { json, .. } => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
@@ -24422,7 +24451,7 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
         "  Use -v/--verbose with --json to enable INFO logs if needed",
         "",
         "Agent preflight: triage | ready | preflight",
-        "Core subcommands: search | pack | sessions | stats | view | index | health | swarm | capabilities | introspect | robot-docs <topic>",
+        "Core subcommands: search | pack | sessions | stats | view | index | health | selftest | swarm | capabilities | introspect | robot-docs <topic>",
         "Topics: commands | env | paths | schemas | guide | exit-codes | examples | contracts | wrap | sources",
         "Exit codes: 0 ok; 1 health; 2 usage; 3 missing index/db; 7 lock/busy",
         "More: cass capabilities --json | cass robot-docs examples | cass robot-docs exit-codes",
@@ -24512,6 +24541,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             // full advertised surface instead of the ~10-command slice.
             "  cass health [--json]             Minimal readiness probe (<50ms, exit 0=healthy, 1=unhealthy).".to_string(),
             "    --binary-only     Report the same readiness verdict but exit 0 unless the executable itself fails (binary promotion gates).".to_string(),
+            "  cass selftest [--json]           Archive-independent executable probe for package and binary-promotion gates.".to_string(),
             "  cass doctor [--json] [--fix]     Legacy spelling: --json realizes read-only check; --fix realizes safe-auto-run.".to_string(),
             "                    doctor JSON includes source_inventory; missing upstream provider files are".to_string(),
             "                    source coverage/prune-risk warnings, not proof that archived cass rows are lost.".to_string(),
@@ -24593,6 +24623,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_INDEX_NO_PROGRESS_EVENTS=1          suppress NDJSON events from `cass index --json`".to_string(),
             "  CASS_INDEX_INGEST_WAL_CHECKPOINT_BYTES=<N>  reset a deferred bulk-ingest WAL after N bytes (default 536870912; 0 disables)".to_string(),
             "  CASS_INDEX_INGEST_WAL_CHECKPOINT_MODE=PASSIVE|FULL|RESTART|TRUNCATE  in-run bulk WAL checkpoint mode (default TRUNCATE)".to_string(),
+            "  CASS_DEFER_ANALYTICS_UPDATES=1             defer derived analytics writes during indexing; a pending legacy OMP rebuild resumes on a later run with this unset".to_string(),
             "  CASS_AUTO_REFRESH=0                      disable stale-on-read catch-up (detached `cass index --background` after a stale search/pack/TUI launch)".to_string(),
             "  CASS_AUTO_REFRESH_COOLDOWN_SECS=<N>      min seconds between auto-spawned catch-up runs (default 300)".to_string(),
             "  CASS_BACKGROUND_NICE=<N>                 nice value for `cass index --background` (default 15)".to_string(),
@@ -39028,6 +39059,9 @@ const DOCTOR_STORAGE_MIN_FREE_BYTES: u64 = 1024 * 1024 * 1024;
 const CASS_TEST_DOCTOR_STORAGE_AVAILABLE_BYTES: &str = "CASS_TEST_DOCTOR_STORAGE_AVAILABLE_BYTES";
 const CASS_RAW_MIRROR_SIZE_WARN_THRESHOLD_BYTES: &str = "CASS_RAW_MIRROR_SIZE_WARN_THRESHOLD_BYTES";
 const DOCTOR_RAW_MIRROR_SIZE_WARN_THRESHOLD_BYTES_DEFAULT: u64 = 100 * 1_000_000_000;
+const DOCTOR_RAW_MIRROR_SOURCE_AMPLIFICATION_WARN_RATIO_MILLI_DEFAULT: u64 = 4_000;
+const DOCTOR_RAW_MIRROR_SOURCE_AMPLIFICATION_WARN_EXCESS_BYTES_DEFAULT: u64 = 256 * 1024 * 1024;
+const DOCTOR_RAW_MIRROR_AMPLIFICATION_MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
 const CASS_TEST_DOCTOR_CANDIDATE_PROMOTION_FAILPOINT: &str =
     "CASS_TEST_DOCTOR_CANDIDATE_PROMOTION_FAILPOINT";
 const CASS_TEST_DOCTOR_RENAME_FAILURE: &str = "CASS_TEST_DOCTOR_RENAME_FAILURE";
@@ -42079,6 +42113,7 @@ struct DoctorRawMirrorReport {
     policy: DoctorRawMirrorPolicyReport,
     summary: DoctorRawMirrorSummary,
     manifests: Vec<DoctorRawMirrorManifestReport>,
+    amplified_sources: Vec<DoctorRawMirrorSourceAmplificationReport>,
     warnings: Vec<String>,
     notes: Vec<String>,
 }
@@ -42193,6 +42228,35 @@ struct DoctorRawMirrorSummary {
     interrupted_capture_count: usize,
     duplicate_blob_reference_count: usize,
     total_blob_bytes: u64,
+    amplified_source_count: usize,
+    amplified_source_referenced_bytes: u64,
+    amplified_source_excess_bytes: u64,
+    max_source_amplification_ratio_milli: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct DoctorRawMirrorSourceAmplificationReport {
+    evidence_kind: &'static str,
+    providers: Vec<String>,
+    source_id: String,
+    redacted_original_path: String,
+    original_path_blake3: String,
+    version_count: usize,
+    referenced_blob_bytes: u64,
+    current_source_size_bytes: u64,
+    excess_bytes: u64,
+    amplification_ratio_milli: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct DoctorRawMirrorSourceAmplificationVersion {
+    provider: String,
+    source_id: String,
+    original_path: String,
+    redacted_original_path: String,
+    original_path_blake3: String,
+    blob_blake3: String,
+    blob_size_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -42404,6 +42468,16 @@ fn doctor_raw_mirror_policy_report() -> DoctorRawMirrorPolicyReport {
                 "blob_checksum_status",
                 "manifest_checksum_status",
                 "invalid_reason",
+                "amplified_sources.evidence_kind",
+                "amplified_sources.providers",
+                "amplified_sources.source_id",
+                "amplified_sources.redacted_original_path",
+                "amplified_sources.original_path_blake3",
+                "amplified_sources.version_count",
+                "amplified_sources.referenced_blob_bytes",
+                "amplified_sources.current_source_size_bytes",
+                "amplified_sources.excess_bytes",
+                "amplified_sources.amplification_ratio_milli",
             ],
             redacted_by_default_fields: vec![
                 "root_path",
@@ -42669,11 +42743,7 @@ fn doctor_raw_mirror_loaded_invalid_manifest_report(
         origin_kind: manifest.origin_kind,
         origin_host: manifest.origin_host,
         original_path: manifest.original_path.clone(),
-        redacted_original_path: if manifest.redacted_original_path.trim().is_empty() {
-            doctor_redacted_path(&manifest.original_path, data_dir)
-        } else {
-            manifest.redacted_original_path
-        },
+        redacted_original_path: doctor_redacted_path(&manifest.original_path, data_dir),
         original_path_blake3: manifest.original_path_blake3,
         captured_at_ms: manifest.captured_at_ms,
         source_mtime_ms: manifest.source_mtime_ms,
@@ -42881,11 +42951,7 @@ fn doctor_verify_raw_mirror_manifest(
         origin_kind: manifest.origin_kind,
         origin_host: manifest.origin_host,
         original_path: manifest.original_path.clone(),
-        redacted_original_path: if manifest.redacted_original_path.trim().is_empty() {
-            doctor_redacted_path(&manifest.original_path, data_dir)
-        } else {
-            manifest.redacted_original_path
-        },
+        redacted_original_path: doctor_redacted_path(&manifest.original_path, data_dir),
         original_path_blake3: manifest.original_path_blake3,
         captured_at_ms: manifest.captured_at_ms,
         source_mtime_ms: manifest.source_mtime_ms,
@@ -42932,6 +42998,278 @@ fn doctor_raw_mirror_size_warning(total_blob_bytes: u64, threshold_bytes: u64) -
             "raw_mirror.size: verified raw-mirror blobs use {total_blob_bytes} bytes, at or above the warn threshold of {threshold_bytes} bytes; inspect `cass mirror prune --older-than 90d --json` and apply only after reviewing the plan"
         )
     })
+}
+
+#[derive(Debug, Default)]
+struct DoctorRawMirrorSourceAmplificationAccumulator {
+    providers: BTreeSet<String>,
+    source_id: String,
+    original_path: String,
+    redacted_original_path: String,
+    original_path_blake3: String,
+    blobs: BTreeMap<String, u64>,
+}
+
+fn doctor_raw_mirror_source_amplification_reports(
+    manifests: &[DoctorRawMirrorManifestReport],
+    ratio_warn_threshold_milli: u64,
+    excess_warn_threshold_bytes: u64,
+) -> Vec<DoctorRawMirrorSourceAmplificationReport> {
+    let versions = manifests
+        .iter()
+        .filter(|manifest| doctor_raw_mirror_manifest_is_verified(manifest))
+        .map(|manifest| DoctorRawMirrorSourceAmplificationVersion {
+            provider: manifest.provider.clone(),
+            source_id: manifest.source_id.clone(),
+            original_path: manifest.original_path.clone(),
+            redacted_original_path: manifest.redacted_original_path.clone(),
+            original_path_blake3: manifest.original_path_blake3.clone(),
+            blob_blake3: manifest.blob_blake3.clone(),
+            blob_size_bytes: manifest.blob_size_bytes,
+        })
+        .collect::<Vec<_>>();
+    doctor_raw_mirror_source_amplification_reports_from_versions(
+        &versions,
+        "full_blob_checksum",
+        ratio_warn_threshold_milli,
+        excess_warn_threshold_bytes,
+    )
+}
+
+fn doctor_raw_mirror_source_amplification_reports_from_versions(
+    versions: &[DoctorRawMirrorSourceAmplificationVersion],
+    evidence_kind: &'static str,
+    ratio_warn_threshold_milli: u64,
+    excess_warn_threshold_bytes: u64,
+) -> Vec<DoctorRawMirrorSourceAmplificationReport> {
+    let mut sources: BTreeMap<(String, String), DoctorRawMirrorSourceAmplificationAccumulator> =
+        BTreeMap::new();
+    for version in versions {
+        let key = (
+            version.source_id.clone(),
+            version.original_path_blake3.clone(),
+        );
+        let source =
+            sources
+                .entry(key)
+                .or_insert_with(|| DoctorRawMirrorSourceAmplificationAccumulator {
+                    providers: BTreeSet::new(),
+                    source_id: version.source_id.clone(),
+                    original_path: version.original_path.clone(),
+                    redacted_original_path: version.redacted_original_path.clone(),
+                    original_path_blake3: version.original_path_blake3.clone(),
+                    blobs: BTreeMap::new(),
+                });
+        source.providers.insert(version.provider.clone());
+        source
+            .blobs
+            .entry(version.blob_blake3.clone())
+            .or_insert(version.blob_size_bytes);
+    }
+
+    let mut reports = Vec::new();
+    for source in sources.into_values() {
+        let version_count = source.blobs.len();
+        if version_count < 2 {
+            continue;
+        }
+        let current_source_size_bytes = match std::fs::symlink_metadata(&source.original_path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                metadata.len()
+            }
+            _ => continue,
+        };
+        let referenced_blob_bytes = source
+            .blobs
+            .values()
+            .copied()
+            .fold(0_u64, u64::saturating_add);
+        let excess_bytes = referenced_blob_bytes.saturating_sub(current_source_size_bytes);
+        let amplification_ratio_milli = (current_source_size_bytes > 0)
+            .then(|| referenced_blob_bytes.saturating_mul(1_000) / current_source_size_bytes);
+        let ratio_exceeded = amplification_ratio_milli
+            .is_some_and(|ratio| ratio >= ratio_warn_threshold_milli)
+            || (current_source_size_bytes == 0 && referenced_blob_bytes > 0);
+        if !ratio_exceeded || excess_bytes < excess_warn_threshold_bytes {
+            continue;
+        }
+        reports.push(DoctorRawMirrorSourceAmplificationReport {
+            evidence_kind,
+            providers: source.providers.into_iter().collect(),
+            source_id: source.source_id,
+            redacted_original_path: source.redacted_original_path,
+            original_path_blake3: source.original_path_blake3,
+            version_count,
+            referenced_blob_bytes,
+            current_source_size_bytes,
+            excess_bytes,
+            amplification_ratio_milli,
+        });
+    }
+    reports.sort_by(|left, right| {
+        right
+            .excess_bytes
+            .cmp(&left.excess_bytes)
+            .then_with(|| left.providers.cmp(&right.providers))
+            .then_with(|| left.source_id.cmp(&right.source_id))
+            .then_with(|| left.original_path_blake3.cmp(&right.original_path_blake3))
+    });
+    reports
+}
+
+/// Read the cheap, integrity-bound subset needed for a storage-amplification
+/// warning without hashing the entire raw blob. This is deliberately not a
+/// repair-authority proof: callers may use it only for diagnostics, and the
+/// serialized report labels the weaker evidence class explicitly.
+fn doctor_raw_mirror_amplification_version_from_manifest_path(
+    data_dir: &Path,
+    root: &Path,
+    manifest_path: &Path,
+) -> Option<DoctorRawMirrorSourceAmplificationVersion> {
+    let metadata = std::fs::symlink_metadata(manifest_path).ok()?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > DOCTOR_RAW_MIRROR_AMPLIFICATION_MANIFEST_MAX_BYTES
+        || path_has_symlink_below_root(manifest_path, root)
+    {
+        return None;
+    }
+    let manifest: DoctorRawMirrorManifestFile =
+        serde_json::from_slice(&std::fs::read(manifest_path).ok()?).ok()?;
+    if manifest.schema_version != DOCTOR_RAW_MIRROR_SCHEMA_VERSION
+        || manifest.manifest_kind != DOCTOR_RAW_MIRROR_MANIFEST_KIND
+        || manifest.blob_hash_algorithm != DOCTOR_RAW_MIRROR_HASH_ALGORITHM
+    {
+        return None;
+    }
+
+    let expected_blob_relative = doctor_raw_mirror_blob_relative_path(&manifest.blob_blake3)?;
+    if manifest.blob_relative_path != expected_blob_relative {
+        return None;
+    }
+    let relative_blob =
+        doctor_raw_mirror_validate_relative_path(&manifest.blob_relative_path).ok()?;
+    let blob_path = root.join(relative_blob);
+    if blob_path
+        .parent()
+        .is_none_or(|parent| existing_path_has_symlink_below_root(parent, root))
+    {
+        return None;
+    }
+    let blob_metadata = std::fs::symlink_metadata(&blob_path).ok()?;
+    if blob_metadata.file_type().is_symlink()
+        || !blob_metadata.is_file()
+        || blob_metadata.len() != manifest.blob_size_bytes
+    {
+        return None;
+    }
+
+    let expected_original_path_blake3 =
+        doctor_raw_mirror_original_path_blake3(&manifest.original_path);
+    if expected_original_path_blake3 != manifest.original_path_blake3 {
+        return None;
+    }
+    let expected_manifest_id = doctor_raw_mirror_manifest_id(
+        &manifest.provider,
+        &manifest.source_id,
+        &manifest.origin_kind,
+        manifest.origin_host.as_deref(),
+        &manifest.original_path_blake3,
+        &manifest.blob_blake3,
+    );
+    if manifest.manifest_id != expected_manifest_id {
+        return None;
+    }
+    let expected_manifest_relative =
+        doctor_raw_mirror_manifest_relative_path(&manifest.manifest_id);
+    if manifest_path.strip_prefix(root).ok()? != Path::new(&expected_manifest_relative) {
+        return None;
+    }
+    let computed_manifest_blake3 = doctor_raw_mirror_manifest_blake3(&manifest);
+    if manifest.manifest_blake3.as_deref() != Some(computed_manifest_blake3.as_str()) {
+        return None;
+    }
+    if manifest
+        .verification
+        .content_blake3
+        .as_deref()
+        .is_some_and(|verified| verified != manifest.blob_blake3)
+    {
+        return None;
+    }
+
+    Some(DoctorRawMirrorSourceAmplificationVersion {
+        provider: doctor_normalized_provider_slug(&manifest.provider),
+        source_id: manifest.source_id,
+        original_path: manifest.original_path.clone(),
+        redacted_original_path: doctor_redacted_path(&manifest.original_path, data_dir),
+        original_path_blake3: manifest.original_path_blake3,
+        blob_blake3: manifest.blob_blake3,
+        blob_size_bytes: manifest.blob_size_bytes,
+    })
+}
+
+fn doctor_raw_mirror_bounded_amplification_reports(
+    data_dir: &Path,
+    root: &Path,
+    manifest_entries: &[(PathBuf, bool)],
+    ratio_warn_threshold_milli: u64,
+    excess_warn_threshold_bytes: u64,
+) -> Vec<DoctorRawMirrorSourceAmplificationReport> {
+    let versions = manifest_entries
+        .iter()
+        .filter(|(_, is_symlink)| !is_symlink)
+        .filter_map(|(path, _)| {
+            doctor_raw_mirror_amplification_version_from_manifest_path(data_dir, root, path)
+        })
+        .collect::<Vec<_>>();
+    doctor_raw_mirror_source_amplification_reports_from_versions(
+        &versions,
+        "manifest_checksum_and_blob_metadata",
+        ratio_warn_threshold_milli,
+        excess_warn_threshold_bytes,
+    )
+}
+
+fn doctor_raw_mirror_apply_source_amplification_reports(
+    report: &mut DoctorRawMirrorReport,
+    amplified_sources: Vec<DoctorRawMirrorSourceAmplificationReport>,
+) {
+    report.amplified_sources = amplified_sources;
+    report.summary.amplified_source_count = report.amplified_sources.len();
+    report.summary.amplified_source_referenced_bytes = report
+        .amplified_sources
+        .iter()
+        .map(|source| source.referenced_blob_bytes)
+        .fold(0_u64, u64::saturating_add);
+    report.summary.amplified_source_excess_bytes = report
+        .amplified_sources
+        .iter()
+        .map(|source| source.excess_bytes)
+        .fold(0_u64, u64::saturating_add);
+    report.summary.max_source_amplification_ratio_milli = report
+        .amplified_sources
+        .iter()
+        .filter_map(|source| source.amplification_ratio_milli)
+        .max();
+    if let Some(worst) = report.amplified_sources.first() {
+        let ratio = worst
+            .amplification_ratio_milli
+            .map(|ratio| format!("{:.1}x", ratio as f64 / 1_000.0))
+            .unwrap_or_else(|| "unbounded (current source is empty)".to_string());
+        report.warnings.push(format!(
+            "raw_mirror.source_amplification: {} source path(s) materially exceed their current file size; evidence={} worst={} providers={:?} versions={} referenced_bytes={} current_bytes={} excess_bytes={} ratio={}. Review `amplified_sources` before applying any prune because an older version can be sole-copy evidence after provider rotation.",
+            report.summary.amplified_source_count,
+            worst.evidence_kind,
+            worst.redacted_original_path,
+            worst.providers,
+            worst.version_count,
+            worst.referenced_blob_bytes,
+            worst.current_source_size_bytes,
+            worst.excess_bytes,
+            ratio,
+        ));
+    }
 }
 
 fn doctor_raw_mirror_full_verify_requested() -> bool {
@@ -42996,6 +43334,37 @@ fn collect_doctor_raw_mirror_report_with_threshold_and_mode(
     size_warn_threshold_bytes: u64,
     verification_mode: DoctorRawMirrorVerificationMode,
 ) -> DoctorRawMirrorReport {
+    collect_doctor_raw_mirror_report_with_thresholds_and_mode(
+        data_dir,
+        size_warn_threshold_bytes,
+        DOCTOR_RAW_MIRROR_SOURCE_AMPLIFICATION_WARN_RATIO_MILLI_DEFAULT,
+        DOCTOR_RAW_MIRROR_SOURCE_AMPLIFICATION_WARN_EXCESS_BYTES_DEFAULT,
+        verification_mode,
+    )
+}
+
+#[cfg(test)]
+fn collect_doctor_raw_mirror_report_with_amplification_thresholds(
+    data_dir: &Path,
+    ratio_warn_threshold_milli: u64,
+    excess_warn_threshold_bytes: u64,
+) -> DoctorRawMirrorReport {
+    collect_doctor_raw_mirror_report_with_thresholds_and_mode(
+        data_dir,
+        0,
+        ratio_warn_threshold_milli,
+        excess_warn_threshold_bytes,
+        DoctorRawMirrorVerificationMode::Full,
+    )
+}
+
+fn collect_doctor_raw_mirror_report_with_thresholds_and_mode(
+    data_dir: &Path,
+    size_warn_threshold_bytes: u64,
+    source_amplification_ratio_warn_threshold_milli: u64,
+    source_amplification_excess_warn_threshold_bytes: u64,
+    verification_mode: DoctorRawMirrorVerificationMode,
+) -> DoctorRawMirrorReport {
     let root = doctor_raw_mirror_root(data_dir);
     let root_path = root.display().to_string();
     let mut report = DoctorRawMirrorReport {
@@ -43010,6 +43379,7 @@ fn collect_doctor_raw_mirror_report_with_threshold_and_mode(
         policy: doctor_raw_mirror_policy_report(),
         summary: DoctorRawMirrorSummary::default(),
         manifests: Vec::new(),
+        amplified_sources: Vec::new(),
         warnings: Vec::new(),
         notes: vec![
             "Raw mirror blobs are precious evidence and are never automatic cleanup candidates.".to_string(),
@@ -43061,7 +43431,6 @@ fn collect_doctor_raw_mirror_report_with_threshold_and_mode(
                     manifest_entry_count += 1;
                     if bounded_manifest_limit.is_some_and(|limit| manifest_entry_count > limit) {
                         full_verification_deferred = true;
-                        continue;
                     }
                     manifest_entries.push((path.to_path_buf(), entry.file_type().is_symlink()));
                 }
@@ -43076,12 +43445,24 @@ fn collect_doctor_raw_mirror_report_with_threshold_and_mode(
     if full_verification_deferred {
         report.summary.manifest_count = manifest_entry_count;
         report.status = "verification_deferred".to_string();
+        let amplified_sources = doctor_raw_mirror_bounded_amplification_reports(
+            data_dir,
+            &root,
+            &manifest_entries,
+            source_amplification_ratio_warn_threshold_milli,
+            source_amplification_excess_warn_threshold_bytes,
+        );
+        doctor_raw_mirror_apply_source_amplification_reports(&mut report, amplified_sources);
         let limit = bounded_manifest_limit.unwrap_or(0);
         report.warnings.push(format!(
             "Raw mirror verification deferred: {manifest_entry_count} manifest(s) exceed the bounded doctor limit of {limit}; set {CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY}=1 to run a full blob checksum verification."
         ));
         report.notes.push(
             "Bounded doctor mode does not claim raw mirror blobs are verified until full checksum verification runs."
+                .to_string(),
+        );
+        report.notes.push(
+            "Per-source amplification remains available in bounded mode using checksum-verified manifest metadata plus regular-file blob sizes; this evidence measures storage growth but is not blob-content or restore-authority proof."
                 .to_string(),
         );
         return report;
@@ -43156,6 +43537,12 @@ fn collect_doctor_raw_mirror_report_with_threshold_and_mode(
     {
         report.warnings.push(warning);
     }
+    let amplified_sources = doctor_raw_mirror_source_amplification_reports(
+        &report.manifests,
+        source_amplification_ratio_warn_threshold_milli,
+        source_amplification_excess_warn_threshold_bytes,
+    );
+    doctor_raw_mirror_apply_source_amplification_reports(&mut report, amplified_sources);
 
     report.status = if report.summary.invalid_manifest_count > 0
         || report.summary.missing_blob_count > 0
@@ -43163,6 +43550,7 @@ fn collect_doctor_raw_mirror_report_with_threshold_and_mode(
         || report.summary.manifest_checksum_mismatch_count > 0
         || report.summary.manifest_checksum_not_recorded_count > 0
         || report.summary.interrupted_capture_count > 0
+        || report.summary.amplified_source_count > 0
         || doctor_raw_mirror_size_warning(
             report.summary.total_blob_bytes,
             size_warn_threshold_bytes,
@@ -68526,6 +68914,7 @@ mod doctor_asset_taxonomy_tests {
                     invalid_reason: Some("fixture parse error".to_string()),
                 },
             ],
+            amplified_sources: Vec::new(),
             warnings: Vec::new(),
             notes: Vec::new(),
         }
@@ -72316,6 +72705,11 @@ paths = ["~/.claude/projects"]
             key_id: Some("local-key-1".to_string()),
             envelope_version: Some(1),
         };
+        // The manifest checksum is public integrity metadata, not an
+        // authentication boundary. A crafted but internally consistent
+        // manifest must not be able to smuggle an exact path through a field
+        // whose name merely claims it is redacted.
+        manifest.redacted_original_path = source_path.display().to_string();
         manifest.manifest_blake3 = Some(doctor_raw_mirror_manifest_blake3(&manifest));
         write_raw_mirror_test_manifest(&data_dir, &manifest, raw_bytes);
 
@@ -72527,6 +72921,160 @@ paths = ["~/.claude/projects"]
                     && warning.contains("cass mirror prune --older-than 90d --json")),
             "raw mirror size warning should include the canonical prune dry-run: {report:#?}"
         );
+    }
+
+    #[test]
+    fn gh430_raw_mirror_report_warns_on_per_source_full_copy_amplification() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = data_dir.join("sessions/growing.jsonl");
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create source parent");
+        std::fs::write(&source_path, b"x").expect("write current source");
+
+        let first_bytes = b"first complete historical source version";
+        let second_bytes = b"second complete historical source version with appended bytes";
+        let first = raw_mirror_test_manifest(
+            &data_dir,
+            "pi_agent",
+            "local",
+            &source_path,
+            first_bytes,
+            Vec::new(),
+        );
+        let second = raw_mirror_test_manifest(
+            &data_dir,
+            "omp",
+            "local",
+            &source_path,
+            second_bytes,
+            Vec::new(),
+        );
+        write_raw_mirror_test_manifest(&data_dir, &first, first_bytes);
+        write_raw_mirror_test_manifest(&data_dir, &second, second_bytes);
+
+        let report =
+            collect_doctor_raw_mirror_report_with_amplification_thresholds(&data_dir, 2_000, 1);
+        let expected_referenced_bytes = (first_bytes.len() + second_bytes.len()) as u64;
+
+        assert_eq!(report.status, "warn");
+        assert_eq!(report.summary.amplified_source_count, 1);
+        assert_eq!(
+            report.summary.amplified_source_referenced_bytes,
+            expected_referenced_bytes
+        );
+        assert_eq!(
+            report.summary.amplified_source_excess_bytes,
+            expected_referenced_bytes - 1
+        );
+        let amplified = report
+            .amplified_sources
+            .first()
+            .expect("source amplification detail");
+        assert_eq!(amplified.evidence_kind, "full_blob_checksum");
+        assert_eq!(
+            amplified.providers,
+            vec!["omp".to_string(), "pi_agent".to_string()],
+            "provider reclassification must not split one physical source path into separate amplification groups"
+        );
+        assert_eq!(amplified.version_count, 2);
+        assert_eq!(amplified.referenced_blob_bytes, expected_referenced_bytes);
+        assert_eq!(amplified.current_source_size_bytes, 1);
+        assert_eq!(
+            amplified.amplification_ratio_milli,
+            Some(expected_referenced_bytes * 1_000)
+        );
+        assert!(
+            report.warnings.iter().any(|warning| warning
+                .contains("raw_mirror.source_amplification")
+                && warning.contains("sole-copy evidence")),
+            "source amplification warning must explain the archive-safety boundary: {report:#?}"
+        );
+        let rendered = serde_json::to_string(&report).expect("serialize raw mirror report");
+        assert!(
+            !rendered.contains(&source_path.display().to_string()),
+            "source amplification diagnostics must not expose exact source paths"
+        );
+    }
+
+    #[test]
+    fn gh430_bounded_doctor_still_reports_amplification_without_claiming_blob_verification() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = data_dir.join("sessions/growing.jsonl");
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create source parent");
+        std::fs::write(&source_path, b"x").expect("write current source");
+
+        let versions: [(&str, &[u8]); 3] = [
+            ("pi_agent", b"first complete source version"),
+            ("omp", b"second complete source version with appended bytes"),
+            (
+                "omp",
+                b"third complete source version with still more appended bytes",
+            ),
+        ];
+        for (provider, bytes) in versions {
+            let manifest = raw_mirror_test_manifest(
+                &data_dir,
+                provider,
+                "local",
+                &source_path,
+                bytes,
+                Vec::new(),
+            );
+            write_raw_mirror_test_manifest(&data_dir, &manifest, bytes);
+        }
+
+        let rejected_bytes = b"forged fourth version must not influence the warning";
+        let mut rejected = raw_mirror_test_manifest(
+            &data_dir,
+            "omp",
+            "local",
+            &source_path,
+            rejected_bytes,
+            Vec::new(),
+        );
+        rejected.manifest_blake3 = Some("doctor-raw-mirror-manifest-v1-forged".to_string());
+        write_raw_mirror_test_manifest(&data_dir, &rejected, rejected_bytes);
+
+        let report = collect_doctor_raw_mirror_report_with_thresholds_and_mode(
+            &data_dir,
+            0,
+            2_000,
+            1,
+            DoctorRawMirrorVerificationMode::Bounded { manifest_limit: 1 },
+        );
+
+        assert_eq!(report.status, "verification_deferred");
+        assert_eq!(report.summary.manifest_count, 4);
+        assert_eq!(report.summary.verified_blob_count, 0);
+        assert!(
+            report.manifests.is_empty(),
+            "bounded metadata diagnostics must not masquerade as fully verified manifest reports"
+        );
+        let amplified = report
+            .amplified_sources
+            .first()
+            .expect("bounded source amplification detail");
+        assert_eq!(
+            amplified.evidence_kind,
+            "manifest_checksum_and_blob_metadata"
+        );
+        assert_eq!(
+            amplified.version_count, 3,
+            "the forged manifest must be excluded from the bounded amplification evidence"
+        );
+        assert_eq!(
+            amplified.providers,
+            vec!["omp".to_string(), "pi_agent".to_string()]
+        );
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains("raw_mirror.source_amplification")
+                && warning.contains("evidence=manifest_checksum_and_blob_metadata")
+        }));
+        let rendered = serde_json::to_string(&report).expect("serialize bounded report");
+        assert!(!rendered.contains(&source_path.display().to_string()));
     }
 
     #[cfg(unix)]
@@ -77277,6 +77825,93 @@ fn run_support_bundle(
     println!("Machine output: cass support-bundle --json");
 
     Ok(())
+}
+
+/// Archive-independent executable probe for package and binary-promotion gates.
+///
+/// This deliberately does not resolve a data directory or database override.
+/// The probe exercises the linked frankensqlite engine against an in-memory
+/// database, including a write and typed read, so a stale, corrupt, locked, or
+/// multi-gigabyte archive cannot affect its cost or exit status (#398).
+fn run_selftest(output_format: Option<RobotFormat>) -> CliResult<()> {
+    let start = Instant::now();
+    let database_probe = (|| -> std::result::Result<i64, crate::franken_sync::FrankenError> {
+        let conn = crate::franken_sync::Connection::open(":memory:")?;
+        conn.execute_batch(
+            "CREATE TABLE cass_selftest_probe (value INTEGER NOT NULL); \
+             INSERT INTO cass_selftest_probe (value) VALUES (42);",
+        )?;
+        conn.query_row("SELECT value FROM cass_selftest_probe LIMIT 1;")?
+            .get_typed::<i64>(0)
+    })();
+
+    let (functional, check_status, detail, probe_error) = match database_probe {
+        Ok(42) => (
+            true,
+            "pass",
+            "opened an in-memory frankensqlite database and round-tripped a typed value"
+                .to_string(),
+            None,
+        ),
+        Ok(value) => {
+            let message = format!("in-memory database returned {value}, expected 42");
+            (false, "fail", message.clone(), Some(message))
+        }
+        Err(error) => {
+            let message = format!("in-memory frankensqlite probe failed: {error}");
+            (false, "fail", message.clone(), Some(message))
+        }
+    };
+    let latency_ms = start.elapsed().as_millis() as u64;
+
+    let structured_format = output_format.or_else(robot_format_from_env).map(|format| {
+        if matches!(format, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            format
+        }
+    });
+    if let Some(format) = structured_format {
+        output_structured_value(
+            serde_json::json!({
+                "schema_version": 1,
+                "status": if functional { "ok" } else { "error" },
+                "functional": functional,
+                "archive_accessed": false,
+                "version": env!("CARGO_PKG_VERSION"),
+                "contract_version": CONTRACT_VERSION,
+                "latency_ms": latency_ms,
+                "checks": [{
+                    "name": "frankensqlite-in-memory-roundtrip",
+                    "status": check_status,
+                    "detail": detail,
+                }],
+            }),
+            format,
+        )?;
+    } else if functional {
+        println!("✓ cass executable self-test passed ({latency_ms}ms)");
+        println!("  frankensqlite in-memory round-trip: pass");
+        println!("  configured archive accessed: no");
+    } else {
+        println!("✗ cass executable self-test failed ({latency_ms}ms)");
+        println!("  {detail}");
+        println!("  configured archive accessed: no");
+    }
+
+    if functional {
+        Ok(())
+    } else {
+        Err(CliError {
+            code: 1,
+            kind: CliErrorKind::Health.kind_str(),
+            message: probe_error.unwrap_or_else(|| "executable self-test failed".to_string()),
+            hint: Some(
+                "Reinstall the cass binary from a checksum-verified release artifact.".to_string(),
+            ),
+            retryable: false,
+        })
+    }
 }
 
 /// Minimal health check (<50ms). Exit 0=healthy, 1=unhealthy.
@@ -82266,12 +82901,20 @@ pub(crate) fn run_doctor_impl(
             );
         }
         "verification_deferred" => {
+            let amplification_suffix = if raw_mirror.summary.amplified_source_count > 0 {
+                format!(
+                    "; {} source path(s) materially exceed their current size (see raw_mirror.amplified_sources)",
+                    raw_mirror.summary.amplified_source_count
+                )
+            } else {
+                String::new()
+            };
             add_check!(
                 "raw_mirror",
                 "warn",
                 format!(
-                    "Raw mirror verification deferred for bounded read-only doctor check ({} manifest(s)); set {CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY}=1 to run full blob checksum verification",
-                    raw_mirror.summary.manifest_count
+                    "Raw mirror verification deferred for bounded read-only doctor check ({} manifest(s)){amplification_suffix}; set {CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY}=1 to run full blob checksum verification",
+                    raw_mirror.summary.manifest_count,
                 ),
                 false
             );
@@ -85563,6 +86206,11 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
             "CASS_INDEX_INGEST_WAL_CHECKPOINT_MODE",
             Some("TRUNCATE"),
             "Checkpoint mode for the single-connection in-run bulk WAL reset: PASSIVE, FULL, RESTART, or TRUNCATE.",
+        ),
+        env_var_capability(
+            "CASS_DEFER_ANALYTICS_UPDATES",
+            Some("0"),
+            "Set to 1 to defer derived analytics writes during indexing. A legacy OMP identity migration keeps its analytics phase and durable cursor pending until a later index run with this unset.",
         ),
         env_var_capability(
             "CASS_AUTO_REFRESH",
@@ -89768,7 +90416,11 @@ fn response_schema_doctor_raw_mirror() -> serde_json::Value {
                     "invalid_manifest_count": { "type": "integer" },
                     "interrupted_capture_count": { "type": "integer" },
                     "duplicate_blob_reference_count": { "type": "integer" },
-                    "total_blob_bytes": { "type": "integer" }
+                    "total_blob_bytes": { "type": "integer" },
+                    "amplified_source_count": { "type": "integer" },
+                    "amplified_source_referenced_bytes": { "type": "integer" },
+                    "amplified_source_excess_bytes": { "type": "integer" },
+                    "max_source_amplification_ratio_milli": { "type": ["integer", "null"] }
                 }
             },
             "manifests": {
@@ -89815,7 +90467,26 @@ fn response_schema_doctor_raw_mirror() -> serde_json::Value {
                         "status": { "type": "string" },
                         "blob_checksum_status": { "type": "string" },
                         "manifest_checksum_status": { "type": "string" },
-                        "invalid_reason": { "type": "string" }
+                        "invalid_reason": { "type": ["string", "null"] }
+                    }
+                }
+            },
+            "amplified_sources": {
+                "type": "array",
+                "description": "Source paths whose unique stored versions materially exceed the current source size. evidence_kind distinguishes full blob checksums from bounded manifest-checksum plus blob-metadata diagnostics; neither classification authorizes automatic pruning.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "evidence_kind": { "type": "string" },
+                        "providers": { "type": "array", "items": { "type": "string" } },
+                        "source_id": { "type": "string" },
+                        "redacted_original_path": { "type": "string" },
+                        "original_path_blake3": { "type": "string" },
+                        "version_count": { "type": "integer" },
+                        "referenced_blob_bytes": { "type": "integer" },
+                        "current_source_size_bytes": { "type": "integer" },
+                        "excess_bytes": { "type": "integer" },
+                        "amplification_ratio_milli": { "type": ["integer", "null"] }
                     }
                 }
             },
@@ -89833,6 +90504,7 @@ fn response_schema_doctor_raw_mirror() -> serde_json::Value {
             "policy",
             "summary",
             "manifests",
+            "amplified_sources",
             "warnings",
             "notes"
         ]
@@ -91430,6 +92102,45 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 },
                 "db_path": { "type": "string" }
             }
+        }),
+    );
+
+    schemas.insert(
+        "selftest".to_string(),
+        json!({
+            "type": "object",
+            "description": "Archive-independent executable probe. This command never resolves, reads, or writes the configured cass archive.",
+            "properties": {
+                "schema_version": { "type": "integer", "const": 1 },
+                "status": { "type": "string", "enum": ["ok", "error"] },
+                "functional": { "type": "boolean" },
+                "archive_accessed": { "type": "boolean", "const": false },
+                "version": { "type": "string" },
+                "contract_version": { "type": "string" },
+                "latency_ms": { "type": "integer" },
+                "checks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "status": { "type": "string", "enum": ["pass", "fail"] },
+                            "detail": { "type": "string" }
+                        },
+                        "required": ["name", "status", "detail"]
+                    }
+                }
+            },
+            "required": [
+                "schema_version",
+                "status",
+                "functional",
+                "archive_accessed",
+                "version",
+                "contract_version",
+                "latency_ms",
+                "checks"
+            ]
         }),
     );
 
@@ -111503,6 +112214,7 @@ mod subcommand_robot_output_tests {
                 vec!["cass", "search", "needle", "--json"],
                 vec!["cass", "index", "--json"],
                 vec!["cass", "health", "--json"],
+                vec!["cass", "selftest", "--json"],
                 vec!["cass", "sessions", "--json"],
                 vec!["cass", "timeline", "--json"],
                 vec!["cass", "analytics", "status", "--json"],
@@ -111531,6 +112243,7 @@ mod subcommand_robot_output_tests {
                     Commands::Search { json, .. }
                     | Commands::Index { json, .. }
                     | Commands::Health { json, .. }
+                    | Commands::Selftest { json }
                     | Commands::Sessions { json, .. }
                     | Commands::Timeline { json, .. }
                     | Commands::Pages { json, .. }

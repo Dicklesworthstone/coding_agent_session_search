@@ -431,6 +431,7 @@ schemas: (auto-generated from contract)
     - primary_incident_id: ?
     - quarantine: object
     - raw_mirror: object
+      - amplified_sources: array
       - exists: boolean
       - layout: object
         - blob_path_template: string
@@ -477,6 +478,9 @@ schemas: (auto-generated from contract)
       - sensitive_paths_included: boolean
       - status: string
       - summary: object
+        - amplified_source_count: integer
+        - amplified_source_excess_bytes: integer
+        - amplified_source_referenced_bytes: integer
         - checksum_mismatch_count: integer
         - duplicate_blob_reference_count: integer
         - interrupted_capture_count: integer
@@ -484,6 +488,7 @@ schemas: (auto-generated from contract)
         - manifest_checksum_mismatch_count: integer
         - manifest_checksum_not_recorded_count: integer
         - manifest_count: integer
+        - max_source_amplification_ratio_milli: ?
         - missing_blob_count: integer
         - total_blob_bytes: integer
         - verified_blob_count: integer
@@ -910,6 +915,7 @@ schemas: (auto-generated from contract)
     - outcome_kind: string
     - plan_fingerprint: ?
     - raw_mirror: object
+      - amplified_sources: array
       - exists: boolean
       - layout: object
         - blob_path_template: string
@@ -956,6 +962,9 @@ schemas: (auto-generated from contract)
       - sensitive_paths_included: boolean
       - status: string
       - summary: object
+        - amplified_source_count: integer
+        - amplified_source_excess_bytes: integer
+        - amplified_source_referenced_bytes: integer
         - checksum_mismatch_count: integer
         - duplicate_blob_reference_count: integer
         - interrupted_capture_count: integer
@@ -963,6 +972,7 @@ schemas: (auto-generated from contract)
         - manifest_checksum_mismatch_count: integer
         - manifest_checksum_not_recorded_count: integer
         - manifest_count: integer
+        - max_source_amplification_ratio_milli: ?
         - missing_blob_count: integer
         - total_blob_bytes: integer
         - verified_blob_count: integer
@@ -3260,6 +3270,15 @@ schemas: (auto-generated from contract)
     - request_id: ?
     - suggestions: array
     - total_matches: integer
+  selftest:
+    - archive_accessed: boolean
+    - checks: array
+    - contract_version: string
+    - functional: boolean
+    - latency_ms: integer
+    - schema_version: integer
+    - status: string
+    - version: string
   sessions:
     - sessions: array
   state:

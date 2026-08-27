@@ -2143,6 +2143,37 @@
       "has_json_output": true
     },
     {
+      "name": "selftest",
+      "description": "Verify this executable without reading or writing the configured archive. Intended for package installation and binary-promotion gates",
+      "arguments": [
+        {
+          "name": "json",
+          "description": "Output a stable machine-readable result (`--robot` also works)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
       "name": "onboarding",
       "description": "First-run source onboarding + readiness wizard. Read-only: explains what CASS found, what it will index, what is missing, and the single safest next command. Scriptable via `--json`; never launches a bare TUI",
       "arguments": [
@@ -7033,6 +7064,21 @@
                 },
                 "total_blob_bytes": {
                   "type": "integer"
+                },
+                "amplified_source_count": {
+                  "type": "integer"
+                },
+                "amplified_source_referenced_bytes": {
+                  "type": "integer"
+                },
+                "amplified_source_excess_bytes": {
+                  "type": "integer"
+                },
+                "max_source_amplification_ratio_milli": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 }
               }
             },
@@ -7166,7 +7212,55 @@
                     "type": "string"
                   },
                   "invalid_reason": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                }
+              }
+            },
+            "amplified_sources": {
+              "type": "array",
+              "description": "Source paths whose unique stored versions materially exceed the current source size. evidence_kind distinguishes full blob checksums from bounded manifest-checksum plus blob-metadata diagnostics; neither classification authorizes automatic pruning.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "evidence_kind": {
                     "type": "string"
+                  },
+                  "providers": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "source_id": {
+                    "type": "string"
+                  },
+                  "redacted_original_path": {
+                    "type": "string"
+                  },
+                  "original_path_blake3": {
+                    "type": "string"
+                  },
+                  "version_count": {
+                    "type": "integer"
+                  },
+                  "referenced_blob_bytes": {
+                    "type": "integer"
+                  },
+                  "current_source_size_bytes": {
+                    "type": "integer"
+                  },
+                  "excess_bytes": {
+                    "type": "integer"
+                  },
+                  "amplification_ratio_milli": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
                   }
                 }
               }
@@ -7195,6 +7289,7 @@
             "policy",
             "summary",
             "manifests",
+            "amplified_sources",
             "warnings",
             "notes"
           ]
@@ -11854,6 +11949,21 @@
                 },
                 "total_blob_bytes": {
                   "type": "integer"
+                },
+                "amplified_source_count": {
+                  "type": "integer"
+                },
+                "amplified_source_referenced_bytes": {
+                  "type": "integer"
+                },
+                "amplified_source_excess_bytes": {
+                  "type": "integer"
+                },
+                "max_source_amplification_ratio_milli": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 }
               }
             },
@@ -11987,7 +12097,55 @@
                     "type": "string"
                   },
                   "invalid_reason": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                }
+              }
+            },
+            "amplified_sources": {
+              "type": "array",
+              "description": "Source paths whose unique stored versions materially exceed the current source size. evidence_kind distinguishes full blob checksums from bounded manifest-checksum plus blob-metadata diagnostics; neither classification authorizes automatic pruning.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "evidence_kind": {
                     "type": "string"
+                  },
+                  "providers": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "source_id": {
+                    "type": "string"
+                  },
+                  "redacted_original_path": {
+                    "type": "string"
+                  },
+                  "original_path_blake3": {
+                    "type": "string"
+                  },
+                  "version_count": {
+                    "type": "integer"
+                  },
+                  "referenced_blob_bytes": {
+                    "type": "integer"
+                  },
+                  "current_source_size_bytes": {
+                    "type": "integer"
+                  },
+                  "excess_bytes": {
+                    "type": "integer"
+                  },
+                  "amplification_ratio_milli": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
                   }
                 }
               }
@@ -12016,6 +12174,7 @@
             "policy",
             "summary",
             "manifests",
+            "amplified_sources",
             "warnings",
             "notes"
           ]
@@ -32202,6 +32361,75 @@
           "additionalProperties": true
         }
       }
+    },
+    "selftest": {
+      "type": "object",
+      "description": "Archive-independent executable probe. This command never resolves, reads, or writes the configured cass archive.",
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "const": 1
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "ok",
+            "error"
+          ]
+        },
+        "functional": {
+          "type": "boolean"
+        },
+        "archive_accessed": {
+          "type": "boolean",
+          "const": false
+        },
+        "version": {
+          "type": "string"
+        },
+        "contract_version": {
+          "type": "string"
+        },
+        "latency_ms": {
+          "type": "integer"
+        },
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "pass",
+                  "fail"
+                ]
+              },
+              "detail": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "status",
+              "detail"
+            ]
+          }
+        }
+      },
+      "required": [
+        "schema_version",
+        "status",
+        "functional",
+        "archive_accessed",
+        "version",
+        "contract_version",
+        "latency_ms",
+        "checks"
+      ]
     },
     "sessions": {
       "type": "object",
