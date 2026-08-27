@@ -332,19 +332,19 @@ fn concurrent_reader_handle_exhaustion() {
 
             // Each thread performs multiple searches
             let mut local_success = 0;
-            let mut local_errors = 0;
+            let mut local_errors = Vec::new();
 
             for j in 0..10 {
                 let term = format!("stress_content_{}", (i * 10 + j) % 100);
                 match client.search(&term, SearchFilters::default(), 5, 0, FieldMask::FULL) {
                     Ok(hits) if !hits.is_empty() => local_success += 1,
                     Ok(_) => local_success += 1, // Empty results still count as success
-                    Err(_) => local_errors += 1,
+                    Err(error) => local_errors.push(error),
                 }
             }
 
             success_count.fetch_add(local_success, Ordering::Relaxed);
-            error_count.fetch_add(local_errors, Ordering::Relaxed);
+            error_count.fetch_add(local_errors.len(), Ordering::Relaxed);
 
             (local_success, local_errors)
         }));

@@ -3458,8 +3458,14 @@ where
     if let Err(error) = std::thread::Builder::new()
         .name("cass-searcher-reload".to_string())
         .spawn(move || {
-            let _in_flight = ReloadInFlightGuard(worker_reload_in_flight);
-            let _ = tx.send(reload());
+            let in_flight = ReloadInFlightGuard(worker_reload_in_flight);
+            let result = reload();
+            // Publish completion only after clearing the single-flight flag.
+            // Otherwise the receiver can return success, immediately start a
+            // subsequent reload, and spuriously observe the completed worker
+            // as still in flight.
+            drop(in_flight);
+            let _ = tx.send(result);
         })
     {
         // The worker did not take ownership, so clear the single-flight flag.
@@ -6941,7 +6947,10 @@ impl SearchClient {
             return Err(error);
         }
         let elapsed = reload_started.elapsed();
-        *guard = Some(now);
+        // Rate-limit from completion, not start. A slow successful reload must
+        // not become immediately eligible for another reload merely because it
+        // consumed the whole minimum interval.
+        *guard = Some(Instant::now());
         let epoch = self.reload_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         self.metrics.record_reload(elapsed);
         let current_generation = self.federated_generation_signature(readers);
@@ -7165,9 +7174,6 @@ impl SearchClient {
             raw_origin_kind: Option<String>,
             origin_host: Option<String>,
         }
-
-        self.maybe_reload_reader(reader)?;
-        self.track_generation(reader.keeper_generation());
 
         let wants_snippet = field_mask.wants_snippet();
         let needs_content = field_mask.needs_content() || wants_snippet;
@@ -9686,7 +9692,9 @@ impl SearchClient {
                 return Err(error);
             }
             let elapsed = reload_started.elapsed();
-            *guard = Some(now);
+            // Rate-limit from completion, not start. This keeps a slow reload
+            // from becoming immediately eligible for another refresh.
+            *guard = Some(Instant::now());
             let epoch = self.reload_epoch.fetch_add(1, Ordering::SeqCst) + 1;
             self.metrics.record_reload(elapsed);
             let current_generation = reader.keeper_generation();
@@ -12318,7 +12326,15 @@ mod tests {
         while reload_in_flight.load(Ordering::Acquire) && Instant::now() < deadline {
             std::thread::yield_now();
         }
-        assert!(!reload_in_flight.load(Ordering::Acquire));
+        let successful_reload = run_reload_bounded(
+            || Ok(()),
+            Arc::clone(&reload_in_flight),
+            Duration::from_secs(1),
+        );
+        assert!(
+            successful_reload.is_ok() && !reload_in_flight.load(Ordering::Acquire),
+            "a successful return must mean the worker no longer owns the single-flight slot"
+        );
     }
 
     #[test]
