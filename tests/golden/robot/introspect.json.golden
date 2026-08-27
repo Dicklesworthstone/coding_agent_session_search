@@ -2857,9 +2857,13 @@
           "name": "theme",
           "description": "Default theme (dark or light)",
           "arg_type": "option",
-          "value_type": "string",
+          "value_type": "enum",
           "required": false,
-          "default": "dark"
+          "default": "dark",
+          "enum_values": [
+            "dark",
+            "light"
+          ]
         },
         {
           "name": "dry-run",
