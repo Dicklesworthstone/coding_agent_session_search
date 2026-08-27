@@ -23379,6 +23379,7 @@ pub fn run_tui_ftui(
             crate::search::query::SearchClientOptions {
                 enable_reload: true,
                 enable_warm: true,
+                strict_read_only: false,
             },
         ) {
             Ok(Some(client)) => {

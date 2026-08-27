@@ -541,8 +541,13 @@ fn load_complete_shard_artifacts_for_current_db(
     embedder_id: &str,
     expected_dimension: usize,
     context_label: &'static str,
+    strict_read_only: bool,
 ) -> Option<Vec<SemanticIndexArtifact>> {
-    let db_fingerprint = match crate::indexer::lexical_storage_fingerprint_for_db(db_path) {
+    let db_fingerprint = match if strict_read_only {
+        crate::indexer::lexical_storage_fingerprint_for_db_strict(db_path)
+    } else {
+        crate::indexer::lexical_storage_fingerprint_for_db(db_path)
+    } {
         Ok(fingerprint) => fingerprint,
         Err(err) => {
             tracing::debug!(
@@ -578,9 +583,34 @@ pub fn load_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSetup {
     load_semantic_context_for_embedder(data_dir, db_path, active_policy_embedder_name())
 }
 
+/// Strict read-only counterpart used by `search --no-maintenance`.
+pub fn load_semantic_context_strict(data_dir: &Path, db_path: &Path) -> SemanticSetup {
+    load_semantic_context_inner(
+        data_dir,
+        db_path,
+        true,
+        active_policy_embedder_name(),
+        false,
+        true,
+    )
+}
+
 /// Load the active policy context without initializing its local model yet.
 pub fn load_semantic_context_deferred(data_dir: &Path, db_path: &Path) -> SemanticSetup {
     load_semantic_context_for_embedder_deferred(data_dir, db_path, active_policy_embedder_name())
+}
+
+/// Strict read-only daemon-first counterpart used by
+/// `search --no-maintenance`.
+pub fn load_semantic_context_deferred_strict(data_dir: &Path, db_path: &Path) -> SemanticSetup {
+    load_semantic_context_inner(
+        data_dir,
+        db_path,
+        true,
+        active_policy_embedder_name(),
+        true,
+        true,
+    )
 }
 
 pub fn load_semantic_context_for_embedder(
@@ -588,7 +618,15 @@ pub fn load_semantic_context_for_embedder(
     db_path: &Path,
     embedder_name: &str,
 ) -> SemanticSetup {
-    load_semantic_context_inner(data_dir, db_path, true, embedder_name, false)
+    load_semantic_context_inner(data_dir, db_path, true, embedder_name, false, false)
+}
+
+pub fn load_semantic_context_for_embedder_strict(
+    data_dir: &Path,
+    db_path: &Path,
+    embedder_name: &str,
+) -> SemanticSetup {
+    load_semantic_context_inner(data_dir, db_path, true, embedder_name, false, true)
 }
 
 /// Load index/filter metadata now while deferring the local model itself.
@@ -601,7 +639,15 @@ pub fn load_semantic_context_for_embedder_deferred(
     db_path: &Path,
     embedder_name: &str,
 ) -> SemanticSetup {
-    load_semantic_context_inner(data_dir, db_path, true, embedder_name, true)
+    load_semantic_context_inner(data_dir, db_path, true, embedder_name, true, false)
+}
+
+pub fn load_semantic_context_for_embedder_deferred_strict(
+    data_dir: &Path,
+    db_path: &Path,
+    embedder_name: &str,
+) -> SemanticSetup {
+    load_semantic_context_inner(data_dir, db_path, true, embedder_name, true, true)
 }
 
 /// Probe semantic availability without loading the embedder or DB-backed
@@ -688,6 +734,18 @@ pub(crate) fn probe_hash_semantic_availability(data_dir: &Path) -> SemanticAvail
 
 /// Load hash-based semantic context (no model download required).
 pub fn load_hash_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSetup {
+    load_hash_semantic_context_inner(data_dir, db_path, false)
+}
+
+pub fn load_hash_semantic_context_strict(data_dir: &Path, db_path: &Path) -> SemanticSetup {
+    load_hash_semantic_context_inner(data_dir, db_path, true)
+}
+
+fn load_hash_semantic_context_inner(
+    data_dir: &Path,
+    db_path: &Path,
+    strict_read_only: bool,
+) -> SemanticSetup {
     if let Some(availability) = selected_generation_owner_requirement(data_dir) {
         return SemanticSetup {
             availability,
@@ -714,6 +772,7 @@ pub fn load_hash_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSe
             embedder.id(),
             embedder.dimension(),
             "hash semantic",
+            strict_read_only,
         )
     } else {
         None
@@ -725,7 +784,11 @@ pub fn load_hash_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSe
         };
     }
 
-    let storage = match FrankenStorage::open_readonly(db_path) {
+    let storage = match if strict_read_only {
+        FrankenStorage::open_strict_readonly(db_path)
+    } else {
+        FrankenStorage::open_readonly(db_path)
+    } {
         Ok(storage) => storage,
         Err(err) => {
             return SemanticSetup {
@@ -810,6 +873,7 @@ pub fn load_semantic_context_no_version_check(data_dir: &Path, db_path: &Path) -
         false,
         active_policy_embedder_name(),
         false,
+        false,
     )
 }
 
@@ -819,6 +883,7 @@ fn load_semantic_context_inner(
     check_for_updates: bool,
     embedder_name: &str,
     defer_embedder_load: bool,
+    strict_read_only: bool,
 ) -> SemanticSetup {
     if let Some(availability) = selected_generation_owner_requirement(data_dir) {
         return SemanticSetup {
@@ -888,6 +953,7 @@ fn load_semantic_context_inner(
             &config.embedder_id,
             config.dimension,
             "semantic",
+            strict_read_only,
         )
     } else {
         None
@@ -899,7 +965,11 @@ fn load_semantic_context_inner(
         };
     }
 
-    let storage = match FrankenStorage::open_readonly(db_path) {
+    let storage = match if strict_read_only {
+        FrankenStorage::open_strict_readonly(db_path)
+    } else {
+        FrankenStorage::open_readonly(db_path)
+    } {
         Ok(storage) => storage,
         Err(err) => {
             return SemanticSetup {

@@ -601,6 +601,72 @@ fn acquire_doctor_mutation_db_open_guard(
     }
 }
 
+/// Acquire the doctor-repair admission lock without creating any filesystem
+/// object. Strict read-only callers use this variant so a search against an
+/// otherwise untouched data directory cannot create `doctor/locks/` merely by
+/// observing the archive. If the lock file does not already exist, there is no
+/// doctor repair to coordinate with and the caller proceeds without a guard.
+fn acquire_existing_doctor_mutation_db_open_guard(
+    db_path: &Path,
+    timeout: Duration,
+) -> Result<DoctorMutationDbOpenGuard> {
+    let Some(lock_path) = doctor_mutation_lock_path_for_db_open(db_path) else {
+        return Ok(DoctorMutationDbOpenGuard(None));
+    };
+    if doctor_mutation_db_open_bypass_active() {
+        return Ok(DoctorMutationDbOpenGuard(None));
+    }
+
+    let deadline = Instant::now() + timeout;
+    let mut backoff = Duration::from_millis(4);
+    loop {
+        let file = match fs::OpenOptions::new().read(true).open(&lock_path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(DoctorMutationDbOpenGuard(None));
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "opening existing doctor mutation lock {} before strict read-only open of {}",
+                        lock_path.display(),
+                        db_path.display()
+                    )
+                });
+            }
+        };
+
+        match fs2::FileExt::try_lock_shared(&file) {
+            Ok(()) => return Ok(DoctorMutationDbOpenGuard(Some(file))),
+            Err(err) if doctor_mutation_lock_error_is_active(&err) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(anyhow!(
+                        "doctor mutation lock {} is active while strictly opening {} read-only; refusing to race repair after waiting {}ms",
+                        lock_path.display(),
+                        db_path.display(),
+                        timeout.as_millis()
+                    ));
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                sleep_with_franken_retry_backoff(
+                    &mut backoff,
+                    remaining,
+                    Duration::from_millis(128),
+                );
+            }
+            Err(err) => {
+                return Err(anyhow!(
+                    "failed to acquire shared existing doctor mutation lock {} before strict read-only open of {}: {}",
+                    lock_path.display(),
+                    db_path.display(),
+                    err
+                ));
+            }
+        }
+    }
+}
+
 pub(crate) fn open_franken_storage_with_timeout(
     path: &Path,
     timeout: Duration,
@@ -846,6 +912,52 @@ pub(crate) fn open_franken_async_readonly_connection_with_timeout(
                 if !wal_recovery_attempted && attempt_dirty_wal_recovery_checkpoint(path, &err) =>
             {
                 wal_recovery_attempted = true;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Open a dedicated-owner read connection without performing or preparing any
+/// repair. Unlike the ordinary read opener, this path never creates the doctor
+/// lock hierarchy, deduplicates schema rows, or checkpoints a dirty WAL. It is
+/// the storage seam for `search --no-maintenance`: an archive that requires
+/// recovery is reported as unavailable instead of being changed by a read.
+pub(crate) fn open_franken_async_strict_readonly_connection_with_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> Result<FrankenAsyncConnection> {
+    if !path.exists() {
+        return Err(anyhow!("Database not found at {}", path.display()));
+    }
+
+    let path_str = path.to_string_lossy().to_string();
+    let deadline = Instant::now() + timeout;
+    let mut backoff = Duration::from_millis(4);
+    loop {
+        let _doctor_guard = acquire_existing_doctor_mutation_db_open_guard(path, timeout)?;
+        match FrankenAsyncConnection::open_with_flags_sync(
+            &path_str,
+            FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .with_context(|| {
+            format!(
+                "strictly opening dedicated-owner frankensqlite db readonly at {}",
+                path.display()
+            )
+        }) {
+            Ok(conn) => return Ok(conn),
+            Err(err) if retryable_franken_anyhow(&err) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(err);
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                sleep_with_franken_retry_backoff(
+                    &mut backoff,
+                    remaining,
+                    Duration::from_millis(128),
+                );
             }
             Err(err) => return Err(err),
         }
@@ -5134,6 +5246,62 @@ impl FrankenStorage {
                 return Err(err).with_context(|| {
                     format!("opening frankensqlite db readonly at {}", path.display())
                 });
+            }
+        };
+        let storage = Self::new(conn, path.to_path_buf());
+        storage.apply_readonly_config()?;
+        Ok(storage)
+    }
+
+    /// Open an archive for a strict non-mutating read.
+    ///
+    /// This deliberately omits the ordinary read opener's two sanctioned
+    /// recovery writes (duplicate-FTS schema repair and dirty-WAL checkpoint)
+    /// and observes only an already-existing doctor lock. Callers must surface
+    /// any recovery-required error and leave repair to an explicitly mutating
+    /// command.
+    pub(crate) fn open_strict_readonly(path: &Path) -> Result<Self> {
+        Self::open_strict_readonly_with_timeout(path, DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT)
+    }
+
+    pub(crate) fn open_strict_readonly_with_timeout(
+        path: &Path,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let path_str = path.to_string_lossy().to_string();
+        let _doctor_guard = acquire_existing_doctor_mutation_db_open_guard(path, timeout)?;
+        let deadline = Instant::now() + timeout;
+        let mut backoff = Duration::from_millis(4);
+        let conn = loop {
+            match open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(anyhow::Error::new)
+            {
+                Ok(conn) => break conn,
+                Err(err) if retryable_franken_anyhow(&err) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(err).with_context(|| {
+                            format!(
+                                "strictly opening frankensqlite db readonly at {}",
+                                path.display()
+                            )
+                        });
+                    }
+                    let remaining = deadline.saturating_duration_since(now);
+                    sleep_with_franken_retry_backoff(
+                        &mut backoff,
+                        remaining,
+                        Duration::from_millis(128),
+                    );
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "strictly opening frankensqlite db readonly at {}",
+                            path.display()
+                        )
+                    });
+                }
             }
         };
         let storage = Self::new(conn, path.to_path_buf());
@@ -22485,6 +22653,63 @@ mod tests {
         assert_eq!(
             reopened_len, dirty_len,
             "successful readonly dispatch must not rewrite or checkpoint the dirty WAL"
+        );
+    }
+
+    #[test]
+    fn gh422_strict_read_openers_do_not_create_lock_state_or_change_database_bundle() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        {
+            let conn = crate::franken_sync::Connection::open(
+                db_path.to_string_lossy().into_owned(),
+            )
+            .unwrap();
+            conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
+            conn.execute("INSERT INTO t (x) VALUES (1), (2), (3);")
+                .unwrap();
+            conn.close().unwrap();
+        }
+        let bundle_snapshot = || {
+            [
+                db_path.clone(),
+                database_sidecar_path(&db_path, "-wal"),
+                database_sidecar_path(&db_path, "-shm"),
+            ]
+            .into_iter()
+            .map(|path| {
+                let bytes = std::fs::read(&path).ok();
+                (path, bytes)
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let before = bundle_snapshot();
+        assert!(!dir.path().join("doctor").exists());
+
+        let mut owner = open_franken_async_strict_readonly_connection_with_timeout(
+            &db_path,
+            Duration::from_secs(2),
+        )
+        .expect("strict dedicated-owner read open");
+        let rows = owner.query_sync("SELECT COUNT(*) FROM t;").unwrap();
+        assert_eq!(rows[0].get_typed::<i64>(0).unwrap(), 3);
+        owner.close_without_checkpoint_sync().unwrap();
+
+        let strict_storage = FrankenStorage::open_strict_readonly(&db_path)
+            .expect("strict storage read open");
+        let count: i64 = strict_storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM t;", &[] as &[ParamValue], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(count, 3);
+        strict_storage.close_without_checkpoint().unwrap();
+
+        assert_eq!(before, bundle_snapshot());
+        assert!(
+            !dir.path().join("doctor").exists(),
+            "a strict read must not create doctor/locks admission state"
         );
     }
 

@@ -749,6 +749,8 @@ fn run_step(name: &str, binary: &Path, args: &[String], log: Option<&mut File>) 
     let started = Instant::now();
     let mut argv = vec![binary.display().to_string()];
     argv.extend(args.iter().cloned());
+    // ubs:ignore — `binary` is the canonicalized `std::env::current_exe()`
+    // resolved by the CLI layer, never user-supplied input.
     let output = Command::new(binary)
         .args(args)
         .stdin(Stdio::null())

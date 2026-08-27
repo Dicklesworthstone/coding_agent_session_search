@@ -1,7 +1,6 @@
 // Index walks over parallel slices by a single counter; an iterator rewrite would
 // obscure the arithmetic without changing behaviour.
 #![allow(clippy::needless_range_loop)]
-
 #![recursion_limit = "256"]
 
 pub mod analytics;
@@ -386,7 +385,6 @@ pub enum Commands {
         /// logged and the TUI opens on the existing index (non-fatal).
         #[arg(long, visible_alias = "catch-up", default_value_t = false)]
         refresh: bool,
-
     },
     /// Run indexer
     Index {
@@ -642,8 +640,13 @@ pub enum Commands {
 
         /// Execute search as a strict read-only operation. Never refresh a
         /// checkpoint, launch or join lexical maintenance, or spawn detached
-        /// catch-up work. Conflicts with --refresh.
-        #[arg(long, default_value_t = false, conflicts_with = "refresh")]
+        /// catch-up work. Conflicts with --refresh and --daemon because daemon
+        /// auto-spawn creates runtime state.
+        #[arg(
+            long,
+            default_value_t = false,
+            conflicts_with_all = ["refresh", "daemon"]
+        )]
         no_maintenance: bool,
     },
     /// Build a deterministic answer pack for agent handoffs
@@ -19981,6 +19984,7 @@ fn state_meta_json_with_counts(
         include_counts_override,
         false,
         allow_db_open,
+        false,
     )
 }
 
@@ -19997,6 +20001,7 @@ fn state_meta_json_full(
     include_counts_override: Option<bool>,
     skip_db_open: bool,
     inspect_semantic: bool,
+    passive_db_probe: bool,
 ) -> serde_json::Value {
     state_meta_json_inner(
         data_dir,
@@ -20006,6 +20011,7 @@ fn state_meta_json_full(
         include_counts_override,
         skip_db_open,
         inspect_semantic,
+        passive_db_probe,
     )
 }
 
@@ -20026,6 +20032,7 @@ fn state_meta_json_for_health(
         Some(false),
         true,
         true,
+        false,
     )
 }
 
@@ -20040,6 +20047,28 @@ fn state_meta_json_for_status(
         stale_threshold,
         true,
         Some(false),
+        false,
+        true,
+        false,
+    )
+}
+
+/// Filesystem-only state metadata for `search --no-maintenance`. The database
+/// is reported as deliberately unprobed, while lexical/semantic manifests and
+/// coordination files are still inspected. This avoids the ordinary read
+/// opener's sanctioned dirty-WAL/schema recovery writes.
+fn state_meta_json_for_strict_read(
+    data_dir: &Path,
+    db_path: &Path,
+    stale_threshold: u64,
+) -> serde_json::Value {
+    state_meta_json_full(
+        data_dir,
+        db_path,
+        stale_threshold,
+        false,
+        Some(false),
+        false,
         false,
         true,
     )
@@ -20172,6 +20201,7 @@ fn state_meta_json_inner(
     include_counts_override: Option<bool>,
     skip_db_open: bool,
     inspect_semantic: bool,
+    passive_db_probe: bool,
 ) -> serde_json::Value {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -20227,7 +20257,14 @@ fn state_meta_json_inner(
     // — we never opened the DB so we never ran COUNT(*); the snapshot
     // counts come from `..default()` (i.e. zero). Reporting
     // counts_skipped=false alongside message_count=0 would be a lie.
-    let db_snapshot = if skip_db_open && db_exists && db_is_regular_file {
+    let db_snapshot = if passive_db_probe && db_exists && db_is_regular_file {
+        StateDbSnapshot {
+            opened: true,
+            counts_skipped: true,
+            open_skipped: true,
+            ..StateDbSnapshot::default()
+        }
+    } else if skip_db_open && db_exists && db_is_regular_file {
         // [coding_agent_session_search #301 truthfulness reconciliation]
         // Previously this branch synthesized a fully-empty snapshot
         // (last_scan_ts=None), which is exactly why `cass health`
@@ -25814,6 +25851,72 @@ fn search_lexical_repair_failed_error(reason: &str, err: anyhow::Error) -> CliEr
 /// existing index may fail open when only its checkpoint metadata is stale;
 /// missing or unsafe assets return a bounded error with an explicit repair
 /// command for a later mutating invocation.
+fn search_lexical_read_only_diagnosis(
+    index_path: &Path,
+    db_path: &Path,
+) -> CliResult<Option<SearchLexicalSelfHealDiagnosis>> {
+    if !crate::search::tantivy::searchable_index_exists(index_path) {
+        return Ok(Some(SearchLexicalSelfHealDiagnosis::rebuild(
+            "searchable lexical metadata missing",
+        )));
+    }
+
+    if let Err(err) = crate::search::tantivy::validate_searchable_index_contract(index_path) {
+        return Ok(Some(SearchLexicalSelfHealDiagnosis::rebuild(format!(
+            "lexical artifact contract is unusable: {err:#}"
+        ))));
+    }
+
+    let checkpoint =
+        crate::indexer::load_lexical_rebuild_checkpoint(index_path).map_err(|err| CliError {
+            code: 5,
+            kind: CliErrorKind::LexicalRebuild.kind_str(),
+            message: format!(
+                "failed to passively inspect lexical rebuild checkpoint for --no-maintenance: {err}"
+            ),
+            hint: Some(
+                "Run `cass index --full --json` from an explicitly mutating workflow to replace the unreadable derived checkpoint."
+                    .to_string(),
+            ),
+            retryable: true,
+        })?;
+    let Some(checkpoint) = checkpoint else {
+        return Ok(Some(SearchLexicalSelfHealDiagnosis::existing_index(
+            "lexical rebuild checkpoint missing",
+        )));
+    };
+
+    if !stored_path_identity_matches(&checkpoint.db_path, db_path) {
+        return Ok(Some(SearchLexicalSelfHealDiagnosis::rebuild(format!(
+            "lexical checkpoint references {}, but active database is {}",
+            checkpoint.db_path,
+            db_path.display()
+        ))));
+    }
+    if !checkpoint.completed {
+        return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(
+            "lexical rebuild checkpoint is incomplete",
+        )));
+    }
+    if checkpoint.schema_hash != crate::search::tantivy::SCHEMA_HASH {
+        return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(
+            "lexical checkpoint schema no longer matches this cass binary",
+        )));
+    }
+    if !crate::indexer::lexical_rebuild_page_size_is_compatible(checkpoint.page_size) {
+        return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(
+            "lexical checkpoint page-size contract is incompatible with this cass binary",
+        )));
+    }
+
+    // Deliberately do not compute the current canonical storage fingerprint.
+    // That path uses FrankenStorage's recovery-capable read opener, which may
+    // checkpoint a dirty WAL or repair duplicate schema rows. A strict read is
+    // allowed to serve the last published generation and truthfully report its
+    // passive metadata; freshness repair belongs to a mutating invocation.
+    Ok(None)
+}
+
 fn inspect_lexical_assets_for_search_read_only(
     data_dir: &Path,
     db_path: &Path,
@@ -25824,14 +25927,19 @@ fn inspect_lexical_assets_for_search_read_only(
     }
 
     let index_exists = crate::search::tantivy::searchable_index_exists(index_path);
+    let diagnosis = search_lexical_read_only_diagnosis(index_path, db_path)?;
     let active = probe_index_run_lock(data_dir, db_path).active;
     if active {
         if index_exists
-            && crate::search::tantivy::validate_searchable_index_contract(index_path).is_ok()
+            && diagnosis
+                .as_ref()
+                .is_none_or(SearchLexicalSelfHealDiagnosis::permits_existing_index_during_active_rebuild)
         {
             return Ok(SearchLexicalSelfHeal {
                 action: "no-maintenance-active-rebuild-searching-existing-index",
-                reason: Some("lexical maintenance is active; --no-maintenance did not join it".to_string()),
+                reason: Some(
+                    "lexical maintenance is active; --no-maintenance did not join it".to_string(),
+                ),
                 indexed_docs: None,
             });
         }
@@ -25850,7 +25958,6 @@ fn inspect_lexical_assets_for_search_read_only(
         });
     }
 
-    let diagnosis = search_lexical_self_heal_diagnosis(index_path, db_path)?;
     let Some(diagnosis) = diagnosis else {
         return Ok(SearchLexicalSelfHeal::skipped());
     };
@@ -25880,6 +25987,51 @@ fn inspect_lexical_assets_for_search_read_only(
         ),
         retryable: true,
     })
+}
+
+/// Run a search-triggered lexical repair under the same forward-progress
+/// watchdog as an explicit `cass index`. The historical direct call ran on the
+/// search thread, so a wedged `lexical_refresh` could heartbeat its lock for
+/// hours with no supervisor capable of terminating the process (#422).
+fn repair_lexical_index_for_search_with_stall_watchdog(
+    db_path: &Path,
+    data_dir: &Path,
+) -> anyhow::Result<crate::indexer::SearchLexicalRepairOutcome> {
+    let progress = Arc::new(crate::indexer::IndexingProgress::default());
+    let worker_progress = Arc::clone(&progress);
+    let worker_db_path = db_path.to_path_buf();
+    let worker_data_dir = data_dir.to_path_buf();
+    let worker = std::thread::spawn(move || {
+        crate::indexer::repair_lexical_index_from_canonical_db_for_search(
+            &worker_db_path,
+            &worker_data_dir,
+            Some(worker_progress),
+        )
+    });
+    let poll_interval = Duration::from_millis(100);
+    let mut watchdog = IndexStallWatchdog::aborting_phase_two(
+        data_dir.to_path_buf(),
+        Duration::from_secs(1),
+    );
+    let started = Instant::now();
+    while !worker.is_finished() {
+        if let Some(payload) = watchdog.observe(&progress, started.elapsed().as_millis()) {
+            let (summary, diagnostics) = index_stall_warning_lines(&payload);
+            eprintln!("{summary}");
+            eprintln!("{diagnostics}");
+            abort_after_index_stall_if_requested(&payload, watchdog.data_dir());
+        }
+        std::thread::sleep(poll_interval);
+    }
+
+    worker.join().map_err(|panic_payload| {
+        let message = panic_payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic_payload.downcast_ref::<&'static str>().copied())
+            .unwrap_or("<non-string panic payload>");
+        anyhow::anyhow!("search-triggered lexical repair worker panicked: {message}")
+    })?
 }
 
 fn ensure_lexical_assets_for_search(
@@ -26020,9 +26172,7 @@ fn ensure_lexical_assets_for_search(
         db_path = %db_path.display(),
         "search detected unusable lexical assets; rebuilding from canonical database before running query"
     );
-    let repair = match crate::indexer::repair_lexical_index_from_canonical_db_for_search(
-        db_path, data_dir, None,
-    ) {
+    let repair = match repair_lexical_index_for_search_with_stall_watchdog(db_path, data_dir) {
         Ok(repair) => repair,
         Err(err) => {
             let rendered = format!("{err:#}");
@@ -26054,9 +26204,7 @@ fn ensure_lexical_assets_for_search(
                 });
             }
 
-            crate::indexer::repair_lexical_index_from_canonical_db_for_search(
-                db_path, data_dir, None,
-            )
+            repair_lexical_index_for_search_with_stall_watchdog(db_path, data_dir)
             .map_err(|retry_err| search_lexical_repair_failed_error(&reason, retry_err))?
         }
     };
@@ -26238,9 +26386,8 @@ mod search_lexical_self_heal_tests {
         let index_path = crate::search::tantivy::expected_index_dir(data_dir);
         let before = data_tree_snapshot(data_dir);
 
-        let outcome =
-            inspect_lexical_assets_for_search_read_only(data_dir, &db_path, &index_path)
-                .expect("a readable index may fail open without maintenance");
+        let outcome = inspect_lexical_assets_for_search_read_only(data_dir, &db_path, &index_path)
+            .expect("a readable index may fail open without maintenance");
         assert_eq!(outcome.action, "no-maintenance-searching-existing-index");
         assert_eq!(before, data_tree_snapshot(data_dir));
     }
@@ -26256,9 +26403,8 @@ mod search_lexical_self_heal_tests {
         let before = data_tree_snapshot(data_dir);
         let started = Instant::now();
 
-        let outcome =
-            inspect_lexical_assets_for_search_read_only(data_dir, &db_path, &index_path)
-                .expect("read-only search must use the existing index immediately");
+        let outcome = inspect_lexical_assets_for_search_read_only(data_dir, &db_path, &index_path)
+            .expect("read-only search must use the existing index immediately");
         assert_eq!(
             outcome.action,
             "no-maintenance-active-rebuild-searching-existing-index"
@@ -26267,6 +26413,72 @@ mod search_lexical_self_heal_tests {
             started.elapsed() < Duration::from_secs(1),
             "--no-maintenance must not join or poll the active rebuild"
         );
+        assert_eq!(before, data_tree_snapshot(data_dir));
+        let _ = fs2::FileExt::unlock(&owner);
+    }
+
+    #[test]
+    fn gh422_no_maintenance_checkpoint_validation_never_opens_canonical_database() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_canonical_search_db(data_dir);
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+            false,
+        )
+        .expect("build a checkpointed lexical generation");
+
+        // A recovery-capable read opener would reject or attempt to recover
+        // these bytes. The strict metadata lane must not open the database at
+        // all: it may serve the already-published generation based solely on
+        // its immutable checkpoint/contract metadata.
+        std::fs::write(&db_path, b"not a sqlite database")
+            .expect("replace canonical fixture with a planted unreadable database");
+        let before = data_tree_snapshot(data_dir);
+        let outcome = inspect_lexical_assets_for_search_read_only(
+            data_dir,
+            &db_path,
+            &index_path,
+        )
+        .expect("passive checkpoint validation must not open the canonical database");
+        assert_eq!(outcome.action, "skipped");
+        assert_eq!(before, data_tree_snapshot(data_dir));
+    }
+
+    #[test]
+    fn gh422_no_maintenance_rejects_active_index_for_a_different_database() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_canonical_search_db(data_dir);
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+            false,
+        )
+        .expect("build a checkpointed lexical generation");
+
+        let other_db_path = data_dir.join("other.db");
+        seed_search_db_at(&other_db_path, "other database", "other-database");
+        let owner = hold_active_index_run_lock(data_dir, &other_db_path);
+        let before = data_tree_snapshot(data_dir);
+        let err = inspect_lexical_assets_for_search_read_only(
+            data_dir,
+            &other_db_path,
+            &index_path,
+        )
+        .expect_err("an active generation for another database is not safe to serve");
+        assert_eq!(err.kind, CliErrorKind::IndexBusy.kind_str());
         assert_eq!(before, data_tree_snapshot(data_dir));
         let _ = fs2::FileExt::unlock(&owner);
     }
@@ -26309,6 +26521,20 @@ mod search_lexical_self_heal_tests {
             .expect("query repaired index");
         assert_eq!(hits.len(), 1);
         assert!(hits[0].content.contains("autohealneedle"));
+        validate_successful_index_artifacts(data_dir, &db_path, true, true)
+            .expect("a completed repair satisfies the full-rebuild success postcondition");
+    }
+
+    #[test]
+    fn gh422_full_rebuild_success_postcondition_rejects_missing_lexical_index() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_canonical_search_db(data_dir);
+
+        let err = validate_successful_index_artifacts(data_dir, &db_path, true, true)
+            .expect_err("success is impossible when no lexical generation was published");
+        assert_eq!(err.kind, CliErrorKind::Index.kind_str());
+        assert!(err.message.contains("no readable lexical index"));
     }
 
     #[test]
@@ -27057,8 +27283,11 @@ fn run_cli_search(
     semantic_opts: SemanticSearchOptions,
 ) -> CliResult<()> {
     use crate::search::model_manager::{
-        load_hash_semantic_context, load_semantic_context, load_semantic_context_deferred,
+        load_hash_semantic_context, load_hash_semantic_context_strict, load_semantic_context,
+        load_semantic_context_deferred, load_semantic_context_deferred_strict,
         load_semantic_context_for_embedder, load_semantic_context_for_embedder_deferred,
+        load_semantic_context_for_embedder_deferred_strict,
+        load_semantic_context_for_embedder_strict, load_semantic_context_strict,
     };
     use crate::search::query::{
         QueryExplanation, SearchClient, SearchClientOptions, SearchFilters, SearchMode,
@@ -27108,7 +27337,11 @@ fn run_cli_search(
     let sessions_filter_stats: Option<SessionsFilterStats> =
         sessions_from.as_ref().map(|_| SessionsFilterStats {
             requested: filters.session_paths.len(),
-            matched: count_indexed_session_paths(&db_path, &filters.session_paths),
+            matched: if no_maintenance {
+                None
+            } else {
+                count_indexed_session_paths(&db_path, &filters.session_paths)
+            },
         });
 
     // Apply cursor overrides (base64-encoded JSON { "offset": usize, "limit": usize })
@@ -27258,6 +27491,7 @@ fn run_cli_search(
         SearchClientOptions {
             enable_reload: false,
             enable_warm: false,
+            strict_read_only: no_maintenance,
         },
     )
     .map_err(|e| CliError {
@@ -27402,15 +27636,31 @@ fn run_cli_search(
             || embedder_info.is_some_and(|e| e.name == HASH_EMBEDDER);
 
         let setup = if prefer_hash {
-            load_hash_semantic_context(&data_dir, &db_path)
+            if no_maintenance {
+                load_hash_semantic_context_strict(&data_dir, &db_path)
+            } else {
+                load_hash_semantic_context(&data_dir, &db_path)
+            }
         } else if let Some(model_name) = requested_model {
-            if semantic_opts.use_daemon {
+            if semantic_opts.use_daemon && no_maintenance {
+                load_semantic_context_for_embedder_deferred_strict(
+                    &data_dir,
+                    &db_path,
+                    model_name,
+                )
+            } else if semantic_opts.use_daemon {
                 load_semantic_context_for_embedder_deferred(&data_dir, &db_path, model_name)
+            } else if no_maintenance {
+                load_semantic_context_for_embedder_strict(&data_dir, &db_path, model_name)
             } else {
                 load_semantic_context_for_embedder(&data_dir, &db_path, model_name)
             }
+        } else if semantic_opts.use_daemon && no_maintenance {
+            load_semantic_context_deferred_strict(&data_dir, &db_path)
         } else if semantic_opts.use_daemon {
             load_semantic_context_deferred(&data_dir, &db_path)
+        } else if no_maintenance {
+            load_semantic_context_strict(&data_dir, &db_path)
         } else {
             load_semantic_context(&data_dir, &db_path)
         };
@@ -28070,12 +28320,16 @@ fn run_cli_search(
         skipped_sections.push("state_meta".to_string());
         None
     } else if robot_meta {
-        Some(state_meta_json(
-            &data_dir,
-            &db_path,
-            DEFAULT_STALE_THRESHOLD_SECS,
-            true,
-        ))
+        Some(if no_maintenance {
+            state_meta_json_for_strict_read(&data_dir, &db_path, DEFAULT_STALE_THRESHOLD_SECS)
+        } else {
+            state_meta_json(
+                &data_dir,
+                &db_path,
+                DEFAULT_STALE_THRESHOLD_SECS,
+                true,
+            )
+        })
     } else {
         None
     };
@@ -28474,6 +28728,7 @@ fn run_cli_pack(
         SearchClientOptions {
             enable_reload: false,
             enable_warm: false,
+            strict_read_only: false,
         },
     )
     .map_err(|e| CliError {
@@ -85218,8 +85473,8 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
         ),
         env_var_capability(
             "CASS_AUTO_REFRESH",
-            Some("0"),
-            "Opt-in stale-on-read catch-up: set to 1 to let search/pack/TUI spawn a detached low-priority `cass index --background` when the index is stale, partial, or behind. `search --no-maintenance` never spawns it.",
+            Some("1"),
+            "Stale-on-read catch-up: search/pack/TUI may spawn a detached low-priority `cass index --background` when the index is stale, partial, or behind. Set 0 to disable globally; `search --no-maintenance` always disables it for that request.",
         ),
         env_var_capability(
             "CASS_AUTO_REFRESH_COOLDOWN_SECS",
@@ -93652,6 +93907,97 @@ fn index_result_counts_from_progress(progress: &indexer::IndexingProgress) -> Op
     ))
 }
 
+fn validate_successful_index_artifacts(
+    data_dir: &Path,
+    db_path: &Path,
+    full: bool,
+    force_rebuild: bool,
+) -> CliResult<()> {
+    let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+    if !crate::search::tantivy::searchable_index_exists(&index_path) {
+        return Err(CliError {
+            code: 9,
+            kind: CliErrorKind::Index.kind_str(),
+            message: format!(
+                "indexing returned success but no readable lexical index exists at {}",
+                index_path.display()
+            ),
+            hint: Some(
+                "The canonical database was preserved. Inspect `cass status --json`; retry `cass index --full --force-rebuild --json` after addressing the reported lexical publish failure."
+                    .to_string(),
+            ),
+            retryable: true,
+        });
+    }
+    crate::search::tantivy::validate_searchable_index_contract(&index_path).map_err(|err| {
+        CliError {
+            code: 9,
+            kind: CliErrorKind::Index.kind_str(),
+            message: format!(
+                "indexing returned success but the published lexical index at {} is unusable: {err:#}",
+                index_path.display()
+            ),
+            hint: Some(
+                "The canonical database was preserved. Inspect `cass status --json` and retry a full forced rebuild after resolving the publish error."
+                    .to_string(),
+            ),
+            retryable: true,
+        }
+    })?;
+
+    if full || force_rebuild {
+        let checkpoint = crate::indexer::load_lexical_rebuild_checkpoint(&index_path).map_err(
+            |err| CliError {
+                code: 9,
+                kind: CliErrorKind::Index.kind_str(),
+                message: format!(
+                    "indexing returned success but its lexical checkpoint cannot be read: {err:#}"
+                ),
+                hint: Some(
+                    "The canonical database was preserved. Retry the full rebuild; a successful run must publish a readable completed checkpoint."
+                        .to_string(),
+                ),
+                retryable: true,
+            },
+        )?;
+        let checkpoint = checkpoint.ok_or_else(|| CliError {
+            code: 9,
+            kind: CliErrorKind::Index.kind_str(),
+            message: "indexing returned success but the full rebuild published no lexical checkpoint"
+                .to_string(),
+            hint: Some(
+                "The canonical database was preserved. Retry the full rebuild; success requires a completed checkpoint."
+                    .to_string(),
+            ),
+            retryable: true,
+        })?;
+        let checkpoint_valid = checkpoint.completed
+            && stored_path_identity_matches(&checkpoint.db_path, db_path)
+            && checkpoint.schema_hash == crate::search::tantivy::SCHEMA_HASH
+            && crate::indexer::lexical_rebuild_page_size_is_compatible(checkpoint.page_size);
+        if !checkpoint_valid {
+            return Err(CliError {
+                code: 9,
+                kind: CliErrorKind::Index.kind_str(),
+                message: format!(
+                    "indexing returned success but the full rebuild checkpoint is incomplete or incompatible (completed={}, db_path={}, schema_hash={}, page_size={})",
+                    checkpoint.completed,
+                    checkpoint.db_path,
+                    checkpoint.schema_hash,
+                    checkpoint.page_size
+                ),
+                hint: Some(
+                    "The canonical database was preserved. Inspect `cass status --json`; the rebuild must publish a completed checkpoint for this database before success can be reported."
+                        .to_string(),
+                ),
+                retryable: true,
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// Run an incremental index pass before a TUI or Search invocation when the
 /// user passes `--refresh` (alias `--catch-up`). Mirrors `cass index` with
 /// `full=false`, `force_rebuild=false`, `watch=false`, `semantic=false` so it
@@ -93690,6 +94036,7 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
     // Run the indexer on a dedicated thread so the main thread can poll the
     // progress counters and emit plain-text status lines while it runs. We
     // move the whole opts struct (it contains the shared progress handle).
+    let watchdog_data_dir = opts.data_dir.clone();
     let index_handle = std::thread::spawn(move || indexer::run_index(opts, None));
 
     // Sentinels are `usize::MAX` so the first observed atomic values always
@@ -93698,6 +94045,9 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
     let mut last_phase = usize::MAX;
     let mut last_current = usize::MAX;
     let mut last_total = usize::MAX;
+    let started = Instant::now();
+    let mut stall_watchdog =
+        IndexStallWatchdog::aborting_phase_two(watchdog_data_dir, Duration::from_secs(1));
     while !index_handle.is_finished() {
         let phase = progress.phase.load(Ordering::Relaxed);
         let current = progress.current.load(Ordering::Relaxed);
@@ -93716,6 +94066,12 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
             last_phase = phase;
             last_current = current;
             last_total = total;
+        }
+        if let Some(payload) = stall_watchdog.observe(&progress, started.elapsed().as_millis()) {
+            let (summary, diagnostics) = index_stall_warning_lines(&payload);
+            eprintln!("{summary}");
+            eprintln!("{diagnostics}");
+            abort_after_index_stall_if_requested(&payload, stall_watchdog.data_dir());
         }
         std::thread::sleep(Duration::from_millis(500));
     }
@@ -95974,7 +96330,7 @@ fn run_index_with_data(
 
     // Get the result from the indexer thread
     let mut active_index_error = None::<ActiveIndexRunDetails>;
-    let res = match index_handle.join() {
+    let mut res = match index_handle.join() {
         Ok(result) => result.map_err(|e| {
             let chain = e
                 .chain()
@@ -96021,6 +96377,12 @@ fn run_index_with_data(
     };
     if let Some(previous) = previous_robot_trace_ingest {
         let _ = indexer::set_robot_trace_ingest_enabled(previous);
+    }
+    if res.is_ok()
+        && let Err(err) =
+            validate_successful_index_artifacts(&data_dir, &db_path, full, force_rebuild)
+    {
+        res = Err(err);
     }
 
     if let Some((pb, conversations, agents)) = progress_completion {
@@ -111183,6 +111545,36 @@ mod subcommand_robot_output_tests {
                 panic!("expected search command without refresh");
             };
             assert!(!refresh, "refresh should stay opt-in");
+        });
+    }
+
+    #[test]
+    fn gh422_no_maintenance_is_explicit_and_conflicts_with_refresh() {
+        run_on_large_stack(|| {
+            let cli =
+                Cli::try_parse_from(["cass", "search", "needle", "--json", "--no-maintenance"])
+                    .expect("parse strict read-only search");
+            let Some(Commands::Search {
+                no_maintenance,
+                refresh,
+                ..
+            }) = cli.command
+            else {
+                panic!("expected search command");
+            };
+            assert!(no_maintenance);
+            assert!(!refresh);
+
+            assert!(
+                Cli::try_parse_from(["cass", "search", "needle", "--no-maintenance", "--refresh",])
+                    .is_err(),
+                "a read-only search cannot also authorize maintenance"
+            );
+            assert!(
+                Cli::try_parse_from(["cass", "search", "needle", "--no-maintenance", "--daemon",])
+                    .is_err(),
+                "a read-only search cannot authorize daemon auto-spawn"
+            );
         });
     }
 }

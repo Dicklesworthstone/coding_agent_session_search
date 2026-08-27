@@ -93,6 +93,7 @@ fn bench_client_options() -> SearchClientOptions {
     SearchClientOptions {
         enable_reload: false,
         enable_warm: false,
+        strict_read_only: false,
     }
 }
 

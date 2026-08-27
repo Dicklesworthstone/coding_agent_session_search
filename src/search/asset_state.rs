@@ -2311,12 +2311,18 @@ mod tests {
             !snapshot.orphaned,
             "stale metadata must be ignored, not reported as orphaned"
         );
-        assert!(snapshot.pid.is_none(), "stale pid must not escape the probe");
+        assert!(
+            snapshot.pid.is_none(),
+            "stale pid must not escape the probe"
+        );
         assert!(
             snapshot.job_id.is_none(),
             "stale job_id must not escape the probe"
         );
-        assert!(snapshot.phase.is_none(), "stale phase must not escape the probe");
+        assert!(
+            snapshot.phase.is_none(),
+            "stale phase must not escape the probe"
+        );
         assert_eq!(
             std::fs::read(&lock_path).expect("read unchanged lock metadata"),
             stale_metadata.as_bytes(),

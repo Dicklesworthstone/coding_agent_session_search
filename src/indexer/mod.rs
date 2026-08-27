@@ -10726,6 +10726,22 @@ pub(crate) fn lexical_storage_fingerprint_for_db(db_path: &Path) -> Result<Strin
     lexical_rebuild_storage_fingerprint(db_path)
 }
 
+/// Compute the lexical fingerprint without invoking any recovery-capable read
+/// opener. Used by strict read-only search so a dirty WAL or duplicate schema
+/// is surfaced rather than repaired as a side effect of freshness validation.
+pub(crate) fn lexical_storage_fingerprint_for_db_strict(db_path: &Path) -> Result<String> {
+    let mut storage = FrankenStorage::open_strict_readonly(db_path).with_context(|| {
+        format!(
+            "strictly opening readonly storage to compute lexical fingerprint for {}",
+            db_path.display()
+        )
+    })?;
+    let total_conversations = count_total_conversations_exact(&storage)?;
+    let fingerprint = lexical_rebuild_content_fingerprint(&storage, total_conversations)?;
+    storage.close_best_effort_in_place();
+    Ok(fingerprint)
+}
+
 /// Same fingerprint as [`lexical_storage_fingerprint_for_db`], computed on an
 /// already-open read-only handle so callers that have paid the archive open
 /// cost (semantic context loading, which opens the DB for filter maps anyway)

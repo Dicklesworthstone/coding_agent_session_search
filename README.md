@@ -1285,13 +1285,14 @@ cass index --full --json --robot-trace-ingest 2>/tmp/cass-ingest-trace.jsonl
 | `--robot-meta` | Include `_meta` block (elapsed_ms, cache stats, index freshness) |
 | `--fields minimal\|summary\|<list>` | Reduce payload size |
 | `--max-content-length N` | Truncate content fields to N chars |
-| `--max-tokens N` | Truncate content fields to N chars |
+| `--max-tokens N` | Apply an approximate token budget to robot output |
 | `--timeout N` | Timeout in milliseconds; returns partial results on expiry |
 | `--cursor <token>` | Cursor-based pagination (from `_meta.next_cursor`) |
 | `--request-id ID` | Echoed in response for correlation |
 | `--aggregate agent,workspace,date` | Server-side aggregations |
 | `--explain` | Include query analysis (parsed query, cost estimate) |
 | `--dry-run` | Validate query without executing |
+| `--no-maintenance` | Strict read-only search: never refresh, join, or spawn lexical maintenance, never auto-repair the archive while opening it, and never auto-spawn the daemon (conflicts with `--refresh` and `--daemon`) |
 | `--source <source>` | Filter by source: `local`, `remote`, `all`, or specific source ID |
 | `--highlight` | Highlight matching terms in output |
 
@@ -2298,7 +2299,7 @@ An index that is always a little behind is the most common complaint about any l
 
 | Layer | What | When it runs | Enable |
 |-------|------|--------------|--------|
-| **Stale-on-read catch-up** | When explicitly enabled, `search`, `pack`, and TUI launch check index freshness. If the index is stale (> 30 min), partial, or has pending sessions, a *detached* incremental `cass index --background` is spawned in its own process group and the current results are returned immediately. The next search is fresh. | On demand, at most once per 5 min per data dir (`CASS_AUTO_REFRESH_COOLDOWN_SECS`). Never for data dirs under the OS temp dir, and never for `search --no-maintenance`. | Off by default so read commands do not unexpectedly start writers. `CASS_AUTO_REFRESH=1` enables. `--robot-meta` reports `index_freshness.auto_refresh.{outcome,trigger,pid}`. |
+| **Stale-on-read catch-up** | `search`, `pack`, and TUI launch check index freshness. If the index is stale (> 30 min), partial, or has pending sessions, a *detached* incremental `cass index --background` is spawned in its own process group and the current results are returned immediately. The next search is fresh. | On demand, at most once per 5 min per data dir (`CASS_AUTO_REFRESH_COOLDOWN_SECS`). Never for data dirs under the OS temp dir, and never for `search --no-maintenance`. | On by default. `CASS_AUTO_REFRESH=0` disables globally. `--robot-meta` reports `index_freshness.auto_refresh.{outcome,trigger,pid}`. |
 | **OS scheduler** (`cass schedule install`) | launchd LaunchAgents (macOS) or systemd user timers (Linux): an **incremental** job every 15 min and a **nightly** job (03:00) that runs `index --full`, then bounded `models backfill --scheduled` batches, plus any remote-source syncs whose `sync_schedule` in `sources.toml` is due. Priority is delegated to the OS (`ProcessType=Background`/`Nice`/`LowPriorityIO`, `Nice=19`/`IOSchedulingClass=idle`/`CPUSchedulingPolicy=idle`). | On the timer, even when no cass process is running; survives reboots (`Persistent=true` / launchd). | `cass schedule install [--interval-mins 15] [--nightly-hour 3] [--no-nightly] [--no-semantic] [--dry-run]`; `cass schedule status`; `cass schedule uninstall`. |
 | **Resident daemon timer** | The warm-model daemon (`cass daemon`, auto-spawned by semantic/hybrid searches) can also kick an incremental background index while it is resident. | Every `CASS_DAEMON_INDEX_INTERVAL_SECS` seconds while the daemon lives (it exits after its idle timeout). | Off by default; `CASS_DAEMON_INDEX_INTERVAL_SECS=900` recommended. |
 
@@ -3072,7 +3073,7 @@ Update check state is stored in the data directory:
 | `CASS_DB_PATH` | `$CASS_DATA_DIR/agent_search.db` | Override database path |
 | `CASS_EXCLUDE_PATHS` | unset | Comma/newline-delimited files or directory prefixes to skip without advancing scan/watch watermarks |
 | **Background Indexing** | | |
-| `CASS_AUTO_REFRESH` | `0` | Opt-in stale-on-read catch-up: set to `1` to let a stale/partial/behind index seen by `search`, `pack`, or TUI launch spawn a detached `cass index --background`. `search --no-maintenance` always remains read-only. |
+| `CASS_AUTO_REFRESH` | `1` | Stale-on-read catch-up for a stale/partial/behind index seen by `search`, `pack`, or TUI launch. Set `0` to disable globally; `search --no-maintenance` always remains read-only. |
 | `CASS_AUTO_REFRESH_COOLDOWN_SECS` | `300` | Minimum spacing between auto-spawned catch-up runs per data dir |
 | `CASS_BACKGROUND_NICE` | `15` | nice value `cass index --background` applies to itself (0..=19) |
 | `CASS_BACKGROUND_IONICE_CLASS` | `3` | ionice class for `cass index --background` on Linux (3 = idle) |

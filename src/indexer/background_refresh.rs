@@ -16,8 +16,7 @@
 //!   searches against a busy session directory from re-spawning the indexer
 //!   every time a file changes. The active-writer window inside the indexer
 //!   already defers files that are still being written.
-//! * **Explicit opt-in.** `CASS_AUTO_REFRESH=1` enables the behaviour. Search
-//!   remains a read operation unless the operator chooses background upkeep.
+//! * **Opt-out.** `CASS_AUTO_REFRESH=0` disables the behaviour entirely.
 //!
 //! The child is `cass index --background --json --no-progress-events`, which
 //! applies `nice`/`ionice` to itself before doing any work.
@@ -52,24 +51,24 @@ pub struct AutoRefreshPolicy {
 impl Default for AutoRefreshPolicy {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             cooldown: Duration::from_secs(DEFAULT_COOLDOWN_SECS),
         }
     }
 }
 
 impl AutoRefreshPolicy {
-    /// `CASS_AUTO_REFRESH` (default off; `1`/`true`/`yes`/`on` enables) and
+    /// `CASS_AUTO_REFRESH` (default on; `0`/`false`/`no`/`off` disables) and
     /// `CASS_AUTO_REFRESH_COOLDOWN_SECS` (default 300).
     pub fn from_env() -> Self {
         let enabled = dotenvy::var("CASS_AUTO_REFRESH")
             .map(|v| {
-                matches!(
+                !matches!(
                     v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
+                    "0" | "false" | "no" | "off"
                 )
             })
-            .unwrap_or(false);
+            .unwrap_or(true);
         let cooldown = dotenvy::var("CASS_AUTO_REFRESH_COOLDOWN_SECS")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
@@ -85,7 +84,7 @@ impl AutoRefreshPolicy {
 pub enum AutoRefreshOutcome {
     /// A detached `cass index --background` child was started.
     Spawned { pid: u32, reason: String },
-    /// `CASS_AUTO_REFRESH` is unset or disabled.
+    /// `CASS_AUTO_REFRESH=0`.
     Disabled,
     /// Another cass index run already holds the data-dir index lock.
     IndexRunActive,
@@ -223,6 +222,8 @@ pub fn background_index_args(data_dir: &Path, db_path: &Path, full: bool) -> Vec
 /// in its own process group so closing the terminal that ran the original
 /// `cass search` does not HUP it.
 fn build_command(binary: &Path, data_dir: &Path, db_path: &Path, full: bool) -> Command {
+    // ubs:ignore — `binary` is always `std::env::current_exe()` (the running
+    // cass), never user-supplied input; same pattern as daemon auto-spawn.
     let mut cmd = Command::new(binary);
     cmd.args(background_index_args(data_dir, db_path, full));
     cmd.env("CASS_INDEX_NO_PROGRESS_EVENTS", "1");
@@ -304,7 +305,7 @@ pub fn maybe_spawn_with_policy(
     policy: AutoRefreshPolicy,
 ) -> AutoRefreshOutcome {
     if !policy.enabled {
-        debug!(reason, "auto-refresh is not enabled");
+        debug!(reason, "auto-refresh disabled via CASS_AUTO_REFRESH");
         return AutoRefreshOutcome::Disabled;
     }
     if crate::search::asset_state::read_search_maintenance_snapshot(data_dir).active {
@@ -447,8 +448,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gh422_auto_refresh_is_opt_in_by_default() {
-        assert!(!AutoRefreshPolicy::default().enabled);
+    fn auto_refresh_is_enabled_by_default() {
+        assert!(AutoRefreshPolicy::default().enabled);
     }
 
     #[test]

@@ -307,9 +307,18 @@ const SQLITE_MESSAGE_SCAN_FALLBACK_PAGE_ROWS: usize = 1_024;
 const SEARCH_SQLITE_HYDRATION_CACHE_KIB: i64 = 4_096;
 const SEMANTIC_EXACT_CHUNK_OVERFETCH_MULTIPLIER: usize = 4;
 
-fn open_search_hydration_sqlite(path: &Path, timeout: Duration) -> Result<SearchSqliteConnection> {
-    let conn =
-        crate::storage::sqlite::open_franken_async_readonly_connection_with_timeout(path, timeout)?;
+fn open_search_hydration_sqlite(
+    path: &Path,
+    timeout: Duration,
+    strict_read_only: bool,
+) -> Result<SearchSqliteConnection> {
+    let conn = if strict_read_only {
+        crate::storage::sqlite::open_franken_async_strict_readonly_connection_with_timeout(
+            path, timeout,
+        )?
+    } else {
+        crate::storage::sqlite::open_franken_async_readonly_connection_with_timeout(path, timeout)?
+    };
     conn.execute_sync("PRAGMA query_only = 1;")
         .with_context(|| "setting search hydration query_only")?;
     conn.execute_sync("PRAGMA busy_timeout = 5000;")
@@ -2898,6 +2907,7 @@ pub struct SearchClient {
     )>,
     sqlite: Mutex<Option<SearchSqliteConnection>>,
     sqlite_path: Option<PathBuf>,
+    strict_read_only: bool,
     prefix_cache: Mutex<CacheShards>,
     reload_on_search: bool,
     last_reload: Mutex<Option<Instant>>,
@@ -2919,6 +2929,10 @@ pub struct SearchClient {
 pub struct SearchClientOptions {
     pub enable_reload: bool,
     pub enable_warm: bool,
+    /// Refuse every storage recovery write while hydrating search results.
+    /// The default reader may repair a dirty WAL or duplicate FTS schema; a
+    /// strict reader surfaces those conditions instead.
+    pub strict_read_only: bool,
 }
 
 impl Default for SearchClientOptions {
@@ -2926,6 +2940,7 @@ impl Default for SearchClientOptions {
         Self {
             enable_reload: true,
             enable_warm: true,
+            strict_read_only: false,
         }
     }
 }
@@ -3950,6 +3965,7 @@ impl SearchClient {
             reader: tantivy,
             sqlite: Mutex::new(None),
             sqlite_path,
+            strict_read_only: options.strict_read_only,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             reload_on_search: options.enable_reload,
             last_reload: Mutex::new(None),
@@ -3973,7 +3989,11 @@ impl SearchClient {
         if guard.is_none()
             && let Some(path) = &self.sqlite_path
         {
-            match open_search_hydration_sqlite(path, std::time::Duration::from_secs(1)) {
+            match open_search_hydration_sqlite(
+                path,
+                std::time::Duration::from_secs(1),
+                self.strict_read_only,
+            ) {
                 Ok(conn) => {
                     *guard = Some(conn);
                 }
