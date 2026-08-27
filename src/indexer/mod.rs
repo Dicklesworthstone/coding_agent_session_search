@@ -8923,6 +8923,23 @@ fn lexical_rebuild_deferred_content_fingerprint(total_conversations: usize) -> S
     format!("content-pending-v1:{total_conversations}")
 }
 
+pub(crate) fn completed_lexical_storage_fingerprint_matches_total(
+    fingerprint: &str,
+    expected_total_conversations: usize,
+) -> bool {
+    let mut parts = match fingerprint.strip_prefix("content-v1:") {
+        Some(rest) => rest.split(':'),
+        None => return false,
+    };
+    let parsed_total = parts.next().and_then(|part| part.parse::<usize>().ok());
+    let max_conversation_id = parts.next().and_then(|part| part.parse::<i64>().ok());
+    let max_message_id = parts.next().and_then(|part| part.parse::<i64>().ok());
+    parsed_total == Some(expected_total_conversations)
+        && max_conversation_id.is_some_and(|id| id >= 0)
+        && max_message_id.is_some_and(|id| id >= 0)
+        && parts.next().is_none()
+}
+
 fn lexical_rebuild_content_fingerprint(
     storage: &FrankenStorage,
     total_conversations: usize,

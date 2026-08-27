@@ -25704,6 +25704,14 @@ fn search_lexical_self_heal_diagnosis(
             "lexical checkpoint page-size contract is incompatible with this cass binary",
         )));
     }
+    if !crate::indexer::completed_lexical_storage_fingerprint_matches_total(
+        &checkpoint.storage_fingerprint,
+        checkpoint.total_conversations,
+    ) {
+        return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(
+            "lexical checkpoint does not carry a completed canonical storage fingerprint",
+        )));
+    }
     let current_storage_fingerprint = match crate::indexer::lexical_storage_fingerprint_for_db(
         db_path,
     ) {
@@ -25906,6 +25914,14 @@ fn search_lexical_read_only_diagnosis(
     if !crate::indexer::lexical_rebuild_page_size_is_compatible(checkpoint.page_size) {
         return Ok(Some(SearchLexicalSelfHealDiagnosis::checkpoint(
             "lexical checkpoint page-size contract is incompatible with this cass binary",
+        )));
+    }
+    if !crate::indexer::completed_lexical_storage_fingerprint_matches_total(
+        &checkpoint.storage_fingerprint,
+        checkpoint.total_conversations,
+    ) {
+        return Ok(Some(SearchLexicalSelfHealDiagnosis::existing_index(
+            "lexical checkpoint fingerprint is incomplete or malformed",
         )));
     }
 
@@ -26535,6 +26551,42 @@ mod search_lexical_self_heal_tests {
             .expect_err("success is impossible when no lexical generation was published");
         assert_eq!(err.kind, CliErrorKind::Index.kind_str());
         assert!(err.message.contains("no readable lexical index"));
+    }
+
+    #[test]
+    fn gh422_full_rebuild_success_postcondition_rejects_incomplete_checkpoint_metadata() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_canonical_search_db(data_dir);
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+            false,
+        )
+        .expect("build a valid completed lexical generation");
+
+        let state_path = index_path.join(".lexical-rebuild-state.json");
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).expect("read checkpoint"))
+                .expect("parse checkpoint");
+        state["db"]["storage_fingerprint"] = serde_json::json!("content-pending-v1:1");
+        state["processed_conversations"] = serde_json::json!(0);
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&state).expect("serialize planted checkpoint"),
+        )
+        .expect("plant an internally incomplete completed checkpoint");
+
+        let err = validate_successful_index_artifacts(data_dir, &db_path, true, true)
+            .expect_err("success must reject an internally incomplete checkpoint");
+        assert_eq!(err.kind, CliErrorKind::Index.kind_str());
+        assert!(err.message.contains("incomplete or incompatible"));
+        assert!(err.message.contains("content-pending-v1:1"));
     }
 
     #[test]
@@ -93974,17 +94026,28 @@ fn validate_successful_index_artifacts(
         let checkpoint_valid = checkpoint.completed
             && stored_path_identity_matches(&checkpoint.db_path, db_path)
             && checkpoint.schema_hash == crate::search::tantivy::SCHEMA_HASH
-            && crate::indexer::lexical_rebuild_page_size_is_compatible(checkpoint.page_size);
+            && crate::indexer::lexical_rebuild_page_size_is_compatible(checkpoint.page_size)
+            && checkpoint.processed_conversations == checkpoint.total_conversations
+            && usize::try_from(checkpoint.committed_offset).ok()
+                == Some(checkpoint.total_conversations)
+            && crate::indexer::completed_lexical_storage_fingerprint_matches_total(
+                &checkpoint.storage_fingerprint,
+                checkpoint.total_conversations,
+            );
         if !checkpoint_valid {
             return Err(CliError {
                 code: 9,
                 kind: CliErrorKind::Index.kind_str(),
                 message: format!(
-                    "indexing returned success but the full rebuild checkpoint is incomplete or incompatible (completed={}, db_path={}, schema_hash={}, page_size={})",
+                    "indexing returned success but the full rebuild checkpoint is incomplete or incompatible (completed={}, db_path={}, schema_hash={}, page_size={}, processed_conversations={}, total_conversations={}, committed_offset={}, storage_fingerprint={})",
                     checkpoint.completed,
                     checkpoint.db_path,
                     checkpoint.schema_hash,
-                    checkpoint.page_size
+                    checkpoint.page_size,
+                    checkpoint.processed_conversations,
+                    checkpoint.total_conversations,
+                    checkpoint.committed_offset,
+                    checkpoint.storage_fingerprint,
                 ),
                 hint: Some(
                     "The canonical database was preserved. Inspect `cass status --json`; the rebuild must publish a completed checkpoint for this database before success can be reported."
