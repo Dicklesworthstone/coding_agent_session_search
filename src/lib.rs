@@ -386,6 +386,7 @@ pub enum Commands {
         /// logged and the TUI opens on the existing index (non-fatal).
         #[arg(long, visible_alias = "catch-up", default_value_t = false)]
         refresh: bool,
+
     },
     /// Run indexer
     Index {
@@ -638,6 +639,12 @@ pub enum Commands {
         /// and the search runs against the existing index (non-fatal).
         #[arg(long, visible_alias = "catch-up", default_value_t = false)]
         refresh: bool,
+
+        /// Execute search as a strict read-only operation. Never refresh a
+        /// checkpoint, launch or join lexical maintenance, or spawn detached
+        /// catch-up work. Conflicts with --refresh.
+        #[arg(long, default_value_t = false, conflicts_with = "refresh")]
+        no_maintenance: bool,
     },
     /// Build a deterministic answer pack for agent handoffs
     Pack {
@@ -7073,6 +7080,7 @@ async fn execute_cli(
                     fast_only,
                     quality_only,
                     refresh,
+                    no_maintenance,
                 } => {
                     // Validate mutually exclusive two-tier flags
                     let tier_count = [two_tier, fast_only, quality_only]
@@ -7188,6 +7196,7 @@ async fn execute_cli(
                         aggregate,
                         explain,
                         dry_run,
+                        no_maintenance,
                         eff_timeout,
                         highlight,
                         source,
@@ -25800,6 +25809,79 @@ fn search_lexical_repair_failed_error(reason: &str, err: anyhow::Error) -> CliEr
     }
 }
 
+/// Validate the lexical assets needed by `search --no-maintenance` without
+/// waiting for, joining, spawning, or performing any maintenance. A readable
+/// existing index may fail open when only its checkpoint metadata is stale;
+/// missing or unsafe assets return a bounded error with an explicit repair
+/// command for a later mutating invocation.
+fn inspect_lexical_assets_for_search_read_only(
+    data_dir: &Path,
+    db_path: &Path,
+    index_path: &Path,
+) -> CliResult<SearchLexicalSelfHeal> {
+    if !db_path.exists() {
+        return Ok(SearchLexicalSelfHeal::skipped());
+    }
+
+    let index_exists = crate::search::tantivy::searchable_index_exists(index_path);
+    let active = probe_index_run_lock(data_dir, db_path).active;
+    if active {
+        if index_exists
+            && crate::search::tantivy::validate_searchable_index_contract(index_path).is_ok()
+        {
+            return Ok(SearchLexicalSelfHeal {
+                action: "no-maintenance-active-rebuild-searching-existing-index",
+                reason: Some("lexical maintenance is active; --no-maintenance did not join it".to_string()),
+                indexed_docs: None,
+            });
+        }
+        return Err(CliError {
+            code: 7,
+            kind: CliErrorKind::IndexBusy.kind_str(),
+            message: format!(
+                "lexical maintenance is active in {}, and no independently readable index is available",
+                data_dir.display()
+            ),
+            hint: Some(
+                "--no-maintenance returned immediately without joining the job. Retry after `cass status --json` reports it idle."
+                    .to_string(),
+            ),
+            retryable: true,
+        });
+    }
+
+    let diagnosis = search_lexical_self_heal_diagnosis(index_path, db_path)?;
+    let Some(diagnosis) = diagnosis else {
+        return Ok(SearchLexicalSelfHeal::skipped());
+    };
+    if index_exists && diagnosis.existing_index_search_allowed {
+        tracing::warn!(
+            reason = %diagnosis.reason,
+            data_dir = %data_dir.display(),
+            "--no-maintenance is using the readable lexical index without changing its stale checkpoint metadata"
+        );
+        return Ok(SearchLexicalSelfHeal {
+            action: "no-maintenance-searching-existing-index",
+            reason: Some(diagnosis.reason),
+            indexed_docs: None,
+        });
+    }
+
+    Err(CliError {
+        code: 5,
+        kind: "maintenance-required",
+        message: format!(
+            "search requires lexical maintenance, but --no-maintenance forbids it: {}",
+            diagnosis.reason
+        ),
+        hint: Some(
+            "Run `cass index --full --json` in a mutating workflow, or retry without --no-maintenance to permit normal self-healing."
+                .to_string(),
+        ),
+        retryable: true,
+    })
+}
+
 fn ensure_lexical_assets_for_search(
     data_dir: &Path,
     db_path: &Path,
@@ -26111,6 +26193,82 @@ mod search_lexical_self_heal_tests {
         crate::search::asset_state::write_index_run_lock_metadata_sidecar(&lock_path, &metadata)
             .expect("write index-run lock metadata sidecar");
         lock_file
+    }
+
+    fn data_tree_snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, blake3::Hash> {
+        walkdir::WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| {
+                let relative = entry
+                    .path()
+                    .strip_prefix(root)
+                    .expect("snapshot path under root")
+                    .to_path_buf();
+                let bytes = std::fs::read(entry.path()).expect("read snapshot file");
+                (relative, blake3::hash(&bytes))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn gh422_no_maintenance_refuses_missing_index_without_creating_assets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_canonical_search_db(data_dir);
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        let before = data_tree_snapshot(data_dir);
+
+        let err = inspect_lexical_assets_for_search_read_only(data_dir, &db_path, &index_path)
+            .expect_err("missing lexical assets require an explicit mutating workflow");
+        assert_eq!(err.kind, "maintenance-required");
+        assert_eq!(before, data_tree_snapshot(data_dir));
+        assert!(!index_path.exists());
+        assert!(!data_dir.join("index-run.lock").exists());
+    }
+
+    #[test]
+    fn gh422_no_maintenance_uses_readable_index_without_refreshing_checkpoint() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_canonical_search_db(data_dir);
+        build_standalone_lexical_index_without_checkpoint(data_dir, "read only needle");
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        let before = data_tree_snapshot(data_dir);
+
+        let outcome =
+            inspect_lexical_assets_for_search_read_only(data_dir, &db_path, &index_path)
+                .expect("a readable index may fail open without maintenance");
+        assert_eq!(outcome.action, "no-maintenance-searching-existing-index");
+        assert_eq!(before, data_tree_snapshot(data_dir));
+    }
+
+    #[test]
+    fn gh422_no_maintenance_never_joins_an_active_rebuild() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_canonical_search_db(data_dir);
+        build_standalone_lexical_index_without_checkpoint(data_dir, "active read needle");
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        let owner = hold_active_index_run_lock(data_dir, &db_path);
+        let before = data_tree_snapshot(data_dir);
+        let started = Instant::now();
+
+        let outcome =
+            inspect_lexical_assets_for_search_read_only(data_dir, &db_path, &index_path)
+                .expect("read-only search must use the existing index immediately");
+        assert_eq!(
+            outcome.action,
+            "no-maintenance-active-rebuild-searching-existing-index"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "--no-maintenance must not join or poll the active rebuild"
+        );
+        assert_eq!(before, data_tree_snapshot(data_dir));
+        let _ = fs2::FileExt::unlock(&owner);
     }
 
     #[test]
@@ -26890,6 +27048,7 @@ fn run_cli_search(
     aggregate: Option<Vec<String>>,
     explain: bool,
     dry_run: bool,
+    no_maintenance: bool,
     timeout_ms: Option<u64>,
     highlight: bool,
     source: Option<String>,
@@ -27067,6 +27226,8 @@ fn run_cli_search(
             "search lexical self-heal skipped: explicit semantic request does not consume the lexical tier"
         );
         SearchLexicalSelfHeal::skipped()
+    } else if no_maintenance {
+        inspect_lexical_assets_for_search_read_only(&data_dir, &db_path, &index_path)?
     } else {
         ensure_lexical_assets_for_search(
             &data_dir,
@@ -27921,8 +28082,11 @@ fn run_cli_search(
     let index_freshness = state_meta.as_ref().and_then(state_index_freshness);
     // Stale-on-read catch-up: never blocks this search; a detached
     // low-priority `cass index --background` makes the *next* search fresh.
-    let auto_refresh =
-        maybe_auto_refresh_index_after_read(&data_dir, &db_path, index_freshness.as_ref());
+    let auto_refresh = if no_maintenance {
+        None
+    } else {
+        maybe_auto_refresh_index_after_read(&data_dir, &db_path, index_freshness.as_ref())
+    };
     let index_freshness = index_freshness.map(|mut freshness| {
         if let (Some(outcome), serde_json::Value::Object(map)) = (&auto_refresh, &mut freshness) {
             map.insert("auto_refresh".to_string(), outcome.clone());
@@ -78997,12 +79161,9 @@ mod cli_read_db_tests {
     }
 
     #[test]
-    fn state_meta_json_reports_orphaned_lock_metadata() {
-        // Since issue #176, stale lock metadata from dead owners is reaped
-        // on read rather than reported as orphaned.  The read path acquires
-        // an exclusive flock, discovers no live holder, truncates the file,
-        // and returns a clean default snapshot.  Verify that the state_meta
-        // JSON reflects the reaped (clean) state.
+    fn gh422_state_meta_ignores_stale_lock_metadata_without_rewriting_it() {
+        // Preserve issue #176's clean observer state without making a status
+        // or search probe mutate the stale lock artifact.
         let (temp, db_path) = seed_cli_db();
         let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
@@ -79030,15 +79191,19 @@ mod cli_read_db_tests {
             ),
         )
         .expect("write orphaned lock metadata");
+        let lock_bytes_before = std::fs::read(&lock_path).expect("read lock bytes before probe");
 
         let state = state_meta_json(temp.path(), &db_path, 60, true);
-        // Stale metadata is reaped on read (issue #176); orphaned is false.
         assert_eq!(state["pending"]["orphaned"].as_bool(), Some(false));
         assert_eq!(state["rebuild"]["orphaned"].as_bool(), Some(false));
         assert_eq!(state["rebuild"]["active"].as_bool(), Some(false));
-        // After reap the metadata fields are absent (default snapshot).
         assert_eq!(state["rebuild"]["job_kind"].as_str(), None);
         assert_eq!(state["rebuild"]["phase"].as_str(), None);
+        assert_eq!(
+            std::fs::read(&lock_path).expect("read lock bytes after probe"),
+            lock_bytes_before,
+            "state metadata observation must preserve the stale lock bytes"
+        );
     }
 
     #[test]
@@ -85053,8 +85218,8 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
         ),
         env_var_capability(
             "CASS_AUTO_REFRESH",
-            Some("1"),
-            "Stale-on-read catch-up: when search/pack/TUI sees a stale, partial, or behind index, spawn a detached low-priority `cass index --background` so the next read is fresh. Set 0 to disable.",
+            Some("0"),
+            "Opt-in stale-on-read catch-up: set to 1 to let search/pack/TUI spawn a detached low-priority `cass index --background` when the index is stale, partial, or behind. `search --no-maintenance` never spawns it.",
         ),
         env_var_capability(
             "CASS_AUTO_REFRESH_COOLDOWN_SECS",

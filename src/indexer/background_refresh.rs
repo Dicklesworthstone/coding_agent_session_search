@@ -16,7 +16,8 @@
 //!   searches against a busy session directory from re-spawning the indexer
 //!   every time a file changes. The active-writer window inside the indexer
 //!   already defers files that are still being written.
-//! * **Opt-out.** `CASS_AUTO_REFRESH=0` disables the behaviour entirely.
+//! * **Explicit opt-in.** `CASS_AUTO_REFRESH=1` enables the behaviour. Search
+//!   remains a read operation unless the operator chooses background upkeep.
 //!
 //! The child is `cass index --background --json --no-progress-events`, which
 //! applies `nice`/`ionice` to itself before doing any work.
@@ -51,24 +52,24 @@ pub struct AutoRefreshPolicy {
 impl Default for AutoRefreshPolicy {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             cooldown: Duration::from_secs(DEFAULT_COOLDOWN_SECS),
         }
     }
 }
 
 impl AutoRefreshPolicy {
-    /// `CASS_AUTO_REFRESH` (default on; `0`/`false`/`no`/`off` disables) and
+    /// `CASS_AUTO_REFRESH` (default off; `1`/`true`/`yes`/`on` enables) and
     /// `CASS_AUTO_REFRESH_COOLDOWN_SECS` (default 300).
     pub fn from_env() -> Self {
         let enabled = dotenvy::var("CASS_AUTO_REFRESH")
             .map(|v| {
-                !matches!(
+                matches!(
                     v.trim().to_ascii_lowercase().as_str(),
-                    "0" | "false" | "no" | "off"
+                    "1" | "true" | "yes" | "on"
                 )
             })
-            .unwrap_or(true);
+            .unwrap_or(false);
         let cooldown = dotenvy::var("CASS_AUTO_REFRESH_COOLDOWN_SECS")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
@@ -84,7 +85,7 @@ impl AutoRefreshPolicy {
 pub enum AutoRefreshOutcome {
     /// A detached `cass index --background` child was started.
     Spawned { pid: u32, reason: String },
-    /// `CASS_AUTO_REFRESH=0`.
+    /// `CASS_AUTO_REFRESH` is unset or disabled.
     Disabled,
     /// Another cass index run already holds the data-dir index lock.
     IndexRunActive,
@@ -303,7 +304,7 @@ pub fn maybe_spawn_with_policy(
     policy: AutoRefreshPolicy,
 ) -> AutoRefreshOutcome {
     if !policy.enabled {
-        debug!(reason, "auto-refresh disabled via CASS_AUTO_REFRESH");
+        debug!(reason, "auto-refresh is not enabled");
         return AutoRefreshOutcome::Disabled;
     }
     if crate::search::asset_state::read_search_maintenance_snapshot(data_dir).active {
@@ -446,6 +447,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gh422_auto_refresh_is_opt_in_by_default() {
+        assert!(!AutoRefreshPolicy::default().enabled);
+    }
+
+    #[test]
     fn catch_up_reason_prefers_partial_then_stale_then_pending() {
         let base = serde_json::json!({"exists": true, "rebuilding": false});
         assert_eq!(catch_up_reason(&base), None);
@@ -586,7 +592,10 @@ mod tests {
             &data_dir.join("agent_search.db"),
             "test",
             false,
-            AutoRefreshPolicy::default(),
+            AutoRefreshPolicy {
+                enabled: true,
+                ..AutoRefreshPolicy::default()
+            },
         );
         assert_eq!(outcome, AutoRefreshOutcome::GuardBusy);
         let _ = FileExt::unlock(&holder);

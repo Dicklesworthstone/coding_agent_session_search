@@ -2285,56 +2285,53 @@ mod tests {
     }
 
     #[test]
-    fn stale_lock_metadata_from_dead_owner_is_reaped_on_read() {
+    fn gh422_stale_lock_metadata_is_ignored_without_mutating_it_on_read() {
         // Regression for issue #176: the TUI used to see a permanent
         // `orphaned: true` state when the index-run.lock file contained
-        // metadata from a crashed process, because nothing in the read
-        // path cleaned it up. That produced a tight CPU-bound poll loop
-        // on startup. The read path now reaps stale metadata atomically
-        // while holding the exclusive flock.
+        // metadata from a crashed process. A successful shared-lock probe now
+        // returns a clean snapshot without rewriting the file, preserving both
+        // the old spin fix and search's strict read-only contract.
         let temp = tempfile::tempdir().expect("tempdir");
         let lock_path = temp.path().join("index-run.lock");
-        // The reap path does not probe the recorded pid — POSIX flock
-        // acquisition is the signal — so the concrete pid value in the
-        // fixture is irrelevant. We still record one so the parser
-        // runs through its full happy path.
-        std::fs::write(
-            &lock_path,
-            concat!(
-                "pid=4242\n",
-                "started_at_ms=1733000111000\n",
-                "updated_at_ms=1733000112000\n",
-                "db_path=/tmp/cass/agent_search.db\n",
-                "mode=index\n",
-                "job_id=lexical-refresh-1733000111000-4242\n",
-                "job_kind=lexical_refresh\n",
-                "phase=rebuilding\n"
-            ),
-        )
-        .expect("write lock metadata");
+        let stale_metadata = concat!(
+            "pid=4242\n",
+            "started_at_ms=1733000111000\n",
+            "updated_at_ms=1733000112000\n",
+            "db_path=/tmp/cass/agent_search.db\n",
+            "mode=index\n",
+            "job_id=lexical-refresh-1733000111000-4242\n",
+            "job_kind=lexical_refresh\n",
+            "phase=rebuilding\n"
+        );
+        std::fs::write(&lock_path, stale_metadata).expect("write lock metadata");
 
         let snapshot = read_search_maintenance_snapshot(temp.path());
         assert!(!snapshot.active, "no owner, must not be reported active");
         assert!(
             !snapshot.orphaned,
-            "stale metadata must be reaped, not reported as orphaned"
+            "stale metadata must be ignored, not reported as orphaned"
         );
-        assert!(snapshot.pid.is_none(), "pid must be cleared after reap");
+        assert!(snapshot.pid.is_none(), "stale pid must not escape the probe");
         assert!(
             snapshot.job_id.is_none(),
-            "job_id must be cleared after reap"
+            "stale job_id must not escape the probe"
         );
-        assert!(snapshot.phase.is_none(), "phase must be cleared after reap");
-
-        // File must still exist (to preserve permissions and avoid
-        // creating/recreating races) but be empty.
-        let post = std::fs::metadata(&lock_path).expect("lock file still present");
-        assert_eq!(post.len(), 0, "stale metadata must be truncated in place");
+        assert!(snapshot.phase.is_none(), "stale phase must not escape the probe");
+        assert_eq!(
+            std::fs::read(&lock_path).expect("read unchanged lock metadata"),
+            stale_metadata.as_bytes(),
+            "an observational lock probe must preserve every byte"
+        );
 
         // Second read also returns a clean default snapshot.
         let snapshot2 = read_search_maintenance_snapshot(temp.path());
         assert!(!snapshot2.active);
         assert!(!snapshot2.orphaned);
+        assert_eq!(
+            std::fs::read(&lock_path).expect("read lock metadata after second probe"),
+            stale_metadata.as_bytes(),
+            "repeated observation must remain byte-for-byte read-only"
+        );
     }
 
     #[test]
