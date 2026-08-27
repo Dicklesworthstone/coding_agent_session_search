@@ -216,7 +216,7 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
 
     let lock_path = index_run_lock_path(data_dir);
     let sidecar_path = index_run_lock_metadata_sidecar_path(&lock_path);
-    let file = match OpenOptions::new().read(true).write(true).open(&lock_path) {
+    let file = match OpenOptions::new().read(true).open(&lock_path) {
         Ok(file) => file,
         Err(err) if windows_lock_conflict(&err) => {
             let raw = read_capped_metadata_from_path(&sidecar_path, MAX_LOCK_FILE_READ)
@@ -261,15 +261,13 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
     snapshot.active = if current_process_owns_recorded_lock {
         true
     } else {
-        match file.try_lock_exclusive() {
+        match file.try_lock_shared() {
             Ok(()) => {
-                // We acquired the exclusive lock with no waiting, which is
-                // proof that no process holds it. POSIX flock (via fs2) is
-                // released automatically when the owning file description
-                // is closed — either explicitly on graceful drop, or by the
-                // kernel on process exit / crash. Therefore, if the file
-                // contains metadata but no holder is present, the previous
-                // owner is gone.
+                // A shared lock succeeds only when no writer holds the
+                // exclusive index-run lock. Treat any metadata as stale, but
+                // do not rewrite it here: this function is used by search,
+                // status, health, and TUI observation paths and therefore
+                // must be byte-for-byte read-only.
                 //
                 // Historically this produced a permanent `orphaned: true`
                 // state that callers (notably the TUI) interpreted as
@@ -277,35 +275,10 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
                 // CPU-bound loop that only cleared when the user manually
                 // deleted the lock file (see issue #176).
                 //
-                // Reap the stale metadata in place while we hold the lock,
-                // so that this and every subsequent reader observes a
-                // clean state.
-                //
-                // We deliberately do NOT gate this on a `kill(pid, 0)`
-                // liveness probe. Under PID reuse (the recorded pid is
-                // reassigned to an unrelated live process), such a probe
-                // would refuse to reap and the spin would reappear. Flock
-                // acquisition is the stronger and more precise signal.
-                if metadata_present {
-                    if let Err(err) = file.set_len(0) {
-                        tracing::warn!(
-                            path = %lock_path.display(),
-                            error = %err,
-                            "failed to truncate stale index-run lock metadata"
-                        );
-                    } else {
-                        let _ = clear_index_run_lock_metadata_sidecar(&lock_path);
-                        let _ = file.sync_all();
-                        tracing::info!(
-                            path = %lock_path.display(),
-                            stale_pid = ?snapshot.pid,
-                            "cleared stale index-run lock metadata (previous owner gone)"
-                        );
-                        let _ = file.unlock();
-                        return SearchMaintenanceSnapshot::default();
-                    }
-                }
                 let _ = file.unlock();
+                if metadata_present {
+                    return SearchMaintenanceSnapshot::default();
+                }
                 false
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => true,

@@ -2289,8 +2289,36 @@ flowchart LR
 ### Background Indexing & Watch Mode
 - **Non-Blocking**: The indexer runs in a background thread. You can search while it works.
 - **Parallel Discovery**: Connector detection and scanning run in parallel across all CPU cores using rayon, significantly reducing startup time when multiple agents are installed.
-- **Watch Mode**: Uses file system watchers (`notify`) to detect changes in agent logs. When you save a file or an agent replies, `cass` re-indexes just that conversation and refreshes the search view automatically.
+- **Watch Mode** (`cass index --watch`, foreground): Uses file system watchers (`notify`) to detect changes in agent logs. When you save a file or an agent replies, `cass` re-indexes just that conversation. The TUI does **not** start a watcher on its own; see *Keeping the Index Fresh* below for what runs automatically.
 - **Real-Time Progress**: The TUI footer updates in real-time showing discovered agent count and conversation totals with sparkline visualization (e.g., "📦 Indexing 150/2000 (7%) ▁▂▄▆█").
+
+### Keeping the Index Fresh (Automatic)
+
+An index that is always a little behind is the most common complaint about any local search tool, so cass has three cooperating mechanisms. None of them block a search; all of them run `cass index --background`, which lowers its own CPU (`nice 15`) and I/O (`ionice` idle on Linux) priority before touching anything, and all of them respect the single `index-run.lock` — two indexers never run at once.
+
+| Layer | What | When it runs | Enable |
+|-------|------|--------------|--------|
+| **Stale-on-read catch-up** | `search`, `pack`, and TUI launch check index freshness (the same health-grade probe as `cass health`, no DB open). If the index is stale (> 30 min), partial, or has pending sessions, a *detached* incremental `cass index --background` is spawned in its own process group and the current results are returned immediately. The next search is fresh. | On demand, at most once per 5 min per data dir (`CASS_AUTO_REFRESH_COOLDOWN_SECS`). Never for data dirs under the OS temp dir. | On by default. `CASS_AUTO_REFRESH=0` disables. `--robot-meta` reports `index_freshness.auto_refresh.{outcome,trigger,pid}`. |
+| **OS scheduler** (`cass schedule install`) | launchd LaunchAgents (macOS) or systemd user timers (Linux): an **incremental** job every 15 min and a **nightly** job (03:00) that runs `index --full`, then bounded `models backfill --scheduled` batches, plus any remote-source syncs whose `sync_schedule` in `sources.toml` is due. Priority is delegated to the OS (`ProcessType=Background`/`Nice`/`LowPriorityIO`, `Nice=19`/`IOSchedulingClass=idle`/`CPUSchedulingPolicy=idle`). | On the timer, even when no cass process is running; survives reboots (`Persistent=true` / launchd). | `cass schedule install [--interval-mins 15] [--nightly-hour 3] [--no-nightly] [--no-semantic] [--dry-run]`; `cass schedule status`; `cass schedule uninstall`. |
+| **Resident daemon timer** | The warm-model daemon (`cass daemon`, auto-spawned by semantic/hybrid searches) can also kick an incremental background index while it is resident. | Every `CASS_DAEMON_INDEX_INTERVAL_SECS` seconds while the daemon lives (it exits after its idle timeout). | Off by default; `CASS_DAEMON_INDEX_INTERVAL_SECS=900` recommended. |
+
+Idle awareness: scheduled work skips a run when the machine is under severe load (Linux `/proc/loadavg` + PSI; macOS `sysctl vm.loadavg`). On macOS you can additionally require the console to have been idle — `CASS_RESPONSIVENESS_MIN_USER_IDLE_SECS=600` makes the nightly job and scheduled semantic backfill wait until nobody has touched the keyboard for ten minutes (the gate fails open where idle time is unavailable). Foreground `cass index` is never gated.
+
+Everything a scheduled job did is recorded under `<data_dir>/schedule/` (`state.json`, `runs.jsonl`, per-job logs) and the last stale-on-read spawn under `<data_dir>/auto-refresh-state.json` / `auto-refresh.log`; `cass schedule status --json` reads all of it.
+
+```bash
+# See what would be registered, then register it
+cass schedule install --dry-run
+cass schedule install
+
+# Run a job by hand (what the units invoke); --force ignores load/idle gates
+cass schedule run --job incremental --json
+cass schedule run --job nightly --force
+
+# Inspect
+cass schedule status --json
+cass search "auth" --robot --robot-meta | jq '._meta.index_freshness.auto_refresh'
+```
 
 ## 🔍 Deep Dive: Internals
 
@@ -2669,7 +2697,9 @@ The `cass` binary supports both interactive use and automation.
 cass [tui] [--data-dir DIR] [--once] [--asciicast FILE]
 
 # Indexing
-cass index [--full] [--watch] [--data-dir DIR] [--idempotency-key KEY]
+cass index [--full] [--watch] [--background] [--data-dir DIR] [--idempotency-key KEY]
+cass schedule install [--interval-mins 15] [--nightly-hour 3] [--no-semantic] [--dry-run]
+cass schedule status --json
 
 # Search
 cass search "query" --robot --limit 5 [--timeout 5000] [--explain] [--dry-run]
@@ -2710,10 +2740,12 @@ cass completions bash > ~/.bash_completion.d/cass
 
 | Command | Purpose |
 |---------|---------|
-| `cass` (default) | Start TUI + background watcher |
+| `cass` (default) | Start TUI (a stale index triggers a detached low-priority catch-up; see *Keeping the Index Fresh*) |
 | `cass tui --asciicast FILE` | Run TUI and save terminal output as asciicast v2 |
 | `index --full` | Discover sessions and refresh the canonical DB plus derived search assets |
-| `index --watch` | Daemon mode: watch for file changes, reindex automatically |
+| `index --background` | Same as `index`, but lowers its own CPU/I/O priority first (used by auto-refresh, `schedule`, and the daemon timer) |
+| `index --watch` | Foreground watch loop: reindex automatically on file changes |
+| `schedule install\|uninstall\|status\|run` | Register incremental (15 min) + nightly (full index + semantic backfill) jobs with launchd / systemd user timers |
 | `search --robot` | JSON output for automation pipelines |
 | `pack --robot` | Deterministic cited answer packs for agent/human handoffs; reports health, freshness, privacy, and warnings |
 | `triage` / `ready` / `preflight` | One-shot agent preflight: readiness, exact next command, docs, schemas, workflows, and recoveries |
@@ -3039,6 +3071,14 @@ Update check state is stored in the data directory:
 | `CASS_DATA_DIR` | Platform default | Override data directory |
 | `CASS_DB_PATH` | `$CASS_DATA_DIR/agent_search.db` | Override database path |
 | `CASS_EXCLUDE_PATHS` | unset | Comma/newline-delimited files or directory prefixes to skip without advancing scan/watch watermarks |
+| **Background Indexing** | | |
+| `CASS_AUTO_REFRESH` | `1` | Stale-on-read catch-up: a stale/partial/behind index seen by `search`, `pack`, or TUI launch spawns a detached `cass index --background`. `0` disables. |
+| `CASS_AUTO_REFRESH_COOLDOWN_SECS` | `300` | Minimum spacing between auto-spawned catch-up runs per data dir |
+| `CASS_BACKGROUND_NICE` | `15` | nice value `cass index --background` applies to itself (0..=19) |
+| `CASS_BACKGROUND_IONICE_CLASS` | `3` | ionice class for `cass index --background` on Linux (3 = idle) |
+| `CASS_DAEMON_INDEX_INTERVAL_SECS` | `0` | While the semantic daemon is resident, spawn an incremental background index every N seconds (`900` recommended; 0 = off) |
+| `CASS_SCHEDULE_MAX_BACKFILL_BATCHES` | `200` | Cap on `models backfill --scheduled` batches per nightly `cass schedule run` |
+| `CASS_RESPONSIVENESS_MIN_USER_IDLE_SECS` | `0` | Require N seconds of console idle (macOS `HIDIdleTime`) before the nightly job / scheduled backfill runs; fails open where unavailable |
 | **Indexing & Redaction** | | |
 | `CASS_INDEX_REDACTION` | `full` | Index-time secret redaction: `full` scrubs API keys/tokens/passwords/private keys from every persisted message, title, snippet, and metadata blob before they reach SQLite or the lexical index; `off` skips redaction for faster ingest. **`off` means raw text is indexed** — note that the original session files and the cass raw-mirror blobs (`<data_dir>/raw-mirror/v1/`) already contain the same raw text unencrypted on the same disk, so `full` protects the queryable surfaces (search results, exports, robot output), not disk-at-rest secrecy. Unrecognized values warn and behave as `full`. |
 | `CASS_REDACT_SECRETS` | `1` | Legacy redaction toggle (`0`/`false`/`off`/`no` disables). `CASS_INDEX_REDACTION` takes precedence when both are set. |
