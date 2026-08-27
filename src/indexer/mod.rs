@@ -11512,6 +11512,10 @@ pub enum IndexMessage {
         is_discovered: bool,
         /// Whether every scan scope for this connector completed without error
         scan_succeeded: bool,
+        /// Whether this connector skipped at least one source that was still
+        /// being written. Its own watermark must remain behind for that source,
+        /// but unrelated connectors may still advance safely.
+        active_source_skipped: bool,
     },
 }
 
@@ -12123,6 +12127,7 @@ fn spawn_connector_producer(
         let was_detected = detect.detected;
         let mut is_discovered = false;
         let mut scan_succeeded = true;
+        let mut active_source_skipped = false;
 
         // #373 Variant A: give the connector a liveness tick so a long internal
         // scan (e.g. decoding a large opencode.db) advances the watchdog's
@@ -12181,6 +12186,7 @@ fn spawn_connector_producer(
                     LOCAL_SOURCE_ID,
                     &conversation.source_path,
                 ) {
+                    active_source_skipped = true;
                     return Ok(());
                 }
                 if should_skip_subagent_source(&conversation.source_path) {
@@ -12284,6 +12290,7 @@ fn spawn_connector_producer(
                     &root.origin.source_id,
                     &conversation.source_path,
                 ) {
+                    active_source_skipped = true;
                     return Ok(());
                 }
                 if should_skip_subagent_source(&conversation.source_path) {
@@ -12387,6 +12394,7 @@ fn spawn_connector_producer(
             scan_ms,
             is_discovered,
             scan_succeeded,
+            active_source_skipped,
         });
     })
 }
@@ -12726,6 +12734,7 @@ fn run_streaming_consumer(
                 scan_ms,
                 is_discovered,
                 scan_succeeded,
+                active_source_skipped,
             }) => {
                 active_producers -= 1;
                 let effective_scan_succeeded =
@@ -12744,11 +12753,15 @@ fn run_streaming_consumer(
                     remember_discovered_connector(&mut discovered_names, connector_name);
                 }
                 if is_discovered && effective_scan_succeeded {
-                    ingest_outcome
-                        .scanned_connectors
-                        .insert(connector_name.to_string());
+                    let connector_watermark_safe =
+                        !scan_path_exclusions_active() && !active_source_skipped;
+                    if connector_watermark_safe {
+                        ingest_outcome
+                            .scanned_connectors
+                            .insert(connector_name.to_string());
+                    }
                     if let Some(ts) = scan_start_ts
-                        && !scan_watermark_preservation_active()
+                        && connector_watermark_safe
                         && let Err(e) = persist::with_ephemeral_writer(
                             storage,
                             true,
@@ -12760,6 +12773,13 @@ fn run_streaming_consumer(
                             connector = connector_name,
                             "streaming connector last_scan_ts save failed: {}",
                             e
+                        );
+                    } else if !connector_watermark_safe {
+                        tracing::debug!(
+                            connector = connector_name,
+                            active_source_skipped,
+                            path_exclusions_active = scan_path_exclusions_active(),
+                            "preserving this connector's scan watermark while allowing unrelated connectors to advance"
                         );
                     }
                 } else if !effective_scan_succeeded {
@@ -29600,6 +29620,24 @@ pub mod persist {
         }
 
         #[test]
+        #[serial]
+        fn gh425_bulk_checkpoint_mode_parses_case_insensitively_and_fails_safe() {
+            let passive_guard = set_env("CASS_INDEX_INGEST_WAL_CHECKPOINT_MODE", "passive");
+            assert_eq!(
+                BulkIngestWalCheckpointMode::from_env(),
+                BulkIngestWalCheckpointMode::Passive
+            );
+            drop(passive_guard);
+
+            let invalid_guard = set_env("CASS_INDEX_INGEST_WAL_CHECKPOINT_MODE", "invalid");
+            assert_eq!(
+                BulkIngestWalCheckpointMode::from_env(),
+                BulkIngestWalCheckpointMode::Truncate
+            );
+            drop(invalid_guard);
+        }
+
+        #[test]
         fn with_ephemeral_writer_marks_preflight_verified_after_first_success() {
             let dir = tempfile::TempDir::new().unwrap();
             let db_path = dir.path().join("preflight-cache.db");
@@ -29693,6 +29731,10 @@ pub mod persist {
                 "TRUNCATE must shrink the in-run WAL: before={wal_bytes_before}, after={wal_bytes_after}"
             );
             assert!(storage.bulk_single_connection_enabled());
+            assert!(
+                !storage.ephemeral_writer_preflight_verified(),
+                "the old cached writer's preflight must not be reused by the primary"
+            );
 
             with_ephemeral_writer(&storage, true, "gh425 post-reset primary write", |writer| {
                 // This INSERT can succeed only on the original primary: a
@@ -29705,6 +29747,7 @@ pub mod persist {
                 Ok(())
             })
             .unwrap();
+            assert!(storage.ephemeral_writer_preflight_verified());
             let primary_count: i64 = storage
                 .raw()
                 .query_row_map("SELECT COUNT(*) FROM gh425_primary_only;", &[], |row| {

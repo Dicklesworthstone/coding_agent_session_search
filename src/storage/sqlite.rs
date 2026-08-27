@@ -5798,6 +5798,12 @@ impl FrankenStorage {
     }
 
     pub(crate) fn enable_bulk_single_connection(&self) {
+        // The existing preflight result belongs to the cached ephemeral
+        // connection that was just closed. The primary must perform its own
+        // write preflight after the WAL reset; otherwise a stale primary MVCC
+        // clock could remain hidden until the first real persistence write.
+        self.ephemeral_writer_preflight_verified
+            .store(false, Ordering::Relaxed);
         self.bulk_single_connection.store(true, Ordering::Relaxed);
     }
 
