@@ -11,10 +11,10 @@
 # It also breaks release reproducibility: the host that gates a release and the
 # host that builds the artifact can disagree about what `nightly` means.
 #
-# nightly-2026-08-20 is the date standardised across this workspace during that
+# nightly-2026-08-25 is the date standardised across this workspace during that
 # run. Bump it deliberately, as its own commit, after a green gate -- never by
 # letting it float.
 [toolchain]
-channel = "nightly-2026-08-20"
+channel = "nightly-2026-08-25"
 components = ["rustfmt", "clippy"]
 profile = "default"

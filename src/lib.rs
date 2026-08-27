@@ -1,3 +1,7 @@
+// Index walks over parallel slices by a single counter; an iterator rewrite would
+// obscure the arithmetic without changing behaviour.
+#![allow(clippy::needless_range_loop)]
+
 #![recursion_limit = "256"]
 
 pub mod analytics;

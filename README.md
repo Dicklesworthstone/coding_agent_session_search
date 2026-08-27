@@ -3141,7 +3141,7 @@ When intentionally updating one of these sibling crates, update the manifest pin
 
 ## 🧪 Developer Workflow
 
-We target the dated Rust nightly `nightly-2026-08-20` pinned by
+We target the dated Rust nightly `nightly-2026-08-25` pinned by
 `rust-toolchain.toml`. Agents should offload build, test, lint, and snapshot
 commands with `rch`.
 
