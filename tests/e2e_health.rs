@@ -1400,6 +1400,96 @@ fn health_binary_only_exit_code_ignores_archive_state() {
     );
 }
 
+/// GH #398: the dedicated executable probe must be independent of archive
+/// state, not merely override the exit code after paying archive open costs.
+/// The planted-negative archive path is a directory, which the ordinary
+/// health surface rejects as an unopenable database; selftest must still run
+/// a real in-memory FrankenSQLite write/read round-trip and leave that path
+/// untouched.
+#[test]
+fn selftest_is_archive_independent_and_exercises_the_database_engine() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path();
+    let poisoned_db_path = home.join("poisoned-agent-search.db");
+    fs::create_dir_all(&poisoned_db_path).expect("create poisoned db directory");
+    let sentinel_path = poisoned_db_path.join("must-remain-untouched");
+    fs::write(&sentinel_path, b"archive sentinel").expect("write archive sentinel");
+
+    let health = isolated_cass_cmd(home)
+        .arg("--db")
+        .arg(&poisoned_db_path)
+        .args(["health", "--json"])
+        .output()
+        .expect("run ordinary health against poisoned archive");
+    assert_eq!(
+        health.status.code(),
+        Some(1),
+        "the planted-negative archive must be observably unopenable; stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&health.stdout),
+        String::from_utf8_lossy(&health.stderr)
+    );
+    let health_json: Value = serde_json::from_slice(&health.stdout).expect("health json");
+    assert_eq!(
+        health_json
+            .get("db")
+            .and_then(|db| db.get("opened"))
+            .and_then(Value::as_bool),
+        Some(false),
+        "the negative control did not actually poison archive opening: {health_json}"
+    );
+
+    let output = isolated_cass_cmd(home)
+        .arg("--db")
+        .arg(&poisoned_db_path)
+        .args(["selftest", "--json"])
+        .output()
+        .expect("run archive-independent selftest");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "selftest must ignore the poisoned archive; stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("selftest json");
+    assert_eq!(payload.get("status").and_then(Value::as_str), Some("ok"));
+    assert_eq!(
+        payload.get("functional").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        payload.get("archive_accessed").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        payload
+            .get("checks")
+            .and_then(Value::as_array)
+            .and_then(|checks| checks.first())
+            .and_then(|check| check.get("name"))
+            .and_then(Value::as_str),
+        Some("frankensqlite-in-memory-roundtrip")
+    );
+    assert_eq!(
+        payload
+            .get("checks")
+            .and_then(Value::as_array)
+            .and_then(|checks| checks.first())
+            .and_then(|check| check.get("status"))
+            .and_then(Value::as_str),
+        Some("pass")
+    );
+    assert!(
+        payload.get("data_dir").is_none() && payload.get("db_path").is_none(),
+        "selftest must not surface or resolve archive paths: {payload}"
+    );
+    assert_eq!(
+        fs::read(&sentinel_path).expect("read untouched archive sentinel"),
+        b"archive sentinel",
+        "selftest mutated the configured archive path"
+    );
+}
+
 /// GH #396: an archive whose canonical DB file exists but cannot be opened
 /// (garbage bytes where a SQLite database should be) must NOT be reported as
 /// `db=available` by the health fast surface. The busy/lock-class elision is
