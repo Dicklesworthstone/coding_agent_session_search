@@ -20054,9 +20054,10 @@ fn state_meta_json_for_status(
 }
 
 /// Filesystem-only state metadata for `search --no-maintenance`. The database
-/// is reported as deliberately unprobed, while lexical/semantic manifests and
-/// coordination files are still inspected. This avoids the ordinary read
-/// opener's sanctioned dirty-WAL/schema recovery writes.
+/// is reported as deliberately unprobed; lexical checkpoint/coordination files
+/// are inspected, while the state surface skips semantic DB fingerprint/filter
+/// probes. This avoids the ordinary read opener's sanctioned dirty-WAL/schema
+/// recovery writes and avoids scratch-copy diagnostics.
 fn state_meta_json_for_strict_read(
     data_dir: &Path,
     db_path: &Path,
@@ -20109,7 +20110,11 @@ fn storage_integrity_value_from_state(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let signals = DoctorStorageSignals {
-        db_file_present,
+        // A deliberately skipped open proves only that a path is present, not
+        // that the archive is readable. Feed the readiness classifier no
+        // synthetic db-open signal so it emits unknown_deferred/not_checked
+        // and records db_open as skipped instead of claiming a check ran.
+        db_file_present: db_file_present && !open_skipped,
         not_initialized,
         // A present-but-unopened archive is an openread fault. status/search
         // open the DB for real (skip_db_open=false), so only claim the fault
@@ -20125,7 +20130,19 @@ fn storage_integrity_value_from_state(
     // fingerprint-still-valid doctor/index quick_check verdict projects its
     // real pass/fail outcome with cached provenance.
     let attestation = load_matching_integrity_attestation(data_dir, db_path);
-    let report = build_readiness_storage_integrity(signals, attestation.as_ref());
+    let mut report = build_readiness_storage_integrity(signals, attestation.as_ref());
+    if open_skipped
+        && db_file_present
+        && let Some(db_open) = report
+            .checks_attempted
+            .iter_mut()
+            .find(|check| check.name == "db_open")
+    {
+        db_open.skipped_reason = Some("passive no-maintenance probe".to_string());
+    }
+    if open_skipped {
+        return serde_json::to_value(report).unwrap_or(serde_json::Value::Null);
+    }
     let dedicated = probe_dedicated_storage_state(db_path, Duration::from_millis(100));
     serde_json::to_value(apply_dedicated_storage_probe(report, dedicated))
         .unwrap_or(serde_json::Value::Null)
@@ -20173,6 +20190,34 @@ fn readiness_projection_uses_only_fingerprint_matching_integrity_attestations() 
     let stale = storage_integrity_value_from_state(data_dir, &db_path, &opened_state, false);
     assert_eq!(stale["storage_state"], "unchecked");
     assert_eq!(stale["attestation_source"], "none");
+}
+
+#[cfg(test)]
+#[test]
+fn gh422_passive_search_metadata_never_claims_a_database_open() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let data_dir = temp.path();
+    let db_path = data_dir.join("agent_search.db");
+    std::fs::write(&db_path, b"present but deliberately unprobed")
+        .expect("seed passive archive path");
+    let passive_state = serde_json::json!({
+        "database": { "opened": false, "open_skipped": true },
+        "index": { "empty_with_messages": false }
+    });
+
+    let report =
+        storage_integrity_value_from_state(data_dir, &db_path, &passive_state, false);
+    assert_eq!(report["storage_state"], "unknown_deferred");
+    assert_eq!(report["archive_readability"], "not_checked");
+    let db_open = report["checks_attempted"]
+        .as_array()
+        .and_then(|checks| checks.iter().find(|check| check["name"] == "db_open"))
+        .expect("passive report must retain an explicit db_open provenance row");
+    assert_eq!(
+        db_open["skipped_reason"],
+        "passive no-maintenance probe",
+        "robot metadata must say the DB open was skipped, never that it ran"
+    );
 }
 
 /// `coding_agent_session_search-d0rmo`: variant of `state_meta_json`
@@ -20259,7 +20304,6 @@ fn state_meta_json_inner(
     // counts_skipped=false alongside message_count=0 would be a lie.
     let db_snapshot = if passive_db_probe && db_exists && db_is_regular_file {
         StateDbSnapshot {
-            opened: true,
             counts_skipped: true,
             open_skipped: true,
             ..StateDbSnapshot::default()
@@ -24414,6 +24458,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "    --aggregate F1,F2 Server-side aggregation by fields (agent,workspace,date,match_type)".to_string(),
             "                      Returns buckets with counts. Reduces tokens by ~99% for overview queries".to_string(),
             "    --mode lexical|semantic|hybrid  Search mode (default: hybrid; hybrid fails open to lexical when semantic assets are unavailable)".to_string(),
+            "    --no-maintenance  Strict read-only search: never joins/spawns index maintenance or a daemon; conflicts with --refresh and --daemon".to_string(),
             "    --robot-meta     Include readiness, requested/realized mode, semantic refinement, fallback tier/reason, cursor, and timing metadata".to_string(),
             "  cass pack <query> [--robot] [--max-tokens N] [--limit N]".to_string(),
             "    Build a deterministic, cited answer pack for agent handoffs without external summarization.".to_string(),
@@ -26025,7 +26070,7 @@ fn repair_lexical_index_for_search_with_stall_watchdog(
         )
     });
     let poll_interval = Duration::from_millis(100);
-    let mut watchdog = IndexStallWatchdog::aborting_phase_two(
+    let mut watchdog = IndexStallWatchdog::aborting_lexical_phases(
         data_dir.to_path_buf(),
         Duration::from_secs(1),
     );
@@ -94071,9 +94116,10 @@ fn validate_successful_index_artifacts(
 /// issue asked for). This avoids a silent multi-second wait when launching
 /// the TUI or running a search against a slightly stale index.
 ///
-/// This is deliberately non-fatal: if the refresh fails we emit a warning and
-/// return, leaving the caller to proceed against the existing (possibly stale)
-/// index. That way a bad indexer state never blocks a search or TUI launch.
+/// Ordinary returned errors are non-fatal: emit a warning and continue against
+/// the existing index. A watchdog-confirmed no-progress stall is different:
+/// the worker cannot be detached without retaining `index-run.lock`, so the
+/// process exits 70 after the configured bound and releases every live lock.
 fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<PathBuf>) {
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -94110,7 +94156,7 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
     let mut last_total = usize::MAX;
     let started = Instant::now();
     let mut stall_watchdog =
-        IndexStallWatchdog::aborting_phase_two(watchdog_data_dir, Duration::from_secs(1));
+        IndexStallWatchdog::aborting_lexical_phases(watchdog_data_dir, Duration::from_secs(1));
     while !index_handle.is_finished() {
         let phase = progress.phase.load(Ordering::Relaxed);
         let current = progress.current.load(Ordering::Relaxed);
@@ -94423,7 +94469,7 @@ fn index_finalize_abort_threshold(abort_threshold: Option<Duration>) -> Option<D
 enum IndexStallAbortPolicy {
     #[cfg(test)]
     ReportOnly,
-    AbortPhaseTwo,
+    AbortLexicalPhases,
 }
 
 struct IndexStallWatchdog {
@@ -94468,11 +94514,11 @@ impl IndexStallWatchdog {
         )
     }
 
-    fn aborting_phase_two(data_dir: PathBuf, progress_interval: Duration) -> Self {
+    fn aborting_lexical_phases(data_dir: PathBuf, progress_interval: Duration) -> Self {
         Self::with_abort_policy(
             data_dir,
             progress_interval,
-            IndexStallAbortPolicy::AbortPhaseTwo,
+            IndexStallAbortPolicy::AbortLexicalPhases,
         )
     }
 
@@ -94490,8 +94536,8 @@ impl IndexStallWatchdog {
     /// Mark this watchdog as supervising a one-shot semantic (vector) build.
     /// Measured semantic phases can emit diagnostics but never exit the
     /// process; native HNSW is opaque and therefore excluded from no-progress
-    /// diagnostics. A genuine phase-2 lexical wedge is still detected and
-    /// aborted under the ordinary policy.
+    /// diagnostics. A genuine preparing/scanning/indexing wedge is still
+    /// detected and bounded under the lexical policy.
     fn semantic_aware(mut self, semantic_build: bool) -> Self {
         self.semantic_build = semantic_build;
         self
@@ -94662,7 +94708,16 @@ impl IndexStallWatchdog {
             && total > 0
             && current >= total
             && index_progress.rebuild_pipeline_is_quiescent();
-        let abort_eligible = phase_code == 2 || finalize_wedge;
+        // #422: a search-triggered lexical refresh can wedge before phase 2,
+        // notably in preparing while opening/counting the canonical DB. A
+        // phase-2-only policy merely warned and then let the live process hold
+        // index-run.lock forever. Every lexical phase is bounded; semantic
+        // phases retain their measured/report-only treatment below.
+        let pre_index_lexical_wedge = phase_code < indexer::INDEX_PHASE_LEXICAL_INDEXING
+            && index_progress.rebuild_pipeline_is_quiescent();
+        let abort_eligible = phase_code == indexer::INDEX_PHASE_LEXICAL_INDEXING
+            || pre_index_lexical_wedge
+            || finalize_wedge;
         // #319/#321: while the indexer signals `finalizing`, the phase-0 /
         // current==total / quiescent shape is the post-publish WAL-checkpoint
         // window, not a #297 wedge. The checkpoint is a synchronous, `!Send`
@@ -94731,7 +94786,7 @@ impl IndexStallWatchdog {
         } else {
             abort_threshold
         };
-        if self.abort_policy != IndexStallAbortPolicy::AbortPhaseTwo
+        if self.abort_policy != IndexStallAbortPolicy::AbortLexicalPhases
             || !abort_eligible
             || self.stall_abort_reported_for_phase == Some(phase_code)
             || stall_elapsed < effective_abort_threshold
@@ -95001,6 +95056,48 @@ mod stall_diagnostics_tests {
         );
     }
 
+    #[test]
+    fn gh422_watchdog_aborts_a_phase_zero_lexical_startup_wedge() -> anyhow::Result<()> {
+        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
+        use crate::indexer::{INDEX_PHASE_PREPARING, IndexingProgress};
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let tmp = TempDir::new()?;
+        let mut watchdog = IndexStallWatchdog::with_abort_policy(
+            tmp.path().to_path_buf(),
+            Duration::from_millis(50),
+            IndexStallAbortPolicy::AbortLexicalPhases,
+        );
+        watchdog.threshold = Some(Duration::from_millis(1));
+        watchdog.abort_threshold = Some(Duration::from_millis(2));
+        watchdog.last_phase = INDEX_PHASE_PREPARING;
+        watchdog.last_current = 0;
+        watchdog.last_activity = 0;
+        watchdog.last_progress_advance =
+            std::time::Instant::now() - Duration::from_millis(100);
+
+        let progress = Arc::new(IndexingProgress::default());
+        assert_eq!(
+            progress.phase.load(Ordering::Relaxed),
+            INDEX_PHASE_PREPARING
+        );
+        let report = watchdog
+            .observe(&progress, 100)
+            .ok_or_else(|| anyhow::anyhow!("preparing wedge did not report"))?;
+        assert_eq!(report["event"], serde_json::json!("stall_detected"));
+        assert_ne!(report["abort_process"], serde_json::json!(true));
+
+        let abort = watchdog
+            .observe(&progress, 200)
+            .ok_or_else(|| anyhow::anyhow!("preparing wedge did not request a bounded abort"))?;
+        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
+        assert_eq!(abort["abort_process"], serde_json::json!(true));
+        assert_eq!(abort["exit_code"], serde_json::json!(70));
+        Ok(())
+    }
+
     /// Regression for #332: `current` measures batch publication, not worker
     /// activity. While a producer is mid-parse of a large source artifact it
     /// ticks `IndexingProgress::activity` per parsed conversation without
@@ -95092,7 +95189,7 @@ mod stall_diagnostics_tests {
         let mut watchdog = IndexStallWatchdog::with_abort_policy(
             tmp.path().to_path_buf(),
             Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
+            IndexStallAbortPolicy::AbortLexicalPhases,
         );
         watchdog.threshold = Some(Duration::from_millis(1));
         watchdog.abort_threshold = Some(Duration::from_millis(2));
@@ -95141,7 +95238,7 @@ mod stall_diagnostics_tests {
         let mut watchdog = IndexStallWatchdog::with_abort_policy(
             tmp.path().to_path_buf(),
             Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
+            IndexStallAbortPolicy::AbortLexicalPhases,
         );
         watchdog.threshold = Some(Duration::from_millis(1));
         watchdog.abort_threshold = Some(Duration::from_millis(2));
@@ -95191,7 +95288,7 @@ mod stall_diagnostics_tests {
             let mut watchdog = IndexStallWatchdog::with_abort_policy(
                 tmp.path().to_path_buf(),
                 Duration::from_millis(50),
-                IndexStallAbortPolicy::AbortPhaseTwo,
+                IndexStallAbortPolicy::AbortLexicalPhases,
             );
             watchdog.threshold = Some(Duration::from_millis(1));
             watchdog.abort_threshold = Some(Duration::from_millis(2));
@@ -95268,7 +95365,7 @@ mod stall_diagnostics_tests {
             let mut watchdog = IndexStallWatchdog::with_abort_policy(
                 tmp.path().to_path_buf(),
                 Duration::from_millis(50),
-                IndexStallAbortPolicy::AbortPhaseTwo,
+                IndexStallAbortPolicy::AbortLexicalPhases,
             );
             watchdog.threshold = Some(Duration::from_millis(1));
             watchdog.abort_threshold = Some(Duration::from_millis(2));
@@ -95365,7 +95462,7 @@ mod stall_diagnostics_tests {
         let mut watchdog = IndexStallWatchdog::with_abort_policy(
             tmp.path().to_path_buf(),
             Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
+            IndexStallAbortPolicy::AbortLexicalPhases,
         )
         .watch_aware(true);
         watchdog.threshold = Some(Duration::from_millis(1));
@@ -95432,7 +95529,7 @@ mod stall_diagnostics_tests {
         let mut watchdog = IndexStallWatchdog::with_abort_policy(
             tmp.path().to_path_buf(),
             Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
+            IndexStallAbortPolicy::AbortLexicalPhases,
         )
         .semantic_aware(true);
         watchdog.threshold = Some(Duration::from_millis(1));
@@ -95490,7 +95587,7 @@ mod stall_diagnostics_tests {
         let mut watchdog = IndexStallWatchdog::with_abort_policy(
             tmp.path().to_path_buf(),
             Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
+            IndexStallAbortPolicy::AbortLexicalPhases,
         )
         .semantic_aware(true);
         watchdog.threshold = Some(Duration::from_millis(1));
@@ -95531,7 +95628,7 @@ mod stall_diagnostics_tests {
         let mut watchdog = IndexStallWatchdog::with_abort_policy(
             tmp.path().to_path_buf(),
             Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
+            IndexStallAbortPolicy::AbortLexicalPhases,
         )
         .semantic_aware(true);
         watchdog.threshold = Some(Duration::from_millis(1));
@@ -95577,7 +95674,7 @@ mod stall_diagnostics_tests {
         let mut watchdog = IndexStallWatchdog::with_abort_policy(
             tmp.path().to_path_buf(),
             Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
+            IndexStallAbortPolicy::AbortLexicalPhases,
         );
         watchdog.threshold = Some(Duration::from_millis(1));
         watchdog.abort_threshold = Some(Duration::from_millis(2));
@@ -95630,7 +95727,7 @@ mod stall_diagnostics_tests {
         let mut wedge_watchdog = IndexStallWatchdog::with_abort_policy(
             tmp.path().to_path_buf(),
             Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
+            IndexStallAbortPolicy::AbortLexicalPhases,
         );
         wedge_watchdog.threshold = Some(Duration::from_millis(1));
         wedge_watchdog.abort_threshold = Some(Duration::from_millis(2));
@@ -95674,7 +95771,7 @@ mod stall_diagnostics_tests {
         let mut watchdog = IndexStallWatchdog::with_abort_policy(
             tmp.path().to_path_buf(),
             Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
+            IndexStallAbortPolicy::AbortLexicalPhases,
         );
         watchdog.threshold = Some(Duration::from_millis(1));
         watchdog.abort_threshold = Some(Duration::from_millis(2));
@@ -95740,7 +95837,7 @@ mod stall_diagnostics_tests {
         let mut watchdog = IndexStallWatchdog::with_abort_policy(
             tmp.path().to_path_buf(),
             Duration::from_millis(50),
-            IndexStallAbortPolicy::AbortPhaseTwo,
+            IndexStallAbortPolicy::AbortLexicalPhases,
         );
         watchdog.threshold = Some(Duration::from_millis(1));
         watchdog.abort_threshold = Some(Duration::from_millis(2));
@@ -96075,7 +96172,7 @@ fn run_index_with_data(
         let mut last_agents = usize::MAX;
         let mut last_update = std::time::Instant::now();
         let mut stall_watchdog =
-            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
+            IndexStallWatchdog::aborting_lexical_phases(data_dir.clone(), progress_interval)
                 .watch_aware(watch)
                 .semantic_aware(semantic);
 
@@ -96209,7 +96306,7 @@ fn run_index_with_data(
             .checked_sub(Duration::from_secs(1))
             .unwrap_or_else(std::time::Instant::now);
         let mut stall_watchdog =
-            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
+            IndexStallWatchdog::aborting_lexical_phases(data_dir.clone(), progress_interval)
                 .watch_aware(watch)
                 .semantic_aware(semantic);
 
@@ -96318,7 +96415,7 @@ fn run_index_with_data(
             .checked_sub(progress_interval)
             .unwrap_or_else(std::time::Instant::now);
         let mut stall_watchdog =
-            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
+            IndexStallWatchdog::aborting_lexical_phases(data_dir.clone(), progress_interval)
                 .watch_aware(watch)
                 .semantic_aware(semantic);
 
@@ -96371,7 +96468,7 @@ fn run_index_with_data(
         // No progress display (json mode with events disabled, or plain=none):
         // just wait for completion.
         let mut stall_watchdog =
-            IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
+            IndexStallWatchdog::aborting_lexical_phases(data_dir.clone(), progress_interval)
                 .watch_aware(watch)
                 .semantic_aware(semantic);
         while !index_handle.is_finished() {

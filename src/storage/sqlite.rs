@@ -935,7 +935,9 @@ pub(crate) fn open_franken_async_strict_readonly_connection_with_timeout(
     let deadline = Instant::now() + timeout;
     let mut backoff = Duration::from_millis(4);
     loop {
-        let _doctor_guard = acquire_existing_doctor_mutation_db_open_guard(path, timeout)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let _doctor_guard =
+            acquire_existing_doctor_mutation_db_open_guard(path, remaining)?;
         match FrankenAsyncConnection::open_with_flags_sync(
             &path_str,
             FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -4608,6 +4610,15 @@ pub struct FrankenStorage {
     index_writer_checkpoint_pages: AtomicI64,
     index_writer_busy_timeout_ms: AtomicU64,
     cached_ephemeral_writer: parking_lot::Mutex<CachedEphemeralWriter>,
+    /// #425: once an in-run WAL reset has closed the cached writer, every
+    /// later batch must stay on the primary connection. Reopening a second
+    /// writer both disables fsqlite's single-connection TRUNCATE fast path and
+    /// can derive a stale MVCC clock immediately after the reset.
+    bulk_single_connection: AtomicBool,
+    /// WAL size at which a failed/non-shrinking in-run checkpoint may be
+    /// retried. This prevents an externally pinned WAL from being re-read and
+    /// backfilled at every batch boundary.
+    bulk_checkpoint_retry_at_bytes: AtomicU64,
     ensured_agents: Arc<parking_lot::Mutex<HashMap<EnsuredAgentKey, i64>>>,
     ensured_workspaces: Arc<parking_lot::Mutex<HashMap<EnsuredWorkspaceKey, i64>>>,
     ensured_conversation_sources: Arc<parking_lot::Mutex<HashSet<EnsuredConversationSourceKey>>>,
@@ -4811,6 +4822,8 @@ impl FrankenStorage {
             index_writer_checkpoint_pages: AtomicI64::new(UNSET_INDEX_WRITER_CHECKPOINT_PAGES),
             index_writer_busy_timeout_ms: AtomicU64::new(UNSET_INDEX_WRITER_BUSY_TIMEOUT_MS),
             cached_ephemeral_writer: parking_lot::Mutex::new(CachedEphemeralWriter::Uninitialized),
+            bulk_single_connection: AtomicBool::new(false),
+            bulk_checkpoint_retry_at_bytes: AtomicU64::new(0),
             ensured_agents,
             ensured_workspaces,
             ensured_conversation_sources,
@@ -5081,6 +5094,29 @@ impl FrankenStorage {
         }
     }
 
+    /// Close the idle cached writer without checkpointing and leave this
+    /// storage with only its primary connection. Returns `true` when a cached
+    /// writer was actually closed. An in-use writer is never stolen; callers
+    /// invoke this only at a between-batches boundary where `InUse` would be a
+    /// programming error rather than a state to race.
+    pub(crate) fn close_idle_cached_ephemeral_writer(&self) -> bool {
+        let cached_writer = {
+            let mut cached = self.cached_ephemeral_writer.lock();
+            match std::mem::replace(&mut *cached, CachedEphemeralWriter::Uninitialized) {
+                CachedEphemeralWriter::Cached(conn) => Some(conn),
+                state => {
+                    *cached = state;
+                    None
+                }
+            }
+        };
+        let Some(mut cached_writer) = cached_writer else {
+            return false;
+        };
+        cached_writer.conn.close_best_effort_in_place();
+        true
+    }
+
     fn cached_agent_id(&self, key: &EnsuredAgentKey) -> Option<i64> {
         self.ensured_agents.lock().get(key).copied()
     }
@@ -5269,8 +5305,13 @@ impl FrankenStorage {
         timeout: Duration,
     ) -> Result<Self> {
         let path_str = path.to_string_lossy().to_string();
-        let _doctor_guard = acquire_existing_doctor_mutation_db_open_guard(path, timeout)?;
+        // The caller supplies one end-to-end admission/open budget. Starting
+        // the deadline after the doctor guard was acquired allowed a busy
+        // repair lock and a busy database open to each consume `timeout`, so
+        // `search --no-maintenance` could block for nearly twice its declared
+        // strict-open bound.
         let deadline = Instant::now() + timeout;
+        let _doctor_guard = acquire_existing_doctor_mutation_db_open_guard(path, timeout)?;
         let mut backoff = Duration::from_millis(4);
         let conn = loop {
             match open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -5743,6 +5784,23 @@ impl FrankenStorage {
     pub(crate) fn mark_index_writer_busy_timeout_ms(&self, timeout_ms: u64) {
         self.index_writer_busy_timeout_ms
             .store(timeout_ms, Ordering::Relaxed);
+    }
+
+    pub(crate) fn bulk_single_connection_enabled(&self) -> bool {
+        self.bulk_single_connection.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn enable_bulk_single_connection(&self) {
+        self.bulk_single_connection.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn bulk_checkpoint_retry_at_bytes(&self) -> u64 {
+        self.bulk_checkpoint_retry_at_bytes.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_bulk_checkpoint_retry_at_bytes(&self, retry_at_bytes: u64) {
+        self.bulk_checkpoint_retry_at_bytes
+            .store(retry_at_bytes, Ordering::Relaxed);
     }
 
     /// Open database with migration, backing up if schema is incompatible.

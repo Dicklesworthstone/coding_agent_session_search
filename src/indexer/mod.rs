@@ -10747,7 +10747,7 @@ pub(crate) fn lexical_storage_fingerprint_for_db(db_path: &Path) -> Result<Strin
 /// opener. Used by strict read-only search so a dirty WAL or duplicate schema
 /// is surfaced rather than repaired as a side effect of freshness validation.
 pub(crate) fn lexical_storage_fingerprint_for_db_strict(db_path: &Path) -> Result<String> {
-    let mut storage = FrankenStorage::open_strict_readonly(db_path).with_context(|| {
+    let storage = FrankenStorage::open_strict_readonly(db_path).with_context(|| {
         format!(
             "strictly opening readonly storage to compute lexical fingerprint for {}",
             db_path.display()
@@ -10755,7 +10755,12 @@ pub(crate) fn lexical_storage_fingerprint_for_db_strict(db_path: &Path) -> Resul
     })?;
     let total_conversations = count_total_conversations_exact(&storage)?;
     let fingerprint = lexical_rebuild_content_fingerprint(&storage, total_conversations)?;
-    storage.close_best_effort_in_place();
+    storage.close_without_checkpoint().with_context(|| {
+        format!(
+            "closing strict readonly storage without checkpoint for {}",
+            db_path.display()
+        )
+    })?;
     Ok(fingerprint)
 }
 
@@ -16011,6 +16016,52 @@ enum FinalWalCheckpointOutcome {
     },
 }
 
+/// Outcome of the separately supervised checkpoint attempted immediately
+/// before a watchdog-forced process exit.
+#[derive(Debug)]
+enum AbortWalCheckpointAttempt {
+    Finished(Result<FinalWalCheckpointOutcome, String>),
+    TimedOut,
+    WorkerUnavailable(String),
+}
+
+const ABORT_WAL_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run the pre-abort checkpoint on a disposable worker and wait only for the
+/// supplied deadline. The watchdog is supervising a process whose indexer
+/// thread is already proven wedged; running another database open/checkpoint
+/// synchronously on the watchdog thread can block behind that same owner and
+/// defeat the promised bounded exit.
+fn run_bounded_abort_wal_checkpoint<F>(
+    db_path: PathBuf,
+    timeout: Duration,
+    checkpoint: F,
+) -> AbortWalCheckpointAttempt
+where
+    F: FnOnce(&Path) -> Result<FinalWalCheckpointOutcome> + Send + 'static,
+{
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let _worker = match std::thread::Builder::new()
+        .name("cass-abort-wal-checkpoint".to_string())
+        .spawn(move || {
+            let result = checkpoint(&db_path).map_err(|err| format!("{err:#}"));
+            let _ = result_tx.send(result);
+        }) {
+        Ok(worker) => worker,
+        Err(err) => return AbortWalCheckpointAttempt::WorkerUnavailable(err.to_string()),
+    };
+
+    match result_rx.recv_timeout(timeout) {
+        Ok(result) => AbortWalCheckpointAttempt::Finished(result),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => AbortWalCheckpointAttempt::TimedOut,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            AbortWalCheckpointAttempt::WorkerUnavailable(
+                "checkpoint worker exited without reporting an outcome".to_string(),
+            )
+        }
+    }
+}
+
 /// Classify a `wal_checkpoint` status row `(busy, log_frames, checkpointed)`.
 ///
 /// A checkpoint only counts as [`FinalWalCheckpointOutcome::Completed`] when
@@ -16045,10 +16096,14 @@ fn classify_final_wal_checkpoint(
 /// canonical DB file (the wedged storage handle's workers are parked, but the
 /// file itself is checkpointable through a new connection) and runs
 /// `wal_checkpoint(TRUNCATE)` so the post-abort DB is recoverable by stock
-/// SQLite. Everything is best-effort: any failure is logged and swallowed so
-/// the abort still proceeds. Stale index-run locks are already reaped on the
-/// next startup by `read_search_maintenance_snapshot` (flock-based), so this
-/// focuses on the WAL.
+/// SQLite. The fresh checkpoint itself is supervised from a disposable thread
+/// and gets only [`ABORT_WAL_CHECKPOINT_TIMEOUT`]: the still-live wedged writer
+/// can otherwise block the fresh open/checkpoint indefinitely and turn the
+/// watchdog's promised exit into another hang. Everything is best-effort; a
+/// failure or timeout is logged and swallowed so the abort still proceeds.
+/// Stale index-run locks are already reaped on the next startup by
+/// `read_search_maintenance_snapshot` (flock-based), so this focuses on the
+/// WAL.
 ///
 /// #321: the abort races the still-running `run_index` thread, which holds the
 /// canonical storage handle open while it performs its own slow finalize
@@ -16062,18 +16117,22 @@ pub fn best_effort_abort_wal_checkpoint(data_dir: &Path) {
     if !db_path.exists() {
         return;
     }
-    match run_final_wal_checkpoint(&db_path, "stall abort") {
-        Ok(FinalWalCheckpointOutcome::Completed) => {
+    match run_bounded_abort_wal_checkpoint(
+        db_path.clone(),
+        ABORT_WAL_CHECKPOINT_TIMEOUT,
+        |path| run_final_wal_checkpoint(path, "stall abort"),
+    ) {
+        AbortWalCheckpointAttempt::Finished(Ok(FinalWalCheckpointOutcome::Completed)) => {
             tracing::info!(
                 db_path = %db_path.display(),
                 "checkpointed canonical WAL before stall abort (#296)"
             );
         }
-        Ok(FinalWalCheckpointOutcome::Blocked {
+        AbortWalCheckpointAttempt::Finished(Ok(FinalWalCheckpointOutcome::Blocked {
             busy,
             log_frames,
             checkpointed_frames,
-        }) => {
+        })) => {
             tracing::warn!(
                 db_path = %db_path.display(),
                 busy,
@@ -16085,11 +16144,25 @@ pub fn best_effort_abort_wal_checkpoint(data_dir: &Path) {
                  checkpoints it (#296/#321)"
             );
         }
-        Err(err) => {
+        AbortWalCheckpointAttempt::Finished(Err(error)) => {
             tracing::warn!(
                 db_path = %db_path.display(),
-                error = %err,
+                %error,
                 "best-effort WAL checkpoint before stall abort failed; the WAL may remain uncheckpointed until the next clean run"
+            );
+        }
+        AbortWalCheckpointAttempt::TimedOut => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                timeout_ms = ABORT_WAL_CHECKPOINT_TIMEOUT.as_millis(),
+                "best-effort WAL checkpoint before stall abort exceeded its deadline; proceeding with the bounded exit and preserving the WAL for recovery"
+            );
+        }
+        AbortWalCheckpointAttempt::WorkerUnavailable(error) => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                %error,
+                "best-effort WAL checkpoint worker was unavailable before stall abort; proceeding with the bounded exit"
             );
         }
     }
@@ -41579,6 +41652,29 @@ mod tests {
         let _ = conn.query("PRAGMA quick_check;");
         conn.close().ok();
         Ok(())
+    }
+
+    /// #422: a watchdog-confirmed wedge must still terminate even when the
+    /// fresh checkpoint attempt blocks behind the wedged writer. Before the
+    /// checkpoint was separately supervised, this pre-exit cleanup could
+    /// itself hang forever and nullify the watchdog's abort guarantee.
+    #[test]
+    fn abort_wal_checkpoint_wait_is_bounded_when_the_worker_blocks() {
+        let started = Instant::now();
+        let attempt = run_bounded_abort_wal_checkpoint(
+            PathBuf::from("unused-by-planted-blocking-checkpoint"),
+            Duration::from_millis(5),
+            |_| {
+                std::thread::sleep(Duration::from_secs(1));
+                Ok(FinalWalCheckpointOutcome::Completed)
+            },
+        );
+
+        assert!(matches!(attempt, AbortWalCheckpointAttempt::TimedOut));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "checkpoint supervision must return at its own deadline, not wait for the blocked worker"
+        );
     }
 
     /// #321: a `wal_checkpoint(TRUNCATE)` that SQLite reports as blocked

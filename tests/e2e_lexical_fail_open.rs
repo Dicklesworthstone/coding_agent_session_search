@@ -54,7 +54,10 @@ fn seed_codex_session(codex_home: &std::path::Path, filename: &str, keyword: &st
 #[derive(Debug, PartialEq, Eq)]
 enum DataTreeEntry {
     Directory,
-    File(Vec<u8>),
+    File {
+        size_bytes: usize,
+        digest: blake3::Hash,
+    },
     Symlink(PathBuf),
 }
 
@@ -82,9 +85,13 @@ fn data_tree_snapshot(root: &Path) -> BTreeMap<PathBuf, DataTreeEntry> {
                     panic!("read symlink {}: {err}", entry.path().display())
                 }))
             } else {
-                DataTreeEntry::File(fs::read(entry.path()).unwrap_or_else(|err| {
+                let bytes = fs::read(entry.path()).unwrap_or_else(|err| {
                     panic!("read data-tree file {}: {err}", entry.path().display())
-                }))
+                });
+                DataTreeEntry::File {
+                    size_bytes: bytes.len(),
+                    digest: blake3::hash(&bytes),
+                }
             };
             (relative, value)
         })
@@ -95,13 +102,48 @@ fn run_fresh_index(home: &Path, data_dir: &Path) {
     let mut index = cass_cmd(home);
     index
         .args(["index", "--full", "--json", "--data-dir"])
-        .arg(data_dir);
+        .arg(data_dir)
+        .timeout(Duration::from_secs(120));
     let index_output = index.output().expect("run cass index --full");
     assert!(
         index_output.status.success(),
         "cass index --full must succeed on the seeded corpus. stdout: {} stderr: {}",
         String::from_utf8_lossy(&index_output.stdout),
         String::from_utf8_lossy(&index_output.stderr)
+    );
+}
+
+fn run_forced_full_index(home: &Path, data_dir: &Path) {
+    let mut index = cass_cmd(home);
+    index
+        .args([
+            "index",
+            "--full",
+            "--force-rebuild",
+            "--json",
+            "--data-dir",
+        ])
+        .arg(data_dir)
+        .timeout(Duration::from_secs(120));
+    let output = index
+        .output()
+        .expect("run cass index --full --force-rebuild");
+    assert!(
+        output.status.success(),
+        "forced full rebuild must succeed on the seeded corpus. stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let checkpoint = lexical_checkpoint(data_dir);
+    assert_eq!(
+        checkpoint.get("completed").and_then(Value::as_bool),
+        Some(true),
+        "a successful forced full rebuild must leave a completed lexical checkpoint"
+    );
+    let index_path = coding_agent_search::search::tantivy::expected_index_dir(data_dir);
+    assert!(
+        coding_agent_search::search::tantivy::searchable_index_exists(&index_path),
+        "a successful forced full rebuild must leave a readable lexical generation"
     );
 }
 
@@ -327,6 +369,7 @@ fn no_maintenance_lexical_search_is_byte_stable_across_the_real_cli_path() {
         "nomaintenancebyteprobe immutable archive proof",
     );
     run_fresh_index(home, &data_dir);
+    run_forced_full_index(home, &data_dir);
 
     let before = data_tree_snapshot(&data_dir);
     let mut search = cass_cmd(home);
@@ -382,6 +425,82 @@ fn no_maintenance_lexical_search_is_byte_stable_across_the_real_cli_path() {
         before,
         data_tree_snapshot(&data_dir),
         "search --no-maintenance must not add, remove, or change any data-dir directory, file, symlink, SQLite sidecar, checkpoint, lock, or search artifact"
+    );
+}
+
+#[test]
+fn no_maintenance_hybrid_search_with_semantic_assets_is_byte_stable() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_no_maintenance_hybrid_data");
+    fs::create_dir_all(&data_dir).unwrap();
+
+    for idx in 1..=3 {
+        seed_codex_session(
+            &codex_home,
+            &format!("rollout-no-maintenance-hybrid-{idx:02}.jsonl"),
+            &format!("nomaintenancehybridprobe semantic archive proof {idx}"),
+        );
+    }
+    run_fresh_index(home, &data_dir);
+    build_hash_semantic_assets(&data_dir, true);
+
+    let before = data_tree_snapshot(&data_dir);
+    let mut search = cass_cmd(home);
+    search
+        .args([
+            "search",
+            "nomaintenancehybridprobe",
+            "--json",
+            "--robot-meta",
+            "--mode",
+            "hybrid",
+            "--model",
+            "hash",
+            "--no-maintenance",
+            "--limit",
+            "10",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .timeout(Duration::from_secs(20));
+    let output = search
+        .output()
+        .expect("run real strict hash-hybrid search subprocess");
+    assert!(
+        output.status.success(),
+        "strict hash-hybrid search must succeed. stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
+        panic!(
+            "strict hash-hybrid search output must be JSON: {err}\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    assert!(
+        payload
+            .get("hits")
+            .and_then(Value::as_array)
+            .is_some_and(|hits| !hits.is_empty()),
+        "strict hash-hybrid search needs a positive matching hit: {payload}"
+    );
+    let meta = payload
+        .get("_meta")
+        .unwrap_or_else(|| panic!("strict hash-hybrid search needs robot metadata: {payload}"));
+    assert_eq!(meta.get("search_mode").and_then(Value::as_str), Some("hybrid"));
+    assert_eq!(
+        meta.get("semantic_refinement").and_then(Value::as_bool),
+        Some(true),
+        "the test must exercise live semantic DB hydration, not lexical fallback"
+    );
+    assert_eq!(
+        before,
+        data_tree_snapshot(&data_dir),
+        "semantic search --no-maintenance must leave every data-dir byte and path unchanged"
     );
 }
 
