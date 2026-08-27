@@ -378,6 +378,17 @@ struct SearchLoopStats {
 #[test]
 #[serial]
 fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() {
+    let sqlite3_available = std::process::Command::new("sqlite3")
+        .arg("-version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !sqlite3_available {
+        eprintln!(
+            "skipping duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes: \
+             duplicate sqlite_master repair requires the sqlite3 CLI"
+        );
+        return;
+    }
     let tracker = tracker_for("duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes");
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();

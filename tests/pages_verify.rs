@@ -1,7 +1,11 @@
 use assert_cmd::cargo::cargo_bin_cmd;
+use coding_agent_search::pages::bundle::BundleBuilder;
+use coding_agent_search::pages::encrypt::EncryptionEngine;
 use serde_json::Value;
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use tempfile::TempDir;
 
 fn fixture_root(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -9,9 +13,32 @@ fn fixture_root(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn build_current_valid_bundle() -> (TempDir, PathBuf) {
+    let temp = TempDir::new().expect("create valid bundle tempdir");
+    let encrypted_dir = temp.path().join("encrypted");
+    let bundle_dir = temp.path().join("bundle");
+    fs::create_dir_all(&encrypted_dir).expect("create encrypted fixture directory");
+
+    let input = temp.path().join("input.db");
+    fs::write(&input, b"pages verifier integration fixture")
+        .expect("write verifier source fixture");
+    let mut engine = EncryptionEngine::default();
+    engine
+        .add_password_slot("test-password")
+        .expect("add verifier fixture password slot");
+    engine
+        .encrypt_file(&input, &encrypted_dir, |_, _| {})
+        .expect("encrypt verifier source fixture");
+
+    let result = BundleBuilder::new()
+        .build(&encrypted_dir, &bundle_dir, |_, _| {})
+        .expect("build current valid Pages bundle");
+    (temp, result.site_dir)
+}
+
 #[test]
 fn test_pages_verify_valid_bundle_json() {
-    let fixture = fixture_root("valid");
+    let (_temp, fixture) = build_current_valid_bundle();
 
     let output = cargo_bin_cmd!("cass")
         .args(["pages", "--verify"])
@@ -21,7 +48,12 @@ fn test_pages_verify_valid_bundle_json() {
         .output()
         .expect("run cass pages --verify (valid)");
 
-    assert!(output.status.success(), "verify should succeed");
+    assert!(
+        output.status.success(),
+        "verify should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let json: Value = serde_json::from_slice(&output.stdout).expect("valid JSON output");
     assert_eq!(json.get("status").and_then(Value::as_str), Some("valid"));
@@ -174,7 +206,12 @@ fn test_attachment_object_urls_are_cached_per_mime_type() {
     "#;
 
     let output = Command::new("node")
-        .args(["--input-type=module", "--eval", script])
+        .args([
+            "--experimental-default-type=module",
+            "--input-type=module",
+            "--eval",
+            script,
+        ])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .expect("run node module assertions");

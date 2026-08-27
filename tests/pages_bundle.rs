@@ -30,7 +30,12 @@ mod tests {
 
     fn run_node_module_assertions(script: &str) -> Result<()> {
         let output = Command::new("node")
-            .args(["--input-type=module", "--eval", script])
+            .args([
+                "--experimental-default-type=module",
+                "--input-type=module",
+                "--eval",
+                script,
+            ])
             .current_dir(env!("CARGO_MANIFEST_DIR"))
             .output()?;
 

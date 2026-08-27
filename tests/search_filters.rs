@@ -95,14 +95,17 @@ fn time_filter_respects_since_until() {
 
     // Three conversations at different times
     let conv_old = util::ConversationFixtureBuilder::new("tester")
+        .source_path(dir.path().join("old.jsonl"))
         .base_ts(1_700_000_000_000) // early
         .with_content(0, "time_term one")
         .build_normalized();
     let conv_mid = util::ConversationFixtureBuilder::new("tester")
+        .source_path(dir.path().join("mid.jsonl"))
         .base_ts(1_800_000_000_000) // middle
         .with_content(0, "time_term two")
         .build_normalized();
     let conv_new = util::ConversationFixtureBuilder::new("tester")
+        .source_path(dir.path().join("new.jsonl"))
         .base_ts(1_900_000_000_000) // latest
         .with_content(0, "time_term three")
         .build_normalized();

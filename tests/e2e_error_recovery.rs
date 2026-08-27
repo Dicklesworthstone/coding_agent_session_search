@@ -709,10 +709,8 @@ fn test_permission_denied_export_directory() {
 
     // Phase 4: Verify appropriate error
     let start = tracker.start("verify_error", Some("Verify permission error is clear"));
-    let err_msg = result
-        .expect_err("Export to read-only directory should fail")
-        .to_string()
-        .to_lowercase();
+    let error = result.expect_err("Export to read-only directory should fail");
+    let err_msg = format!("{error:#}").to_lowercase();
     // Error message may vary by platform but should indicate write failure
     assert!(
         err_msg.contains("permission")

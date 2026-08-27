@@ -20,7 +20,7 @@ use coding_agent_search::pages::errors::{
 };
 use std::fs;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
@@ -34,6 +34,18 @@ const TEST_RECOVERY_SECRET: &[u8] = b"test-recovery-secret-32-bytes!!";
 // =============================================================================
 // Helper Functions
 // =============================================================================
+
+fn run_node_module_assertions(script: &str) -> std::io::Result<Output> {
+    Command::new("node")
+        .args([
+            "--experimental-default-type=module",
+            "--input-type=module",
+            "--eval",
+            script,
+        ])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+}
 
 /// Create a test archive with password encryption.
 fn create_test_archive(temp_dir: &Path, password: &str) -> std::path::PathBuf {
@@ -1002,11 +1014,8 @@ fn browser_storage_clear_reports_partial_failures_and_continues_cleanup() {
         }
     "#;
 
-    let output = Command::new("node")
-        .args(["--input-type=module", "--eval", script])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .expect("run browser storage clear assertions with node");
+    let output =
+        run_node_module_assertions(script).expect("run browser storage clear assertions with node");
 
     assert!(
         output.status.success(),
@@ -1192,10 +1201,7 @@ fn browser_storage_fallback_and_migration_preserve_logical_write_order() {
         }
     "#;
 
-    let output = Command::new("node")
-        .args(["--input-type=module", "--eval", script])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
+    let output = run_node_module_assertions(script)
         .expect("run browser storage fallback and migration assertions with node");
 
     assert!(
@@ -1341,11 +1347,8 @@ fn browser_opfs_cleanup_is_scope_bound_and_truthful() {
         }
     "#;
 
-    let output = Command::new("node")
-        .args(["--input-type=module", "--eval", script])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .expect("run scoped OPFS cleanup assertions with node");
+    let output =
+        run_node_module_assertions(script).expect("run scoped OPFS cleanup assertions with node");
 
     assert!(
         output.status.success(),
@@ -1484,10 +1487,7 @@ fn browser_cache_and_registration_cleanup_are_scope_bound() {
         }
     "#;
 
-    let output = Command::new("node")
-        .args(["--input-type=module", "--eval", script])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
+    let output = run_node_module_assertions(script)
         .expect("run scoped browser cache cleanup assertions with node");
 
     assert!(
@@ -1625,10 +1625,7 @@ fn browser_session_teardown_survives_partial_storage_failures() {
         }
     "#;
 
-    let output = Command::new("node")
-        .args(["--input-type=module", "--eval", script])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
+    let output = run_node_module_assertions(script)
         .expect("run browser session teardown assertions with node");
 
     assert!(
@@ -1885,10 +1882,7 @@ fn browser_session_rejects_invalid_or_uncommitted_state() {
         }
     "#;
 
-    let output = Command::new("node")
-        .args(["--input-type=module", "--eval", script])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
+    let output = run_node_module_assertions(script)
         .expect("run invalid browser session assertions with node");
 
     assert!(
