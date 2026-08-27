@@ -86488,7 +86488,10 @@ fn response_schema_state_database() -> serde_json::Value {
             "open_error": { "type": ["string", "null"] },
             "open_retryable": { "type": "boolean" },
             "counts_skipped": { "type": "boolean" },
-            "open_skipped": { "type": "boolean" }
+            "open_skipped": { "type": "boolean" },
+            "integrity": { "type": "string" },
+            "integrity_detail": { "type": ["string", "null"] },
+            "integrity_hint": { "type": ["string", "null"] }
         }
     })
 }
@@ -90258,6 +90261,8 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
             "properties": {
                 "version": { "type": "string" },
                 "crate_version": { "type": "string" },
+                "build_commit": { "type": "string" },
+                "build_commit_date": { "type": "string" },
                 "api_version": { "type": "integer" },
                 "contract_version": { "type": "string" },
                 "features": { "type": "array", "items": { "type": "string" } },
@@ -90375,6 +90380,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
             "type": "object",
             "properties": {
                 "crate_version": { "type": "string" },
+                "build_commit": { "type": "string" },
                 "api_version": { "type": "integer" },
                 "contract_version": { "type": "string" }
             }
@@ -90614,6 +90620,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
             "properties": {
                 "status": { "type": "string" },
                 "healthy": { "type": "boolean" },
+                "exit_policy": { "type": "string" },
                 "health_level": { "type": "string" },
                 "initialized": { "type": "boolean" },
                 "explanation": { "type": ["string", "null"] },

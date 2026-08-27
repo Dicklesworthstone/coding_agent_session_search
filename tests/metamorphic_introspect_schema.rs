@@ -170,16 +170,23 @@ fn schema_allows_dynamic_properties(schema: &Value) -> bool {
     }
 }
 
-fn assert_runtime_shape_covered(surface: &str, path: &str, runtime: &Value, advertised: &Value) {
+fn collect_runtime_shape_gaps(
+    surface: &str,
+    path: &str,
+    runtime: &Value,
+    advertised: &Value,
+    gaps: &mut Vec<String>,
+) {
     let runtime_type = runtime
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
-    assert!(
-        schema_allows_type(advertised, runtime_type),
-        "{surface}{path}: runtime type {runtime_type:?} is not allowed by introspect schema {}",
-        serde_json::to_string_pretty(advertised).expect("schema pretty-print"),
-    );
+    if !schema_allows_type(advertised, runtime_type) {
+        gaps.push(format!(
+            "{surface}{path}: runtime type {runtime_type:?} is not allowed by introspect schema {advertised}"
+        ));
+        return;
+    }
 
     match runtime_type {
         "object" => {
@@ -190,17 +197,27 @@ fn assert_runtime_shape_covered(surface: &str, path: &str, runtime: &Value, adve
             if advertised_props.is_none() && schema_allows_dynamic_properties(advertised) {
                 return;
             }
-            let advertised_props = advertised_props.unwrap_or_else(|| {
-                panic!(
+            let Some(advertised_props) = advertised_props else {
+                gaps.push(format!(
                     "{surface}{path}: runtime object has properties but introspect schema has none"
-                )
-            });
+                ));
+                return;
+            };
             for (key, runtime_child) in runtime_props {
                 let child_path = format!("{path}.{key}");
-                let advertised_child = advertised_props.get(key).unwrap_or_else(|| {
-                    panic!("{surface}{child_path}: runtime field is missing from introspect schema")
-                });
-                assert_runtime_shape_covered(surface, &child_path, runtime_child, advertised_child);
+                if let Some(advertised_child) = advertised_props.get(key) {
+                    collect_runtime_shape_gaps(
+                        surface,
+                        &child_path,
+                        runtime_child,
+                        advertised_child,
+                        gaps,
+                    );
+                } else {
+                    gaps.push(format!(
+                        "{surface}{child_path}: runtime field is missing from introspect schema"
+                    ));
+                }
             }
         }
         "array" => {
@@ -214,15 +231,17 @@ fn assert_runtime_shape_covered(surface: &str, path: &str, runtime: &Value, adve
             {
                 return;
             }
-            let advertised_items = advertised
-                .get("items")
-                .unwrap_or_else(|| panic!("{surface}{path}: array schema missing items"));
-            assert_runtime_shape_covered(
-                surface,
-                &format!("{path}[]"),
-                runtime_items,
-                advertised_items,
-            );
+            if let Some(advertised_items) = advertised.get("items") {
+                collect_runtime_shape_gaps(
+                    surface,
+                    &format!("{path}[]"),
+                    runtime_items,
+                    advertised_items,
+                    gaps,
+                );
+            } else {
+                gaps.push(format!("{surface}{path}: array schema missing items"));
+            }
         }
         _ => {}
     }
@@ -402,6 +421,7 @@ fn introspect_response_schemas_cover_runtime_json_shapes() -> Result<(), Box<dyn
     let response_schemas = introspect["response_schemas"]
         .as_object()
         .expect("introspect.response_schemas is an object");
+    let mut gaps = Vec::new();
 
     for (surface, advertised_schema) in response_schemas {
         let Some((args, expect_status)) = surface_command(surface, test_home.path(), &demo_data)
@@ -413,7 +433,12 @@ fn introspect_response_schemas_cover_runtime_json_shapes() -> Result<(), Box<dyn
         };
         let payload = run_json(test_home.path(), &args, expect_status);
         let runtime_schema = json_value_schema(&payload);
-        assert_runtime_shape_covered(surface, "$", &runtime_schema, advertised_schema);
+        collect_runtime_shape_gaps(surface, "$", &runtime_schema, advertised_schema, &mut gaps);
     }
+    assert!(
+        gaps.is_empty(),
+        "runtime payloads are not covered by introspect schemas:\n{}",
+        gaps.join("\n")
+    );
     Ok(())
 }

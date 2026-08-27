@@ -457,6 +457,10 @@ fn normalize_live_robot_values(value: &mut Value) {
                 }
 
                 match key.as_str() {
+                    "last_snapshot" | "last_reason" => {
+                        *child = json!("[LIVE_SAMPLE]");
+                        continue;
+                    }
                     "current_capacity_pct" => {
                         *child = json!(100);
                         continue;
@@ -565,6 +569,14 @@ fn live_value_scrubbing_preserves_response_schema_properties() {
                     },
                     "semantic_batchers": {
                         "type": "integer"
+                    },
+                    "last_snapshot": {
+                        "type": ["object", "null"],
+                        "properties": {
+                            "load_per_core": {
+                                "type": "number"
+                            }
+                        }
                     }
                 }
             }
@@ -588,6 +600,12 @@ fn live_value_scrubbing_preserves_response_schema_properties() {
                     "semantic_batchers": 99,
                     "steady_batch_fetch_conversations": 768,
                     "startup_batch_fetch_conversations": 16
+                },
+                "watchdog": {
+                    "last_snapshot": {
+                        "load_per_core": 7.5
+                    },
+                    "last_reason": null
                 }
             }
         }
@@ -604,6 +622,11 @@ fn live_value_scrubbing_preserves_response_schema_properties() {
     assert_eq!(
         scrubbed["response_schemas"]["health"]["properties"]["semantic_batchers"]["type"],
         "integer"
+    );
+    assert_eq!(
+        scrubbed["response_schemas"]["health"]["properties"]["last_snapshot"]["properties"]["load_per_core"]
+            ["type"],
+        "number"
     );
     assert_eq!(
         scrubbed["schema_fragment"]["properties"]["logical_cpus"]["type"],
@@ -628,6 +651,14 @@ fn live_value_scrubbing_preserves_response_schema_properties() {
     assert_eq!(
         scrubbed["state"]["resource_policy"]["advisory_budgets"]["startup_batch_fetch_conversations"],
         32
+    );
+    assert_eq!(
+        scrubbed["state"]["resource_policy"]["watchdog"]["last_snapshot"],
+        "[LIVE_SAMPLE]"
+    );
+    assert_eq!(
+        scrubbed["state"]["resource_policy"]["watchdog"]["last_reason"],
+        "[LIVE_SAMPLE]"
     );
 }
 
@@ -867,37 +898,12 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
             .to_string();
     }
 
-    // 8. `last_snapshot` + `last_reason` in health --json vary between
-    // `null` (sampler has not yet fired) and a populated object/string
-    // (sampler has fired at least once) depending on timing. The content
-    // of the populated form already has its inner floats scrubbed by
-    // rule 6; the remaining difference is whether the sampler fired. Fold
-    // both forms to a single sentinel so the golden does not race the
-    // sampler timer. We match `null`, a string value, or a `{...}` object
-    // by consuming everything up to the next unescaped `"..."` key at the
-    // same indentation — kept narrow so the scrub only fires on the
-    // health watchdog block.
-    //
-    // The object form is multi-line pretty-printed JSON; `(?s)` enables
-    // `.` to match newlines. Non-greedy match `.*?` stops at the first
-    // closing `}` on its own line at the correct indent. We rely on the
-    // outer scrub-then-compare discipline: any false-positive collapse
-    // would still fail the golden because the sentinel would differ
-    // between runs — the goal is deterministic scrubbing, not semantic
-    // parsing.
-    let last_snapshot_obj_re = regex::Regex::new(r#"(?s)"last_snapshot"\s*:\s*\{[^}]*\}"#).unwrap();
-    out = last_snapshot_obj_re
-        .replace_all(&out, r#""last_snapshot": "[LIVE_SAMPLE]""#)
-        .to_string();
-    let last_snapshot_null_re = regex::Regex::new(r#""last_snapshot"\s*:\s*null"#).unwrap();
-    out = last_snapshot_null_re
-        .replace_all(&out, r#""last_snapshot": "[LIVE_SAMPLE]""#)
-        .to_string();
-
-    let last_reason_re = regex::Regex::new(r#""last_reason"\s*:\s*(null|"[^"]*")"#).unwrap();
-    out = last_reason_re
-        .replace_all(&out, r#""last_reason": "[LIVE_SAMPLE]""#)
-        .to_string();
+    // 8. `last_snapshot` + `last_reason` in health --json vary depending on
+    // whether the responsiveness sampler has fired. They are normalized
+    // structurally in `normalize_live_robot_values` below. Keeping this out
+    // of the regex pass is essential: introspection embeds a nested JSON
+    // Schema named `last_snapshot`, and a brace-matching regex can truncate
+    // that schema into invalid JSON.
 
     // Resource policy status reports include host-live CPU and memory budgets.
     // The shape is contractual; the sampled worker/byte counts are not.
@@ -1014,6 +1020,9 @@ fn assert_golden(name: &str, actual: &str) {
         .join("tests")
         .join("golden")
         .join(name);
+
+    serde_json::from_str::<Value>(actual)
+        .unwrap_or_else(|err| panic!("generated golden {name} is not valid JSON: {err}"));
 
     if std::env::var("UPDATE_GOLDENS").is_ok() {
         std::fs::create_dir_all(golden_path.parent().unwrap()).expect("create golden parent dir");

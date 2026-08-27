@@ -3927,6 +3927,9 @@
         "crate_version": {
           "type": "string"
         },
+        "build_commit": {
+          "type": "string"
+        },
         "api_version": {
           "type": "integer"
         },
@@ -3942,6 +3945,12 @@
           "type": "string"
         },
         "crate_version": {
+          "type": "string"
+        },
+        "build_commit": {
+          "type": "string"
+        },
+        "build_commit_date": {
           "type": "string"
         },
         "api_version": {
@@ -27607,6 +27616,9 @@
         "healthy": {
           "type": "boolean"
         },
+        "exit_policy": {
+          "type": "string"
+        },
         "health_level": {
           "type": "string"
         },
@@ -28699,7 +28711,18 @@
               "type": "boolean",
               "description": "True when CASS_RESPONSIVENESS_DISABLE pins capacity at 100%."
             },
-            "last_snapshot": "[LIVE_SAMPLE]",
+            "last_snapshot": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "load_per_core": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
                 "psi_cpu_some_avg10": {
                   "type": [
                     "number",
@@ -28929,6 +28952,21 @@
                 },
                 "open_skipped": {
                   "type": "boolean"
+                },
+                "integrity": {
+                  "type": "string"
+                },
+                "integrity_detail": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "integrity_hint": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 }
               }
             },
@@ -31335,6 +31373,21 @@
                     },
                     "open_skipped": {
                       "type": "boolean"
+                    },
+                    "integrity": {
+                      "type": "string"
+                    },
+                    "integrity_detail": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "integrity_hint": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   }
                 },
@@ -32403,6 +32456,21 @@
             },
             "open_skipped": {
               "type": "boolean"
+            },
+            "integrity": {
+              "type": "string"
+            },
+            "integrity_detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "integrity_hint": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "path": {
               "type": "string"
@@ -34442,6 +34510,21 @@
             "open_skipped": {
               "type": "boolean"
             },
+            "integrity": {
+              "type": "string"
+            },
+            "integrity_detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "integrity_hint": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "path": {
               "type": "string"
             }
@@ -36464,6 +36547,21 @@
                 },
                 "open_skipped": {
                   "type": "boolean"
+                },
+                "integrity": {
+                  "type": "string"
+                },
+                "integrity_detail": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "integrity_hint": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 }
               }
             },
