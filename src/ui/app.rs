@@ -27118,12 +27118,15 @@ mod tests {
         app.search_dirty_since = Some(Instant::now());
         app.search_input_started_at = Some(Instant::now());
         let _ = app.update(CassMsg::SearchRequested);
-        assert!(app.search_dirty_since.is_none());
-        assert!(app.search_input_started_at.is_none());
+        assert!(
+            app.search_dirty_since.is_none() && app.search_input_started_at.is_none(),
+            "search request should clear both debounce and latency input timestamps"
+        );
     }
 
     #[test]
-    fn latency_trace_preserves_first_input_while_debounce_tracks_latest_input() {
+    fn latency_trace_preserves_first_input_while_debounce_tracks_latest_input() -> anyhow::Result<()>
+    {
         let mut app = CassApp::default();
         let recorder = Arc::new(Mutex::new(TuiLatencyRecorder::new(PathBuf::from(
             "trace.json",
@@ -27137,21 +27140,34 @@ mod tests {
 
         let _ = app.update(CassMsg::QueryChanged("x".to_string()));
 
-        assert_eq!(app.search_input_started_at, Some(first_input));
-        assert!(app.search_dirty_since.is_some_and(|dirty| dirty > previous_dirty));
+        anyhow::ensure!(
+            app.search_input_started_at == Some(first_input),
+            "a later edit replaced the interaction's first-input timestamp"
+        );
+        anyhow::ensure!(
+            app.search_dirty_since
+                .is_some_and(|dirty| dirty > previous_dirty),
+            "a later edit did not advance the debounce timestamp"
+        );
 
         let _ = app.update(CassMsg::SearchRequested);
 
-        assert!(app.search_input_started_at.is_none());
-        assert!(app.search_dirty_since.is_none());
-        let trace = recorder.lock().expect("latency recorder lock");
-        assert_eq!(
+        anyhow::ensure!(
+            app.search_input_started_at.is_none() && app.search_dirty_since.is_none(),
+            "search request did not consume both input timestamps"
+        );
+        let trace = recorder
+            .lock()
+            .map_err(|_| anyhow::anyhow!("latency recorder lock poisoned"))?;
+        anyhow::ensure!(
             trace
                 .active
                 .get(&1)
-                .and_then(|sample| sample.input_started_at),
-            Some(first_input)
+                .and_then(|sample| sample.input_started_at)
+                == Some(first_input),
+            "latency trace did not retain the interaction's first input"
         );
+        Ok(())
     }
 
     #[test]

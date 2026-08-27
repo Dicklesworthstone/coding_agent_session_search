@@ -2525,13 +2525,8 @@ fn tui_typing_writes_latency_trace() -> Result<(), String> {
         }),
         "Did not observe the typed latency query in the rendered search field"
     );
-    let before_submit_len = captured.lock().expect("capture lock").len();
-    send_key_sequence(&mut *writer, b"\r");
-    thread::sleep(Duration::from_millis(120));
-    assert!(
-        wait_for_output_growth(&captured, before_submit_len, 24, Duration::from_secs(6)),
-        "Did not observe output growth after explicit query submission in latency PTY"
-    );
+    // Enter opens the selected startup hit by design. Exercise the live-search
+    // debounce instead so this flow measures typing-to-visible latency.
     if !wait_for_rendered_output(&captured, Duration::from_secs(8), |rendered| {
         rendered.contains("No results match your query")
     }) {
