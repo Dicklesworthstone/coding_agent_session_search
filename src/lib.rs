@@ -1,7 +1,7 @@
 // Index walks over parallel slices by a single counter; an iterator rewrite would
 // obscure the arithmetic without changing behaviour.
 #![allow(clippy::needless_range_loop)]
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 pub mod analytics;
 pub mod bakeoff;
@@ -77,6 +77,17 @@ pub mod ui;
 pub mod update_check;
 pub mod workflow_analytics;
 pub mod workflow_macros;
+
+/// Shut down synchronous bridge runtimes cached on the calling thread.
+///
+/// The CLI calls this after its command future completes so Windows tears down
+/// the runtimes before the CRT starts destroying thread-local storage.
+#[doc(hidden)]
+pub fn shutdown_thread_local_bridge_runtimes() -> bool {
+    let fsqlite_shutdown = franken_sync::shutdown_driver();
+    let quill_shutdown = search::quill_bridge::shutdown_driver();
+    fsqlite_shutdown && quill_shutdown
+}
 
 use crate::franken_sync::compat::{
     ConnectionExt, OpenFlags as FrankenOpenFlags, RowExt,
@@ -19955,7 +19966,7 @@ fn index_unsupported_quill_writer_admission_cli_error(chain: &str) -> CliError {
             "indexing is unsupported on this platform because Quill cannot acquire its cross-process writer lock: {chain}"
         ),
         hint: Some(
-            "This build cannot create or update the Quill lexical index on this platform. Use a supported Unix build, or update CASS after frankensearch#39 ships Windows writer admission. Retrying the same command will not help."
+            "This build cannot create or update the Quill lexical index on this platform. Use a supported Unix or Windows build; Windows support requires Frankensearch 0.4.1 or later. Retrying the same command will not help."
                 .to_string(),
         ),
         retryable: false,
@@ -27950,8 +27961,6 @@ fn run_cli_search(
 
             let embedder: Arc<dyn crate::search::embedder::Embedder> =
                 if semantic_opts.use_daemon && !prefer_hash && daemon_embedder_compatible {
-                    use crate::search::daemon_client::DaemonRetryConfig;
-
                     #[cfg(unix)]
                     {
                         let daemon = if semantic_opts.auto_spawn_daemon {
@@ -27966,7 +27975,8 @@ fn run_cli_search(
                                 &data_dir,
                             )
                         };
-                        let config = DaemonRetryConfig::from_env();
+                        let config =
+                            crate::search::daemon_client::DaemonRetryConfig::from_env();
                         match daemon {
                             Some(daemon) => match daemon.attestation_channel(&data_dir) {
                                 Ok((connection, verifier)) => {
@@ -28358,11 +28368,9 @@ fn run_cli_search(
         };
 
         let reranker: Option<Arc<dyn Reranker>> = if semantic_opts.use_daemon {
-            use crate::search::daemon_client::{DaemonFallbackReranker, DaemonRetryConfig};
-
             #[cfg(unix)]
             {
-                let config = DaemonRetryConfig::from_env();
+                let config = crate::search::daemon_client::DaemonRetryConfig::from_env();
                 let daemon = if semantic_opts.auto_spawn_daemon {
                     crate::daemon::client::connect_or_spawn_for_embedder(
                         FastEmbedder::embedder_id_static(),
@@ -28377,7 +28385,7 @@ fn run_cli_search(
                         Ok((connection, verifier)) => {
                             let daemon: Arc<dyn crate::search::daemon_client::DaemonClient> =
                                 daemon;
-                            match DaemonFallbackReranker::new_verified(
+                            match crate::search::daemon_client::DaemonFallbackReranker::new_verified(
                                 daemon,
                                 local_reranker.clone(),
                                 config,
@@ -96563,6 +96571,16 @@ fn validate_successful_index_artifacts(
     Ok(())
 }
 
+#[cfg(windows)]
+const WINDOWS_INDEX_WORKER_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
+
+fn index_worker_thread_builder() -> std::thread::Builder {
+    let builder = std::thread::Builder::new().name("cass-index-worker".to_string());
+    #[cfg(windows)]
+    let builder = builder.stack_size(WINDOWS_INDEX_WORKER_STACK_SIZE_BYTES);
+    builder
+}
+
 /// Run an incremental index pass before a TUI or Search invocation when the
 /// user passes `--refresh` (alias `--catch-up`). Mirrors `cass index` with
 /// `full=false`, `force_rebuild=false`, `watch=false`, `semantic=false` so it
@@ -96603,7 +96621,15 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
     // progress counters and emit plain-text status lines while it runs. We
     // move the whole opts struct (it contains the shared progress handle).
     let watchdog_data_dir = opts.data_dir.clone();
-    let index_handle = std::thread::spawn(move || indexer::run_index(opts, None));
+    let index_handle = match index_worker_thread_builder()
+        .spawn(move || indexer::run_index(opts, None))
+    {
+        Ok(handle) => handle,
+        Err(error) => {
+            eprintln!("Warning: failed to start the refresh index worker: {error}");
+            return;
+        }
+    };
 
     // Sentinels are `usize::MAX` so the first observed atomic values always
     // differ and trigger the first print. Using `0` for `last_total` would
@@ -98601,7 +98627,15 @@ fn run_index_with_data(
     let opts_clone = opts.clone();
     let previous_robot_trace_ingest =
         robot_trace_ingest.then(|| indexer::set_robot_trace_ingest_enabled(true));
-    let index_handle = std::thread::spawn(move || indexer::run_index(opts_clone, None));
+    let index_handle = index_worker_thread_builder()
+        .spawn(move || indexer::run_index(opts_clone, None))
+        .map_err(|error| CliError {
+            code: 9,
+            kind: CliErrorKind::Index.kind_str(),
+            message: format!("failed to start the index worker: {error}"),
+            hint: Some("Retry after reducing process or memory pressure.".to_string()),
+            retryable: true,
+        })?;
 
     // Poll and display progress while indexer runs
     if show_progress {

@@ -1252,6 +1252,20 @@ mod tests {
         }
     }
 
+    fn ensure_eq<T>(actual: T, expected: T, message: impl Into<String>) -> TestResult
+    where
+        T: std::fmt::Debug + PartialEq,
+    {
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(test_error(format!(
+                "{}: expected {expected:?}, got {actual:?}",
+                message.into()
+            )))
+        }
+    }
+
     fn write_test_lock_metadata(path: &Path, generation: Option<u64>) {
         let metadata = DaemonRunLockMetadata {
             pid: std::process::id(),

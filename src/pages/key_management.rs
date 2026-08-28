@@ -594,9 +594,13 @@ fn collect_key_publication_paths(
 fn allocate_key_mutation_staging_root(live_root: &Path) -> Result<PathBuf> {
     for _ in 0..64 {
         let path = random_key_mutation_sidecar_path(live_root, "staged");
-        let mut builder = std::fs::DirBuilder::new();
+        let builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
-        builder.mode(0o700);
+        let builder = {
+            let mut builder = builder;
+            builder.mode(0o700);
+            builder
+        };
         match builder.create(&path) {
             Ok(()) => {
                 #[cfg(unix)]

@@ -48,17 +48,18 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "fsqlite",
         manifest_package_field: Some("fsqlite"),
         // crates.io-only exact pin (established with the fsqlite 0.2.1
-        // migration, bead bo000; now at 0.3.8, which carries the asupersync
+        // migration, bead bo000; now at 0.3.11, which carries the asupersync
         // 0.4.3 runtime migration, the GH#333/GH#334 bug-fix wave, the
         // cass#393 namespace-sidecar st_dev repair, the 0.3.1
         // allocator/freelist/concurrent-writer correctness wave, and the
-        // later FTS5 correctness fixes).
+        // later FTS5 correctness fixes plus the GH#438 Windows sidecar-less
+        // read-only close repair shipped in 0.3.9).
         // Empty `expected_git` signals `validate_manifest_dependency_spec`
-        // to require a bare `=0.3.8` registry pin. Whole-family registry
+        // to require a bare `=0.3.11` registry pin. Whole-family registry
         // convergence is enforced by `validate_fsqlite_registry_pin`.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.8",
+        expected_version: "0.3.11",
         // `async-api` exposes frankensqlite::AsyncConnection, which
         // src/search/query.rs uses (as SearchSqliteConnection) for the
         // no-hit alternate-agent suggestions without a full storage open.
@@ -79,7 +80,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // Keep shared types on the identical registry release as the facade.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.8",
+        expected_version: "0.3.11",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -97,7 +98,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // Keep shared types on the identical registry release as the facade.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.8",
+        expected_version: "0.3.11",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -164,18 +165,19 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensearch",
         crate_package_name: "frankensearch",
         manifest_package_field: None,
-        // Registry pin (gh#416). 0.4.0 is the first crates.io release carrying
+        // Registry pin (gh#429). 0.4.1 adds native Windows Quill writer
+        // admission and atomic publication to the first crates.io line carrying
         // the pure-Rust `native` feature and the explicit `cass-compat` ->
         // `lexical-tantivy` foreign-index surface (which keeps CASS schema-v8
         // access independent from FrankenSearch's swappable generic lexical
         // backend — cass #308, bd-8nqz.5). Registry 0.3.2 was a stale
         // same-version twin of an older tree (no quill/cass-compat/native);
-        // the exact `=0.4.0` pin exists so resolution can never reach it.
+        // the exact `=0.4.1` pin exists so resolution can never reach it.
         // Empty `expected_git` signals `validate_manifest_dependency_spec`
         // to skip git/rev checks.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.4.0",
+        expected_version: "0.4.1",
         // cass #308: the ort/ONNX `fastembed` stack was removed; semantic
         // embedding + reranking are now pure-Rust via frankensearch's `native`
         // feature, kept always-on here (no AVX/ONNX static-init hazard, so no
@@ -303,6 +305,15 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-env-changed={STRICT_PATH_DEP_ENV}");
 
+    // MSVC reserves only 1 MiB for an executable's main thread by default.
+    // CASS's clap command graph and startup state exceed that in debug builds,
+    // causing even `cass --version` to abort before argument dispatch. Reserve
+    // virtual address space here for the actual binary; thread stacks remain
+    // independently bounded by their structured spawn sites.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:rustc-link-arg-bin=cass=/STACK:8388608");
+    }
+
     let manifest_dir = match env::var("CARGO_MANIFEST_DIR") {
         Ok(value) => PathBuf::from(value),
         Err(err) => fatal(format!(
@@ -419,7 +430,7 @@ fn validate_fsqlite_registry_pin(manifest_dir: &Path, manifest: &Value, packaged
     // The fsqlite engine family must resolve exclusively from crates.io at the
     // pinned release. This replaces the pre-0.2.1 [patch.crates-io] git-rev
     // override contract while keeping its purpose: no silent engine drift.
-    const EXPECTED_VERSION: &str = "0.3.8";
+    const EXPECTED_VERSION: &str = "0.3.11";
     const REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
     // 1. The former git source override must not quietly come back: no

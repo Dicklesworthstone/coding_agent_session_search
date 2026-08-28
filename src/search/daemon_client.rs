@@ -6,11 +6,11 @@
 
 use std::sync::Arc;
 
+use frankensearch::core::EmbeddingIdentityBundleV1;
 pub use frankensearch::{
     DaemonClient, DaemonConnectionIdentityV1, DaemonError, DaemonFallbackEmbedder,
     DaemonFallbackReranker, DaemonRetryConfig, NoopDaemonClient, PinnedDaemonVerifierV1,
 };
-use frankensearch::core::EmbeddingIdentityBundleV1;
 use frankensearch::{ModelCategory, ModelTier, SearchError, SearchResult, SyncEmbed};
 
 /// Local fallback whose advertised identity is pinned by the authenticated

@@ -13,8 +13,8 @@ use crate::search::embedder::{Embedder, EmbedderError, EmbedderResult};
 use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::fastembed_reranker::FastEmbedReranker;
 use crate::search::reranker::{Reranker, RerankerError, RerankerResult, rerank_texts};
-use frankensearch::core::EmbeddingIdentityBundleV1;
 use frankensearch::ModelCategory;
+use frankensearch::core::EmbeddingIdentityBundleV1;
 
 /// Model manager that handles lazy loading of embedder and reranker models.
 pub struct ModelManager {

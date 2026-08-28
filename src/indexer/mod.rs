@@ -27685,7 +27685,7 @@ pub fn apply_workspace_rewrite(conv: &mut NormalizedConversation, root: &ScanRoo
 
 pub mod persist {
     use super::{LexicalPopulationStrategy, lexical_population_strategy_requires_inline_tantivy};
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeMap, HashMap, HashSet};
     use std::ops::Range;
     use std::path::Path;
     use std::sync::Arc;
