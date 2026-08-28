@@ -3,8 +3,15 @@
 
 [build]
 rustflags = ["-Z", "threads=4"]
-# Use all available CPU cores for parallel compilation
-jobs = -1
+# NOTE: do NOT set `jobs` here. A repo .cargo/config.toml outranks
+# ~/.cargo/config.toml, so pinning it overrides whatever the host decided.
+# This file previously carried `jobs = -1` ("all cores minus one"); on a
+# 128-thread build host that is 127 parallel rustc, each forking a ~1GB
+# rust-lld. The same pattern wedged trj for hours on 2026-08-28 (202GB of
+# linkers, RAM and swap exhausted, 100% disk utilization). Parallelism is a
+# property of the MACHINE, not the project -- let the host set
+# CARGO_BUILD_JOBS (which outranks every config file) or its own
+# ~/.cargo/config.toml.
 
 [env]
 # fsqlite 0.3.x builds very large debug-mode futures; a single statement poll
