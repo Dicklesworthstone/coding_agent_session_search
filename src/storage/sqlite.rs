@@ -18260,30 +18260,6 @@ impl FrankenStorage {
         if let Some(heartbeat) = heartbeat {
             heartbeat();
         }
-        let total_messages: i64 = self
-            .conn
-            .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .with_context(|| "daily_stats phase=count_messages table=messages")?;
-        let message_metrics_rows: i64 = self
-            .conn
-            .query_row_map("SELECT COUNT(*) FROM message_metrics", fparams![], |row| {
-                row.get_typed(0)
-            })
-            .with_context(|| "daily_stats phase=count_messages table=message_metrics")?;
-        let use_message_metrics = total_messages > 0 && total_messages == message_metrics_rows;
-
-        tracing::info!(
-            target: "cass::perf::daily_stats",
-            total_messages,
-            message_metrics_rows,
-            use_message_metrics,
-            "daily_stats rebuild selected message source"
-        );
-        if let Some(heartbeat) = heartbeat {
-            heartbeat();
-        }
 
         // Build into a connection-local staging table and commit every bounded
         // aggregate batch. Holding one write transaction for the entire archive
@@ -18316,28 +18292,20 @@ impl FrankenStorage {
         let mut message_batch_count = 0_usize;
         let mut raw_entries_flushed = 0_usize;
         let mut expanded_entries_flushed = 0_usize;
-        let message_scan_sql = if use_message_metrics {
-            // GH #424 (third finding): the former `JOIN message_metrics` page
-            // cost ~8 s per call on frankensqlite 0.3.8 regardless of the
-            // conversation's size — the join was materialized before the
-            // index lookup applied — so the step ran for hours across a few
-            // hundred conversations. Page the keyset over `messages` alone
-            // (second column = message id) and resolve `content_chars` by
-            // primary-key point lookup below; content pages stay untouched.
-            "SELECT m.idx, m.id
+        // GH #424 (third finding): the former `JOIN message_metrics` page cost
+        // ~8 s per call on frankensqlite 0.3.8 regardless of conversation
+        // size, and replacing the JOIN with one point lookup per message still
+        // executed hundreds of thousands of avoidable statements. Canonical
+        // message content is the source of truth. Rust's `String::len()` and
+        // SQLite's BLOB length both count UTF-8 bytes, so the bounded single-
+        // table keyset preserves the existing `total_chars` contract without
+        // trusting a potentially stale derived `message_metrics` row.
+        let message_scan_sql = "SELECT m.idx, COALESCE(LENGTH(CAST(m.content AS BLOB)), 0)
              FROM messages m INDEXED BY sqlite_autoindex_messages_1
              WHERE m.conversation_id = ?1
                AND m.idx > ?2
              ORDER BY m.idx
-             LIMIT ?3"
-        } else {
-            "SELECT m.idx, COALESCE(LENGTH(CAST(m.content AS BLOB)), 0)
-             FROM messages m INDEXED BY sqlite_autoindex_messages_1
-             WHERE m.conversation_id = ?1
-               AND m.idx > ?2
-             ORDER BY m.idx
-             LIMIT ?3"
-        };
+             LIMIT ?3";
         // #329: prepare this once and stream each bounded page through the row
         // handler. Re-preparing and materializing one Vec per conversation/page
         // retained engine execution state until the 967k-message field corpus
@@ -18348,15 +18316,6 @@ impl FrankenStorage {
             .conn
             .prepare(message_scan_sql)
             .with_context(|| "preparing daily_stats bounded message scan")?;
-        let metrics_lookup_statement = if use_message_metrics {
-            Some(
-                self.conn
-                    .prepare("SELECT content_chars FROM message_metrics WHERE message_id = ?1")
-                    .with_context(|| "preparing daily_stats message_metrics point lookup")?,
-            )
-        } else {
-            None
-        };
 
         loop {
             // Avoid the 2-table JOIN with LIMIT that triggers frankensqlite's
@@ -18466,10 +18425,6 @@ impl FrankenStorage {
                     let mut next_message_idx = cursor_message_idx;
                     let mut page_rows = 0_usize;
                     let mut aggregate = StatsAggregator::new();
-                    // GH #424: with `message_metrics` as the source the page
-                    // yields message ids; `content_chars` is resolved by
-                    // point lookup once the scan has completed.
-                    let mut pending_metric_ids: Vec<i64> = Vec::new();
                     let scan_params = [
                         SqliteValue::from(conversation_id),
                         SqliteValue::from(page_start_message_idx),
@@ -18478,21 +18433,17 @@ impl FrankenStorage {
                     let scan_result =
                         message_scan_statement.query_with_params_for_each(&scan_params, |row| {
                             let message_idx: i64 = row.get_typed(0)?;
-                            let second_column: i64 = row.get_typed(1)?;
+                            let content_len: i64 = row.get_typed(1)?;
                             next_message_idx = message_idx;
                             page_rows = page_rows.saturating_add(1);
-                            if use_message_metrics {
-                                pending_metric_ids.push(second_column);
-                            } else {
-                                aggregate.record_delta(
-                                    &agent_slug,
-                                    &source_id,
-                                    day_id,
-                                    0,
-                                    1,
-                                    second_column,
-                                );
-                            }
+                            aggregate.record_delta(
+                                &agent_slug,
+                                &source_id,
+                                day_id,
+                                0,
+                                1,
+                                content_len,
+                            );
                             Ok(())
                         });
                     match scan_result {
@@ -18520,36 +18471,6 @@ impl FrankenStorage {
                     }
                     if page_rows == 0 {
                         break;
-                    }
-                    if let Some(lookup) = metrics_lookup_statement.as_ref() {
-                        for (lookup_idx, message_id) in pending_metric_ids.into_iter().enumerate() {
-                            let rows = lookup
-                                .query_with_params(&[SqliteValue::from(message_id)])
-                                .with_context(|| {
-                                    format!(
-                                        "daily_stats phase=message_metrics_lookup conversation_id={conversation_id} message_id={message_id}"
-                                    )
-                                })?;
-                            if (lookup_idx + 1).is_multiple_of(1_000)
-                                && let Some(heartbeat) = heartbeat
-                            {
-                                heartbeat();
-                            }
-                            // A message without a metrics row is dropped,
-                            // exactly as the former inner JOIN did.
-                            let Some(row) = rows.first() else {
-                                continue;
-                            };
-                            let content_len: i64 = row.get_typed(0)?;
-                            aggregate.record_delta(
-                                &agent_slug,
-                                &source_id,
-                                day_id,
-                                0,
-                                1,
-                                content_len,
-                            );
-                        }
                     }
 
                     messages_processed = messages_processed.saturating_add(page_rows);
@@ -18589,11 +18510,7 @@ impl FrankenStorage {
                             messages_processed,
                             batches = message_batch_count,
                             batch_size = message_batch_size,
-                            source = if use_message_metrics {
-                                "message_metrics"
-                            } else {
-                                "messages"
-                            },
+                            source = "messages",
                             conversation_id,
                             cursor_message_idx,
                             "daily_stats rebuild message scan progress"
@@ -18659,7 +18576,6 @@ impl FrankenStorage {
             message_batches = message_batch_count,
             message_batch_size,
             messages_processed,
-            use_message_metrics,
             raw_entries_flushed,
             expanded_entries_flushed,
             "Daily stats rebuilt from conversations"
@@ -24423,7 +24339,7 @@ mod tests {
                 .map(|idx| Message {
                     id: None,
                     idx,
-                    role: if idx % 2 == 0 {
+                    role: if idx.is_multiple_of(2) {
                         MessageRole::User
                     } else {
                         MessageRole::Agent
@@ -24532,7 +24448,7 @@ mod tests {
 
         type UsageSnapshotRow = (i64, String, i64, String, i64, i64, i64, i64);
         let usage_snapshot = || -> anyhow::Result<Vec<UsageSnapshotRow>> {
-            Ok(storage.conn.query_map_collect(
+            storage.conn.query_map_collect(
                 "SELECT day_id, agent_slug, workspace_id, source_id,
                         message_count, user_message_count,
                         assistant_message_count, content_tokens_est_total
@@ -24551,7 +24467,7 @@ mod tests {
                         row.get_typed(7)?,
                     ))
                 },
-            )?)
+            )
         };
         let resumed_usage = usage_snapshot()?;
 
@@ -25527,7 +25443,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_daily_stats_preserves_byte_counts_with_message_metrics() {
+    fn rebuild_daily_stats_uses_canonical_message_bytes_when_metrics_are_stale() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
         let storage = SqliteStorage::open(&db_path).unwrap();
@@ -25599,7 +25515,9 @@ mod tests {
                     0_i64,
                     LOCAL_SOURCE_ID,
                     "user",
-                    expected_bytes,
+                    // A complete-but-stale derived row must not override the
+                    // canonical message bytes during the rebuild.
+                    expected_bytes + 10_000,
                     expected_bytes / 4,
                     0_i64,
                     0_i64,
