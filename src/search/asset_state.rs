@@ -751,7 +751,7 @@ fn apply_semantic_identity_invalidation(
         SemanticPreference::HashFallback => SemanticIdentityTier::Fast,
         SemanticPreference::DefaultModel => SemanticIdentityTier::Quality,
     };
-    let storage = match FrankenStorage::open_readonly(db_path) {
+    let storage = match FrankenStorage::open_canonical_readonly(db_path) {
         Ok(storage) => storage,
         Err(err) => {
             // `db_available` is a point-in-time observation, not proof that

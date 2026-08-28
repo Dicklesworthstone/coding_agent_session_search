@@ -17497,7 +17497,7 @@ fn open_franken_analytics_db(
     data_dir: &Option<PathBuf>,
     db_path_override: Option<&PathBuf>,
 ) -> CliResult<crate::franken_sync::Connection> {
-    open_franken_cli_read_db(
+    open_franken_cli_canonical_read_db(
         analytics_db_path(data_dir, db_path_override),
         "analytics",
         Duration::from_secs(1),
@@ -17516,6 +17516,29 @@ fn open_franken_cli_read_db(
     reason: &str,
     busy_timeout: Duration,
 ) -> CliResult<crate::franken_sync::Connection> {
+    open_franken_cli_read_db_for_scope(path, reason, busy_timeout, CliReadDbScope::Full)
+}
+
+fn open_franken_cli_canonical_read_db(
+    path: PathBuf,
+    reason: &str,
+    busy_timeout: Duration,
+) -> CliResult<crate::franken_sync::Connection> {
+    open_franken_cli_read_db_for_scope(path, reason, busy_timeout, CliReadDbScope::Canonical)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CliReadDbScope {
+    Canonical,
+    Full,
+}
+
+fn open_franken_cli_read_db_for_scope(
+    path: PathBuf,
+    reason: &str,
+    busy_timeout: Duration,
+    scope: CliReadDbScope,
+) -> CliResult<crate::franken_sync::Connection> {
     if !path.exists() {
         return Err(CliError {
             code: 3,
@@ -17529,13 +17552,39 @@ fn open_franken_cli_read_db(
         });
     }
 
-    let conn = match crate::storage::sqlite::open_franken_readonly_storage_with_timeout(
-        &path,
-        busy_timeout,
-    ) {
+    let storage_open = match scope {
+        CliReadDbScope::Canonical => {
+            crate::storage::sqlite::open_franken_canonical_readonly_storage_with_timeout(
+                &path,
+                busy_timeout,
+            )
+        }
+        CliReadDbScope::Full => {
+            crate::storage::sqlite::open_franken_readonly_storage_with_timeout(&path, busy_timeout)
+        }
+    };
+    let conn = match storage_open {
         Ok(storage) => storage.into_raw(),
         Err(err) => {
             let readonly_retryable = crate::storage::sqlite::retryable_franken_anyhow(&err);
+            if scope == CliReadDbScope::Canonical {
+                let message = format!(
+                    "Failed to open {reason} database at {}: canonical readonly storage open failed ({err})",
+                    path.display()
+                );
+                if let Some(fts_err) =
+                    crate::storage::sqlite::fts_messages_integrity_error_from_message(&message)
+                {
+                    return Err(fts_messages_integrity_cli_error(reason, fts_err.into()));
+                }
+                return Err(CliError {
+                    code: 9,
+                    kind: CliErrorKind::DbOpen.kind_str(),
+                    message,
+                    hint: None,
+                    retryable: readonly_retryable,
+                });
+            }
             match crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout(
                 &path,
                 busy_timeout,
@@ -19490,10 +19539,10 @@ pub(crate) fn bounded_canonical_db_corruption_probe(
         return None;
     }
 
-    match open_franken_cli_read_db(db_path.to_path_buf(), reason, STATE_DB_OPEN_TIMEOUT) {
+    match open_franken_cli_canonical_read_db(db_path.to_path_buf(), reason, STATE_DB_OPEN_TIMEOUT) {
         Ok(conn) => {
             let (integrity, detail) = probe_state_db_integrity(&conn);
-            let _ = close_franken_cli_read_db(conn, db_path, reason);
+            let _ = close_franken_cli_read_db_without_checkpoint(conn, db_path, reason);
             match integrity {
                 Some(StateDbIntegrity::Corrupt) => {
                     Some(detail.unwrap_or_else(|| "corruption-class read failure".to_owned()))
@@ -19555,7 +19604,7 @@ fn probe_state_db_modes(
         ..StateDbSnapshot::default()
     };
 
-    let conn = match open_franken_cli_read_db(db_path.to_path_buf(), reason, timeout) {
+    let conn = match open_franken_cli_canonical_read_db(db_path.to_path_buf(), reason, timeout) {
         Ok(conn) => conn,
         Err(err) => {
             if watermarks_only && err.retryable {
@@ -19675,7 +19724,7 @@ fn probe_state_db_modes(
         }
     }
 
-    if let Err(err) = close_franken_cli_read_db(conn, db_path, reason) {
+    if let Err(err) = close_franken_cli_read_db_without_checkpoint(conn, db_path, reason) {
         snapshot.open_error = Some(err.message);
     }
 
@@ -99499,7 +99548,7 @@ fn count_indexed_session_paths(
     if requested.is_empty() || !db_path.is_file() {
         return None;
     }
-    let conn = open_franken_cli_read_db(
+    let conn = open_franken_cli_canonical_read_db(
         db_path.to_path_buf(),
         "sessions-from-resolution",
         Duration::from_secs(2),
@@ -99528,7 +99577,7 @@ fn count_indexed_session_paths(
             }
         }
     }
-    let _ = close_franken_cli_read_db(conn, db_path, "sessions-from-resolution");
+    let _ = close_franken_cli_read_db_without_checkpoint(conn, db_path, "sessions-from-resolution");
     complete.then_some(matched)
 }
 

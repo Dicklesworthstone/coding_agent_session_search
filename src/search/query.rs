@@ -311,13 +311,29 @@ fn open_search_hydration_sqlite(
     path: &Path,
     timeout: Duration,
     strict_read_only: bool,
+    defer_fts5_hydration: bool,
 ) -> Result<SearchSqliteConnection> {
-    let conn = if strict_read_only {
-        crate::storage::sqlite::open_franken_async_strict_readonly_connection_with_timeout(
-            path, timeout,
-        )?
-    } else {
-        crate::storage::sqlite::open_franken_async_readonly_connection_with_timeout(path, timeout)?
+    let conn = match (strict_read_only, defer_fts5_hydration) {
+        (true, true) => {
+            crate::storage::sqlite::open_franken_async_canonical_strict_readonly_connection_with_timeout(
+                path, timeout,
+            )?
+        }
+        (true, false) => {
+            crate::storage::sqlite::open_franken_async_strict_readonly_connection_with_timeout(
+                path, timeout,
+            )?
+        }
+        (false, true) => {
+            crate::storage::sqlite::open_franken_async_canonical_readonly_connection_with_timeout(
+                path, timeout,
+            )?
+        }
+        (false, false) => {
+            crate::storage::sqlite::open_franken_async_readonly_connection_with_timeout(
+                path, timeout,
+            )?
+        }
     };
     conn.execute_sync("PRAGMA query_only = 1;")
         .with_context(|| "setting search hydration query_only")?;
@@ -3989,10 +4005,19 @@ impl SearchClient {
         if guard.is_none()
             && let Some(path) = &self.sqlite_path
         {
+            // An external reader owns retrieval whenever it exists. SQLite
+            // then serves canonical hydration/filter data only, so leave its
+            // legacy derived FTS index unhydrated. The SQLite fallback lane
+            // still opens FTS normally.
+            let defer_fts5_hydration = self.reader.is_some()
+                || FEDERATED_SEARCH_READERS
+                    .read()
+                    .contains_key(&self.cache_namespace);
             match open_search_hydration_sqlite(
                 path,
                 std::time::Duration::from_secs(1),
                 self.strict_read_only,
+                defer_fts5_hydration,
             ) {
                 Ok(conn) => {
                     *guard = Some(conn);

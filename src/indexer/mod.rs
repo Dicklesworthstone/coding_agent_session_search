@@ -2668,7 +2668,7 @@ fn confirm_nonresumable_pending_lexical_rebuild_state_from_readonly_db(
     state: &LexicalRebuildState,
     db_path: &Path,
 ) -> Result<Option<(MatchingLexicalRebuildStateStatus, usize)>> {
-    let mut storage = FrankenStorage::open_readonly(db_path).with_context(|| {
+    let mut storage = FrankenStorage::open_canonical_readonly(db_path).with_context(|| {
         format!(
             "opening readonly storage to classify pending lexical rebuild checkpoint: {}",
             db_path.display()
@@ -2721,7 +2721,7 @@ fn try_readonly_canonical_force_rebuild(
         return Ok(false);
     }
 
-    let storage = FrankenStorage::open_readonly(&opts.db_path).with_context(|| {
+    let storage = FrankenStorage::open_canonical_readonly(&opts.db_path).with_context(|| {
         format!(
             "opening canonical database read-only for force rebuild: {}",
             opts.db_path.display()
@@ -9071,7 +9071,7 @@ fn lexical_rebuild_content_fingerprint(
 }
 
 fn lexical_rebuild_storage_fingerprint(db_path: &Path) -> Result<String> {
-    let mut storage = FrankenStorage::open_readonly(db_path).with_context(|| {
+    let mut storage = FrankenStorage::open_canonical_readonly(db_path).with_context(|| {
         format!(
             "opening readonly storage to compute lexical fingerprint for {}",
             db_path.display()
@@ -9482,7 +9482,7 @@ fn can_skip_absent_explicit_watch_once_index_run(opts: &IndexOptions) -> bool {
     if !should_skip_absent_explicit_watch_once_paths(opts) {
         return false;
     }
-    let Ok(storage) = FrankenStorage::open_readonly(&opts.db_path) else {
+    let Ok(storage) = FrankenStorage::open_canonical_readonly(&opts.db_path) else {
         return false;
     };
     let db_schema_current = matches!(
@@ -10841,7 +10841,7 @@ pub(crate) fn lexical_storage_fingerprint_for_db(db_path: &Path) -> Result<Strin
 /// opener. Used by strict read-only search so a dirty WAL or duplicate schema
 /// is surfaced rather than repaired as a side effect of freshness validation.
 pub(crate) fn lexical_storage_fingerprint_for_db_strict(db_path: &Path) -> Result<String> {
-    let storage = FrankenStorage::open_strict_readonly(db_path).with_context(|| {
+    let storage = FrankenStorage::open_canonical_strict_readonly(db_path).with_context(|| {
         format!(
             "strictly opening readonly storage to compute lexical fingerprint for {}",
             db_path.display()
@@ -11057,7 +11057,7 @@ fn refresh_completed_lexical_rebuild_checkpoint_for_final_state(
     // fingerprint from that fresh snapshot, and avoids a redundant second open
     // just to rebuild the same lexical storage fingerprint.
     storage.close_best_effort_in_place();
-    let mut settled = FrankenStorage::open_readonly(db_path).with_context(|| {
+    let mut settled = FrankenStorage::open_canonical_readonly(db_path).with_context(|| {
         format!(
             "reopening readonly storage to refresh settled lexical checkpoint for {}",
             db_path.display()
@@ -15543,7 +15543,7 @@ pub fn run_index(
                 0,
                 0,
             );
-            let mut semantic_read_storage = FrankenStorage::open_readonly(&opts.db_path)
+            let mut semantic_read_storage = FrankenStorage::open_canonical_readonly(&opts.db_path)
                 .with_context(|| {
                     format!(
                         "opening fresh readonly canonical storage for semantic indexing: {}",
@@ -18333,7 +18333,7 @@ pub(crate) fn refresh_completed_lexical_rebuild_checkpoint_from_live_index(
     db_path: &Path,
     data_dir: &Path,
 ) -> Result<()> {
-    let storage = FrankenStorage::open_readonly(db_path).with_context(|| {
+    let storage = FrankenStorage::open_canonical_readonly(db_path).with_context(|| {
         format!(
             "opening database to refresh lexical checkpoint: {}",
             db_path.display()
@@ -18364,7 +18364,7 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
     // debris from previous crashed runs while we hold the exclusive lock.
     staging_reclaim::reclaim_orphaned_staging_dirs_for_data_dir(data_dir, SystemTime::now()).log();
 
-    let storage = FrankenStorage::open_readonly(db_path).with_context(|| {
+    let storage = FrankenStorage::open_canonical_readonly(db_path).with_context(|| {
         format!(
             "opening database to repair lexical index for search: {}",
             db_path.display()
@@ -18845,7 +18845,7 @@ fn spawn_lexical_rebuild_page_prep_workers(
                         // active.  Require an already-readable archive here and
                         // leave any repair to the single mutating owner.
                         let mut storage =
-                            match FrankenStorage::open_strict_readonly(&worker_db_path) {
+                            match FrankenStorage::open_canonical_strict_readonly(&worker_db_path) {
                             Ok(storage) => storage,
                             Err(err) => {
                                 let _ = worker_result_tx.send(LexicalRebuildPagePrepResult::Error {
@@ -18981,7 +18981,7 @@ fn spawn_lexical_rebuild_packet_producer(
                 let _ = tx.send(LexicalRebuildPipelineMessage::Error(format!("{error:#}")));
             };
 
-            let mut storage = match FrankenStorage::open_readonly(&db_path) {
+            let mut storage = match FrankenStorage::open_canonical_readonly(&db_path) {
                 Ok(storage) => storage,
                 Err(err) => {
                     send_error(err.context(format!(
@@ -21677,7 +21677,7 @@ fn rebuild_tantivy_from_db_with_options(
         *step_started = Instant::now();
     };
 
-    let storage = FrankenStorage::open_readonly(db_path).with_context(|| {
+    let storage = FrankenStorage::open_canonical_readonly(db_path).with_context(|| {
         format!(
             "opening database for Tantivy rebuild: {}",
             db_path.display()

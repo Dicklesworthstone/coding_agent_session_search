@@ -741,6 +741,21 @@ pub(crate) fn open_franken_readonly_storage_with_timeout(
     path: &Path,
     timeout: Duration,
 ) -> Result<FrankenStorage> {
+    open_franken_readonly_storage_with_options(path, timeout, false)
+}
+
+pub(crate) fn open_franken_canonical_readonly_storage_with_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> Result<FrankenStorage> {
+    open_franken_readonly_storage_with_options(path, timeout, true)
+}
+
+fn open_franken_readonly_storage_with_options(
+    path: &Path,
+    timeout: Duration,
+    defer_fts5_hydration: bool,
+) -> Result<FrankenStorage> {
     if !path.exists() {
         return Err(anyhow!("Database not found at {}", path.display()));
     }
@@ -748,7 +763,12 @@ pub(crate) fn open_franken_readonly_storage_with_timeout(
     let deadline = Instant::now() + timeout;
     let mut backoff = Duration::from_millis(4);
     loop {
-        match FrankenStorage::open_readonly(path) {
+        let open_result = if defer_fts5_hydration {
+            FrankenStorage::open_canonical_readonly_with_doctor_lock_timeout(path, timeout)
+        } else {
+            FrankenStorage::open_readonly(path)
+        };
+        match open_result {
             Ok(storage) => return Ok(storage),
             Err(err) if retryable_franken_anyhow(&err) => {
                 let now = Instant::now();
@@ -862,6 +882,24 @@ pub(crate) fn open_franken_async_readonly_connection_with_timeout(
     path: &Path,
     timeout: Duration,
 ) -> Result<FrankenAsyncConnection> {
+    open_franken_async_readonly_connection_with_options(path, timeout, false)
+}
+
+/// Open the canonical archive for queries that never touch `fts_messages`.
+/// Legacy in-database FTS state stays unhydrated; ordinary tables are still
+/// read through the pager and the connection remains read-only.
+pub(crate) fn open_franken_async_canonical_readonly_connection_with_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> Result<FrankenAsyncConnection> {
+    open_franken_async_readonly_connection_with_options(path, timeout, true)
+}
+
+fn open_franken_async_readonly_connection_with_options(
+    path: &Path,
+    timeout: Duration,
+    defer_fts5_hydration: bool,
+) -> Result<FrankenAsyncConnection> {
     if !path.exists() {
         return Err(anyhow!("Database not found at {}", path.display()));
     }
@@ -873,11 +911,15 @@ pub(crate) fn open_franken_async_readonly_connection_with_timeout(
     let mut duplicate_fts_repair_attempted = false;
     loop {
         let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
-        match FrankenAsyncConnection::open_with_flags_sync(
-            &path_str,
-            FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .with_context(|| {
+        let open_result = if defer_fts5_hydration {
+            FrankenAsyncConnection::open_schema_only_deferred_fts5_sync(&path_str)
+        } else {
+            FrankenAsyncConnection::open_with_flags_sync(
+                &path_str,
+                FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+        };
+        match open_result.with_context(|| {
             format!(
                 "opening dedicated-owner frankensqlite db readonly at {}",
                 path.display()
@@ -927,6 +969,21 @@ pub(crate) fn open_franken_async_strict_readonly_connection_with_timeout(
     path: &Path,
     timeout: Duration,
 ) -> Result<FrankenAsyncConnection> {
+    open_franken_async_strict_readonly_connection_with_options(path, timeout, false)
+}
+
+pub(crate) fn open_franken_async_canonical_strict_readonly_connection_with_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> Result<FrankenAsyncConnection> {
+    open_franken_async_strict_readonly_connection_with_options(path, timeout, true)
+}
+
+fn open_franken_async_strict_readonly_connection_with_options(
+    path: &Path,
+    timeout: Duration,
+    defer_fts5_hydration: bool,
+) -> Result<FrankenAsyncConnection> {
     if !path.exists() {
         return Err(anyhow!("Database not found at {}", path.display()));
     }
@@ -937,11 +994,15 @@ pub(crate) fn open_franken_async_strict_readonly_connection_with_timeout(
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let _doctor_guard = acquire_existing_doctor_mutation_db_open_guard(path, remaining)?;
-        match FrankenAsyncConnection::open_with_flags_sync(
-            &path_str,
-            FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .with_context(|| {
+        let open_result = if defer_fts5_hydration {
+            FrankenAsyncConnection::open_schema_only_deferred_fts5_sync(&path_str)
+        } else {
+            FrankenAsyncConnection::open_with_flags_sync(
+                &path_str,
+                FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+        };
+        match open_result.with_context(|| {
             format!(
                 "strictly opening dedicated-owner frankensqlite db readonly at {}",
                 path.display()
@@ -5263,11 +5324,35 @@ impl FrankenStorage {
         Self::open_readonly_with_doctor_lock_timeout(path, DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT)
     }
 
+    /// Open canonical CASS tables read-only without hydrating the derived
+    /// in-database FTS5 index.
+    pub fn open_canonical_readonly(path: &Path) -> Result<Self> {
+        Self::open_canonical_readonly_with_doctor_lock_timeout(
+            path,
+            DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT,
+        )
+    }
+
     /// Open in read-only mode with an explicit doctor mutation-lock timeout.
     ///
     /// This is primarily useful for probes that need to prove a reader would
     /// not enter the archive while `cass doctor --fix` owns the repair lock.
     pub fn open_readonly_with_doctor_lock_timeout(path: &Path, timeout: Duration) -> Result<Self> {
+        Self::open_readonly_with_options(path, timeout, false)
+    }
+
+    pub fn open_canonical_readonly_with_doctor_lock_timeout(
+        path: &Path,
+        timeout: Duration,
+    ) -> Result<Self> {
+        Self::open_readonly_with_options(path, timeout, true)
+    }
+
+    fn open_readonly_with_options(
+        path: &Path,
+        timeout: Duration,
+        defer_fts5_hydration: bool,
+    ) -> Result<Self> {
         let path_str = path.to_string_lossy().to_string();
         let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
         // fsqlite 0.3.x surfaces transient `BusyRecovery` from a readonly open
@@ -5275,9 +5360,15 @@ impl FrankenStorage {
         // class upstream retries in prepare's prologue since 55d7f2c5). The
         // lexical-rebuild page-prep workers open readonly right next to the
         // active writer, so a bounded retry here is load-bearing.
+        let open_connection = || {
+            if defer_fts5_hydration {
+                FrankenConnection::open_schema_only_deferred_fts5(&path_str)
+            } else {
+                open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
+            }
+        };
         let conn = match retry_transient_storage_op("open_readonly", || {
-            open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
-                .map_err(anyhow::Error::new)
+            open_connection().map_err(anyhow::Error::new)
         }) {
             Ok(conn) => conn,
             // Same duplicate-fts_messages debris handling as the canonical
@@ -5293,8 +5384,7 @@ impl FrankenStorage {
                      fts_messages schema rows; deduplicating via sqlite3 bridge"
                 );
                 dedupe_conflicting_fts_schema_rows_via_sqlite3(path)?;
-                open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
-                    .map_err(anyhow::Error::new)?
+                open_connection().map_err(anyhow::Error::new)?
             }
             // gh #389: a hard (non-busy) readonly failure with a non-empty
             // `-wal` present is the unclean-shutdown dirty-WAL shape — the
@@ -5303,7 +5393,7 @@ impl FrankenStorage {
             // shutdown path uses, then retry the readonly open once. The
             // doctor mutation guard acquired above is still held here.
             Err(err) if attempt_dirty_wal_recovery_checkpoint(path, &err) => {
-                open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
+                open_connection()
                     .map_err(anyhow::Error::new)
                     .with_context(|| {
                         format!(
@@ -5338,6 +5428,29 @@ impl FrankenStorage {
         path: &Path,
         timeout: Duration,
     ) -> Result<Self> {
+        Self::open_strict_readonly_with_options(path, timeout, false)
+    }
+
+    /// Open canonical archive tables without recovery writes or FTS hydration.
+    pub(crate) fn open_canonical_strict_readonly(path: &Path) -> Result<Self> {
+        Self::open_canonical_strict_readonly_with_timeout(
+            path,
+            DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT,
+        )
+    }
+
+    pub(crate) fn open_canonical_strict_readonly_with_timeout(
+        path: &Path,
+        timeout: Duration,
+    ) -> Result<Self> {
+        Self::open_strict_readonly_with_options(path, timeout, true)
+    }
+
+    fn open_strict_readonly_with_options(
+        path: &Path,
+        timeout: Duration,
+        defer_fts5_hydration: bool,
+    ) -> Result<Self> {
         let path_str = path.to_string_lossy().to_string();
         // The caller supplies one end-to-end admission/open budget. Starting
         // the deadline after the doctor guard was acquired allowed a busy
@@ -5348,9 +5461,12 @@ impl FrankenStorage {
         let _doctor_guard = acquire_existing_doctor_mutation_db_open_guard(path, timeout)?;
         let mut backoff = Duration::from_millis(4);
         let conn = loop {
-            match open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
-                .map_err(anyhow::Error::new)
-            {
+            let open_result = if defer_fts5_hydration {
+                FrankenConnection::open_schema_only_deferred_fts5(&path_str)
+            } else {
+                open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
+            };
+            match open_result.map_err(anyhow::Error::new) {
                 Ok(conn) => break conn,
                 Err(err) if retryable_franken_anyhow(&err) => {
                     let now = Instant::now();
@@ -23000,6 +23116,20 @@ mod tests {
         assert!(storage.schema_version().is_ok());
     }
 
+    #[test]
+    fn open_canonical_readonly_reads_schema_and_refuses_writes() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("canonical-readonly.db");
+        drop(SqliteStorage::open(&db_path).unwrap());
+
+        let storage = SqliteStorage::open_canonical_readonly(&db_path).unwrap();
+        assert!(storage.schema_version().is_ok());
+        storage
+            .raw()
+            .execute("CREATE TABLE refused(id INTEGER)")
+            .expect_err("canonical deferred-fts5 connection must remain read-only");
+    }
+
     // gh #389: dirty-WAL recovery must never fire without a non-empty WAL
     // sidecar, and must never fire on retryable (live-writer) failures.
     #[test]
@@ -23179,8 +23309,8 @@ mod tests {
         assert_eq!(rows[0].get_typed::<i64>(0).unwrap(), 3);
         owner.close_without_checkpoint_sync().unwrap();
 
-        let strict_storage =
-            FrankenStorage::open_strict_readonly(&db_path).expect("strict storage read open");
+        let strict_storage = FrankenStorage::open_canonical_strict_readonly(&db_path)
+            .expect("strict canonical storage read open");
         let count: i64 = strict_storage
             .raw()
             .query_row_map("SELECT COUNT(*) FROM t;", &[] as &[ParamValue], |row| {

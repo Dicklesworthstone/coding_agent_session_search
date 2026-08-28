@@ -785,9 +785,9 @@ fn load_hash_semantic_context_inner(
     }
 
     let storage = match if strict_read_only {
-        FrankenStorage::open_strict_readonly(db_path)
+        FrankenStorage::open_canonical_strict_readonly(db_path)
     } else {
-        FrankenStorage::open_readonly(db_path)
+        FrankenStorage::open_canonical_readonly(db_path)
     } {
         Ok(storage) => storage,
         Err(err) => {
@@ -966,9 +966,9 @@ fn load_semantic_context_inner(
     }
 
     let storage = match if strict_read_only {
-        FrankenStorage::open_strict_readonly(db_path)
+        FrankenStorage::open_canonical_strict_readonly(db_path)
     } else {
-        FrankenStorage::open_readonly(db_path)
+        FrankenStorage::open_canonical_readonly(db_path)
     } {
         Ok(storage) => storage,
         Err(err) => {

@@ -97,6 +97,16 @@ impl Connection {
         })
     }
 
+    /// Open an existing database read-only while leaving FTS5 virtual tables
+    /// unhydrated. Canonical tables remain available through pager cursors.
+    pub fn open_schema_only_deferred_fts5(path: impl Into<String>) -> Result<Self, FrankenError> {
+        Ok(Self {
+            inner: drive(frankensqlite::Connection::open_schema_only_deferred_fts5(
+                path,
+            ))?,
+        })
+    }
+
     /// Open an existing database only, deferring FTS5 shadow-table
     /// validation (corrupt-shadow repair path, cass#368 defect 3).
     pub fn open_existing_schema_only_deferred_fts5(
