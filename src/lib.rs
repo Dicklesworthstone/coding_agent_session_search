@@ -9340,15 +9340,26 @@ fn run_mirror_prune(
             apply,
         },
     )
-    .map_err(|err| CliError {
-        code: 9,
-        kind: "raw-mirror",
-        message: format!("raw-mirror prune failed: {err}"),
-        hint: Some(
-            "Run `cass mirror prune --dry-run --json` first and inspect the plan before applying."
-                .to_string(),
-        ),
-        retryable: false,
+    .map_err(|err| {
+        let detail = err.to_string();
+        let index_lock_busy = detail.contains("because an index run acquired");
+        CliError {
+            code: if index_lock_busy { 7 } else { 9 },
+            kind: if index_lock_busy {
+                "lock-busy"
+            } else {
+                "raw-mirror"
+            },
+            message: format!("raw-mirror prune failed: {detail}"),
+            hint: Some(if index_lock_busy {
+                "Wait for indexing/watch work to finish, then rerun `cass mirror prune --apply`."
+                    .to_string()
+            } else {
+                "Run `cass mirror prune --dry-run --json` first and inspect the plan before applying."
+                    .to_string()
+            }),
+            retryable: index_lock_busy,
+        }
     })?;
 
     if let Some(fmt) = output_format {
@@ -38405,6 +38416,12 @@ struct DoctorRawMirrorBackfillCandidate {
     message_count: usize,
 }
 
+/// Maximum number of per-record doctor details emitted by default on robot
+/// surfaces. The full collections remain in memory for coverage/risk decisions;
+/// only the serialized projection is capped. `--verbose` removes this output
+/// cap for operators who explicitly need the complete evidence listing.
+const DOCTOR_STRUCTURED_DETAIL_DEFAULT_LIMIT: usize = 64;
+
 #[derive(Debug, Clone, Serialize, Default)]
 struct DoctorRawMirrorBackfillReport {
     schema_version: u32,
@@ -38457,6 +38474,10 @@ struct DoctorRawMirrorBackfillReceipt {
     raw_mirror_manifest_relative_path: Option<String>,
     raw_mirror_blob_blake3: Option<String>,
     raw_mirror_blob_size_bytes: Option<u64>,
+    raw_mirror_source_content_blake3: Option<String>,
+    raw_mirror_source_size_bytes: Option<u64>,
+    raw_mirror_storage_kind: Option<String>,
+    raw_mirror_chunk_count: Option<usize>,
     backfill_generation: u32,
     forensic_bundle: DoctorForensicBundleMetadata,
     warnings: Vec<String>,
@@ -38694,6 +38715,10 @@ struct DoctorRawMirrorExistingEvidence {
     manifest_relative_path: String,
     blob_blake3: String,
     blob_size_bytes: u64,
+    source_content_blake3: String,
+    source_size_bytes: Option<u64>,
+    storage_kind: String,
+    chunk_count: usize,
     captured_at_ms: i64,
     source_mtime_ms: Option<i64>,
     db_linked: bool,
@@ -38779,6 +38804,44 @@ struct DoctorSoleCopyWarning {
     confidence_tier: String,
     reason: String,
     recommended_action: String,
+}
+
+fn bounded_doctor_structured_details(
+    raw_mirror_backfill: &mut DoctorRawMirrorBackfillReport,
+    sole_copy_warnings: &mut Vec<DoctorSoleCopyWarning>,
+    verbose: bool,
+    full_details_command: &str,
+) -> serde_json::Value {
+    let receipt_total = raw_mirror_backfill.receipts.len();
+    let warning_total = sole_copy_warnings.len();
+
+    if !verbose {
+        raw_mirror_backfill
+            .receipts
+            .truncate(DOCTOR_STRUCTURED_DETAIL_DEFAULT_LIMIT);
+        sole_copy_warnings.truncate(DOCTOR_STRUCTURED_DETAIL_DEFAULT_LIMIT);
+    }
+
+    let receipt_returned = raw_mirror_backfill.receipts.len();
+    let warning_returned = sole_copy_warnings.len();
+    let details_truncated = receipt_returned < receipt_total || warning_returned < warning_total;
+    serde_json::json!({
+        "mode": if verbose { "full_verbose" } else { "bounded_summary" },
+        "limit_per_collection": if verbose {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(DOCTOR_STRUCTURED_DETAIL_DEFAULT_LIMIT)
+        },
+        "details_truncated": details_truncated,
+        "raw_mirror_backfill_receipts_total": receipt_total,
+        "raw_mirror_backfill_receipts_returned": receipt_returned,
+        "raw_mirror_backfill_receipts_omitted": receipt_total.saturating_sub(receipt_returned),
+        "sole_copy_warnings_total": warning_total,
+        "sole_copy_warnings_returned": warning_returned,
+        "sole_copy_warnings_omitted": warning_total.saturating_sub(warning_returned),
+        "full_details_command": details_truncated.then_some(full_details_command),
+        "note": "Counts and safety decisions use the complete internal collections; only per-record robot details are capped unless --verbose is requested.",
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -39146,7 +39209,10 @@ const CASS_RAW_MIRROR_SIZE_WARN_THRESHOLD_BYTES: &str = "CASS_RAW_MIRROR_SIZE_WA
 const DOCTOR_RAW_MIRROR_SIZE_WARN_THRESHOLD_BYTES_DEFAULT: u64 = 100 * 1_000_000_000;
 const DOCTOR_RAW_MIRROR_SOURCE_AMPLIFICATION_WARN_RATIO_MILLI_DEFAULT: u64 = 4_000;
 const DOCTOR_RAW_MIRROR_SOURCE_AMPLIFICATION_WARN_EXCESS_BYTES_DEFAULT: u64 = 256 * 1024 * 1024;
+const DOCTOR_RAW_MIRROR_MANIFEST_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const DOCTOR_RAW_MIRROR_AMPLIFICATION_MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
+const DOCTOR_RAW_MIRROR_BOUNDED_AMPLIFICATION_MANIFEST_LIMIT: usize = 4_096;
+const DOCTOR_RAW_MIRROR_BOUNDED_AMPLIFICATION_BYTE_LIMIT: u64 = 64 * 1024 * 1024;
 const CASS_TEST_DOCTOR_CANDIDATE_PROMOTION_FAILPOINT: &str =
     "CASS_TEST_DOCTOR_CANDIDATE_PROMOTION_FAILPOINT";
 const CASS_TEST_DOCTOR_RENAME_FAILURE: &str = "CASS_TEST_DOCTOR_RENAME_FAILURE";
@@ -42175,12 +42241,18 @@ const DOCTOR_RAW_MIRROR_FILE_MODE: &str = "0600";
 const CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY: &str = "CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY";
 const CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_MANIFEST_LIMIT: &str =
     "CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_MANIFEST_LIMIT";
+const CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_BYTE_LIMIT: &str =
+    "CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_BYTE_LIMIT";
 const DOCTOR_RAW_MIRROR_DEFAULT_FULL_VERIFY_MANIFEST_LIMIT: usize = 256;
+const DOCTOR_RAW_MIRROR_DEFAULT_FULL_VERIFY_BYTE_LIMIT: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DoctorRawMirrorVerificationMode {
     Full,
-    Bounded { manifest_limit: usize },
+    Bounded {
+        manifest_limit: usize,
+        byte_limit: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -42337,11 +42409,13 @@ struct DoctorRawMirrorSourceAmplificationReport {
 struct DoctorRawMirrorSourceAmplificationVersion {
     provider: String,
     source_id: String,
+    origin_kind: String,
+    origin_host: Option<String>,
     original_path: String,
     redacted_original_path: String,
     original_path_blake3: String,
-    blob_blake3: String,
-    blob_size_bytes: u64,
+    snapshot_blake3: String,
+    stored_blobs: Vec<(String, u64)>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -42357,6 +42431,11 @@ struct DoctorRawMirrorManifestReport {
     redacted_blob_path: String,
     blob_blake3: String,
     blob_size_bytes: u64,
+    storage_kind: String,
+    source_content_blake3: String,
+    chunk_count: usize,
+    #[serde(skip_serializing)]
+    verified_stored_blobs: Vec<(String, u64)>,
     provider: String,
     source_id: String,
     origin_kind: String,
@@ -42466,6 +42545,8 @@ struct DoctorRawMirrorManifestFile {
     source_mtime_ms: Option<i64>,
     #[serde(default)]
     source_size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_storage: Option<serde_json::Value>,
     #[serde(default)]
     compression: DoctorRawMirrorCompressionEnvelope,
     #[serde(default)]
@@ -42476,6 +42557,39 @@ struct DoctorRawMirrorManifestFile {
     verification: DoctorRawMirrorVerificationRecord,
     #[serde(default)]
     manifest_blake3: Option<String>,
+}
+
+fn doctor_raw_mirror_storage_metadata(
+    manifest: &DoctorRawMirrorManifestFile,
+) -> (String, String, usize) {
+    let Some(storage) = manifest.content_storage.as_ref() else {
+        return (
+            "whole_blob_v1".to_string(),
+            manifest
+                .verification
+                .content_blake3
+                .clone()
+                .unwrap_or_else(|| manifest.blob_blake3.clone()),
+            1,
+        );
+    };
+    (
+        storage
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("invalid")
+            .to_string(),
+        storage
+            .get("content_blake3")
+            .and_then(serde_json::Value::as_str)
+            .or(manifest.verification.content_blake3.as_deref())
+            .unwrap_or("")
+            .to_string(),
+        storage
+            .get("chunks")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len),
+    )
 }
 
 fn doctor_raw_mirror_none_state() -> String {
@@ -42501,11 +42615,11 @@ fn doctor_raw_mirror_layout_report() -> DoctorRawMirrorLayoutReport {
         manifest_path_template: "manifests/<manifest-id>.json".to_string(),
         verification_path_template: "verification/<manifest-id>.json".to_string(),
         temp_path_template: "tmp/<operation-id>/<file>.tmp".to_string(),
-        content_address_scope: "global within the cass data dir; identical bytes share one blob across providers and sources".to_string(),
+        content_address_scope: "global within the cass data dir; identical whole files, chunk descriptors, and fixed-size source chunks share blobs across versions, providers, and sources".to_string(),
         source_identity_scope: "manifest metadata records provider, source_id, origin_kind, origin_host, original path hash, and db_links back to archive conversations/messages".to_string(),
         db_link_contract: "db_links entries identify archived conversations without embedding raw session content in manifests".to_string(),
         case_insensitive_collision_behavior: "no original path segment is used as a storage directory; path identity is hashed from exact bytes, so case-folding filesystems cannot collide user paths".to_string(),
-        migration_contract: "schema_version and raw-mirror/vN keep future layouts side-by-side; v1 readers ignore unknown manifest fields".to_string(),
+        migration_contract: "schema_version and raw-mirror/vN keep future layouts side-by-side; v1 manifests without content_storage remain whole-blob captures, while new large-source manifests declare fixed_chunks_v1 metadata".to_string(),
     }
 }
 
@@ -42519,8 +42633,8 @@ fn doctor_raw_mirror_policy_report() -> DoctorRawMirrorPolicyReport {
         directory_mode_octal: DOCTOR_RAW_MIRROR_DIR_MODE,
         file_mode_octal: DOCTOR_RAW_MIRROR_FILE_MODE,
         enforce_private_files: true,
-        atomic_publish: "write temp file under tmp, fsync file, rename into content-addressed destination, fsync parent directory, then publish manifest".to_string(),
-        fsync_required: true,
+        atomic_publish: "write whole-file or fixed-size chunk temps under tmp, verify the stable source, publish immutable content-addressed blobs, then publish the integrity-bound manifest".to_string(),
+        fsync_required: false,
         path_traversal_defense: "manifest blob paths must be relative normal components under raw-mirror/v1 and may not contain absolute paths, prefixes, dot-dot, or empty components".to_string(),
         symlink_defense: "doctor verification refuses symlinked blob or manifest paths and never follows symlinks while validating mirror evidence".to_string(),
         default_report_contract: "default doctor reports expose redacted paths, content hashes, sizes, timestamps, provider/source identity, and codec/encryption metadata; exact paths and raw bytes stay internal unless a future explicit sensitive-evidence mode requests them".to_string(),
@@ -42534,6 +42648,9 @@ fn doctor_raw_mirror_policy_report() -> DoctorRawMirrorPolicyReport {
                 "redacted_blob_path",
                 "blob_blake3",
                 "blob_size_bytes",
+                "storage_kind",
+                "source_content_blake3",
+                "chunk_count",
                 "provider",
                 "source_id",
                 "origin_kind",
@@ -42629,7 +42746,7 @@ fn doctor_raw_mirror_policy_report() -> DoctorRawMirrorPolicyReport {
             default_robot_json_includes_raw_content: false,
             public_artifact_contract: "Pages, HTML exports, robot logs, and default support bundles must not include raw mirror bytes, exact source paths, prompts, attachment payloads, or decrypted/encrypted evidence blobs".to_string(),
         },
-        compression_contract: "v1 stores plain bytes by default; future compression must be declared in the compression envelope and preserve uncompressed size/hash metadata".to_string(),
+        compression_contract: "v1 stores plain bytes by default; large sources use fixed_chunks_v1 content-addressed chunking without compression, while future compression must be declared in the compression envelope and preserve uncompressed size/hash metadata".to_string(),
         encryption_contract: "v1 stores unencrypted local evidence by default; future encryption must be explicit in the encryption envelope and must not weaken manifest integrity checks".to_string(),
         support_bundle_redaction_contract: "support bundles use redacted_original_path and original_path_blake3; raw bytes are not exported unless an operator explicitly asks for evidence export".to_string(),
         missing_upstream_semantics: "missing upstream provider files are distinct from missing cass mirror evidence; a verified mirror blob is preserved archive evidence even if the original source path was pruned".to_string(),
@@ -42742,8 +42859,53 @@ fn doctor_raw_mirror_unique_db_links(
     dedup
 }
 
+#[cfg(unix)]
+fn doctor_same_open_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    left.is_file() && right.is_file() && left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn doctor_same_open_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.is_file()
+        && right.is_file()
+        && left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
+}
+
+fn doctor_open_regular_file_for_read(path: &Path) -> io::Result<std::fs::File> {
+    let expected_metadata = std::fs::symlink_metadata(path)?;
+    if expected_metadata.file_type().is_symlink() || !expected_metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to open a symlink or non-regular file",
+        ));
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    let opened_metadata = file.metadata()?;
+    let current_path_metadata = std::fs::symlink_metadata(path)?;
+    if current_path_metadata.file_type().is_symlink()
+        || !doctor_same_open_file_identity(&expected_metadata, &opened_metadata)
+        || !doctor_same_open_file_identity(&opened_metadata, &current_path_metadata)
+    {
+        return Err(io::Error::other(
+            "file changed identity while it was being opened",
+        ));
+    }
+    Ok(file)
+}
+
 fn doctor_file_blake3(path: &Path) -> io::Result<String> {
-    let mut file = std::fs::File::open(path)?;
+    let mut file = doctor_open_regular_file_for_read(path)?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
@@ -42773,6 +42935,10 @@ fn doctor_raw_mirror_invalid_manifest_report(
         redacted_blob_path: String::new(),
         blob_blake3: String::new(),
         blob_size_bytes: 0,
+        storage_kind: "unknown".to_string(),
+        source_content_blake3: String::new(),
+        chunk_count: 0,
+        verified_stored_blobs: Vec::new(),
         provider: "unknown".to_string(),
         source_id: crate::sources::provenance::LOCAL_SOURCE_ID.to_string(),
         origin_kind: "unknown".to_string(),
@@ -42814,6 +42980,8 @@ fn doctor_raw_mirror_loaded_invalid_manifest_report(
     let manifest_path_string = manifest_path.display().to_string();
     let blob_path_string = blob_path.display().to_string();
     let db_links = doctor_raw_mirror_unique_db_links(&manifest.db_links);
+    let (storage_kind, source_content_blake3, chunk_count) =
+        doctor_raw_mirror_storage_metadata(&manifest);
     DoctorRawMirrorManifestReport {
         manifest_id: manifest.manifest_id,
         manifest_path: manifest_path_string.clone(),
@@ -42823,6 +42991,10 @@ fn doctor_raw_mirror_loaded_invalid_manifest_report(
         redacted_blob_path: doctor_redacted_path(&blob_path_string, data_dir),
         blob_blake3: manifest.blob_blake3,
         blob_size_bytes: manifest.blob_size_bytes,
+        storage_kind,
+        source_content_blake3,
+        chunk_count,
+        verified_stored_blobs: Vec::new(),
         provider: doctor_normalized_provider_slug(&manifest.provider),
         source_id: manifest.source_id,
         origin_kind: manifest.origin_kind,
@@ -42936,6 +43108,8 @@ fn doctor_verify_raw_mirror_manifest(
         Some(_) => DoctorArtifactChecksumStatus::Mismatched,
         None => DoctorArtifactChecksumStatus::NotRecorded,
     };
+    let (mut storage_kind, mut source_content_blake3, mut chunk_count) =
+        doctor_raw_mirror_storage_metadata(&manifest);
 
     if blob_path
         .parent()
@@ -42951,8 +43125,9 @@ fn doctor_verify_raw_mirror_manifest(
         );
     }
 
-    let (blob_checksum_status, status, invalid_reason) = match std::fs::symlink_metadata(&blob_path)
-    {
+    let (mut blob_checksum_status, mut status, mut invalid_reason) = match std::fs::symlink_metadata(
+        &blob_path,
+    ) {
         Ok(metadata) if metadata.file_type().is_symlink() => (
             DoctorArtifactChecksumStatus::Mismatched,
             "invalid_manifest".to_string(),
@@ -43001,23 +43176,75 @@ fn doctor_verify_raw_mirror_manifest(
             Some("content-addressed blob is missing".to_string()),
         ),
     };
+    let mut verified_stored_blobs = if blob_checksum_status == DoctorArtifactChecksumStatus::Matched
+    {
+        vec![(manifest.blob_blake3.clone(), manifest.blob_size_bytes)]
+    } else {
+        Vec::new()
+    };
+
+    if manifest.content_storage.is_some()
+        && manifest_checksum_status == DoctorArtifactChecksumStatus::Matched
+    {
+        match crate::raw_mirror::verify_source_capture(data_dir, &manifest.manifest_id) {
+            Ok(verified) => {
+                blob_checksum_status = DoctorArtifactChecksumStatus::Matched;
+                status = "verified".to_string();
+                invalid_reason = None;
+                debug_assert_eq!(verified.stored_blob_count, verified.stored_blobs.len());
+                debug_assert_eq!(
+                    verified.stored_bytes,
+                    verified
+                        .stored_blobs
+                        .iter()
+                        .map(|(_, bytes)| *bytes)
+                        .fold(0_u64, u64::saturating_add)
+                );
+                storage_kind = verified.storage_kind;
+                source_content_blake3 = verified.source_content_blake3;
+                chunk_count = verified.chunk_count;
+                verified_stored_blobs = verified.stored_blobs;
+                if manifest.source_size_bytes != Some(verified.source_size_bytes) {
+                    blob_checksum_status = DoctorArtifactChecksumStatus::Mismatched;
+                    status = "checksum_mismatch".to_string();
+                    invalid_reason = Some(
+                        "chunked source size disagrees with manifest source_size_bytes".to_string(),
+                    );
+                    verified_stored_blobs.clear();
+                }
+            }
+            Err(error) => {
+                blob_checksum_status = DoctorArtifactChecksumStatus::Mismatched;
+                status = "checksum_mismatch".to_string();
+                invalid_reason = Some(format!("chunked source verification failed: {error}"));
+                verified_stored_blobs.clear();
+            }
+        }
+    }
 
     let original_path_blake3 = doctor_raw_mirror_original_path_blake3(&manifest.original_path);
-    let mut invalid_reason = invalid_reason;
     if original_path_blake3 != manifest.original_path_blake3 {
         invalid_reason = Some("original_path_blake3 does not match original_path".to_string());
     }
-    let mut status = status;
     if original_path_blake3 != manifest.original_path_blake3 {
         status = "invalid_manifest".to_string();
     }
-    if manifest
-        .verification
-        .content_blake3
-        .as_deref()
-        .is_some_and(|verified| verified != manifest.blob_blake3)
+    if manifest.content_storage.is_none()
+        && manifest
+            .verification
+            .content_blake3
+            .as_deref()
+            .is_some_and(|verified| verified != manifest.blob_blake3)
     {
         invalid_reason = Some("verification content_blake3 does not match blob_blake3".to_string());
+        status = "invalid_manifest".to_string();
+    }
+    if manifest.content_storage.is_none()
+        && manifest.source_size_bytes != Some(manifest.blob_size_bytes)
+    {
+        invalid_reason = Some(
+            "whole-blob source_size_bytes does not match blob_size_bytes".to_string(),
+        );
         status = "invalid_manifest".to_string();
     }
 
@@ -43031,6 +43258,10 @@ fn doctor_verify_raw_mirror_manifest(
         redacted_blob_path: doctor_redacted_path(&blob_path_string, data_dir),
         blob_blake3: manifest.blob_blake3,
         blob_size_bytes: manifest.blob_size_bytes,
+        storage_kind,
+        source_content_blake3,
+        chunk_count,
+        verified_stored_blobs,
         provider: doctor_normalized_provider_slug(&manifest.provider),
         source_id: manifest.source_id,
         origin_kind: manifest.origin_kind,
@@ -43092,7 +43323,15 @@ struct DoctorRawMirrorSourceAmplificationAccumulator {
     original_path: String,
     redacted_original_path: String,
     original_path_blake3: String,
+    snapshots: BTreeSet<String>,
     blobs: BTreeMap<String, u64>,
+}
+
+#[derive(Debug)]
+struct DoctorRawMirrorBoundedAmplificationScan {
+    reports: Vec<DoctorRawMirrorSourceAmplificationReport>,
+    scanned_manifest_count: usize,
+    truncated: bool,
 }
 
 fn doctor_raw_mirror_source_amplification_reports(
@@ -43106,11 +43345,13 @@ fn doctor_raw_mirror_source_amplification_reports(
         .map(|manifest| DoctorRawMirrorSourceAmplificationVersion {
             provider: manifest.provider.clone(),
             source_id: manifest.source_id.clone(),
+            origin_kind: manifest.origin_kind.clone(),
+            origin_host: manifest.origin_host.clone(),
             original_path: manifest.original_path.clone(),
             redacted_original_path: manifest.redacted_original_path.clone(),
             original_path_blake3: manifest.original_path_blake3.clone(),
-            blob_blake3: manifest.blob_blake3.clone(),
-            blob_size_bytes: manifest.blob_size_bytes,
+            snapshot_blake3: manifest.blob_blake3.clone(),
+            stored_blobs: manifest.verified_stored_blobs.clone(),
         })
         .collect::<Vec<_>>();
     doctor_raw_mirror_source_amplification_reports_from_versions(
@@ -43130,6 +43371,16 @@ fn doctor_raw_mirror_source_amplification_reports_from_versions(
     let mut sources: BTreeMap<(String, String), DoctorRawMirrorSourceAmplificationAccumulator> =
         BTreeMap::new();
     for version in versions {
+        // `original_path` is meaningful only on the machine that captured a
+        // local source. A remote manifest can carry the same path text as an
+        // unrelated local file, so comparing its historical bytes with local
+        // filesystem metadata would manufacture an amplification warning.
+        if version.source_id != crate::sources::provenance::LOCAL_SOURCE_ID
+            || version.origin_kind != crate::sources::provenance::LOCAL_SOURCE_ID
+            || version.origin_host.is_some()
+        {
+            continue;
+        }
         let key = (
             version.source_id.clone(),
             version.original_path_blake3.clone(),
@@ -43143,18 +43394,22 @@ fn doctor_raw_mirror_source_amplification_reports_from_versions(
                     original_path: version.original_path.clone(),
                     redacted_original_path: version.redacted_original_path.clone(),
                     original_path_blake3: version.original_path_blake3.clone(),
+                    snapshots: BTreeSet::new(),
                     blobs: BTreeMap::new(),
                 });
         source.providers.insert(version.provider.clone());
-        source
-            .blobs
-            .entry(version.blob_blake3.clone())
-            .or_insert(version.blob_size_bytes);
+        source.snapshots.insert(version.snapshot_blake3.clone());
+        for (blob_blake3, blob_size_bytes) in &version.stored_blobs {
+            source
+                .blobs
+                .entry(blob_blake3.clone())
+                .or_insert(*blob_size_bytes);
+        }
     }
 
     let mut reports = Vec::new();
     for source in sources.into_values() {
-        let version_count = source.blobs.len();
+        let version_count = source.snapshots.len();
         if version_count < 2 {
             continue;
         }
@@ -43274,11 +43529,98 @@ fn doctor_raw_mirror_amplification_version_from_manifest_path(
     if manifest.manifest_blake3.as_deref() != Some(computed_manifest_blake3.as_str()) {
         return None;
     }
+    let mut stored_blobs = vec![(manifest.blob_blake3.clone(), manifest.blob_size_bytes)];
+    let expected_content_blake3 = if let Some(storage) = manifest.content_storage.as_ref() {
+        if storage.get("kind").and_then(serde_json::Value::as_str)
+            != Some("fixed_chunks_v1")
+            || storage
+                .get("content_hash_algorithm")
+                .and_then(serde_json::Value::as_str)
+                != Some(DOCTOR_RAW_MIRROR_HASH_ALGORITHM)
+        {
+            return None;
+        }
+        let content_blake3 = storage
+            .get("content_blake3")
+            .and_then(serde_json::Value::as_str)?;
+        doctor_raw_mirror_blob_relative_path(content_blake3)?;
+        let content_size_bytes = storage
+            .get("content_size_bytes")
+            .and_then(serde_json::Value::as_u64)?;
+        let declared_chunk_size_bytes = storage
+            .get("chunk_size_bytes")
+            .and_then(serde_json::Value::as_u64)?;
+        if declared_chunk_size_bytes == 0 {
+            return None;
+        }
+        if manifest.source_size_bytes != Some(content_size_bytes) {
+            return None;
+        }
+        let chunks = storage
+            .get("chunks")
+            .and_then(serde_json::Value::as_array)?;
+        if chunks.is_empty() {
+            return None;
+        }
+        let mut reconstructed_size_bytes = 0_u64;
+        for (index, chunk) in chunks.iter().enumerate() {
+            let chunk_blake3 = chunk
+                .get("blob_blake3")
+                .and_then(serde_json::Value::as_str)?;
+            let chunk_relative_path = chunk
+                .get("blob_relative_path")
+                .and_then(serde_json::Value::as_str)?;
+            let chunk_blob_size_bytes = chunk
+                .get("blob_size_bytes")
+                .and_then(serde_json::Value::as_u64)?;
+            let is_last = index + 1 == chunks.len();
+            if chunk_blob_size_bytes == 0
+                || chunk_blob_size_bytes > declared_chunk_size_bytes
+                || (!is_last && chunk_blob_size_bytes != declared_chunk_size_bytes)
+            {
+                return None;
+            }
+            reconstructed_size_bytes =
+                reconstructed_size_bytes.checked_add(chunk_blob_size_bytes)?;
+            if doctor_raw_mirror_blob_relative_path(chunk_blake3)?.as_str()
+                != chunk_relative_path
+            {
+                return None;
+            }
+            let relative_chunk =
+                doctor_raw_mirror_validate_relative_path(chunk_relative_path).ok()?;
+            let chunk_path = root.join(relative_chunk);
+            if chunk_path.parent().is_none_or(|parent| {
+                existing_path_has_symlink_below_root(parent, root)
+            }) {
+                return None;
+            }
+            let chunk_metadata = std::fs::symlink_metadata(&chunk_path).ok()?;
+            if chunk_metadata.file_type().is_symlink()
+                || !chunk_metadata.is_file()
+                || chunk_metadata.len() != chunk_blob_size_bytes
+            {
+                return None;
+            }
+            stored_blobs.push((chunk_blake3.to_string(), chunk_blob_size_bytes));
+        }
+        if reconstructed_size_bytes != content_size_bytes
+            || manifest.verification.content_blake3.as_deref() != Some(content_blake3)
+        {
+            return None;
+        }
+        content_blake3
+    } else {
+        if manifest.source_size_bytes != Some(manifest.blob_size_bytes) {
+            return None;
+        }
+        manifest.blob_blake3.as_str()
+    };
     if manifest
         .verification
         .content_blake3
         .as_deref()
-        .is_some_and(|verified| verified != manifest.blob_blake3)
+        .is_some_and(|verified| verified != expected_content_blake3)
     {
         return None;
     }
@@ -43286,11 +43628,13 @@ fn doctor_raw_mirror_amplification_version_from_manifest_path(
     Some(DoctorRawMirrorSourceAmplificationVersion {
         provider: doctor_normalized_provider_slug(&manifest.provider),
         source_id: manifest.source_id,
+        origin_kind: manifest.origin_kind,
+        origin_host: manifest.origin_host,
         original_path: manifest.original_path.clone(),
         redacted_original_path: doctor_redacted_path(&manifest.original_path, data_dir),
         original_path_blake3: manifest.original_path_blake3,
-        blob_blake3: manifest.blob_blake3,
-        blob_size_bytes: manifest.blob_size_bytes,
+        snapshot_blake3: manifest.blob_blake3,
+        stored_blobs,
     })
 }
 
@@ -43298,22 +43642,75 @@ fn doctor_raw_mirror_bounded_amplification_reports(
     data_dir: &Path,
     root: &Path,
     manifest_entries: &[(PathBuf, bool)],
+    inventory_truncated: bool,
     ratio_warn_threshold_milli: u64,
     excess_warn_threshold_bytes: u64,
-) -> Vec<DoctorRawMirrorSourceAmplificationReport> {
-    let versions = manifest_entries
-        .iter()
-        .filter(|(_, is_symlink)| !is_symlink)
-        .filter_map(|(path, _)| {
+) -> DoctorRawMirrorBoundedAmplificationScan {
+    doctor_raw_mirror_bounded_amplification_reports_with_limits(
+        data_dir,
+        root,
+        manifest_entries,
+        inventory_truncated,
+        ratio_warn_threshold_milli,
+        excess_warn_threshold_bytes,
+        DOCTOR_RAW_MIRROR_BOUNDED_AMPLIFICATION_MANIFEST_LIMIT,
+        DOCTOR_RAW_MIRROR_BOUNDED_AMPLIFICATION_BYTE_LIMIT,
+    )
+}
+
+fn doctor_raw_mirror_bounded_amplification_reports_with_limits(
+    data_dir: &Path,
+    root: &Path,
+    manifest_entries: &[(PathBuf, bool)],
+    inventory_truncated: bool,
+    ratio_warn_threshold_milli: u64,
+    excess_warn_threshold_bytes: u64,
+    manifest_limit: usize,
+    byte_limit: u64,
+) -> DoctorRawMirrorBoundedAmplificationScan {
+    let mut versions = Vec::new();
+    let mut scanned_manifest_count = 0_usize;
+    let mut scanned_manifest_bytes = 0_u64;
+    let mut truncated = inventory_truncated;
+    for (path, is_symlink) in manifest_entries {
+        if *is_symlink {
+            continue;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            continue;
+        };
+        if !metadata.is_file()
+            || metadata.len() > DOCTOR_RAW_MIRROR_AMPLIFICATION_MANIFEST_MAX_BYTES
+        {
+            continue;
+        }
+        let Some(next_scanned_bytes) = scanned_manifest_bytes.checked_add(metadata.len()) else {
+            truncated = true;
+            break;
+        };
+        if scanned_manifest_count >= manifest_limit || next_scanned_bytes > byte_limit {
+            truncated = true;
+            break;
+        }
+        scanned_manifest_count += 1;
+        scanned_manifest_bytes = next_scanned_bytes;
+        if let Some(version) =
             doctor_raw_mirror_amplification_version_from_manifest_path(data_dir, root, path)
-        })
-        .collect::<Vec<_>>();
-    doctor_raw_mirror_source_amplification_reports_from_versions(
+        {
+            versions.push(version);
+        }
+    }
+    let reports = doctor_raw_mirror_source_amplification_reports_from_versions(
         &versions,
         "manifest_checksum_and_blob_metadata",
         ratio_warn_threshold_milli,
         excess_warn_threshold_bytes,
-    )
+    );
+    DoctorRawMirrorBoundedAmplificationScan {
+        reports,
+        scanned_manifest_count,
+        truncated,
+    }
 }
 
 fn doctor_raw_mirror_apply_source_amplification_reports(
@@ -43376,6 +43773,50 @@ fn doctor_raw_mirror_full_verify_manifest_limit() -> usize {
         .unwrap_or(DOCTOR_RAW_MIRROR_DEFAULT_FULL_VERIFY_MANIFEST_LIMIT)
 }
 
+fn doctor_raw_mirror_full_verify_byte_limit() -> u64 {
+    dotenvy::var(CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_BYTE_LIMIT)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|&limit| limit > 0)
+        .unwrap_or(DOCTOR_RAW_MIRROR_DEFAULT_FULL_VERIFY_BYTE_LIMIT)
+}
+
+fn doctor_raw_mirror_estimated_verification_bytes(
+    manifest_entries: &[(PathBuf, bool)],
+) -> u64 {
+    let mut estimated_bytes = 0_u64;
+    for (path, is_symlink) in manifest_entries {
+        if *is_symlink {
+            continue;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.len() > DOCTOR_RAW_MIRROR_MANIFEST_MAX_BYTES {
+            continue;
+        }
+        estimated_bytes = estimated_bytes.saturating_add(metadata.len());
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        let Ok(manifest) = serde_json::from_slice::<DoctorRawMirrorManifestFile>(&bytes) else {
+            continue;
+        };
+        estimated_bytes = estimated_bytes.saturating_add(manifest.blob_size_bytes);
+        if manifest.content_storage.is_some() {
+            // Chunked verification reads the manifest a second time through the
+            // raw-mirror validator. The descriptor is read three times total:
+            // once by doctor, then once for its raw checksum and once for typed
+            // descriptor parsing. Chunk bytes are streamed once in source order.
+            estimated_bytes = estimated_bytes
+                .saturating_add(metadata.len())
+                .saturating_add(manifest.blob_size_bytes.saturating_mul(2))
+                .saturating_add(manifest.source_size_bytes.unwrap_or_default());
+        }
+    }
+    estimated_bytes
+}
+
 fn collect_doctor_raw_mirror_report_for_doctor(
     data_dir: &Path,
     mutating_repair_requested: bool,
@@ -43385,6 +43826,7 @@ fn collect_doctor_raw_mirror_report_for_doctor(
     } else {
         DoctorRawMirrorVerificationMode::Bounded {
             manifest_limit: doctor_raw_mirror_full_verify_manifest_limit(),
+            byte_limit: doctor_raw_mirror_full_verify_byte_limit(),
         }
     };
     collect_doctor_raw_mirror_report_with_threshold_and_mode(
@@ -43495,13 +43937,19 @@ fn collect_doctor_raw_mirror_report_with_thresholds_and_mode(
     }
 
     let manifest_root = root.join("manifests");
-    let bounded_manifest_limit = match verification_mode {
-        DoctorRawMirrorVerificationMode::Full => None,
-        DoctorRawMirrorVerificationMode::Bounded { manifest_limit } => Some(manifest_limit),
+    let (bounded_manifest_limit, bounded_byte_limit) = match verification_mode {
+        DoctorRawMirrorVerificationMode::Full => (None, None),
+        DoctorRawMirrorVerificationMode::Bounded {
+            manifest_limit,
+            byte_limit,
+        } => (Some(manifest_limit), Some(byte_limit)),
     };
     let mut manifest_entries: Vec<(PathBuf, bool)> = Vec::new();
     let mut manifest_entry_count = 0usize;
     let mut full_verification_deferred = false;
+    let bounded_inventory_entry_limit = bounded_manifest_limit.map(|limit| {
+        limit.max(DOCTOR_RAW_MIRROR_BOUNDED_AMPLIFICATION_MANIFEST_LIMIT)
+    });
     if manifest_root.exists() {
         for entry in walkdir::WalkDir::new(&manifest_root)
             .follow_links(false)
@@ -43517,7 +43965,14 @@ fn collect_doctor_raw_mirror_report_with_thresholds_and_mode(
                     if bounded_manifest_limit.is_some_and(|limit| manifest_entry_count > limit) {
                         full_verification_deferred = true;
                     }
-                    manifest_entries.push((path.to_path_buf(), entry.file_type().is_symlink()));
+                    if bounded_inventory_entry_limit
+                        .is_none_or(|limit| manifest_entries.len() < limit)
+                    {
+                        manifest_entries.push((
+                            path.to_path_buf(),
+                            entry.file_type().is_symlink(),
+                        ));
+                    }
                 }
                 Ok(_) => {}
                 Err(err) => report
@@ -43527,20 +43982,51 @@ fn collect_doctor_raw_mirror_report_with_thresholds_and_mode(
         }
     }
 
+    let physical_storage_bytes = bounded_byte_limit
+        .map(|_| crate::raw_mirror::physical_storage_bytes(data_dir))
+        .unwrap_or(0);
+    let physical_limit_exceeded =
+        bounded_byte_limit.is_some_and(|limit| physical_storage_bytes > limit);
+    let verification_work_computed = bounded_byte_limit.is_some()
+        && !physical_limit_exceeded
+        && !full_verification_deferred;
+    let estimated_verification_bytes = if verification_work_computed {
+        doctor_raw_mirror_estimated_verification_bytes(&manifest_entries)
+    } else {
+        0
+    };
+    let verification_work_limit_exceeded = bounded_byte_limit
+        .is_some_and(|limit| estimated_verification_bytes > limit);
+    if physical_limit_exceeded || verification_work_limit_exceeded {
+        full_verification_deferred = true;
+    }
+
     if full_verification_deferred {
         report.summary.manifest_count = manifest_entry_count;
         report.status = "verification_deferred".to_string();
-        let amplified_sources = doctor_raw_mirror_bounded_amplification_reports(
+        let amplification_scan = doctor_raw_mirror_bounded_amplification_reports(
             data_dir,
             &root,
             &manifest_entries,
+            manifest_entries.len() < manifest_entry_count,
             source_amplification_ratio_warn_threshold_milli,
             source_amplification_excess_warn_threshold_bytes,
         );
-        doctor_raw_mirror_apply_source_amplification_reports(&mut report, amplified_sources);
+        doctor_raw_mirror_apply_source_amplification_reports(
+            &mut report,
+            amplification_scan.reports,
+        );
         let limit = bounded_manifest_limit.unwrap_or(0);
+        let byte_limit = bounded_byte_limit.unwrap_or(0);
+        let verification_work = if physical_limit_exceeded {
+            "not computed because the physical-byte limit was already exceeded".to_string()
+        } else if !verification_work_computed {
+            "not computed because the manifest-count limit was already exceeded".to_string()
+        } else {
+            format!("{estimated_verification_bytes} bytes")
+        };
         report.warnings.push(format!(
-            "Raw mirror verification deferred: {manifest_entry_count} manifest(s) exceed the bounded doctor limit of {limit}; set {CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY}=1 to run a full blob checksum verification."
+            "Raw mirror verification deferred: inventory has {manifest_entry_count} manifest(s) and {physical_storage_bytes} physical bytes across blobs, manifests, logs, and interrupted temp artifacts; estimated full verification work is {verification_work}. Bounded doctor limits are {limit} manifests, {byte_limit} physical bytes, and {byte_limit} estimated verification-work bytes. Set {CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY}=1 to run a full blob checksum verification."
         ));
         report.notes.push(
             "Bounded doctor mode does not claim raw mirror blobs are verified until full checksum verification runs."
@@ -43550,6 +44036,16 @@ fn collect_doctor_raw_mirror_report_with_thresholds_and_mode(
             "Per-source amplification remains available in bounded mode using checksum-verified manifest metadata plus regular-file blob sizes; this evidence measures storage growth but is not blob-content or restore-authority proof."
                 .to_string(),
         );
+        report.notes.push(format!(
+            "Bounded amplification diagnostics scanned {} of {} manifest entries{}.",
+            amplification_scan.scanned_manifest_count,
+            manifest_entry_count,
+            if amplification_scan.truncated {
+                "; the evidence is partial because the metadata scan cap was reached"
+            } else {
+                ""
+            }
+        ));
         return report;
     }
 
@@ -43559,6 +44055,17 @@ fn collect_doctor_raw_mirror_report_with_thresholds_and_mode(
                 data_dir,
                 &path,
                 "manifest path is a symlink".to_string(),
+            )
+        } else if std::fs::symlink_metadata(&path)
+            .is_ok_and(|metadata| metadata.len() > DOCTOR_RAW_MIRROR_MANIFEST_MAX_BYTES)
+        {
+            doctor_raw_mirror_invalid_manifest_report(
+                data_dir,
+                &path,
+                format!(
+                    "manifest exceeds the {}-byte validation limit",
+                    DOCTOR_RAW_MIRROR_MANIFEST_MAX_BYTES
+                ),
             )
         } else {
             match std::fs::read_to_string(&path)
@@ -43585,15 +44092,19 @@ fn collect_doctor_raw_mirror_report_with_thresholds_and_mode(
     let mut blob_reference_counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut verified_blob_bytes: BTreeMap<String, u64> = BTreeMap::new();
     for manifest in &report.manifests {
-        if !manifest.blob_blake3.is_empty() {
+        if !manifest.verified_stored_blobs.is_empty() {
+            for (blob_blake3, blob_size_bytes) in &manifest.verified_stored_blobs {
+                *blob_reference_counts
+                    .entry(blob_blake3.clone())
+                    .or_default() += 1;
+                verified_blob_bytes
+                    .entry(blob_blake3.clone())
+                    .or_insert(*blob_size_bytes);
+            }
+        } else if !manifest.blob_blake3.is_empty() {
             *blob_reference_counts
                 .entry(manifest.blob_blake3.clone())
                 .or_default() += 1;
-            if manifest.blob_checksum_status == DoctorArtifactChecksumStatus::Matched {
-                verified_blob_bytes
-                    .entry(manifest.blob_blake3.clone())
-                    .or_insert(manifest.blob_size_bytes);
-            }
         }
         if manifest.blob_checksum_status == DoctorArtifactChecksumStatus::Missing {
             report.summary.missing_blob_count += 1;
@@ -44689,6 +45200,14 @@ pub(crate) fn run_doctor_archive_scan_impl(
         }
     });
     if let Some(fmt) = structured_format {
+        let mut output_backfill = context.raw_mirror_backfill;
+        let mut output_sole_copy_warnings = context.sole_copy_warnings;
+        let detail_output = bounded_doctor_structured_details(
+            &mut output_backfill,
+            &mut output_sole_copy_warnings,
+            verbose,
+            "cass doctor archive-scan --json --verbose",
+        );
         return output_structured_value(
             serde_json::json!({
                 "status": context.scan.status,
@@ -44707,9 +45226,10 @@ pub(crate) fn run_doctor_archive_scan_impl(
                 "findings": &context.scan.findings,
                 "source_inventory": &context.source_inventory,
                 "raw_mirror": &context.raw_mirror,
-                "raw_mirror_backfill": &context.raw_mirror_backfill,
+                "raw_mirror_backfill": output_backfill,
                 "coverage_summary": &context.coverage_summary,
-                "sole_copy_warnings": &context.sole_copy_warnings,
+                "sole_copy_warnings": output_sole_copy_warnings,
+                "detail_output": detail_output,
                 "coverage_risk": &context.coverage_risk,
                 "source_authority": &context.source_authority,
                 "_meta": {
@@ -44839,6 +45359,14 @@ pub(crate) fn run_doctor_archive_normalize_impl(
     };
     let mutation_performed = receipt.mutation_performed;
     if let Some(fmt) = structured_format {
+        let mut output_backfill = context.raw_mirror_backfill;
+        let mut output_sole_copy_warnings = context.sole_copy_warnings;
+        let detail_output = bounded_doctor_structured_details(
+            &mut output_backfill,
+            &mut output_sole_copy_warnings,
+            verbose,
+            "cass doctor archive-normalize --dry-run --json --verbose",
+        );
         output_structured_value(
             serde_json::json!({
                 "status": status,
@@ -44864,9 +45392,10 @@ pub(crate) fn run_doctor_archive_normalize_impl(
                 "skipped_risky_actions": &plan.skipped_actions,
                 "source_inventory": &context.source_inventory,
                 "raw_mirror": &context.raw_mirror,
-                "raw_mirror_backfill": &context.raw_mirror_backfill,
+                "raw_mirror_backfill": output_backfill,
                 "coverage_summary": &context.coverage_summary,
-                "sole_copy_warnings": &context.sole_copy_warnings,
+                "sole_copy_warnings": output_sole_copy_warnings,
+                "detail_output": detail_output,
                 "coverage_risk": &context.coverage_risk,
                 "source_authority": &context.source_authority,
                 "_meta": {
@@ -45036,16 +45565,14 @@ fn doctor_raw_mirror_backfill_source_path_blake3(path: &str) -> String {
 }
 
 fn doctor_raw_mirror_backfill_source_key(
-    provider: &str,
     source_id: &str,
     origin_kind: &str,
     origin_host: Option<&str>,
     source_path: &str,
 ) -> String {
     doctor_canonical_blake3(
-        "doctor-raw-mirror-backfill-source-key-v1",
+        "doctor-raw-mirror-backfill-source-key-v2",
         serde_json::json!({
-            "provider": provider,
             "source_id": source_id,
             "origin_kind": origin_kind,
             "origin_host": origin_host,
@@ -45083,10 +45610,18 @@ fn doctor_raw_mirror_backfill_source_stat(
                 "other"
             }
             .to_string();
-            let content_blake3 = if metadata.is_file() && !metadata.file_type().is_symlink() {
-                doctor_file_blake3(path).ok()
+            let (content_blake3, stat_error) = if metadata.is_file()
+                && !metadata.file_type().is_symlink()
+            {
+                match doctor_file_blake3(path) {
+                    Ok(hash) => (Some(hash), None),
+                    Err(err) => (
+                        None,
+                        Some(format!("failed to hash source contents: {err}")),
+                    ),
+                }
             } else {
-                None
+                (None, None)
             };
             DoctorRawMirrorBackfillSourceStatSnapshot {
                 exists: true,
@@ -45094,7 +45629,7 @@ fn doctor_raw_mirror_backfill_source_stat(
                 size_bytes: metadata.is_file().then_some(metadata.len()),
                 modified_at_ms: metadata.modified().ok().and_then(system_time_to_unix_ms),
                 content_blake3,
-                stat_error: None,
+                stat_error,
             }
         }
         Err(err) => DoctorRawMirrorBackfillSourceStatSnapshot {
@@ -45121,6 +45656,10 @@ fn doctor_raw_mirror_existing_evidence(
         manifest_relative_path: doctor_raw_mirror_manifest_relative_path(&manifest.manifest_id),
         blob_blake3: manifest.blob_blake3.clone(),
         blob_size_bytes: manifest.blob_size_bytes,
+        source_content_blake3: manifest.source_content_blake3.clone(),
+        source_size_bytes: manifest.source_size_bytes,
+        storage_kind: manifest.storage_kind.clone(),
+        chunk_count: manifest.chunk_count,
         captured_at_ms: manifest.captured_at_ms,
         source_mtime_ms: manifest.source_mtime_ms,
         db_linked,
@@ -45146,6 +45685,11 @@ fn doctor_raw_mirror_existing_evidence_maps(
             if let Some(conversation_id) = link.conversation_id {
                 by_conversation_id
                     .entry(conversation_id)
+                    .and_modify(|existing| {
+                        if doctor_raw_mirror_evidence_is_newer(&linked_evidence, existing) {
+                            *existing = linked_evidence.clone();
+                        }
+                    })
                     .or_insert_with(|| linked_evidence.clone());
             }
         }
@@ -45153,7 +45697,6 @@ fn doctor_raw_mirror_existing_evidence_maps(
         if !manifest.original_path.trim().is_empty() {
             let has_db_link = !manifest.db_links.is_empty();
             let source_key = doctor_raw_mirror_backfill_source_key(
-                &manifest.provider,
                 &manifest.source_id,
                 &manifest.origin_kind,
                 manifest.origin_host.as_deref(),
@@ -45163,7 +45706,7 @@ fn doctor_raw_mirror_existing_evidence_maps(
             by_source_key
                 .entry(source_key)
                 .and_modify(|existing| {
-                    if evidence.captured_at_ms < existing.captured_at_ms {
+                    if doctor_raw_mirror_evidence_is_newer(&evidence, existing) {
                         *existing = evidence.clone();
                     }
                 })
@@ -45172,6 +45715,21 @@ fn doctor_raw_mirror_existing_evidence_maps(
     }
 
     (by_conversation_id, by_source_key)
+}
+
+fn doctor_raw_mirror_evidence_is_newer(
+    candidate: &DoctorRawMirrorExistingEvidence,
+    current: &DoctorRawMirrorExistingEvidence,
+) -> bool {
+    (
+        candidate.captured_at_ms,
+        candidate.source_mtime_ms.unwrap_or(i64::MIN),
+        candidate.manifest_id.as_str(),
+    ) > (
+        current.captured_at_ms,
+        current.source_mtime_ms.unwrap_or(i64::MIN),
+        current.manifest_id.as_str(),
+    )
 }
 
 fn doctor_raw_mirror_backfill_db_link(
@@ -45223,6 +45781,11 @@ fn doctor_raw_mirror_backfill_mark_existing_evidence(
     receipt.raw_mirror_manifest_relative_path = Some(evidence.manifest_relative_path.clone());
     receipt.raw_mirror_blob_blake3 = Some(evidence.blob_blake3.clone());
     receipt.raw_mirror_blob_size_bytes = Some(evidence.blob_size_bytes);
+    receipt.raw_mirror_source_content_blake3 =
+        Some(evidence.source_content_blake3.clone());
+    receipt.raw_mirror_source_size_bytes = evidence.source_size_bytes;
+    receipt.raw_mirror_storage_kind = Some(evidence.storage_kind.clone());
+    receipt.raw_mirror_chunk_count = Some(evidence.chunk_count);
     if evidence.source_mtime_ms.is_none() {
         receipt
             .warnings
@@ -45234,14 +45797,27 @@ fn doctor_raw_mirror_backfill_live_source_changed(
     receipt: &mut DoctorRawMirrorBackfillReceipt,
     evidence: &DoctorRawMirrorExistingEvidence,
 ) -> bool {
+    if let Some(snapshot) = receipt.source_stat_snapshot.as_ref()
+        && snapshot.file_type == "file"
+        && snapshot.content_blake3.is_none()
+    {
+        receipt.warnings.push(format!(
+            "current upstream file could not be checksum-verified against the raw mirror source digest: {}",
+            snapshot
+                .stat_error
+                .as_deref()
+                .unwrap_or("source content hash unavailable")
+        ));
+        return false;
+    }
     let changed = receipt
         .source_stat_snapshot
         .as_ref()
         .and_then(|snapshot| snapshot.content_blake3.as_deref())
-        .is_some_and(|current_hash| current_hash != evidence.blob_blake3);
+        .is_some_and(|current_hash| current_hash != evidence.source_content_blake3);
     if changed {
         receipt.warnings.push(
-            "current upstream file hash differs from the verified raw mirror blob; backfill keeps the existing raw mirror evidence rather than recapturing changed live bytes".to_string(),
+            "current upstream file hash differs from the verified raw mirror source digest; backfill keeps the existing raw mirror evidence rather than recapturing changed live bytes".to_string(),
         );
     }
     changed
@@ -45252,6 +45828,7 @@ fn doctor_raw_mirror_backfill_candidate_receipt(
     candidate: &DoctorRawMirrorBackfillCandidate,
     by_conversation_id: &HashMap<i64, DoctorRawMirrorExistingEvidence>,
     by_source_key: &HashMap<String, DoctorRawMirrorExistingEvidence>,
+    source_stat_cache: &mut HashMap<PathBuf, DoctorRawMirrorBackfillSourceStatSnapshot>,
     apply: bool,
 ) -> DoctorRawMirrorBackfillReceipt {
     let provider = doctor_normalized_provider_slug(&candidate.provider);
@@ -45309,13 +45886,15 @@ fn doctor_raw_mirror_backfill_candidate_receipt(
     }
 
     let source_key = doctor_raw_mirror_backfill_source_key(
-        &provider,
         &source_id,
         &origin_kind,
         origin_host.as_deref(),
         &source_path,
     );
-    let source_stat = doctor_raw_mirror_backfill_source_stat(path);
+    let source_stat = source_stat_cache
+        .entry(path.to_path_buf())
+        .or_insert_with(|| doctor_raw_mirror_backfill_source_stat(path))
+        .clone();
     receipt.source_stat_snapshot = Some(source_stat.clone());
     receipt.source_missing = !source_stat.exists;
 
@@ -45391,6 +45970,18 @@ fn doctor_raw_mirror_backfill_candidate_receipt(
         ));
         return receipt;
     }
+    if source_stat.content_blake3.is_none() {
+        receipt.action = "source_content_unverified_db_projection_only".to_string();
+        receipt.db_projection_only = true;
+        receipt.warnings.push(format!(
+            "source file metadata was readable but its contents could not be checksum-verified; doctor refuses raw-mirror capture: {}",
+            source_stat
+                .stat_error
+                .as_deref()
+                .unwrap_or("source content hash unavailable")
+        ));
+        return receipt;
+    }
 
     if !apply {
         receipt.action = "would_capture_live_source".to_string();
@@ -45415,11 +46006,20 @@ fn doctor_raw_mirror_backfill_candidate_receipt(
             };
             receipt.raw_source_captured = true;
             receipt.raw_mirror_db_linked = true;
+            if let Some(snapshot) = receipt.source_stat_snapshot.as_mut() {
+                snapshot.size_bytes = Some(record.source_size_bytes);
+                snapshot.modified_at_ms = record.source_mtime_ms;
+                snapshot.content_blake3 = Some(record.source_content_blake3.clone());
+            }
             receipt.captured_at_ms = Some(record.captured_at_ms);
             receipt.raw_mirror_manifest_id = Some(record.manifest_id);
             receipt.raw_mirror_manifest_relative_path = Some(record.manifest_relative_path);
             receipt.raw_mirror_blob_blake3 = Some(record.blob_blake3);
             receipt.raw_mirror_blob_size_bytes = Some(record.blob_size_bytes);
+            receipt.raw_mirror_source_content_blake3 = Some(record.source_content_blake3);
+            receipt.raw_mirror_source_size_bytes = Some(record.source_size_bytes);
+            receipt.raw_mirror_storage_kind = Some(record.storage_kind);
+            receipt.raw_mirror_chunk_count = Some(record.chunk_count);
         }
         Err(err) => {
             receipt.action = "capture_live_source_failed".to_string();
@@ -45546,7 +46146,7 @@ fn collect_doctor_raw_mirror_backfill_report(
             candidates
         }
         Err(err) => {
-            report.db_available = true;
+            report.db_available = false;
             report.status = "warn".to_string();
             report.db_query_error = Some(err.message.clone());
             report
@@ -45557,6 +46157,10 @@ fn collect_doctor_raw_mirror_backfill_report(
     };
 
     let (by_conversation_id, by_source_key) = doctor_raw_mirror_existing_evidence_maps(raw_mirror);
+    let mut source_stat_cache: HashMap<
+        PathBuf,
+        DoctorRawMirrorBackfillSourceStatSnapshot,
+    > = HashMap::new();
     if apply {
         let dry_run_receipts = candidates
             .iter()
@@ -45566,6 +46170,7 @@ fn collect_doctor_raw_mirror_backfill_report(
                     candidate,
                     &by_conversation_id,
                     &by_source_key,
+                    &mut source_stat_cache,
                     false,
                 )
             })
@@ -45614,6 +46219,7 @@ fn collect_doctor_raw_mirror_backfill_report(
             candidate,
             &by_conversation_id,
             &by_source_key,
+            &mut source_stat_cache,
             apply,
         );
         let mutating_receipt = receipt.raw_source_captured
@@ -45663,7 +46269,11 @@ fn collect_doctor_raw_mirror_backfill_report(
     report
 }
 
-fn doctor_raw_mirror_backfill_deferred(apply: bool, reason: &str) -> DoctorRawMirrorBackfillReport {
+fn doctor_raw_mirror_backfill_deferred(
+    apply: bool,
+    reason: &str,
+    forensic_reason: &'static str,
+) -> DoctorRawMirrorBackfillReport {
     DoctorRawMirrorBackfillReport {
         schema_version: 1,
         backfill_generation: DOCTOR_RAW_MIRROR_BACKFILL_GENERATION,
@@ -45676,7 +46286,7 @@ fn doctor_raw_mirror_backfill_deferred(apply: bool, reason: &str) -> DoctorRawMi
         db_available: false,
         db_query_error: Some(reason.to_string()),
         read_only_external_source_dirs: true,
-        forensic_bundle: doctor_forensic_bundle_uncaptured("archive_wide_collectors_deferred"),
+        forensic_bundle: doctor_forensic_bundle_uncaptured(forensic_reason),
         warnings: vec![reason.to_string()],
         notes: vec![
             "Archive-wide raw-mirror backfill candidates were not scanned; zero-valued candidate and coverage fields are unknown, not evidence of absence."
@@ -45686,6 +46296,30 @@ fn doctor_raw_mirror_backfill_deferred(apply: bool, reason: &str) -> DoctorRawMi
         ],
         ..DoctorRawMirrorBackfillReport::default()
     }
+}
+
+fn collect_doctor_raw_mirror_backfill_report_for_doctor(
+    data_dir: &Path,
+    db_path: &Path,
+    raw_mirror: &DoctorRawMirrorReport,
+    apply: bool,
+    archive_wide_collectors_deferred_reason: Option<&str>,
+) -> DoctorRawMirrorBackfillReport {
+    if let Some(reason) = archive_wide_collectors_deferred_reason {
+        return doctor_raw_mirror_backfill_deferred(
+            apply,
+            reason,
+            "archive_wide_collectors_deferred",
+        );
+    }
+    if raw_mirror.status == "verification_deferred" {
+        return doctor_raw_mirror_backfill_deferred(
+            apply,
+            "raw mirror verification was deferred by the bounded read-only doctor limits; backfill is also deferred because unverified manifests must not be treated as absent evidence",
+            "raw_mirror_verification_deferred",
+        );
+    }
+    collect_doctor_raw_mirror_backfill_report(data_dir, db_path, raw_mirror, apply)
 }
 
 fn doctor_coverage_confidence_tier(
@@ -47329,14 +47963,12 @@ fn doctor_candidate_raw_mirror_key(manifest: &DoctorRawMirrorManifestReport) -> 
         return format!("archive-conversation-id:{conversation_id}");
     }
     doctor_canonical_blake3(
-        "doctor-candidate-raw-mirror-dedupe-key-v1",
+        "doctor-candidate-raw-mirror-dedupe-key-v2",
         serde_json::json!({
-            "provider": manifest.provider,
             "source_id": manifest.source_id,
             "origin_kind": manifest.origin_kind,
             "origin_host": manifest.origin_host,
             "original_path_blake3": manifest.original_path_blake3,
-            "blob_blake3": manifest.blob_blake3,
         }),
     )
 }
@@ -47357,42 +47989,12 @@ fn doctor_candidate_read_verified_raw_mirror_blob(
             manifest.manifest_id, manifest.compression_state, manifest.encryption_state
         ));
     }
-
-    let root = doctor_raw_mirror_root(data_dir);
-    let relative_blob = doctor_raw_mirror_validate_relative_path(&manifest.blob_relative_path)?;
-    let blob_path = root.join(relative_blob);
-    if !blob_path.starts_with(&root) || path_has_symlink_below_root(&blob_path, &root) {
-        return Err(format!(
-            "refusing to read unsafe raw mirror blob path for manifest {}",
-            manifest.manifest_id
-        ));
-    }
-    let metadata = std::fs::symlink_metadata(&blob_path).map_err(|err| {
+    crate::raw_mirror::read_source_bytes(data_dir, &manifest.manifest_id).map_err(|error| {
         format!(
-            "failed to inspect raw mirror blob for manifest {}: {err}",
+            "raw mirror source verification changed before reconstruction for manifest {}: {error}",
             manifest.manifest_id
         )
-    })?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(format!(
-            "refusing to read non-regular raw mirror blob for manifest {}",
-            manifest.manifest_id
-        ));
-    }
-    let bytes = std::fs::read(&blob_path).map_err(|err| {
-        format!(
-            "failed to read raw mirror blob for manifest {}: {err}",
-            manifest.manifest_id
-        )
-    })?;
-    let observed_hash = blake3::hash(&bytes).to_hex().to_string();
-    if observed_hash != manifest.blob_blake3 || bytes.len() as u64 != manifest.blob_size_bytes {
-        return Err(format!(
-            "raw mirror blob verification changed before reconstruction for manifest {}",
-            manifest.manifest_id
-        ));
-    }
-    Ok(bytes)
+    })
 }
 
 fn doctor_candidate_message_role(value: &serde_json::Value) -> crate::model::types::MessageRole {
@@ -47571,7 +48173,7 @@ fn doctor_candidate_conversation_from_raw_mirror(
             "doctor-reconstruct-raw-mirror-external-id-v1",
             serde_json::json!({
                 "manifest_id": manifest.manifest_id,
-                "blob_blake3": manifest.blob_blake3,
+                "source_content_blake3": manifest.source_content_blake3,
                 "db_link_conversation_ids": db_link_conversation_ids,
             }),
         )),
@@ -47591,6 +48193,10 @@ fn doctor_candidate_conversation_from_raw_mirror(
                     "manifest_id": manifest.manifest_id,
                     "blob_blake3": manifest.blob_blake3,
                     "blob_size_bytes": manifest.blob_size_bytes,
+                    "storage_kind": manifest.storage_kind,
+                    "source_content_blake3": manifest.source_content_blake3,
+                    "source_size_bytes": manifest.source_size_bytes,
+                    "chunk_count": manifest.chunk_count,
                     "redacted_original_path": manifest.redacted_original_path,
                     "original_path_blake3": manifest.original_path_blake3,
                     "db_link_count": manifest.db_link_count,
@@ -47611,13 +48217,8 @@ fn doctor_candidate_copy_raw_mirror_evidence_to_staging(
 ) -> Vec<DoctorFsMutationReceipt> {
     let mut receipts = Vec::new();
     let evidence_root = context.candidate_dir.join("evidence/raw-mirror");
-    for relative in [
-        PathBuf::from("blobs").join(format!("{}.raw", manifest.blob_blake3)),
-        PathBuf::from("manifests").join(format!("{}.json", manifest.manifest_id)),
-    ] {
-        if let Some(parent) = evidence_root.join(&relative).parent()
-            && let Err(err) = doctor_forensic_create_private_dir_all(parent)
-        {
+    for directory in [evidence_root.join("blobs"), evidence_root.join("manifests")] {
+        if let Err(err) = doctor_forensic_create_private_dir_all(&directory) {
             receipts.push(DoctorFsMutationReceipt {
                 schema_version: 1,
                 operation_id: context.operation_id.to_string(),
@@ -47628,9 +48229,9 @@ fn doctor_candidate_copy_raw_mirror_evidence_to_staging(
                 asset_class: DoctorAssetClass::RawMirrorBlob,
                 source_path: None,
                 redacted_source_path: None,
-                target_path: parent.display().to_string(),
+                target_path: directory.display().to_string(),
                 redacted_target_path: doctor_redacted_path(
-                    &parent.display().to_string(),
+                    &directory.display().to_string(),
                     context.data_dir,
                 ),
                 staging_root: Some(context.candidate_dir.display().to_string()),
@@ -47656,16 +48257,67 @@ fn doctor_candidate_copy_raw_mirror_evidence_to_staging(
         }
     }
 
-    let blob_path = PathBuf::from(&manifest.blob_path);
-    receipts.push(doctor_candidate_copy_to_staging(
-        context,
-        "copy-raw-mirror-blob-to-candidate",
-        &blob_path,
-        &evidence_root
-            .join("blobs")
-            .join(format!("{}.raw", manifest.blob_blake3)),
-        DoctorAssetClass::RawMirrorBlob,
-    ));
+    let stored_blobs = if manifest.verified_stored_blobs.is_empty() {
+        vec![(manifest.blob_blake3.clone(), manifest.blob_size_bytes)]
+    } else {
+        manifest.verified_stored_blobs.clone()
+    };
+    for (index, (blob_blake3, _)) in stored_blobs.into_iter().enumerate() {
+        let Some(blob_relative_path) = doctor_raw_mirror_blob_relative_path(&blob_blake3) else {
+            continue;
+        };
+        let source_path = doctor_raw_mirror_root(context.data_dir).join(&blob_relative_path);
+        let target_path = evidence_root.join(&blob_relative_path);
+        if let Some(parent) = target_path.parent()
+            && let Err(err) = doctor_forensic_create_private_dir_all(parent)
+        {
+            receipts.push(DoctorFsMutationReceipt {
+                schema_version: 1,
+                operation_id: context.operation_id.to_string(),
+                action_id: format!("prepare-raw-mirror-blob-{index}"),
+                mutation_kind: DoctorFsMutationKind::CopyFileToStaging,
+                fallback_kind: None,
+                mode: DoctorRepairMode::ReconstructPromote,
+                asset_class: DoctorAssetClass::RawMirrorBlob,
+                source_path: None,
+                redacted_source_path: None,
+                target_path: parent.display().to_string(),
+                redacted_target_path: doctor_redacted_path(
+                    &parent.display().to_string(),
+                    context.data_dir,
+                ),
+                staging_root: Some(context.candidate_dir.display().to_string()),
+                redacted_staging_root: Some(doctor_redacted_path(
+                    &context.candidate_dir.display().to_string(),
+                    context.data_dir,
+                )),
+                expected_source_blake3: Some(blob_blake3.clone()),
+                actual_source_blake3: None,
+                actual_target_blake3: None,
+                planned_bytes: 0,
+                affected_bytes: 0,
+                status: DoctorActionStatus::Failed,
+                blocked_reasons: vec![format!(
+                    "failed to create raw mirror blob evidence parent: {err}"
+                )],
+                precondition_checks: Vec::new(),
+                forensic_bundle: doctor_forensic_bundle_uncaptured(
+                    "not_captured_for_failed_evidence_parent_creation",
+                ),
+            });
+            continue;
+        }
+        receipts.push(doctor_candidate_copy_to_staging(
+            context,
+            &format!(
+                "copy-raw-mirror-blob-{}-to-candidate",
+                &blob_blake3[..12]
+            ),
+            &source_path,
+            &target_path,
+            DoctorAssetClass::RawMirrorBlob,
+        ));
+    }
     let manifest_path = PathBuf::from(&manifest.manifest_path);
     receipts.push(doctor_candidate_copy_to_staging(
         context,
@@ -47699,13 +48351,22 @@ fn doctor_candidate_reconstruct_archive_from_raw_mirror(
     let mut evidence_sources = Vec::new();
     let mut receipts = Vec::new();
 
-    for manifest in raw_mirror
+    let mut verified_manifests = raw_mirror
         .manifests
         .iter()
         .filter(|manifest| doctor_raw_mirror_manifest_is_verified(manifest))
-    {
+        .collect::<Vec<_>>();
+    verified_manifests.sort_by(|left, right| {
+        right
+            .captured_at_ms
+            .cmp(&left.captured_at_ms)
+            .then_with(|| right.source_mtime_ms.cmp(&left.source_mtime_ms))
+            .then_with(|| left.manifest_id.cmp(&right.manifest_id))
+    });
+
+    for manifest in verified_manifests {
         let key = doctor_candidate_raw_mirror_key(manifest);
-        if !seen.insert(key.clone()) {
+        if seen.contains(&key) {
             skipped_records.push(serde_json::json!({
                 "manifest_id": manifest.manifest_id,
                 "status": "skipped",
@@ -47755,6 +48416,7 @@ fn doctor_candidate_reconstruct_archive_from_raw_mirror(
                 )
             })?;
         if !outcome.conversation_inserted && outcome.inserted_indices.is_empty() {
+            seen.insert(key);
             skipped_records.push(serde_json::json!({
                 "manifest_id": manifest.manifest_id,
                 "status": "skipped",
@@ -47765,6 +48427,7 @@ fn doctor_candidate_reconstruct_archive_from_raw_mirror(
             }));
             continue;
         }
+        seen.insert(key);
         inserted_conversations += usize::from(outcome.conversation_inserted);
         inserted_messages += message_count;
         evidence_sources.push(format!(
@@ -62498,7 +63161,14 @@ fn execute_doctor_copy_file_to_staging(
         .push("source_blake3_recorded".to_string());
 
     match std::fs::symlink_metadata(request.target_path) {
-        Ok(_) => {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                receipt.blocked_reasons.push(format!(
+                    "refusing to overwrite existing staging target {} because it is non-regular or a symlink",
+                    request.target_path.display()
+                ));
+                return receipt;
+            }
             // Content-addressed staging copies (e.g. raw-mirror blobs named by
             // their blake3) can legitimately collide when two distinct verified
             // manifests reference byte-identical evidence. An existing target
@@ -63289,7 +63959,7 @@ fn doctor_fs_mutation_action_id(
 fn file_blake3_hex(path: &Path) -> Result<String, String> {
     use std::io::Read as _;
 
-    let mut file = std::fs::File::open(path)
+    let mut file = doctor_open_regular_file_for_read(path)
         .map_err(|err| format!("failed to open {} for blake3: {err}", path.display()))?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0_u8; 64 * 1024];
@@ -68931,6 +69601,10 @@ mod doctor_asset_taxonomy_tests {
                         .to_string(),
                     blob_blake3: "00".repeat(32),
                     blob_size_bytes: 12,
+                    storage_kind: "whole_blob_v1".to_string(),
+                    source_content_blake3: "00".repeat(32),
+                    chunk_count: 1,
+                    verified_stored_blobs: vec![("00".repeat(32), 12)],
                     provider: "codex".to_string(),
                     source_id: crate::sources::provenance::LOCAL_SOURCE_ID.to_string(),
                     origin_kind: "local".to_string(),
@@ -68976,6 +69650,10 @@ mod doctor_asset_taxonomy_tests {
                         .to_string(),
                     blob_blake3: "ff".repeat(32),
                     blob_size_bytes: 9,
+                    storage_kind: "whole_blob_v1".to_string(),
+                    source_content_blake3: "ff".repeat(32),
+                    chunk_count: 1,
+                    verified_stored_blobs: Vec::new(),
                     provider: "codex".to_string(),
                     source_id: crate::sources::provenance::LOCAL_SOURCE_ID.to_string(),
                     origin_kind: "local".to_string(),
@@ -69018,6 +69696,33 @@ mod doctor_asset_taxonomy_tests {
             .expect("insert conversation");
         conn.execute("INSERT INTO messages (id) VALUES (1);")
             .expect("insert message");
+    }
+
+    #[test]
+    fn raw_mirror_candidate_fallback_key_groups_versions_and_provider_reclassification() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let report = test_doctor_raw_mirror_report_for_candidate(&data_dir);
+        let mut first = report.manifests[0].clone();
+        first.db_links.clear();
+        let mut later = first.clone();
+        later.provider = "omp".to_string();
+        later.manifest_id = "later-manifest".to_string();
+        later.blob_blake3 = "22".repeat(32);
+        later.source_content_blake3 = "33".repeat(32);
+        later.captured_at_ms += 1;
+
+        assert_eq!(
+            doctor_candidate_raw_mirror_key(&first),
+            doctor_candidate_raw_mirror_key(&later),
+            "content changes and provider reclassification must remain versions of one physical source"
+        );
+        later.original_path_blake3 = "different-path".to_string();
+        assert_ne!(
+            doctor_candidate_raw_mirror_key(&first),
+            doctor_candidate_raw_mirror_key(&later),
+            "distinct physical source paths must remain separate recovery candidates"
+        );
     }
 
     #[test]
@@ -69227,10 +69932,16 @@ mod doctor_asset_taxonomy_tests {
         );
 
         let candidate_dir = PathBuf::from(build.path.as_deref().expect("candidate path"));
+        let staged_blob_relative = doctor_raw_mirror_blob_relative_path(&manifest.blob_blake3)
+            .expect("canonical staged blob path");
         assert!(
             candidate_dir
                 .join("evidence/raw-mirror/blobs")
-                .join(format!("{}.raw", manifest.blob_blake3))
+                .join(
+                    staged_blob_relative
+                        .strip_prefix("blobs/")
+                        .expect("blob path prefix"),
+                )
                 .exists(),
             "candidate should stage raw mirror blob evidence"
         );
@@ -69281,7 +69992,7 @@ mod doctor_asset_taxonomy_tests {
             source_path: Some(source_a.display().to_string()),
             started_at_ms: Some(1_700_000_000_000),
         };
-        let manifest_a = raw_mirror_test_manifest(
+        let mut manifest_a = raw_mirror_test_manifest(
             &data_dir,
             "codex",
             "local",
@@ -69289,7 +70000,7 @@ mod doctor_asset_taxonomy_tests {
             bytes_a,
             vec![duplicate_link.clone()],
         );
-        let manifest_b = raw_mirror_test_manifest(
+        let mut manifest_b = raw_mirror_test_manifest(
             &data_dir,
             "codex",
             "local",
@@ -69297,6 +70008,12 @@ mod doctor_asset_taxonomy_tests {
             bytes_b,
             vec![duplicate_link],
         );
+        manifest_a.captured_at_ms = 1_733_000_000_100;
+        manifest_a.source_mtime_ms = Some(1_733_000_000_100);
+        manifest_a.manifest_blake3 = Some(doctor_raw_mirror_manifest_blake3(&manifest_a));
+        manifest_b.captured_at_ms = 1_733_000_000_200;
+        manifest_b.source_mtime_ms = Some(1_733_000_000_200);
+        manifest_b.manifest_blake3 = Some(doctor_raw_mirror_manifest_blake3(&manifest_b));
         write_raw_mirror_test_manifest(&data_dir, &manifest_a, bytes_a);
         write_raw_mirror_test_manifest(&data_dir, &manifest_b, bytes_b);
         let raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
@@ -69325,6 +70042,20 @@ mod doctor_asset_taxonomy_tests {
         assert_eq!(build.candidate_conversation_count, Some(1));
         assert_eq!(build.candidate_message_count, Some(1));
         assert!(
+            build
+                .evidence_sources
+                .iter()
+                .any(|source| source.contains(&manifest_b.manifest_id)),
+            "newest verified capture must win duplicate-conversation recovery: {build:#?}"
+        );
+        assert!(
+            build
+                .evidence_sources
+                .iter()
+                .all(|source| !source.contains(&manifest_a.manifest_id)),
+            "older duplicate evidence must not become the reconstructed conversation: {build:#?}"
+        );
+        assert!(
             build.skipped_record_count >= 1,
             "duplicate manifest should be logged as skipped: {build:#?}"
         );
@@ -69335,6 +70066,47 @@ mod doctor_asset_taxonomy_tests {
             skipped_log.contains("duplicate_raw_mirror_conversation_key"),
             "duplicate suppression reason should be durable: {skipped_log}"
         );
+        assert!(
+            skipped_log.contains(&manifest_a.manifest_id),
+            "the skipped record must identify the older capture: {skipped_log}"
+        );
+
+        let newest_blob_path = doctor_raw_mirror_root(&data_dir)
+            .join(&manifest_b.blob_relative_path);
+        std::fs::write(&newest_blob_path, vec![b'X'; bytes_b.len()])
+            .expect("plant same-size post-verification corruption in newest blob");
+        let fallback_build = build_doctor_reconstruct_candidate(
+            &data_dir,
+            &db_path,
+            &index_path,
+            &raw_mirror,
+            &source_authority,
+            &coverage_summary,
+        );
+        assert_eq!(fallback_build.status, "completed", "{fallback_build:#?}");
+        assert_eq!(fallback_build.candidate_conversation_count, Some(1));
+        assert!(
+            fallback_build
+                .evidence_sources
+                .iter()
+                .any(|source| source.contains(&manifest_a.manifest_id)),
+            "an unreadable newest version must fall back to older verified evidence: {fallback_build:#?}"
+        );
+        assert!(
+            fallback_build
+                .evidence_sources
+                .iter()
+                .all(|source| !source.contains(&manifest_b.manifest_id)),
+            "post-verification corruption must not become recovery authority: {fallback_build:#?}"
+        );
+        let fallback_candidate_dir =
+            PathBuf::from(fallback_build.path.as_deref().expect("fallback candidate path"));
+        let fallback_skipped_log = std::fs::read_to_string(
+            fallback_candidate_dir.join("logs/skipped-records.jsonl"),
+        )
+        .expect("read fallback skipped log");
+        assert!(fallback_skipped_log.contains(&manifest_b.manifest_id));
+        assert!(fallback_skipped_log.contains("source verification changed"));
     }
 
     #[test]
@@ -69923,7 +70695,11 @@ mod doctor_asset_taxonomy_tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("archive_wide_collectors_deferred"))
         );
-        let backfill = doctor_raw_mirror_backfill_deferred(false, &reason);
+        let backfill = doctor_raw_mirror_backfill_deferred(
+            false,
+            &reason,
+            "archive_wide_collectors_deferred",
+        );
         assert_eq!(backfill.status, "deferred");
         assert_eq!(backfill.total_candidate_count, 0);
         let coverage = doctor_coverage_summary_deferred(Some(17), Some(101), 3, &reason);
@@ -71990,6 +72766,87 @@ paths = ["~/.claude/projects"]
     }
 
     #[test]
+    fn doctor_structured_details_are_bounded_without_weakening_summary_counts() {
+        let detail_count = DOCTOR_STRUCTURED_DETAIL_DEFAULT_LIMIT + 7;
+        let mut bounded_backfill = DoctorRawMirrorBackfillReport {
+            total_candidate_count: detail_count,
+            source_missing_count: detail_count,
+            receipts: (0..detail_count)
+                .map(|index| DoctorRawMirrorBackfillReceipt {
+                    stable_record_id: format!("receipt-{index:04}"),
+                    source_missing: true,
+                    ..DoctorRawMirrorBackfillReceipt::default()
+                })
+                .collect(),
+            ..DoctorRawMirrorBackfillReport::default()
+        };
+        let mut bounded_warnings = (0..detail_count)
+            .map(|index| DoctorSoleCopyWarning {
+                stable_warning_id: format!("warning-{index:04}"),
+                ..DoctorSoleCopyWarning::default()
+            })
+            .collect::<Vec<_>>();
+
+        let bounded_meta = bounded_doctor_structured_details(
+            &mut bounded_backfill,
+            &mut bounded_warnings,
+            false,
+            "cass doctor check --json --verbose",
+        );
+        assert_eq!(
+            bounded_backfill.receipts.len(),
+            DOCTOR_STRUCTURED_DETAIL_DEFAULT_LIMIT
+        );
+        assert_eq!(
+            bounded_warnings.len(),
+            DOCTOR_STRUCTURED_DETAIL_DEFAULT_LIMIT
+        );
+        assert_eq!(bounded_backfill.total_candidate_count, detail_count);
+        assert_eq!(bounded_backfill.source_missing_count, detail_count);
+        assert_eq!(bounded_meta["details_truncated"], true);
+        assert_eq!(
+            bounded_meta["raw_mirror_backfill_receipts_total"],
+            detail_count
+        );
+        assert_eq!(
+            bounded_meta["raw_mirror_backfill_receipts_omitted"],
+            detail_count - DOCTOR_STRUCTURED_DETAIL_DEFAULT_LIMIT
+        );
+        assert_eq!(bounded_meta["sole_copy_warnings_total"], detail_count);
+        assert_eq!(
+            bounded_meta["full_details_command"],
+            "cass doctor check --json --verbose"
+        );
+
+        let mut full_backfill = DoctorRawMirrorBackfillReport {
+            receipts: (0..detail_count)
+                .map(|index| DoctorRawMirrorBackfillReceipt {
+                    stable_record_id: format!("receipt-{index:04}"),
+                    ..DoctorRawMirrorBackfillReceipt::default()
+                })
+                .collect(),
+            ..DoctorRawMirrorBackfillReport::default()
+        };
+        let mut full_warnings = (0..detail_count)
+            .map(|index| DoctorSoleCopyWarning {
+                stable_warning_id: format!("warning-{index:04}"),
+                ..DoctorSoleCopyWarning::default()
+            })
+            .collect::<Vec<_>>();
+        let full_meta = bounded_doctor_structured_details(
+            &mut full_backfill,
+            &mut full_warnings,
+            true,
+            "cass doctor check --json --verbose",
+        );
+        assert_eq!(full_backfill.receipts.len(), detail_count);
+        assert_eq!(full_warnings.len(), detail_count);
+        assert_eq!(full_meta["details_truncated"], false);
+        assert_eq!(full_meta["limit_per_collection"], serde_json::Value::Null);
+        assert_eq!(full_meta["full_details_command"], serde_json::Value::Null);
+    }
+
+    #[test]
     fn doctor_coverage_summary_classifies_ledger_gaps_and_confidence_tiers() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
@@ -72645,6 +73502,7 @@ paths = ["~/.claude/projects"]
             captured_at_ms: 1_733_000_000_000,
             source_mtime_ms: Some(1_733_000_000_000),
             source_size_bytes: Some(bytes.len() as u64),
+            content_storage: None,
             compression: DoctorRawMirrorCompressionEnvelope {
                 state: "none".to_string(),
                 algorithm: None,
@@ -72705,6 +73563,7 @@ paths = ["~/.claude/projects"]
         assert_eq!(policy.directory_mode_octal, "0700");
         assert_eq!(policy.file_mode_octal, "0600");
         assert!(policy.enforce_private_files);
+        assert!(!policy.fsync_required);
         assert!(
             policy.path_traversal_defense.contains("dot-dot")
                 && policy.symlink_defense.contains("refuses symlinked")
@@ -72899,6 +73758,386 @@ paths = ["~/.claude/projects"]
     }
 
     #[test]
+    fn raw_mirror_report_verifies_and_reconstructs_chunked_sources() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("large-source-fixture.jsonl");
+        let source_bytes = b"0123456789abcdefABCDEFGHIJKLMNOPqrstuvwxyz!@#$%^tail!";
+        std::fs::write(&source_path, source_bytes).expect("write chunked source fixture");
+        let captured = crate::raw_mirror::capture_source_file_with_chunk_policy(
+            crate::raw_mirror::RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "codex",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &source_path,
+                db_links: &[],
+            },
+            1,
+            16,
+        )
+        .expect("capture chunked source");
+
+        let report = collect_doctor_raw_mirror_report_with_threshold(&data_dir, u64::MAX);
+        assert_eq!(report.status, "verified");
+        assert_eq!(report.summary.manifest_count, 1);
+        assert_eq!(report.summary.verified_blob_count, 5);
+        let manifest = report.manifests.first().expect("chunked manifest report");
+        assert_eq!(manifest.status, "verified");
+        assert_eq!(manifest.storage_kind, "fixed_chunks_v1");
+        assert_eq!(manifest.chunk_count, 4);
+        assert_eq!(
+            manifest.source_content_blake3,
+            blake3::hash(source_bytes).to_hex().to_string()
+        );
+        assert_eq!(manifest.source_size_bytes, Some(source_bytes.len() as u64));
+        assert_eq!(
+            doctor_candidate_read_verified_raw_mirror_blob(&data_dir, manifest)
+                .expect("reconstruct doctor candidate bytes"),
+            source_bytes
+        );
+
+        let payload = serde_json::to_value(&report).expect("raw mirror report JSON");
+        assert_eq!(
+            payload["manifests"][0]["storage_kind"].as_str(),
+            Some("fixed_chunks_v1")
+        );
+        assert_eq!(payload["manifests"][0]["chunk_count"].as_u64(), Some(4));
+        assert!(
+            !serde_json::to_string(&payload)
+                .expect("render report")
+                .contains("0123456789abcdef"),
+            "doctor metadata must not serialize reconstructed source bytes"
+        );
+        assert_eq!(
+            std::fs::read(&source_path).expect("source remains untouched"),
+            source_bytes
+        );
+        assert_eq!(captured.storage_kind, "fixed_chunks_v1");
+    }
+
+    #[test]
+    fn raw_mirror_report_rejects_whole_blob_source_size_drift() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = data_dir.join("sessions/source-size-drift.jsonl");
+        let bytes = b"{\"type\":\"message\",\"text\":\"hello\"}\n";
+        let mut manifest =
+            raw_mirror_test_manifest(&data_dir, "codex", "local", &source_path, bytes, Vec::new());
+        manifest.source_size_bytes = Some(bytes.len() as u64 + 1);
+        manifest.manifest_blake3 = Some(doctor_raw_mirror_manifest_blake3(&manifest));
+        write_raw_mirror_test_manifest(&data_dir, &manifest, bytes);
+
+        let report = collect_doctor_raw_mirror_report_with_threshold(&data_dir, u64::MAX);
+        let manifest_report = report.manifests.first().expect("manifest report");
+        assert_eq!(report.status, "warn");
+        assert_eq!(manifest_report.status, "invalid_manifest");
+        assert_eq!(
+            manifest_report.invalid_reason.as_deref(),
+            Some("whole-blob source_size_bytes does not match blob_size_bytes")
+        );
+        assert!(!doctor_raw_mirror_manifest_is_verified(manifest_report));
+    }
+
+    #[test]
+    fn raw_mirror_backfill_uses_newest_source_digest_for_chunked_evidence() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("mutable-source.jsonl");
+        let db_link = crate::raw_mirror::RawMirrorDbLink {
+            conversation_id: Some(7),
+            message_count: Some(1),
+            source_path: Some(source_path.display().to_string()),
+            started_at_ms: Some(1_733_000_000_000),
+        };
+        let first_bytes = b"0123456789abcdefABCDEFGHIJKLMNOP";
+        std::fs::write(&source_path, first_bytes).expect("write first source version");
+        crate::raw_mirror::capture_source_file_with_chunk_policy(
+            crate::raw_mirror::RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "codex",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &source_path,
+                db_links: std::slice::from_ref(&db_link),
+            },
+            1,
+            16,
+        )
+        .expect("capture first chunked source version");
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let mut second_bytes = first_bytes.to_vec();
+        second_bytes.extend_from_slice(b"tail");
+        std::fs::write(&source_path, &second_bytes).expect("write second source version");
+        crate::raw_mirror::capture_source_file_with_chunk_policy(
+            crate::raw_mirror::RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "codex",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &source_path,
+                db_links: std::slice::from_ref(&db_link),
+            },
+            1,
+            16,
+        )
+        .expect("capture second chunked source version");
+
+        let report = collect_doctor_raw_mirror_report_with_threshold(&data_dir, u64::MAX);
+        let (by_conversation_id, by_source_key) =
+            doctor_raw_mirror_existing_evidence_maps(&report);
+        let expected_source_blake3 = blake3::hash(&second_bytes).to_hex().to_string();
+        let linked = by_conversation_id
+            .get(&7)
+            .expect("newest conversation-linked evidence");
+        assert_eq!(linked.source_content_blake3, expected_source_blake3);
+        assert_ne!(
+            linked.source_content_blake3, linked.blob_blake3,
+            "chunked evidence must distinguish the source digest from the descriptor digest"
+        );
+        let source_key = doctor_raw_mirror_backfill_source_key(
+            "local",
+            "local",
+            None,
+            &source_path.display().to_string(),
+        );
+        assert_eq!(
+            by_source_key
+                .get(&source_key)
+                .expect("newest source-key evidence")
+                .source_content_blake3,
+            expected_source_blake3
+        );
+
+        let reclassified_candidate = DoctorRawMirrorBackfillCandidate {
+            conversation_id: 8,
+            provider: "omp".to_string(),
+            source_path: Some(source_path.display().to_string()),
+            source_id: "local".to_string(),
+            origin_host: None,
+            origin_kind: Some("local".to_string()),
+            started_at_ms: Some(1_733_000_000_001),
+            message_count: 1,
+        };
+        let reclassified_receipt = doctor_raw_mirror_backfill_candidate_receipt(
+            &data_dir,
+            &reclassified_candidate,
+            &by_conversation_id,
+            &by_source_key,
+            &mut HashMap::new(),
+            false,
+        );
+        assert_eq!(reclassified_receipt.provider, "omp");
+        assert_eq!(
+            reclassified_receipt.action,
+            "existing_raw_manifest_needs_db_link",
+            "provider reclassification must reuse the verified physical-source evidence"
+        );
+        assert!(reclassified_receipt.raw_source_captured);
+        assert!(!reclassified_receipt.raw_mirror_db_linked);
+        assert_eq!(
+            reclassified_receipt.raw_mirror_manifest_id,
+            Some(linked.manifest_id.clone())
+        );
+        assert_eq!(
+            reclassified_receipt.raw_mirror_source_content_blake3.as_deref(),
+            Some(expected_source_blake3.as_str())
+        );
+        assert_eq!(
+            reclassified_receipt.raw_mirror_source_size_bytes,
+            Some(second_bytes.len() as u64)
+        );
+        assert_eq!(
+            reclassified_receipt.raw_mirror_storage_kind.as_deref(),
+            Some("fixed_chunks_v1")
+        );
+        assert_eq!(reclassified_receipt.raw_mirror_chunk_count, Some(3));
+
+        let mut receipt = DoctorRawMirrorBackfillReceipt {
+            source_stat_snapshot: Some(DoctorRawMirrorBackfillSourceStatSnapshot {
+                exists: true,
+                file_type: "file".to_string(),
+                size_bytes: Some(second_bytes.len() as u64),
+                content_blake3: Some(expected_source_blake3),
+                ..DoctorRawMirrorBackfillSourceStatSnapshot::default()
+            }),
+            ..DoctorRawMirrorBackfillReceipt::default()
+        };
+        assert!(
+            !doctor_raw_mirror_backfill_live_source_changed(&mut receipt, linked),
+            "byte-identical chunked sources must not be misreported as changed"
+        );
+        receipt
+            .source_stat_snapshot
+            .as_mut()
+            .expect("source stat")
+            .content_blake3 = Some(blake3::hash(first_bytes).to_hex().to_string());
+        assert!(doctor_raw_mirror_backfill_live_source_changed(
+            &mut receipt,
+            linked
+        ));
+    }
+
+    #[test]
+    fn raw_mirror_backfill_hashes_each_distinct_source_path_once_per_report() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("shared-source.jsonl");
+        let first_bytes = b"first source snapshot";
+        let first_blake3 = blake3::hash(first_bytes).to_hex().to_string();
+        std::fs::write(&source_path, first_bytes).expect("write first source snapshot");
+        let candidate = |conversation_id| DoctorRawMirrorBackfillCandidate {
+            conversation_id,
+            provider: "codex".to_string(),
+            source_path: Some(source_path.display().to_string()),
+            source_id: "local".to_string(),
+            origin_host: None,
+            origin_kind: Some("local".to_string()),
+            started_at_ms: Some(1_733_000_000_000),
+            message_count: 1,
+        };
+        let by_conversation_id = HashMap::new();
+        let by_source_key = HashMap::new();
+        let mut source_stat_cache = HashMap::new();
+
+        let first = doctor_raw_mirror_backfill_candidate_receipt(
+            &data_dir,
+            &candidate(1),
+            &by_conversation_id,
+            &by_source_key,
+            &mut source_stat_cache,
+            false,
+        );
+        assert_eq!(
+            first
+                .source_stat_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.content_blake3.as_deref()),
+            Some(first_blake3.as_str())
+        );
+
+        let second_bytes = b"a different source snapshot";
+        let second_blake3 = blake3::hash(second_bytes).to_hex().to_string();
+        std::fs::write(&source_path, second_bytes).expect("plant a later source mutation");
+        let second = doctor_raw_mirror_backfill_candidate_receipt(
+            &data_dir,
+            &candidate(2),
+            &by_conversation_id,
+            &by_source_key,
+            &mut source_stat_cache,
+            false,
+        );
+        assert_eq!(source_stat_cache.len(), 1);
+        assert_eq!(
+            second
+                .source_stat_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.content_blake3.as_deref()),
+            first
+                .source_stat_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.content_blake3.as_deref()),
+            "a report must reuse one source snapshot instead of rehashing the same large provider file per conversation"
+        );
+        assert_ne!(
+            second
+                .source_stat_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.content_blake3.as_deref()),
+            Some(second_blake3.as_str()),
+            "the planted mutation proves the second candidate did not perform another source hash"
+        );
+    }
+
+    #[test]
+    fn raw_mirror_backfill_refuses_capture_when_source_content_hash_is_unavailable() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("unverified-source.jsonl");
+        let source_bytes = b"source bytes that must not be captured without a digest";
+        std::fs::write(&source_path, source_bytes).expect("write source");
+        let candidate = DoctorRawMirrorBackfillCandidate {
+            conversation_id: 17,
+            provider: "codex".to_string(),
+            source_path: Some(source_path.display().to_string()),
+            source_id: "local".to_string(),
+            origin_host: None,
+            origin_kind: Some("local".to_string()),
+            started_at_ms: Some(1_733_000_000_000),
+            message_count: 1,
+        };
+        let mut source_stat_cache = HashMap::from([(
+            source_path.clone(),
+            DoctorRawMirrorBackfillSourceStatSnapshot {
+                exists: true,
+                file_type: "file".to_string(),
+                size_bytes: Some(source_bytes.len() as u64),
+                content_blake3: None,
+                stat_error: Some("injected source read failure".to_string()),
+                ..DoctorRawMirrorBackfillSourceStatSnapshot::default()
+            },
+        )]);
+
+        let receipt = doctor_raw_mirror_backfill_candidate_receipt(
+            &data_dir,
+            &candidate,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut source_stat_cache,
+            true,
+        );
+
+        assert_eq!(
+            receipt.action,
+            "source_content_unverified_db_projection_only"
+        );
+        assert!(receipt.db_projection_only);
+        assert!(!receipt.raw_source_captured);
+        assert!(
+            receipt
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("refuses raw-mirror capture")),
+            "receipt must explain why unverified bytes were not captured: {:?}",
+            receipt.warnings
+        );
+        assert!(
+            !data_dir.join("raw-mirror").exists(),
+            "the refusal path must not create raw-mirror state"
+        );
+        assert_eq!(
+            std::fs::read(&source_path).expect("read untouched source"),
+            source_bytes
+        );
+    }
+
+    #[test]
+    fn raw_mirror_backfill_does_not_report_an_unopenable_archive_as_available() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"not a sqlite database").expect("write malformed archive");
+        let raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
+
+        let report = collect_doctor_raw_mirror_backfill_report(
+            &data_dir,
+            &db_path,
+            &raw_mirror,
+            false,
+        );
+
+        assert!(!report.db_available);
+        assert_eq!(report.status, "warn");
+        assert!(report.db_query_error.is_some());
+        assert!(report.receipts.is_empty());
+    }
+
+    #[test]
     fn raw_mirror_report_verifies_blobs_flags_manifest_drift_and_interrupted_captures() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
@@ -73038,12 +74277,32 @@ paths = ["~/.claude/projects"]
         write_raw_mirror_test_manifest(&data_dir, &first, first_bytes);
         write_raw_mirror_test_manifest(&data_dir, &second, second_bytes);
 
+        // A remote machine can have the same path text. Its historical bytes
+        // must not be compared with this host's current file metadata.
+        for remote_bytes in [
+            &b"first remote source version"[..],
+            &b"second much larger remote source version"[..],
+        ] {
+            let remote = raw_mirror_test_manifest(
+                &data_dir,
+                "codex",
+                "remote-workstation",
+                &source_path,
+                remote_bytes,
+                Vec::new(),
+            );
+            write_raw_mirror_test_manifest(&data_dir, &remote, remote_bytes);
+        }
+
         let report =
             collect_doctor_raw_mirror_report_with_amplification_thresholds(&data_dir, 2_000, 1);
         let expected_referenced_bytes = (first_bytes.len() + second_bytes.len()) as u64;
 
         assert_eq!(report.status, "warn");
-        assert_eq!(report.summary.amplified_source_count, 1);
+        assert_eq!(
+            report.summary.amplified_source_count, 1,
+            "remote manifests must not be measured against an unrelated local path"
+        );
         assert_eq!(
             report.summary.amplified_source_referenced_bytes,
             expected_referenced_bytes
@@ -73099,6 +74358,7 @@ paths = ["~/.claude/projects"]
                 b"third complete source version with still more appended bytes",
             ),
         ];
+        let mut valid_manifest_entries = Vec::new();
         for (provider, bytes) in versions {
             let manifest = raw_mirror_test_manifest(
                 &data_dir,
@@ -73108,7 +74368,8 @@ paths = ["~/.claude/projects"]
                 bytes,
                 Vec::new(),
             );
-            write_raw_mirror_test_manifest(&data_dir, &manifest, bytes);
+            let (_, manifest_path) = write_raw_mirror_test_manifest(&data_dir, &manifest, bytes);
+            valid_manifest_entries.push((manifest_path, false));
         }
 
         let rejected_bytes = b"forged fourth version must not influence the warning";
@@ -73128,7 +74389,10 @@ paths = ["~/.claude/projects"]
             0,
             2_000,
             1,
-            DoctorRawMirrorVerificationMode::Bounded { manifest_limit: 1 },
+            DoctorRawMirrorVerificationMode::Bounded {
+                manifest_limit: 1,
+                byte_limit: u64::MAX,
+            },
         );
 
         assert_eq!(report.status, "verification_deferred");
@@ -73160,6 +74424,144 @@ paths = ["~/.claude/projects"]
         }));
         let rendered = serde_json::to_string(&report).expect("serialize bounded report");
         assert!(!rendered.contains(&source_path.display().to_string()));
+
+        let capped_scan = doctor_raw_mirror_bounded_amplification_reports_with_limits(
+            &data_dir,
+            &doctor_raw_mirror_root(&data_dir),
+            &valid_manifest_entries,
+            false,
+            2_000,
+            1,
+            2,
+            u64::MAX,
+        );
+        assert_eq!(capped_scan.scanned_manifest_count, 2);
+        assert!(capped_scan.truncated);
+        assert_eq!(capped_scan.reports.len(), 1);
+        assert_eq!(capped_scan.reports[0].version_count, 2);
+
+        let byte_limited = collect_doctor_raw_mirror_report_with_thresholds_and_mode(
+            &data_dir,
+            0,
+            2_000,
+            1,
+            DoctorRawMirrorVerificationMode::Bounded {
+                manifest_limit: 100,
+                byte_limit: 1,
+            },
+        );
+        assert_eq!(byte_limited.status, "verification_deferred");
+        assert_eq!(byte_limited.summary.manifest_count, 4);
+        assert!(byte_limited.manifests.is_empty());
+        assert!(byte_limited.warnings.iter().any(|warning| {
+            warning.contains("physical bytes across blobs, manifests, logs, and interrupted temp artifacts")
+                && warning.contains("1 physical bytes")
+        }));
+
+        let poisoned_db_path = data_dir.join("agent_search.db");
+        std::fs::write(&poisoned_db_path, b"not a sqlite database")
+            .expect("plant a DB that would fail if bounded doctor queried backfill");
+        let deferred_backfill = collect_doctor_raw_mirror_backfill_report_for_doctor(
+            &data_dir,
+            &poisoned_db_path,
+            &byte_limited,
+            false,
+            None,
+        );
+        assert_eq!(deferred_backfill.status, "deferred");
+        assert!(!deferred_backfill.db_available);
+        assert!(deferred_backfill.warnings.iter().any(|warning| {
+            warning.contains("unverified manifests must not be treated as absent evidence")
+        }));
+    }
+
+    #[test]
+    fn gh430_bounded_doctor_caps_logical_verification_work_for_shared_chunks() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("growing-source.jsonl");
+        let first_bytes = vec![b'a'; 64 * 1024];
+        std::fs::write(&source_path, &first_bytes).expect("write first source version");
+        crate::raw_mirror::capture_source_file_with_chunk_policy(
+            crate::raw_mirror::RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "codex",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &source_path,
+                db_links: &[],
+            },
+            1,
+            32 * 1024,
+        )
+        .expect("capture first chunked version");
+        let mut second_bytes = first_bytes;
+        second_bytes.push(b'\n');
+        std::fs::write(&source_path, &second_bytes).expect("write appended source version");
+        crate::raw_mirror::capture_source_file_with_chunk_policy(
+            crate::raw_mirror::RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "codex",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &source_path,
+                db_links: &[],
+            },
+            1,
+            32 * 1024,
+        )
+        .expect("capture second chunked version");
+
+        let physical_storage_bytes = crate::raw_mirror::physical_storage_bytes(&data_dir);
+        let report = collect_doctor_raw_mirror_report_with_thresholds_and_mode(
+            &data_dir,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            DoctorRawMirrorVerificationMode::Bounded {
+                manifest_limit: 100,
+                byte_limit: physical_storage_bytes,
+            },
+        );
+
+        assert_eq!(report.status, "verification_deferred");
+        assert_eq!(report.summary.manifest_count, 2);
+        assert!(report.manifests.is_empty());
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains("estimated full verification work is")
+                && warning.contains("estimated verification-work bytes")
+                && !warning.contains("not computed")
+        }));
+    }
+
+    #[test]
+    fn raw_mirror_full_report_rejects_oversized_manifest_before_parsing() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = data_dir.join("sessions/source.jsonl");
+        let bytes = b"{\"type\":\"message\",\"text\":\"bounded\"}\n";
+        let manifest =
+            raw_mirror_test_manifest(&data_dir, "codex", "local", &source_path, bytes, Vec::new());
+        let (_, manifest_path) = write_raw_mirror_test_manifest(&data_dir, &manifest, bytes);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&manifest_path)
+            .expect("open manifest fixture")
+            .set_len(DOCTOR_RAW_MIRROR_MANIFEST_MAX_BYTES + 1)
+            .expect("plant oversized sparse manifest");
+
+        let report = collect_doctor_raw_mirror_report(&data_dir);
+        assert_eq!(report.status, "warn");
+        assert_eq!(report.summary.manifest_count, 1);
+        assert_eq!(report.summary.invalid_manifest_count, 1);
+        assert!(
+            report.manifests[0]
+                .invalid_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("16777216-byte validation limit"))
+        );
     }
 
     #[cfg(unix)]
@@ -74958,6 +76360,70 @@ mod cleanup_target_safety_tests {
         assert!(
             !outside_parent.join("candidate.raw").exists(),
             "executor must not write through a symlinked staging parent"
+        );
+    }
+
+    #[test]
+    fn doctor_fs_mutation_executor_rejects_matching_symlinked_copy_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let index_path = data_dir.join("index").join("live-generation");
+        std::fs::create_dir_all(&index_path).expect("create live index");
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::write(&db_path, b"sqlite placeholder").expect("write db placeholder");
+
+        let source_path = data_dir.join("raw-mirror").join("source.raw");
+        let source_bytes = b"raw mirror bytes shared with an outside target";
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create source parent");
+        std::fs::write(&source_path, source_bytes).expect("write source");
+        let expected_source_blake3 = blake3::hash(source_bytes).to_hex().to_string();
+
+        let staging_root = data_dir.join("doctor-staging").join("matching-target-symlink");
+        std::fs::create_dir_all(&staging_root).expect("create staging root");
+        let outside_target = temp.path().join("outside-matching-target.raw");
+        std::fs::write(&outside_target, source_bytes).expect("write matching outside target");
+        let target_path = staging_root.join("candidate.raw");
+        std::os::unix::fs::symlink(&outside_target, &target_path)
+            .expect("create matching symlink as staging target");
+
+        let receipt = execute_doctor_fs_mutation(DoctorFsMutationRequest {
+            operation_id: "reconstruct-promote-copy-source",
+            action_id: "copy-matching-symlinked-staging-target",
+            mutation_kind: DoctorFsMutationKind::CopyFileToStaging,
+            mode: DoctorRepairMode::ReconstructPromote,
+            asset_class: DoctorAssetClass::RawMirrorBlob,
+            source_path: Some(&source_path),
+            target_path: &target_path,
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            staging_root: Some(&staging_root),
+            expected_source_blake3: Some(&expected_source_blake3),
+            planned_bytes: source_bytes.len() as u64,
+            required_min_age_seconds: None,
+        });
+
+        assert_eq!(receipt.status, DoctorActionStatus::Blocked);
+        assert!(
+            receipt
+                .blocked_reasons
+                .iter()
+                .any(|reason| reason.contains("non-regular or a symlink")),
+            "matching symlink targets must be rejected before content hashing: {:?}",
+            receipt.blocked_reasons
+        );
+        assert!(
+            std::fs::symlink_metadata(&target_path)
+                .expect("target symlink still exists")
+                .file_type()
+                .is_symlink(),
+            "blocked copy must preserve the symlink for operator inspection"
+        );
+        assert_eq!(
+            std::fs::read(&outside_target).expect("read outside target"),
+            source_bytes,
+            "blocked copy must not mutate the external symlink target"
         );
     }
 
@@ -82922,13 +84388,13 @@ pub(crate) fn run_doctor_impl(
         vec!["raw mirror manifests and blob checksums were summarized".to_string()],
     );
     let raw_mirror_backfill_started = Instant::now();
-    let raw_mirror_backfill = if let Some(reason) =
-        archive_wide_collectors_deferred_reason.as_deref()
-    {
-        doctor_raw_mirror_backfill_deferred(fix_can_mutate, reason)
-    } else {
-        collect_doctor_raw_mirror_backfill_report(&data_dir, &db_path, &raw_mirror, fix_can_mutate)
-    };
+    let raw_mirror_backfill = collect_doctor_raw_mirror_backfill_report_for_doctor(
+        &data_dir,
+        &db_path,
+        &raw_mirror,
+        fix_can_mutate,
+        archive_wide_collectors_deferred_reason.as_deref(),
+    );
     let raw_mirror_backfill_applied =
         matches!(raw_mirror_backfill.status.as_str(), "applied" | "partial")
             && (raw_mirror_backfill.captured_live_source_count > 0
@@ -82951,12 +84417,23 @@ pub(crate) fn run_doctor_impl(
         DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS,
         vec![if !archive_wide_collectors_complete {
             "archive-wide raw mirror backfill scan was explicitly deferred".to_string()
+        } else if raw_mirror_backfill.status == "deferred" {
+            "raw mirror backfill was explicitly deferred because its evidence prerequisites were not fully verified".to_string()
         } else if raw_mirror_backfill_applied {
             "raw mirror backfill applied and raw mirror summary was refreshed".to_string()
         } else {
             "raw mirror backfill plan was evaluated without provider source mutation".to_string()
         }],
     );
+    let recovery_evidence_deferred_reason = archive_wide_collectors_deferred_reason
+        .clone()
+        .or_else(|| {
+            (raw_mirror.status == "verification_deferred").then(|| {
+                "raw_mirror_verification_deferred: bounded read-only doctor did not establish checksum-verified raw-mirror recovery evidence"
+                    .to_string()
+            })
+        });
+    let recovery_evidence_collectors_complete = recovery_evidence_deferred_reason.is_none();
     match raw_mirror.status.as_str() {
         "absent" => {
             add_check!(
@@ -83098,13 +84575,12 @@ pub(crate) fn run_doctor_impl(
         fix_available: backfill_fix_available,
         fix_applied: backfill_fix_applied,
     });
-    let sole_copy_warnings = if archive_wide_collectors_complete {
+    let sole_copy_warnings = if recovery_evidence_collectors_complete {
         build_doctor_sole_copy_warnings(&raw_mirror_backfill)
     } else {
         Vec::new()
     };
-    let coverage_summary = if let Some(reason) = archive_wide_collectors_deferred_reason.as_deref()
-    {
+    let coverage_summary = if let Some(reason) = recovery_evidence_deferred_reason.as_deref() {
         doctor_coverage_summary_deferred(
             db_conversations,
             db_messages,
@@ -83119,7 +84595,7 @@ pub(crate) fn run_doctor_impl(
             &sole_copy_warnings,
         )
     };
-    let coverage_risk = if let Some(reason) = archive_wide_collectors_deferred_reason.as_deref() {
+    let coverage_risk = if let Some(reason) = recovery_evidence_deferred_reason.as_deref() {
         let mut risk = doctor_fast_coverage_risk_unchecked(db_path.exists());
         risk.recommended_action = format!(
             "{reason}. Run process-isolated archive coverage probes before archive repair."
@@ -83128,7 +84604,7 @@ pub(crate) fn run_doctor_impl(
     } else {
         doctor_coverage_risk_summary(&coverage_summary, sole_copy_warnings.len())
     };
-    if let Some(reason) = archive_wide_collectors_deferred_reason.as_deref() {
+    if let Some(reason) = recovery_evidence_deferred_reason.as_deref() {
         add_check!(
             "source_coverage",
             "warn",
@@ -83172,7 +84648,7 @@ pub(crate) fn run_doctor_impl(
     let source_authority_started = Instant::now();
     let source_authority = {
         let report = build_doctor_source_authority_report(&db_path, &source_inventory, &raw_mirror);
-        if let Some(reason) = archive_wide_collectors_deferred_reason.as_deref() {
+        if let Some(reason) = recovery_evidence_deferred_reason.as_deref() {
             doctor_refuse_source_authority_when_collectors_deferred(report, reason)
         } else {
             report
@@ -83187,7 +84663,7 @@ pub(crate) fn run_doctor_impl(
         DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS,
         vec!["source-authority matrix selected or rejected repair authorities".to_string()],
     );
-    if let Some(reason) = archive_wide_collectors_deferred_reason.as_deref() {
+    if let Some(reason) = recovery_evidence_deferred_reason.as_deref() {
         add_check!(
             "source_authority",
             "warn",
@@ -83198,7 +84674,7 @@ pub(crate) fn run_doctor_impl(
     let candidate_staging_started = Instant::now();
     let mut candidate_staging =
         collect_doctor_candidate_staging_report(&data_dir, &db_path, &index_path);
-    if archive_wide_collectors_complete
+    if recovery_evidence_collectors_complete
         && candidate_staging.total_candidate_count == 0
         && doctor_candidate_build_should_run(
             fix_can_mutate,
@@ -84626,6 +86102,14 @@ pub(crate) fn run_doctor_impl(
                 Some(&storage_integrity_signal_value),
             ),
         );
+        let mut output_backfill = raw_mirror_backfill;
+        let mut output_sole_copy_warnings = sole_copy_warnings;
+        let detail_output = bounded_doctor_structured_details(
+            &mut output_backfill,
+            &mut output_sole_copy_warnings,
+            verbose,
+            "cass doctor check --json --verbose",
+        );
         let mut payload = serde_json::json!({
             // Top-level envelope versioning. Bumped to 2 in world-class-doctor
             // pass-3 alongside the new per-run artifact directory + undo
@@ -84713,9 +86197,10 @@ pub(crate) fn run_doctor_impl(
             "source_inventory": source_inventory,
             "remote_source_sync": remote_source_sync,
             "raw_mirror": raw_mirror,
-            "raw_mirror_backfill": raw_mirror_backfill,
+            "raw_mirror_backfill": output_backfill,
             "coverage_summary": coverage_summary,
-            "sole_copy_warnings": sole_copy_warnings,
+            "sole_copy_warnings": output_sole_copy_warnings,
+            "detail_output": detail_output,
             "coverage_risk": coverage_risk,
             "source_authority": source_authority,
             "candidate_staging": candidate_staging,
@@ -90066,6 +91551,39 @@ fn response_schema_doctor_config_exclusion_risk() -> serde_json::Value {
     })
 }
 
+fn response_schema_doctor_detail_output() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Bounds for per-record doctor JSON details. Summary counts and safety decisions always use the complete internal evidence collections.",
+        "properties": {
+            "mode": { "type": "string", "description": "bounded_summary | full_verbose" },
+            "limit_per_collection": { "type": ["integer", "null"] },
+            "details_truncated": { "type": "boolean" },
+            "raw_mirror_backfill_receipts_total": { "type": "integer" },
+            "raw_mirror_backfill_receipts_returned": { "type": "integer" },
+            "raw_mirror_backfill_receipts_omitted": { "type": "integer" },
+            "sole_copy_warnings_total": { "type": "integer" },
+            "sole_copy_warnings_returned": { "type": "integer" },
+            "sole_copy_warnings_omitted": { "type": "integer" },
+            "full_details_command": { "type": ["string", "null"] },
+            "note": { "type": "string" }
+        },
+        "required": [
+            "mode",
+            "limit_per_collection",
+            "details_truncated",
+            "raw_mirror_backfill_receipts_total",
+            "raw_mirror_backfill_receipts_returned",
+            "raw_mirror_backfill_receipts_omitted",
+            "sole_copy_warnings_total",
+            "sole_copy_warnings_returned",
+            "sole_copy_warnings_omitted",
+            "full_details_command",
+            "note"
+        ]
+    })
+}
+
 fn response_schema_doctor_raw_mirror_backfill() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -90118,6 +91636,10 @@ fn response_schema_doctor_raw_mirror_backfill() -> serde_json::Value {
                         "raw_mirror_manifest_relative_path": { "type": ["string", "null"] },
                         "raw_mirror_blob_blake3": { "type": ["string", "null"] },
                         "raw_mirror_blob_size_bytes": { "type": ["integer", "null"] },
+                        "raw_mirror_source_content_blake3": { "type": ["string", "null"] },
+                        "raw_mirror_source_size_bytes": { "type": ["integer", "null"] },
+                        "raw_mirror_storage_kind": { "type": ["string", "null"] },
+                        "raw_mirror_chunk_count": { "type": ["integer", "null"] },
                         "backfill_generation": { "type": "integer" },
                         "forensic_bundle": response_schema_doctor_forensic_bundle_metadata(),
                         "warnings": { "type": "array", "items": { "type": "string" } }
@@ -90519,6 +92041,9 @@ fn response_schema_doctor_raw_mirror() -> serde_json::Value {
                         "redacted_blob_path": { "type": "string" },
                         "blob_blake3": { "type": "string" },
                         "blob_size_bytes": { "type": "integer" },
+                        "storage_kind": { "type": "string" },
+                        "source_content_blake3": { "type": "string" },
+                        "chunk_count": { "type": "integer" },
                         "provider": { "type": "string" },
                         "source_id": { "type": "string" },
                         "origin_kind": { "type": "string" },
@@ -92470,6 +93995,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
             "raw_mirror_backfill": response_schema_doctor_raw_mirror_backfill(),
             "coverage_summary": response_schema_doctor_coverage_summary(),
             "sole_copy_warnings": { "type": "array", "items": response_schema_opaque_object() },
+            "detail_output": response_schema_doctor_detail_output(),
             "coverage_risk": response_schema_doctor_coverage_risk(),
             "source_authority": response_schema_doctor_source_authority(),
             "candidate_staging": response_schema_doctor_candidate_staging(),
@@ -92500,7 +94026,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 }
             }
         },
-        "required": ["status", "health_class", "risk_level", "healthy", "initialized", "recommended_action", "fallback_mode", "doctor_command", "check_scope", "repair_previously_failed", "failure_marker_path", "repeat_refusal_reason", "override_available", "override_used", "active_repair", "post_repair_probes", "repair_failure_marker", "operation_outcome", "operation_state", "locks", "slow_operations", "timing_summary", "retry_recommendation", "safe_auto_eligibility", "primary_incident_id", "incidents", "event_log", "lexical", "semantic", "derived_semantic_assets", "storage_pressure", "config_exclusion_risks", "raw_mirror_backfill", "coverage_summary", "sole_copy_warnings", "coverage_risk", "source_authority", "candidate_staging", "checks"]
+        "required": ["status", "health_class", "risk_level", "healthy", "initialized", "recommended_action", "fallback_mode", "doctor_command", "check_scope", "repair_previously_failed", "failure_marker_path", "repeat_refusal_reason", "override_available", "override_used", "active_repair", "post_repair_probes", "repair_failure_marker", "operation_outcome", "operation_state", "locks", "slow_operations", "timing_summary", "retry_recommendation", "safe_auto_eligibility", "primary_incident_id", "incidents", "event_log", "lexical", "semantic", "derived_semantic_assets", "storage_pressure", "config_exclusion_risks", "raw_mirror_backfill", "coverage_summary", "sole_copy_warnings", "detail_output", "coverage_risk", "source_authority", "candidate_staging", "checks"]
     });
     let doctor_properties = doctor_schema
         .get_mut("properties")
@@ -92562,6 +94088,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 ("repair_plan", response_schema_doctor_repair_plan_preview()),
                 ("safety_gates", serde_json::json!({ "type": "array", "items": response_schema_doctor_safety_gate() })),
                 ("forensic_bundle", response_schema_doctor_forensic_bundle_metadata()),
+                ("detail_output", response_schema_doctor_detail_output()),
             ],
         ),
     );
@@ -92589,6 +94116,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 ("raw_mirror", response_schema_doctor_raw_mirror()),
                 ("coverage_summary", response_schema_doctor_coverage_summary()),
                 ("sole_copy_warnings", serde_json::json!({ "type": "array", "items": response_schema_opaque_object() })),
+                ("detail_output", response_schema_doctor_detail_output()),
                 ("source_authority", response_schema_doctor_source_authority()),
             ],
         ),

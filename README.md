@@ -589,6 +589,14 @@ holds down blobs referenced by captures from the last 7 days by default, writes
 `raw-mirror/v1/pruned.jsonl` for every non-empty plan, and refuses apply mode
 while an index/watch job is active.
 
+Large mutable sources are stored as 4 MiB content-addressed chunks. Growing
+JSONL files reuse every unchanged complete chunk, and SQLite sources reuse
+unchanged 4 MiB byte regions, so each historical snapshot remains byte-exact without
+writing another full-file blob. Existing whole-blob manifests remain readable;
+`cass doctor --json` reports `storage_kind`, `chunk_count`, the full-source
+digest, and verifies every referenced chunk before treating a snapshot as
+recovery authority.
+
 #### Configuration File
 
 Sources are configured in the platform config directory (Linux: `~/.config/cass/sources.toml`, macOS: `~/Library/Application Support/cass/sources.toml`):
@@ -3078,6 +3086,9 @@ Update check state is stored in the data directory:
 | `CASS_DATA_DIR` | Platform default | Override data directory |
 | `CASS_DB_PATH` | `$CASS_DATA_DIR/agent_search.db` | Override database path |
 | `CASS_EXCLUDE_PATHS` | unset | Comma/newline-delimited files or directory prefixes to skip without advancing scan/watch watermarks |
+| `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY` | unset | Set to `1` to hash every raw-mirror descriptor/chunk during a read-only doctor run, overriding the default bounded verification limits |
+| `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_MANIFEST_LIMIT` | `256` | Defer full raw-mirror hashing above this manifest count while retaining metadata-only amplification diagnostics |
+| `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_BYTE_LIMIT` | `536870912` | Defer full raw-mirror hashing when either physical storage or estimated logical verification work exceeds this byte count; metadata-only amplification diagnostics remain available |
 | **Background Indexing** | | |
 | `CASS_AUTO_REFRESH` | `1` | Stale-on-read catch-up for a stale/partial/behind index seen by `search`, `pack`, or TUI launch. Set `0` to disable globally; `search --no-maintenance` always remains read-only. |
 | `CASS_AUTO_REFRESH_COOLDOWN_SECS` | `300` | Minimum spacing between auto-spawned catch-up runs per data dir |

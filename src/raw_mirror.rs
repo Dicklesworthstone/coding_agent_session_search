@@ -15,16 +15,39 @@ const RAW_MIRROR_VERSION_DIR: &str = "v1";
 const RAW_MIRROR_MANIFEST_KIND: &str = "cass_raw_session_mirror_v1";
 const RAW_MIRROR_HASH_ALGORITHM: &str = "blake3";
 const RAW_MIRROR_BLOB_EXTENSION: &str = "raw";
+const RAW_MIRROR_MANIFEST_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const RAW_MIRROR_CHUNK_SIZE_BYTES: usize = 4 * 1024 * 1024;
+const RAW_MIRROR_CHUNK_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
+const RAW_MIRROR_FIXED_CHUNKS_KIND: &str = "fixed_chunks_v1";
+const RAW_MIRROR_BLOB_CACHE_MAX_ENTRIES: usize = 16_384;
+const RAW_MIRROR_MUTATION_LOCK_FILE: &str = ".mutation.lock";
 
 static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
-static BLOB_CAPTURE_CACHE: OnceLock<Mutex<HashMap<RawMirrorBlobCacheKey, RawMirrorBlobRecord>>> =
-    OnceLock::new();
+static BLOB_CAPTURE_CACHE: OnceLock<
+    Mutex<HashMap<RawMirrorBlobSourceKey, CachedRawMirrorBlobRecord>>,
+> = OnceLock::new();
 static MANIFEST_UPDATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[derive(Debug)]
+struct RawMirrorFileLockGuard {
+    file: File,
+}
+
+impl Drop for RawMirrorFileLockGuard {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
 
 fn raw_mirror_fsync_enabled() -> bool {
     dotenvy::var("CASS_RAW_MIRROR_FSYNC")
         .ok()
-        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -45,9 +68,24 @@ pub struct RawMirrorCaptureRecord {
     pub blob_relative_path: String,
     pub blob_blake3: String,
     pub blob_size_bytes: u64,
+    pub source_content_blake3: String,
+    pub source_size_bytes: u64,
+    pub storage_kind: String,
+    pub chunk_count: usize,
     pub captured_at_ms: i64,
     pub source_mtime_ms: Option<i64>,
     pub already_present: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawMirrorVerifiedCapture {
+    pub storage_kind: String,
+    pub source_content_blake3: String,
+    pub source_size_bytes: u64,
+    pub stored_blob_count: usize,
+    pub stored_bytes: u64,
+    pub stored_blobs: Vec<(String, u64)>,
+    pub chunk_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -131,6 +169,16 @@ pub fn storage_summary(data_dir: &Path) -> RawMirrorStorageSummary {
             }
         };
         summary.manifest_count = summary.manifest_count.saturating_add(1);
+        let expected_path = root.join(raw_mirror_manifest_relative_path(&manifest.manifest_id));
+        let blob_references = if path == expected_path {
+            validate_raw_mirror_manifest_contents(&manifest, &manifest.manifest_id).ok()
+        } else {
+            None
+        };
+        let Some(blob_references) = blob_references else {
+            summary.invalid_manifest_count = summary.invalid_manifest_count.saturating_add(1);
+            continue;
+        };
         merge_min_max(
             &mut summary.oldest_capture_at_ms,
             &mut summary.newest_capture_at_ms,
@@ -142,33 +190,38 @@ pub fn storage_summary(data_dir: &Path) -> RawMirrorStorageSummary {
             manifest.source_mtime_ms,
         );
 
-        let Some(blob_relative_path) = raw_mirror_blob_relative_path(&manifest.blob_blake3) else {
-            summary.invalid_manifest_count = summary.invalid_manifest_count.saturating_add(1);
-            continue;
-        };
-        if manifest.blob_relative_path != blob_relative_path {
-            summary.invalid_manifest_count = summary.invalid_manifest_count.saturating_add(1);
-            continue;
-        }
-
-        if !seen_blobs.insert(blob_relative_path.clone()) {
-            continue;
-        }
-        let blob_path = root.join(blob_relative_path);
-        match fs::symlink_metadata(&blob_path) {
-            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
-                let size = metadata.len();
-                summary.unique_blob_count = summary.unique_blob_count.saturating_add(1);
-                summary.total_blob_bytes = summary.total_blob_bytes.saturating_add(size);
-                summary.largest_blob_bytes = summary.largest_blob_bytes.max(size);
+        for blob_reference in blob_references {
+            if !seen_blobs.insert(blob_reference.blob_relative_path.clone()) {
+                continue;
             }
-            _ => {
+            let blob_path = root.join(&blob_reference.blob_relative_path);
+            if raw_mirror_path_has_symlink_below_root(&root, &blob_path) {
                 summary.missing_blob_count = summary.missing_blob_count.saturating_add(1);
+                continue;
+            }
+            match fs::symlink_metadata(&blob_path) {
+                Ok(metadata)
+                    if metadata.is_file()
+                        && !metadata.file_type().is_symlink()
+                        && metadata.len() == blob_reference.blob_size_bytes =>
+                {
+                    let size = metadata.len();
+                    summary.unique_blob_count = summary.unique_blob_count.saturating_add(1);
+                    summary.total_blob_bytes = summary.total_blob_bytes.saturating_add(size);
+                    summary.largest_blob_bytes = summary.largest_blob_bytes.max(size);
+                }
+                _ => {
+                    summary.missing_blob_count = summary.missing_blob_count.saturating_add(1);
+                }
             }
         }
     }
 
     summary
+}
+
+pub(crate) fn physical_storage_bytes(data_dir: &Path) -> u64 {
+    raw_mirror_dir_file_bytes(&raw_mirror_root(data_dir))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -217,9 +270,7 @@ struct RawMirrorPruneManifest {
     manifest_id: String,
     relative_path: String,
     size_bytes: u64,
-    blob_blake3: String,
-    blob_relative_path: String,
-    blob_size_bytes: u64,
+    blob_references: Vec<RawMirrorChunkRef>,
     captured_at_ms: i64,
     provider: String,
     original_path: String,
@@ -267,6 +318,13 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         );
     }
     report.initialized = true;
+    // Dry-runs append the same audit stream as applied prunes, so both modes
+    // need one stable manifest/blob view and serialized audit writes.
+    let _mutation_lock = acquire_raw_mirror_mutation_lock(&root)?;
+    let _index_run_lock = options
+        .apply
+        .then(|| try_acquire_index_run_lock_for_prune(data_dir))
+        .transpose()?;
 
     let manifests = collect_prune_manifests(&root)?;
     report.manifest_count = manifests.len() as u64;
@@ -276,16 +334,22 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
     let mut blob_size_by_relative: HashMap<String, u64> = HashMap::new();
     for manifest in &manifests {
         manifest_by_id.insert(manifest.manifest_id.clone(), manifest);
-        blob_to_manifests
-            .entry(manifest.blob_relative_path.clone())
-            .or_default()
-            .push(manifest.manifest_id.clone());
-        blob_size_by_relative
-            .entry(manifest.blob_relative_path.clone())
-            .or_insert_with(|| {
-                blob_file_size(&root.join(&manifest.blob_relative_path))
-                    .unwrap_or(manifest.blob_size_bytes)
-            });
+        let mut seen_manifest_blobs = HashSet::new();
+        for blob_reference in &manifest.blob_references {
+            if !seen_manifest_blobs.insert(blob_reference.blob_relative_path.clone()) {
+                continue;
+            }
+            blob_to_manifests
+                .entry(blob_reference.blob_relative_path.clone())
+                .or_default()
+                .push(manifest.manifest_id.clone());
+            blob_size_by_relative
+                .entry(blob_reference.blob_relative_path.clone())
+                .or_insert_with(|| {
+                    blob_file_size(root, &root.join(&blob_reference.blob_relative_path))
+                        .unwrap_or(blob_reference.blob_size_bytes)
+                });
+        }
     }
     report.unique_blob_count = blob_size_by_relative.len() as u64;
     report.current_blob_bytes = blob_size_by_relative
@@ -329,45 +393,56 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
     if let Some(max_size_bytes) = options.max_size_bytes
         && report.current_blob_bytes > max_size_bytes
     {
-        let mut blob_groups: Vec<_> = blob_to_manifests
-            .iter()
-            .map(|(blob_relative_path, manifest_ids)| {
-                let oldest_capture = manifest_ids
-                    .iter()
-                    .filter_map(|id| manifest_by_id.get(id).map(|m| m.captured_at_ms))
-                    .min()
-                    .unwrap_or(i64::MAX);
-                let size = blob_size_by_relative
-                    .get(blob_relative_path)
-                    .copied()
-                    .unwrap_or(0);
-                (
-                    blob_relative_path.clone(),
-                    manifest_ids.clone(),
-                    oldest_capture,
-                    size,
-                )
-            })
-            .collect::<Vec<_>>();
-        blob_groups.sort_by(|left, right| left.2.cmp(&right.2).then_with(|| left.0.cmp(&right.0)));
-
         let mut projected_bytes = report.current_blob_bytes;
-        for (blob_relative_path, manifest_ids, _, size) in blob_groups {
+        for (blob_relative_path, manifest_ids) in &blob_to_manifests {
+            if manifest_ids
+                .iter()
+                .all(|id| selected_manifests.contains(id))
+            {
+                projected_bytes = projected_bytes.saturating_sub(
+                    blob_size_by_relative
+                        .get(blob_relative_path)
+                        .copied()
+                        .unwrap_or(0),
+                );
+            }
+        }
+
+        for manifest in &manifests {
             if projected_bytes <= max_size_bytes {
                 break;
             }
-            if pinned_blobs.contains(&blob_relative_path) {
+            if pinned_manifests.contains(&manifest.manifest_id)
+                || selected_manifests.contains(&manifest.manifest_id)
+            {
                 continue;
             }
-            for manifest_id in manifest_ids {
-                if !pinned_manifests.contains(&manifest_id) {
-                    selected_manifests.insert(manifest_id.clone());
-                    manifest_reasons.entry(manifest_id).or_insert_with(|| {
-                        format!("max-size over budget; retiring blob {blob_relative_path}")
+            selected_manifests.insert(manifest.manifest_id.clone());
+            manifest_reasons
+                .entry(manifest.manifest_id.clone())
+                .or_insert_with(|| "max-size over budget; retiring oldest unpinned capture".to_string());
+
+            let mut seen_manifest_blobs = HashSet::new();
+            for blob_reference in &manifest.blob_references {
+                if !seen_manifest_blobs.insert(blob_reference.blob_relative_path.clone()) {
+                    continue;
+                }
+                let becomes_unreferenced = blob_to_manifests
+                    .get(&blob_reference.blob_relative_path)
+                    .is_some_and(|manifest_ids| {
+                        manifest_ids
+                            .iter()
+                            .all(|id| selected_manifests.contains(id))
                     });
+                if becomes_unreferenced {
+                    projected_bytes = projected_bytes.saturating_sub(
+                        blob_size_by_relative
+                            .get(&blob_reference.blob_relative_path)
+                            .copied()
+                            .unwrap_or(0),
+                    );
                 }
             }
-            projected_bytes = projected_bytes.saturating_sub(size);
         }
     }
 
@@ -394,7 +469,10 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         entries.push(RawMirrorPruneEntry {
             kind: "manifest".to_string(),
             path: manifest.relative_path.clone(),
-            blob_blake3: Some(manifest.blob_blake3.clone()),
+            blob_blake3: manifest
+                .blob_references
+                .first()
+                .map(|reference| reference.blob_blake3.clone()),
             size_bytes: manifest.size_bytes,
             reason,
             applied: false,
@@ -434,9 +512,15 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         .fold(0, u64::saturating_add);
 
     if options.apply {
+        for entry in &entries {
+            let path = root.join(&entry.path);
+            validate_prune_target_file(&root, &path).with_context(|| {
+                format!("preflight raw mirror prune target {}", path.display())
+            })?;
+        }
         for entry in &mut entries {
             let path = root.join(&entry.path);
-            let removed = remove_prune_target_file(&path)
+            let removed = remove_prune_target_file(&root, &path)
                 .with_context(|| format!("applying raw mirror prune for {}", path.display()))?;
             entry.applied = removed;
             if removed {
@@ -491,29 +575,31 @@ fn collect_prune_manifests(root: &Path) -> Result<Vec<RawMirrorPruneManifest>> {
                 path.display()
             );
         }
-        let manifest = read_raw_mirror_manifest(&path)?;
-        if manifest.manifest_kind != RAW_MIRROR_MANIFEST_KIND {
+        let parsed_manifest = read_raw_mirror_manifest(&path)?;
+        let expected_path = root.join(raw_mirror_manifest_relative_path(
+            &parsed_manifest.manifest_id,
+        ));
+        if path != expected_path {
             anyhow::bail!(
-                "refusing to prune with unexpected raw mirror manifest kind `{}` in {}",
-                manifest.manifest_kind,
-                path.display()
-            );
-        }
-        let Some(expected_blob_relative_path) =
-            raw_mirror_blob_relative_path(&manifest.blob_blake3)
-        else {
-            anyhow::bail!(
-                "refusing to prune raw mirror manifest {} with invalid blob hash",
-                path.display()
-            );
-        };
-        if manifest.blob_relative_path != expected_blob_relative_path {
-            anyhow::bail!(
-                "refusing to prune raw mirror manifest {} with unexpected blob path `{}`",
+                "refusing to prune non-canonical raw mirror manifest path {}; expected {}",
                 path.display(),
-                manifest.blob_relative_path
+                expected_path.display()
             );
         }
+        let manifest = read_validated_raw_mirror_manifest(root, &parsed_manifest.manifest_id)
+            .with_context(|| {
+                format!(
+                    "refusing to prune raw mirror manifest without valid identity and checksum {}",
+                    path.display()
+                )
+            })?;
+        let blob_references =
+            raw_mirror_manifest_blob_references(&manifest).with_context(|| {
+                format!(
+                    "refusing to prune invalid raw mirror manifest {}",
+                    path.display()
+                )
+            })?;
         let relative_path = path
             .strip_prefix(root)
             .unwrap_or(&path)
@@ -523,9 +609,7 @@ fn collect_prune_manifests(root: &Path) -> Result<Vec<RawMirrorPruneManifest>> {
             manifest_id: manifest.manifest_id,
             relative_path,
             size_bytes: manifest_metadata.len(),
-            blob_blake3: manifest.blob_blake3,
-            blob_relative_path: manifest.blob_relative_path,
-            blob_size_bytes: manifest.blob_size_bytes,
+            blob_references,
             captured_at_ms: manifest.captured_at_ms,
             provider: manifest.provider,
             original_path: manifest.original_path,
@@ -647,14 +731,23 @@ fn load_keep_tag_conversation_ids(
     Ok(pinned)
 }
 
-fn blob_file_size(path: &Path) -> Option<u64> {
+fn blob_file_size(root: &Path, path: &Path) -> Option<u64> {
+    if raw_mirror_path_has_symlink_below_root(root, path) {
+        return None;
+    }
     fs::symlink_metadata(path)
         .ok()
         .filter(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
         .map(|metadata| metadata.len())
 }
 
-fn remove_prune_target_file(path: &Path) -> Result<bool> {
+fn validate_prune_target_file(root: &Path, path: &Path) -> Result<bool> {
+    if raw_mirror_path_has_symlink_below_root(root, path) {
+        anyhow::bail!(
+            "refusing to prune raw mirror path with a symlinked ancestor {}",
+            path.display()
+        );
+    }
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -666,6 +759,13 @@ fn remove_prune_target_file(path: &Path) -> Result<bool> {
             path.display()
         );
     }
+    Ok(true)
+}
+
+fn remove_prune_target_file(root: &Path, path: &Path) -> Result<bool> {
+    if !validate_prune_target_file(root, path)? {
+        return Ok(false);
+    }
     fs::remove_file(path).with_context(|| format!("remove raw mirror file {}", path.display()))?;
     sync_parent(path)?;
     Ok(true)
@@ -675,12 +775,27 @@ fn append_prune_audit_log(root: &Path, report: &RawMirrorPruneReport) -> Result<
     ensure_private_dir(root)?;
     let audit_path = root.join("pruned.jsonl");
     ensure_prune_audit_log_appendable(&audit_path)?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    configure_lock_open_options(&mut options);
+    let mut file = options
         .open(&audit_path)
         .with_context(|| format!("open raw mirror prune audit {}", audit_path.display()))?;
-    set_private_file_permissions(&audit_path)?;
+    let opened_metadata = file
+        .metadata()
+        .with_context(|| format!("stat opened raw mirror prune audit {}", audit_path.display()))?;
+    let path_metadata = fs::symlink_metadata(&audit_path)
+        .with_context(|| format!("restat raw mirror prune audit {}", audit_path.display()))?;
+    if path_metadata.file_type().is_symlink()
+        || !path_metadata.is_file()
+        || !same_source_identity(&opened_metadata, &path_metadata)
+    {
+        return Err(anyhow!(
+            "raw mirror prune audit {} changed identity while being opened",
+            audit_path.display()
+        ));
+    }
+    set_private_open_file_permissions(&file, &audit_path)?;
     let now = now_ms();
     for entry in &report.entries {
         let record = json!({
@@ -729,6 +844,142 @@ fn ensure_prune_audit_log_appendable(path: &Path) -> Result<()> {
     }
 }
 
+fn acquire_raw_mirror_mutation_lock(root: &Path) -> Result<RawMirrorFileLockGuard> {
+    let lock_path = root.join(RAW_MIRROR_MUTATION_LOCK_FILE);
+    if raw_mirror_path_has_symlink_below_root(root, &lock_path) {
+        return Err(anyhow!(
+            "raw mirror mutation lock path {} contains a symlink",
+            lock_path.display()
+        ));
+    }
+    match fs::symlink_metadata(&lock_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(anyhow!(
+                "raw mirror mutation lock path {} is not a regular file",
+                lock_path.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("stat raw mirror mutation lock {}", lock_path.display()));
+        }
+    }
+
+    let mut options = OpenOptions::new();
+    options
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true);
+    configure_lock_open_options(&mut options);
+    let file = options
+        .open(&lock_path)
+        .with_context(|| format!("open raw mirror mutation lock {}", lock_path.display()))?;
+    fs2::FileExt::lock_exclusive(&file)
+        .with_context(|| format!("acquire raw mirror mutation lock {}", lock_path.display()))?;
+
+    let opened_metadata = file
+        .metadata()
+        .with_context(|| format!("stat opened raw mirror mutation lock {}", lock_path.display()))?;
+    let path_metadata = fs::symlink_metadata(&lock_path)
+        .with_context(|| format!("restat raw mirror mutation lock {}", lock_path.display()))?;
+    if path_metadata.file_type().is_symlink()
+        || !path_metadata.is_file()
+        || !same_source_identity(&opened_metadata, &path_metadata)
+    {
+        let _ = fs2::FileExt::unlock(&file);
+        return Err(anyhow!(
+            "raw mirror mutation lock {} changed identity while being acquired",
+            lock_path.display()
+        ));
+    }
+    set_private_open_file_permissions(&file, &lock_path)?;
+
+    Ok(RawMirrorFileLockGuard { file })
+}
+
+fn try_acquire_index_run_lock_for_prune(data_dir: &Path) -> Result<RawMirrorFileLockGuard> {
+    let lock_path = data_dir.join("index-run.lock");
+    match fs::symlink_metadata(&lock_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(anyhow!(
+                "refusing raw mirror prune because index-run lock {} is not a regular file",
+                lock_path.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("stat index-run lock {}", lock_path.display()));
+        }
+    }
+    let mut options = OpenOptions::new();
+    options
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true);
+    configure_lock_open_options(&mut options);
+    let file = options
+        .open(&lock_path)
+        .with_context(|| format!("open index-run lock {}", lock_path.display()))?;
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            return Err(anyhow!(
+                "refusing raw mirror prune because an index run acquired {}: {error}",
+                lock_path.display()
+            ));
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("acquire index-run lock {}", lock_path.display()));
+        }
+    }
+    let opened_metadata = file
+        .metadata()
+        .with_context(|| format!("stat opened index-run lock {}", lock_path.display()))?;
+    let path_metadata = fs::symlink_metadata(&lock_path)
+        .with_context(|| format!("restat index-run lock {}", lock_path.display()))?;
+    if path_metadata.file_type().is_symlink()
+        || !path_metadata.is_file()
+        || !same_source_identity(&opened_metadata, &path_metadata)
+    {
+        let _ = fs2::FileExt::unlock(&file);
+        return Err(anyhow!(
+            "refusing raw mirror prune because index-run lock {} changed identity while being acquired",
+            lock_path.display()
+        ));
+    }
+    Ok(RawMirrorFileLockGuard { file })
+}
+
+fn configure_lock_open_options(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(not(unix))]
+    let _ = options;
+}
+
+#[cfg(unix)]
+fn set_private_open_file_permissions(file: &File, path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("set raw mirror lock permissions {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_private_open_file_permissions(_file: &File, _path: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn merge_min_max(min: &mut Option<i64>, max: &mut Option<i64>, value: Option<i64>) {
     let Some(value) = value else {
         return;
@@ -769,12 +1020,56 @@ struct RawMirrorBlobCacheKey {
     source_size_bytes: u64,
     source_mtime_ns: Option<u128>,
     source_change_time_ns: Option<u128>,
+    chunk_threshold_bytes: u64,
+    chunk_size_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RawMirrorBlobSourceKey {
+    data_dir: PathBuf,
+    source_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedRawMirrorBlobRecord {
+    cache_key: RawMirrorBlobCacheKey,
+    record: RawMirrorBlobRecord,
+    stored_blob_fingerprints: Vec<RawMirrorStoredBlobFingerprint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawMirrorStoredBlobFingerprint {
+    blob_relative_path: String,
+    file_identity: String,
+    size_bytes: u64,
+    modified_ns: u128,
+    change_time_ns: u128,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RawMirrorBlobRecord {
     blob_blake3: String,
-    bytes_copied: u64,
+    blob_size_bytes: u64,
+    source_content_blake3: String,
+    source_size_bytes: u64,
+    content_storage: Option<RawMirrorContentStorage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RawMirrorChunkRef {
+    blob_relative_path: String,
+    blob_blake3: String,
+    blob_size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RawMirrorContentStorage {
+    kind: String,
+    content_hash_algorithm: String,
+    content_blake3: String,
+    content_size_bytes: u64,
+    chunk_size_bytes: u64,
+    chunks: Vec<RawMirrorChunkRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -819,6 +1114,8 @@ struct RawMirrorManifestFile {
     captured_at_ms: i64,
     source_mtime_ms: Option<i64>,
     source_size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_storage: Option<RawMirrorContentStorage>,
     compression: RawMirrorCompressionEnvelope,
     encryption: RawMirrorEncryptionEnvelope,
     db_links: Vec<RawMirrorDbLink>,
@@ -827,6 +1124,26 @@ struct RawMirrorManifestFile {
 }
 
 pub fn capture_source_file(input: RawMirrorCaptureInput<'_>) -> Result<RawMirrorCaptureRecord> {
+    capture_source_file_with_chunk_policy(
+        input,
+        RAW_MIRROR_CHUNK_THRESHOLD_BYTES,
+        RAW_MIRROR_CHUNK_SIZE_BYTES,
+    )
+}
+
+pub(crate) fn capture_source_file_with_chunk_policy(
+    input: RawMirrorCaptureInput<'_>,
+    chunk_threshold_bytes: u64,
+    chunk_size_bytes: usize,
+) -> Result<RawMirrorCaptureRecord> {
+    if chunk_threshold_bytes == 0 {
+        return Err(anyhow!(
+            "raw mirror chunk threshold must be greater than zero"
+        ));
+    }
+    if chunk_size_bytes == 0 {
+        return Err(anyhow!("raw mirror chunk size must be greater than zero"));
+    }
     let source_metadata = fs::symlink_metadata(input.source_path)
         .with_context(|| format!("stat raw mirror source {}", input.source_path.display()))?;
     if source_metadata.file_type().is_symlink() {
@@ -844,35 +1161,31 @@ pub fn capture_source_file(input: RawMirrorCaptureInput<'_>) -> Result<RawMirror
 
     let root = ensure_raw_mirror_root(input.data_dir)?;
     ensure_private_dir_descendant(&root, &root.join("tmp"))?;
+    let _mutation_lock = acquire_raw_mirror_mutation_lock(&root)?;
 
-    let cache_key = raw_mirror_blob_cache_key(&input, &source_metadata);
-    let (blob_blake3, bytes_copied, blob_already_present) =
-        match cached_raw_mirror_blob_record(&cache_key, &root) {
-            Some(record) => (record.blob_blake3, record.bytes_copied, true),
-            None => {
-                let temp_dir = unique_capture_temp_dir(&root);
-                ensure_private_dir_descendant(&root, &temp_dir)?;
-                let CopyToTempResult {
-                    temp_path,
-                    blob_blake3,
-                    bytes_copied,
-                } = copy_source_to_private_temp(input.source_path, &temp_dir, &source_metadata)?;
-                let blob_relative_path = raw_mirror_blob_relative_path(&blob_blake3)
-                    .ok_or_else(|| anyhow!("computed invalid raw mirror blake3 digest"))?;
-                let blob_path = root.join(&blob_relative_path);
-                let already_present =
-                    publish_content_addressed_temp(&root, &temp_path, &blob_path, &blob_blake3)?;
-                remove_empty_temp_dir_best_effort(&temp_dir);
-                cache_raw_mirror_blob_record(
-                    cache_key.clone(),
-                    RawMirrorBlobRecord {
-                        blob_blake3: blob_blake3.clone(),
-                        bytes_copied,
-                    },
-                );
-                (blob_blake3, bytes_copied, already_present)
-            }
-        };
+    let cache_key = raw_mirror_blob_cache_key(
+        &input,
+        &source_metadata,
+        chunk_threshold_bytes,
+        chunk_size_bytes,
+    );
+    let (blob_record, pending_publish) = match cached_raw_mirror_blob_record(&cache_key, &root) {
+        Some(record) => (record, None),
+        None => {
+            let temp_dir = unique_capture_temp_dir(&root);
+            ensure_private_dir_descendant(&root, &temp_dir)?;
+            let prepared = prepare_source_content(
+                &root,
+                input.source_path,
+                &temp_dir,
+                &source_metadata,
+                chunk_threshold_bytes,
+                chunk_size_bytes,
+            )?;
+            (prepared.record, Some((temp_dir, prepared.files)))
+        }
+    };
+    let blob_blake3 = blob_record.blob_blake3.clone();
     let blob_relative_path = raw_mirror_blob_relative_path(&blob_blake3)
         .ok_or_else(|| anyhow!("computed invalid raw mirror blake3 digest"))?;
 
@@ -897,7 +1210,7 @@ pub fn capture_source_file(input: RawMirrorCaptureInput<'_>) -> Result<RawMirror
         blob_hash_algorithm: RAW_MIRROR_HASH_ALGORITHM.to_string(),
         blob_relative_path: blob_relative_path.clone(),
         blob_blake3: blob_blake3.clone(),
-        blob_size_bytes: bytes_copied,
+        blob_size_bytes: blob_record.blob_size_bytes,
         provider: input.provider.to_string(),
         source_id: input.source_id.to_string(),
         origin_kind: input.origin_kind.to_string(),
@@ -907,11 +1220,12 @@ pub fn capture_source_file(input: RawMirrorCaptureInput<'_>) -> Result<RawMirror
         original_path_blake3,
         captured_at_ms,
         source_mtime_ms,
-        source_size_bytes: source_metadata.len(),
+        source_size_bytes: blob_record.source_size_bytes,
+        content_storage: blob_record.content_storage.clone(),
         compression: RawMirrorCompressionEnvelope {
             state: "none".to_string(),
             algorithm: None,
-            uncompressed_size_bytes: Some(bytes_copied),
+            uncompressed_size_bytes: Some(blob_record.source_size_bytes),
         },
         encryption: RawMirrorEncryptionEnvelope {
             state: "none".to_string(),
@@ -923,13 +1237,45 @@ pub fn capture_source_file(input: RawMirrorCaptureInput<'_>) -> Result<RawMirror
         verification: RawMirrorVerificationRecord {
             status: "captured".to_string(),
             verifier: "cass_indexer".to_string(),
-            content_blake3: Some(blob_blake3.clone()),
+            content_blake3: Some(blob_record.source_content_blake3.clone()),
             verified_at_ms: Some(captured_at_ms),
         },
         manifest_blake3: None,
     };
     manifest.manifest_blake3 = Some(raw_mirror_manifest_blake3(&manifest));
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+    if manifest_bytes.len() as u64 > RAW_MIRROR_MANIFEST_MAX_BYTES {
+        if let Some((temp_dir, files)) = &pending_publish {
+            for file in files {
+                remove_temp_best_effort(&file.temp_path);
+            }
+            remove_empty_temp_dir_best_effort(temp_dir);
+        }
+        return Err(anyhow!(
+            "raw mirror manifest for {} exceeds the {}-byte validation limit",
+            input.source_path.display(),
+            RAW_MIRROR_MANIFEST_MAX_BYTES
+        ));
+    }
+    let blob_already_present = if let Some((temp_dir, files)) = pending_publish {
+        let mut all_already_present = true;
+        for file in &files {
+            let file_blob_relative_path = raw_mirror_blob_relative_path(&file.blob_blake3)
+                .ok_or_else(|| anyhow!("computed invalid raw mirror blake3 digest"))?;
+            let blob_path = root.join(&file_blob_relative_path);
+            all_already_present &= publish_content_addressed_temp(
+                &root,
+                &file.temp_path,
+                &blob_path,
+                &file.blob_blake3,
+            )?;
+        }
+        remove_empty_temp_dir_best_effort(&temp_dir);
+        cache_raw_mirror_blob_record(cache_key, blob_record.clone());
+        all_already_present
+    } else {
+        true
+    };
     let manifest_already_present =
         publish_manifest_bytes_create_new(&root, &manifest_path, &manifest_bytes, &blob_blake3)?;
     let (record_blob_size_bytes, record_captured_at_ms, record_source_mtime_ms) =
@@ -947,15 +1293,28 @@ pub fn capture_source_file(input: RawMirrorCaptureInput<'_>) -> Result<RawMirror
                 published.source_mtime_ms,
             )
         } else {
-            (bytes_copied, captured_at_ms, source_mtime_ms)
+            (blob_record.blob_size_bytes, captured_at_ms, source_mtime_ms)
         };
+
+    let storage_kind = blob_record.content_storage.as_ref().map_or_else(
+        || "whole_blob_v1".to_string(),
+        |storage| storage.kind.clone(),
+    );
+    let chunk_count = blob_record
+        .content_storage
+        .as_ref()
+        .map_or(1, |storage| storage.chunks.len());
 
     Ok(RawMirrorCaptureRecord {
         manifest_id,
         manifest_relative_path,
         blob_relative_path,
-        blob_blake3,
+        blob_blake3: blob_blake3.clone(),
         blob_size_bytes: record_blob_size_bytes,
+        source_content_blake3: blob_record.source_content_blake3,
+        source_size_bytes: blob_record.source_size_bytes,
+        storage_kind,
+        chunk_count,
         captured_at_ms: record_captured_at_ms,
         source_mtime_ms: record_source_mtime_ms,
         already_present: blob_already_present && manifest_already_present,
@@ -971,6 +1330,7 @@ pub fn merge_manifest_db_links(
         return Ok(());
     }
     let root = raw_mirror_root(data_dir);
+    let _mutation_lock = acquire_raw_mirror_mutation_lock(&root)?;
     let manifest_path = raw_mirror_manifest_path_from_relative(&root, manifest_relative_path)?;
     merge_raw_mirror_manifest_db_links(&root, &manifest_path, links, None)
 }
@@ -979,6 +1339,42 @@ struct CopyToTempResult {
     temp_path: PathBuf,
     blob_blake3: String,
     bytes_copied: u64,
+}
+
+struct PreparedRawMirrorContent {
+    record: RawMirrorBlobRecord,
+    files: Vec<CopyToTempResult>,
+}
+
+fn prepare_source_content(
+    root: &Path,
+    source_path: &Path,
+    temp_dir: &Path,
+    source_metadata: &fs::Metadata,
+    chunk_threshold_bytes: u64,
+    chunk_size_bytes: usize,
+) -> Result<PreparedRawMirrorContent> {
+    if source_metadata.len() < chunk_threshold_bytes {
+        let whole = copy_source_to_private_temp(source_path, temp_dir, source_metadata)?;
+        return Ok(PreparedRawMirrorContent {
+            record: RawMirrorBlobRecord {
+                blob_blake3: whole.blob_blake3.clone(),
+                blob_size_bytes: whole.bytes_copied,
+                source_content_blake3: whole.blob_blake3.clone(),
+                source_size_bytes: whole.bytes_copied,
+                content_storage: None,
+            },
+            files: vec![whole],
+        });
+    }
+
+    copy_source_to_private_chunks(
+        root,
+        source_path,
+        temp_dir,
+        source_metadata,
+        chunk_size_bytes,
+    )
 }
 
 fn copy_source_to_private_temp(
@@ -1011,7 +1407,9 @@ fn copy_source_to_private_temp(
     let final_source_metadata = source
         .metadata()
         .with_context(|| format!("stat opened raw mirror source {}", source_path.display()))?;
-    if source_file_changed_during_capture(source_metadata, &final_source_metadata) {
+    if source_file_changed_during_capture(source_metadata, &final_source_metadata)
+        || source_path_changed_identity_during_capture(source_path, source_metadata)
+    {
         remove_temp_best_effort(&temp_path);
         return Err(anyhow!(
             "raw mirror source {} changed while it was being captured; retry indexing to capture a stable copy",
@@ -1024,6 +1422,164 @@ fn copy_source_to_private_temp(
         blob_blake3: hasher.finalize().to_hex().to_string(),
         bytes_copied,
     })
+}
+
+fn copy_source_to_private_chunks(
+    root: &Path,
+    source_path: &Path,
+    temp_dir: &Path,
+    source_metadata: &fs::Metadata,
+    chunk_size_bytes: usize,
+) -> Result<PreparedRawMirrorContent> {
+    let mut source = open_stable_source_file(source_path, source_metadata)?;
+    let mut content_hasher = blake3::Hasher::new();
+    let mut chunk_buffer = vec![0_u8; chunk_size_bytes];
+    let mut chunk_files = Vec::new();
+    let mut prepared_blob_blake3 = HashSet::new();
+    let mut chunks = Vec::new();
+    let mut content_size_bytes = 0_u64;
+
+    loop {
+        let mut filled = 0_usize;
+        while filled < chunk_buffer.len() {
+            let read = source
+                .read(&mut chunk_buffer[filled..])
+                .with_context(|| format!("read raw mirror source {}", source_path.display()))?;
+            if read == 0 {
+                break;
+            }
+            filled += read;
+        }
+        if filled == 0 {
+            break;
+        }
+
+        let chunk_bytes = &chunk_buffer[..filled];
+        content_hasher.update(chunk_bytes);
+        content_size_bytes = content_size_bytes.saturating_add(filled as u64);
+        let chunk_blake3 = blake3::hash(chunk_bytes).to_hex().to_string();
+        let chunk_relative_path = raw_mirror_blob_relative_path(&chunk_blake3)
+            .ok_or_else(|| anyhow!("computed invalid raw mirror chunk digest"))?;
+        let chunk_reference = RawMirrorChunkRef {
+            blob_relative_path: chunk_relative_path,
+            blob_blake3: chunk_blake3.clone(),
+            blob_size_bytes: filled as u64,
+        };
+        if prepared_blob_blake3.insert(chunk_blake3.clone())
+            && !content_addressed_blob_is_verified(root, &chunk_reference)?
+        {
+            let chunk_temp_path = unique_temp_path(temp_dir, "chunk");
+            let mut chunk_temp = private_create_new_file(&chunk_temp_path)?;
+            chunk_temp.write_all(chunk_bytes).with_context(|| {
+                format!("write raw mirror chunk temp {}", chunk_temp_path.display())
+            })?;
+            sync_open_file_if_required(&chunk_temp, || {
+                format!("sync raw mirror chunk temp {}", chunk_temp_path.display())
+            })?;
+            drop(chunk_temp);
+            chunk_files.push(CopyToTempResult {
+                temp_path: chunk_temp_path,
+                blob_blake3: chunk_blake3,
+                bytes_copied: filled as u64,
+            });
+        }
+        chunks.push(chunk_reference);
+
+        if filled < chunk_buffer.len() {
+            break;
+        }
+    }
+
+    let final_source_metadata = source
+        .metadata()
+        .with_context(|| format!("stat opened raw mirror source {}", source_path.display()))?;
+    if source_file_changed_during_capture(source_metadata, &final_source_metadata)
+        || source_path_changed_identity_during_capture(source_path, source_metadata)
+    {
+        for chunk in &chunk_files {
+            remove_temp_best_effort(&chunk.temp_path);
+        }
+        return Err(anyhow!(
+            "raw mirror source {} changed while it was being captured; retry indexing to capture a stable copy",
+            source_path.display()
+        ));
+    }
+
+    let content_blake3 = content_hasher.finalize().to_hex().to_string();
+    let content_storage = RawMirrorContentStorage {
+        kind: RAW_MIRROR_FIXED_CHUNKS_KIND.to_string(),
+        content_hash_algorithm: RAW_MIRROR_HASH_ALGORITHM.to_string(),
+        content_blake3: content_blake3.clone(),
+        content_size_bytes,
+        chunk_size_bytes: chunk_size_bytes as u64,
+        chunks,
+    };
+    let descriptor_bytes = serde_json::to_vec(&content_storage)?;
+    let descriptor_blake3 = blake3::hash(&descriptor_bytes).to_hex().to_string();
+    let descriptor_reference = RawMirrorChunkRef {
+        blob_relative_path: raw_mirror_blob_relative_path(&descriptor_blake3)
+            .ok_or_else(|| anyhow!("computed invalid raw mirror descriptor digest"))?,
+        blob_blake3: descriptor_blake3.clone(),
+        blob_size_bytes: descriptor_bytes.len() as u64,
+    };
+    if prepared_blob_blake3.insert(descriptor_blake3.clone())
+        && !content_addressed_blob_is_verified(root, &descriptor_reference)?
+    {
+        let descriptor_temp_path = unique_temp_path(temp_dir, "chunk-descriptor");
+        let mut descriptor_temp = private_create_new_file(&descriptor_temp_path)?;
+        descriptor_temp
+            .write_all(&descriptor_bytes)
+            .with_context(|| {
+                format!(
+                    "write raw mirror chunk descriptor {}",
+                    descriptor_temp_path.display()
+                )
+            })?;
+        sync_open_file_if_required(&descriptor_temp, || {
+            format!(
+                "sync raw mirror chunk descriptor {}",
+                descriptor_temp_path.display()
+            )
+        })?;
+        drop(descriptor_temp);
+        chunk_files.push(CopyToTempResult {
+            temp_path: descriptor_temp_path,
+            blob_blake3: descriptor_blake3.clone(),
+            bytes_copied: descriptor_bytes.len() as u64,
+        });
+    }
+
+    Ok(PreparedRawMirrorContent {
+        record: RawMirrorBlobRecord {
+            blob_blake3: descriptor_blake3,
+            blob_size_bytes: descriptor_bytes.len() as u64,
+            source_content_blake3: content_blake3,
+            source_size_bytes: content_size_bytes,
+            content_storage: Some(content_storage),
+        },
+        files: chunk_files,
+    })
+}
+
+fn content_addressed_blob_is_verified(
+    root: &Path,
+    reference: &RawMirrorChunkRef,
+) -> Result<bool> {
+    let path = root.join(&reference.blob_relative_path);
+    if raw_mirror_path_has_symlink_below_root(root, &path) {
+        return Err(anyhow!(
+            "raw mirror blob path {} contains a symlink",
+            path.display()
+        ));
+    }
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            verify_existing_blob_reference(root, reference)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("stat raw mirror blob {}", path.display())),
+    }
 }
 
 fn open_stable_source_file(source_path: &Path, expected_metadata: &fs::Metadata) -> Result<File> {
@@ -1099,12 +1655,32 @@ fn source_file_changed_during_capture(
     initial: &fs::Metadata,
     final_metadata: &fs::Metadata,
 ) -> bool {
+    if !same_source_identity(initial, final_metadata) {
+        return true;
+    }
     if initial.len() != final_metadata.len() {
+        return true;
+    }
+    if let (Some(initial_change), Some(final_change)) = (
+        source_change_time_ns(initial),
+        source_change_time_ns(final_metadata),
+    ) && initial_change != final_change
+    {
         return true;
     }
     match (initial.modified().ok(), final_metadata.modified().ok()) {
         (Some(initial_mtime), Some(final_mtime)) => initial_mtime != final_mtime,
         _ => false,
+    }
+}
+
+fn source_path_changed_identity_during_capture(
+    source_path: &Path,
+    initial: &fs::Metadata,
+) -> bool {
+    match fs::symlink_metadata(source_path) {
+        Ok(current) => current.file_type().is_symlink() || !same_source_identity(initial, &current),
+        Err(_) => true,
     }
 }
 
@@ -1114,16 +1690,40 @@ fn publish_content_addressed_temp(
     final_path: &Path,
     expected_blake3: &str,
 ) -> Result<bool> {
+    let expected_relative_path = raw_mirror_blob_relative_path(expected_blake3)
+        .ok_or_else(|| anyhow!("computed invalid raw mirror blake3 digest"))?;
+    if final_path != root.join(&expected_relative_path) {
+        return Err(anyhow!(
+            "raw mirror blob publish target {} is not the canonical path for {}",
+            final_path.display(),
+            expected_blake3
+        ));
+    }
+    let temp_size_bytes = fs::symlink_metadata(temp_path)
+        .with_context(|| format!("stat raw mirror temp {}", temp_path.display()))?
+        .len();
+    let reference = RawMirrorChunkRef {
+        blob_relative_path: expected_relative_path,
+        blob_blake3: expected_blake3.to_string(),
+        blob_size_bytes: temp_size_bytes,
+    };
     ensure_private_dir_descendant(
         root,
         final_path
             .parent()
             .ok_or_else(|| anyhow!("raw mirror blob path has no parent"))?,
     )?;
-    if final_path.exists() {
-        verify_existing_file(final_path, expected_blake3)?;
-        remove_temp_best_effort(temp_path);
-        return Ok(true);
+    match fs::symlink_metadata(final_path) {
+        Ok(_) => {
+            verify_existing_blob_reference(root, &reference)?;
+            remove_temp_best_effort(temp_path);
+            return Ok(true);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("stat raw mirror blob {}", final_path.display()));
+        }
     }
 
     match fs::hard_link(temp_path, final_path) {
@@ -1134,7 +1734,7 @@ fn publish_content_addressed_temp(
             Ok(false)
         }
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            verify_existing_file(final_path, expected_blake3)?;
+            verify_existing_blob_reference(root, &reference)?;
             remove_temp_best_effort(temp_path);
             Ok(true)
         }
@@ -1159,7 +1759,7 @@ fn publish_manifest_bytes_create_new(
             .ok_or_else(|| anyhow!("raw mirror manifest path has no parent"))?,
     )?;
     if manifest_path.exists() {
-        verify_existing_manifest(manifest_path, blob_blake3)?;
+        verify_existing_manifest(root, manifest_path, blob_blake3)?;
         return Ok(true);
     }
 
@@ -1182,7 +1782,7 @@ fn publish_manifest_bytes_create_new(
             Ok(false)
         }
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            verify_existing_manifest(manifest_path, blob_blake3)?;
+            verify_existing_manifest(root, manifest_path, blob_blake3)?;
             remove_temp_best_effort(&temp_path);
             remove_empty_temp_dir_best_effort(&temp_dir);
             Ok(true)
@@ -1210,7 +1810,18 @@ fn merge_raw_mirror_manifest_db_links(
         .lock()
         .map_err(|_| anyhow!("raw mirror manifest update lock poisoned"))?;
 
-    let mut manifest = read_raw_mirror_manifest(manifest_path)?;
+    let parsed_manifest = read_raw_mirror_manifest(manifest_path)?;
+    let expected_manifest_path = root.join(raw_mirror_manifest_relative_path(
+        &parsed_manifest.manifest_id,
+    ));
+    if manifest_path != expected_manifest_path {
+        return Err(anyhow!(
+            "raw mirror manifest {} is not at its canonical path {}",
+            manifest_path.display(),
+            expected_manifest_path.display()
+        ));
+    }
+    let mut manifest = read_validated_raw_mirror_manifest(root, &parsed_manifest.manifest_id)?;
     if let Some(expected_blob_blake3) = expected_blob_blake3
         && manifest.blob_blake3 != expected_blob_blake3
     {
@@ -1232,6 +1843,14 @@ fn merge_raw_mirror_manifest_db_links(
     manifest.db_links = merged_links;
     manifest.manifest_blake3 = Some(raw_mirror_manifest_blake3(&manifest));
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+    if manifest_bytes.len() as u64 > RAW_MIRROR_MANIFEST_MAX_BYTES {
+        return Err(anyhow!(
+            "refusing to replace raw mirror manifest {} with {} bytes because the validation limit is {} bytes",
+            manifest_path.display(),
+            manifest_bytes.len(),
+            RAW_MIRROR_MANIFEST_MAX_BYTES
+        ));
+    }
     replace_manifest_bytes(root, manifest_path, &manifest_bytes)
 }
 
@@ -1267,8 +1886,6 @@ fn replace_manifest_bytes(root: &Path, manifest_path: &Path, manifest_bytes: &[u
             temp_path.display()
         )
     })?;
-    set_private_file_permissions(manifest_path)?;
-    sync_file(manifest_path)?;
     sync_parent(manifest_path)?;
     remove_empty_temp_dir_best_effort(&temp_dir);
     Ok(())
@@ -1337,8 +1954,23 @@ fn verify_existing_file(path: &Path, expected_blake3: &str) -> Result<()> {
     }
 }
 
-fn verify_existing_manifest(path: &Path, expected_blob_blake3: &str) -> Result<()> {
-    let manifest = read_raw_mirror_manifest(path)?;
+fn verify_existing_manifest(
+    root: &Path,
+    path: &Path,
+    expected_blob_blake3: &str,
+) -> Result<()> {
+    let parsed_manifest = read_raw_mirror_manifest(path)?;
+    let expected_manifest_path = root.join(raw_mirror_manifest_relative_path(
+        &parsed_manifest.manifest_id,
+    ));
+    if path != expected_manifest_path {
+        return Err(anyhow!(
+            "existing raw mirror manifest {} is not at its canonical path {}",
+            path.display(),
+            expected_manifest_path.display()
+        ));
+    }
+    let manifest = read_validated_raw_mirror_manifest(root, &parsed_manifest.manifest_id)?;
     if manifest.blob_blake3 == expected_blob_blake3 {
         Ok(())
     } else {
@@ -1366,6 +1998,13 @@ fn read_raw_mirror_manifest(path: &Path) -> Result<RawMirrorManifestFile> {
             path.display()
         ));
     }
+    if metadata.len() > RAW_MIRROR_MANIFEST_MAX_BYTES {
+        return Err(anyhow!(
+            "refusing to read raw mirror manifest {} larger than {} bytes",
+            path.display(),
+            RAW_MIRROR_MANIFEST_MAX_BYTES
+        ));
+    }
     serde_json::from_slice(
         &fs::read(path).with_context(|| format!("read raw mirror manifest {}", path.display()))?,
     )
@@ -1389,6 +2028,8 @@ fn ensure_raw_mirror_root(data_dir: &Path) -> Result<PathBuf> {
 fn raw_mirror_blob_cache_key(
     input: &RawMirrorCaptureInput<'_>,
     source_metadata: &fs::Metadata,
+    chunk_threshold_bytes: u64,
+    chunk_size_bytes: usize,
 ) -> RawMirrorBlobCacheKey {
     RawMirrorBlobCacheKey {
         data_dir: input.data_dir.to_path_buf(),
@@ -1397,6 +2038,8 @@ fn raw_mirror_blob_cache_key(
         source_size_bytes: source_metadata.len(),
         source_mtime_ns: source_metadata.modified().ok().and_then(system_time_to_ns),
         source_change_time_ns: source_change_time_ns(source_metadata),
+        chunk_threshold_bytes,
+        chunk_size_bytes,
     }
 }
 
@@ -1404,69 +2047,185 @@ fn cached_raw_mirror_blob_record(
     key: &RawMirrorBlobCacheKey,
     root: &Path,
 ) -> Option<RawMirrorBlobRecord> {
-    let cache = BLOB_CAPTURE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let record = {
-        let mut guard = cache.lock().ok()?;
-        let record = guard.get(key).cloned()?;
-        if raw_mirror_blob_relative_path(&record.blob_blake3).is_none() {
-            guard.remove(key);
-            return None;
-        }
-        record
-    };
-
-    let blob_relative_path = raw_mirror_blob_relative_path(&record.blob_blake3)?;
-    let blob_path = root.join(blob_relative_path);
-    let metadata_valid = fs::symlink_metadata(&blob_path)
-        .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
-        .unwrap_or(false);
-    if !metadata_valid {
-        remove_cached_raw_mirror_blob_record_if_unchanged(cache, key, &record);
+    if !raw_mirror_blob_cache_key_is_strong(key) {
         return None;
     }
+    let cache = BLOB_CAPTURE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let source_key = raw_mirror_blob_source_key(key);
+    let cached = {
+        let mut guard = cache.lock().ok()?;
+        let cached = guard.get(&source_key).cloned()?;
+        if cached.cache_key != *key {
+            guard.remove(&source_key);
+            return None;
+        }
+        if raw_mirror_blob_relative_path(&cached.record.blob_blake3).is_none() {
+            guard.remove(&source_key);
+            return None;
+        }
+        cached
+    };
+    let record = cached.record.clone();
 
-    match file_blake3(&blob_path) {
-        Ok(actual) if actual == record.blob_blake3 => Some(record),
-        Ok(actual) => {
+    if raw_mirror_stored_blob_fingerprints(root, &record)
+        .is_some_and(|current| current == cached.stored_blob_fingerprints)
+    {
+        return Some(record);
+    }
+
+    match cached_raw_mirror_blob_record_is_verified(root, &record) {
+        Ok(()) => {
+            refresh_cached_raw_mirror_blob_fingerprints(cache, key, &record, root);
+            Some(record)
+        }
+        Err(err) => {
+            let blob_relative_path = raw_mirror_blob_relative_path(&record.blob_blake3)?;
+            let blob_path = root.join(blob_relative_path);
             tracing::warn!(
                 path = %blob_path.display(),
                 expected_blake3 = %record.blob_blake3,
-                actual_blake3 = %actual,
+                error = %err,
                 "discarding raw mirror blob cache entry with mismatched content"
             );
             remove_cached_raw_mirror_blob_record_if_unchanged(cache, key, &record);
             None
         }
-        Err(err) => {
-            tracing::debug!(
-                path = %blob_path.display(),
-                error = %err,
-                "discarding unreadable raw mirror blob cache entry"
-            );
-            remove_cached_raw_mirror_blob_record_if_unchanged(cache, key, &record);
-            None
-        }
     }
 }
 
+fn raw_mirror_stored_blob_fingerprints(
+    root: &Path,
+    record: &RawMirrorBlobRecord,
+) -> Option<Vec<RawMirrorStoredBlobFingerprint>> {
+    let mut references = vec![RawMirrorChunkRef {
+        blob_relative_path: raw_mirror_blob_relative_path(&record.blob_blake3)?,
+        blob_blake3: record.blob_blake3.clone(),
+        blob_size_bytes: record.blob_size_bytes,
+    }];
+    if let Some(storage) = &record.content_storage {
+        references.extend(storage.chunks.iter().cloned());
+    }
+
+    let mut seen = HashSet::new();
+    let mut fingerprints = Vec::with_capacity(references.len());
+    for reference in references {
+        if !seen.insert(reference.blob_relative_path.clone()) {
+            continue;
+        }
+        let path = root.join(&reference.blob_relative_path);
+        if raw_mirror_path_has_symlink_below_root(root, &path) {
+            return None;
+        }
+        let metadata = fs::symlink_metadata(&path).ok()?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() != reference.blob_size_bytes
+        {
+            return None;
+        }
+        fingerprints.push(RawMirrorStoredBlobFingerprint {
+            blob_relative_path: reference.blob_relative_path,
+            file_identity: source_identity_token(&metadata)?,
+            size_bytes: metadata.len(),
+            modified_ns: metadata.modified().ok().and_then(system_time_to_ns)?,
+            change_time_ns: source_change_time_ns(&metadata)?,
+        });
+    }
+    Some(fingerprints)
+}
+
+fn refresh_cached_raw_mirror_blob_fingerprints(
+    cache: &Mutex<HashMap<RawMirrorBlobSourceKey, CachedRawMirrorBlobRecord>>,
+    key: &RawMirrorBlobCacheKey,
+    record: &RawMirrorBlobRecord,
+    root: &Path,
+) {
+    let Some(stored_blob_fingerprints) = raw_mirror_stored_blob_fingerprints(root, record) else {
+        return;
+    };
+    let source_key = raw_mirror_blob_source_key(key);
+    if let Ok(mut guard) = cache.lock()
+        && let Some(current) = guard.get_mut(&source_key)
+        && current.cache_key == *key
+        && current.record == *record
+    {
+        current.stored_blob_fingerprints = stored_blob_fingerprints;
+    }
+}
+
+fn cached_raw_mirror_blob_record_is_verified(
+    root: &Path,
+    record: &RawMirrorBlobRecord,
+) -> Result<()> {
+    let descriptor = RawMirrorChunkRef {
+        blob_relative_path: raw_mirror_blob_relative_path(&record.blob_blake3)
+            .ok_or_else(|| anyhow!("cached raw mirror blob has an invalid digest"))?,
+        blob_blake3: record.blob_blake3.clone(),
+        blob_size_bytes: record.blob_size_bytes,
+    };
+    verify_existing_blob_reference(root, &descriptor)?;
+    let mut verified_blobs = HashSet::from([descriptor.blob_blake3]);
+    if let Some(storage) = &record.content_storage {
+        for chunk in &storage.chunks {
+            if verified_blobs.insert(chunk.blob_blake3.clone()) {
+                verify_existing_blob_reference(root, chunk)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn remove_cached_raw_mirror_blob_record_if_unchanged(
-    cache: &Mutex<HashMap<RawMirrorBlobCacheKey, RawMirrorBlobRecord>>,
+    cache: &Mutex<HashMap<RawMirrorBlobSourceKey, CachedRawMirrorBlobRecord>>,
     key: &RawMirrorBlobCacheKey,
     stale_record: &RawMirrorBlobRecord,
 ) {
+    let source_key = raw_mirror_blob_source_key(key);
     if let Ok(mut guard) = cache.lock()
         && guard
-            .get(key)
-            .is_some_and(|current| current == stale_record)
+            .get(&source_key)
+            .is_some_and(|current| current.cache_key == *key && current.record == *stale_record)
     {
-        guard.remove(key);
+        guard.remove(&source_key);
     }
 }
 
 fn cache_raw_mirror_blob_record(key: RawMirrorBlobCacheKey, record: RawMirrorBlobRecord) {
+    if !raw_mirror_blob_cache_key_is_strong(&key) {
+        return;
+    }
+    let root = raw_mirror_root(&key.data_dir);
+    let Some(stored_blob_fingerprints) = raw_mirror_stored_blob_fingerprints(&root, &record) else {
+        return;
+    };
     let cache = BLOB_CAPTURE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut guard) = cache.lock() {
-        guard.insert(key, record);
+        let source_key = raw_mirror_blob_source_key(&key);
+        if !guard.contains_key(&source_key)
+            && guard.len() >= RAW_MIRROR_BLOB_CACHE_MAX_ENTRIES
+            && let Some(evicted) = guard.keys().next().cloned()
+        {
+            guard.remove(&evicted);
+        }
+        guard.insert(
+            source_key,
+            CachedRawMirrorBlobRecord {
+                cache_key: key,
+                record,
+                stored_blob_fingerprints,
+            },
+        );
+    }
+}
+
+fn raw_mirror_blob_cache_key_is_strong(key: &RawMirrorBlobCacheKey) -> bool {
+    key.source_identity.is_some() && key.source_change_time_ns.is_some()
+}
+
+fn raw_mirror_blob_source_key(key: &RawMirrorBlobCacheKey) -> RawMirrorBlobSourceKey {
+    RawMirrorBlobSourceKey {
+        data_dir: key.data_dir.clone(),
+        source_path: key.source_path.clone(),
     }
 }
 
@@ -1482,6 +2241,380 @@ fn raw_mirror_blob_relative_path(blob_blake3: &str) -> Option<String> {
         lower,
         RAW_MIRROR_BLOB_EXTENSION
     ))
+}
+
+fn raw_mirror_manifest_blob_references(
+    manifest: &RawMirrorManifestFile,
+) -> Result<Vec<RawMirrorChunkRef>> {
+    let expected_descriptor_path = raw_mirror_blob_relative_path(&manifest.blob_blake3)
+        .ok_or_else(|| anyhow!("raw mirror manifest has an invalid blob digest"))?;
+    if manifest.blob_relative_path != expected_descriptor_path {
+        return Err(anyhow!(
+            "raw mirror manifest blob path does not match its digest"
+        ));
+    }
+
+    let descriptor = RawMirrorChunkRef {
+        blob_relative_path: manifest.blob_relative_path.clone(),
+        blob_blake3: manifest.blob_blake3.clone(),
+        blob_size_bytes: manifest.blob_size_bytes,
+    };
+    let Some(storage) = manifest.content_storage.as_ref() else {
+        if manifest.source_size_bytes != manifest.blob_size_bytes {
+            return Err(anyhow!(
+                "whole-blob raw mirror source size does not match blob size"
+            ));
+        }
+        if manifest
+            .verification
+            .content_blake3
+            .as_deref()
+            .is_some_and(|digest| digest != manifest.blob_blake3)
+        {
+            return Err(anyhow!(
+                "whole-blob raw mirror content digest does not match blob digest"
+            ));
+        }
+        return Ok(vec![descriptor]);
+    };
+
+    if storage.kind != RAW_MIRROR_FIXED_CHUNKS_KIND
+        || storage.content_hash_algorithm != RAW_MIRROR_HASH_ALGORITHM
+        || storage.chunk_size_bytes == 0
+        || storage.chunks.is_empty()
+        || storage.content_size_bytes != manifest.source_size_bytes
+        || manifest.verification.content_blake3.as_deref()
+            != Some(storage.content_blake3.as_str())
+        || raw_mirror_blob_relative_path(&storage.content_blake3).is_none()
+    {
+        return Err(anyhow!(
+            "raw mirror fixed-chunk storage metadata is invalid"
+        ));
+    }
+    let descriptor_bytes = serde_json::to_vec(storage)?;
+    if descriptor_bytes.len() as u64 != manifest.blob_size_bytes
+        || blake3::hash(&descriptor_bytes).to_hex().as_str()
+            != manifest.blob_blake3.as_str()
+    {
+        return Err(anyhow!(
+            "raw mirror fixed-chunk descriptor does not match the manifest blob"
+        ));
+    }
+
+    let mut content_size_bytes = 0_u64;
+    for (index, chunk) in storage.chunks.iter().enumerate() {
+        let expected_chunk_path = raw_mirror_blob_relative_path(&chunk.blob_blake3)
+            .ok_or_else(|| anyhow!("raw mirror chunk has an invalid digest"))?;
+        let is_last = index + 1 == storage.chunks.len();
+        if chunk.blob_relative_path != expected_chunk_path
+            || chunk.blob_size_bytes == 0
+            || chunk.blob_size_bytes > storage.chunk_size_bytes
+            || (!is_last && chunk.blob_size_bytes != storage.chunk_size_bytes)
+        {
+            return Err(anyhow!("raw mirror fixed-chunk entry is invalid"));
+        }
+        content_size_bytes = content_size_bytes
+            .checked_add(chunk.blob_size_bytes)
+            .ok_or_else(|| anyhow!("raw mirror fixed-chunk sizes overflow the source size"))?;
+    }
+    if content_size_bytes != storage.content_size_bytes {
+        return Err(anyhow!(
+            "raw mirror fixed-chunk sizes do not reconstruct the source size"
+        ));
+    }
+
+    let mut references = Vec::with_capacity(storage.chunks.len() + 1);
+    references.push(descriptor);
+    references.extend(storage.chunks.iter().cloned());
+    Ok(references)
+}
+
+pub(crate) fn read_source_bytes(data_dir: &Path, manifest_id: &str) -> Result<Vec<u8>> {
+    let root = raw_mirror_root(data_dir);
+    let manifest = read_validated_raw_mirror_manifest(&root, manifest_id)?;
+    let references = raw_mirror_manifest_blob_references(&manifest)?;
+
+    let Some(storage) = manifest.content_storage.as_ref() else {
+        validate_existing_blob_metadata(&root, &references[0])?;
+        let bytes = fs::read(root.join(&manifest.blob_relative_path)).with_context(|| {
+            format!(
+                "read raw mirror source blob for manifest {}",
+                manifest.manifest_id
+            )
+        })?;
+        if bytes.len() as u64 != manifest.source_size_bytes
+            || blake3::hash(&bytes).to_hex().as_str() != manifest.blob_blake3.as_str()
+        {
+            return Err(anyhow!(
+                "raw mirror source blob has the wrong size or digest for manifest {}",
+                manifest.manifest_id
+            ));
+        }
+        return Ok(bytes);
+    };
+
+    validate_existing_blob_metadata(&root, &references[0])?;
+    let descriptor_bytes =
+        fs::read(root.join(&manifest.blob_relative_path)).with_context(|| {
+            format!(
+                "read raw mirror chunk descriptor for manifest {}",
+                manifest.manifest_id
+            )
+        })?;
+    if blake3::hash(&descriptor_bytes).to_hex().as_str() != manifest.blob_blake3.as_str() {
+        return Err(anyhow!(
+            "raw mirror chunk descriptor failed content verification for manifest {}",
+            manifest.manifest_id
+        ));
+    }
+    let descriptor: RawMirrorContentStorage = serde_json::from_slice(&descriptor_bytes)
+        .with_context(|| {
+            format!(
+                "parse raw mirror chunk descriptor for manifest {}",
+                manifest.manifest_id
+            )
+        })?;
+    if &descriptor != storage {
+        return Err(anyhow!(
+            "raw mirror chunk descriptor disagrees with manifest {}",
+            manifest.manifest_id
+        ));
+    }
+
+    let content_capacity = usize::try_from(storage.content_size_bytes)
+        .map_err(|_| anyhow!("raw mirror source is too large to reconstruct in memory"))?;
+    let mut content = Vec::with_capacity(content_capacity);
+    for chunk in &storage.chunks {
+        let chunk_path = root.join(&chunk.blob_relative_path);
+        validate_existing_blob_metadata(&root, chunk)?;
+        let bytes = fs::read(&chunk_path)
+            .with_context(|| format!("read raw mirror chunk {}", chunk_path.display()))?;
+        if bytes.len() as u64 != chunk.blob_size_bytes
+            || blake3::hash(&bytes).to_hex().as_str() != chunk.blob_blake3.as_str()
+        {
+            return Err(anyhow!(
+                "raw mirror chunk {} has the wrong size or digest",
+                chunk_path.display()
+            ));
+        }
+        content.extend_from_slice(&bytes);
+    }
+    if content.len() as u64 != storage.content_size_bytes
+        || blake3::hash(&content).to_hex().as_str() != storage.content_blake3.as_str()
+    {
+        return Err(anyhow!(
+            "raw mirror chunks do not reconstruct the recorded source content"
+        ));
+    }
+    Ok(content)
+}
+
+pub(crate) fn verify_source_capture(
+    data_dir: &Path,
+    manifest_id: &str,
+) -> Result<RawMirrorVerifiedCapture> {
+    let root = raw_mirror_root(data_dir);
+    let manifest = read_validated_raw_mirror_manifest(&root, manifest_id)?;
+    let references = raw_mirror_manifest_blob_references(&manifest)?;
+    let descriptor_path = root.join(&references[0].blob_relative_path);
+    verify_existing_blob_reference(&root, &references[0])?;
+
+    let Some(storage) = manifest.content_storage.as_ref() else {
+        return Ok(RawMirrorVerifiedCapture {
+            storage_kind: "whole_blob_v1".to_string(),
+            source_content_blake3: manifest.blob_blake3,
+            source_size_bytes: manifest.source_size_bytes,
+            stored_blob_count: 1,
+            stored_bytes: manifest.blob_size_bytes,
+            stored_blobs: vec![(manifest.blob_blake3, manifest.blob_size_bytes)],
+            chunk_count: 1,
+        });
+    };
+
+    let descriptor_bytes = fs::read(&descriptor_path).with_context(|| {
+        format!(
+            "read raw mirror chunk descriptor for manifest {}",
+            manifest.manifest_id
+        )
+    })?;
+    let descriptor: RawMirrorContentStorage = serde_json::from_slice(&descriptor_bytes)
+        .with_context(|| {
+            format!(
+                "parse raw mirror chunk descriptor for manifest {}",
+                manifest.manifest_id
+            )
+        })?;
+    if &descriptor != storage {
+        return Err(anyhow!(
+            "raw mirror chunk descriptor disagrees with manifest {}",
+            manifest.manifest_id
+        ));
+    }
+
+    let mut content_hasher = blake3::Hasher::new();
+    let mut content_size_bytes = 0_u64;
+    let mut stored_paths = HashSet::new();
+    stored_paths.insert(manifest.blob_relative_path.clone());
+    let mut stored_bytes = manifest.blob_size_bytes;
+    let mut stored_blobs = vec![(manifest.blob_blake3.clone(), manifest.blob_size_bytes)];
+    let mut buffer = [0_u8; 64 * 1024];
+    for chunk in &storage.chunks {
+        let chunk_path = root.join(&chunk.blob_relative_path);
+        validate_existing_blob_metadata(&root, chunk)?;
+        let mut file = File::open(&chunk_path)
+            .with_context(|| format!("open raw mirror chunk {}", chunk_path.display()))?;
+        let mut chunk_hasher = blake3::Hasher::new();
+        let mut observed_chunk_bytes = 0_u64;
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .with_context(|| format!("read raw mirror chunk {}", chunk_path.display()))?;
+            if read == 0 {
+                break;
+            }
+            chunk_hasher.update(&buffer[..read]);
+            content_hasher.update(&buffer[..read]);
+            observed_chunk_bytes = observed_chunk_bytes.saturating_add(read as u64);
+        }
+        let observed_chunk_blake3 = chunk_hasher.finalize().to_hex().to_string();
+        if observed_chunk_bytes != chunk.blob_size_bytes
+            || observed_chunk_blake3 != chunk.blob_blake3
+        {
+            return Err(anyhow!(
+                "raw mirror chunk {} failed content verification",
+                chunk_path.display()
+            ));
+        }
+        content_size_bytes = content_size_bytes.saturating_add(observed_chunk_bytes);
+        if stored_paths.insert(chunk.blob_relative_path.clone()) {
+            stored_bytes = stored_bytes.saturating_add(observed_chunk_bytes);
+            stored_blobs.push((chunk.blob_blake3.clone(), observed_chunk_bytes));
+        }
+    }
+    let observed_content_blake3 = content_hasher.finalize().to_hex().to_string();
+    if content_size_bytes != storage.content_size_bytes
+        || observed_content_blake3 != storage.content_blake3
+    {
+        return Err(anyhow!(
+            "raw mirror chunks do not reconstruct the recorded source content"
+        ));
+    }
+    Ok(RawMirrorVerifiedCapture {
+        storage_kind: storage.kind.clone(),
+        source_content_blake3: storage.content_blake3.clone(),
+        source_size_bytes: storage.content_size_bytes,
+        stored_blob_count: stored_paths.len(),
+        stored_bytes,
+        stored_blobs,
+        chunk_count: storage.chunks.len(),
+    })
+}
+
+fn read_validated_raw_mirror_manifest(
+    root: &Path,
+    manifest_id: &str,
+) -> Result<RawMirrorManifestFile> {
+    let manifest_relative_path = raw_mirror_manifest_relative_path(manifest_id);
+    let manifest_path = raw_mirror_manifest_path_from_relative(root, &manifest_relative_path)?;
+    if raw_mirror_path_has_symlink_below_root(root, &manifest_path) {
+        return Err(anyhow!("raw mirror manifest path contains a symlink"));
+    }
+    let manifest = read_raw_mirror_manifest(&manifest_path)?;
+    validate_raw_mirror_manifest_contents(&manifest, manifest_id)?;
+    Ok(manifest)
+}
+
+fn validate_raw_mirror_manifest_contents(
+    manifest: &RawMirrorManifestFile,
+    expected_manifest_id: &str,
+) -> Result<Vec<RawMirrorChunkRef>> {
+    let expected_manifest_checksum = raw_mirror_manifest_blake3(&manifest);
+    let expected_original_path_blake3 = raw_mirror_original_path_blake3(&manifest.original_path);
+    let derived_manifest_id = raw_mirror_manifest_id(
+        &manifest.provider,
+        &manifest.source_id,
+        &manifest.origin_kind,
+        manifest.origin_host.as_deref(),
+        &manifest.original_path_blake3,
+        &manifest.blob_blake3,
+    );
+    if manifest.manifest_id != expected_manifest_id
+        || manifest.manifest_id != derived_manifest_id
+        || manifest.original_path_blake3 != expected_original_path_blake3
+        || manifest.manifest_kind != RAW_MIRROR_MANIFEST_KIND
+        || manifest.schema_version != RAW_MIRROR_SCHEMA_VERSION
+        || manifest.blob_hash_algorithm != RAW_MIRROR_HASH_ALGORITHM
+        || manifest.manifest_blake3.as_deref() != Some(expected_manifest_checksum.as_str())
+    {
+        return Err(anyhow!(
+            "raw mirror manifest identity or checksum is invalid"
+        ));
+    }
+    raw_mirror_manifest_blob_references(manifest)
+        .context("raw mirror manifest storage metadata is invalid")
+}
+
+fn verify_existing_blob_reference(root: &Path, reference: &RawMirrorChunkRef) -> Result<()> {
+    validate_existing_blob_metadata(root, reference)?;
+    verify_existing_file(
+        &root.join(&reference.blob_relative_path),
+        &reference.blob_blake3,
+    )
+}
+
+fn validate_existing_blob_metadata(root: &Path, reference: &RawMirrorChunkRef) -> Result<()> {
+    let expected_relative_path = raw_mirror_blob_relative_path(&reference.blob_blake3)
+        .ok_or_else(|| anyhow!("raw mirror blob reference has an invalid digest"))?;
+    if reference.blob_relative_path != expected_relative_path {
+        return Err(anyhow!(
+            "raw mirror blob reference path does not match its digest"
+        ));
+    }
+    let path = root.join(&reference.blob_relative_path);
+    if raw_mirror_path_has_symlink_below_root(root, &path) {
+        return Err(anyhow!(
+            "raw mirror blob path {} contains a symlink",
+            path.display()
+        ));
+    }
+    let metadata = fs::symlink_metadata(&path)
+        .with_context(|| format!("stat raw mirror blob {}", path.display()))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() != reference.blob_size_bytes
+    {
+        return Err(anyhow!(
+            "raw mirror blob {} is missing, unsafe, or has the wrong size",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn raw_mirror_path_has_symlink_below_root(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return true;
+    };
+    if fs::symlink_metadata(root)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(true)
+    {
+        return true;
+    }
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return true;
+        };
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return true,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(_) => return true,
+        }
+    }
+    false
 }
 
 fn raw_mirror_manifest_relative_path(manifest_id: &str) -> String {
@@ -1571,7 +2704,34 @@ fn unique_db_links(links: &[RawMirrorDbLink]) -> Vec<RawMirrorDbLink> {
 }
 
 fn file_blake3(path: &Path) -> Result<String> {
-    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let expected_metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("stat {} before hashing", path.display()))?;
+    if expected_metadata.file_type().is_symlink() || !expected_metadata.is_file() {
+        return Err(anyhow!(
+            "refusing to hash non-regular raw mirror file {}",
+            path.display()
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    configure_lock_open_options(&mut options);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let opened_metadata = file
+        .metadata()
+        .with_context(|| format!("stat opened raw mirror file {}", path.display()))?;
+    let current_path_metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("restat raw mirror file {}", path.display()))?;
+    if current_path_metadata.file_type().is_symlink()
+        || !same_source_identity(&expected_metadata, &opened_metadata)
+        || !same_source_identity(&opened_metadata, &current_path_metadata)
+    {
+        return Err(anyhow!(
+            "raw mirror file {} changed identity while being opened for hashing",
+            path.display()
+        ));
+    }
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
@@ -1807,18 +2967,6 @@ fn set_private_dir_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn set_private_file_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("set raw mirror file permissions {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn set_private_file_permissions(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1938,7 +3086,439 @@ mod tests {
                     & 0o777,
                 0o600
             );
+            assert_eq!(
+                fs::metadata(root.join(RAW_MIRROR_MUTATION_LOCK_FILE))
+                    .expect("mutation lock metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
         }
+    }
+
+    #[test]
+    fn growing_sources_reuse_fixed_chunks_and_reconstruct_every_snapshot() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("growing-rollout.jsonl");
+        let first_bytes = b"0123456789abcdefABCDEFGHIJKLMNOPqrstuvwxyz!@#$%^";
+        assert_eq!(first_bytes.len(), 48);
+        fs::write(&source_path, first_bytes).expect("write first source version");
+
+        let first = capture_source_file_with_chunk_policy(
+            RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "codex",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &source_path,
+                db_links: &[],
+            },
+            1,
+            16,
+        )
+        .expect("capture first chunked version");
+
+        let mut second_bytes = first_bytes.to_vec();
+        second_bytes.extend_from_slice(b"tail!");
+        fs::write(&source_path, &second_bytes).expect("append next source version");
+        let second = capture_source_file_with_chunk_policy(
+            RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "codex",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &source_path,
+                db_links: &[],
+            },
+            1,
+            16,
+        )
+        .expect("capture appended chunked version");
+
+        assert_eq!(first.storage_kind, RAW_MIRROR_FIXED_CHUNKS_KIND);
+        assert_eq!(first.chunk_count, 3);
+        assert_eq!(second.storage_kind, RAW_MIRROR_FIXED_CHUNKS_KIND);
+        assert_eq!(second.chunk_count, 4);
+        assert_eq!(
+            read_source_bytes(&data_dir, &first.manifest_id).expect("reconstruct first version"),
+            first_bytes
+        );
+        assert_eq!(
+            read_source_bytes(&data_dir, &second.manifest_id).expect("reconstruct second version"),
+            second_bytes
+        );
+
+        let root = raw_mirror_root(&data_dir);
+        let first_manifest = read_raw_mirror_manifest(&root.join(&first.manifest_relative_path))
+            .expect("first manifest");
+        let second_manifest = read_raw_mirror_manifest(&root.join(&second.manifest_relative_path))
+            .expect("second manifest");
+        let first_storage = first_manifest.content_storage.expect("first chunk storage");
+        let second_storage = second_manifest.content_storage.expect("second chunk storage");
+        assert_eq!(
+            first_storage.chunks,
+            second_storage.chunks[..3],
+            "an append must reuse every complete prior chunk instead of copying the full file"
+        );
+        assert_eq!(second_storage.chunks[3].blob_size_bytes, 5);
+
+        let mut third_bytes = second_bytes.clone();
+        third_bytes[20] ^= 0x20;
+        fs::write(&source_path, &third_bytes).expect("write in-place-mutated source version");
+        let third = capture_source_file_with_chunk_policy(
+            RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "cursor",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &source_path,
+                db_links: &[],
+            },
+            1,
+            16,
+        )
+        .expect("capture in-place-mutated chunked version");
+        assert_eq!(
+            read_source_bytes(&data_dir, &third.manifest_id).expect("reconstruct third version"),
+            third_bytes
+        );
+        let third_manifest = read_raw_mirror_manifest(&root.join(&third.manifest_relative_path))
+            .expect("third manifest");
+        let third_storage = third_manifest.content_storage.expect("third chunk storage");
+        assert_eq!(third_storage.chunks.len(), 4);
+        assert_eq!(third_storage.chunks[0], second_storage.chunks[0]);
+        assert_ne!(third_storage.chunks[1], second_storage.chunks[1]);
+        assert_eq!(third_storage.chunks[2], second_storage.chunks[2]);
+        assert_eq!(third_storage.chunks[3], second_storage.chunks[3]);
+
+        let summary = storage_summary(&data_dir);
+        assert_eq!(summary.manifest_count, 3);
+        assert_eq!(summary.unique_blob_count, 8);
+        assert_eq!(
+            summary.total_blob_bytes,
+            69 + first.blob_size_bytes + second.blob_size_bytes + third.blob_size_bytes,
+            "physical inventory must count shared content chunks once plus one descriptor per snapshot"
+        );
+
+        let first_manifest_path = root.join(&first.manifest_relative_path);
+        let mut old_first_manifest =
+            read_raw_mirror_manifest(&first_manifest_path).expect("re-read first manifest");
+        old_first_manifest.captured_at_ms = 0;
+        old_first_manifest.manifest_blake3 =
+            Some(raw_mirror_manifest_blake3(&old_first_manifest));
+        fs::write(
+            &first_manifest_path,
+            serde_json::to_vec_pretty(&old_first_manifest).expect("serialize old manifest"),
+        )
+        .expect("age first manifest fixture");
+        let prune_report = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                older_than_ms: Some(now_ms() / 2),
+                safety_hold_down_ms: 0,
+                apply: false,
+                ..RawMirrorPruneOptions::default()
+            },
+        )
+        .expect("plan chunk-aware prune");
+        assert_eq!(prune_report.planned_manifest_count, 1);
+        assert_eq!(prune_report.planned_blob_count, 1);
+        assert!(
+            prune_report.entries.iter().any(|entry| {
+                entry.kind == "blob" && entry.path == first.blob_relative_path
+            }),
+            "the retired snapshot descriptor should be reclaimable"
+        );
+        for shared_chunk in &first_storage.chunks {
+            assert!(
+                prune_report.entries.iter().all(|entry| {
+                    entry.kind != "blob" || entry.path != shared_chunk.blob_relative_path
+                }),
+                "a chunk retained by a newer snapshot must not be reclaimed: {shared_chunk:?}"
+            );
+        }
+
+        let size_report = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                max_size_bytes: Some(
+                    summary
+                        .total_blob_bytes
+                        .saturating_sub(first.blob_size_bytes),
+                ),
+                safety_hold_down_ms: 0,
+                apply: false,
+                ..RawMirrorPruneOptions::default()
+            },
+        )
+        .expect("plan chunk-aware max-size prune");
+        assert_eq!(
+            size_report.planned_manifest_count, 1,
+            "a shared base chunk must not cause max-size pruning to retire every snapshot"
+        );
+        assert_eq!(size_report.planned_blob_count, 1);
+        assert!(size_report.entries.iter().any(|entry| {
+            entry.kind == "manifest" && entry.path == first.manifest_relative_path
+        }));
+
+        let shared_chunk_path = root.join(&first_storage.chunks[0].blob_relative_path);
+        fs::write(&shared_chunk_path, b"tampered-16-byte").expect("plant same-size corruption");
+        assert_eq!(fs::metadata(&shared_chunk_path).expect("chunk metadata").len(), 16);
+        let error = verify_source_capture(&data_dir, &third.manifest_id)
+            .expect_err("same-size chunk corruption must invalidate reconstruction authority");
+        assert!(
+            error.to_string().contains("failed content verification"),
+            "unexpected chunk verification error: {error}"
+        );
+        let recapture_error = capture_source_file_with_chunk_policy(
+            RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "cursor",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &source_path,
+                db_links: &[],
+            },
+            1,
+            16,
+        )
+        .expect_err("a cache hit must not conceal same-size chunk corruption");
+        assert!(
+            recapture_error
+                .to_string()
+                .contains("existing raw mirror blob"),
+            "unexpected recapture error: {recapture_error}"
+        );
+        assert_eq!(
+            fs::read(&source_path).expect("source remains untouched"),
+            third_bytes
+        );
+    }
+
+    #[test]
+    fn blob_cache_does_not_cross_chunk_policy_boundaries() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("policy-sensitive.jsonl");
+        let source_bytes = b"0123456789abcdef0123456789abcdef";
+        fs::write(&source_path, source_bytes).expect("write source");
+
+        let chunked = capture_source_file_with_chunk_policy(
+            RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "codex",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &source_path,
+                db_links: &[],
+            },
+            1,
+            16,
+        )
+        .expect("capture with chunking");
+        let whole = capture_source_file_with_chunk_policy(
+            RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "codex",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &source_path,
+                db_links: &[],
+            },
+            u64::MAX,
+            16,
+        )
+        .expect("capture without chunking");
+
+        assert_eq!(chunked.storage_kind, RAW_MIRROR_FIXED_CHUNKS_KIND);
+        assert_eq!(whole.storage_kind, "whole_blob_v1");
+        assert_ne!(chunked.manifest_id, whole.manifest_id);
+        assert_eq!(
+            read_source_bytes(&data_dir, &whole.manifest_id).expect("read whole snapshot"),
+            source_bytes
+        );
+    }
+
+    #[test]
+    fn fixed_chunk_manifest_rejects_reconstructed_size_overflow() {
+        let content_blake3 = "11".repeat(32);
+        let first_chunk_blake3 = "22".repeat(32);
+        let second_chunk_blake3 = "33".repeat(32);
+        let storage = RawMirrorContentStorage {
+            kind: RAW_MIRROR_FIXED_CHUNKS_KIND.to_string(),
+            content_hash_algorithm: RAW_MIRROR_HASH_ALGORITHM.to_string(),
+            content_blake3: content_blake3.clone(),
+            content_size_bytes: u64::MAX,
+            chunk_size_bytes: u64::MAX,
+            chunks: vec![
+                RawMirrorChunkRef {
+                    blob_relative_path: raw_mirror_blob_relative_path(&first_chunk_blake3)
+                        .expect("first chunk path"),
+                    blob_blake3: first_chunk_blake3,
+                    blob_size_bytes: u64::MAX,
+                },
+                RawMirrorChunkRef {
+                    blob_relative_path: raw_mirror_blob_relative_path(&second_chunk_blake3)
+                        .expect("second chunk path"),
+                    blob_blake3: second_chunk_blake3,
+                    blob_size_bytes: 1,
+                },
+            ],
+        };
+        let descriptor_bytes = serde_json::to_vec(&storage).expect("serialize descriptor");
+        let descriptor_blake3 = blake3::hash(&descriptor_bytes).to_hex().to_string();
+        let manifest = RawMirrorManifestFile {
+            schema_version: RAW_MIRROR_SCHEMA_VERSION,
+            manifest_kind: RAW_MIRROR_MANIFEST_KIND.to_string(),
+            manifest_id: "overflow-fixture".to_string(),
+            blob_hash_algorithm: RAW_MIRROR_HASH_ALGORITHM.to_string(),
+            blob_relative_path: raw_mirror_blob_relative_path(&descriptor_blake3)
+                .expect("descriptor path"),
+            blob_blake3: descriptor_blake3,
+            blob_size_bytes: descriptor_bytes.len() as u64,
+            provider: "codex".to_string(),
+            source_id: "local".to_string(),
+            origin_kind: "local".to_string(),
+            origin_host: None,
+            original_path: "/fixture/overflow.jsonl".to_string(),
+            redacted_original_path: "[codex]/overflow.jsonl".to_string(),
+            original_path_blake3: "unused-by-storage-validator".to_string(),
+            captured_at_ms: 0,
+            source_mtime_ms: None,
+            source_size_bytes: u64::MAX,
+            content_storage: Some(storage),
+            compression: RawMirrorCompressionEnvelope {
+                state: "none".to_string(),
+                algorithm: None,
+                uncompressed_size_bytes: Some(u64::MAX),
+            },
+            encryption: RawMirrorEncryptionEnvelope {
+                state: "none".to_string(),
+                algorithm: None,
+                key_id: None,
+                envelope_version: None,
+            },
+            db_links: Vec::new(),
+            verification: RawMirrorVerificationRecord {
+                status: "captured".to_string(),
+                verifier: "cass_indexer".to_string(),
+                content_blake3: Some(content_blake3),
+                verified_at_ms: Some(0),
+            },
+            manifest_blake3: None,
+        };
+
+        let error = raw_mirror_manifest_blob_references(&manifest)
+            .expect_err("overflowing reconstructed size must be rejected");
+        assert!(error.to_string().contains("sizes overflow"), "{error:#}");
+    }
+
+    #[test]
+    fn appended_chunk_preparation_writes_only_the_new_tail_and_descriptor() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("growing-rollout.jsonl");
+        let first_bytes = b"0123456789abcdefABCDEFGHIJKLMNOPqrstuvwxyz!@#$%^";
+        fs::write(&source_path, first_bytes).expect("write first source version");
+        capture_source_file_with_chunk_policy(
+            RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "codex",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &source_path,
+                db_links: &[],
+            },
+            1,
+            16,
+        )
+        .expect("capture first chunked version");
+
+        let mut appended_bytes = first_bytes.to_vec();
+        appended_bytes.extend_from_slice(b"tail!");
+        fs::write(&source_path, &appended_bytes).expect("append source version");
+        let root = raw_mirror_root(&data_dir);
+        let temp_dir = root.join("tmp/manual-prepare");
+        ensure_private_dir_descendant(&root, &temp_dir).expect("create preparation temp dir");
+        let source_metadata = fs::symlink_metadata(&source_path).expect("source metadata");
+
+        let prepared = prepare_source_content(
+            &root,
+            &source_path,
+            &temp_dir,
+            &source_metadata,
+            1,
+            16,
+        )
+        .expect("prepare appended source");
+
+        assert_eq!(prepared.record.source_size_bytes, appended_bytes.len() as u64);
+        assert_eq!(prepared.files.len(), 2);
+        assert!(
+            prepared.files.iter().any(|file| file.bytes_copied == 5),
+            "the appended tail must be the only new source-content temp"
+        );
+        assert!(
+            prepared
+                .files
+                .iter()
+                .all(|file| file.bytes_copied != 16),
+            "unchanged complete chunks must be verified and reused without temp rewrites"
+        );
+    }
+
+    #[test]
+    fn chunk_preparation_materializes_repeated_content_once() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("repeated-chunks.jsonl");
+        fs::write(&source_path, b"abcdefghijklmnopabcdefghijklmnop")
+            .expect("write repeated chunks");
+        let root = ensure_raw_mirror_root(&data_dir).expect("create raw mirror root");
+        let temp_dir = root.join("tmp/manual-repeated-prepare");
+        ensure_private_dir_descendant(&root, &temp_dir).expect("create preparation temp dir");
+        let source_metadata = fs::symlink_metadata(&source_path).expect("source metadata");
+
+        let prepared = prepare_source_content(
+            &root,
+            &source_path,
+            &temp_dir,
+            &source_metadata,
+            1,
+            16,
+        )
+        .expect("prepare repeated chunks");
+
+        assert_eq!(prepared.record.source_size_bytes, 32);
+        assert_eq!(
+            prepared
+                .record
+                .content_storage
+                .as_ref()
+                .expect("chunk storage")
+                .chunks
+                .len(),
+            2
+        );
+        assert_eq!(
+            prepared
+                .files
+                .iter()
+                .filter(|file| file.bytes_copied == 16)
+                .count(),
+            1,
+            "one repeated content hash must create one pending chunk temp"
+        );
+        assert_eq!(prepared.files.len(), 2, "one chunk plus one descriptor");
     }
 
     #[test]
@@ -2025,6 +3605,121 @@ mod tests {
                 "unexpected error for {relative}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn merge_manifest_db_links_refuses_to_publish_an_unreadable_oversized_manifest() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("source.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"bounded\"}\n")
+            .expect("write source");
+        let captured = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("capture source");
+        let manifest_path = raw_mirror_root(&data_dir).join(&captured.manifest_relative_path);
+        let original_manifest_bytes = fs::read(&manifest_path).expect("read original manifest");
+        let oversized_link = RawMirrorDbLink {
+            conversation_id: Some(42),
+            message_count: Some(1),
+            source_path: Some("x".repeat(RAW_MIRROR_MANIFEST_MAX_BYTES as usize)),
+            started_at_ms: Some(1_733_000_000_000),
+        };
+
+        let err = merge_manifest_db_links(
+            &data_dir,
+            &captured.manifest_relative_path,
+            std::slice::from_ref(&oversized_link),
+        )
+        .expect_err("oversized merged manifest must be refused");
+
+        assert!(
+            format!("{err:#}").contains("validation limit is 16777216 bytes"),
+            "unexpected oversized-merge error: {err:#}"
+        );
+        assert_eq!(
+            fs::read(&manifest_path).expect("re-read manifest"),
+            original_manifest_bytes,
+            "a refused merge must leave the last readable manifest intact"
+        );
+        read_raw_mirror_manifest(&manifest_path).expect("original manifest remains readable");
+    }
+
+    #[test]
+    fn recapture_and_db_link_merge_refuse_to_launder_manifest_checksum_drift() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("source.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"integrity\"}\n")
+            .expect("write source");
+        let captured = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("capture source");
+        let manifest_path = raw_mirror_root(&data_dir).join(&captured.manifest_relative_path);
+        let mut manifest = read_raw_mirror_manifest(&manifest_path).expect("read manifest");
+        manifest.redacted_original_path = "[tampered]/source.jsonl".to_string();
+        let tampered_bytes = serde_json::to_vec_pretty(&manifest).expect("serialize drift");
+        fs::write(&manifest_path, &tampered_bytes).expect("plant checksum drift");
+
+        let summary = storage_summary(&data_dir);
+        assert_eq!(summary.manifest_count, 1);
+        assert_eq!(summary.invalid_manifest_count, 1);
+        assert_eq!(summary.unique_blob_count, 0);
+        assert_eq!(summary.total_blob_bytes, 0);
+
+        let recapture_error = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect_err("idempotent recapture must reject manifest checksum drift");
+        assert!(
+            recapture_error
+                .to_string()
+                .contains("identity or checksum is invalid"),
+            "unexpected recapture error: {recapture_error:#}"
+        );
+
+        let merge_error = merge_manifest_db_links(
+            &data_dir,
+            &captured.manifest_relative_path,
+            &[RawMirrorDbLink {
+                conversation_id: Some(42),
+                message_count: Some(1),
+                source_path: Some(source_path.display().to_string()),
+                started_at_ms: Some(1_733_000_000_000),
+            }],
+        )
+        .expect_err("DB-link merge must reject manifest checksum drift");
+        assert!(
+            merge_error
+                .to_string()
+                .contains("identity or checksum is invalid"),
+            "unexpected merge error: {merge_error:#}"
+        );
+        assert_eq!(
+            fs::read(&manifest_path).expect("read refused manifest"),
+            tampered_bytes,
+            "refusal must not rewrite a drifted manifest with a fresh checksum"
+        );
     }
 
     #[cfg(unix)]
@@ -2117,6 +3812,40 @@ mod tests {
         assert!(summary.total_storage_bytes >= source_bytes.len() as u64);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn storage_summary_rejects_blob_below_symlinked_directory() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("source.jsonl");
+        let source_bytes = b"{\"type\":\"message\",\"text\":\"outside\"}\n";
+        fs::write(&source_path, source_bytes).expect("source bytes");
+        let captured = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("capture source");
+        let root = raw_mirror_root(&data_dir);
+        let blob_path = root.join(&captured.blob_relative_path);
+        let blob_parent = blob_path.parent().expect("blob parent");
+        let relocated_parent = temp.path().join("relocated-blob-prefix");
+        fs::rename(blob_parent, &relocated_parent).expect("relocate blob prefix");
+        std::os::unix::fs::symlink(&relocated_parent, blob_parent)
+            .expect("symlink blob prefix");
+
+        let summary = storage_summary(&data_dir);
+        assert_eq!(summary.manifest_count, 1);
+        assert_eq!(summary.unique_blob_count, 0);
+        assert_eq!(summary.total_blob_bytes, 0);
+        assert_eq!(summary.missing_blob_count, 1);
+        assert_eq!(fs::read(&blob_path).expect("outside blob bytes"), source_bytes);
+    }
+
     #[test]
     fn storage_summary_rejects_hostile_blob_relative_path() {
         let temp = tempfile::TempDir::new().expect("tempdir");
@@ -2156,6 +3885,67 @@ mod tests {
         assert_eq!(summary.invalid_manifest_count, 1);
         assert_eq!(summary.unique_blob_count, 0);
         assert_eq!(summary.total_blob_bytes, 0);
+
+        let recapture_error = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect_err("recapture must reject checksum-valid but structurally invalid metadata");
+        assert!(
+            format!("{recapture_error:#}").contains("storage metadata is invalid"),
+            "unexpected structurally-invalid recapture error: {recapture_error:#}"
+        );
+    }
+
+    #[test]
+    fn oversized_manifest_is_rejected_before_json_allocation_or_prune_planning() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("source.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"bounded\"}\n")
+            .expect("write source");
+        let captured = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("capture source");
+        let root = raw_mirror_root(&data_dir);
+        let manifest_path = root.join(&captured.manifest_relative_path);
+        OpenOptions::new()
+            .write(true)
+            .open(&manifest_path)
+            .expect("open manifest fixture")
+            .set_len(RAW_MIRROR_MANIFEST_MAX_BYTES + 1)
+            .expect("plant oversized sparse manifest");
+
+        let summary = storage_summary(&data_dir);
+        assert_eq!(summary.manifest_count, 0);
+        assert_eq!(summary.invalid_manifest_count, 1);
+        let err = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                older_than_ms: Some(0),
+                apply: false,
+                ..RawMirrorPruneOptions::default()
+            },
+        )
+        .expect_err("oversized manifest must not enter prune planning");
+        assert!(
+            format!("{err:#}").contains("larger than 16777216 bytes"),
+            "unexpected oversized-manifest error: {err:#}"
+        );
+        assert!(manifest_path.exists());
+        assert!(root.join(&captured.blob_relative_path).exists());
     }
 
     #[test]
@@ -2205,12 +3995,105 @@ mod tests {
         )
         .expect_err("hostile inventory should fail closed");
 
+        let detail = format!("{err:#}");
         assert!(
-            err.to_string().contains("unexpected blob path"),
-            "error should explain the unsafe manifest inventory: {err}"
+            detail.contains("blob path does not match its digest"),
+            "error should explain the unsafe manifest inventory: {detail}"
         );
         assert!(manifest_path.exists());
         assert!(blob_path.exists());
+        assert!(!root.join("pruned.jsonl").exists());
+    }
+
+    #[test]
+    fn prune_fails_closed_on_manifest_checksum_drift_before_removing_evidence() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("source.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"old\"}\n")
+            .expect("write source");
+        let captured = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("capture source");
+        let root = raw_mirror_root(&data_dir);
+        let manifest_path = root.join(&captured.manifest_relative_path);
+        let blob_path = root.join(&captured.blob_relative_path);
+        let mut manifest = read_raw_mirror_manifest(&manifest_path).expect("read manifest");
+        manifest.captured_at_ms = 0;
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize drifted manifest"),
+        )
+        .expect("plant manifest checksum drift");
+
+        let err = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                older_than_ms: Some(0),
+                safety_hold_down_ms: 0,
+                apply: true,
+                ..RawMirrorPruneOptions::default()
+            },
+        )
+        .expect_err("manifest checksum drift must not authorize pruning");
+        let detail = format!("{err:#}");
+        assert!(
+            detail.contains("valid identity and checksum"),
+            "unexpected checksum-drift error: {detail}"
+        );
+        assert!(manifest_path.exists());
+        assert!(blob_path.exists());
+        assert!(!root.join("pruned.jsonl").exists());
+    }
+
+    #[test]
+    fn prune_apply_refuses_a_held_index_run_lock_without_removing_evidence() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("source.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"old\"}\n")
+            .expect("write source");
+        let captured = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("capture source");
+        let root = raw_mirror_root(&data_dir);
+        let index_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(data_dir.join("index-run.lock"))
+            .expect("open index-run lock");
+        fs2::FileExt::try_lock_exclusive(&index_lock).expect("hold index-run lock");
+
+        let error = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                older_than_ms: Some(0),
+                safety_hold_down_ms: 0,
+                apply: true,
+                ..RawMirrorPruneOptions::default()
+            },
+        )
+        .expect_err("held index-run lock must block applied prune");
+
+        assert!(error.to_string().contains("index run acquired"), "{error:#}");
+        assert!(root.join(captured.manifest_relative_path).exists());
+        assert!(root.join(captured.blob_relative_path).exists());
         assert!(!root.join("pruned.jsonl").exists());
     }
 
@@ -2322,6 +4205,57 @@ mod tests {
         if !root.join(&captured.blob_relative_path).exists() {
             anyhow::bail!("failed audit append removed the captured blob");
         }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_preflight_rejects_symlinked_blob_ancestor_before_removing_manifest() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new()?;
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("source.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"old\"}\n")?;
+        let captured = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })?;
+        let root = raw_mirror_root(&data_dir);
+        let manifest_path = root.join(&captured.manifest_relative_path);
+        let blob_path = root.join(&captured.blob_relative_path);
+        let blob_bucket = blob_path.parent().context("blob bucket")?;
+        let outside_bucket = temp.path().join("outside-blob-bucket");
+        fs::rename(blob_bucket, &outside_bucket)?;
+        symlink(&outside_bucket, blob_bucket)?;
+
+        let err = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                older_than_ms: Some(0),
+                safety_hold_down_ms: 0,
+                apply: true,
+                ..RawMirrorPruneOptions::default()
+            },
+        )
+        .expect_err("a symlinked blob ancestor must abort prune before any removal");
+        let detail = format!("{err:#}");
+        assert!(
+            detail.contains("symlinked ancestor"),
+            "unexpected prune preflight error: {detail}"
+        );
+        assert!(manifest_path.exists(), "preflight failure removed the manifest");
+        assert!(blob_path.exists(), "preflight failure removed the blob");
+        assert!(
+            outside_bucket.join(blob_path.file_name().context("blob file name")?).exists(),
+            "preflight failure removed the external blob target"
+        );
+        assert!(!root.join("pruned.jsonl").exists());
         Ok(())
     }
 
@@ -2598,6 +4532,120 @@ mod tests {
         assert_eq!(fs::read(&source_path).expect("source bytes"), source_bytes);
     }
 
+    #[test]
+    fn blob_cache_keeps_one_bounded_entry_per_source_path() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let source_path = temp.path().join("source.jsonl");
+        let first_key = RawMirrorBlobCacheKey {
+            data_dir: temp.path().join("cass-data"),
+            source_path: source_path.clone(),
+            source_identity: Some("first".to_string()),
+            source_size_bytes: 1,
+            source_mtime_ns: Some(1),
+            source_change_time_ns: Some(1),
+            chunk_threshold_bytes: 1,
+            chunk_size_bytes: 16,
+        };
+        let second_key = RawMirrorBlobCacheKey {
+            source_identity: Some("second".to_string()),
+            source_size_bytes: 2,
+            source_mtime_ns: Some(2),
+            source_change_time_ns: Some(2),
+            ..first_key.clone()
+        };
+        let first_record = RawMirrorBlobRecord {
+            blob_blake3: "00".repeat(32),
+            blob_size_bytes: 1,
+            source_content_blake3: "00".repeat(32),
+            source_size_bytes: 1,
+            content_storage: None,
+        };
+        let second_record = RawMirrorBlobRecord {
+            blob_blake3: "11".repeat(32),
+            blob_size_bytes: 2,
+            source_content_blake3: "11".repeat(32),
+            source_size_bytes: 2,
+            content_storage: None,
+        };
+        let root = ensure_raw_mirror_root(&first_key.data_dir).expect("create mirror root");
+        for (record, bytes) in [(&first_record, &b"a"[..]), (&second_record, &b"bb"[..])]
+        {
+            let relative = raw_mirror_blob_relative_path(&record.blob_blake3)
+                .expect("fixture blob relative path");
+            let path = root.join(relative);
+            ensure_private_dir_descendant(&root, path.parent().expect("blob parent"))
+                .expect("create fixture blob parent");
+            fs::write(path, bytes).expect("write fixture blob");
+        }
+
+        cache_raw_mirror_blob_record(first_key, first_record);
+        cache_raw_mirror_blob_record(second_key.clone(), second_record.clone());
+
+        let source_key = raw_mirror_blob_source_key(&second_key);
+        let cache = BLOB_CAPTURE_CACHE.get().expect("cache initialized");
+        let guard = cache.lock().expect("cache lock");
+        let cached = guard.get(&source_key).expect("latest source cache entry");
+        assert_eq!(cached.cache_key, second_key);
+        assert_eq!(cached.record, second_record);
+        assert!(guard.len() <= RAW_MIRROR_BLOB_CACHE_MAX_ENTRIES);
+    }
+
+    #[test]
+    fn blob_cache_refuses_keys_without_file_identity_and_change_time() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let weak_key = RawMirrorBlobCacheKey {
+            data_dir: temp.path().join("cass-data"),
+            source_path: temp.path().join("weak-key-source.jsonl"),
+            source_identity: None,
+            source_size_bytes: 1,
+            source_mtime_ns: Some(1),
+            source_change_time_ns: None,
+            chunk_threshold_bytes: 1,
+            chunk_size_bytes: 16,
+        };
+        let record = RawMirrorBlobRecord {
+            blob_blake3: "22".repeat(32),
+            blob_size_bytes: 1,
+            source_content_blake3: "22".repeat(32),
+            source_size_bytes: 1,
+            content_storage: None,
+        };
+
+        assert!(!raw_mirror_blob_cache_key_is_strong(&weak_key));
+        cache_raw_mirror_blob_record(weak_key.clone(), record);
+
+        let source_key = raw_mirror_blob_source_key(&weak_key);
+        let cache = BLOB_CAPTURE_CACHE.get().expect("cache initialized");
+        assert!(
+            !cache
+                .lock()
+                .expect("cache lock")
+                .contains_key(&source_key),
+            "a weak non-Unix-style metadata key must never authorize cache reuse"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_source_path_check_detects_same_size_atomic_replacement() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let source_path = temp.path().join("rotating-source.jsonl");
+        let replacement_path = temp.path().join("replacement.jsonl");
+        fs::write(&source_path, b"original\n").expect("write original source");
+        fs::write(&replacement_path, b"replaced\n").expect("write same-size replacement");
+        let initial = fs::symlink_metadata(&source_path).expect("initial source metadata");
+
+        assert!(!source_path_changed_identity_during_capture(
+            &source_path,
+            &initial
+        ));
+        fs::rename(&replacement_path, &source_path).expect("atomically replace source path");
+        assert!(
+            source_path_changed_identity_during_capture(&source_path, &initial),
+            "capture must reject bytes from an inode no longer reachable through the recorded path"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn capture_source_file_does_not_reuse_cache_after_same_size_mtime_preserving_rewrite() {
@@ -2687,7 +4735,7 @@ mod tests {
         })
         .expect_err("symlinked content-addressed blob path must be rejected");
         assert!(
-            err.to_string().contains("symlink raw mirror blob"),
+            err.to_string().contains("contains a symlink"),
             "unexpected symlink-blob error: {err:#}"
         );
 
@@ -2701,6 +4749,45 @@ mod tests {
         );
         assert_eq!(fs::read(&source_path).expect("source bytes"), source_bytes);
         assert_eq!(fs::read(&outside).expect("outside bytes"), source_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_source_file_rejects_symlinked_mutation_lock() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let root = data_dir
+            .join(RAW_MIRROR_ROOT_DIR)
+            .join(RAW_MIRROR_VERSION_DIR);
+        let source_path = temp.path().join("source.jsonl");
+        let protected_target = temp.path().join("protected-lock-target");
+        let source_bytes = b"{\"type\":\"message\",\"text\":\"hello\"}\n";
+        fs::create_dir_all(&root).expect("raw mirror root");
+        fs::write(&source_path, source_bytes).expect("source bytes");
+        fs::write(&protected_target, b"protected\n").expect("protected target");
+        std::os::unix::fs::symlink(
+            &protected_target,
+            root.join(RAW_MIRROR_MUTATION_LOCK_FILE),
+        )
+        .expect("symlink mutation lock");
+
+        let error = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect_err("symlinked mutation lock must be rejected");
+
+        assert!(error.to_string().contains("mutation lock path"), "{error:#}");
+        assert_eq!(
+            fs::read(&protected_target).expect("protected bytes"),
+            b"protected\n"
+        );
+        assert!(!root.join("manifests").exists());
     }
 
     #[cfg(unix)]

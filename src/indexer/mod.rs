@@ -26960,7 +26960,6 @@ fn attach_raw_mirror_capture(data_dir: &Path, conv: &mut NormalizedConversation)
     }
 
     let (source_id, origin_kind, origin_host) = raw_mirror_origin_from_metadata(&conv.metadata);
-    let db_link = raw_mirror_db_link_for_conversation(conv);
     match crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
         data_dir,
         provider: &conv.agent_slug,
@@ -26968,7 +26967,10 @@ fn attach_raw_mirror_capture(data_dir: &Path, conv: &mut NormalizedConversation)
         origin_kind: &origin_kind,
         origin_host: origin_host.as_deref(),
         source_path: &conv.source_path,
-        db_links: std::slice::from_ref(&db_link),
+        // A conversation is not linked to the canonical archive until its
+        // transaction returns an actual conversation id. Persist batches add
+        // those authoritative links in one manifest update per source.
+        db_links: &[],
     }) {
         Ok(record) => {
             attach_raw_mirror_metadata(conv, &record);
@@ -26990,17 +26992,6 @@ fn attach_raw_mirror_capture(data_dir: &Path, conv: &mut NormalizedConversation)
                 "failed to capture parsed conversation source into raw mirror before archive upsert"
             );
         }
-    }
-}
-
-fn raw_mirror_db_link_for_conversation(
-    conv: &NormalizedConversation,
-) -> crate::raw_mirror::RawMirrorDbLink {
-    crate::raw_mirror::RawMirrorDbLink {
-        conversation_id: None,
-        message_count: Some(conv.messages.len()),
-        source_path: Some(conv.source_path.display().to_string()),
-        started_at_ms: conv.started_at,
     }
 }
 
@@ -27063,6 +27054,10 @@ fn attach_raw_mirror_metadata(
             "blob_relative_path": record.blob_relative_path,
             "blob_blake3": record.blob_blake3,
             "blob_size_bytes": record.blob_size_bytes,
+            "source_content_blake3": record.source_content_blake3,
+            "source_size_bytes": record.source_size_bytes,
+            "storage_kind": record.storage_kind,
+            "chunk_count": record.chunk_count,
             "captured_at_ms": record.captured_at_ms,
             "source_mtime_ms": record.source_mtime_ms,
         }),
@@ -27505,27 +27500,39 @@ pub mod persist {
         }
     }
 
-    fn record_persisted_raw_mirror_db_link(
+    fn record_persisted_raw_mirror_db_link_groups<'a>(
         data_dir: &Path,
-        conv: &NormalizedConversation,
-        outcome: &InsertOutcome,
+        conversations_and_outcomes: impl IntoIterator<
+            Item = (&'a NormalizedConversation, &'a InsertOutcome),
+        >,
     ) {
-        let Some(manifest_relative_path) = raw_mirror_manifest_relative_path(conv) else {
-            return;
-        };
-        let db_link = persisted_raw_mirror_db_link(conv, outcome);
-        if let Err(error) = crate::raw_mirror::merge_manifest_db_links(
-            data_dir,
-            manifest_relative_path,
-            std::slice::from_ref(&db_link),
-        ) {
-            tracing::warn!(
-                agent = %conv.agent_slug,
-                conversation_id = outcome.conversation_id,
-                manifest_relative_path,
-                error = %error,
-                "failed to record persisted raw mirror conversation link"
-            );
+        let mut links_by_manifest: BTreeMap<
+            String,
+            Vec<crate::raw_mirror::RawMirrorDbLink>,
+        > = BTreeMap::new();
+        for (conv, outcome) in conversations_and_outcomes {
+            let Some(manifest_relative_path) = raw_mirror_manifest_relative_path(conv) else {
+                continue;
+            };
+            links_by_manifest
+                .entry(manifest_relative_path.to_string())
+                .or_default()
+                .push(persisted_raw_mirror_db_link(conv, outcome));
+        }
+
+        for (manifest_relative_path, links) in links_by_manifest {
+            if let Err(error) = crate::raw_mirror::merge_manifest_db_links(
+                data_dir,
+                &manifest_relative_path,
+                &links,
+            ) {
+                tracing::warn!(
+                    link_count = links.len(),
+                    manifest_relative_path,
+                    error = %error,
+                    "failed to record persisted raw mirror conversation links"
+                );
+            }
         }
     }
 
@@ -27537,9 +27544,10 @@ pub mod persist {
         let Some(data_dir) = data_dir else {
             return;
         };
-        for (conv, outcome) in convs.iter().zip(outcomes.iter()) {
-            record_persisted_raw_mirror_db_link(data_dir, conv, outcome);
-        }
+        record_persisted_raw_mirror_db_link_groups(
+            data_dir,
+            convs.iter().zip(outcomes.iter()),
+        );
     }
 
     fn begin_concurrent_writes_enabled() -> bool {
@@ -28460,11 +28468,12 @@ pub mod persist {
         }
         ordered.sort_by_key(|(idx, _)| *idx);
         if let Some(data_dir) = raw_mirror_data_dir {
-            for (idx, outcome) in &ordered {
-                if let Some(conv) = convs.get(*idx) {
-                    record_persisted_raw_mirror_db_link(data_dir, conv, outcome);
-                }
-            }
+            record_persisted_raw_mirror_db_link_groups(
+                data_dir,
+                ordered.iter().filter_map(|(idx, outcome)| {
+                    convs.get(*idx).map(|conv| (conv, outcome))
+                }),
+            );
         }
 
         let defer_lexical_updates = defer_lexical_updates_enabled();
@@ -32344,7 +32353,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_mirror_capture_attaches_conversation_metadata_before_persist() {
+    fn raw_mirror_capture_attaches_metadata_without_claiming_a_persisted_db_link() {
         let temp = TempDir::new().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
         let source_path = temp.path().join("rollout-test.jsonl");
@@ -32406,10 +32415,10 @@ mod tests {
                 .expect("raw mirror manifest"),
         )
         .expect("manifest json");
-        assert_eq!(manifest["db_links"][0]["message_count"].as_u64(), Some(1));
         assert_eq!(
-            manifest["db_links"][0]["started_at_ms"].as_i64(),
-            Some(1_733_000_000_000)
+            manifest["db_links"].as_array().map(Vec::len),
+            Some(0),
+            "pre-persist capture must not manufacture a database link without a canonical conversation id"
         );
         assert_eq!(
             std::fs::read(&source_path).expect("source bytes"),
@@ -33126,7 +33135,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_mirror_capture_enriches_preparse_manifest_after_successful_parse() {
+    fn raw_mirror_capture_reuses_preparse_manifest_without_a_prepersist_db_link() {
         let temp = TempDir::new().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
         let source_path = temp.path().join("preparse-then-parsed.jsonl");
@@ -33169,11 +33178,10 @@ mod tests {
         let manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(manifests[0].path()).expect("manifest bytes"))
                 .expect("manifest json");
-        assert_eq!(manifest["db_links"].as_array().map(Vec::len), Some(1));
-        assert_eq!(manifest["db_links"][0]["message_count"].as_u64(), Some(1));
         assert_eq!(
-            manifest["db_links"][0]["started_at_ms"].as_i64(),
-            Some(1_733_000_000_000)
+            manifest["db_links"].as_array().map(Vec::len),
+            Some(0),
+            "successful parsing alone does not prove a canonical archive insertion"
         );
         assert_eq!(
             std::fs::read(&source_path).expect("source bytes"),
@@ -52621,10 +52629,18 @@ mod tests {
             Some(&serde_json::json!("local"))
         );
         assert_eq!(
-            conv.metadata.pointer("/cass/raw_mirror/blob_size_bytes"),
+            conv.metadata.pointer("/cass/raw_mirror/source_size_bytes"),
             Some(&serde_json::json!(
                 CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES
             ))
+        );
+        assert_eq!(
+            conv.metadata.pointer("/cass/raw_mirror/storage_kind"),
+            Some(&serde_json::json!("fixed_chunks_v1"))
+        );
+        assert_eq!(
+            conv.metadata.pointer("/cass/raw_mirror/chunk_count"),
+            Some(&serde_json::json!(4))
         );
     }
 
