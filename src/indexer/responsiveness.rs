@@ -73,6 +73,29 @@ const DEFAULT_GROWTH_CONSECUTIVE_HEALTHY_TICKS: u32 = 3;
 /// more wasted wakeups on an idle box.
 const DEFAULT_TICK_SECS: u64 = 2;
 
+/// `footprint(1)` is materially heavier than reading `/proc` or invoking
+/// `ps`, and lexical-pipeline snapshots can be captured many times per second.
+/// Cache the Darwin sample at the same cadence as the responsiveness governor
+/// so accurate physical-footprint telemetry does not become rebuild work.
+#[cfg(target_os = "macos")]
+const MACOS_PROCESS_MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_secs(DEFAULT_TICK_SECS);
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct MacosProcessMemorySample {
+    sampled_at: Option<Instant>,
+    bytes: Option<u64>,
+}
+
+#[cfg(target_os = "macos")]
+static MACOS_PROCESS_MEMORY_SAMPLE: LazyLock<Mutex<MacosProcessMemorySample>> =
+    LazyLock::new(|| {
+        Mutex::new(MacosProcessMemorySample {
+            sampled_at: None,
+            bytes: None,
+        })
+    });
+
 /// Fallback process-wide in-flight byte ceiling for responsiveness-governed
 /// maintenance work when memory telemetry is unavailable.
 const DEFAULT_MAX_INFLIGHT_BYTES: usize = 512 * 1024 * 1024;
@@ -1597,15 +1620,65 @@ pub(crate) fn total_memory_bytes() -> Option<u64> {
     }
 }
 
+/// Process memory used by the indexing responsiveness controller.
+///
+/// Linux exposes RSS cheaply through `/proc`. On macOS RSS is not the memory
+/// pressure number operators see: compressed/private VM ownership is charged
+/// to `phys_footprint`, which can be many times larger. Use the OS `footprint`
+/// utility there and cache the result so a hot progress loop cannot spawn it
+/// repeatedly. `ps` RSS remains a compatibility fallback when `footprint` is
+/// unavailable.
 pub(crate) fn process_resident_memory_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let status = std::fs::read_to_string("/proc/self/status").ok()?;
         proc_kib_field_bytes(&status, "VmRSS:")
     }
-    // macOS: `ps -o rss=` reports resident set size in KiB for our own pid.
     #[cfg(target_os = "macos")]
     {
+        let now = Instant::now();
+        {
+            let sample = MACOS_PROCESS_MEMORY_SAMPLE
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if sample
+                .sampled_at
+                .is_some_and(|sampled_at| now.duration_since(sampled_at) < MACOS_PROCESS_MEMORY_SAMPLE_INTERVAL)
+            {
+                return sample.bytes;
+            }
+        }
+
+        let bytes = read_macos_process_phys_footprint_bytes()
+            .or_else(read_macos_process_rss_bytes);
+        let mut sample = MACOS_PROCESS_MEMORY_SAMPLE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        sample.sampled_at = Some(now);
+        sample.bytes = bytes;
+        bytes
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_process_phys_footprint_bytes() -> Option<u64> {
+    let pid = std::process::id().to_string();
+    let output = std::process::Command::new("/usr/bin/footprint")
+        .args(["--pid", &pid, "--noCategories", "--format", "bytes"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    macos_phys_footprint_bytes_from_output(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_process_rss_bytes() -> Option<u64> {
         let pid = std::process::id().to_string();
         let output = std::process::Command::new("ps")
             .args(["-o", "rss=", "-p", &pid])
@@ -1615,11 +1688,6 @@ pub(crate) fn process_resident_memory_bytes() -> Option<u64> {
             return None;
         }
         macos_rss_kib_to_bytes(&String::from_utf8_lossy(&output.stdout))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        None
-    }
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1714,6 +1782,20 @@ fn macos_rss_kib_to_bytes(text: &str) -> Option<u64> {
         .parse::<u64>()
         .ok()?
         .checked_mul(1024)
+}
+
+/// Parse the byte-formatted `footprint --noCategories` auxiliary field. Match
+/// the exact key so `phys_footprint_peak` cannot silently replace the current
+/// sample if Apple reorders the output.
+#[cfg(any(target_os = "macos", test))]
+fn macos_phys_footprint_bytes_from_output(text: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let (key, value) = line.trim().split_once(':')?;
+        if key.trim() != "phys_footprint" {
+            return None;
+        }
+        value.split_whitespace().next()?.parse::<u64>().ok()
+    })
 }
 
 #[cfg(test)]
@@ -1814,6 +1896,31 @@ mod tests {
     fn macos_rss_parser_converts_kib_to_bytes() {
         assert_eq!(macos_rss_kib_to_bytes("  204800\n"), Some(204800 * 1024));
         assert_eq!(macos_rss_kib_to_bytes("not-a-number"), None);
+    }
+
+    #[test]
+    fn macos_phys_footprint_parser_selects_current_byte_value() {
+        let output = "\
+======================================================================\n\
+cass [123]: 64-bit    Footprint: 9000000 B (16384 bytes per page)\n\
+======================================================================\n\
+\n\
+Auxiliary data:\n\
+    phys_footprint_peak: 14000000 B\n\
+    phys_footprint: 12000000 B\n";
+        assert_eq!(
+            macos_phys_footprint_bytes_from_output(output),
+            Some(12_000_000)
+        );
+        assert_eq!(
+            macos_phys_footprint_bytes_from_output("phys_footprint_peak: 42 B\n"),
+            None,
+            "a peak-only report must not masquerade as the current footprint"
+        );
+        assert_eq!(
+            macos_phys_footprint_bytes_from_output("phys_footprint: unknown\n"),
+            None
+        );
     }
 
     fn cfg() -> GovernorConfig {

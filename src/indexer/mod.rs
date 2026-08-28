@@ -51,9 +51,7 @@ use tempfile::Builder as TempDirBuilder;
 use crate::connector_ingest_diagnostics::{
     ConnectorIngestDiagnostic, ConnectorIngestReport, ConnectorIngestRun, ProviderIngestSummary,
 };
-use crate::connectors::NormalizedConversation;
-#[cfg(test)]
-use crate::connectors::NormalizedMessage;
+use crate::connectors::{NormalizedConversation, NormalizedMessage, NormalizedSnippet};
 use crate::connectors::{
     Connector, ScanRoot, aider::AiderConnector, amp::AmpConnector,
     antigravity::AntigravityConnector, chatgpt::ChatGptConnector, claude_code::ClaudeCodeConnector,
@@ -11901,10 +11899,135 @@ fn acquire_ordered_lexical_rebuild_page_budget(
     acquired
 }
 
-fn conversation_batch_footprint(conv: &NormalizedConversation) -> (usize, usize) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamingConversationFootprint {
+    message_count: usize,
+    content_bytes: usize,
+    retained_bytes: usize,
+}
+
+/// Heap bytes retained by a `serde_json::Value`, excluding the inline root
+/// enum already counted by its owner. Allocator bookkeeping is not observable
+/// without unsafe allocator APIs, so object entries include the owned key/value
+/// pair that must exist for each node and all recursively owned allocations.
+fn json_heap_bytes(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_) => 0,
+        serde_json::Value::String(text) => text.capacity(),
+        serde_json::Value::Array(values) => values
+            .capacity()
+            .saturating_mul(std::mem::size_of::<serde_json::Value>())
+            .saturating_add(
+                values
+                    .iter()
+                    .map(json_heap_bytes)
+                    .fold(0usize, usize::saturating_add),
+            ),
+        serde_json::Value::Object(values) => values
+            .len()
+            .saturating_mul(std::mem::size_of::<(String, serde_json::Value)>())
+            .saturating_add(values.iter().fold(0usize, |bytes, (key, value)| {
+                bytes
+                    .saturating_add(key.capacity())
+                    .saturating_add(json_heap_bytes(value))
+            })),
+    }
+}
+
+fn optional_string_heap_bytes(value: Option<&String>) -> usize {
+    value.map_or(0, String::capacity)
+}
+
+fn path_heap_bytes(path: &Path) -> usize {
+    path.as_os_str().as_encoded_bytes().len()
+}
+
+fn normalized_snippet_heap_bytes(snippet: &NormalizedSnippet) -> usize {
+    snippet
+        .file_path
+        .as_deref()
+        .map_or(0, path_heap_bytes)
+        .saturating_add(optional_string_heap_bytes(snippet.language.as_ref()))
+        .saturating_add(optional_string_heap_bytes(snippet.snippet_text.as_ref()))
+}
+
+/// Estimate the complete normalized object graph retained in the producer
+/// buffer/channel, not just message content. This is deliberately based on
+/// actual vector/string capacities where the public APIs expose them. It also
+/// charges connector metadata, snippets, and tool invocation arguments, which
+/// can dominate tiny or empty message bodies (#320).
+fn conversation_batch_footprint(conv: &NormalizedConversation) -> StreamingConversationFootprint {
     let message_count = conv.messages.len();
-    let char_count = conv.messages.iter().map(|msg| msg.content.len()).sum();
-    (message_count, char_count)
+    let content_bytes = conv
+        .messages
+        .iter()
+        .map(|message| message.content.len())
+        .fold(0usize, usize::saturating_add);
+    let mut retained_bytes = std::mem::size_of_val(conv)
+        .saturating_add(conv.agent_slug.capacity())
+        .saturating_add(optional_string_heap_bytes(conv.external_id.as_ref()))
+        .saturating_add(optional_string_heap_bytes(conv.title.as_ref()))
+        .saturating_add(conv.workspace.as_deref().map_or(0, path_heap_bytes))
+        .saturating_add(path_heap_bytes(&conv.source_path))
+        .saturating_add(json_heap_bytes(&conv.metadata))
+        .saturating_add(
+            conv.messages
+                .capacity()
+                .saturating_mul(std::mem::size_of::<NormalizedMessage>()),
+        );
+
+    for message in &conv.messages {
+        retained_bytes = retained_bytes
+            .saturating_add(message.role.capacity())
+            .saturating_add(optional_string_heap_bytes(message.author.as_ref()))
+            .saturating_add(message.content.capacity())
+            .saturating_add(json_heap_bytes(&message.extra))
+            .saturating_add(
+                message
+                    .snippets
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<NormalizedSnippet>()),
+            )
+            .saturating_add(
+                message
+                    .snippets
+                    .iter()
+                    .map(normalized_snippet_heap_bytes)
+                    .fold(0usize, usize::saturating_add),
+            )
+            .saturating_add(
+                message
+                    .invocations
+                    .first()
+                    .map_or(0, |invocation| {
+                        message
+                            .invocations
+                            .capacity()
+                            .saturating_mul(std::mem::size_of_val(invocation))
+                    }),
+            );
+        for invocation in &message.invocations {
+            retained_bytes = retained_bytes
+                .saturating_add(invocation.kind.capacity())
+                .saturating_add(invocation.name.capacity())
+                .saturating_add(optional_string_heap_bytes(invocation.raw_name.as_ref()))
+                .saturating_add(optional_string_heap_bytes(invocation.call_id.as_ref()))
+                .saturating_add(
+                    invocation
+                        .arguments
+                        .as_ref()
+                        .map_or(0, json_heap_bytes),
+                );
+        }
+    }
+
+    StreamingConversationFootprint {
+        message_count,
+        content_bytes,
+        retained_bytes: retained_bytes.max(content_bytes),
+    }
 }
 
 #[cfg(test)]
@@ -11913,16 +12036,16 @@ fn next_streaming_batch(
     limits: StreamingBatchLimits,
 ) -> Option<(Vec<NormalizedConversation>, usize)> {
     let first = conversations.next()?;
-    let (first_messages, first_chars) = conversation_batch_footprint(&first);
+    let first_footprint = conversation_batch_footprint(&first);
     let mut batch = vec![first];
-    let mut total_messages = first_messages;
-    let mut total_chars = first_chars;
+    let mut total_messages = first_footprint.message_count;
+    let mut total_content_bytes = first_footprint.content_bytes;
 
     while let Some(next) = conversations.peek() {
-        let (next_messages, next_chars) = conversation_batch_footprint(next);
+        let next_footprint = conversation_batch_footprint(next);
         let would_exceed_limits = batch.len() >= limits.max_conversations
-            || total_messages.saturating_add(next_messages) > limits.max_messages
-            || total_chars.saturating_add(next_chars) > limits.max_chars;
+            || total_messages.saturating_add(next_footprint.message_count) > limits.max_messages
+            || total_content_bytes.saturating_add(next_footprint.content_bytes) > limits.max_chars;
         if would_exceed_limits {
             break;
         }
@@ -11930,8 +12053,8 @@ fn next_streaming_batch(
         let conv = conversations
             .next()
             .expect("peek indicated another conversation existed");
-        total_messages += next_messages;
-        total_chars += next_chars;
+        total_messages = total_messages.saturating_add(next_footprint.message_count);
+        total_content_bytes = total_content_bytes.saturating_add(next_footprint.content_bytes);
         batch.push(conv);
     }
 
@@ -11945,7 +12068,7 @@ struct StreamingBatchSender<'a> {
     next_batch_is_discovered: bool,
     conversations: Vec<NormalizedConversation>,
     message_count: usize,
-    char_count: usize,
+    content_bytes: usize,
     byte_reservation: usize,
 }
 
@@ -11969,7 +12092,7 @@ impl<'a> StreamingBatchSender<'a> {
             next_batch_is_discovered: is_discovered,
             conversations: Vec::new(),
             message_count: 0,
-            char_count: 0,
+            content_bytes: 0,
             byte_reservation: 0,
         }
     }
@@ -11979,30 +12102,30 @@ impl<'a> StreamingBatchSender<'a> {
     }
 
     fn push(&mut self, conversation: NormalizedConversation) -> Result<()> {
-        let (message_count, char_count) = conversation_batch_footprint(&conversation);
+        let footprint = conversation_batch_footprint(&conversation);
         let would_exceed_limits = !self.conversations.is_empty()
             && (self.conversations.len() >= DEFAULT_STREAMING_BATCH_LIMITS.max_conversations
-                || self.message_count.saturating_add(message_count)
+                || self.message_count.saturating_add(footprint.message_count)
                     > DEFAULT_STREAMING_BATCH_LIMITS.max_messages
-                || self.char_count.saturating_add(char_count)
+                || self.content_bytes.saturating_add(footprint.content_bytes)
                     > DEFAULT_STREAMING_BATCH_LIMITS.max_chars);
         if would_exceed_limits {
             self.flush()?;
         }
 
-        let byte_reservation = self.flow_limiter.acquire(char_count).map_err(|_| {
+        let byte_reservation = self.flow_limiter.acquire(footprint.retained_bytes).map_err(|_| {
             anyhow::Error::new(StreamingConsumerDisconnected {
                 connector_name: self.connector_name,
             })
         })?;
-        self.message_count += message_count;
-        self.char_count += char_count;
+        self.message_count = self.message_count.saturating_add(footprint.message_count);
+        self.content_bytes = self.content_bytes.saturating_add(footprint.content_bytes);
         self.byte_reservation = self.byte_reservation.saturating_add(byte_reservation);
         self.conversations.push(conversation);
 
         let single_conversation_exceeds_limits = self.conversations.len() == 1
             && (self.message_count > DEFAULT_STREAMING_BATCH_LIMITS.max_messages
-                || self.char_count > DEFAULT_STREAMING_BATCH_LIMITS.max_chars);
+                || self.content_bytes > DEFAULT_STREAMING_BATCH_LIMITS.max_chars);
         if single_conversation_exceeds_limits {
             self.flush()?;
         }
@@ -12031,14 +12154,14 @@ impl<'a> StreamingBatchSender<'a> {
         }) {
             self.flow_limiter.release(byte_reservation);
             self.message_count = 0;
-            self.char_count = 0;
+            self.content_bytes = 0;
             self.byte_reservation = 0;
             return Err(anyhow::Error::new(StreamingConsumerDisconnected {
                 connector_name: self.connector_name,
             }));
         }
         self.message_count = 0;
-        self.char_count = 0;
+        self.content_bytes = 0;
         self.byte_reservation = 0;
         self.next_batch_is_discovered = false;
         Ok(())
