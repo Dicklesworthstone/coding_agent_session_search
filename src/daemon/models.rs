@@ -13,6 +13,7 @@ use crate::search::embedder::{Embedder, EmbedderError, EmbedderResult};
 use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::fastembed_reranker::FastEmbedReranker;
 use crate::search::reranker::{Reranker, RerankerError, RerankerResult, rerank_texts};
+use frankensearch::{EmbeddingIdentityBundleV1, ModelCategory};
 
 /// Model manager that handles lazy loading of embedder and reranker models.
 pub struct ModelManager {
@@ -66,6 +67,28 @@ impl ModelManager {
     /// Check if embedder is loaded.
     pub fn embedder_loaded(&self) -> bool {
         self.embedder.read().is_some()
+    }
+
+    /// Return the exact immutable embedding identity and model category served
+    /// by this process. Attestation setup calls this only after model warm-up;
+    /// it still fails closed if the loaded wrapper does not expose a complete
+    /// Frankensearch identity bundle.
+    pub fn embedder_attestation_identity(
+        &self,
+    ) -> EmbedderResult<(EmbeddingIdentityBundleV1, ModelCategory)> {
+        if self.embedder.read().is_none() {
+            self.warm_embedder()?;
+        }
+        let embedder = self.embedder.read();
+        let embedder = embedder
+            .as_ref()
+            .ok_or_else(|| EmbedderError::EmbedderUnavailable {
+                model: "unknown".to_string(),
+                reason: "embedder not loaded".to_string(),
+            })?;
+        let identity = embedder.identity()?.clone();
+        identity.validate()?;
+        Ok((identity, embedder.category()))
     }
 
     /// Get the reranker ID.

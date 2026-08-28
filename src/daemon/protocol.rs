@@ -11,9 +11,14 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use frankensearch::{
+    AttestedDaemonEmbeddingResponseV1, DaemonChallengeV1, DaemonConnectionIdentityV1,
+    DaemonEmbeddingAttestationV1,
+};
+
 /// Protocol version for compatibility checks.
 /// Clients and the CASS daemon must use the same version.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Default CASS-owned socket path.
 pub fn default_socket_path() -> PathBuf {
@@ -42,6 +47,17 @@ pub enum Request {
     /// Health check - returns daemon status.
     Health,
 
+    /// Fetch the candidate connection identity used to construct a challenge.
+    /// This response is not trusted until an HMAC-authenticated handshake for
+    /// the exact identity succeeds.
+    ConnectionIdentity,
+
+    /// Authenticate the candidate connection identity with a fresh challenge.
+    HandshakeAttested { challenge: DaemonChallengeV1 },
+
+    /// Authenticate current daemon readiness with a fresh challenge.
+    HealthAttested { challenge: DaemonChallengeV1 },
+
     /// Generate embeddings for texts.
     Embed {
         texts: Vec<String>,
@@ -49,11 +65,27 @@ pub enum Request {
         dims: Option<usize>,
     },
 
+    /// Generate producer-authenticated embeddings for an ordered text batch.
+    EmbedAttested {
+        texts: Vec<String>,
+        model: String,
+        dims: Option<usize>,
+        challenge: DaemonChallengeV1,
+    },
+
     /// Rerank documents against a query.
     Rerank {
         query: String,
         documents: Vec<String>,
         model: String,
+    },
+
+    /// Generate producer-authenticated rerank scores.
+    RerankAttested {
+        query: String,
+        documents: Vec<String>,
+        model: String,
+        challenge: DaemonChallengeV1,
     },
 
     /// Get daemon status and loaded models.
@@ -87,8 +119,18 @@ pub enum Response {
     /// Health check response.
     Health(HealthStatus),
 
+    /// Candidate connection identity. It becomes authoritative only after a
+    /// successful attested handshake under the locally pinned key.
+    ConnectionIdentity(DaemonConnectionIdentityV1),
+
+    /// Signed handshake or health proof with no vector payload.
+    Attestation(DaemonEmbeddingAttestationV1),
+
     /// Embedding response with vectors.
     Embed(EmbedResponse),
+
+    /// Signed embedding or rerank payload.
+    AttestedEmbedding(AttestedDaemonEmbeddingResponseV1),
 
     /// Rerank response with scores.
     Rerank(RerankResponse),
@@ -294,6 +336,12 @@ mod tests {
     use std::error::Error;
     use std::fmt::Debug;
 
+    use frankensearch::{
+        AttestedDaemonEmbeddingResponseV1, DAEMON_CONNECTION_IDENTITY_SCHEMA_V1,
+        DaemonChallengeV1, DaemonConnectionIdentityV1, DaemonOperationV1, HashAlgorithm,
+        Embedder as _, HashEmbedder, ModelCategory,
+    };
+
     type TestResult = Result<(), Box<dyn Error>>;
 
     fn test_error(message: impl Into<String>) -> Box<dyn Error> {
@@ -330,6 +378,20 @@ mod tests {
             .get(4..)
             .ok_or_else(|| test_error("encoded frame should include a 4-byte length prefix"))?;
         decode_message(payload).map_err(|err| test_error(err.to_string()))
+    }
+
+    fn attested_test_connection() -> DaemonConnectionIdentityV1 {
+        let embedder = HashEmbedder::new(3, HashAlgorithm::FnvModular);
+        DaemonConnectionIdentityV1 {
+            schema_version: DAEMON_CONNECTION_IDENTITY_SCHEMA_V1,
+            endpoint_fingerprint: "11".repeat(32),
+            executable_fingerprint: "22".repeat(32),
+            protocol_revision: "cass-test-attested-v1".to_string(),
+            key_id: "cass-test-key-v1".to_string(),
+            generation: 1,
+            embedding_identity: embedder.identity().expect("hash identity").clone(),
+            model_category: ModelCategory::HashEmbedder,
+        }
     }
 
     #[test]
@@ -386,6 +448,58 @@ mod tests {
         )?;
         ensure_eq(model, "all-MiniLM-L6-v2".to_string(), "embed model")?;
         ensure(dims.is_none(), "embed dims should be absent")
+    }
+
+    #[test]
+    fn attested_embed_request_and_response_round_trip_without_losing_proof() -> TestResult {
+        let connection = attested_test_connection();
+        let challenge = DaemonChallengeV1::for_inputs(
+            "aa".repeat(32),
+            DaemonOperationV1::Embed,
+            &["hello"],
+            &connection,
+        )?;
+        let request = FramedMessage::new(
+            "attested-request",
+            Request::EmbedAttested {
+                texts: vec!["hello".to_string()],
+                model: "default".to_string(),
+                dims: None,
+                challenge: challenge.clone(),
+            },
+        );
+        let decoded: FramedMessage<Request> = decode_framed(&encode_message(&request)?)?;
+        let Request::EmbedAttested {
+            texts,
+            challenge: decoded_challenge,
+            ..
+        } = decoded.payload
+        else {
+            return Err(test_error("expected attested embed request"));
+        };
+        ensure_eq(texts, vec!["hello".to_string()], "attested inputs")?;
+        ensure_eq(decoded_challenge, challenge.clone(), "attested challenge")?;
+
+        let key = [7_u8; 32];
+        let signed = AttestedDaemonEmbeddingResponseV1::signed(
+            challenge.clone(),
+            connection.clone(),
+            vec![vec![0.25, 0.5, 0.75]],
+            &key,
+        )?;
+        let response = FramedMessage::new(
+            "attested-response",
+            Response::AttestedEmbedding(signed),
+        );
+        let decoded: FramedMessage<Response> = decode_framed(&encode_message(&response)?)?;
+        let Response::AttestedEmbedding(decoded) = decoded.payload else {
+            return Err(test_error("expected attested embed response"));
+        };
+        decoded
+            .attestation
+            .validate_against(&challenge, &connection, &decoded.vectors)?;
+        decoded.attestation.authenticate_hmac_sha256(&key)?;
+        ensure_eq(decoded.vectors, vec![vec![0.25, 0.5, 0.75]], "vectors")
     }
 
     #[test]

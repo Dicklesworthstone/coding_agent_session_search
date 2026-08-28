@@ -25298,18 +25298,42 @@ const fn semantic_daemon_policy(daemon: bool, no_daemon: bool) -> SemanticDaemon
     }
 }
 
-fn compose_daemon_embedder_or_verified_local(
+fn compose_verified_daemon_embedder_or_local(
     daemon: Arc<dyn crate::search::daemon_client::DaemonClient>,
     embedder: Arc<dyn crate::search::embedder::Embedder>,
     config: crate::search::daemon_client::DaemonRetryConfig,
+    expected_connection: crate::search::daemon_client::DaemonConnectionIdentityV1,
+    verifier: crate::search::daemon_client::PinnedDaemonVerifierV1,
 ) -> Arc<dyn crate::search::embedder::Embedder> {
     let daemon_reachable = daemon.is_available();
-    match crate::search::daemon_client::DaemonFallbackEmbedder::new(
-        daemon,
+    let checked_local = match crate::search::daemon_client::IdentityCheckedLocalEmbedder::new(
         Arc::clone(&embedder),
-        config,
+        expected_connection.embedding_identity.clone(),
     ) {
-        Ok(verified) => Arc::new(verified),
+        Ok(checked) => Arc::new(checked) as Arc<dyn crate::search::embedder::Embedder>,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                embedder_id = %embedder.id(),
+                "Authenticated daemon identity is incompatible with the local fallback"
+            );
+            return embedder;
+        }
+    };
+    match crate::search::daemon_client::DaemonFallbackEmbedder::new_verified(
+        daemon,
+        Some(checked_local),
+        config,
+        expected_connection,
+        verifier,
+    ) {
+        Ok(verified) => Arc::new(
+            crate::search::daemon_client::CassVerifiedDaemonEmbedder::new(
+                verified,
+                embedder.id(),
+                embedder.model_name(),
+            ),
+        ) as Arc<dyn crate::search::embedder::Embedder>,
         Err(error) => {
             tracing::warn!(
                 error = %error,
@@ -25317,20 +25341,11 @@ fn compose_daemon_embedder_or_verified_local(
                 daemon_reachable,
                 "Daemon embedding identity is unverifiable; using the verified local embedder"
             );
-            // GH #409: this is not a transient daemon hiccup — at the pinned
-            // frankensearch rev the legacy constructor rejects every
-            // caller-supplied daemon identity, so an operator with a warm
-            // daemon is about to pay full in-process model load + direct
-            // inference. A tracing warn is invisible by default; say it on
-            // stderr (diagnostics channel, stdout stays data-only) so the
-            // fallback is never silent. Only when a daemon was actually
-            // reachable — the no-daemon case is the ordinary local path.
             if daemon_reachable {
                 eprintln!(
                     "Warning: a local embedding daemon is running but was not used ({error}); \
-                     falling back to in-process {} inference. The daemon path needs a \
-                     producer-attested handshake that cass's daemon protocol does not \
-                     provide yet (GH #409); pass --no-daemon to skip daemon discovery.",
+                     falling back to in-process {} inference because its producer \
+                     attestation was rejected; pass --no-daemon to skip daemon discovery.",
                     embedder.id()
                 );
             }
@@ -25368,17 +25383,45 @@ fn issue_347_semantic_daemon_policy_discovers_existing_by_default_and_respects_o
 #[cfg(test)]
 #[test]
 fn unverifiable_daemon_composition_preserves_the_verified_local_embedding_space() {
-    use crate::search::daemon_client::{DaemonRetryConfig, NoopDaemonClient};
+    use crate::search::daemon_client::{
+        DaemonConnectionIdentityV1, DaemonRetryConfig, NoopDaemonClient,
+        PinnedDaemonVerifierV1,
+    };
     use crate::search::embedder::Embedder;
     use crate::search::hash_embedder::HashEmbedder;
+    use frankensearch::{
+        DAEMON_CONNECTION_IDENTITY_SCHEMA_V1, Embedder as _, ModelCategory,
+    };
 
     let local: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(32));
     let expected = local
         .embed_sync("preserve verified local vectors")
         .expect("local control embedding");
+    let identity_source =
+        frankensearch::HashEmbedder::new(32, frankensearch::HashAlgorithm::FnvModular);
+    let connection = DaemonConnectionIdentityV1 {
+        schema_version: DAEMON_CONNECTION_IDENTITY_SCHEMA_V1,
+        endpoint_fingerprint: "11".repeat(32),
+        executable_fingerprint: "22".repeat(32),
+        protocol_revision: "test-attested-v1".to_string(),
+        key_id: "test-key-v1".to_string(),
+        generation: 1,
+        embedding_identity: identity_source
+            .identity()
+            .expect("Frankensearch hash identity")
+            .clone(),
+        model_category: ModelCategory::HashEmbedder,
+    };
     let daemon = Arc::new(NoopDaemonClient::new("unverified-test-daemon"));
-    let composed =
-        compose_daemon_embedder_or_verified_local(daemon, local, DaemonRetryConfig::default());
+    let verifier = PinnedDaemonVerifierV1::new("test-key-v1", vec![7_u8; 32])
+        .expect("test verifier");
+    let composed = compose_verified_daemon_embedder_or_local(
+        daemon,
+        local,
+        DaemonRetryConfig::default(),
+        connection,
+        verifier,
+    );
 
     assert_eq!(composed.id(), "fnv1a-32");
     assert_eq!(
@@ -27797,27 +27840,54 @@ fn run_cli_search(
 
                     #[cfg(unix)]
                     {
-                        let daemon = (if semantic_opts.auto_spawn_daemon {
-                            crate::daemon::client::connect_or_spawn_for_embedder(embedder.id()).ok()
+                        let daemon = if semantic_opts.auto_spawn_daemon {
+                            crate::daemon::client::connect_or_spawn_for_embedder(
+                                embedder.id(),
+                                &data_dir,
+                            )
+                            .ok()
                         } else {
-                            crate::daemon::client::try_connect_for_embedder(embedder.id())
-                        })
-                        .map(|d| d as Arc<dyn crate::search::daemon_client::DaemonClient>)
-                        .unwrap_or_else(|| {
-                            Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
-                                "daemon-unconfigured",
-                            ))
-                        });
+                            crate::daemon::client::try_connect_for_embedder(
+                                embedder.id(),
+                                &data_dir,
+                            )
+                        };
                         let config = DaemonRetryConfig::from_env();
-                        compose_daemon_embedder_or_verified_local(daemon, embedder, config)
+                        match daemon {
+                            Some(daemon) => match daemon.attestation_channel(&data_dir) {
+                                Ok((connection, verifier)) => {
+                                    let daemon: Arc<
+                                        dyn crate::search::daemon_client::DaemonClient,
+                                    > = daemon;
+                                    compose_verified_daemon_embedder_or_local(
+                                        daemon,
+                                        embedder,
+                                        config,
+                                        connection,
+                                        verifier,
+                                    )
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        error = %error,
+                                        embedder_id = %embedder.id(),
+                                        "Daemon attestation channel could not be established"
+                                    );
+                                    eprintln!(
+                                        "Warning: a local embedding daemon is running but its \
+                                         producer attestation could not be established ({error}); \
+                                         falling back to in-process {} inference.",
+                                        embedder.id()
+                                    );
+                                    embedder
+                                }
+                            },
+                            None => embedder,
+                        }
                     }
                     #[cfg(not(unix))]
                     {
-                        let daemon = Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
-                            "daemon-unconfigured",
-                        ));
-                        let config = DaemonRetryConfig::from_env();
-                        compose_daemon_embedder_or_verified_local(daemon, embedder, config)
+                        embedder
                     }
                 } else {
                     embedder
@@ -28157,51 +28227,66 @@ fn run_cli_search(
         skipped_sections.push("reranking".to_string());
         result
     } else if semantic_opts.rerank && !result.hits.is_empty() {
-        use crate::search::fastembed_reranker::FastEmbedReranker;
+        use crate::search::fastembed_reranker::{FastEmbedReranker, LazyFastEmbedReranker};
         use crate::search::reranker::{Reranker, rerank_texts};
 
-        let model_dir = FastEmbedReranker::default_model_dir(&data_dir);
-        let local_reranker: Option<Arc<dyn Reranker>> =
+        let local_reranker: Option<Arc<dyn Reranker>> = if semantic_opts.use_daemon {
+            Some(Arc::new(LazyFastEmbedReranker::new(&data_dir)))
+        } else {
+            let model_dir = FastEmbedReranker::default_model_dir(&data_dir);
             match FastEmbedReranker::load_from_dir(&model_dir) {
                 Ok(reranker) => Some(Arc::new(reranker)),
                 Err(e) => {
-                    if !semantic_opts.use_daemon {
-                        tracing::debug!(error = %e, "Reranker not available, skipping rerank");
-                    }
+                    tracing::debug!(error = %e, "Reranker not available, skipping rerank");
                     None
                 }
-            };
+            }
+        };
 
         let reranker: Option<Arc<dyn Reranker>> = if semantic_opts.use_daemon {
             use crate::search::daemon_client::{DaemonFallbackReranker, DaemonRetryConfig};
 
             #[cfg(unix)]
             {
-                let daemon = crate::daemon::client::try_connect()
-                    .map(|d| d as Arc<dyn crate::search::daemon_client::DaemonClient>)
-                    .unwrap_or_else(|| {
-                        Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
-                            "daemon-unconfigured",
-                        ))
-                    });
                 let config = DaemonRetryConfig::from_env();
-                Some(Arc::new(DaemonFallbackReranker::new(
-                    daemon,
-                    local_reranker,
-                    config,
-                )))
+                match crate::daemon::client::try_connect_for_data_dir(&data_dir) {
+                    Some(daemon) => match daemon.attestation_channel(&data_dir) {
+                        Ok((connection, verifier)) => {
+                            let daemon: Arc<dyn crate::search::daemon_client::DaemonClient> =
+                                daemon;
+                            match DaemonFallbackReranker::new_verified(
+                                daemon,
+                                local_reranker.clone(),
+                                config,
+                                connection,
+                                verifier,
+                            ) {
+                                Ok(reranker) => {
+                                    Some(Arc::new(reranker) as Arc<dyn Reranker>)
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        error = %error,
+                                        "Daemon reranker attestation was rejected"
+                                    );
+                                    local_reranker
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                "Daemon reranker attestation channel could not be established"
+                            );
+                            local_reranker
+                        }
+                    },
+                    None => local_reranker,
+                }
             }
             #[cfg(not(unix))]
             {
-                let daemon = Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
-                    "daemon-unconfigured",
-                ));
-                let config = DaemonRetryConfig::from_env();
-                Some(Arc::new(DaemonFallbackReranker::new(
-                    daemon,
-                    local_reranker,
-                    config,
-                )))
+                local_reranker
             }
         } else {
             local_reranker
@@ -111771,7 +111856,12 @@ fn run_daemon(
     use crate::daemon::{ModelDaemon, ModelManager};
 
     let data_dir = data_dir.unwrap_or_else(default_data_dir);
+    let socket_was_explicit =
+        socket.is_some() || dotenvy::var("CASS_DAEMON_SOCKET").is_ok();
     let mut config = resolved_daemon_config(socket, idle_timeout, max_connections);
+    if !socket_was_explicit {
+        config.socket_path = crate::daemon::daemon_socket_path_for_data_dir(&data_dir);
+    }
     config.served_generation = crate::daemon::published_lexical_generation(&data_dir);
     config.data_dir = Some(data_dir.clone());
 

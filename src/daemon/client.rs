@@ -13,6 +13,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
+use frankensearch::{
+    AttestedDaemonEmbeddingResponseV1, DaemonChallengeV1, DaemonConnectionIdentityV1,
+    DaemonEmbeddingAttestationV1, PinnedDaemonVerifierV1,
+};
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
@@ -22,8 +26,9 @@ use super::protocol::{
 };
 use super::worker::EmbeddingJobConfig;
 use super::{
-    DaemonRunLockMetadata, daemon_run_lock_path, daemon_spawn_guard_lock_path,
-    published_lexical_generation,
+    DAEMON_ATTESTATION_PROTOCOL_REVISION, DaemonRunLockMetadata,
+    daemon_run_lock_path, daemon_socket_endpoint_fingerprint, daemon_spawn_guard_lock_path,
+    daemon_socket_path_for_data_dir, load_daemon_attestation_key, published_lexical_generation,
 };
 use crate::search::daemon_client::{DaemonClient, DaemonError};
 
@@ -60,6 +65,9 @@ pub struct DaemonClientConfig {
     pub auto_spawn: bool,
     /// Path to the daemon binary (if auto-spawn is enabled).
     pub daemon_binary: Option<PathBuf>,
+    /// Data directory passed to an auto-spawned daemon. This must match the
+    /// client's pinned attestation key and model assets.
+    pub data_dir: Option<PathBuf>,
     /// Embedder identity required by the caller's vector index.
     ///
     /// The daemon protocol reports the model that produced every embedding.
@@ -77,6 +85,7 @@ impl Default for DaemonClientConfig {
             request_timeout: Duration::from_secs(30),
             auto_spawn: true,
             daemon_binary: None, // Will use current executable with --daemon flag
+            data_dir: None,
             expected_embedder_id: None,
         }
     }
@@ -271,11 +280,15 @@ impl UdsDaemonClient {
 
         remove_stale_daemon_socket(&self.config.socket_path)?;
 
-        // Spawn daemon in background
-        let result = Command::new(&binary)
-            .arg("daemon")
-            .arg("--socket")
-            .arg(&self.config.socket_path)
+        // Spawn daemon in background. A custom data directory is part of the
+        // authenticated channel, so it must be forwarded to the resident
+        // process rather than silently serving the platform default.
+        let mut command = Command::new(&binary);
+        command.arg("daemon").arg("--socket").arg(&self.config.socket_path);
+        if let Some(data_dir) = &self.config.data_dir {
+            command.arg("--data-dir").arg(data_dir);
+        }
+        let result = command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -501,6 +514,40 @@ impl UdsDaemonClient {
         }
     }
 
+    /// Fetch the daemon's candidate connection identity and bind it to the
+    /// owner-private key pinned in this CASS data directory. The candidate is
+    /// still untrusted here; `DaemonFallbackEmbedder::new_verified` immediately
+    /// proves it with fresh handshake and health challenges before exposing an
+    /// embedder.
+    pub fn attestation_channel(
+        &self,
+        data_dir: &Path,
+    ) -> Result<(DaemonConnectionIdentityV1, PinnedDaemonVerifierV1), DaemonError> {
+        let identity = match self.send_request(Request::ConnectionIdentity)? {
+            Response::ConnectionIdentity(identity) => identity,
+            other => return Err(unexpected_response(other)),
+        };
+        identity
+            .validate()
+            .map_err(|_| DaemonError::UnverifiableRemoteSpace)?;
+        if identity.endpoint_fingerprint
+            != daemon_socket_endpoint_fingerprint(&self.config.socket_path)
+            || identity.protocol_revision != DAEMON_ATTESTATION_PROTOCOL_REVISION
+        {
+            return Err(DaemonError::UnverifiableRemoteSpace);
+        }
+
+        let authority = load_daemon_attestation_key(data_dir)
+            .map_err(|_| DaemonError::UnverifiableRemoteSpace)?;
+        if authority.key_id() != identity.key_id.as_str() {
+            return Err(DaemonError::UnverifiableRemoteSpace);
+        }
+        let verifier = authority
+            .pinned_verifier()
+            .map_err(|_| DaemonError::UnverifiableRemoteSpace)?;
+        Ok((identity, verifier))
+    }
+
     /// Request daemon shutdown.
     pub fn shutdown(&self) -> Result<(), DaemonError> {
         match self.send_request(Request::Shutdown)? {
@@ -581,6 +628,82 @@ impl DaemonClient for UdsDaemonClient {
                 self.mark_unavailable();
                 false
             }
+        }
+    }
+
+    fn handshake_attested(
+        &self,
+        challenge: &DaemonChallengeV1,
+    ) -> Result<DaemonEmbeddingAttestationV1, DaemonError> {
+        match self.send_request(Request::HandshakeAttested {
+            challenge: challenge.clone(),
+        })? {
+            Response::Attestation(attestation) => Ok(attestation),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    fn health_attested(
+        &self,
+        challenge: &DaemonChallengeV1,
+    ) -> Result<DaemonEmbeddingAttestationV1, DaemonError> {
+        match self.send_request(Request::HealthAttested {
+            challenge: challenge.clone(),
+        })? {
+            Response::Attestation(attestation) => Ok(attestation),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    fn embed_attested(
+        &self,
+        text: &str,
+        challenge: &DaemonChallengeV1,
+    ) -> Result<AttestedDaemonEmbeddingResponseV1, DaemonError> {
+        match self.send_request(Request::EmbedAttested {
+            texts: vec![text.to_string()],
+            model: "default".to_string(),
+            dims: None,
+            challenge: challenge.clone(),
+        })? {
+            Response::AttestedEmbedding(response) => Ok(response),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    fn embed_batch_attested(
+        &self,
+        texts: &[&str],
+        challenge: &DaemonChallengeV1,
+    ) -> Result<AttestedDaemonEmbeddingResponseV1, DaemonError> {
+        match self.send_request(Request::EmbedAttested {
+            texts: texts.iter().map(|text| (*text).to_string()).collect(),
+            model: "default".to_string(),
+            dims: None,
+            challenge: challenge.clone(),
+        })? {
+            Response::AttestedEmbedding(response) => Ok(response),
+            other => Err(unexpected_response(other)),
+        }
+    }
+
+    fn rerank_attested(
+        &self,
+        query: &str,
+        documents: &[&str],
+        challenge: &DaemonChallengeV1,
+    ) -> Result<AttestedDaemonEmbeddingResponseV1, DaemonError> {
+        match self.send_request(Request::RerankAttested {
+            query: query.to_string(),
+            documents: documents
+                .iter()
+                .map(|document| (*document).to_string())
+                .collect(),
+            model: "default".to_string(),
+            challenge: challenge.clone(),
+        })? {
+            Response::AttestedEmbedding(response) => Ok(response),
+            other => Err(unexpected_response(other)),
         }
     }
 
@@ -705,7 +828,11 @@ pub fn probe_daemon_runtime(
     timeout: Duration,
 ) -> crate::daemon_runtime_state::DaemonRuntimeDiagnostic {
     let mut config = DaemonClientConfig::from_env();
+    if dotenvy::var("CASS_DAEMON_SOCKET").is_err() {
+        config.socket_path = daemon_socket_path_for_data_dir(data_dir);
+    }
     config.auto_spawn = false;
+    config.data_dir = Some(data_dir.to_path_buf());
     config.connect_timeout = timeout;
     // The caller's receive deadline is the authoritative hard bound. Keep the
     // worker's socket timeout longer so the two clocks cannot race and turn a
@@ -887,9 +1014,14 @@ pub fn connect_or_spawn() -> Result<Arc<UdsDaemonClient>, DaemonError> {
 /// model that owns the caller's vector index.
 pub fn connect_or_spawn_for_embedder(
     expected_embedder_id: &str,
+    data_dir: &Path,
 ) -> Result<Arc<UdsDaemonClient>, DaemonError> {
     let mut config = DaemonClientConfig::from_env();
+    if dotenvy::var("CASS_DAEMON_SOCKET").is_err() {
+        config.socket_path = daemon_socket_path_for_data_dir(data_dir);
+    }
     config.expected_embedder_id = Some(expected_embedder_id.to_string());
+    config.data_dir = Some(data_dir.to_path_buf());
     let client = UdsDaemonClient::new(config);
     client.connect()?;
     Ok(Arc::new(client))
@@ -906,12 +1038,36 @@ pub fn try_connect() -> Option<Arc<UdsDaemonClient>> {
     }
 }
 
+/// Try the default socket associated with one data directory without
+/// spawning. This keeps independent CASS archives and attestation authorities
+/// from sharing an ambiguous per-user endpoint.
+pub fn try_connect_for_data_dir(data_dir: &Path) -> Option<Arc<UdsDaemonClient>> {
+    let mut config = DaemonClientConfig::from_env();
+    if dotenvy::var("CASS_DAEMON_SOCKET").is_err() {
+        config.socket_path = daemon_socket_path_for_data_dir(data_dir);
+    }
+    config.auto_spawn = false;
+    config.data_dir = Some(data_dir.to_path_buf());
+    let client = UdsDaemonClient::new(config);
+    match client.connect() {
+        Ok(()) => Some(Arc::new(client)),
+        Err(_) => None,
+    }
+}
+
 /// Try an existing daemon without spawning and require embeddings from the
 /// model that owns the caller's vector index.
-pub fn try_connect_for_embedder(expected_embedder_id: &str) -> Option<Arc<UdsDaemonClient>> {
+pub fn try_connect_for_embedder(
+    expected_embedder_id: &str,
+    data_dir: &Path,
+) -> Option<Arc<UdsDaemonClient>> {
     let mut config = DaemonClientConfig::from_env();
+    if dotenvy::var("CASS_DAEMON_SOCKET").is_err() {
+        config.socket_path = daemon_socket_path_for_data_dir(data_dir);
+    }
     config.auto_spawn = false;
     config.expected_embedder_id = Some(expected_embedder_id.to_string());
+    config.data_dir = Some(data_dir.to_path_buf());
     let client = UdsDaemonClient::new(config);
     match client.connect() {
         Ok(()) => Some(Arc::new(client)),
@@ -922,11 +1078,167 @@ pub fn try_connect_for_embedder(expected_embedder_id: &str) -> Option<Arc<UdsDae
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frankensearch::{
+        DAEMON_CONNECTION_IDENTITY_SCHEMA_V1, DaemonChallengeV1, DaemonConnectionIdentityV1,
+        DaemonEmbeddingAttestationV1, DaemonFallbackEmbedder, DaemonOperationV1,
+        DaemonRetryConfig, Embedder as _, HashAlgorithm, HashEmbedder, ModelCategory,
+        SyncEmbed as _,
+    };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     fn test_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
         std::io::Error::other(message.into()).into()
+    }
+
+    #[test]
+    fn gh409_attested_uds_channel_serves_verified_vectors_without_local_inference() -> TestResult {
+        let data_dir = tempfile::tempdir()?;
+        let socket_path = data_dir.path().join("logical-semantic.sock");
+        let (authority, generation) =
+            crate::daemon::initialize_daemon_attestation_authority(data_dir.path())?;
+        let hash = HashEmbedder::new(3, HashAlgorithm::FnvModular);
+        let connection = DaemonConnectionIdentityV1 {
+            schema_version: DAEMON_CONNECTION_IDENTITY_SCHEMA_V1,
+            endpoint_fingerprint: daemon_socket_endpoint_fingerprint(&socket_path),
+            executable_fingerprint: "22".repeat(32),
+            protocol_revision: DAEMON_ATTESTATION_PROTOCOL_REVISION.to_string(),
+            key_id: authority.key_id().to_string(),
+            generation,
+            embedding_identity: hash.identity()?.clone(),
+            model_category: ModelCategory::HashEmbedder,
+        };
+        connection.validate()?;
+
+        let (client_stream, mut server_stream) = UnixStream::pair()?;
+        let server_connection = connection.clone();
+        let server = std::thread::spawn(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            for step in 0..4 {
+                let mut len = [0_u8; 4];
+                server_stream.read_exact(&mut len)?;
+                let mut payload = vec![0_u8; u32::from_be_bytes(len) as usize];
+                server_stream.read_exact(&mut payload)?;
+                let request = decode_message::<Request>(&payload)?;
+                let response = match (step, request.payload) {
+                    (0, Request::ConnectionIdentity) => {
+                        Response::ConnectionIdentity(server_connection.clone())
+                    }
+                    (1, Request::HandshakeAttested { challenge }) => {
+                        let expected = DaemonChallengeV1::for_inputs(
+                            challenge.request_nonce.clone(),
+                            DaemonOperationV1::Handshake,
+                            &[],
+                            &server_connection,
+                        )?;
+                        if expected != challenge {
+                            return Err(std::io::Error::other(
+                                "handshake challenge mismatch",
+                            )
+                            .into());
+                        }
+                        let mut attestation = DaemonEmbeddingAttestationV1::unsigned(
+                            challenge,
+                            server_connection.clone(),
+                            &[],
+                        )?;
+                        attestation.sign_hmac_sha256(authority.secret())?;
+                        Response::Attestation(attestation)
+                    }
+                    (2, Request::HealthAttested { challenge }) => {
+                        let expected = DaemonChallengeV1::for_inputs(
+                            challenge.request_nonce.clone(),
+                            DaemonOperationV1::Health,
+                            &[],
+                            &server_connection,
+                        )?;
+                        if expected != challenge {
+                            return Err(
+                                std::io::Error::other("health challenge mismatch").into()
+                            );
+                        }
+                        let mut attestation = DaemonEmbeddingAttestationV1::unsigned(
+                            challenge,
+                            server_connection.clone(),
+                            &[],
+                        )?;
+                        attestation.sign_hmac_sha256(authority.secret())?;
+                        Response::Attestation(attestation)
+                    }
+                    (
+                        3,
+                        Request::EmbedAttested {
+                            texts, challenge, ..
+                        },
+                    ) => {
+                        let input_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+                        let expected = DaemonChallengeV1::for_inputs(
+                            challenge.request_nonce.clone(),
+                            DaemonOperationV1::Embed,
+                            &input_refs,
+                            &server_connection,
+                        )?;
+                        if expected != challenge {
+                            return Err(std::io::Error::other("embed challenge mismatch").into());
+                        }
+                        Response::AttestedEmbedding(
+                            AttestedDaemonEmbeddingResponseV1::signed(
+                                challenge,
+                                server_connection.clone(),
+                                vec![vec![0.25, 0.5, 0.75]],
+                                authority.secret(),
+                            )?,
+                        )
+                    }
+                    _ => {
+                        return Err(
+                            std::io::Error::other("unexpected attested request sequence").into()
+                        );
+                    }
+                };
+                let framed = FramedMessage::new(request.request_id, response);
+                server_stream.write_all(&encode_message(&framed)?)?;
+            }
+            Ok(())
+        });
+
+        let client = Arc::new(UdsDaemonClient::new(DaemonClientConfig {
+            socket_path,
+            auto_spawn: false,
+            data_dir: Some(data_dir.path().to_path_buf()),
+            ..Default::default()
+        }));
+        *client.connection.lock() = Some(client_stream);
+        client.available.store(true, Ordering::SeqCst);
+        *client.last_health_check.lock() = Some(Instant::now());
+        let (candidate, verifier) = client.attestation_channel(data_dir.path())?;
+        let daemon: Arc<dyn DaemonClient> = client;
+        let verified = DaemonFallbackEmbedder::new_verified(
+            daemon,
+            None,
+            DaemonRetryConfig::default(),
+            candidate,
+            verifier,
+        )?;
+        let verified = crate::search::daemon_client::CassVerifiedDaemonEmbedder::new(
+            verified,
+            "cass-index-id",
+            "cass-model-name",
+        );
+        ensure_eq(
+            verified.id(),
+            "cass-index-id",
+            "CASS operational vector-index identifier",
+        )?;
+        ensure_eq(
+            verified.embed_sync("attested input")?,
+            vec![0.25, 0.5, 0.75],
+            "verified daemon vector",
+        )?;
+        server
+            .join()
+            .map_err(|_| test_error("attested server thread panicked"))?
+            .map_err(|error| test_error(error.to_string()))?;
+        Ok(())
     }
 
     fn ensure(condition: bool, message: impl Into<String>) -> TestResult {

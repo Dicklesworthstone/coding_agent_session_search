@@ -14,6 +14,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
+use frankensearch::{
+    AttestedDaemonEmbeddingResponseV1, DAEMON_CONNECTION_IDENTITY_SCHEMA_V1, DaemonChallengeV1,
+    DaemonConnectionIdentityV1, DaemonEmbeddingAttestationV1, DaemonError, DaemonOperationV1,
+};
 use parking_lot::RwLock;
 use tracing::{debug, error, info, warn};
 
@@ -26,11 +30,91 @@ use super::protocol::{
 use super::resource::ResourceMonitor;
 use super::worker::{EmbeddingJobConfig, EmbeddingWorker, EmbeddingWorkerHandle};
 use super::{DaemonRunLockMetadata, daemon_run_lock_path};
+use super::{
+    DAEMON_ATTESTATION_PROTOCOL_REVISION, DaemonAttestationKeyV1,
+    current_daemon_executable_fingerprint, daemon_socket_endpoint_fingerprint,
+    daemon_socket_path_for_data_dir, initialize_daemon_attestation_authority,
+};
 
 struct BoundDaemonSocket {
     listener: UnixListener,
     public_path: PathBuf,
     bind_path: PathBuf,
+}
+
+struct DaemonAttestationState {
+    connection: DaemonConnectionIdentityV1,
+    authority: DaemonAttestationKeyV1,
+}
+
+impl DaemonAttestationState {
+    fn validate_challenge_for_inputs(
+        &self,
+        challenge: &DaemonChallengeV1,
+        operation: DaemonOperationV1,
+        inputs: &[&str],
+    ) -> Result<(), DaemonError> {
+        let expected = DaemonChallengeV1::for_inputs(
+            challenge.request_nonce.clone(),
+            operation,
+            inputs,
+            &self.connection,
+        )?;
+        if &expected == challenge {
+            Ok(())
+        } else {
+            Err(DaemonError::UnverifiableRemoteSpace)
+        }
+    }
+
+    fn sign_control(
+        &self,
+        challenge: &DaemonChallengeV1,
+        operation: DaemonOperationV1,
+    ) -> Result<DaemonEmbeddingAttestationV1, DaemonError> {
+        self.validate_challenge_for_inputs(challenge, operation, &[])?;
+        let mut attestation = DaemonEmbeddingAttestationV1::unsigned(
+            challenge.clone(),
+            self.connection.clone(),
+            &[],
+        )?;
+        attestation.sign_hmac_sha256(self.authority.secret())?;
+        Ok(attestation)
+    }
+
+    fn sign_vectors(
+        &self,
+        challenge: &DaemonChallengeV1,
+        operation: DaemonOperationV1,
+        inputs: &[&str],
+        vectors: Vec<Vec<f32>>,
+    ) -> Result<AttestedDaemonEmbeddingResponseV1, DaemonError> {
+        self.validate_challenge_for_inputs(challenge, operation, inputs)?;
+        AttestedDaemonEmbeddingResponseV1::signed(
+            challenge.clone(),
+            self.connection.clone(),
+            vectors,
+            self.authority.secret(),
+        )
+    }
+}
+
+fn attestation_unavailable_response() -> Response {
+    Response::Error(ErrorResponse {
+        code: ErrorCode::ModelLoadFailed,
+        message: "producer-attested daemon channel is unavailable".to_string(),
+        retryable: false,
+        retry_after_ms: None,
+    })
+}
+
+fn rejected_attestation_response() -> Response {
+    Response::Error(ErrorResponse {
+        code: ErrorCode::InvalidInput,
+        message: "daemon attestation request failed verification".to_string(),
+        retryable: false,
+        retry_after_ms: None,
+    })
 }
 
 fn protocol_version_mismatch_message(actual_version: u32) -> String {
@@ -293,6 +377,7 @@ pub struct ModelDaemon {
     active_connections: AtomicU64,
     shutdown: AtomicBool,
     last_activity: RwLock<Instant>,
+    attestation: RwLock<Option<DaemonAttestationState>>,
     worker_handle: parking_lot::Mutex<Option<EmbeddingWorkerHandle>>,
 }
 
@@ -308,6 +393,7 @@ impl ModelDaemon {
             active_connections: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             last_activity: RwLock::new(Instant::now()),
+            attestation: RwLock::new(None),
             worker_handle: parking_lot::Mutex::new(None),
         }
     }
@@ -341,9 +427,43 @@ impl ModelDaemon {
 
     /// Create daemon with default config and models from data directory.
     pub fn with_defaults(data_dir: &Path) -> Self {
-        let config = DaemonConfig::from_env();
+        let mut config = DaemonConfig::from_env();
+        if dotenvy::var("CASS_DAEMON_SOCKET").is_err() {
+            config.socket_path = daemon_socket_path_for_data_dir(data_dir);
+        }
+        config.data_dir = Some(data_dir.to_path_buf());
         let models = ModelManager::new(data_dir);
         Self::new(config, models)
+    }
+
+    fn initialize_attestation(&self) -> std::io::Result<()> {
+        let data_dir = self.config.data_dir.as_deref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "daemon data directory is required for producer attestation",
+            )
+        })?;
+        let (authority, generation) = initialize_daemon_attestation_authority(data_dir)?;
+        let (embedding_identity, model_category) = self
+            .models
+            .embedder_attestation_identity()
+            .map_err(std::io::Error::other)?;
+        let connection = DaemonConnectionIdentityV1 {
+            schema_version: DAEMON_CONNECTION_IDENTITY_SCHEMA_V1,
+            endpoint_fingerprint: daemon_socket_endpoint_fingerprint(&self.config.socket_path),
+            executable_fingerprint: current_daemon_executable_fingerprint()?,
+            protocol_revision: DAEMON_ATTESTATION_PROTOCOL_REVISION.to_string(),
+            key_id: authority.key_id().to_string(),
+            generation,
+            embedding_identity,
+            model_category,
+        };
+        connection.validate().map_err(std::io::Error::other)?;
+        *self.attestation.write() = Some(DaemonAttestationState {
+            connection,
+            authority,
+        });
+        Ok(())
     }
 
     /// Get current uptime in seconds.
@@ -482,6 +602,9 @@ impl ModelDaemon {
         }
         if let Err(e) = self.models.warm_reranker() {
             warn!(error = %e, "Failed to pre-warm reranker");
+        }
+        if let Err(error) = self.initialize_attestation() {
+            warn!(error = %error, "Producer-attested daemon channel is unavailable");
         }
         info!("Model pre-warming complete");
 
@@ -767,6 +890,38 @@ impl ModelDaemon {
                 memory_bytes: self.resources.memory_usage(),
             }),
 
+            Request::ConnectionIdentity => self
+                .attestation
+                .read()
+                .as_ref()
+                .map(|state| Response::ConnectionIdentity(state.connection.clone()))
+                .unwrap_or_else(attestation_unavailable_response),
+
+            Request::HandshakeAttested { challenge } => {
+                let state = self.attestation.read();
+                match state.as_ref() {
+                    Some(state) => state
+                        .sign_control(&challenge, DaemonOperationV1::Handshake)
+                        .map(Response::Attestation)
+                        .unwrap_or_else(|_| rejected_attestation_response()),
+                    None => attestation_unavailable_response(),
+                }
+            }
+
+            Request::HealthAttested { challenge } => {
+                let state = self.attestation.read();
+                if !self.models.is_ready() {
+                    return attestation_unavailable_response();
+                }
+                match state.as_ref() {
+                    Some(state) => state
+                        .sign_control(&challenge, DaemonOperationV1::Health)
+                        .map(Response::Attestation)
+                        .unwrap_or_else(|_| rejected_attestation_response()),
+                    None => attestation_unavailable_response(),
+                }
+            }
+
             Request::Embed {
                 texts,
                 model,
@@ -794,6 +949,48 @@ impl ModelDaemon {
                 }
             }
 
+            Request::EmbedAttested {
+                texts,
+                model,
+                dims: _,
+                challenge,
+            } => {
+                let operation = if texts.len() == 1 {
+                    DaemonOperationV1::Embed
+                } else {
+                    DaemonOperationV1::EmbedBatch
+                };
+                let inputs: Vec<&str> = texts.iter().map(String::as_str).collect();
+                let state = self.attestation.read();
+                let Some(state) = state.as_ref() else {
+                    return attestation_unavailable_response();
+                };
+                if state
+                    .validate_challenge_for_inputs(&challenge, operation, &inputs)
+                    .is_err()
+                {
+                    return rejected_attestation_response();
+                }
+                debug!(
+                    request_id = %request_id,
+                    batch_size = texts.len(),
+                    model = %model,
+                    "Processing attested embed request"
+                );
+                match self.models.embed_batch(&texts) {
+                    Ok(embeddings) => state
+                        .sign_vectors(&challenge, operation, &inputs, embeddings)
+                        .map(Response::AttestedEmbedding)
+                        .unwrap_or_else(|_| rejected_attestation_response()),
+                    Err(error) => Response::Error(ErrorResponse {
+                        code: ErrorCode::ModelLoadFailed,
+                        message: error.to_string(),
+                        retryable: true,
+                        retry_after_ms: Some(1000),
+                    }),
+                }
+            }
+
             Request::Rerank {
                 query,
                 documents,
@@ -815,6 +1012,54 @@ impl ModelDaemon {
                     Err(e) => Response::Error(ErrorResponse {
                         code: ErrorCode::ModelLoadFailed,
                         message: e.to_string(),
+                        retryable: true,
+                        retry_after_ms: Some(1000),
+                    }),
+                }
+            }
+
+            Request::RerankAttested {
+                query,
+                documents,
+                model,
+                challenge,
+            } => {
+                let mut inputs = Vec::with_capacity(documents.len() + 1);
+                inputs.push(query.as_str());
+                inputs.extend(documents.iter().map(String::as_str));
+                let state = self.attestation.read();
+                let Some(state) = state.as_ref() else {
+                    return attestation_unavailable_response();
+                };
+                if state
+                    .validate_challenge_for_inputs(
+                        &challenge,
+                        DaemonOperationV1::Rerank,
+                        &inputs,
+                    )
+                    .is_err()
+                {
+                    return rejected_attestation_response();
+                }
+                debug!(
+                    request_id = %request_id,
+                    doc_count = documents.len(),
+                    model = %model,
+                    "Processing attested rerank request"
+                );
+                match self.models.rerank(&query, &documents) {
+                    Ok(scores) => state
+                        .sign_vectors(
+                            &challenge,
+                            DaemonOperationV1::Rerank,
+                            &inputs,
+                            vec![scores],
+                        )
+                        .map(Response::AttestedEmbedding)
+                        .unwrap_or_else(|_| rejected_attestation_response()),
+                    Err(error) => Response::Error(ErrorResponse {
+                        code: ErrorCode::ModelLoadFailed,
+                        message: error.to_string(),
                         retryable: true,
                         retry_after_ms: Some(1000),
                     }),
@@ -998,8 +1243,79 @@ fn write_daemon_run_lock_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frankensearch::{Embedder as _, HashAlgorithm, HashEmbedder, ModelCategory};
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    fn test_attestation_state(data_dir: &Path) -> DaemonAttestationState {
+        let (authority, generation) =
+            initialize_daemon_attestation_authority(data_dir).expect("test authority");
+        let embedder = HashEmbedder::new(3, HashAlgorithm::FnvModular);
+        let connection = DaemonConnectionIdentityV1 {
+            schema_version: DAEMON_CONNECTION_IDENTITY_SCHEMA_V1,
+            endpoint_fingerprint: "11".repeat(32),
+            executable_fingerprint: "22".repeat(32),
+            protocol_revision: DAEMON_ATTESTATION_PROTOCOL_REVISION.to_string(),
+            key_id: authority.key_id().to_string(),
+            generation,
+            embedding_identity: embedder.identity().expect("hash identity").clone(),
+            model_category: ModelCategory::HashEmbedder,
+        };
+        DaemonAttestationState {
+            connection,
+            authority,
+        }
+    }
+
+    #[test]
+    fn attestation_signer_binds_nonce_operation_inputs_identity_and_vectors() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = test_attestation_state(temp.path());
+        let challenge = DaemonChallengeV1::for_inputs(
+            "aa".repeat(32),
+            DaemonOperationV1::Embed,
+            &["original input"],
+            &state.connection,
+        )
+        .expect("challenge");
+
+        assert!(
+            state
+                .validate_challenge_for_inputs(
+                    &challenge,
+                    DaemonOperationV1::Embed,
+                    &["original input"],
+                )
+                .is_ok()
+        );
+        assert!(
+            state
+                .validate_challenge_for_inputs(
+                    &challenge,
+                    DaemonOperationV1::Embed,
+                    &["substituted input"],
+                )
+                .is_err(),
+            "the daemon must not sign a challenge for different input bytes"
+        );
+
+        let signed = state
+            .sign_vectors(
+                &challenge,
+                DaemonOperationV1::Embed,
+                &["original input"],
+                vec![vec![0.25, 0.5, 0.75]],
+            )
+            .expect("signed response");
+        signed
+            .attestation
+            .validate_against(&challenge, &state.connection, &signed.vectors)
+            .expect("bound response");
+        signed
+            .attestation
+            .authenticate_hmac_sha256(state.authority.secret())
+            .expect("authenticated response");
+    }
 
     #[test]
     fn periodic_index_is_off_at_zero_and_fires_on_first_tick_then_per_interval() {

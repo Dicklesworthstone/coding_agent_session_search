@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use super::embedder::{Embedder, EmbedderError, EmbedderResult};
-use frankensearch::{ModelCategory, ModelTier, NativeEmbedder};
+use frankensearch::{EmbeddingIdentityBundleV1, ModelCategory, ModelTier, NativeEmbedder};
 
 /// Pooling strategy for the embedder configuration. The native embedder always
 /// mean-pools over every token (the sentence-transformers all-MiniLM head), so
@@ -152,6 +152,10 @@ impl Embedder for LazyFastEmbedder {
 
     fn dimension(&self) -> usize {
         self.config.dimension
+    }
+
+    fn identity(&self) -> EmbedderResult<&EmbeddingIdentityBundleV1> {
+        self.loaded()?.identity()
     }
 
     fn id(&self) -> &str {
@@ -446,6 +450,10 @@ impl Embedder for FastEmbedder {
 
     fn dimension(&self) -> usize {
         self.dimension
+    }
+
+    fn identity(&self) -> EmbedderResult<&EmbeddingIdentityBundleV1> {
+        self.inner.identity()
     }
 
     fn id(&self) -> &str {
