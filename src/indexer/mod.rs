@@ -18696,7 +18696,7 @@ fn prepare_lexical_rebuild_page_work(
             let mut prepared_packets = Vec::with_capacity(work.conversation_page.len());
             for conversation in work.conversation_page {
                 let conversation_id = conversation.id.ok_or_else(|| {
-                    anyhow!(
+                    anyhow::anyhow!(
                         "lexical rebuild page sequence {sequence} contains a conversation without an id"
                     )
                 })?;
