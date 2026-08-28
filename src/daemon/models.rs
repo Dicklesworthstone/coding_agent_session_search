@@ -19,6 +19,7 @@ use frankensearch::core::EmbeddingIdentityBundleV1;
 /// Model manager that handles lazy loading of embedder and reranker models.
 pub struct ModelManager {
     data_dir: PathBuf,
+    embedder_registry_name: &'static str,
     embedder: RwLock<Option<Arc<dyn Embedder>>>,
     reranker: RwLock<Option<Arc<dyn Reranker>>>,
     embedder_name: RwLock<String>,
@@ -28,8 +29,18 @@ pub struct ModelManager {
 impl ModelManager {
     /// Create a new model manager with the given data directory.
     pub fn new(data_dir: &Path) -> Self {
+        let policy = crate::search::policy::SemanticPolicy::resolve(
+            &crate::search::policy::CliSemanticOverrides::default(),
+        );
+        let embedder_registry_name =
+            FastEmbedder::canonical_name(&policy.quality_tier_embedder).unwrap_or("minilm");
+        Self::new_for_embedder(data_dir, embedder_registry_name)
+    }
+
+    fn new_for_embedder(data_dir: &Path, embedder_registry_name: &'static str) -> Self {
         Self {
             data_dir: data_dir.to_path_buf(),
+            embedder_registry_name,
             embedder: RwLock::new(None),
             reranker: RwLock::new(None),
             embedder_name: RwLock::new("not-loaded".to_string()),
@@ -124,20 +135,39 @@ impl ModelManager {
             return Ok(());
         }
 
-        let model_dir = FastEmbedder::default_model_dir(&self.data_dir);
-        info!(model_dir = %model_dir.display(), "Loading embedder");
+        let model_dir =
+            FastEmbedder::runtime_model_dir_for(&self.data_dir, self.embedder_registry_name)
+                .ok_or_else(|| EmbedderError::EmbedderUnavailable {
+                    model: self.embedder_registry_name.to_string(),
+                    reason: "registered embedder has no model directory mapping".to_string(),
+                })?;
+        info!(
+            embedder = self.embedder_registry_name,
+            model_dir = %model_dir.display(),
+            "Loading embedder"
+        );
 
-        match FastEmbedder::load_from_dir(&model_dir) {
+        match FastEmbedder::load_by_name(&self.data_dir, self.embedder_registry_name) {
             Ok(embedder) => {
                 let id = embedder.id().to_string();
                 let dimension = embedder.dimension();
+                let model_name = embedder.model_name().to_string();
                 *embedder_guard = Some(Arc::new(embedder));
-                *self.embedder_name.write() = "MiniLM-L6-v2".to_string();
-                info!(id = %id, dimension = dimension, "Embedder loaded");
+                *self.embedder_name.write() = model_name;
+                info!(
+                    registry_name = self.embedder_registry_name,
+                    id = %id,
+                    dimension,
+                    "Embedder loaded"
+                );
                 Ok(())
             }
             Err(e) => {
-                warn!(error = %e, "Failed to load MiniLM embedder");
+                warn!(
+                    registry_name = self.embedder_registry_name,
+                    error = %e,
+                    "Failed to load semantic embedder"
+                );
                 *self.embedder_name.write() = "load-failed".to_string();
                 Err(e)
             }
@@ -262,6 +292,14 @@ mod tests {
         assert!(!manager.is_ready());
         assert!(!manager.embedder_loaded());
         assert!(!manager.reranker_loaded());
+    }
+
+    #[test]
+    fn multilingual_model_manager_keeps_an_explicit_distinct_registry_selection() {
+        let manager = ModelManager::new_for_embedder(&test_data_dir(), "multilingual-minilm");
+        assert_eq!(manager.embedder_registry_name, "multilingual-minilm");
+        assert_eq!(manager.embedder_name(), "not-loaded");
+        assert_eq!(manager.embedder_id(), "not-loaded");
     }
 
     #[test]

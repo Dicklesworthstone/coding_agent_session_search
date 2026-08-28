@@ -1950,9 +1950,9 @@ dependencies = [
 
 [[package]]
 name = "frankensearch"
-version = "0.4.1"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "884ee48bcfb816160f336ab3962fa038bbfc1934f82bf17842f1dab25adeeb7b"
+checksum = "d65bb594d3fbc1c3bd7cb7601a976209adbf9d0b328f036eeffecb4c7a23664b"
 dependencies = [
  "asupersync",
  "frankensearch-core",
@@ -1984,9 +1984,9 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-embed"
-version = "0.2.3"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c73f3070eaa1400d73d583b768723c24f9edfb5003e28127c9b493a7415de3e0"
+checksum = "0557766f609d6aa992494b8d5b6fc74d9cd3dc7b8bbc7fb6ea93dba02f8ad529"
 dependencies = [
  "asupersync",
  "frankensearch-core",
@@ -2089,9 +2089,9 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-rerank"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22191eb789819dfe1b895f3dd22366fb9a7edf41df325a6548873ab26c7c51bb"
+checksum = "e9d9e49616934512cc018e5bd49ae17f976fca61f7d27270d6c7895c511c457e"
 dependencies = [
  "asupersync",
  "frankensearch-core",

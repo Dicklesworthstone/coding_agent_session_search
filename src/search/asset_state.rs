@@ -809,7 +809,10 @@ pub(crate) fn semantic_state_from_availability(
         );
     }
     let base_vector_index_path = semantic_vector_index_path(data_dir, availability, preference);
-    let base_model_dir = preference_surface.model_dir;
+    let base_model_dir = match availability {
+        SemanticAvailability::ModelMissing { model_dir, .. } => Some(model_dir.clone()),
+        _ => preference_surface.model_dir,
+    };
     let base_hnsw_path = base_embedder_id
         .as_deref()
         .map(|embedder_id| hnsw_index_path(data_dir, embedder_id));
@@ -1074,6 +1077,12 @@ fn active_policy_model_dir(data_dir: &Path) -> Option<PathBuf> {
     let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
     let embedder_name = FastEmbedder::canonical_name(&policy.quality_tier_embedder)?;
     FastEmbedder::runtime_model_dir_for(data_dir, embedder_name)
+}
+
+fn active_policy_embedder_id() -> Option<String> {
+    let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
+    let embedder_name = FastEmbedder::canonical_name(&policy.quality_tier_embedder)?;
+    FastEmbedder::config_for(embedder_name).map(|config| config.embedder_id)
 }
 
 fn model_dir_for_embedder_id(data_dir: &Path, embedder_id: &str) -> Option<PathBuf> {
@@ -1561,12 +1570,11 @@ fn semantic_embedder_id(
         SemanticAvailability::Ready { embedder_id }
         | SemanticAvailability::UpdateAvailable { embedder_id, .. }
         | SemanticAvailability::IndexBuilding { embedder_id, .. }
-        | SemanticAvailability::IndexStale { embedder_id, .. } => Some(embedder_id.clone()),
+        | SemanticAvailability::IndexStale { embedder_id, .. }
+        | SemanticAvailability::ModelMissing { embedder_id, .. } => Some(embedder_id.clone()),
         SemanticAvailability::HashFallback => Some(HashEmbedder::default().id().to_string()),
         _ => match preference {
-            SemanticPreference::DefaultModel => {
-                Some(FastEmbedder::embedder_id_static().to_string())
-            }
+            SemanticPreference::DefaultModel => active_policy_embedder_id(),
             SemanticPreference::HashFallback => Some(HashEmbedder::default().id().to_string()),
         },
     }
@@ -3243,6 +3251,32 @@ mod tests {
         assert!(state.available);
         assert!(state.can_search);
         assert_eq!(state.fallback_mode, None);
+    }
+
+    #[test]
+    fn semantic_state_preserves_missing_model_identity_and_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let model_dir = temp.path().join("models/multilingual-minilm");
+        let state = semantic_state_from_availability(
+            temp.path(),
+            &SemanticAvailability::ModelMissing {
+                embedder_id: "multilingual-minilm-384".to_string(),
+                model_dir: model_dir.clone(),
+                missing_files: vec!["model.safetensors".to_string()],
+            },
+            SemanticPreference::DefaultModel,
+            None,
+        );
+
+        assert_eq!(
+            state.embedder_id.as_deref(),
+            Some("multilingual-minilm-384")
+        );
+        assert_eq!(state.model_dir.as_deref(), Some(model_dir.as_path()));
+        assert_eq!(
+            state.vector_index_path.as_deref(),
+            Some(vector_index_path(temp.path(), "multilingual-minilm-384").as_path())
+        );
     }
 
     #[test]

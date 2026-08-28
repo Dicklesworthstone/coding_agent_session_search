@@ -103,6 +103,107 @@
           "size_match": false
         }
       ]
+    },
+    {
+      "registry_name": "multilingual-minilm",
+      "model_id": "paraphrase-multilingual-minilm-l12-v2",
+      "model_dir": "[TEST_HOME]/coding-agent-search/models/paraphrase-multilingual-MiniLM-L12-v2",
+      "active": false,
+      "installed": false,
+      "state": "not_acquired",
+      "state_detail": "model not acquired (user consent required); missing model.safetensors, tokenizer.json, config.json, special_tokens_map.json, tokenizer_config.json",
+      "next_step": "Run `cass models install`, or keep using lexical search.",
+      "revision": "e8f8c211226b894fcb81acc59f3b34ba3efd5f42",
+      "license": "Apache-2.0",
+      "total_size_bytes": 479724528,
+      "installed_size_bytes": 0,
+      "observed_file_bytes": 0,
+      "policy_source": "semantic_policy",
+      "cache_lifecycle": {
+        "model_id": "paraphrase-multilingual-minilm-l12-v2",
+        "model_dir": "[TEST_HOME]/coding-agent-search/models/paraphrase-multilingual-MiniLM-L12-v2",
+        "state": {
+          "state": "not_acquired",
+          "missing_files": [
+            "model.safetensors",
+            "tokenizer.json",
+            "config.json",
+            "special_tokens_map.json",
+            "tokenizer_config.json"
+          ],
+          "needs_consent": true
+        },
+        "required_size_bytes": 479724528,
+        "installed_size_bytes": 0,
+        "policy_source": "semantic_policy"
+      },
+      "model_acquisition": {
+        "state": "absent",
+        "usable": false,
+        "runtime": "not_probed",
+        "source": "unknown",
+        "cost_class": "large",
+        "expected_download_bytes": 479724528,
+        "offline_install_available": true,
+        "skipped_network_reason": "explicit_install_required",
+        "fallback_mode": "lexical",
+        "next_step": "install_model",
+        "next_command": "cass models install --model multilingual-minilm --json",
+        "state_detail": "no embedding model acquired; lexical search works, semantic is opt-in via explicit install",
+        "rollback_guidance": null,
+        "fingerprint": {
+          "revision": "e8f8c211226b894fcb81acc59f3b34ba3efd5f42",
+          "content_digest": "3138453609a2abb5bcf7cb378e997d8f56febb2ad68f954631e590e126b09e79",
+          "marker_token": "e8f8c211226b894fcb81acc59f3b34ba3efd5f42:3138453609a2abb5"
+        }
+      },
+      "files": [
+        {
+          "name": "model.safetensors",
+          "local_name": "model.safetensors",
+          "actual_path": null,
+          "expected_size": 470641600,
+          "actual_size": 0,
+          "exists": false,
+          "size_match": false
+        },
+        {
+          "name": "tokenizer.json",
+          "local_name": "tokenizer.json",
+          "actual_path": null,
+          "expected_size": 9081518,
+          "actual_size": 0,
+          "exists": false,
+          "size_match": false
+        },
+        {
+          "name": "config.json",
+          "local_name": "config.json",
+          "actual_path": null,
+          "expected_size": 645,
+          "actual_size": 0,
+          "exists": false,
+          "size_match": false
+        },
+        {
+          "name": "special_tokens_map.json",
+          "local_name": "special_tokens_map.json",
+          "actual_path": null,
+          "expected_size": 239,
+          "actual_size": 0,
+          "exists": false,
+          "size_match": false
+        },
+        {
+          "name": "tokenizer_config.json",
+          "local_name": "tokenizer_config.json",
+          "actual_path": null,
+          "expected_size": 526,
+          "actual_size": 0,
+          "exists": false,
+          "size_match": false
+        }
+      ]
     }
   ],
   "model_id": "all-minilm-l6-v2",

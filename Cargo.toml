@@ -111,16 +111,17 @@ half = { version = "2.7.1", features = ["bytemuck"] }
 memmap2 = "0.9.10"
 bytemuck = "1.25.0"
 # Semantic embedding + reranking are PURE-RUST via frankensearch's `native`
-# feature: the frankentorch all-MiniLM-L6-v2 sentence embedder (NativeEmbedder)
-# + the ms-marco cross-encoder reranker (NativeReranker). The old
+# feature: the frankentorch all-MiniLM-L6-v2 baseline plus the explicit
+# multilingual MiniLM-L12 sentence embedder (NativeEmbedder), and the ms-marco
+# cross-encoder reranker (NativeReranker). The old
 # `fastembed`/ONNX-Runtime stack was removed (cass #308): ort 2.0.0-rc.12 could
 # not run the all-MiniLM LayerNorm export, and its prebuilt AVX/AVX2 vendor
 # binaries crashed pre-AVX2 CPUs at static init (#256/#307). No ONNX means no
 # AVX-static-init hazard and no separate `-baseline` artifact is needed.
-# Registry pin (gh#429): 0.4.1 adds native Windows Quill writer admission and
-# atomic publication to the 0.4.0 `quill`/`cass-compat`/`ann`/`native` line;
+# Registry pin (gh#410): 0.4.2 adds the distinct opt-in multilingual native
+# embedding space to the Windows Quill publication line introduced in 0.4.1;
 # registry 0.3.2 was a stale same-version twin and must never be resolved.
-frankensearch = { version = "=0.4.1", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
+frankensearch = { version = "=0.4.2", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
 franken-agent-detection = { version = "=0.2.1", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization

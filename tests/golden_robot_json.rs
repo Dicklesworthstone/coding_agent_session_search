@@ -439,6 +439,41 @@ fn looks_like_json_schema_object(value: &Value) -> bool {
 fn normalize_live_robot_values(value: &mut Value) {
     match value {
         Value::Object(map) => {
+            let is_topology_budget = map.contains_key("topology")
+                && map.contains_key("reserved_core_policy")
+                && map.contains_key("advisory_budgets")
+                && map.contains_key("fallback_active")
+                && map.contains_key("decision_reason")
+                && map.contains_key("proof_notes");
+            if is_topology_budget {
+                if let Some(topology) = map.get_mut("topology").and_then(Value::as_object_mut) {
+                    topology.insert("source".to_string(), json!("fallback"));
+                    topology.insert("memory_total_bytes".to_string(), Value::Null);
+                    topology.insert("memory_available_bytes".to_string(), Value::Null);
+                }
+                if let Some(policy) = map
+                    .get_mut("reserved_core_policy")
+                    .and_then(Value::as_object_mut)
+                {
+                    policy.insert("policy".to_string(), json!("current conservative default"));
+                    policy.insert(
+                        "reason".to_string(),
+                        json!("topology could not be derived, so cass preserves existing worker and RAM defaults"),
+                    );
+                }
+                map.insert("fallback_active".to_string(), json!(true));
+                map.insert(
+                    "decision_reason".to_string(),
+                    json!("using conservative defaults: linux sysfs topology is unavailable on this platform"),
+                );
+                map.insert(
+                    "proof_notes".to_string(),
+                    json!([
+                        "fallback is intentionally isomorphic to current defaults for live rebuild budgets",
+                        "no /sys-derived CPU locality assumptions are made in fallback mode"
+                    ]),
+                );
+            }
             let redact_result_content = map.contains_key("source_path")
                 && map.contains_key("line_number")
                 && map.contains_key("agent");
@@ -660,6 +695,70 @@ fn live_value_scrubbing_preserves_response_schema_properties() {
         scrubbed["state"]["resource_policy"]["watchdog"]["last_reason"],
         "[LIVE_SAMPLE]"
     );
+}
+
+#[test]
+fn live_value_scrubbing_normalizes_host_topology_without_erasing_its_shape() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let input = serde_json::to_string_pretty(&json!({
+        "topology_budget": {
+            "topology": {
+                "source": "linux_sysfs",
+                "topology_class": "dual_socket",
+                "logical_cpus": 96,
+                "physical_cores": 48,
+                "sockets": 2,
+                "numa_nodes": 2,
+                "llc_groups": 4,
+                "smt_threads_per_core": 2,
+                "memory_total_bytes": 123,
+                "memory_available_bytes": 45
+            },
+            "reserved_core_policy": {
+                "reserved_cores": 8,
+                "policy": "host-specific policy",
+                "reason": "host-specific reason"
+            },
+            "advisory_budgets": {},
+            "fallback_active": false,
+            "decision_reason": "planned from DualSocket",
+            "proof_notes": ["host-specific proof"]
+        },
+        "near_miss_without_proof_notes": {
+            "topology": {
+                "source": "linux_sysfs",
+                "memory_total_bytes": 999,
+                "memory_available_bytes": 888
+            },
+            "reserved_core_policy": {},
+            "advisory_budgets": {},
+            "fallback_active": false,
+            "decision_reason": "must remain live"
+        }
+    }))
+    .expect("serialize fixture");
+
+    let scrubbed = scrub_robot_json(&input, test_home.path());
+    let scrubbed: Value = serde_json::from_str(&scrubbed).expect("parse scrubbed fixture");
+    let topology_budget = &scrubbed["topology_budget"];
+
+    assert_eq!(topology_budget["topology"]["source"], "fallback");
+    assert!(topology_budget["topology"]["memory_total_bytes"].is_null());
+    assert!(topology_budget["topology"]["memory_available_bytes"].is_null());
+    assert_eq!(topology_budget["fallback_active"], true);
+    assert!(topology_budget["reserved_core_policy"].is_object());
+    assert!(topology_budget["advisory_budgets"].is_object());
+    assert!(topology_budget["proof_notes"].is_array());
+
+    let near_miss = &scrubbed["near_miss_without_proof_notes"];
+    assert_eq!(near_miss["topology"]["source"], "linux_sysfs");
+    assert_eq!(near_miss["topology"]["memory_total_bytes"], "[LIVE_BYTES]");
+    assert_eq!(
+        near_miss["topology"]["memory_available_bytes"],
+        "[LIVE_BYTES]"
+    );
+    assert_eq!(near_miss["fallback_active"], false);
+    assert_eq!(near_miss["decision_reason"], "must remain live");
 }
 
 #[test]

@@ -2,10 +2,12 @@
 //!
 //! Loads a local safetensors model + tokenizer bundle and produces semantic
 //! embeddings via frankensearch's [`NativeEmbedder`](frankensearch::NativeEmbedder)
-//! — a pure-Rust (frankentorch) `all-MiniLM-L6-v2` sentence embedder with **no
-//! ONNX Runtime / no `ort`**. This implementation never downloads model assets;
-//! it expects the model files to be present on disk and returns a clear error
-//! when they are missing.
+//! — a pure-Rust (frankentorch) sentence embedder with **no ONNX Runtime / no
+//! `ort`**. The default is `all-MiniLM-L6-v2`; the distinct, opt-in
+//! `paraphrase-multilingual-MiniLM-L12-v2` space supports CJK and mixed-language
+//! archives. This implementation never downloads model assets; it expects the
+//! model files to be present on disk and returns a clear error when they are
+//! missing.
 //!
 //! The type is still named `FastEmbedder` for call-site stability (the registry,
 //! model management, and vector-index naming reference it), but the FastEmbed /
@@ -15,16 +17,16 @@
 //! pure-Rust backend has neither problem — no AVX-static-init hazard, so a single
 //! binary runs everywhere (the `-baseline` artifact is no longer needed).
 //!
-//! Only the exact 384-dim `all-MiniLM-L6-v2` topology is supported by the native
-//! backend today. Other model families are rejected rather than routed through
-//! a topology that could silently produce incompatible vectors.
+//! Only the two exact, manifest-attested 384-dimensional MiniLM topologies are
+//! supported. They deliberately use different embedder IDs and vector-space
+//! revisions; sharing a dimension never makes their vectors interchangeable.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use super::embedder::{Embedder, EmbedderError, EmbedderResult};
 use frankensearch::core::EmbeddingIdentityBundleV1;
-use frankensearch::{ModelCategory, ModelTier, NativeEmbedder};
+use frankensearch::{ModelCategory, ModelTier, NativeEmbedder, NativeEmbeddingModel};
 
 /// Pooling strategy for the embedder configuration. The native embedder always
 /// mean-pools over every token (the sentence-transformers all-MiniLM head), so
@@ -39,6 +41,9 @@ pub enum Pooling {
 const MINILM_MODEL_ID: &str = "all-minilm-l6-v2";
 const MINILM_DIR_NAME: &str = "all-MiniLM-L6-v2";
 const MINILM_EMBEDDER_ID: &str = "minilm-384";
+const MULTILINGUAL_MINILM_MODEL_ID: &str = "paraphrase-multilingual-minilm-l12-v2";
+const MULTILINGUAL_MINILM_DIR_NAME: &str = "paraphrase-multilingual-MiniLM-L12-v2";
+const MULTILINGUAL_MINILM_EMBEDDER_ID: &str = "multilingual-minilm-384";
 const MINILM_DIMENSION: usize = 384;
 
 /// FSVI vector-space revision for the native MiniLM implementation.
@@ -49,6 +54,12 @@ const MINILM_DIMENSION: usize = 384;
 /// same-shape vectors from being mixed silently.
 pub const MINILM_VECTOR_SPACE_REVISION: &str =
     "native-minilm-v1:c9745ed1d9f207416be6d2e6f8de32d1f16199bf";
+
+/// FSVI vector-space revision for the opt-in multilingual native model.
+///
+/// The suffix is the frozen Frankensearch artifact/execution-manifest
+/// fingerprint, not merely the shared 384-dimensional geometry.
+pub const MULTILINGUAL_MINILM_VECTOR_SPACE_REVISION: &str = "native-multilingual-minilm-v1:59160d9e43d396d05b4139c99f9feb7922da14868587fca7e33d379821a41405";
 
 // Safetensors model file names: prefer an explicit f32 export, fall back to the
 // standard HuggingFace `model.safetensors`. The native embedder also needs
@@ -226,6 +237,7 @@ impl FastEmbedder {
     pub fn model_dir_for(data_dir: &Path, embedder_name: &str) -> Option<PathBuf> {
         let dir_name = match Self::canonical_name(embedder_name)? {
             "minilm" => MINILM_DIR_NAME,
+            "multilingual-minilm" => MULTILINGUAL_MINILM_DIR_NAME,
             _ => return None,
         };
         Some(data_dir.join("models").join(dir_name))
@@ -243,6 +255,10 @@ impl FastEmbedder {
     pub fn canonical_name(embedder_name: &str) -> Option<&'static str> {
         match embedder_name.trim().to_ascii_lowercase().as_str() {
             "fastembed" | "minilm" | "all-minilm-l6-v2" | "minilm-384" => Some("minilm"),
+            "multilingual"
+            | "multilingual-minilm"
+            | "multilingual-minilm-384"
+            | "paraphrase-multilingual-minilm-l12-v2" => Some("multilingual-minilm"),
             _ => None,
         }
     }
@@ -256,6 +272,12 @@ impl FastEmbedder {
                 dimension: 384,
                 pooling: Pooling::Mean,
             }),
+            "multilingual-minilm" => Some(OnnxEmbedderConfig {
+                embedder_id: MULTILINGUAL_MINILM_EMBEDDER_ID.to_string(),
+                model_id: MULTILINGUAL_MINILM_MODEL_ID.to_string(),
+                dimension: MINILM_DIMENSION,
+                pooling: Pooling::Mean,
+            }),
             _ => None,
         }
     }
@@ -267,28 +289,26 @@ impl FastEmbedder {
 
     /// Load a native embedder with custom configuration.
     ///
-    /// Only the exact 384-dim all-MiniLM-L6-v2 topology is supported by the pure-Rust
-    /// backend; all other model IDs or dimensions are rejected with
-    /// [`EmbedderError::EmbedderUnavailable`].
+    /// Only the exact manifest-attested MiniLM L6 and multilingual MiniLM L12
+    /// profiles are supported; all other model IDs or dimensions are rejected.
     pub fn load_with_config(model_dir: &Path, config: OnnxEmbedderConfig) -> EmbedderResult<Self> {
-        // Only all-MiniLM-L6-v2 is architecture-verified against the native
-        // (frankentorch) backend, which hardcodes the 6-layer / 384-hidden /
-        // 12-head MiniLM topology and reads weights positionally. Routing a model
-        // with a different topology (e.g. snowflake-arctic-embed-s, whose layer
-        // layout is NOT verified to match; or nomic-embed at 768d) through it would
-        // silently produce wrong embeddings, so reject anything but MiniLM. Other
-        // models need their topology verified first (cass #308 follow-up).
-        if config.model_id != MINILM_MODEL_ID || config.dimension != MINILM_DIMENSION {
-            return Err(Self::unavailable_error(
-                &config.embedder_id,
-                format!(
-                    "only all-MiniLM-L6-v2 (384-d) is architecture-verified for the pure-Rust \
-                     native embedder; {} ({}d) requires a verified frankentorch topology and the \
-                     removed fastembed/ONNX stack (cass #308)",
-                    config.model_id, config.dimension
-                ),
-            ));
-        }
+        let profile = match (config.model_id.as_str(), config.dimension) {
+            (MINILM_MODEL_ID, MINILM_DIMENSION) => NativeEmbeddingModel::AllMiniLmL6V2,
+            (MULTILINGUAL_MINILM_MODEL_ID, MINILM_DIMENSION) => {
+                NativeEmbeddingModel::ParaphraseMultilingualMiniLmL12V2
+            }
+            _ => {
+                return Err(Self::unavailable_error(
+                    &config.embedder_id,
+                    format!(
+                        "the pure-Rust native embedder supports only all-MiniLM-L6-v2 and \
+                         paraphrase-multilingual-MiniLM-L12-v2 at 384 dimensions; {} ({}d) \
+                         has no verified Frankentorch profile",
+                        config.model_id, config.dimension
+                    ),
+                ));
+            }
+        };
         if !model_dir.is_dir() {
             return Err(Self::unavailable_error(
                 &config.embedder_id,
@@ -313,7 +333,7 @@ impl FastEmbedder {
             ));
         }
 
-        let inner = NativeEmbedder::load(model_dir)?;
+        let inner = NativeEmbedder::load_model(model_dir, profile)?;
         let dimension = inner.dimension();
         if dimension != config.dimension {
             return Err(Self::unavailable_error(
@@ -544,18 +564,41 @@ mod tests {
     }
 
     #[test]
-    fn config_for_only_native_supported_model() {
+    fn config_for_only_native_supported_models() {
         assert_eq!(FastEmbedder::config_for("minilm").unwrap().dimension, 384);
+        let multilingual = FastEmbedder::config_for("multilingual-minilm").unwrap();
+        assert_eq!(multilingual.dimension, 384);
+        assert_eq!(multilingual.embedder_id, MULTILINGUAL_MINILM_EMBEDDER_ID);
         assert!(FastEmbedder::config_for("snowflake-arctic-s").is_none());
         assert!(FastEmbedder::config_for("nomic-embed").is_none());
         assert!(FastEmbedder::config_for("unknown").is_none());
     }
 
     #[test]
-    fn canonical_name_accepts_only_minilm_aliases() {
+    fn canonical_name_accepts_only_verified_native_aliases() {
         assert_eq!(FastEmbedder::canonical_name("fastembed"), Some("minilm"));
         assert_eq!(FastEmbedder::canonical_name("minilm-384"), Some("minilm"));
+        assert_eq!(
+            FastEmbedder::canonical_name("paraphrase-multilingual-minilm-l12-v2"),
+            Some("multilingual-minilm")
+        );
+        assert_eq!(
+            FastEmbedder::canonical_name("multilingual-minilm-384"),
+            Some("multilingual-minilm")
+        );
         assert!(FastEmbedder::canonical_name("snowflake-arctic-s-384").is_none());
         assert!(FastEmbedder::canonical_name("nomic-embed-text-v1.5").is_none());
+    }
+
+    #[test]
+    fn same_dimension_models_have_distinct_index_contracts() {
+        let baseline = FastEmbedder::config_for("minilm").unwrap();
+        let multilingual = FastEmbedder::config_for("multilingual-minilm").unwrap();
+        assert_eq!(baseline.dimension, multilingual.dimension);
+        assert_ne!(baseline.embedder_id, multilingual.embedder_id);
+        assert_ne!(
+            MINILM_VECTOR_SPACE_REVISION,
+            MULTILINGUAL_MINILM_VECTOR_SPACE_REVISION
+        );
     }
 }

@@ -18,6 +18,7 @@
 //! | Name | ID | Dimension | Type | Notes |
 //! |------|-----|-----------|------|-------|
 //! | minilm | minilm-384 | 384 | ML | Default semantic embedder |
+//! | multilingual-minilm | multilingual-minilm-384 | 384 | ML | Explicit CJK/multilingual model |
 //! | hash | fnv1a-384 | 384 | Hash | Explicit fast/degraded mode |
 //!
 //! # Example
@@ -76,9 +77,14 @@ pub struct RegisteredEmbedder {
     pub is_baseline: bool,
 }
 
-/// Files required for the pure-Rust (frankentorch) embedder: a safetensors
-/// weight file plus the tokenizer. The ONNX backend was removed in cass #308.
-pub const REQUIRED_NATIVE_MODEL_FILES: &[&str] = &["model.safetensors", "tokenizer.json"];
+/// Files required for a verified pure-Rust Frankentorch embedder bundle.
+pub const REQUIRED_NATIVE_MODEL_FILES: &[&str] = &[
+    "model.safetensors",
+    "tokenizer.json",
+    "config.json",
+    "special_tokens_map.json",
+    "tokenizer_config.json",
+];
 
 /// Eligibility cutoff for bake-off (models must be released on/after this date).
 pub const BAKEOFF_ELIGIBILITY_CUTOFF: &str = "2025-11-01";
@@ -162,9 +168,11 @@ impl RegisteredEmbedder {
 
 /// Static registry of all supported embedders.
 ///
-/// MiniLM is the only architecture verified by the pure-Rust native backend.
+/// MiniLM L6 and multilingual MiniLM L12 are the only architectures verified
+/// by the pure-Rust native backend.
 /// Hash vectors remain available for the explicit fast/degraded tier, but are
-/// never selected as a silent substitute for a missing semantic model.
+/// never selected as a silent substitute for a missing semantic model. The
+/// multilingual model is also opt-in and never replaces the default implicitly.
 pub static EMBEDDERS: &[RegisteredEmbedder] = &[
     // === Baseline (not eligible for bake-off) ===
     RegisteredEmbedder {
@@ -178,6 +186,18 @@ pub static EMBEDDERS: &[RegisteredEmbedder] = &[
         huggingface_id: "sentence-transformers/all-MiniLM-L6-v2",
         size_bytes: 90_000_000,
         is_baseline: true,
+    },
+    RegisteredEmbedder {
+        name: "multilingual-minilm",
+        id: "multilingual-minilm-384",
+        dimension: 384,
+        is_semantic: true,
+        description: "Multilingual MiniLM L12 v2 - opt-in CJK and mixed-language embeddings",
+        requires_model_files: true,
+        release_date: "2020-11-01",
+        huggingface_id: "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        size_bytes: 479_724_528,
+        is_baseline: false,
     },
     // === Explicit fast/degraded tier (always available) ===
     RegisteredEmbedder {
@@ -247,15 +267,10 @@ impl EmbedderRegistry {
 
     /// Get the preferred semantic embedder.
     ///
-    /// If MiniLM is not installed this still returns its registry entry, so a
-    /// caller either reports the missing model or fails open to lexical search.
-    /// Hash vectors must be selected explicitly by name or tier.
+    /// This always returns the default MiniLM entry. A missing default fails open
+    /// to lexical search; hash and multilingual vectors must be selected explicitly
+    /// by name or policy so an installed alternate cannot silently change spaces.
     pub fn best_available(&self) -> &'static RegisteredEmbedder {
-        for e in EMBEDDERS.iter().filter(|e| e.is_semantic) {
-            if e.is_available(&self.data_dir) {
-                return e;
-            }
-        }
         self.default_embedder()
     }
 
@@ -361,7 +376,7 @@ fn load_embedder_by_name(data_dir: &Path, name: &str) -> EmbedderResult<Arc<dyn 
             let embedder = HashEmbedder::default();
             Ok(Arc::new(embedder))
         }
-        "minilm" => {
+        "minilm" | "multilingual-minilm" => {
             let embedder = FastEmbedder::load_by_name(data_dir, name)?;
             Ok(Arc::new(embedder))
         }
@@ -416,6 +431,10 @@ mod tests {
         let minilm = registry.get("minilm");
         assert!(minilm.is_some());
         assert_eq!(minilm.unwrap().dimension, 384);
+
+        let multilingual = registry.get("multilingual-minilm");
+        assert!(multilingual.is_some());
+        assert_eq!(multilingual.unwrap().id, "multilingual-minilm-384");
 
         let hash = registry.get("hash");
         assert!(hash.is_some());
@@ -480,6 +499,27 @@ mod tests {
         // a same-dimensional hash vector space here would silently mix contracts.
         let best = registry.best_available();
         assert_eq!(best.name, "minilm");
+    }
+
+    #[test]
+    fn installed_multilingual_model_remains_explicit_opt_in() {
+        let (tmp, registry) = registry_fixture();
+        let model_dir = FastEmbedder::model_dir_for(tmp.path(), "multilingual-minilm")
+            .expect("registered multilingual directory");
+        std::fs::create_dir_all(&model_dir).expect("create multilingual model directory");
+        for file in REQUIRED_NATIVE_MODEL_FILES {
+            std::fs::write(model_dir.join(file), b"fixture").expect("write model marker");
+        }
+
+        assert!(registry.is_available("multilingual-minilm"));
+        assert_eq!(registry.best_available().name, "minilm");
+        assert_eq!(
+            registry
+                .validate("multilingual-minilm")
+                .expect("explicit multilingual selection")
+                .id,
+            "multilingual-minilm-384"
+        );
     }
 
     #[test]
@@ -556,6 +596,11 @@ mod tests {
         assert!(
             !eligible.iter().any(|e| e.name == "hash"),
             "hash should not be in eligible list"
+        );
+
+        assert!(
+            !eligible.iter().any(|e| e.name == "multilingual-minilm"),
+            "the frozen opt-in multilingual model predates the bake-off cutoff"
         );
     }
 

@@ -166,19 +166,20 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensearch",
         crate_package_name: "frankensearch",
         manifest_package_field: None,
-        // Registry pin (gh#429). 0.4.1 adds native Windows Quill writer
-        // admission and atomic publication to the first crates.io line carrying
+        // Registry pin (gh#429, gh#410). 0.4.2 extends the native Windows Quill
+        // publication line with the explicit multilingual MiniLM embedding
+        // profile while preserving the first crates.io line carrying
         // the pure-Rust `native` feature and the explicit `cass-compat` ->
         // `lexical-tantivy` foreign-index surface (which keeps CASS schema-v8
         // access independent from FrankenSearch's swappable generic lexical
         // backend — cass #308, bd-8nqz.5). Registry 0.3.2 was a stale
         // same-version twin of an older tree (no quill/cass-compat/native);
-        // the exact `=0.4.1` pin exists so resolution can never reach it.
+        // the exact `=0.4.2` pin exists so resolution can never reach it.
         // Empty `expected_git` signals `validate_manifest_dependency_spec`
         // to skip git/rev checks.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.4.1",
+        expected_version: "0.4.2",
         // cass #308: the ort/ONNX `fastembed` stack was removed; semantic
         // embedding + reranking are now pure-Rust via frankensearch's `native`
         // feature, kept always-on here (no AVX/ONNX static-init hazard, so no

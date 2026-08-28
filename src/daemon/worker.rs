@@ -204,14 +204,11 @@ fn resolve_embedder_kind(
         return Ok(WorkerEmbedderKind::Hash);
     }
 
-    let normalized_name = match model_name.to_ascii_lowercase().as_str() {
-        "fastembed" | "minilm" | "minilm-384" | "all-minilm-l6-v2" => DEFAULT_SEMANTIC_MODEL,
-        _ => {
-            anyhow::bail!(
-                "unsupported semantic model '{model_name}' for daemon embedding worker; the pure-Rust native backend supports only minilm (all-MiniLM-L6-v2)"
-            );
-        }
-    };
+    let normalized_name = FastEmbedder::canonical_name(model_name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unsupported semantic model '{model_name}' for daemon embedding worker; the pure-Rust native backend supports minilm and the explicit multilingual-minilm profile"
+        )
+    })?;
 
     let config = FastEmbedder::config_for(normalized_name).ok_or_else(|| {
         anyhow::anyhow!("missing FastEmbedder config for registered model '{normalized_name}'")
@@ -930,6 +927,14 @@ mod tests {
             resolve_embedder_kind("fastembed", true).unwrap(),
             fast_embed_kind("minilm", "minilm-384")
         );
+        assert_eq!(
+            resolve_embedder_kind("multilingual-minilm", true).unwrap(),
+            fast_embed_kind("multilingual-minilm", "multilingual-minilm-384")
+        );
+        assert_eq!(
+            resolve_embedder_kind("paraphrase-multilingual-minilm-l12-v2", true).unwrap(),
+            fast_embed_kind("multilingual-minilm", "multilingual-minilm-384")
+        );
     }
 
     #[test]
@@ -939,7 +944,8 @@ mod tests {
                 anyhow::bail!("unverified model topology {model} was accepted");
             };
             let message = format!("{error:#}");
-            assert!(message.contains("supports only minilm"), "{message}");
+            assert!(message.contains("supports minilm"), "{message}");
+            assert!(message.contains("multilingual-minilm"), "{message}");
         }
         Ok(())
     }

@@ -29,7 +29,9 @@ use crate::model::conversation_packet::{ConversationPacket, ConversationPacketPr
 use crate::model::types::{Conversation, Message};
 use crate::search::canonicalize::{canonicalize_for_embedding, content_hash};
 use crate::search::embedder::Embedder;
-use crate::search::fastembed_embedder::{FastEmbedder, MINILM_VECTOR_SPACE_REVISION};
+use crate::search::fastembed_embedder::{
+    FastEmbedder, MINILM_VECTOR_SPACE_REVISION, MULTILINGUAL_MINILM_VECTOR_SPACE_REVISION,
+};
 use crate::search::hash_embedder::HashEmbedder;
 use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION, SemanticPolicy};
 use crate::search::semantic_manifest::{
@@ -78,6 +80,7 @@ pub const HASH_VECTOR_SPACE_REVISION: &str = "hash-fnv1a-modular-v1";
 pub fn expected_vector_space_revision(embedder_id: &str) -> Option<&'static str> {
     match embedder_id {
         "minilm-384" => Some(MINILM_VECTOR_SPACE_REVISION),
+        "multilingual-minilm-384" => Some(MULTILINGUAL_MINILM_VECTOR_SPACE_REVISION),
         "fnv1a-384" => Some(HASH_VECTOR_SPACE_REVISION),
         _ => None,
     }
@@ -3591,6 +3594,18 @@ mod tests {
     use serde_json::json;
     use std::path::Path;
     use tempfile::tempdir;
+
+    #[test]
+    fn multilingual_model_has_a_distinct_registered_vector_space_revision() {
+        let baseline = expected_vector_space_revision("minilm-384").expect("MiniLM revision");
+        let multilingual = expected_vector_space_revision("multilingual-minilm-384")
+            .expect("multilingual MiniLM revision");
+        assert_ne!(baseline, multilingual);
+        assert!(
+            multilingual
+                .contains("59160d9e43d396d05b4139c99f9feb7922da14868587fca7e33d379821a41405")
+        );
+    }
 
     /// cass #309: length-aware embed batching must cap both row count and
     /// `row_count × max_canonical_len` per batch, never drop or reorder rows,

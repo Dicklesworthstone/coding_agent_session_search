@@ -105,10 +105,10 @@ commands:
   cass api-version [--json]        Show crate_version + api_version + contract_version.
   cass state [--json]              Alias of `cass status` (index/db/rebuild/semantic readiness).
   cass models status [--json]      Semantic model acquisition + cache state.
-  cass models install [--from-file DIR] [--model minilm]  Download + install the MiniLM embedder.
+  cass models install [--from-file DIR] [--model minilm|multilingual-minilm]  Download + install an explicit native embedder.
   cass models remove [--model NAME]  Remove an installed semantic model from disk.
-  cass models verify [--json]      Per-file SHA-256 verification of the installed model.
-  cass models check-update [--json]  Compare installed revision against the pinned registry revision.
+  cass models verify [--model NAME] [--json]  Per-file SHA-256 verification of an explicit installed model.
+  cass models check-update [--model NAME] [--json]  Compare an explicit installed revision against its pin.
   cass models backfill             Re-embed conversations against a newly acquired model.
   cass expand <path> --line N [-C CONTEXT] [--json]  Show messages around a specific line in a session.
   cass resume <path> [--shell]     Resolve a session path into its native-harness resume command.

@@ -153,6 +153,8 @@ fn models_verify_repair_controls_remain_data_dir_scoped() -> Result<(), String> 
             "cass",
             "models",
             "verify",
+            "--model",
+            "multilingual-minilm",
             "--repair",
             "--data-dir",
             "/cass/models",
@@ -161,10 +163,15 @@ fn models_verify_repair_controls_remain_data_dir_scoped() -> Result<(), String> 
 
         match cli.command {
             Some(Commands::Models(ModelsCommand::Verify {
+                model,
                 repair: true,
                 data_dir: Some(data_dir),
                 json: true,
-            })) if data_dir.display().to_string() == "/cass/models" => Ok(()),
+            })) if model == "multilingual-minilm"
+                && data_dir.display().to_string() == "/cass/models" =>
+            {
+                Ok(())
+            }
             other => Err(format!(
                 "expected data-dir scoped model verify repair controls: {other:?}"
             )),
@@ -186,10 +193,15 @@ fn models_verify_defaults_to_inspection_without_repair() -> Result<(), String> {
 
         match cli.command {
             Some(Commands::Models(ModelsCommand::Verify {
+                model,
                 repair: false,
                 data_dir: Some(data_dir),
                 json: true,
-            })) if data_dir.display().to_string() == "/cass/models" => Ok(()),
+            })) if model == "all-minilm-l6-v2"
+                && data_dir.display().to_string() == "/cass/models" =>
+            {
+                Ok(())
+            }
             other => Err(format!(
                 "expected model verification to default to inspect-only mode: {other:?}"
             )),
@@ -253,6 +265,62 @@ fn models_verify_json_missing_cache_stays_fail_open_and_read_only() {
 }
 
 #[test]
+fn models_status_json_reports_explicit_multilingual_space_without_acquiring_it() {
+    use assert_cmd::cargo::cargo_bin;
+    use serde_json::Value;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let output = std::process::Command::new(cargo_bin("cass"))
+        .args(["models", "status", "--json"])
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("CASS_SEMANTIC_EMBEDDER", "multilingual-minilm")
+        .env("HOME", tmp.path())
+        .env("XDG_DATA_HOME", tmp.path().join(".local/share"))
+        .env("XDG_CONFIG_HOME", tmp.path().join(".config"))
+        .output()
+        .expect("run cass models status --json");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "multilingual status must fail open without downloading; stdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("models status emits JSON");
+    assert_eq!(
+        payload["policy_quality_tier_embedder"].as_str(),
+        Some("multilingual-minilm")
+    );
+    assert_eq!(
+        payload["active_registry_name"].as_str(),
+        Some("multilingual-minilm")
+    );
+    assert_eq!(
+        payload["model_id"].as_str(),
+        Some("paraphrase-multilingual-minilm-l12-v2")
+    );
+    assert_eq!(payload["installed"].as_bool(), Some(false));
+    assert_eq!(payload["state"].as_str(), Some("not_acquired"));
+    assert_eq!(payload["lexical_fail_open"].as_bool(), Some(true));
+
+    let models = payload["models"].as_array().expect("models array");
+    assert_eq!(models.len(), 2);
+    let baseline = models
+        .iter()
+        .find(|model| model["registry_name"] == "minilm")
+        .expect("baseline model status");
+    let multilingual = models
+        .iter()
+        .find(|model| model["registry_name"] == "multilingual-minilm")
+        .expect("multilingual model status");
+    assert_eq!(baseline["active"].as_bool(), Some(false));
+    assert_eq!(multilingual["active"].as_bool(), Some(true));
+    assert_ne!(baseline["model_dir"], multilingual["model_dir"]);
+}
+
+#[test]
 fn models_remove_requires_explicit_model_and_yes_controls() -> Result<(), String> {
     run_on_large_stack(|| {
         let cli = parse(&[
@@ -312,6 +380,8 @@ fn models_check_update_reports_against_scoped_data_dir() -> Result<(), String> {
             "cass",
             "models",
             "check-update",
+            "--model",
+            "multilingual-minilm",
             "--data-dir",
             "/cass/models",
             "--json",
@@ -319,9 +389,14 @@ fn models_check_update_reports_against_scoped_data_dir() -> Result<(), String> {
 
         match cli.command {
             Some(Commands::Models(ModelsCommand::CheckUpdate {
+                model,
                 data_dir: Some(data_dir),
                 json: true,
-            })) if data_dir.display().to_string() == "/cass/models" => Ok(()),
+            })) if model == "multilingual-minilm"
+                && data_dir.display().to_string() == "/cass/models" =>
+            {
+                Ok(())
+            }
             other => Err(format!(
                 "expected scoped model update check controls to parse: {other:?}"
             )),

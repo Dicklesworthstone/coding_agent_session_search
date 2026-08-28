@@ -315,7 +315,7 @@
         },
         {
           "name": "embedder",
-          "description": "Embedder to use for semantic indexing (hash, fastembed)",
+          "description": "Embedder to use for semantic indexing (hash, minilm, multilingual-minilm)",
           "arg_type": "option",
           "value_type": "string",
           "required": false,

@@ -437,7 +437,7 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         build_hnsw: bool,
 
-        /// Embedder to use for semantic indexing (hash, fastembed)
+        /// Embedder to use for semantic indexing (hash, minilm, multilingual-minilm)
         #[arg(long, default_value = "fastembed")]
         embedder: String,
 
@@ -2434,6 +2434,9 @@ pub enum ModelsCommand {
     },
     /// Verify model integrity (SHA256 checksums)
     Verify {
+        /// Model to verify (default: all-minilm-l6-v2)
+        #[arg(long, default_value = "all-minilm-l6-v2")]
+        model: String,
         /// Attempt to repair corrupted files
         #[arg(long)]
         repair: bool,
@@ -2449,7 +2452,7 @@ pub enum ModelsCommand {
         /// Semantic tier to backfill: fast or quality
         #[arg(long, default_value = "fast")]
         tier: String,
-        /// Embedder implementation: hash or fastembed
+        /// Embedder implementation: hash, minilm, or multilingual-minilm
         #[arg(long)]
         embedder: Option<String>,
         /// Maximum canonical conversations to process in this batch
@@ -2482,6 +2485,9 @@ pub enum ModelsCommand {
     },
     /// Check for model updates
     CheckUpdate {
+        /// Model to inspect (default: all-minilm-l6-v2)
+        #[arg(long, default_value = "all-minilm-l6-v2")]
+        model: String,
         /// Override data dir
         #[arg(long)]
         data_dir: Option<PathBuf>,
@@ -24702,10 +24708,10 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass api-version [--json]        Show crate_version + api_version + contract_version.".to_string(),
             "  cass state [--json]              Alias of `cass status` (index/db/rebuild/semantic readiness).".to_string(),
             "  cass models status [--json]      Semantic model acquisition + cache state.".to_string(),
-            "  cass models install [--from-file DIR] [--model minilm]  Download + install the MiniLM embedder.".to_string(),
+            "  cass models install [--from-file DIR] [--model minilm|multilingual-minilm]  Download + install an explicit native embedder.".to_string(),
             "  cass models remove [--model NAME]  Remove an installed semantic model from disk.".to_string(),
-            "  cass models verify [--json]      Per-file SHA-256 verification of the installed model.".to_string(),
-            "  cass models check-update [--json]  Compare installed revision against the pinned registry revision.".to_string(),
+            "  cass models verify [--model NAME] [--json]  Per-file SHA-256 verification of an explicit installed model.".to_string(),
+            "  cass models check-update [--model NAME] [--json]  Compare an explicit installed revision against its pin.".to_string(),
             "  cass models backfill             Re-embed conversations against a newly acquired model.".to_string(),
             "  cass expand <path> --line N [-C CONTEXT] [--json]  Show messages around a specific line in a session.".to_string(),
             "  cass resume <path> [--shell]     Resolve a session path into its native-harness resume command.".to_string(),
@@ -27678,6 +27684,7 @@ fn run_cli_search(
         )
     });
     let mut skipped_sections = Vec::<String>::new();
+    let mut daemon_embedder_id_for_rerank = None::<String>;
     let field_mask_visible_limit = token_budget_field_mask_visible_limit(max_tokens, limit_val);
     let field_mask = resolve_field_mask(
         &fields,
@@ -27915,6 +27922,9 @@ fn run_cli_search(
             Some(name) => registry.get(name),
             None => Some(registry.best_available()),
         };
+        daemon_embedder_id_for_rerank = embedder_info
+            .filter(|entry| entry.is_semantic)
+            .map(|entry| entry.id.to_string());
         // `--fast-only` is a request for the hash-vector space, not merely a
         // scoring toggle over a quality embedding. Feeding a MiniLM daemon
         // vector to the same-dimensional FNV index is silently wrong (#347).
@@ -27954,66 +27964,60 @@ fn run_cli_search(
             let quality_artifact = context.quality_artifact;
             let filter_maps = context.filter_maps;
             let roles = context.roles;
-            let daemon_embedder_compatible = embedder.id()
-                == crate::search::fastembed_embedder::FastEmbedder::embedder_id_static();
+            let daemon_embedder_compatible =
+                crate::search::fastembed_embedder::FastEmbedder::canonical_name(embedder.id())
+                    .is_some();
 
-            let embedder: Arc<dyn crate::search::embedder::Embedder> =
-                if semantic_opts.use_daemon && !prefer_hash && daemon_embedder_compatible {
-                    #[cfg(unix)]
-                    {
-                        let daemon = if semantic_opts.auto_spawn_daemon {
-                            crate::daemon::client::connect_or_spawn_for_embedder(
-                                embedder.id(),
-                                &data_dir,
-                            )
-                            .ok()
-                        } else {
-                            crate::daemon::client::try_connect_for_embedder(
-                                embedder.id(),
-                                &data_dir,
-                            )
-                        };
-                        let config =
-                            crate::search::daemon_client::DaemonRetryConfig::from_env();
-                        match daemon {
-                            Some(daemon) => match daemon.attestation_channel(&data_dir) {
-                                Ok((connection, verifier)) => {
-                                    let daemon: Arc<
-                                        dyn crate::search::daemon_client::DaemonClient,
-                                    > = daemon;
-                                    compose_verified_daemon_embedder_or_local(
-                                        daemon,
-                                        embedder,
-                                        config,
-                                        connection,
-                                        verifier,
-                                    )
-                                }
-                                Err(error) => {
-                                    tracing::warn!(
-                                        error = %error,
-                                        embedder_id = %embedder.id(),
-                                        "Daemon attestation channel could not be established"
-                                    );
-                                    eprintln!(
-                                        "Warning: a local embedding daemon is running but its \
+            let embedder: Arc<dyn crate::search::embedder::Embedder> = if semantic_opts.use_daemon
+                && !prefer_hash
+                && daemon_embedder_compatible
+            {
+                #[cfg(unix)]
+                {
+                    let daemon = if semantic_opts.auto_spawn_daemon {
+                        crate::daemon::client::connect_or_spawn_for_embedder(
+                            embedder.id(),
+                            &data_dir,
+                        )
+                        .ok()
+                    } else {
+                        crate::daemon::client::try_connect_for_embedder(embedder.id(), &data_dir)
+                    };
+                    let config = crate::search::daemon_client::DaemonRetryConfig::from_env();
+                    match daemon {
+                        Some(daemon) => match daemon.attestation_channel(&data_dir) {
+                            Ok((connection, verifier)) => {
+                                let daemon: Arc<dyn crate::search::daemon_client::DaemonClient> =
+                                    daemon;
+                                compose_verified_daemon_embedder_or_local(
+                                    daemon, embedder, config, connection, verifier,
+                                )
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    error = %error,
+                                    embedder_id = %embedder.id(),
+                                    "Daemon attestation channel could not be established"
+                                );
+                                eprintln!(
+                                    "Warning: a local embedding daemon is running but its \
                                          producer attestation could not be established ({error}); \
                                          falling back to in-process {} inference.",
-                                        embedder.id()
-                                    );
-                                    embedder
-                                }
-                            },
-                            None => embedder,
-                        }
+                                    embedder.id()
+                                );
+                                embedder
+                            }
+                        },
+                        None => embedder,
                     }
-                    #[cfg(not(unix))]
-                    {
-                        embedder
-                    }
-                } else {
+                }
+                #[cfg(not(unix))]
+                {
                     embedder
-                };
+                }
+            } else {
+                embedder
+            };
 
             if let Err(err) = client.set_semantic_artifacts_context(
                 embedder,
@@ -28371,7 +28375,9 @@ fn run_cli_search(
                 let config = crate::search::daemon_client::DaemonRetryConfig::from_env();
                 let daemon = if semantic_opts.auto_spawn_daemon {
                     crate::daemon::client::connect_or_spawn_for_embedder(
-                        crate::search::fastembed_embedder::FastEmbedder::embedder_id_static(),
+                        daemon_embedder_id_for_rerank.as_deref().unwrap_or(
+                            crate::search::fastembed_embedder::FastEmbedder::embedder_id_static(),
+                        ),
                         &data_dir,
                     )
                     .ok()
@@ -110847,12 +110853,13 @@ fn run_models_command(cmd: ModelsCommand, cli: &Cli) -> CliResult<()> {
             data_dir,
         ),
         ModelsCommand::Verify {
+            model,
             repair,
             data_dir,
             json,
         } => {
             let structured_format = resolve_subcommand_structured_format(cli, json);
-            run_models_verify(repair, data_dir, structured_format)
+            run_models_verify(&model, repair, data_dir, structured_format)
         }
         ModelsCommand::Backfill {
             tier,
@@ -110879,9 +110886,13 @@ fn run_models_command(cmd: ModelsCommand, cli: &Cli) -> CliResult<()> {
             yes,
             data_dir,
         } => run_models_remove(&model, yes, data_dir),
-        ModelsCommand::CheckUpdate { data_dir, json } => {
+        ModelsCommand::CheckUpdate {
+            model,
+            data_dir,
+            json,
+        } => {
             let structured_format = resolve_subcommand_structured_format(cli, json);
-            run_models_check_update(structured_format, data_dir)
+            run_models_check_update(&model, structured_format, data_dir)
         }
     }
 }
@@ -111442,7 +111453,8 @@ fn print_fleet_upgrade_rehearsal_human(output: &FleetUpgradeRehearsalOutput) {
 
 /// Show semantic model installation status.
 ///
-/// Reports the MiniLM embedder implemented by the native backend.
+/// Reports the default MiniLM and explicit multilingual MiniLM embedders
+/// implemented by the native backend.
 /// The "active" model is the one resolved from policy
 /// (`quality_tier_embedder`) — that is what `cass index` and `cass search`
 /// will actually use.
@@ -111468,7 +111480,7 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
         budget_max_bytes: acquisition_policy.max_model_bytes,
     };
 
-    // Canonicalize the policy's quality_tier_embedder to the one registry name
+    // Canonicalize the policy's quality_tier_embedder to a registry name
     // implemented by the native backend. Unsupported historical aliases remain
     // visible in `policy_quality_tier_embedder`, but never become active.
     let policy_embedder = policy.quality_tier_embedder.as_str();
@@ -111488,7 +111500,7 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
         acquisition: serde_json::Value,
     }
 
-    let known: &[&str] = &["minilm"];
+    let known: &[&str] = &["minilm", "multilingual-minilm"];
     let mut statuses: Vec<ModelStatus> = Vec::with_capacity(known.len());
     for name in known {
         let Some(manifest) = ModelManifest::for_embedder(name) else {
@@ -111644,7 +111656,7 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
         if policy_embedder == "hash" {
             println!("  The explicit hash vector tier is active; no native model is in use.");
         }
-        println!("Override with: CASS_SEMANTIC_EMBEDDER={{minilm|hash}}");
+        println!("Override with: CASS_SEMANTIC_EMBEDDER={{minilm|multilingual-minilm|hash}}");
         println!("Fail-open: lexical search remains available.");
         println!();
 
@@ -111714,7 +111726,7 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
         if active_status.is_none() && policy_embedder != "hash" {
             println!(
                 "{}: active embedder '{}' has no manifest registered. \
-                 Use 'cass models install --model minilm' to install the supported embedder.",
+                 Use 'cass models install --model minilm' or '--model multilingual-minilm' to install a supported embedder.",
                 "⚠".yellow(),
                 policy_embedder
             );
@@ -111726,21 +111738,26 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
 
 /// Resolve a CLI-supplied semantic model name (or alias) to the canonical
 /// registry name used by model installation and removal. Embedder aliases match
-/// the MiniLM-only daemon worker; retired ONNX-era aliases are rejected before
+/// the manifest-attested daemon worker; retired ONNX-era aliases are rejected before
 /// they can route to an unloadable manifest.
 /// Models the pure-Rust native inference backend can actually load (cass
-/// #308): the native embedder hardcodes the all-MiniLM-L6-v2 topology and the
+/// #308/#410): the native embedder admits the registered MiniLM L6 and
+/// multilingual MiniLM L12 topologies, while the
 /// native reranker is architecture-verified for ms-marco only. Anything else
 /// would download and sha-verify fine, report installed/Ready, and then fail
 /// every load with `EmbedderUnavailable` — so `models install` refuses it up
 /// front instead of leaving a 100+ MB permanently-unloadable install behind.
 fn native_backend_supports_model(registry_name: &str) -> bool {
-    matches!(registry_name, "minilm" | "ms-marco")
+    matches!(registry_name, "minilm" | "multilingual-minilm" | "ms-marco")
 }
 
 fn resolve_cli_model_name(model_name: &str) -> CliResult<&'static str> {
     match model_name.to_ascii_lowercase().as_str() {
         "fastembed" | "minilm" | "minilm-384" | "all-minilm-l6-v2" => Ok("minilm"),
+        "multilingual"
+        | "multilingual-minilm"
+        | "multilingual-minilm-384"
+        | "paraphrase-multilingual-minilm-l12-v2" => Ok("multilingual-minilm"),
         "snowflake"
         | "snowflake-arctic-s"
         | "snowflake-arctic-s-384"
@@ -111752,10 +111769,13 @@ fn resolve_cli_model_name(model_name: &str) -> CliResult<&'static str> {
             code: 20,
             kind: CliErrorKind::Model.kind_str(),
             message: format!(
-                "Unsupported embedder '{}': the pure-Rust native backend currently supports only all-MiniLM-L6-v2 (alias minilm).",
+                "Unsupported embedder '{}': the pure-Rust native backend supports all-MiniLM-L6-v2 (alias minilm) and paraphrase-multilingual-MiniLM-L12-v2 (alias multilingual-minilm).",
                 model_name
             ),
-            hint: Some("Use --model minilm, or keep using lexical search".into()),
+            hint: Some(
+                "Use --model minilm, --model multilingual-minilm, or keep using lexical search"
+                    .into(),
+            ),
             retryable: false,
         }),
         "ms-marco" | "ms-marco-minilm" | "ms-marco-minilm-l-6-v2" | "ms-marco-minilm-l6-v2" => {
@@ -111777,7 +111797,8 @@ fn resolve_cli_model_name(model_name: &str) -> CliResult<&'static str> {
             code: 20,
             kind: CliErrorKind::Model.kind_str(),
             message: format!(
-                "Unknown model '{}'. Embedder: all-minilm-l6-v2 (alias minilm). \
+                "Unknown model '{}'. Embedders: all-minilm-l6-v2 (alias minilm), \
+                 paraphrase-multilingual-minilm-l12-v2 (alias multilingual-minilm). \
                  Reranker: ms-marco.",
                 model_name
             ),
@@ -111853,7 +111874,7 @@ fn run_models_install(
             kind: CliErrorKind::Model.kind_str(),
             message: format!(
                 "Model '{registry_name}' cannot be loaded by the pure-Rust native inference \
-                 backend yet: only all-MiniLM-L6-v2 (embedder) and ms-marco (reranker) are \
+                 backend yet: only the registered MiniLM embedders and ms-marco reranker are \
                  architecture-verified (cass #308). Installing it would download files that \
                  can never be used."
             ),
@@ -112162,21 +112183,20 @@ fn run_models_install(
 
 /// Verify model file integrity
 fn run_models_verify(
+    model_name: &str,
     repair: bool,
     data_dir_override: Option<PathBuf>,
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
-    use crate::search::fastembed_embedder::FastEmbedder;
     use crate::search::model_download::{
-        ModelAcquisitionPolicy, ModelManifest, classify_model_cache, compute_sha256,
-        model_file_path,
+        ModelAcquisitionPolicy, classify_model_cache, compute_sha256, model_file_path,
     };
     use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
     use colored::Colorize;
 
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
-    let model_dir = FastEmbedder::default_model_dir(&data_dir);
-    let manifest = ModelManifest::minilm_v2();
+    let registry_name = resolve_cli_model_name(model_name)?;
+    let (model_dir, manifest) = resolve_model_install_dir(&data_dir, registry_name)?;
     let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
     let acquisition_policy = ModelAcquisitionPolicy::from_semantic_policy(&policy);
     let cache_report = classify_model_cache(&model_dir, &manifest, &acquisition_policy);
@@ -112195,7 +112215,7 @@ fn run_models_verify(
             offline: acquisition_policy.offline,
             budget_max_bytes: acquisition_policy.max_model_bytes,
         },
-        "all-minilm-l6-v2",
+        registry_name,
     );
 
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
@@ -112328,13 +112348,13 @@ fn run_models_verify(
                 println!("Repairing by re-downloading model files...");
                 println!();
                 // Actually perform the repair by re-running install
-                return run_models_install("all-minilm-l6-v2", None, None, true, data_dir_override);
+                return run_models_install(registry_name, None, None, true, data_dir_override);
             } else {
                 println!();
                 println!("To repair corrupted files, run:");
-                println!("  cass models verify --repair");
+                println!("  cass models verify --model {registry_name} --repair");
                 println!("Or reinstall:");
-                println!("  cass models install -y");
+                println!("  cass models install --model {registry_name} -y");
             }
         }
     }
@@ -112458,7 +112478,10 @@ fn run_models_backfill(
             code: 20,
             kind: CliErrorKind::Model.kind_str(),
             message: format!("Unknown embedder '{}'.", embedder_type),
-            hint: Some("Use --embedder hash or --embedder minilm (alias fastembed)".into()),
+            hint: Some(
+                "Use --embedder hash, --embedder minilm (alias fastembed), or --embedder multilingual-minilm"
+                    .into(),
+            ),
             retryable: false,
         });
     }
@@ -112897,18 +112920,18 @@ fn run_models_remove(
 
 /// Check for model updates
 fn run_models_check_update(
+    model_name: &str,
     output_format: Option<RobotFormat>,
     data_dir_override: Option<PathBuf>,
 ) -> CliResult<()> {
-    use crate::search::fastembed_embedder::FastEmbedder;
     use crate::search::model_download::{
-        ModelManifest, ModelState, check_model_installed, check_version_mismatch,
+        ModelState, check_model_installed, check_version_mismatch,
     };
     use colored::Colorize;
 
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
-    let model_dir = FastEmbedder::default_model_dir(&data_dir);
-    let manifest = ModelManifest::minilm_v2();
+    let registry_name = resolve_cli_model_name(model_name)?;
+    let (model_dir, manifest) = resolve_model_install_dir(&data_dir, registry_name)?;
 
     // bead coding_agent_session_search-odbnh: pass the resolved manifest
     // so the file-presence check matches the installed model's layout.
@@ -112942,7 +112965,7 @@ fn run_models_check_update(
             );
             println!();
             println!("To install, run:");
-            println!("  cass models install");
+            println!("  cass models install --model {registry_name}");
         }
         return Ok(());
     }
@@ -114471,13 +114494,19 @@ mod cli_models_resolution_tests {
     use super::*;
 
     #[test]
-    fn resolve_cli_model_name_accepts_only_native_minilm_embedder_aliases() -> Result<(), String> {
+    fn resolve_cli_model_name_accepts_verified_native_embedder_aliases() -> Result<(), String> {
         for alias in [
             ("all-minilm-l6-v2", "minilm"),
             ("minilm", "minilm"),
             ("minilm-384", "minilm"),
             ("fastembed", "minilm"),
             ("MINILM", "minilm"),
+            ("multilingual", "multilingual-minilm"),
+            ("multilingual-minilm-384", "multilingual-minilm"),
+            (
+                "paraphrase-multilingual-minilm-l12-v2",
+                "multilingual-minilm",
+            ),
         ] {
             let resolved = resolve_cli_model_name(alias.0).map_err(|error| error.message)?;
             assert_eq!(resolved, alias.1);
@@ -114496,7 +114525,11 @@ mod cli_models_resolution_tests {
             if error.code != 20 {
                 return Err("unimplemented embedder topology returned the wrong error code");
             }
-            if !error.message.contains("supports only all-MiniLM-L6-v2") {
+            if !error.message.contains("supports all-MiniLM-L6-v2")
+                || !error
+                    .message
+                    .contains("paraphrase-multilingual-MiniLM-L12-v2")
+            {
                 return Err("unimplemented embedder topology returned the wrong error message");
             }
             for forbidden in ["install --model snowflake", "install --model nomic"] {
@@ -114565,8 +114598,7 @@ mod cli_models_resolution_tests {
         use crate::search::model_download::ModelManifest;
 
         let probe_data_dir = std::path::Path::new("/tmp/cass-v3of1-probe");
-        {
-            let canonical = "minilm";
+        for canonical in ["minilm", "multilingual-minilm"] {
             assert!(
                 ModelManifest::for_embedder(canonical).is_some(),
                 "canonical name {canonical:?} returned by resolve_cli_model_name must have a \

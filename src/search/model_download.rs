@@ -536,6 +536,29 @@ impl ModelManifest {
         }
     }
 
+    /// Opt-in multilingual MiniLM L12 manifest from the pinned Frankensearch
+    /// release. Mapping the canonical manifest prevents checksum, revision, or
+    /// file-list drift between CASS acquisition and the native loader.
+    pub fn multilingual_minilm_l12_v2() -> Self {
+        let canonical =
+            frankensearch::embed::model_manifest::ModelManifest::multilingual_minilm_l12_v2();
+        Self {
+            id: canonical.id,
+            repo: canonical.repo,
+            revision: canonical.revision,
+            files: canonical
+                .files
+                .into_iter()
+                .map(|file| ModelFile {
+                    name: file.name,
+                    sha256: file.sha256,
+                    size: file.size,
+                })
+                .collect(),
+            license: canonical.license,
+        }
+    }
+
     // ==================== Bake-off Eligible Models ====================
     // These models were released after 2025-11-01 and are candidates for
     // the CPU-optimized embedding bake-off.
@@ -747,6 +770,9 @@ impl ModelManifest {
     pub fn for_embedder(name: &str) -> Option<Self> {
         match name {
             "minilm" => Some(Self::minilm_v2()),
+            "multilingual-minilm" | "paraphrase-multilingual-minilm-l12-v2" => {
+                Some(Self::multilingual_minilm_l12_v2())
+            }
             "snowflake-arctic-s" => Some(Self::snowflake_arctic_s()),
             "nomic-embed" => Some(Self::nomic_embed()),
             _ => None,
@@ -765,7 +791,7 @@ impl ModelManifest {
     /// Get runnable bake-off embedder manifests for the current native backend.
     ///
     /// Historical Snowflake and Nomic manifests remain available for cache
-    /// diagnostics, but neither topology is implemented by the MiniLM-only
+    /// diagnostics, but neither topology is implemented by the manifest-attested
     /// native inference engine, so advertising them here would create an
     /// installable-looking candidate that cannot execute (cass #308).
     pub fn bakeoff_embedder_candidates() -> Vec<Self> {
@@ -3109,6 +3135,30 @@ mod tests {
         assert!(manifest.has_verified_checksums());
         assert!(manifest.has_pinned_revision());
         assert!(manifest.is_production_ready());
+    }
+
+    #[test]
+    fn multilingual_manifest_matches_the_pinned_frankensearch_contract() {
+        let manifest = ModelManifest::multilingual_minilm_l12_v2();
+        assert!(manifest.is_production_ready());
+        assert_eq!(manifest.id, "paraphrase-multilingual-minilm-l12-v2");
+        assert_eq!(
+            manifest.revision,
+            "e8f8c211226b894fcb81acc59f3b34ba3efd5f42"
+        );
+        assert_eq!(manifest.total_size(), 479_724_528);
+        assert!(
+            manifest.total_size()
+                <= SemanticPolicy::compiled_defaults()
+                    .max_model_size_mb
+                    .saturating_mul(1_048_576),
+            "the default acquisition policy must admit the explicitly supported multilingual model"
+        );
+        assert_eq!(manifest.files.len(), 5);
+        assert_eq!(
+            manifest.files[0].sha256,
+            "eaa086f0ffee582aeb45b36e34cdd1fe2d6de2bef61f8a559a1bbc9bd955917b"
+        );
     }
 
     #[test]

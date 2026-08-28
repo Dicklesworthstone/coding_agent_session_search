@@ -183,8 +183,10 @@ pub const DEFAULT_SEMANTIC_BUDGET_MB: u64 = 500;
 /// skipped.  This protects the canonical DB, lexical index, and OS.
 pub const MIN_FREE_DISK_MB: u64 = 200;
 
-/// Model files are the biggest single cost.  Cap per-model.
-pub const MAX_MODEL_SIZE_MB: u64 = 300;
+/// Model files are the biggest single cost. Cap each model at the full default
+/// semantic budget so the verified multilingual MiniLM bundle (about 458 MiB)
+/// remains installable while larger accidental acquisitions still fail closed.
+pub const MAX_MODEL_SIZE_MB: u64 = 500;
 
 // ─── Background scheduler budgets ──────────────────────────────────────────
 
@@ -1011,6 +1013,7 @@ mod tests {
         assert_eq!(p.max_refinement_docs, 100);
         assert_eq!(p.semantic_budget_mb, 500);
         assert_eq!(p.min_free_disk_mb, 200);
+        assert_eq!(p.max_model_size_mb, 500);
         assert_eq!(p.max_backfill_threads, 1);
         assert_eq!(p.semantic_schema_version, SEMANTIC_SCHEMA_VERSION);
         assert_eq!(p.chunking_strategy_version, CHUNKING_STRATEGY_VERSION);

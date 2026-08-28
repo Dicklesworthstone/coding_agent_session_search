@@ -98,6 +98,7 @@ pub enum SemanticAvailability {
     // =========================================================================
     /// Model files are missing.
     ModelMissing {
+        embedder_id: String,
         model_dir: PathBuf,
         missing_files: Vec<String>,
     },
@@ -666,7 +667,9 @@ pub(crate) fn probe_semantic_availability_for_embedder(
     }
     let Some(canonical_name) = FastEmbedder::canonical_name(embedder_name) else {
         return SemanticAvailability::LoadFailed {
-            context: format!("unsupported semantic embedder: {embedder_name}; supported: minilm"),
+            context: format!(
+                "unsupported semantic embedder: {embedder_name}; supported: minilm, multilingual-minilm"
+            ),
         };
     };
     let Some(config) = FastEmbedder::config_for(canonical_name) else {
@@ -685,9 +688,12 @@ pub(crate) fn probe_semantic_availability_for_embedder(
     let acquisition_policy = ModelAcquisitionPolicy::from_semantic_policy(&semantic_policy);
     let cache_report = classify_model_cache_metadata(&model_dir, &manifest, &acquisition_policy);
 
-    if let Some(availability) =
-        semantic_availability_from_cache_state(&model_dir, &cache_report.state, true)
-    {
+    if let Some(availability) = semantic_availability_from_cache_state(
+        &config.embedder_id,
+        &model_dir,
+        &cache_report.state,
+        true,
+    ) {
         return availability;
     }
 
@@ -895,7 +901,7 @@ fn load_semantic_context_inner(
         return SemanticSetup {
             availability: SemanticAvailability::LoadFailed {
                 context: format!(
-                    "unsupported semantic embedder: {embedder_name}; supported: minilm"
+                    "unsupported semantic embedder: {embedder_name}; supported: minilm, multilingual-minilm"
                 ),
             },
             context: None,
@@ -925,9 +931,12 @@ fn load_semantic_context_inner(
     let acquisition_policy = ModelAcquisitionPolicy::from_semantic_policy(&semantic_policy);
     let cache_report = classify_model_cache(&model_dir, &manifest, &acquisition_policy);
 
-    if let Some(availability) =
-        semantic_availability_from_cache_state(&model_dir, &cache_report.state, check_for_updates)
-    {
+    if let Some(availability) = semantic_availability_from_cache_state(
+        &config.embedder_id,
+        &model_dir,
+        &cache_report.state,
+        check_for_updates,
+    ) {
         return SemanticSetup {
             availability,
             context: None,
@@ -1174,6 +1183,7 @@ fn active_policy_embedder_name() -> &'static str {
 }
 
 fn semantic_availability_from_cache_state(
+    embedder_id: &str,
     model_dir: &Path,
     state: &ModelCacheState,
     check_for_updates: bool,
@@ -1186,7 +1196,7 @@ fn semantic_availability_from_cache_state(
             current_revision,
             expected_revision,
         } if check_for_updates => Some(SemanticAvailability::UpdateAvailable {
-            embedder_id: FastEmbedder::embedder_id_static().to_string(),
+            embedder_id: embedder_id.to_string(),
             current_revision: current_revision.clone(),
             latest_revision: expected_revision.clone(),
         }),
@@ -1199,6 +1209,7 @@ fn semantic_availability_from_cache_state(
                 Some(SemanticAvailability::NeedsConsent)
             } else {
                 Some(SemanticAvailability::ModelMissing {
+                    embedder_id: embedder_id.to_string(),
                     model_dir: model_dir.to_path_buf(),
                     missing_files: missing_files.clone(),
                 })
@@ -1376,6 +1387,42 @@ mod tests {
         assert!(!update.is_ready());
         assert!(update.has_update());
         assert_eq!(update.status_label(), "UPD");
+    }
+
+    #[test]
+    fn cache_state_preserves_selected_embedder_identity() {
+        let model_dir = Path::new("/tmp/cass/models/multilingual-minilm");
+        let missing = semantic_availability_from_cache_state(
+            "multilingual-minilm-384",
+            model_dir,
+            &ModelCacheState::NotAcquired {
+                missing_files: vec!["model.safetensors".to_string()],
+                needs_consent: false,
+            },
+            true,
+        )
+        .expect("missing cache state");
+        assert!(matches!(
+            missing,
+            SemanticAvailability::ModelMissing { embedder_id, model_dir: actual_dir, .. }
+                if embedder_id == "multilingual-minilm-384" && actual_dir == model_dir
+        ));
+
+        let update = semantic_availability_from_cache_state(
+            "multilingual-minilm-384",
+            model_dir,
+            &ModelCacheState::IncompatibleVersion {
+                current_revision: "old".to_string(),
+                expected_revision: "new".to_string(),
+            },
+            true,
+        )
+        .expect("update cache state");
+        assert!(matches!(
+            update,
+            SemanticAvailability::UpdateAvailable { embedder_id, .. }
+                if embedder_id == "multilingual-minilm-384"
+        ));
     }
 
     #[test]
