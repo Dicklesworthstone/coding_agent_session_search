@@ -113669,6 +113669,17 @@ fn run_schedule_command(subcmd: ScheduleCommand, cli: &Cli) -> CliResult<()> {
                     println!("{}", "-".repeat(72).dimmed());
                 }
             }
+            for path in &report.stale_removed {
+                println!(
+                    "  {} {}",
+                    if dry_run {
+                        "would remove stale unit:".dimmed()
+                    } else {
+                        "removed stale unit:".dimmed()
+                    },
+                    path.display()
+                );
+            }
             for command in &report.commands {
                 let status = match (command.executed, command.exit_code) {
                     (false, _) => "(dry-run)".dimmed().to_string(),

@@ -374,6 +374,10 @@ pub struct InstallReport {
     pub commands: Vec<CommandRecord>,
     pub spec: ScheduleSpec,
     pub warnings: Vec<String>,
+    /// Unit files from a previous install of a job this install no longer
+    /// registers (e.g. `--no-nightly` after a full install): unloaded from
+    /// the scheduler and removed so no orphaned job keeps firing.
+    pub stale_removed: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -495,6 +499,68 @@ pub fn install(spec: &ScheduleSpec, dry_run: bool) -> Result<InstallReport, Sche
         }
     }
 
+    // De-register jobs this install no longer selects (e.g. `--no-nightly`
+    // after a previous full install). Without this, the old nightly unit
+    // would keep firing forever with no surface reporting it.
+    let mut stale_removed = Vec::new();
+    let stale_jobs: Vec<ScheduleJob> = [ScheduleJob::Incremental, ScheduleJob::Nightly]
+        .into_iter()
+        .filter(|job| !spec.jobs().contains(job))
+        .collect();
+    for job in &stale_jobs {
+        let stale_paths: Vec<PathBuf> = match platform {
+            Platform::Launchd => vec![unit_dir.join(format!("{}.plist", job.launchd_label()))],
+            Platform::Systemd => {
+                let base = job.systemd_unit_base();
+                vec![
+                    unit_dir.join(format!("{base}.timer")),
+                    unit_dir.join(format!("{base}.service")),
+                ]
+            }
+            Platform::Unsupported => Vec::new(),
+        };
+        let previously_installed = stale_paths.iter().any(|p| p.exists());
+        if !previously_installed {
+            continue;
+        }
+        match platform {
+            Platform::Launchd => {
+                let uid = current_uid().unwrap_or_else(|| "501".to_string());
+                commands.push(run_recorded(
+                    &[
+                        "launchctl".to_string(),
+                        "bootout".to_string(),
+                        format!("gui/{uid}/{}", job.launchd_label()),
+                    ],
+                    !dry_run,
+                ));
+            }
+            Platform::Systemd => {
+                commands.push(run_recorded(
+                    &[
+                        "systemctl".to_string(),
+                        "--user".to_string(),
+                        "disable".to_string(),
+                        "--now".to_string(),
+                        format!("{}.timer", job.systemd_unit_base()),
+                    ],
+                    !dry_run,
+                ));
+            }
+            Platform::Unsupported => {}
+        }
+        for path in stale_paths {
+            if path.exists() {
+                if !dry_run {
+                    std::fs::remove_file(&path).map_err(|e| {
+                        ScheduleError::Io(format!("cannot remove {}: {e}", path.display()))
+                    })?;
+                }
+                stale_removed.push(path);
+            }
+        }
+    }
+
     match platform {
         Platform::Launchd => {
             let uid = current_uid().unwrap_or_else(|| "501".to_string());
@@ -572,6 +638,7 @@ pub fn install(spec: &ScheduleSpec, dry_run: bool) -> Result<InstallReport, Sche
         commands,
         spec: spec.clone(),
         warnings,
+        stale_removed,
     })
 }
 
