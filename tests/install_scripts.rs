@@ -332,6 +332,7 @@ chmod 755 "$checkout/target/release/cass"
         r#"#!/bin/sh
 set -eu
 printf 'rustup|%s|%s\n' "$PWD" "$*" >> "$FAKE_INSTALL_EVENT_LOG"
+test -z "${RUSTUP_TOOLCHAIN:-}"
 case "${1:-}:${2:-}" in
   show:active-toolchain) exit 1 ;;
   toolchain:install)
@@ -348,6 +349,7 @@ esac
         r#"#!/bin/sh
 set -eu
 printf 'cargo|%s|%s\n' "$PWD" "$*" >> "$FAKE_INSTALL_EVENT_LOG"
+test -z "${RUSTUP_TOOLCHAIN:-}"
 test -f rust-toolchain.toml
 test -f .pinned-toolchain-installed
 test "${1:-}" = build
@@ -366,6 +368,7 @@ test "${1:-}" = build
         .env("HOME", home.path())
         .env("PATH", fake_path)
         .env("FAKE_INSTALL_EVENT_LOG", &event_log)
+        .env("RUSTUP_TOOLCHAIN", "stable")
         .env_remove("RUSTUP_INIT_SKIP")
         .output()
         .expect("run source installer with fake toolchain commands");
@@ -391,7 +394,10 @@ test "${1:-}" = build
         git_offset < show_offset && show_offset < install_offset && install_offset < cargo_offset,
         "expected clone -> probe -> toolchain install -> build, got:\n{events}"
     );
-    for event in events.lines().filter(|line| line.starts_with("rustup|") || line.starts_with("cargo|")) {
+    for event in events
+        .lines()
+        .filter(|line| line.starts_with("rustup|") || line.starts_with("cargo|"))
+    {
         assert!(
             event.contains("/src|"),
             "toolchain commands must run from the cloned checkout: {event}"
