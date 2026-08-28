@@ -293,7 +293,7 @@ ensure_rust() {
     export PATH="$HOME/.cargo/bin:$PATH"
   fi
   if command -v rustup >/dev/null 2>&1 \
-    && (cd "$source_dir" && rustup show active-toolchain >/dev/null 2>&1); then
+    && (unset RUSTUP_TOOLCHAIN; cd "$source_dir" && rustup show active-toolchain >/dev/null 2>&1); then
     return 0
   fi
 
@@ -316,7 +316,7 @@ ensure_rust() {
   fi
 
   info "Installing the Rust toolchain pinned by rust-toolchain.toml"
-  (cd "$source_dir" && rustup toolchain install)
+  (unset RUSTUP_TOOLCHAIN; cd "$source_dir" && rustup toolchain install)
 }
 
 usage() {
@@ -471,7 +471,7 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   info "Building from source (requires git and the repository-pinned Rust toolchain)"
   git clone --depth 1 --branch "$VERSION" "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"
   ensure_rust "$TMP/src"
-  (cd "$TMP/src" && cargo build --locked --release)
+  (unset RUSTUP_TOOLCHAIN; cd "$TMP/src" && cargo build --locked --release)
   BIN="$TMP/src/target/release/$INSTALL_BASENAME"
   if [ ! -f "$BIN" ] || [ ! -x "$BIN" ]; then
     BIN="$TMP/src/target/release/cass"
