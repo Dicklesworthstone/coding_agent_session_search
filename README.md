@@ -224,10 +224,12 @@ AI coding agents are transforming how we write software. Claude Code, Codex, Cur
   `CASS_DAEMON_SOCKET`) and only initialize the installed in-process model if
   daemon inference fails. Pass `--daemon` to permit auto-spawning a missing
   daemon, or `--no-daemon` to force direct inference. `--fast-only` stays in
-  the deterministic hash-vector space, and daemon responses are accepted only
-  when their reported embedder matches the active vector index. The one-shot
-  CLI's `--two-tier` output is the final quality result set, while the TUI is
-  the surface that displays fast results and refines them in place.
+  the deterministic hash-vector space. Each data directory gets a distinct
+  default socket and owner-private pinned key; fresh handshake, health,
+  embedding, batch, and rerank challenges authenticate the exact response and
+  immutable Frankensearch embedding identity before any daemon output is used.
+  The one-shot CLI's `--two-tier` output is the final quality result set, while
+  the TUI is the surface that displays fast results and refines them in place.
 - **Opt-in acquisition**: `cass models install` downloads `all-minilm-l6-v2` from Hugging Face on explicit request and verifies SHA256 checksums. Nothing is fetched until you run the install command. MiniLM is 384-dimensional and about 90 MB; no other embedder topology is currently installable or runnable.
 
 - **Air-gapped install**: `cass models install --model minilm --from-file <dir>` accepts a pre-downloaded MiniLM directory so you can bring the assets in yourself.
