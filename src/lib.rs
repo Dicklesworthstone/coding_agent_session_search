@@ -28275,7 +28275,16 @@ fn run_cli_search(
             #[cfg(unix)]
             {
                 let config = DaemonRetryConfig::from_env();
-                match crate::daemon::client::try_connect_for_data_dir(&data_dir) {
+                let daemon = if semantic_opts.auto_spawn_daemon {
+                    crate::daemon::client::connect_or_spawn_for_embedder(
+                        FastEmbedder::embedder_id_static(),
+                        &data_dir,
+                    )
+                    .ok()
+                } else {
+                    crate::daemon::client::try_connect_for_data_dir(&data_dir)
+                };
+                match daemon {
                     Some(daemon) => match daemon.attestation_channel(&data_dir) {
                         Ok((connection, verifier)) => {
                             let daemon: Arc<dyn crate::search::daemon_client::DaemonClient> =

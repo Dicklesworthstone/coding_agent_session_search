@@ -25,12 +25,12 @@
 //! ## Usage
 //!
 //! ```ignore
-//! use cass::daemon::{client::UdsDaemonClient, core::ModelDaemon};
+//! use cass::daemon::{client, core::ModelDaemon};
 //!
-//! // Client usage (auto-spawns daemon if not running)
-//! let client = UdsDaemonClient::with_defaults();
-//! client.connect()?;
-//! let embeddings = client.embed(&["hello world"])?;
+//! // Search clients discover the data-directory-specific endpoint and pin its
+//! // owner-private attestation authority before composing a verified embedder.
+//! let client = client::connect_or_spawn_for_embedder("minilm-384", &data_dir)?;
+//! let (candidate, verifier) = client.attestation_channel(&data_dir)?;
 //!
 //! // Server usage (for daemon subprocess)
 //! let daemon = ModelDaemon::with_defaults(&data_dir);
