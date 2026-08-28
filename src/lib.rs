@@ -32277,27 +32277,35 @@ fn output_robot_results(
 fn source_filter_where_clause(
     source_filter: Option<&crate::sources::provenance::SourceFilter>,
 ) -> (String, Option<String>) {
-    source_filter_where_clause_with_columns(source_filter, "c.source_id", "c.origin_host")
+    source_filter_where_clause_with_columns(
+        source_filter,
+        "c.source_id",
+        "(SELECT s.kind FROM sources s WHERE s.id = c.source_id LIMIT 1)",
+        "c.origin_host",
+    )
 }
 
 fn source_filter_where_clause_with_columns(
     source_filter: Option<&crate::sources::provenance::SourceFilter>,
     source_id_sql: &str,
+    origin_kind_sql: &str,
     origin_host_sql: &str,
 ) -> (String, Option<String>) {
     let normalized_source_sql = normalized_source_identity_sql_expr(source_id_sql, origin_host_sql);
+    let normalized_origin_kind_sql =
+        normalized_source_origin_kind_sql_expr(source_id_sql, origin_kind_sql, origin_host_sql);
     match source_filter {
         None | Some(crate::sources::provenance::SourceFilter::All) => (String::new(), None),
         Some(crate::sources::provenance::SourceFilter::Local) => (
             format!(
-                " WHERE {normalized_source_sql} = '{local}'",
+                " WHERE {normalized_origin_kind_sql} = '{local}'",
                 local = crate::sources::provenance::LOCAL_SOURCE_ID,
             ),
             None,
         ),
         Some(crate::sources::provenance::SourceFilter::Remote) => (
             format!(
-                " WHERE {normalized_source_sql} != '{local}'",
+                " WHERE {normalized_origin_kind_sql} != '{local}'",
                 local = crate::sources::provenance::LOCAL_SOURCE_ID,
             ),
             None,
@@ -32312,22 +32320,24 @@ fn source_filter_where_clause_with_columns(
     }
 }
 
-fn stats_message_count_sql(source_where: &str) -> String {
-    if source_where.is_empty() {
+fn stats_message_count_sql(source_join: &str, source_where: &str) -> String {
+    if source_join.is_empty() && source_where.is_empty() {
         "SELECT COUNT(*) FROM messages".to_string()
     } else {
         format!(
-            "SELECT COUNT(*) FROM messages m JOIN conversations c ON m.conversation_id = c.id{source_where}"
+            "SELECT COUNT(*) FROM messages m JOIN conversations c ON m.conversation_id = c.id{source_join}{source_where}"
         )
     }
 }
 
-fn stats_workspace_count_sql(source_where: &str) -> String {
+fn stats_workspace_count_sql(source_join: &str, source_where: &str) -> String {
     if source_where.is_empty() {
-        "SELECT c.workspace_id, COUNT(*) FROM conversations c WHERE c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC".to_string()
+        format!(
+            "SELECT c.workspace_id, COUNT(*) FROM conversations c{source_join} WHERE c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC"
+        )
     } else {
         format!(
-            "SELECT c.workspace_id, COUNT(*) FROM conversations c{source_where} AND c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC"
+            "SELECT c.workspace_id, COUNT(*) FROM conversations c{source_join}{source_where} AND c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC"
         )
     }
 }
@@ -32342,6 +32352,7 @@ fn append_source_filter_condition(
         params,
         source_filter,
         "c.source_id",
+        "s.kind",
         "c.origin_host",
     );
 }
@@ -32351,20 +32362,23 @@ fn append_source_filter_condition_with_columns(
     params: &mut Vec<crate::franken_sync::compat::ParamValue>,
     source_filter: &crate::sources::provenance::SourceFilter,
     source_id_sql: &str,
+    origin_kind_sql: &str,
     origin_host_sql: &str,
 ) {
     let normalized_source_sql = normalized_source_identity_sql_expr(source_id_sql, origin_host_sql);
+    let normalized_origin_kind_sql =
+        normalized_source_origin_kind_sql_expr(source_id_sql, origin_kind_sql, origin_host_sql);
     match source_filter {
         crate::sources::provenance::SourceFilter::All => {}
         crate::sources::provenance::SourceFilter::Local => {
             sql.push_str(&format!(
-                " AND {normalized_source_sql} = '{local}'",
+                " AND {normalized_origin_kind_sql} = '{local}'",
                 local = crate::sources::provenance::LOCAL_SOURCE_ID,
             ));
         }
         crate::sources::provenance::SourceFilter::Remote => {
             sql.push_str(&format!(
-                " AND {normalized_source_sql} != '{local}'",
+                " AND {normalized_origin_kind_sql} != '{local}'",
                 local = crate::sources::provenance::LOCAL_SOURCE_ID,
             ));
         }
@@ -32411,12 +32425,31 @@ fn run_stats(
 
     // Parse source filter (P3.7)
     let source_filter = source.map(SourceFilter::parse);
+    let source_kind_filter_active = matches!(
+        source_filter.as_ref(),
+        Some(SourceFilter::Local | SourceFilter::Remote)
+    );
+    let source_columns = if source_kind_filter_active {
+        doctor_table_columns(&conn, "sources")
+    } else {
+        HashSet::new()
+    };
+    let can_join_source_kind = conversation_columns.contains("source_id")
+        && source_columns.contains("id")
+        && source_columns.contains("kind");
+    let source_join = if source_kind_filter_active && can_join_source_kind {
+        " LEFT JOIN sources s ON s.id = c.source_id"
+    } else {
+        ""
+    };
+    let origin_kind_sql = if source_join.is_empty() { "NULL" } else { "s.kind" };
 
     // Build WHERE clause for source filtering
     let (source_where, source_param): (String, Option<String>) =
         source_filter_where_clause_with_columns(
             source_filter.as_ref(),
             source_id_sql,
+            origin_kind_sql,
             origin_host_sql,
         );
 
@@ -32430,8 +32463,9 @@ fn run_stats(
 
     // Get counts and statistics with source filter
     let params = make_params(&source_param);
-    let conversation_sql = format!("SELECT COUNT(*) FROM conversations c{source_where}");
-    let message_sql = stats_message_count_sql(&source_where);
+    let conversation_sql =
+        format!("SELECT COUNT(*) FROM conversations c{source_join}{source_where}");
+    let message_sql = stats_message_count_sql(source_join, &source_where);
 
     let mut conversation_count: i64 =
         franken_query_row_map_retry(&conn, &conversation_sql, &params, |r| r.get_typed(0))
@@ -32469,7 +32503,7 @@ fn run_stats(
         .collect();
 
     let agent_sql = format!(
-        "SELECT c.agent_id, COUNT(*) FROM conversations c{source_where} GROUP BY c.agent_id ORDER BY COUNT(*) DESC"
+        "SELECT c.agent_id, COUNT(*) FROM conversations c{source_join}{source_where} GROUP BY c.agent_id ORDER BY COUNT(*) DESC"
     );
     let agent_count_rows: Vec<(Option<i64>, i64)> =
         franken_query_map_collect_retry(&conn, &agent_sql, &params, |r| {
@@ -32494,7 +32528,7 @@ fn run_stats(
         .into_iter()
         .collect();
 
-    let ws_sql = stats_workspace_count_sql(&source_where);
+    let ws_sql = stats_workspace_count_sql(source_join, &source_where);
     let workspace_count_rows: Vec<(i64, i64)> =
         franken_query_map_collect_retry(&conn, &ws_sql, &params, |r| {
             Ok((r.get_typed::<i64>(0)?, r.get_typed::<i64>(1)?))
@@ -32519,7 +32553,7 @@ fn run_stats(
             .to_string()
     } else {
         format!(
-            "SELECT MIN(started_at), MAX(started_at) FROM conversations c{source_where} AND started_at IS NOT NULL"
+            "SELECT MIN(started_at), MAX(started_at) FROM conversations c{source_join}{source_where} AND started_at IS NOT NULL"
         )
     };
     let (oldest, newest): (Option<i64>, Option<i64>) =
@@ -32536,6 +32570,7 @@ fn run_stats(
         let source_sql = format!(
             "SELECT {normalized_source_sql} as source_id, COUNT(DISTINCT c.id) as convs, COUNT(m.id) as msgs
              FROM conversations c
+             {source_join}
              LEFT JOIN messages m ON m.conversation_id = c.id
              {source_where}
              GROUP BY {normalized_source_sql}
@@ -41370,9 +41405,7 @@ fn build_doctor_source_inventory_report(
         );
         let origin_kind =
             normalized_provenance_origin_kind(source_id.as_str(), row.origin_kind.as_deref());
-        let is_remote = source_id != crate::sources::provenance::LOCAL_SOURCE_ID
-            || origin_kind != crate::sources::provenance::LOCAL_SOURCE_ID
-            || origin_host.is_some();
+        let is_remote = origin_kind != crate::sources::provenance::LOCAL_SOURCE_ID;
         let local_path_missing = !is_remote
             && source_path
                 .as_deref()
@@ -43498,10 +43531,16 @@ fn doctor_raw_mirror_source_amplification_reports_from_versions(
         // local source. A remote manifest can carry the same path text as an
         // unrelated local file, so comparing its historical bytes with local
         // filesystem metadata would manufacture an amplification warning.
-        if version.source_id != crate::sources::provenance::LOCAL_SOURCE_ID
-            || version.origin_kind != crate::sources::provenance::LOCAL_SOURCE_ID
-            || version.origin_host.is_some()
-        {
+        let normalized_source_id = normalized_provenance_source_id(
+            version.source_id.as_str(),
+            Some(version.origin_kind.as_str()),
+            version.origin_host.as_deref(),
+        );
+        let normalized_origin_kind = normalized_provenance_origin_kind(
+            normalized_source_id.as_str(),
+            Some(version.origin_kind.as_str()),
+        );
+        if normalized_origin_kind != crate::sources::provenance::LOCAL_SOURCE_ID {
             continue;
         }
         let key = (
@@ -45983,9 +46022,7 @@ fn doctor_raw_mirror_backfill_candidate_receipt(
     );
     let origin_kind =
         normalized_provenance_origin_kind(source_id.as_str(), candidate.origin_kind.as_deref());
-    let is_remote = source_id != crate::sources::provenance::LOCAL_SOURCE_ID
-        || origin_kind != crate::sources::provenance::LOCAL_SOURCE_ID
-        || origin_host.is_some();
+    let is_remote = origin_kind != crate::sources::provenance::LOCAL_SOURCE_ID;
     let source_path = doctor_normalized_source_path(candidate.source_path.as_deref());
     let mut receipt = doctor_raw_mirror_backfill_receipt_base(
         data_dir,
@@ -72289,6 +72326,38 @@ paths = ["~/.claude/projects"]
     }
 
     #[test]
+    fn doctor_source_inventory_classifies_named_local_id_by_kind() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = data_dir.join("sessions/backup.jsonl");
+        std::fs::create_dir_all(source_path.parent().expect("source parent"))
+            .expect("create source parent");
+        std::fs::write(&source_path, "{}\n").expect("write named local source");
+
+        let report = build_doctor_source_inventory_report(
+            &data_dir,
+            true,
+            None,
+            vec![DoctorSourceInventoryDbRow {
+                provider: "codex".to_string(),
+                source_path: Some(source_path.display().to_string()),
+                source_id: "backup-local".to_string(),
+                origin_host: None,
+                origin_kind: Some("local".to_string()),
+                conversation_count: 2,
+            }],
+            Vec::new(),
+        );
+
+        assert_eq!(report.local_source_count, 2);
+        assert_eq!(report.remote_source_count, 0);
+        let source = report.sources.first().expect("named local inventory row");
+        assert_eq!(source.source_id, "backup-local");
+        assert_eq!(source.origin_kind, "local");
+        assert!(!source.is_remote);
+    }
+
+    #[test]
     fn doctor_remote_source_sync_report_flags_gaps_without_remote_probe() {
         use crate::sources::config::{SourceDefinition, SourcesConfig, SyncSchedule};
         use crate::sources::sync::{SourceSyncInfo, SyncResult, SyncStatus};
@@ -73615,14 +73684,37 @@ paths = ["~/.claude/projects"]
         bytes: &[u8],
         db_links: Vec<DoctorRawMirrorDbLink>,
     ) -> DoctorRawMirrorManifestFile {
+        raw_mirror_test_manifest_with_origin(
+            data_dir,
+            provider,
+            source_id,
+            "local",
+            None,
+            original_path,
+            bytes,
+            db_links,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn raw_mirror_test_manifest_with_origin(
+        data_dir: &Path,
+        provider: &str,
+        source_id: &str,
+        origin_kind: &str,
+        origin_host: Option<&str>,
+        original_path: &Path,
+        bytes: &[u8],
+        db_links: Vec<DoctorRawMirrorDbLink>,
+    ) -> DoctorRawMirrorManifestFile {
         let blob_blake3 = blake3::hash(bytes).to_hex().to_string();
         let original_path = original_path.display().to_string();
         let original_path_blake3 = doctor_raw_mirror_original_path_blake3(&original_path);
         let manifest_id = doctor_raw_mirror_manifest_id(
             provider,
             source_id,
-            "local",
-            None,
+            origin_kind,
+            origin_host,
             &original_path_blake3,
             &blob_blake3,
         );
@@ -73637,8 +73729,8 @@ paths = ["~/.claude/projects"]
             blob_blake3,
             provider: provider.to_string(),
             source_id: source_id.to_string(),
-            origin_kind: "local".to_string(),
-            origin_host: None,
+            origin_kind: origin_kind.to_string(),
+            origin_host: origin_host.map(str::to_string),
             original_path: original_path.clone(),
             redacted_original_path: doctor_redacted_path(&original_path, data_dir),
             original_path_blake3,
@@ -74404,7 +74496,7 @@ paths = ["~/.claude/projects"]
         let first = raw_mirror_test_manifest(
             &data_dir,
             "pi_agent",
-            "local",
+            "backup-local",
             &source_path,
             first_bytes,
             Vec::new(),
@@ -74412,7 +74504,7 @@ paths = ["~/.claude/projects"]
         let second = raw_mirror_test_manifest(
             &data_dir,
             "omp",
-            "local",
+            "backup-local",
             &source_path,
             second_bytes,
             Vec::new(),
@@ -74426,10 +74518,12 @@ paths = ["~/.claude/projects"]
             &b"first remote source version"[..],
             &b"second much larger remote source version"[..],
         ] {
-            let remote = raw_mirror_test_manifest(
+            let remote = raw_mirror_test_manifest_with_origin(
                 &data_dir,
                 "codex",
                 "remote-workstation",
+                "ssh",
+                Some("remote-workstation"),
                 &source_path,
                 remote_bytes,
                 Vec::new(),
@@ -74459,6 +74553,7 @@ paths = ["~/.claude/projects"]
             .first()
             .expect("source amplification detail");
         assert_eq!(amplified.evidence_kind, "full_blob_checksum");
+        assert_eq!(amplified.source_id, "backup-local");
         assert_eq!(
             amplified.providers,
             vec!["omp".to_string(), "pi_agent".to_string()],
@@ -86850,7 +86945,13 @@ fn run_sessions(
                     origin_kind.as_deref(),
                     origin_host.as_deref(),
                 );
-                let metadata = if source_id == crate::sources::provenance::LOCAL_SOURCE_ID {
+                let normalized_origin_kind = normalized_provenance_origin_kind(
+                    source_id.as_str(),
+                    origin_kind.as_deref(),
+                );
+                let metadata = if normalized_origin_kind
+                    == crate::sources::provenance::LOCAL_SOURCE_ID
+                {
                     std::fs::metadata(&source_path_buf).ok()
                 } else {
                     None
@@ -95837,6 +95938,25 @@ fn normalized_source_identity_sql_expr(source_id_column: &str, origin_host_colum
     )
 }
 
+fn normalized_source_origin_kind_sql_expr(
+    source_id_column: &str,
+    origin_kind_column: &str,
+    origin_host_column: &str,
+) -> String {
+    format!(
+        "CASE \
+            WHEN LOWER(TRIM(COALESCE({origin_kind_column}, ''))) = '{local}' THEN '{local}' \
+            WHEN LOWER(TRIM(COALESCE({origin_kind_column}, ''))) IN ('ssh', 'remote') THEN 'remote' \
+            WHEN TRIM(COALESCE({origin_kind_column}, '')) != '' THEN LOWER(TRIM({origin_kind_column})) \
+            WHEN LOWER(TRIM(COALESCE({source_id_column}, ''))) = '{local}' THEN '{local}' \
+            WHEN TRIM(COALESCE({source_id_column}, '')) != '' THEN 'remote' \
+            WHEN TRIM(COALESCE({origin_host_column}, '')) != '' THEN 'remote' \
+            ELSE '{local}' \
+         END",
+        local = crate::sources::provenance::LOCAL_SOURCE_ID,
+    )
+}
+
 #[cfg(test)]
 fn normalized_source_id_sql_expr(column: &str) -> String {
     format!(
@@ -103500,15 +103620,20 @@ mod legacy_source_filter_tests {
     }
 
     #[test]
-    fn source_filter_helpers_use_normalized_source_sql_for_local_semantics() {
+    fn source_filter_helpers_use_normalized_origin_kind_for_local_semantics() {
         let normalized_source_sql =
             normalized_source_identity_sql_expr("c.source_id", "c.origin_host");
+        let normalized_where_origin_kind_sql = normalized_source_origin_kind_sql_expr(
+            "c.source_id",
+            "(SELECT s.kind FROM sources s WHERE s.id = c.source_id LIMIT 1)",
+            "c.origin_host",
+        );
 
         let (where_sql, param) = source_filter_where_clause(Some(&SourceFilter::Local));
         assert_eq!(
             where_sql,
             format!(
-                " WHERE {normalized_source_sql} = '{local}'",
+                " WHERE {normalized_where_origin_kind_sql} = '{local}'",
                 local = crate::sources::provenance::LOCAL_SOURCE_ID,
             )
         );
@@ -103522,10 +103647,12 @@ mod legacy_source_filter_tests {
         let mut sql = "SELECT 1 WHERE 1=1".to_string();
         let mut params = Vec::new();
         append_source_filter_condition(&mut sql, &mut params, &SourceFilter::Remote);
+        let normalized_joined_origin_kind_sql =
+            normalized_source_origin_kind_sql_expr("c.source_id", "s.kind", "c.origin_host");
         assert_eq!(
             sql,
             format!(
-                "SELECT 1 WHERE 1=1 AND {normalized_source_sql} != '{local}'",
+                "SELECT 1 WHERE 1=1 AND {normalized_joined_origin_kind_sql} != '{local}'",
                 local = crate::sources::provenance::LOCAL_SOURCE_ID,
             )
         );
@@ -103535,28 +103662,38 @@ mod legacy_source_filter_tests {
     #[test]
     fn stats_message_count_sql_skips_join_when_unfiltered() {
         assert_eq!(
-            stats_message_count_sql(""),
+            stats_message_count_sql("", ""),
             "SELECT COUNT(*) FROM messages",
             "unfiltered stats can count messages directly without a conversation join"
         );
         assert_eq!(
-            stats_workspace_count_sql(""),
+            stats_workspace_count_sql("", ""),
             "SELECT c.workspace_id, COUNT(*) FROM conversations c WHERE c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC",
             "unfiltered workspace stats can aggregate workspace IDs before path lookup"
         );
 
-        let (where_sql, _param) = source_filter_where_clause(Some(&SourceFilter::Local));
-        let sql = stats_message_count_sql(&where_sql);
+        let source_join = " LEFT JOIN sources s ON s.id = c.source_id";
+        let (where_sql, _param) = source_filter_where_clause_with_columns(
+            Some(&SourceFilter::Local),
+            "c.source_id",
+            "s.kind",
+            "c.origin_host",
+        );
+        let sql = stats_message_count_sql(source_join, &where_sql);
         assert!(
             sql.contains("JOIN conversations c ON m.conversation_id = c.id"),
             "source-filtered stats must retain the conversation join; sql={sql}"
+        );
+        assert!(
+            sql.contains(source_join),
+            "kind-filtered stats must join registered source metadata; sql={sql}"
         );
         assert!(
             sql.ends_with(&where_sql),
             "source filter should be appended unchanged; sql={sql}"
         );
 
-        let workspace_sql = stats_workspace_count_sql(&where_sql);
+        let workspace_sql = stats_workspace_count_sql(source_join, &where_sql);
         assert!(
             workspace_sql.contains(" AND c.workspace_id IS NOT NULL"),
             "source-filtered workspace stats append the non-null guard after the source WHERE; sql={workspace_sql}"
@@ -103588,6 +103725,51 @@ mod legacy_source_filter_tests {
             .query_row_map(&sql, &[], |r: &crate::franken_sync::Row| r.get_typed(0))
             .expect("count remote source rows");
         assert_eq!(count, 1);
+
+        conn.close().expect("close writable legacy source test db");
+    }
+
+    #[test]
+    fn source_filter_helpers_classify_registered_named_local_source_by_kind() {
+        let (_tmp, db_path, _shared_path) = make_legacy_local_db();
+        let conn = open_legacy_local_db_for_update(&db_path);
+        conn.execute(
+            "INSERT INTO sources(id, kind, host_label) VALUES ('backup-local', 'local', NULL)",
+        )
+        .expect("insert named local source");
+        conn.execute(
+            "UPDATE conversations SET source_id = 'backup-local', origin_host = NULL WHERE id = 2",
+        )
+        .expect("move second conversation to named local source");
+
+        let count_for = |filter: SourceFilter| {
+            let (where_sql, param) = source_filter_where_clause_with_columns(
+                Some(&filter),
+                "c.source_id",
+                "s.kind",
+                "c.origin_host",
+            );
+            let sql = format!(
+                "SELECT COUNT(*) FROM conversations c \
+                 LEFT JOIN sources s ON s.id = c.source_id{where_sql}"
+            );
+            let params = param
+                .as_deref()
+                .map(crate::franken_sync::compat::ParamValue::from)
+                .into_iter()
+                .collect::<Vec<_>>();
+            conn.query_row_map(&sql, &params, |row: &crate::franken_sync::Row| {
+                row.get_typed::<i64>(0)
+            })
+            .expect("count source-filtered conversations")
+        };
+
+        assert_eq!(count_for(SourceFilter::Local), 2);
+        assert_eq!(count_for(SourceFilter::Remote), 0);
+        assert_eq!(
+            count_for(SourceFilter::SourceId("backup-local".to_string())),
+            1
+        );
 
         conn.close().expect("close writable legacy source test db");
     }
@@ -107666,7 +107848,13 @@ fn run_timeline(
             origin_kind.as_deref(),
             origin_host.as_deref(),
         );
-        let source_badge = if normalized_source_id != crate::sources::provenance::LOCAL_SOURCE_ID {
+        let normalized_origin_kind = normalized_provenance_origin_kind(
+            normalized_source_id.as_str(),
+            origin_kind.as_deref(),
+        );
+        let source_badge = if normalized_origin_kind
+            != crate::sources::provenance::LOCAL_SOURCE_ID
+        {
             let label = origin_host
                 .as_deref()
                 .map(str::trim)

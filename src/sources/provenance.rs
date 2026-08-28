@@ -107,9 +107,9 @@ impl Source {
         self.kind.is_remote()
     }
 
-    /// Check if this is the local source.
+    /// Check if this is a local source.
     pub fn is_local(&self) -> bool {
-        self.id == LOCAL_SOURCE_ID && self.kind == SourceKind::Local
+        self.kind == SourceKind::Local
     }
 
     /// Get a display label for this source.
@@ -162,7 +162,7 @@ impl SourceFilter {
     pub fn matches(&self, origin: &Origin) -> bool {
         match self {
             Self::All => true,
-            Self::Local => origin.is_local(),
+            Self::Local => origin.kind == SourceKind::Local,
             Self::Remote => origin.is_remote(),
             Self::SourceId(id) => {
                 let filter_id = id.trim();
@@ -259,6 +259,31 @@ mod tests {
         assert_eq!(source.kind, SourceKind::Local);
         assert!(source.is_local());
         assert!(!source.is_remote());
+    }
+
+    #[test]
+    fn test_named_local_source_and_origin_match_local_by_kind() {
+        let source = Source {
+            id: "backup-local".to_string(),
+            kind: SourceKind::Local,
+            host_label: None,
+            machine_id: None,
+            platform: None,
+            config_json: None,
+            created_at: None,
+            updated_at: None,
+        };
+        let origin = Origin {
+            source_id: source.id.clone(),
+            kind: SourceKind::Local,
+            host: None,
+        };
+
+        assert!(source.is_local());
+        assert!(!source.is_remote());
+        assert!(SourceFilter::Local.matches(&origin));
+        assert!(!SourceFilter::Remote.matches(&origin));
+        assert!(SourceFilter::SourceId("backup-local".to_string()).matches(&origin));
     }
 
     #[test]

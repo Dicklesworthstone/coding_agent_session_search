@@ -51,6 +51,24 @@ fn normalized_ui_source_identity_sql_expr(
     )
 }
 
+fn normalized_ui_source_origin_kind_sql_expr(
+    source_id_column: &str,
+    origin_kind_column: &str,
+    origin_host_column: &str,
+) -> String {
+    format!(
+        "CASE \
+            WHEN LOWER(TRIM(COALESCE({origin_kind_column}, ''))) = '{local}' THEN '{local}' \
+            WHEN TRIM(COALESCE({origin_kind_column}, '')) != '' THEN 'remote' \
+            WHEN LOWER(TRIM(COALESCE({source_id_column}, ''))) = '{local}' THEN '{local}' \
+            WHEN TRIM(COALESCE({source_id_column}, '')) != '' THEN 'remote' \
+            WHEN TRIM(COALESCE({origin_host_column}, '')) != '' THEN 'remote' \
+            ELSE '{local}' \
+         END",
+        local = crate::sources::provenance::LOCAL_SOURCE_ID,
+    )
+}
+
 fn normalize_ui_source_id_value(source_id: Option<&str>) -> String {
     let trimmed = source_id.unwrap_or_default().trim();
     if trimmed.is_empty()
@@ -382,6 +400,11 @@ pub(crate) fn load_conversation_uncached(
 ) -> Result<Option<ConversationView>> {
     let normalized_source_sql =
         normalized_ui_source_identity_sql_expr("c.source_id", "c.origin_host");
+    let normalized_origin_kind_sql = normalized_ui_source_origin_kind_sql_expr(
+        "c.source_id",
+        "s.kind",
+        "c.origin_host",
+    );
     // LEFT JOIN + COALESCE on agents for the same NULL-agent_id safety as
     // load_conversation_by_id_uncached.
     let (sql, params) = if let Some(source_id) = source_id {
@@ -392,6 +415,7 @@ pub(crate) fn load_conversation_uncached(
                  FROM conversations c
                  LEFT JOIN agents a ON c.agent_id = a.id
                  LEFT JOIN workspaces w ON c.workspace_id = w.id
+                 LEFT JOIN sources s ON c.source_id = s.id
                  WHERE c.source_path = ?1 AND {normalized_source_sql} = ?2
                  ORDER BY c.started_at DESC LIMIT 1"
             ),
@@ -405,8 +429,9 @@ pub(crate) fn load_conversation_uncached(
                  FROM conversations c
                  LEFT JOIN agents a ON c.agent_id = a.id
                  LEFT JOIN workspaces w ON c.workspace_id = w.id
+                 LEFT JOIN sources s ON c.source_id = s.id
                  WHERE c.source_path = ?1
-                 ORDER BY CASE WHEN {normalized_source_sql} = '{local}' THEN 0 ELSE 1 END,
+                 ORDER BY CASE WHEN {normalized_origin_kind_sql} = '{local}' THEN 0 ELSE 1 END,
                           c.started_at DESC
                  LIMIT 1",
                 local = crate::sources::provenance::LOCAL_SOURCE_ID,
@@ -451,11 +476,21 @@ fn cached_conversation_matches_lookup_head(
         return Ok(false);
     };
 
-    let normalized_source_sql = normalized_ui_source_identity_sql_expr("source_id", "origin_host");
+    let normalized_source_sql =
+        normalized_ui_source_identity_sql_expr("c.source_id", "c.origin_host");
+    let normalized_origin_kind_sql = normalized_ui_source_origin_kind_sql_expr(
+        "c.source_id",
+        "s.kind",
+        "c.origin_host",
+    );
     let (sql, params) = if let Some(source_id) = source_id {
         (
             format!(
-                "SELECT id, {normalized_source_sql} FROM conversations WHERE source_path = ?1 AND {normalized_source_sql} = ?2 ORDER BY started_at DESC LIMIT 1"
+                "SELECT c.id, {normalized_source_sql}
+                 FROM conversations c
+                 LEFT JOIN sources s ON c.source_id = s.id
+                 WHERE c.source_path = ?1 AND {normalized_source_sql} = ?2
+                 ORDER BY c.started_at DESC LIMIT 1"
             ),
             crate::franken_sync::params![
                 source_path,
@@ -465,7 +500,12 @@ fn cached_conversation_matches_lookup_head(
     } else {
         (
             format!(
-                "SELECT id, {normalized_source_sql} FROM conversations WHERE source_path = ?1 ORDER BY CASE WHEN {normalized_source_sql} = '{local}' THEN 0 ELSE 1 END, started_at DESC LIMIT 1",
+                "SELECT c.id, {normalized_source_sql}
+                 FROM conversations c
+                 LEFT JOIN sources s ON c.source_id = s.id
+                 WHERE c.source_path = ?1
+                 ORDER BY CASE WHEN {normalized_origin_kind_sql} = '{local}' THEN 0 ELSE 1 END,
+                          c.started_at DESC LIMIT 1",
                 local = crate::sources::provenance::LOCAL_SOURCE_ID,
             ),
             crate::franken_sync::params![source_path],
@@ -1596,7 +1636,7 @@ mod tests {
     }
 
     #[test]
-    fn load_conversation_prefers_local_source_for_shared_path() {
+    fn load_conversation_prefers_named_local_source_for_shared_path() {
         use crate::storage::sqlite::FrankenStorage;
 
         let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -1608,9 +1648,9 @@ mod tests {
         conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)")
             .expect("insert agent");
         conn.execute(
-            "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('  local  ', 'local', 'local', 0, 0)",
+            "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('backup-local', 'local', NULL, 0, 0)",
         )
-        .expect("insert local source");
+        .expect("insert named local source");
         conn.execute(
             "INSERT INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('work-laptop', 'ssh', 'work-laptop', 0, 0)",
         )
@@ -1619,7 +1659,7 @@ mod tests {
             use crate::franken_sync::compat::{ParamValue, param_slice_to_values};
             let p = [ParamValue::from(shared_path.to_string())];
             conn.execute_with_params(
-                "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'local-ext', 'Local Session', ?1, '  local  ', 100)",
+                "INSERT INTO conversations (id, agent_id, external_id, title, source_path, source_id, started_at) VALUES (1, 1, 'local-ext', 'Local Session', ?1, 'backup-local', 100)",
                 &param_slice_to_values(&p),
             )
             .expect("insert local conversation");
@@ -1642,7 +1682,7 @@ mod tests {
             .expect("load conversation")
             .expect("conversation present");
 
-        assert_eq!(loaded.convo.source_id, "local");
+        assert_eq!(loaded.convo.source_id, "backup-local");
         assert_eq!(loaded.convo.title.as_deref(), Some("Local Session"));
         assert_eq!(loaded.messages[0].content, "local body");
     }

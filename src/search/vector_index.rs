@@ -571,8 +571,8 @@ impl SemanticFilterMaps {
             // Every known local-*kind* source (backup roots, chatgpt-import),
             // not only the built-in `local` id — the complement of the
             // remote set, which is already classified by `sources.kind`
-            // (bead 5bf29). The built-in id is included even when the
-            // archive has no `sources` row for it.
+            // (bead 5bf29). Synthesize the built-in id only when the archive
+            // has no registry row whose explicit kind should take precedence.
             SourceFilter::Local => {
                 let mut local: HashSet<u32> = self
                     .source_id_to_id
@@ -580,7 +580,9 @@ impl SemanticFilterMaps {
                     .copied()
                     .filter(|id| !self.remote_source_ids.contains(id))
                     .collect();
-                local.insert(self.source_id(LOCAL_SOURCE_ID));
+                if !self.source_id_to_id.contains_key(LOCAL_SOURCE_ID) {
+                    local.insert(self.source_id(LOCAL_SOURCE_ID));
+                }
                 Some(local)
             }
             SourceFilter::Remote => Some(self.remote_source_ids.clone()),
@@ -688,6 +690,43 @@ pub fn dot_product_f16_simd_bench(stored: &[f16], query: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_source_filters_respect_registered_kind_before_local_id_fallback() {
+        let canonical_local = source_id_hash(LOCAL_SOURCE_ID);
+        let named_local = source_id_hash("backup-local");
+        let maps = SemanticFilterMaps::for_tests(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([
+                (LOCAL_SOURCE_ID.to_string(), canonical_local),
+                ("backup-local".to_string(), named_local),
+            ]),
+            HashSet::from([canonical_local]),
+        );
+
+        assert_eq!(
+            maps.sources_from_filter(&SourceFilter::Local).unwrap(),
+            Some(HashSet::from([named_local]))
+        );
+        assert_eq!(
+            maps.sources_from_filter(&SourceFilter::Remote).unwrap(),
+            Some(HashSet::from([canonical_local]))
+        );
+
+        let legacy_maps = SemanticFilterMaps::for_tests(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashSet::new(),
+        );
+        assert_eq!(
+            legacy_maps
+                .sources_from_filter(&SourceFilter::Local)
+                .unwrap(),
+            Some(HashSet::from([canonical_local]))
+        );
+    }
 
     #[test]
     fn role_code_from_str_accepts_known_roles() {

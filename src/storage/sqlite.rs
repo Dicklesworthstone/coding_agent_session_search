@@ -10706,7 +10706,15 @@ impl FrankenStorage {
     pub fn get_source_ids(&self) -> Result<Vec<String>> {
         self.conn
             .query_map_collect(
-                "SELECT id FROM sources WHERE id != 'local' ORDER BY id",
+                "SELECT id
+                 FROM sources
+                 WHERE CASE
+                           WHEN LOWER(TRIM(COALESCE(kind, ''))) = 'local' THEN 0
+                           WHEN TRIM(COALESCE(kind, '')) != '' THEN 1
+                           WHEN LOWER(TRIM(COALESCE(id, ''))) = 'local' THEN 0
+                           ELSE 1
+                       END = 1
+                 ORDER BY id",
                 fparams![],
                 |row| row.get_typed(0),
             )
@@ -11405,20 +11413,7 @@ impl FrankenStorage {
             };
 
             if !known_sources.contains(&conversation.source_id) {
-                let placeholder = if conversation.source_id == LOCAL_SOURCE_ID {
-                    Source::local()
-                } else {
-                    Source {
-                        id: conversation.source_id.clone(),
-                        kind: SourceKind::Ssh,
-                        host_label: conversation.origin_host.clone(),
-                        machine_id: None,
-                        platform: None,
-                        config_json: None,
-                        created_at: None,
-                        updated_at: None,
-                    }
-                };
+                let placeholder = normalized_source_for_conversation(&conversation);
                 self.upsert_source(&placeholder)?;
                 known_sources.insert(conversation.source_id.clone());
             }
@@ -14849,18 +14844,29 @@ fn normalized_storage_source_parts(
         origin_kind,
         host_label.as_deref(),
     );
-
-    if source_id == LOCAL_SOURCE_ID {
+    let normalized_kind = crate::search::tantivy::normalized_index_origin_kind(
+        source_id.as_str(),
+        origin_kind,
+    );
+    if normalized_kind == LOCAL_SOURCE_ID {
         (source_id, SourceKind::Local, None)
     } else {
         (source_id, SourceKind::Ssh, host_label)
     }
 }
 
+fn conversation_origin_kind(conv: &Conversation) -> Option<&str> {
+    conv.metadata_json
+        .pointer("/cass/origin/kind")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|kind| !kind.is_empty())
+}
+
 fn normalized_source_for_conversation(conv: &Conversation) -> Source {
     let (id, kind, host_label) = normalized_storage_source_parts(
         Some(conv.source_id.as_str()),
-        None,
+        conversation_origin_kind(conv),
         conv.origin_host.as_deref(),
     );
     Source {
@@ -14910,6 +14916,18 @@ impl FrankenStorage {
         if self.conversation_source_already_ensured(&cache_key) {
             return Ok(());
         }
+        if conversation_origin_kind(conv).is_none()
+            && let Some(existing) = self.get_source(source.id.as_str())?
+        {
+            // A conversation without explicit provenance cannot supersede the
+            // authoritative registry classification. This matters for legacy
+            // archive imports whose `sources` rows carry kind but whose older
+            // conversation metadata does not.
+            self.mark_conversation_source_ensured(
+                EnsuredConversationSourceKey::from_source(&existing),
+            );
+            return Ok(());
+        }
         self.upsert_source(&source)?;
         self.mark_conversation_source_ensured(cache_key);
         Ok(())
@@ -14924,6 +14942,14 @@ impl FrankenStorage {
             let source = normalized_source_for_conversation(conv);
             if seen.insert(source.id.clone()) {
                 if is_bootstrap_local_source(&source) {
+                    continue;
+                }
+                if conversation_origin_kind(conv).is_none()
+                    && let Some(existing) = self.get_source(source.id.as_str())?
+                {
+                    self.mark_conversation_source_ensured(
+                        EnsuredConversationSourceKey::from_source(&existing),
+                    );
                     continue;
                 }
                 self.upsert_source(&source)?;
@@ -15046,7 +15072,7 @@ fn ensure_sources_in_tx(
     for &(_, _, conv) in conversations {
         let (source_id, source_kind, host_label) = normalized_storage_source_parts(
             Some(conv.source_id.as_str()),
-            None,
+            conversation_origin_kind(conv),
             conv.origin_host.as_deref(),
         );
         if !seen.insert(source_id.clone()) {
@@ -30904,6 +30930,69 @@ mod tests {
     }
 
     #[test]
+    fn storage_source_normalization_prefers_explicit_local_kind_over_named_id() {
+        let (source_id, source_kind, host_label) = normalized_storage_source_parts(
+            Some("backup-local"),
+            Some("local"),
+            Some("stale-host-label"),
+        );
+
+        assert_eq!(source_id, "backup-local");
+        assert_eq!(source_kind, SourceKind::Local);
+        assert_eq!(host_label, None);
+    }
+
+    #[test]
+    fn incomplete_conversation_metadata_does_not_overwrite_registered_local_kind() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .upsert_source(&Source {
+                id: "backup-local".into(),
+                kind: SourceKind::Local,
+                host_label: None,
+                machine_id: Some("machine-a".into()),
+                platform: Some("macos".into()),
+                config_json: Some(serde_json::json!({"root": "/backup"})),
+                created_at: None,
+                updated_at: None,
+            })
+            .unwrap();
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: Some("legacy-backup-local".into()),
+            title: None,
+            source_path: dir.path().join("backup.jsonl"),
+            started_at: None,
+            ended_at: None,
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: Vec::new(),
+            source_id: "backup-local".into(),
+            origin_host: None,
+        };
+
+        storage
+            .ensure_source_for_conversation(&conversation)
+            .unwrap();
+        let preserved = storage
+            .get_source("backup-local")
+            .unwrap()
+            .expect("registered named local source");
+        assert_eq!(preserved.kind, SourceKind::Local);
+        assert_eq!(preserved.machine_id.as_deref(), Some("machine-a"));
+        assert_eq!(preserved.platform.as_deref(), Some("macos"));
+        assert_eq!(
+            preserved.config_json,
+            Some(serde_json::json!({"root": "/backup"}))
+        );
+    }
+
+    #[test]
     fn insert_conversation_tree_blank_local_source_normalizes_to_local_id() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
@@ -31184,9 +31273,22 @@ mod tests {
             updated_at: None,
         };
         storage.upsert_source(&source).unwrap();
+        storage
+            .upsert_source(&Source {
+                id: "backup-local".into(),
+                kind: SourceKind::Local,
+                host_label: None,
+                machine_id: None,
+                platform: None,
+                config_json: None,
+                created_at: Some(SqliteStorage::now_millis()),
+                updated_at: None,
+            })
+            .unwrap();
 
         let ids = storage.get_source_ids().unwrap();
         assert!(!ids.contains(&LOCAL_SOURCE_ID.to_string()));
+        assert!(!ids.contains(&"backup-local".to_string()));
         assert!(ids.contains(&"remote-1".to_string()));
     }
 

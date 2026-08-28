@@ -239,10 +239,10 @@ fn test_active_session_source_path_matches(_path: &Path) -> bool {
 
 fn should_skip_active_session_source(
     active_source_filter: &ActiveSessionSourceFilter,
-    source_id: &str,
+    source_kind: SourceKind,
     source_path: &Path,
 ) -> bool {
-    if source_id != LOCAL_SOURCE_ID {
+    if source_kind != SourceKind::Local {
         return false;
     }
     let Some(reason) = active_source_filter.active_writer_reason(source_path) else {
@@ -12454,7 +12454,7 @@ fn spawn_connector_producer(
             match conn.scan_with_callback(&ctx, &mut |mut conversation| {
                 if should_skip_active_session_source(
                     config.active_source_filter.as_ref(),
-                    LOCAL_SOURCE_ID,
+                    SourceKind::Local,
                     &conversation.source_path,
                 ) {
                     active_source_skipped = true;
@@ -12560,7 +12560,7 @@ fn spawn_connector_producer(
             match conn.scan_with_callback(&ctx, &mut |mut conversation| {
                 if should_skip_active_session_source(
                     config.active_source_filter.as_ref(),
-                    &root.origin.source_id,
+                    root.origin.kind,
                     &conversation.source_path,
                 ) {
                     active_source_skipped = true;
@@ -13512,7 +13512,7 @@ fn run_batch_index_with_connector_factories(
                             local_convs.retain(|conv| {
                                 !should_skip_active_session_source(
                                     active_source_filter.as_ref(),
-                                    LOCAL_SOURCE_ID,
+                                    SourceKind::Local,
                                     &conv.source_path,
                                 )
                             });
@@ -13585,7 +13585,7 @@ fn run_batch_index_with_connector_factories(
                                 remote_convs.retain(|conv| {
                                     !should_skip_active_session_source(
                                         active_source_filter.as_ref(),
-                                        &root.origin.source_id,
+                                        root.origin.kind,
                                         &conv.source_path,
                                     )
                                 });
@@ -25595,7 +25595,7 @@ fn reindex_paths_with_semantic_delta(
     for (kind, root, min_ts, max_ts) in triggers {
         let conn = kind.create_connector();
         let detect = conn.detect();
-        if !detect.detected && root.origin.source_id == "local" && !root.path.exists() {
+        if !detect.detected && root.origin.kind == SourceKind::Local && !root.path.exists() {
             // For local roots, if detection fails and the root is gone, skip.
             // For remote roots, detection might fail but we should still try scanning
             // if it's a brute-force attempt.
@@ -25658,7 +25658,7 @@ fn reindex_paths_with_semantic_delta(
         if root.path.is_file()
             && should_skip_active_session_source(
                 &active_source_filter,
-                &root.origin.source_id,
+                root.origin.kind,
                 &root.path,
             )
         {
@@ -25709,7 +25709,7 @@ fn reindex_paths_with_semantic_delta(
         convs.retain(|conv| {
             !should_skip_active_session_source(
                 &active_source_filter,
-                &root.origin.source_id,
+                root.origin.kind,
                 &conv.source_path,
             )
         });
@@ -27229,7 +27229,7 @@ fn capture_connector_sources_before_parse(
             for source in sources {
                 if should_skip_active_session_source(
                     active_source_filter,
-                    &source.origin.source_id,
+                    source.origin.kind,
                     &source.source_path,
                 ) {
                     active_source_skipped = true;
@@ -27474,7 +27474,7 @@ fn capture_scan_root_file_before_parse(
     if !root.path.is_file() {
         return false;
     }
-    if should_skip_active_session_source(active_source_filter, &root.origin.source_id, &root.path) {
+    if should_skip_active_session_source(active_source_filter, root.origin.kind, &root.path) {
         return true;
     }
     match crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
@@ -34039,6 +34039,19 @@ mod tests {
         assert_eq!(
             active_filter.active_writer_reason(&source_path),
             Some(ActiveSessionSourceReason::RecentlyModified)
+        );
+        assert!(should_skip_active_session_source(
+            &active_filter,
+            SourceKind::Local,
+            &source_path
+        ));
+        assert!(
+            !should_skip_active_session_source(
+                &active_filter,
+                SourceKind::Ssh,
+                &source_path
+            ),
+            "remote mirrors are immutable local copies, not live provider writers"
         );
     }
 

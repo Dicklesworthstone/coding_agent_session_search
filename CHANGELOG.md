@@ -76,6 +76,14 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ### Fixed
 
+- Completed kind-first local/remote provenance across analytics, incident
+  discovery, stats, timeline, semantic filtering, TUI local-file actions, and
+  doctor/raw-mirror diagnostics, and storage ingestion. Named local-kind
+  sources such as backup roots now remain local without collapsing their
+  stable source IDs; incomplete legacy conversation metadata no longer
+  overwrites authoritative source-registry kinds, while exact-source filters
+  and source menus still preserve those identities (bead `rril3`, follow-up to
+  `5bf29`).
 - Bounded lexical-rebuild preparation by the cumulative per-conversation
   content ceiling, made the guardrail fallback prepare one conversation at a
   time, and compiled CASS's projection to FrankenSQLite's

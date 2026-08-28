@@ -3000,7 +3000,8 @@ fn source_display_label(source_id: &str, origin_host: Option<&str>) -> String {
 }
 
 fn hit_is_local_source(hit: &SearchHit) -> bool {
-    hit_source_id_display(hit) == crate::sources::provenance::LOCAL_SOURCE_ID
+    normalized_source_kind(Some(hit.origin_kind.as_str()), hit.source_id.as_str())
+        == crate::sources::provenance::LOCAL_SOURCE_ID
 }
 
 fn normalized_source_kind(origin_kind: Option<&str>, source_id: &str) -> String {
@@ -7617,8 +7618,9 @@ impl CassApp {
     fn refresh_available_source_ids(&mut self) {
         let mut ids = BTreeSet::new();
         for hit in &self.results {
-            if !hit_is_local_source(hit) {
-                ids.insert(hit_source_id_display(hit).to_string());
+            let source_id = hit_source_id_display(hit);
+            if source_id != crate::sources::provenance::LOCAL_SOURCE_ID {
+                ids.insert(source_id.to_string());
             }
         }
         if let SourceFilter::SourceId(id) =
@@ -28481,7 +28483,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_prefers_direct_followup_file_treats_blank_local_source_as_local() {
+    fn tui_prefers_direct_followup_file_accepts_legacy_and_named_local_sources() {
         let temp = tempfile::tempdir().expect("tempdir");
         let session_path = temp.path().join("session.jsonl");
         std::fs::write(
@@ -28491,13 +28493,18 @@ mod tests {
         )
         .expect("write session");
 
-        let mut hit = make_test_hit();
-        hit.source_path = session_path.display().to_string();
-        hit.source_id = "   ".to_string();
-        hit.origin_kind = "local".to_string();
-        hit.origin_host = None;
+        for source_id in ["   ", "backup-local"] {
+            let mut hit = make_test_hit();
+            hit.source_path = session_path.display().to_string();
+            hit.source_id = source_id.to_string();
+            hit.origin_kind = "local".to_string();
+            hit.origin_host = None;
 
-        assert!(tui_prefers_direct_followup_file(&hit));
+            assert!(
+                tui_prefers_direct_followup_file(&hit),
+                "local-kind source {source_id:?} should use its live local file"
+            );
+        }
     }
 
     #[test]
@@ -28638,7 +28645,7 @@ mod tests {
     }
 
     #[test]
-    fn result_item_source_kind_prefers_displayed_local_badge_when_origin_kind_conflicts() {
+    fn result_item_source_kind_prefers_explicit_remote_kind_over_local_id() {
         let mut hit = make_test_hit();
         hit.source_id = " local ".to_string();
         hit.origin_kind = "ssh".to_string();
@@ -28646,11 +28653,11 @@ mod tests {
         let item = make_result_item(hit, 1);
 
         assert_eq!(item.source_badge(), "[local]");
-        assert_eq!(item.source_kind(), "local");
+        assert_eq!(item.source_kind(), "remote");
     }
 
     #[test]
-    fn result_item_source_kind_prefers_displayed_remote_badge_when_origin_kind_conflicts() {
+    fn result_item_source_kind_prefers_explicit_local_kind_over_named_id() {
         let mut hit = make_test_hit();
         hit.source_id = " work-laptop ".to_string();
         hit.origin_kind = "local".to_string();
@@ -28658,7 +28665,7 @@ mod tests {
         let item = make_result_item(hit, 1);
 
         assert_eq!(item.source_badge(), "[work-laptop]");
-        assert_eq!(item.source_kind(), "remote");
+        assert_eq!(item.source_kind(), "local");
     }
 
     #[test]
@@ -29744,22 +29751,30 @@ mod tests {
     }
 
     #[test]
-    fn refresh_available_source_ids_ignores_normalized_local_and_keeps_normalized_remote() {
+    fn refresh_available_source_ids_keeps_named_local_and_remote_identities() {
         let mut app = CassApp::default();
         let mut local = make_test_hit();
         local.source_id = "   ".to_string();
         local.origin_kind = "local".to_string();
         local.origin_host = None;
 
+        let mut named_local = make_test_hit();
+        named_local.source_id = "backup-local".to_string();
+        named_local.origin_kind = "local".to_string();
+        named_local.origin_host = None;
+
         let mut remote = make_test_hit();
         remote.source_id = "   ".to_string();
         remote.origin_kind = "ssh".to_string();
         remote.origin_host = Some("laptop".to_string());
 
-        app.results = vec![local, remote];
+        app.results = vec![local, named_local, remote];
         app.refresh_available_source_ids();
 
-        assert_eq!(app.available_source_ids, vec!["laptop".to_string()]);
+        assert_eq!(
+            app.available_source_ids,
+            vec!["backup-local".to_string(), "laptop".to_string()]
+        );
     }
 
     #[test]

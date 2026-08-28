@@ -3,7 +3,7 @@
 //! All functions accept a `&crate::franken_sync::Connection` and an [`AnalyticsFilter`],
 //! keeping the SQL and bucketing logic in one place for both CLI and ftui.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::franken_sync::Connection;
 use crate::franken_sync::Row;
@@ -32,7 +32,7 @@ pub fn table_exists(conn: &Connection, name: &str) -> bool {
     !rows.is_empty()
 }
 
-fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
+pub(crate) fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
     // Basic validation to prevent SQL injection.
     if !table.chars().all(|c| c.is_alphanumeric() || c == '_')
         || !column.chars().all(|c| c.is_alphanumeric() || c == '_')
@@ -222,12 +222,58 @@ fn canonical_message_metrics_from_sql(conn: &Connection) -> Option<String> {
     ))
 }
 
-fn analytics_source_filter_matches_key(filter: &SourceFilter, key: &str) -> bool {
+fn default_analytics_local_source_ids() -> BTreeSet<String> {
+    BTreeSet::from([crate::sources::provenance::LOCAL_SOURCE_ID.to_string()])
+}
+
+fn analytics_local_source_ids(conn: &Connection) -> BTreeSet<String> {
+    let mut local_source_ids = default_analytics_local_source_ids();
+    let rows = conn.query_map_collect(
+        "SELECT COALESCE(id, ''), COALESCE(kind, '') FROM sources",
+        &[],
+        |row: &Row| Ok((row.get_typed::<String>(0)?, row.get_typed::<String>(1)?)),
+    );
+    if let Ok(rows) = rows {
+        for (source_id, kind) in rows {
+            if source_id.trim().is_empty() {
+                continue;
+            }
+            let source_id = normalized_analytics_source_id_value(&source_id);
+            let kind = kind.trim();
+            if kind.is_empty() {
+                continue;
+            }
+            if kind.eq_ignore_ascii_case("local") {
+                local_source_ids.insert(source_id);
+            } else {
+                local_source_ids.remove(&source_id);
+            }
+        }
+    }
+    local_source_ids
+}
+
+fn analytics_local_source_ids_for_filter(
+    conn: &Connection,
+    filter: &SourceFilter,
+) -> BTreeSet<String> {
+    if matches!(filter, SourceFilter::Local | SourceFilter::Remote) {
+        analytics_local_source_ids(conn)
+    } else {
+        default_analytics_local_source_ids()
+    }
+}
+
+fn analytics_source_filter_matches_key(
+    filter: &SourceFilter,
+    key: &str,
+    local_source_ids: &BTreeSet<String>,
+) -> bool {
     let normalized_key = normalized_analytics_source_id_value(key);
     match filter {
         SourceFilter::All => true,
-        SourceFilter::Local => normalized_key == crate::sources::provenance::LOCAL_SOURCE_ID,
-        SourceFilter::Remote => normalized_key != crate::sources::provenance::LOCAL_SOURCE_ID,
+        SourceFilter::Local => local_source_ids.contains(&normalized_key),
+        SourceFilter::Remote => !local_source_ids.contains(&normalized_key),
         SourceFilter::Specific(source_id) => {
             normalized_key == normalized_analytics_source_id_value(source_id)
         }
@@ -239,20 +285,28 @@ fn push_source_filter_clause(
     _params: &mut Vec<ParamValue>,
     filter: &SourceFilter,
     normalized_source_sql: &str,
+    local_source_ids: &BTreeSet<String>,
 ) {
+    let local_source_literals = local_source_ids
+        .iter()
+        .map(|source_id| sql_string_literal(source_id))
+        .collect::<Vec<_>>()
+        .join(", ");
     match filter {
         SourceFilter::All => {}
         SourceFilter::Local => {
-            parts.push(format!(
-                "{normalized_source_sql} = {}",
-                sql_string_literal(crate::sources::provenance::LOCAL_SOURCE_ID)
-            ));
+            if local_source_ids.is_empty() {
+                parts.push("0 = 1".to_string());
+            } else {
+                parts.push(format!("{normalized_source_sql} IN ({local_source_literals})"));
+            }
         }
         SourceFilter::Remote => {
-            parts.push(format!(
-                "{normalized_source_sql} != {}",
-                sql_string_literal(crate::sources::provenance::LOCAL_SOURCE_ID)
-            ));
+            if !local_source_ids.is_empty() {
+                parts.push(format!(
+                    "{normalized_source_sql} NOT IN ({local_source_literals})"
+                ));
+            }
         }
         SourceFilter::Specific(source_id) => {
             let normalized_source_id = normalized_analytics_source_id_value(source_id);
@@ -301,6 +355,7 @@ fn build_where_parts_for_columns<'a>(
     agent_column_sql: Option<String>,
     source_column_sql: String,
     workspace_column: Option<&'a str>,
+    local_source_ids: &BTreeSet<String>,
 ) -> (Vec<String>, Vec<ParamValue>) {
     let mut parts: Vec<String> = Vec::new();
     let mut params: Vec<ParamValue> = Vec::new();
@@ -333,7 +388,13 @@ fn build_where_parts_for_columns<'a>(
         }
     }
 
-    push_source_filter_clause(&mut parts, &mut params, &filter.source, &source_column_sql);
+    push_source_filter_clause(
+        &mut parts,
+        &mut params,
+        &filter.source,
+        &source_column_sql,
+        local_source_ids,
+    );
 
     if let Some(workspace_column) = workspace_column
         && !filter.workspace_ids.is_empty()
@@ -357,17 +418,20 @@ fn build_where_parts_for_columns<'a>(
 }
 
 fn build_filtered_where_sql<'a>(
+    conn: &Connection,
     filter: &'a AnalyticsFilter,
     workspace_column: Option<&'a str>,
     agent_column_sql: Option<String>,
     source_column_sql: String,
     time_column: Option<AnalyticsTimeColumn<'a>>,
 ) -> (String, Vec<ParamValue>) {
+    let local_source_ids = analytics_local_source_ids_for_filter(conn, &filter.source);
     let (mut parts, params) = build_where_parts_for_columns(
         filter,
         agent_column_sql,
         source_column_sql,
         workspace_column,
+        &local_source_ids,
     );
 
     match time_column {
@@ -423,11 +487,28 @@ pub fn build_where_parts<'a>(
     filter: &'a AnalyticsFilter,
     workspace_column: Option<&'a str>,
 ) -> (Vec<String>, Vec<ParamValue>) {
+    let local_source_ids = default_analytics_local_source_ids();
     build_where_parts_for_columns(
         filter,
         Some(normalized_analytics_agent_sql_expr("agent_slug")),
         normalized_analytics_source_id_sql_expr("source_id"),
         workspace_column,
+        &local_source_ids,
+    )
+}
+
+fn build_where_parts_for_connection<'a>(
+    conn: &Connection,
+    filter: &'a AnalyticsFilter,
+    workspace_column: Option<&'a str>,
+) -> (Vec<String>, Vec<ParamValue>) {
+    let local_source_ids = analytics_local_source_ids_for_filter(conn, &filter.source);
+    build_where_parts_for_columns(
+        filter,
+        Some(normalized_analytics_agent_sql_expr("agent_slug")),
+        normalized_analytics_source_id_sql_expr("source_id"),
+        workspace_column,
+        &local_source_ids,
     )
 }
 fn message_metrics_time_sql(conn: &Connection) -> Option<String> {
@@ -608,6 +689,7 @@ fn query_table_stats_from_source<'a>(
     }
 
     let (where_sql, params) = build_filtered_where_sql(
+        conn,
         filter,
         workspace_column,
         agent_column_sql,
@@ -661,6 +743,7 @@ fn query_total_messages_filtered(conn: &Connection, filter: &AnalyticsFilter) ->
         "COALESCE(m.created_at, c.started_at, 0)"
     };
     let (where_sql, params) = build_filtered_where_sql(
+        conn,
         filter,
         Some("c.workspace_id"),
         has_agents.then(|| normalized_analytics_agent_sql_expr("a.slug")),
@@ -691,6 +774,7 @@ fn query_message_metrics_filtered_count(
         .map(AnalyticsTimeColumn::TimestampMs)
         .unwrap_or(AnalyticsTimeColumn::Day("mm.day_id"));
     let (where_sql, params) = build_filtered_where_sql(
+        conn,
         filter,
         Some("mm.workspace_id"),
         Some(normalized_analytics_agent_sql_expr("mm.agent_slug")),
@@ -724,6 +808,7 @@ fn query_token_usage_filtered_count(
         .map(AnalyticsTimeColumn::TimestampMs)
         .unwrap_or(AnalyticsTimeColumn::Day("tu.day_id"));
     let (where_sql, params) = build_filtered_where_sql(
+        conn,
         filter,
         Some("tu.workspace_id"),
         agent_sql,
@@ -907,6 +992,7 @@ fn query_track_a_rollup_status_with_message_metrics_fallback(
     let message_metrics_agent_sql = normalized_analytics_agent_sql_expr("mm.agent_slug");
     let message_metrics_time_sql = message_metrics_time_sql(conn);
     let (where_sql, params) = build_filtered_where_sql(
+        conn,
         filter,
         Some("mm.workspace_id"),
         Some(message_metrics_agent_sql.clone()),
@@ -966,6 +1052,7 @@ fn query_token_daily_stats_status(conn: &Connection, filter: &AnalyticsFilter) -
     let token_usage_model_sql = normalized_analytics_model_family_sql_expr("tu.model_family");
     let token_usage_time_sql = token_usage_time_sql(conn);
     let (where_sql, params) = build_filtered_where_sql(
+        conn,
         filter,
         Some("tu.workspace_id"),
         Some(token_usage_agent_sql.clone()),
@@ -1290,7 +1377,8 @@ pub fn query_tokens_timeseries(
     let (day_min, day_max) = bucketing::resolve_day_range(filter);
     let (hour_min, hour_max) = bucketing::resolve_hour_range(filter);
 
-    let (dim_parts, dim_params) = build_where_parts(filter, Some("workspace_id"));
+    let (dim_parts, dim_params) =
+        build_where_parts_for_connection(conn, filter, Some("workspace_id"));
     let mut where_parts = dim_parts;
     let mut bind_values = dim_params;
 
@@ -1500,6 +1588,7 @@ fn query_track_a_timeseries_from_raw(
         "COALESCE(m.created_at, c.started_at, 0)"
     };
     let (where_sql, params) = build_filtered_where_sql(
+        conn,
         &filter_for_sql,
         Some("c.workspace_id"),
         has_agents.then(|| normalized_analytics_agent_sql_expr("a.slug")),
@@ -1639,10 +1728,15 @@ fn query_track_a_timeseries_from_raw(
         })
         .map_err(|e| analytics_query_error("Analytics query failed", e))?;
 
+    let local_source_ids = analytics_local_source_ids_for_filter(conn, &filter.source);
     let mut grouped_buckets: BTreeMap<i64, UsageBucket> = BTreeMap::new();
     for (source_id, origin_host, bucket_id, bucket) in row_buckets {
         let normalized_key = normalized_analytics_source_identity_value(&source_id, &origin_host);
-        if !analytics_source_filter_matches_key(&filter.source, &normalized_key) {
+        if !analytics_source_filter_matches_key(
+            &filter.source,
+            &normalized_key,
+            &local_source_ids,
+        ) {
             continue;
         }
         grouped_buckets.entry(bucket_id).or_default().merge(&bucket);
@@ -1741,6 +1835,7 @@ fn query_cost_timeseries_from_token_usage(
         .map(AnalyticsTimeColumn::TimestampMs)
         .unwrap_or(AnalyticsTimeColumn::Day("tu.day_id"));
     let (where_sql, params) = build_filtered_where_sql(
+        conn,
         filter,
         Some("tu.workspace_id"),
         token_usage_agent_sql,
@@ -1936,7 +2031,7 @@ pub fn query_cost_timeseries(
 
     // Build WHERE clause — Track B only has day_id (no hourly equivalent).
     let (day_min, day_max) = bucketing::resolve_day_range(filter);
-    let (dim_parts, dim_params) = build_where_parts(filter, None);
+    let (dim_parts, dim_params) = build_where_parts_for_connection(conn, filter, None);
     let mut where_parts = dim_parts;
     let mut bind_values = dim_params;
 
@@ -2173,6 +2268,7 @@ fn query_track_b_breakdown_from_token_usage(
         .map(AnalyticsTimeColumn::TimestampMs)
         .unwrap_or(AnalyticsTimeColumn::Day("tu.day_id"));
     let (where_sql, params) = build_filtered_where_sql(
+        conn,
         filter,
         Some("tu.workspace_id"),
         Some(token_usage_agent_sql.clone()),
@@ -2335,6 +2431,7 @@ fn query_track_a_breakdown_from_raw(
         "COALESCE(m.created_at, c.started_at, 0)"
     };
     let (where_sql, params) = build_filtered_where_sql(
+        conn,
         &filter_for_sql,
         Some("c.workspace_id"),
         has_agents.then(|| normalized_analytics_agent_sql_expr("a.slug")),
@@ -2469,11 +2566,16 @@ fn query_track_a_breakdown_from_raw(
         })
         .map_err(|e| analytics_query_error("Breakdown query failed", e))?;
 
+    let local_source_ids = analytics_local_source_ids_for_filter(conn, &filter.source);
     let mut grouped_buckets: BTreeMap<String, UsageBucket> = BTreeMap::new();
     for (source_id, origin_host, dim_key, bucket) in row_buckets {
         let normalized_source_key =
             normalized_analytics_source_identity_value(&source_id, &origin_host);
-        if !analytics_source_filter_matches_key(&filter.source, &normalized_source_key) {
+        if !analytics_source_filter_matches_key(
+            &filter.source,
+            &normalized_source_key,
+            &local_source_ids,
+        ) {
             continue;
         }
 
@@ -2589,7 +2691,8 @@ pub fn query_breakdown(
         filter.clone()
     };
     let (day_min, day_max) = bucketing::resolve_day_range(filter);
-    let (dim_parts, dim_params) = build_where_parts(
+    let (dim_parts, dim_params) = build_where_parts_for_connection(
+        conn,
         &filter_for_sql,
         if use_track_b {
             None
@@ -2656,7 +2759,10 @@ pub fn query_breakdown(
     };
 
     if matches!(dim, Dim::Source) {
-        rows.retain(|row| analytics_source_filter_matches_key(&filter.source, &row.key));
+        let local_source_ids = analytics_local_source_ids_for_filter(conn, &filter.source);
+        rows.retain(|row| {
+            analytics_source_filter_matches_key(&filter.source, &row.key, &local_source_ids)
+        });
         rows.truncate(limit);
     }
 
@@ -2979,6 +3085,7 @@ fn query_tools_from_raw(
         "COALESCE(m.created_at, c.started_at, 0)"
     };
     let (where_sql, params) = build_filtered_where_sql(
+        conn,
         &filter_for_sql,
         Some("c.workspace_id"),
         has_agents.then(|| normalized_analytics_agent_sql_expr("a.slug")),
@@ -3058,6 +3165,7 @@ fn query_tools_from_raw(
         })
         .map_err(|e| analytics_query_error("Tool report query failed", e))?;
 
+    let local_source_ids = analytics_local_source_ids_for_filter(conn, &filter.source);
     let mut grouped_rows: BTreeMap<String, (i64, i64, i64, i64)> = BTreeMap::new();
     for (
         source_id,
@@ -3070,7 +3178,11 @@ fn query_tools_from_raw(
     {
         let normalized_source_key =
             normalized_analytics_source_identity_value(&source_id, &origin_host);
-        if !analytics_source_filter_matches_key(&filter.source, &normalized_source_key) {
+        if !analytics_source_filter_matches_key(
+            &filter.source,
+            &normalized_source_key,
+            &local_source_ids,
+        ) {
             continue;
         }
 
@@ -3165,7 +3277,8 @@ pub fn query_tools(
     // Build WHERE clause.
     let (day_min, day_max) = bucketing::resolve_day_range(filter);
     let (hour_min, hour_max) = bucketing::resolve_hour_range(filter);
-    let (dim_parts, dim_params) = build_where_parts(filter, Some("workspace_id"));
+    let (dim_parts, dim_params) =
+        build_where_parts_for_connection(conn, filter, Some("workspace_id"));
     let mut where_parts = dim_parts;
     let mut bind_values = dim_params;
 
@@ -3325,11 +3438,13 @@ pub fn query_session_scatter(
     } else {
         normalized_analytics_source_id_sql_expr("c.source_id")
     };
+    let local_source_ids = analytics_local_source_ids_for_filter(conn, &filter.source);
     push_source_filter_clause(
         &mut where_parts,
         &mut bind_values,
         &filter.source,
         &normalized_source_sql,
+        &local_source_ids,
     );
 
     // Workspace filters.
@@ -3689,7 +3804,7 @@ mod tests {
         let (parts, params) = build_where_parts(&f, None);
         assert_eq!(parts.len(), 1);
         assert!(parts[0].contains("CASE WHEN TRIM(COALESCE(source_id, '')) = ''"));
-        assert!(parts[0].contains("= 'local'"));
+        assert!(parts[0].contains("IN ('local')"));
         assert!(params.is_empty());
     }
 
@@ -3702,8 +3817,55 @@ mod tests {
         let (parts, params) = build_where_parts(&f, None);
         assert_eq!(parts.len(), 1);
         assert!(parts[0].contains("CASE WHEN TRIM(COALESCE(source_id, '')) = ''"));
-        assert!(parts[0].contains("!= 'local'"));
+        assert!(parts[0].contains("NOT IN ('local')"));
         assert!(params.is_empty());
+    }
+
+    #[test]
+    fn source_filter_predicates_handle_an_explicitly_empty_local_set() {
+        let mut parts = Vec::new();
+        let mut params = Vec::new();
+        let local_source_ids = BTreeSet::new();
+
+        push_source_filter_clause(
+            &mut parts,
+            &mut params,
+            &SourceFilter::Local,
+            "source_id",
+            &local_source_ids,
+        );
+        assert_eq!(parts, vec!["0 = 1".to_string()]);
+        assert!(params.is_empty());
+
+        parts.clear();
+        push_source_filter_clause(
+            &mut parts,
+            &mut params,
+            &SourceFilter::Remote,
+            "source_id",
+            &local_source_ids,
+        );
+        assert!(parts.is_empty());
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn blank_registered_kind_preserves_canonical_local_fallback() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT NOT NULL);
+             INSERT INTO sources(id, kind) VALUES ('local', '');",
+        )
+        .unwrap();
+
+        assert_eq!(
+            analytics_local_source_ids(&conn),
+            BTreeSet::from([crate::sources::provenance::LOCAL_SOURCE_ID.to_string()])
+        );
+
+        conn.execute("UPDATE sources SET kind = 'ssh' WHERE id = 'local'")
+            .unwrap();
+        assert!(analytics_local_source_ids(&conn).is_empty());
     }
 
     #[test]
@@ -3743,7 +3905,7 @@ mod tests {
         assert_eq!(parts.len(), 2);
         assert!(parts[0].contains("TRIM(COALESCE(agent_slug, ''))"));
         assert!(parts[0].contains("'codex'"));
-        assert!(parts[1].contains("= 'local'"));
+        assert!(parts[1].contains("IN ('local')"));
         assert!(params.is_empty());
     }
 
@@ -5041,6 +5203,60 @@ mod tests {
             crate::metric_integrity::MetricOutcome::TrueZero
         );
         assert_eq!(result.recommended_action, "none");
+    }
+
+    #[test]
+    fn analytics_local_filter_uses_registered_source_kind_without_erasing_source_id() {
+        let conn = setup_status_filter_db();
+        conn.execute_batch(
+            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT NOT NULL);
+             INSERT INTO sources(id, kind) VALUES
+                ('local', 'local'),
+                ('desktop-local', 'local'),
+                ('remote-ci', 'ssh');
+             UPDATE conversations SET source_id = 'desktop-local' WHERE id = 1;
+             UPDATE message_metrics SET source_id = 'desktop-local' WHERE agent_slug = 'codex';
+             UPDATE usage_hourly SET source_id = 'desktop-local' WHERE agent_slug = 'codex';
+             UPDATE usage_daily SET source_id = 'desktop-local' WHERE agent_slug = 'codex';
+             UPDATE token_usage SET source_id = 'desktop-local' WHERE agent_id = 1;
+             UPDATE token_daily_stats SET source_id = 'desktop-local' WHERE agent_slug = 'codex';",
+        )
+        .unwrap();
+
+        let local_filter = AnalyticsFilter {
+            source: SourceFilter::Local,
+            ..AnalyticsFilter::default()
+        };
+        let local_status = query_status(&conn, &local_filter).unwrap();
+        assert_eq!(local_status.coverage.total_messages, 2);
+        assert_eq!(status_table_row_count(&local_status, "usage_daily"), 1);
+        assert_eq!(status_table_row_count(&local_status, "token_daily_stats"), 1);
+
+        let local_sources = query_breakdown(
+            &conn,
+            &local_filter,
+            Dim::Source,
+            Metric::MessageCount,
+            10,
+        )
+        .unwrap();
+        assert_eq!(local_sources.rows.len(), 1);
+        assert_eq!(local_sources.rows[0].key, "desktop-local");
+        assert_eq!(local_sources.rows[0].value, 2);
+
+        let remote_filter = AnalyticsFilter {
+            source: SourceFilter::Remote,
+            ..AnalyticsFilter::default()
+        };
+        let remote_status = query_status(&conn, &remote_filter).unwrap();
+        assert_eq!(remote_status.coverage.total_messages, 1);
+
+        let specific_filter = AnalyticsFilter {
+            source: SourceFilter::Specific("desktop-local".to_string()),
+            ..AnalyticsFilter::default()
+        };
+        let specific_status = query_status(&conn, &specific_filter).unwrap();
+        assert_eq!(specific_status.coverage.total_messages, 2);
     }
 
     #[test]

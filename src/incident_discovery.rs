@@ -326,6 +326,7 @@ struct CandidateConversation {
     workspace_id: Option<i64>,
     source_path: String,
     source_id: String,
+    origin_kind: String,
     origin_host: Option<String>,
     effective_started_at: i64,
 }
@@ -366,6 +367,15 @@ fn normalized_source_identity(source_id: &str, origin_host: Option<&str>) -> Str
     }
 }
 
+fn candidate_is_local(candidate: &CandidateConversation) -> bool {
+    let origin_kind = candidate.origin_kind.trim();
+    if origin_kind.is_empty() {
+        normalized_source_id(&candidate.source_id) == "local"
+    } else {
+        origin_kind.eq_ignore_ascii_case("local")
+    }
+}
+
 fn normalize_epoch_millis(timestamp: i64) -> i64 {
     if (0..100_000_000_000).contains(&timestamp) {
         timestamp.saturating_mul(1_000)
@@ -380,6 +390,14 @@ fn query_candidate_conversations(
     started: Instant,
     budget_ms: u64,
 ) -> Result<CandidateWindow> {
+    let origin_kind_sql = if crate::analytics::query::table_exists(conn, "sources")
+        && crate::analytics::query::table_has_column(conn, "sources", "id")
+        && crate::analytics::query::table_has_column(conn, "sources", "kind")
+    {
+        "COALESCE((SELECT s.kind FROM sources s WHERE s.id = c.source_id LIMIT 1), '')"
+    } else {
+        "''"
+    };
     let query_limit = max_files.min(CONVERSATION_QUERY_HARD_CAP).saturating_add(1);
     let query_limit = usize::try_from(query_limit).unwrap_or(usize::MAX);
     let mut candidates = Vec::with_capacity(query_limit.min(CONVERSATION_BATCH_ROWS));
@@ -418,6 +436,7 @@ fn query_candidate_conversations(
                     c.source_path,
                     COALESCE(c.source_id, ''),
                     c.origin_host,
+                    {origin_kind_sql},
                     COALESCE(c.started_at, c.ended_at, 0)
                FROM conversations c
                {where_clause}
@@ -435,8 +454,9 @@ fn query_candidate_conversations(
                     workspace_id: row.get_typed(3)?,
                     source_path: row.get_typed(4)?,
                     source_id: normalized_source_identity(&raw_source_id, origin_host.as_deref()),
+                    origin_kind: row.get_typed(7)?,
                     origin_host,
-                    effective_started_at: normalize_epoch_millis(row.get_typed(7)?),
+                    effective_started_at: normalize_epoch_millis(row.get_typed(8)?),
                 })
             })
             .context("querying bounded incident candidate conversation page")?;
@@ -483,8 +503,8 @@ fn candidate_matches_filter(candidate: &CandidateConversation, filter: &Analytic
 
     match &filter.source {
         SourceFilter::All => true,
-        SourceFilter::Local => candidate.source_id == "local",
-        SourceFilter::Remote => candidate.source_id != "local",
+        SourceFilter::Local => candidate_is_local(candidate),
+        SourceFilter::Remote => !candidate_is_local(candidate),
         SourceFilter::Specific(source_id) => candidate.source_id == normalized_source_id(source_id),
     }
 }
@@ -544,7 +564,7 @@ fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> (&str, bool) {
 }
 
 fn existence_state(candidate: &CandidateConversation) -> SessionExistsState {
-    if normalized_source_id(&candidate.source_id) != "local" {
+    if !candidate_is_local(candidate) {
         // A remote archive path is not a live path on this machine. Without an
         // explicit remote liveness receipt, existence is honestly unknown.
         return SessionExistsState::Unknown;
@@ -1125,6 +1145,62 @@ mod tests {
                 .iter()
                 .all(|session| session.conversation_id != 4)
         );
+    }
+
+    #[test]
+    fn live_scanner_classifies_registered_local_source_id_by_kind() {
+        let conn = incident_db();
+        conn.execute_batch(
+            "CREATE TABLE sources (
+                 id TEXT PRIMARY KEY,
+                 kind TEXT NOT NULL
+             );
+             INSERT INTO sources(id, kind) VALUES
+                 ('local', 'local'),
+                 ('desktop-local', 'local'),
+                 ('remote-ts1', 'ssh');
+             INSERT INTO conversations(
+                 id, agent_id, workspace_id, source_id, external_id,
+                 source_path, started_at, origin_host
+             ) VALUES (4, 1, 10, 'desktop-local', 'desktop-session',
+                 '/definitely/missing/private/desktop.jsonl', 400, NULL);
+             INSERT INTO messages(id, conversation_id, idx, content) VALUES
+                 (5, 4, 0, 'cass index failed because database is locked');",
+        )
+        .unwrap();
+
+        let local_filter = AnalyticsFilter {
+            source: SourceFilter::Local,
+            ..AnalyticsFilter::default()
+        };
+        let local = scan_incidents(&conn, &local_filter, scan_caps(), 10, None).unwrap();
+        let desktop = local
+            .top_sessions
+            .iter()
+            .find(|session| session.conversation_id == 4)
+            .expect("registered local-kind source must pass the local filter");
+        assert_eq!(desktop.source_id, "desktop-local");
+        assert_eq!(desktop.exists_state, SessionExistsState::ArchiveOnly);
+
+        let remote_filter = AnalyticsFilter {
+            source: SourceFilter::Remote,
+            ..AnalyticsFilter::default()
+        };
+        let remote = scan_incidents(&conn, &remote_filter, scan_caps(), 10, None).unwrap();
+        assert!(
+            remote
+                .top_sessions
+                .iter()
+                .all(|session| session.conversation_id != 4)
+        );
+
+        let specific_filter = AnalyticsFilter {
+            source: SourceFilter::Specific("desktop-local".to_string()),
+            ..AnalyticsFilter::default()
+        };
+        let specific = scan_incidents(&conn, &specific_filter, scan_caps(), 10, None).unwrap();
+        assert_eq!(specific.total_sessions, 1);
+        assert_eq!(specific.top_sessions[0].conversation_id, 4);
     }
 
     #[test]
