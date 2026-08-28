@@ -20,11 +20,90 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 > crates.io `0.7.0` was published from commit `1f6cdcf9` on 2026-08-25.
 > Subsequent correctness and release-hardening changes on `main` target
 > `0.7.1`; do not tag a later commit as `v0.7.0`.
+>
+> No `v0.7.1` git tag or GitHub Release exists yet. The entries below describe
+> the current release candidate on `main`, not already-published binaries.
 
-## [v0.7.1] -- 2026-08-25
+### Added
+
+- Added OS-native scheduled maintenance and stale-on-read catch-up, with
+  launchd/systemd installation, bounded nightly model backfill, machine-pressure
+  gates, daemon-driven refresh, truthful robot metadata, and a pure-read
+  `search --no-maintenance` escape hatch
+  ([`81516c01`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/81516c01),
+  [`f58d9f61`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/f58d9f61),
+  [`fdac5715`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/fdac5715)).
+- Replaced full-copy raw-mirror snapshots for sources at least 8 MiB with
+  byte-exact 4 MiB content-addressed chunks. Growing JSONL and mutable SQLite
+  sources now reuse unchanged regions across versions; verification,
+  reconstruction, pruning, doctor diagnostics, and legacy whole-blob manifests
+  all understand the mixed layout
+  ([`402515f8`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/402515f8),
+  [`56a5ad57`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/56a5ad57),
+  [#430](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/430)).
+- Added per-archive protocol-v2 daemon attestation for embedding and reranking,
+  including pinned connection identity, auto-spawned verified rerank clients,
+  and explicit local fallback when attestation cannot be established
+  ([`fbabc4e2`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/fbabc4e2),
+  [`2139e73e`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/2139e73e)).
+- Added a binary-only `selftest` error/JSON contract so packaging gates can
+  distinguish executable failure from archive readiness
+  ([`5adce792`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/5adce792)).
+
+### Changed
+
+- Advanced the registry dependency line to FrankenSQLite `0.3.11` and
+  Frankensearch `0.4.1`. This carries the Windows read-only reopen repair and
+  native Quill `LockFileEx` writer admission, and the build contract now rejects
+  a stale or mixed lockfile family
+  ([`e16d39a2`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/e16d39a2),
+  [#402](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/402),
+  [#429](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/429)).
+- Reworked analytics and daily-stat rebuilds into short keyset-paginated
+  transactions with in-memory dimension maps and canonical message-byte
+  semantics. Filtered-out pages advance the cursor, orphan messages retain the
+  former inner-join behavior, and the long rebuild-spanning write transaction is
+  gone
+  ([`58072668`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/58072668),
+  [`722f3f35`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/722f3f35),
+  [#424](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/424)).
+- Reduced indexing queue and canonical-replay memory retention, tightened
+  working-set reservations after responsiveness-governor clamps, and cached the
+  expensive macOS physical-footprint probe
+  ([`4937c134`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/4937c134),
+  [`1bfc929b`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/1bfc929b),
+  [`ac49507d`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ac49507d)).
 
 ### Fixed
 
+- Bounded lexical-rebuild preparation by the cumulative per-conversation
+  content ceiling, made the guardrail fallback prepare one conversation at a
+  time, and compiled CASS's projection to FrankenSQLite's
+  `ColumnSubstrPrefix`/`ColumnOctetLength` fast paths. Interrupted legacy
+  checkpoints with no recorded execution mode now take the count-free
+  restart-from-zero route instead of hydrating a multi-gigabyte archive during
+  phase zero
+  ([`f8d1cdb7`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/f8d1cdb7),
+  [`f273ccc4`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/f273ccc4),
+  [`bc39bf94`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/bc39bf94),
+  [#413](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/413)).
+- Made Windows startup and shutdown viable under MSVC: the binary and index
+  worker receive explicit stack budgets, cached FrankenSQLite/Quill bridge
+  runtimes shut down before CRT thread-local destruction, and platform-specific
+  path/lock code compiles without Unix-only assumptions
+  ([`d9477c69`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/d9477c69)).
+- Hardened transient search-map recovery and semantic marker handling: a
+  temporary map lock now requires a complete reopen before success, reload
+  completion observations are rate-limited and accurate, and unreadable
+  semantic markers fail closed rather than admitting stale vectors
+  ([`3fcfb995`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/3fcfb995),
+  [`d959f035`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/d959f035),
+  [`20d92acf`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/20d92acf)).
+- Secured daemon spawn-lock creation with no-follow semantics and private mode,
+  and made schedule reinstall remove obsolete jobs such as a previously enabled
+  nightly timer
+  ([`876d816e`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/876d816e),
+  [`72b15ebd`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/72b15ebd)).
 - Hardened first-class OMP v18 ownership and resume behavior for relocated XDG
   stores, named profiles, copied archives, and Pi-family ambiguity. Legacy
   identity reclassification now uses the same provider-qualified path evidence.
@@ -2155,9 +2234,8 @@ Initial development. Project scaffolding, architecture design, and first impleme
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.7.1...HEAD
-[v0.7.1]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.7.0...v0.7.1
-[v0.7.0]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.6.26...v0.7.0
+[Unreleased]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.6.26...HEAD
+[v0.7.0]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.6.26...1f6cdcf9
 [v0.6.25]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.6.24...v0.6.25
 [v0.6.24]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.6.23...v0.6.24
 [v0.2.2]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.2.1...v0.2.2
