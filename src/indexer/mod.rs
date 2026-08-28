@@ -4757,6 +4757,10 @@ fn flush_streamed_lexical_rebuild_batch(
         .iter()
         .filter(|packet| packet.diagnostics.missing_conversation_id)
         .count();
+    let chunk_packet_version = pending_batch
+        .first()
+        .map(|packet| packet.diagnostics.version)
+        .unwrap_or(LEXICAL_REBUILD_PACKET_VERSION);
     let chunk_last_message_id = pending_batch
         .iter()
         .filter_map(|packet| packet.last_message_id)
@@ -4776,6 +4780,12 @@ fn flush_streamed_lexical_rebuild_batch(
     let add_started = perf_profile.as_ref().map(|_| Instant::now());
     *indexed_docs = (*indexed_docs)
         .saturating_add(t_index.add_prebuilt_document_refs_slice(prepared_docs.as_slice())?);
+    // `prepared_docs` borrows the packet strings. Drop those views, then free
+    // the packets before publishing their byte capacity back to page prep.
+    // Releasing first lets a newly awakened worker allocate the next giant
+    // page while this batch is still resident, so the limiter temporarily
+    // undercounts the real in-flight working set (#320/#413).
+    drop(prepared_docs);
     if let Some(profile) = perf_profile {
         profile.batch_flushes = profile.batch_flushes.saturating_add(1);
         profile.batch_conversations = profile
@@ -4794,13 +4804,13 @@ fn flush_streamed_lexical_rebuild_batch(
     }
     *messages_since_commit = (*messages_since_commit).saturating_add(chunk_message_count);
     *message_bytes_since_commit = (*message_bytes_since_commit).saturating_add(chunk_message_bytes);
+    pending_batch.clear();
+    *pending_batch_message_count = 0;
+    *pending_batch_message_bytes = 0;
     flow_reservation.release_now();
     tracing::info!(
         page_size,
-        packet_version = pending_batch
-            .first()
-            .map(|packet| packet.diagnostics.version)
-            .unwrap_or(LEXICAL_REBUILD_PACKET_VERSION),
+        packet_version = chunk_packet_version,
         chunk_conversations = batch_conversations,
         chunk_messages = chunk_message_count,
         chunk_message_bytes = chunk_message_bytes,
@@ -4809,9 +4819,6 @@ fn flush_streamed_lexical_rebuild_batch(
         chunk_limit,
         "lexical rebuild flushed a streamed conversation batch"
     );
-    pending_batch.clear();
-    *pending_batch_message_count = 0;
-    *pending_batch_message_bytes = 0;
     Ok(())
 }
 
@@ -5097,6 +5104,12 @@ fn spawn_lexical_rebuild_shard_builder_workers(
                             index_size_bytes,
                             shard_message_bytes,
                         );
+                        // The reservation covers the packet heap, not merely
+                        // the Tantivy build call. Free that heap before waking
+                        // producers; otherwise a newly admitted giant page can
+                        // overlap the completed shard packets in RSS while the
+                        // limiter already reports their bytes as available.
+                        drop(work.packets);
                         flow_limiter.release(flow_reservation_bytes);
                         match result {
                             Ok(summary) => {
@@ -11734,11 +11747,13 @@ impl StreamingByteLimiter {
 
     /// Whether any thread is currently parked inside [`Self::acquire_with_wait`].
     ///
-    /// Relaxed staleness is fine for the GH#413 starvation-flush poll: a
-    /// waiter that registers just after a load is observed on the sink's next
-    /// 250 ms tick, and a stale `true` merely causes one extra (harmless)
-    /// flush of a non-empty pending batch.
+    /// Take the predicate mutex before observing the waiter count. A waiter
+    /// registers while holding this same mutex and `Condvar::wait_timeout`
+    /// releases it, so the lock handoff makes the cross-thread observation
+    /// authoritative. The starvation flush is a liveness mechanism and must
+    /// not depend on eventual visibility of an otherwise relaxed atomic poll.
     fn has_active_waiters(&self) -> bool {
+        let _state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         self.active_waiter_count.load(Ordering::Relaxed) > 0
     }
 
@@ -12194,13 +12209,16 @@ impl<'a> StreamingBatchSender<'a> {
         let message_count = self.message_count;
         let byte_reservation = self.byte_reservation;
         let conversations = std::mem::take(&mut self.conversations);
-        if let Err(_send_error) = self.tx.send(IndexMessage::Batch {
+        if let Err(send_error) = self.tx.send(IndexMessage::Batch {
             connector_name: self.connector_name,
             conversations,
             is_discovered: self.next_batch_is_discovered,
             message_count,
             byte_reservation,
         }) {
+            // `send_error` owns the rejected batch. Free it before returning
+            // that batch's capacity to other connector producers.
+            drop(send_error);
             self.flow_limiter.release(byte_reservation);
             self.message_count = 0;
             self.content_bytes = 0;
@@ -12222,6 +12240,9 @@ impl<'a> StreamingBatchSender<'a> {
 impl Drop for StreamingBatchSender<'_> {
     fn drop(&mut self) {
         if self.byte_reservation > 0 {
+            // Unflushed conversations still own the bytes represented by this
+            // reservation. Drop them before publishing capacity to peers.
+            self.conversations.clear();
             self.flow_limiter.release(self.byte_reservation);
             self.byte_reservation = 0;
         }
@@ -12886,6 +12907,11 @@ fn run_streaming_consumer(
                     defer_streaming_checkpoints,
                     progress_bump,
                 );
+                // The reservation belongs to these retained conversation
+                // trees. Drop them before waking blocked producers so the
+                // queue's byte counter never advertises memory that is still
+                // live in this consumer arm (#320).
+                drop(combined_conversations);
                 flow_limiter.release(combined_byte_reservation);
                 ingest_outcome = ingest_outcome.accumulate(batch_outcome?);
 

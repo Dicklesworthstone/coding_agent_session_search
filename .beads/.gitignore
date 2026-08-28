@@ -50,3 +50,9 @@ issues.jsonl.pre-*
 # .beads.db.schema-migration-<ts>-<pid>-0.vacuum-fsqlite-ns-{gate,use}.
 *-fsqlite-ns-gate
 *-fsqlite-ns-use
+.write.lock
+*.tmp
+
+# Local recovery snapshots (fixing-beads-problems skill; never committed)
+recovery_*/
+.br_recovery/

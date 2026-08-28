@@ -5,6 +5,7 @@
 //! `search::daemon_client` for integration with the fallback wrappers.
 
 use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -233,30 +234,24 @@ impl UdsDaemonClient {
         // Use a file lock to prevent multiple processes from spawning the daemon simultaneously
         let lock_path = daemon_spawn_guard_lock_path(&self.config.socket_path);
 
-        let lock_file = match std::fs::OpenOptions::new()
+        let mut create_options = std::fs::OpenOptions::new();
+        create_options
             .read(true)
             .write(true)
             .create_new(true)
-            .open(&lock_path)
-        {
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW);
+        let lock_file = match create_options.open(&lock_path) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Prevent symlink attacks by refusing to open symlinks.
-                if std::fs::symlink_metadata(&lock_path)
-                    .map(|m| m.file_type().is_symlink())
-                    .unwrap_or(false)
-                {
-                    return Err(DaemonError::Unavailable(
-                        "refusing to open a symlink spawn lock".to_string(),
-                    ));
-                }
-                std::fs::OpenOptions::new()
+                let mut existing_options = std::fs::OpenOptions::new();
+                existing_options
                     .read(true)
                     .write(true)
-                    .open(&lock_path)
-                    .map_err(|e| {
-                        DaemonError::Unavailable(format!("failed to open spawn lock: {}", e))
-                    })?
+                    .custom_flags(libc::O_NOFOLLOW);
+                existing_options.open(&lock_path).map_err(|e| {
+                    DaemonError::Unavailable(format!("failed to open spawn lock: {}", e))
+                })?
             }
             Err(e) => {
                 return Err(DaemonError::Unavailable(format!(
@@ -265,6 +260,14 @@ impl UdsDaemonClient {
                 )));
             }
         };
+        let lock_metadata = lock_file.metadata().map_err(|error| {
+            DaemonError::Unavailable(format!("failed to inspect spawn lock: {error}"))
+        })?;
+        if !lock_metadata.file_type().is_file() || lock_metadata.nlink() != 1 {
+            return Err(DaemonError::Unavailable(
+                "refusing to use a non-regular or multiply-linked spawn lock".to_string(),
+            ));
+        }
 
         // Acquire exclusive lock (blocks until available) so concurrent clients
         // don't all try to auto-spawn the daemon at once.

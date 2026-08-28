@@ -6,7 +6,9 @@
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{
+    DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt,
+};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -520,32 +522,32 @@ impl ModelDaemon {
         // Use a file lock to ensure only one daemon instance runs for this socket path
         let lock_path = daemon_run_lock_path(&self.config.socket_path);
 
-        let mut lock_file = match std::fs::OpenOptions::new()
+        let mut create_options = std::fs::OpenOptions::new();
+        create_options
             .read(true)
             .write(true)
             .create_new(true)
-            .open(&lock_path)
-        {
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW);
+        let mut lock_file = match create_options.open(&lock_path) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Prevent symlink attacks by refusing to open symlinks.
-                // TOCTOU window exists here but is significantly reduced.
-                if std::fs::symlink_metadata(&lock_path)?
-                    .file_type()
-                    .is_symlink()
-                {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        "refusing to open a symlink lock file",
-                    ));
-                }
-                std::fs::OpenOptions::new()
+                let mut existing_options = std::fs::OpenOptions::new();
+                existing_options
                     .read(true)
                     .write(true)
-                    .open(&lock_path)?
+                    .custom_flags(libc::O_NOFOLLOW);
+                existing_options.open(&lock_path)?
             }
             Err(e) => return Err(e),
         };
+        let lock_metadata = lock_file.metadata()?;
+        if !lock_metadata.file_type().is_file() || lock_metadata.nlink() != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "refusing to use a non-regular or multiply-linked daemon run lock",
+            ));
+        }
 
         // Acquire exclusive lock (non-blocking to fail fast if another daemon is already running)
         if lock_file.try_lock_exclusive().is_err() {
