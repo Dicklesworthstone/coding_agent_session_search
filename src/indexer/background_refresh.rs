@@ -16,6 +16,9 @@
 //!   searches against a busy session directory from re-spawning the indexer
 //!   every time a file changes. The active-writer window inside the indexer
 //!   already defers files that are still being written.
+//! * **Bounded surprise work.** Interactive reads do not auto-spawn the
+//!   current full-hydration writer for archives above the configured size
+//!   ceiling. Explicit and scheduled maintenance retain their normal policy.
 //! * **Opt-out.** `CASS_AUTO_REFRESH=0` disables the behaviour entirely.
 //!
 //! The child is `cass index --background --json --no-progress-events`, which
@@ -35,6 +38,11 @@ use tracing::{debug, info, warn};
 /// Default minimum spacing between two auto-spawned catch-up runs.
 pub const DEFAULT_COOLDOWN_SECS: u64 = 300;
 
+/// Largest canonical archive that an interactive read may automatically hand
+/// to the current full-hydration writer path. Larger archives remain eligible
+/// for explicit and scheduled indexing.
+pub const DEFAULT_MAX_DB_BYTES: u64 = 1024 * 1024 * 1024;
+
 /// Default nice value applied by `cass index --background`.
 pub const DEFAULT_BACKGROUND_NICE: i32 = 15;
 
@@ -46,6 +54,7 @@ pub const DEFAULT_BACKGROUND_IONICE_CLASS: u32 = 3;
 pub struct AutoRefreshPolicy {
     pub enabled: bool,
     pub cooldown: Duration,
+    pub max_db_bytes: u64,
 }
 
 impl Default for AutoRefreshPolicy {
@@ -53,13 +62,14 @@ impl Default for AutoRefreshPolicy {
         Self {
             enabled: true,
             cooldown: Duration::from_secs(DEFAULT_COOLDOWN_SECS),
+            max_db_bytes: DEFAULT_MAX_DB_BYTES,
         }
     }
 }
 
 impl AutoRefreshPolicy {
-    /// `CASS_AUTO_REFRESH` (default on; `0`/`false`/`no`/`off` disables) and
-    /// `CASS_AUTO_REFRESH_COOLDOWN_SECS` (default 300).
+    /// Resolve the interactive auto-refresh controls. A zero byte limit opts
+    /// out of the large-archive guard without changing explicit index jobs.
     pub fn from_env() -> Self {
         let enabled = dotenvy::var("CASS_AUTO_REFRESH")
             .map(|v| {
@@ -74,7 +84,15 @@ impl AutoRefreshPolicy {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map(Duration::from_secs)
             .unwrap_or(Duration::from_secs(DEFAULT_COOLDOWN_SECS));
-        Self { enabled, cooldown }
+        let max_db_bytes = dotenvy::var("CASS_AUTO_REFRESH_MAX_DB_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_MAX_DB_BYTES);
+        Self {
+            enabled,
+            cooldown,
+            max_db_bytes,
+        }
     }
 }
 
@@ -90,6 +108,13 @@ pub enum AutoRefreshOutcome {
     IndexRunActive,
     /// A catch-up ran too recently.
     Cooldown { remaining_secs: u64 },
+    /// Interactive catch-up was refused because the canonical archive exceeds
+    /// the bounded automatic-work policy. Explicit/scheduled indexing remains
+    /// available.
+    DeferredLargeArchive {
+        db_size_bytes: u64,
+        max_db_size_bytes: u64,
+    },
     /// Another process is spawning right now.
     GuardBusy,
     /// Could not start the child process.
@@ -141,6 +166,18 @@ fn save_state(data_dir: &Path, state: &AutoRefreshState) -> std::io::Result<()> 
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+fn automatic_archive_size_deferral(
+    db_path: &Path,
+    full: bool,
+    max_db_bytes: u64,
+) -> Option<(u64, u64)> {
+    if full || max_db_bytes == 0 {
+        return None;
+    }
+    let db_size_bytes = std::fs::metadata(db_path).ok()?.len();
+    (db_size_bytes > max_db_bytes).then_some((db_size_bytes, max_db_bytes))
 }
 
 /// Decide whether a freshness snapshot (the `index_freshness` block that
@@ -312,6 +349,20 @@ pub fn maybe_spawn_with_policy(
         debug!(reason, "auto-refresh skipped: index run already active");
         return AutoRefreshOutcome::IndexRunActive;
     }
+    if let Some((db_size_bytes, max_db_size_bytes)) =
+        automatic_archive_size_deferral(db_path, full, policy.max_db_bytes)
+    {
+        debug!(
+            reason,
+            db_size_bytes,
+            max_db_size_bytes,
+            "auto-refresh deferred: canonical archive exceeds interactive size limit"
+        );
+        return AutoRefreshOutcome::DeferredLargeArchive {
+            db_size_bytes,
+            max_db_size_bytes,
+        };
+    }
     if let Err(error) = std::fs::create_dir_all(data_dir) {
         return AutoRefreshOutcome::SpawnFailed {
             error: format!("cannot create data dir {}: {error}", data_dir.display()),
@@ -449,7 +500,9 @@ mod tests {
 
     #[test]
     fn auto_refresh_is_enabled_by_default() {
-        assert!(AutoRefreshPolicy::default().enabled);
+        let policy = AutoRefreshPolicy::default();
+        assert!(policy.enabled);
+        assert_eq!(policy.max_db_bytes, DEFAULT_MAX_DB_BYTES);
     }
 
     #[test]
@@ -537,6 +590,7 @@ mod tests {
             AutoRefreshPolicy {
                 enabled: false,
                 cooldown: Duration::from_secs(1),
+                ..AutoRefreshPolicy::default()
             },
         );
         assert_eq!(outcome, AutoRefreshOutcome::Disabled);
@@ -564,6 +618,7 @@ mod tests {
             AutoRefreshPolicy {
                 enabled: true,
                 cooldown: Duration::from_secs(3600),
+                ..AutoRefreshPolicy::default()
             },
         );
         assert!(
@@ -574,6 +629,36 @@ mod tests {
             !log_path(data_dir).exists(),
             "no child must have been spawned"
         );
+    }
+
+    #[test]
+    fn large_archive_is_deferred_but_full_and_explicitly_unbounded_jobs_remain_admitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+        let db_path = data_dir.join("agent_search.db");
+        File::create(&db_path).unwrap().set_len(2).unwrap();
+        assert_eq!(
+            automatic_archive_size_deferral(&db_path, false, 1),
+            Some((2, 1))
+        );
+        assert_eq!(automatic_archive_size_deferral(&db_path, true, 1), None);
+        assert_eq!(automatic_archive_size_deferral(&db_path, false, 0), None);
+
+        let policy = AutoRefreshPolicy {
+            max_db_bytes: 1,
+            ..AutoRefreshPolicy::default()
+        };
+        let outcome = maybe_spawn_with_policy(data_dir, &db_path, "index-stale", false, policy);
+        assert_eq!(
+            outcome,
+            AutoRefreshOutcome::DeferredLargeArchive {
+                db_size_bytes: 2,
+                max_db_size_bytes: 1,
+            }
+        );
+        assert!(!log_path(data_dir).exists());
+        assert!(!guard_path(data_dir).exists());
+        assert!(!state_path(data_dir).exists());
     }
 
     #[test]

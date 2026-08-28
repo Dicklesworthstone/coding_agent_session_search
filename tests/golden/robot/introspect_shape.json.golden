@@ -61405,6 +61405,28 @@
                                             }
                                           }
                                         },
+                                        "db_size_bytes": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
+                                        "max_db_size_bytes": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
                                         "error": {
                                           "type": "object",
                                           "properties": {

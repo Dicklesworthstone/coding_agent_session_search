@@ -3474,6 +3474,11 @@
       "description": "Minimum seconds between two auto-spawned catch-up index runs per data dir."
     },
     {
+      "name": "CASS_AUTO_REFRESH_MAX_DB_BYTES",
+      "default": "1073741824",
+      "description": "Maximum canonical database size eligible for interactive stale-on-read auto-refresh. Larger archives defer to explicit or scheduled indexing; 0 disables this guard."
+    },
+    {
       "name": "CASS_BACKGROUND_NICE",
       "default": "15",
       "description": "nice value `cass index --background` applies to itself (0..=19)."

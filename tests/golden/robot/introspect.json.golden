@@ -32197,7 +32197,7 @@
                     "object",
                     "null"
                   ],
-                  "description": "Present when a stale/partial/behind index triggered stale-on-read catch-up evaluation (indexer::background_refresh). `outcome` is one of spawned | disabled | index_run_active | cooldown | guard_busy | spawn_failed.",
+                  "description": "Present when a stale/partial/behind index triggered stale-on-read catch-up evaluation (indexer::background_refresh). `outcome` is one of spawned | disabled | index_run_active | cooldown | deferred_large_archive | guard_busy | spawn_failed.",
                   "properties": {
                     "outcome": {
                       "type": "string"
@@ -32218,6 +32218,18 @@
                       ]
                     },
                     "remaining_secs": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "db_size_bytes": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "max_db_size_bytes": {
                       "type": [
                         "integer",
                         "null"

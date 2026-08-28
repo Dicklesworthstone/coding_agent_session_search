@@ -24749,6 +24749,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_DEFER_ANALYTICS_UPDATES=1             defer derived analytics writes during indexing; a pending legacy OMP rebuild resumes on a later run with this unset".to_string(),
             "  CASS_AUTO_REFRESH=0                      disable stale-on-read catch-up (detached `cass index --background` after a stale search/pack/TUI launch)".to_string(),
             "  CASS_AUTO_REFRESH_COOLDOWN_SECS=<N>      min seconds between auto-spawned catch-up runs (default 300)".to_string(),
+            "  CASS_AUTO_REFRESH_MAX_DB_BYTES=<N>       max canonical DB size for interactive auto-refresh (default 1073741824; 0 disables the size guard)".to_string(),
             "  CASS_BACKGROUND_NICE=<N>                 nice value for `cass index --background` (default 15)".to_string(),
             "  CASS_BACKGROUND_IONICE_CLASS=<N>         ionice class for `cass index --background` on Linux (default 3 = idle)".to_string(),
             "  CASS_DAEMON_INDEX_INTERVAL_SECS=<N>      resident daemon spawns an incremental background index every N s (default 0 = off)".to_string(),
@@ -87944,6 +87945,11 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
             "Minimum seconds between two auto-spawned catch-up index runs per data dir.",
         ),
         env_var_capability(
+            "CASS_AUTO_REFRESH_MAX_DB_BYTES",
+            Some("1073741824"),
+            "Maximum canonical database size eligible for interactive stale-on-read auto-refresh. Larger archives defer to explicit or scheduled indexing; 0 disables this guard.",
+        ),
+        env_var_capability(
             "CASS_BACKGROUND_NICE",
             Some("15"),
             "nice value `cass index --background` applies to itself (0..=19).",
@@ -90102,13 +90108,15 @@ fn response_schema_index_freshness() -> serde_json::Value {
             "pending_sessions": { "type": "integer" },
             "auto_refresh": {
                 "type": ["object", "null"],
-                "description": "Present when a stale/partial/behind index triggered stale-on-read catch-up evaluation (indexer::background_refresh). `outcome` is one of spawned | disabled | index_run_active | cooldown | guard_busy | spawn_failed.",
+                "description": "Present when a stale/partial/behind index triggered stale-on-read catch-up evaluation (indexer::background_refresh). `outcome` is one of spawned | disabled | index_run_active | cooldown | deferred_large_archive | guard_busy | spawn_failed.",
                 "properties": {
                     "outcome": { "type": "string" },
                     "trigger": { "type": "string" },
                     "pid": { "type": ["integer", "null"] },
                     "reason": { "type": ["string", "null"] },
                     "remaining_secs": { "type": ["integer", "null"] },
+                    "db_size_bytes": { "type": ["integer", "null"] },
+                    "max_db_size_bytes": { "type": ["integer", "null"] },
                     "error": { "type": ["string", "null"] }
                 }
             }
