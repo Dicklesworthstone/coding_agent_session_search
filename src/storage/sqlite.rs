@@ -24415,7 +24415,7 @@ mod tests {
                 .map(|idx| Message {
                     id: None,
                     idx,
-                    role: if idx.is_multiple_of(2) {
+                    role: if idx % 2 == 0 {
                         MessageRole::User
                     } else {
                         MessageRole::Agent
@@ -24524,7 +24524,7 @@ mod tests {
 
         type UsageSnapshotRow = (i64, String, i64, String, i64, i64, i64, i64);
         let usage_snapshot = || -> anyhow::Result<Vec<UsageSnapshotRow>> {
-            storage.conn.query_map_collect(
+            Ok(storage.conn.query_map_collect(
                 "SELECT day_id, agent_slug, workspace_id, source_id,
                         message_count, user_message_count,
                         assistant_message_count, content_tokens_est_total
@@ -24543,7 +24543,7 @@ mod tests {
                         row.get_typed(7)?,
                     ))
                 },
-            )
+            )?)
         };
         let resumed_usage = usage_snapshot()?;
 

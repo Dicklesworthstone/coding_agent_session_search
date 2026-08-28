@@ -28373,7 +28373,7 @@ fn run_cli_search(
                 let config = crate::search::daemon_client::DaemonRetryConfig::from_env();
                 let daemon = if semantic_opts.auto_spawn_daemon {
                     crate::daemon::client::connect_or_spawn_for_embedder(
-                        FastEmbedder::embedder_id_static(),
+                        crate::search::fastembed_embedder::FastEmbedder::embedder_id_static(),
                         &data_dir,
                     )
                     .ok()
@@ -44054,8 +44054,7 @@ fn collect_doctor_raw_mirror_report_with_thresholds_and_mode(
     }
 
     let physical_inventory = crate::raw_mirror::storage_summary(data_dir);
-    report.summary.orphan_blob_count =
-        usize::try_from(physical_inventory.orphan_blob_count).unwrap_or(usize::MAX);
+    report.summary.orphan_blob_count = physical_inventory.orphan_blob_count;
     report.summary.orphan_blob_bytes = physical_inventory.orphan_blob_bytes;
     if report.summary.orphan_blob_count > 0 {
         report.warnings.push(format!(
