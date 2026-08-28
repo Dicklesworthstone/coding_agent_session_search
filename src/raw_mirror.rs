@@ -2773,7 +2773,7 @@ pub(crate) fn verify_source_capture(
     let Some(storage) = manifest.content_storage.as_ref() else {
         return Ok(RawMirrorVerifiedCapture {
             storage_kind: "whole_blob_v1".to_string(),
-            source_content_blake3: manifest.blob_blake3,
+            source_content_blake3: manifest.blob_blake3.clone(),
             source_size_bytes: manifest.source_size_bytes,
             stored_blob_count: 1,
             stored_bytes: manifest.blob_size_bytes,

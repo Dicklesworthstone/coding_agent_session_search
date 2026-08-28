@@ -40,6 +40,12 @@ thread_local! {
     static DRIVER: RefCell<Option<Runtime>> = const { RefCell::new(None) };
 }
 
+pub(crate) fn shutdown_driver() -> bool {
+    DRIVER
+        .with(|slot| slot.borrow_mut().take())
+        .is_none_or(|runtime| runtime.shutdown_timeout(std::time::Duration::from_secs(30)))
+}
+
 /// Drive one Quill future to completion on the calling thread.
 ///
 /// The closure receives a per-call [`Cx`]. A fresh `Cx` per bridge call is

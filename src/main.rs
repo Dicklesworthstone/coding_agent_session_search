@@ -279,7 +279,18 @@ fn main() -> anyhow::Result<()> {
         asupersync::runtime::RuntimeBuilder::multi_thread().build()?
     };
 
-    match runtime.block_on(coding_agent_search::run_with_parsed(parsed)) {
+    let result = runtime.block_on(coding_agent_search::run_with_parsed(parsed));
+    // Tear down scheduler threads while normal thread operations are still
+    // available. On Windows, deferring a cached bridge runtime's final drop to
+    // the CRT thread-local destructor phase makes JoinHandle::join fail with
+    // `threads should not terminate unexpectedly` after a successful command.
+    let bridges_shutdown = coding_agent_search::shutdown_thread_local_bridge_runtimes();
+    let runtime_shutdown = runtime.shutdown_timeout(std::time::Duration::from_secs(30));
+    if !bridges_shutdown || !runtime_shutdown {
+        tracing::warn!("asupersync runtime teardown exceeded 30 seconds");
+    }
+
+    match result {
         Ok(()) => Ok(()),
         Err(err) => handle_fatal_error(err),
     }

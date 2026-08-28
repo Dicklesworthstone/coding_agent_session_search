@@ -39,6 +39,12 @@ thread_local! {
     static DRIVER: RefCell<Option<Runtime>> = const { RefCell::new(None) };
 }
 
+pub(crate) fn shutdown_driver() -> bool {
+    DRIVER
+        .with(|slot| slot.borrow_mut().take())
+        .is_none_or(|runtime| runtime.shutdown_timeout(std::time::Duration::from_secs(30)))
+}
+
 /// Drive a `!Send` fsqlite future to completion on the calling thread.
 fn drive<T>(future: impl Future<Output = T>) -> T {
     let runtime = DRIVER
