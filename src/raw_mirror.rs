@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -106,6 +106,8 @@ pub struct RawMirrorStorageSummary {
     pub unique_blob_count: u64,
     pub total_blob_bytes: u64,
     pub largest_blob_bytes: u64,
+    pub orphan_blob_count: u64,
+    pub orphan_blob_bytes: u64,
     pub missing_blob_count: u64,
     pub invalid_manifest_count: u64,
     pub oldest_capture_at_ms: Option<i64>,
@@ -134,6 +136,7 @@ pub fn storage_summary(data_dir: &Path) -> RawMirrorStorageSummary {
 
     let manifests_dir = root.join("manifests");
     let Ok(manifests_metadata) = fs::symlink_metadata(&manifests_dir) else {
+        populate_raw_mirror_orphan_summary(&root, &HashSet::new(), &mut summary);
         return summary;
     };
     if manifests_metadata.file_type().is_symlink() || !manifests_metadata.is_dir() {
@@ -217,7 +220,27 @@ pub fn storage_summary(data_dir: &Path) -> RawMirrorStorageSummary {
         }
     }
 
+    if summary.invalid_manifest_count == 0 {
+        populate_raw_mirror_orphan_summary(&root, &seen_blobs, &mut summary);
+    }
+
     summary
+}
+
+fn populate_raw_mirror_orphan_summary(
+    root: &Path,
+    referenced_blob_paths: &HashSet<String>,
+    summary: &mut RawMirrorStorageSummary,
+) {
+    let Ok(physical_blobs) = collect_raw_mirror_physical_blobs(root) else {
+        return;
+    };
+    for blob in physical_blobs {
+        if !referenced_blob_paths.contains(&blob.relative_path) {
+            summary.orphan_blob_count = summary.orphan_blob_count.saturating_add(1);
+            summary.orphan_blob_bytes = summary.orphan_blob_bytes.saturating_add(blob.size_bytes);
+        }
+    }
 }
 
 pub(crate) fn physical_storage_bytes(data_dir: &Path) -> u64 {
@@ -241,6 +264,8 @@ pub struct RawMirrorPruneReport {
     pub manifest_count: u64,
     pub unique_blob_count: u64,
     pub current_blob_bytes: u64,
+    pub orphan_blob_count: u64,
+    pub orphan_blob_bytes: u64,
     pub safety_hold_down_ms: i64,
     pub keep_tags: Vec<String>,
     pub pinned_manifest_count: u64,
@@ -277,6 +302,14 @@ struct RawMirrorPruneManifest {
     db_links: Vec<RawMirrorDbLink>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawMirrorPhysicalBlob {
+    relative_path: String,
+    blob_blake3: String,
+    size_bytes: u64,
+    modified_at_ms: Option<i64>,
+}
+
 pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirrorPruneReport> {
     let root = raw_mirror_root(data_dir);
     let mut report = RawMirrorPruneReport {
@@ -290,6 +323,8 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         manifest_count: 0,
         unique_blob_count: 0,
         current_blob_bytes: 0,
+        orphan_blob_count: 0,
+        orphan_blob_bytes: 0,
         safety_hold_down_ms: options.safety_hold_down_ms,
         keep_tags: options.keep_tags.clone(),
         pinned_manifest_count: 0,
@@ -328,6 +363,11 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
 
     let manifests = collect_prune_manifests(&root)?;
     report.manifest_count = manifests.len() as u64;
+    let physical_blobs = collect_raw_mirror_physical_blobs(&root)?;
+    let physical_blob_by_relative = physical_blobs
+        .iter()
+        .map(|blob| (blob.relative_path.clone(), blob))
+        .collect::<BTreeMap<_, _>>();
 
     let mut blob_to_manifests: HashMap<String, Vec<String>> = HashMap::new();
     let mut manifest_by_id: HashMap<String, &RawMirrorPruneManifest> = HashMap::new();
@@ -343,18 +383,42 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
                 .entry(blob_reference.blob_relative_path.clone())
                 .or_default()
                 .push(manifest.manifest_id.clone());
+            let physical = physical_blob_by_relative
+                .get(&blob_reference.blob_relative_path)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "refusing to prune because manifest {} references missing blob {}",
+                        manifest.manifest_id,
+                        blob_reference.blob_relative_path
+                    )
+                })?;
+            if physical.size_bytes != blob_reference.blob_size_bytes
+                || physical.blob_blake3 != blob_reference.blob_blake3
+            {
+                return Err(anyhow!(
+                    "refusing to prune because manifest {} disagrees with physical blob {}",
+                    manifest.manifest_id,
+                    blob_reference.blob_relative_path
+                ));
+            }
             blob_size_by_relative
                 .entry(blob_reference.blob_relative_path.clone())
-                .or_insert_with(|| {
-                    blob_file_size(root, &root.join(&blob_reference.blob_relative_path))
-                        .unwrap_or(blob_reference.blob_size_bytes)
-                });
+                .or_insert(physical.size_bytes);
         }
     }
-    report.unique_blob_count = blob_size_by_relative.len() as u64;
-    report.current_blob_bytes = blob_size_by_relative
-        .values()
-        .copied()
+    let orphan_blobs = physical_blobs
+        .iter()
+        .filter(|blob| !blob_to_manifests.contains_key(&blob.relative_path))
+        .collect::<Vec<_>>();
+    report.unique_blob_count = physical_blobs.len() as u64;
+    report.current_blob_bytes = physical_blobs
+        .iter()
+        .map(|blob| blob.size_bytes)
+        .fold(0u64, u64::saturating_add);
+    report.orphan_blob_count = orphan_blobs.len() as u64;
+    report.orphan_blob_bytes = orphan_blobs
+        .iter()
+        .map(|blob| blob.size_bytes)
         .fold(0u64, u64::saturating_add);
 
     let now = now_ms();
@@ -366,15 +430,29 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         now,
     )?;
     report.pinned_manifest_count = pinned_manifests.len() as u64;
-    let pinned_blobs: HashSet<String> = blob_to_manifests
+    let mut pinned_blobs: HashSet<String> = blob_to_manifests
         .iter()
         .filter(|(_, manifest_ids)| manifest_ids.iter().any(|id| pinned_manifests.contains(id)))
         .map(|(blob_relative_path, _)| blob_relative_path.clone())
         .collect();
+    if options.safety_hold_down_ms > 0 {
+        let hold_down_cutoff = now.saturating_sub(options.safety_hold_down_ms);
+        pinned_blobs.extend(
+            orphan_blobs
+                .iter()
+                .filter(|blob| {
+                    blob.modified_at_ms
+                        .is_none_or(|modified_at_ms| modified_at_ms > hold_down_cutoff)
+                })
+                .map(|blob| blob.relative_path.clone()),
+        );
+    }
     report.pinned_blob_count = pinned_blobs.len() as u64;
 
     let mut selected_manifests: HashSet<String> = HashSet::new();
     let mut manifest_reasons: HashMap<String, String> = HashMap::new();
+    let mut selected_orphan_blobs: HashSet<String> = HashSet::new();
+    let mut orphan_blob_reasons: HashMap<String, String> = HashMap::new();
 
     if let Some(older_than_ms) = options.older_than_ms {
         let cutoff_ms = now.saturating_sub(older_than_ms.max(0));
@@ -386,6 +464,19 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
                 manifest_reasons
                     .entry(manifest.manifest_id.clone())
                     .or_insert_with(|| format!("captured_at_ms <= {cutoff_ms}"));
+            }
+        }
+        for blob in &orphan_blobs {
+            if !pinned_blobs.contains(&blob.relative_path)
+                && blob
+                    .modified_at_ms
+                    .is_some_and(|modified_at_ms| modified_at_ms <= cutoff_ms)
+            {
+                selected_orphan_blobs.insert(blob.relative_path.clone());
+                orphan_blob_reasons.insert(
+                    blob.relative_path.clone(),
+                    format!("unreferenced blob modified_at_ms <= {cutoff_ms}"),
+                );
             }
         }
     }
@@ -406,6 +497,29 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
                         .unwrap_or(0),
                 );
             }
+        }
+        for blob in &orphan_blobs {
+            if selected_orphan_blobs.contains(&blob.relative_path) {
+                projected_bytes = projected_bytes.saturating_sub(blob.size_bytes);
+            }
+        }
+
+        for blob in &orphan_blobs {
+            if projected_bytes <= max_size_bytes {
+                break;
+            }
+            if pinned_blobs.contains(&blob.relative_path)
+                || selected_orphan_blobs.contains(&blob.relative_path)
+            {
+                continue;
+            }
+            selected_orphan_blobs.insert(blob.relative_path.clone());
+            orphan_blob_reasons
+                .entry(blob.relative_path.clone())
+                .or_insert_with(|| {
+                    "max-size over budget; reclaiming oldest unreferenced blob".to_string()
+                });
+            projected_bytes = projected_bytes.saturating_sub(blob.size_bytes);
         }
 
         for manifest in &manifests {
@@ -446,7 +560,7 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         }
     }
 
-    let selected_blobs: HashSet<String> = blob_to_manifests
+    let mut selected_blobs: HashSet<String> = blob_to_manifests
         .iter()
         .filter(|(_, manifest_ids)| {
             manifest_ids
@@ -455,16 +569,17 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         })
         .map(|(blob_relative_path, _)| blob_relative_path.clone())
         .collect();
+    selected_blobs.extend(selected_orphan_blobs);
 
     let mut entries = Vec::new();
     let mut selected_manifest_ids = selected_manifests.into_iter().collect::<Vec<_>>();
     selected_manifest_ids.sort();
-    for manifest_id in selected_manifest_ids {
-        let Some(manifest) = manifest_by_id.get(&manifest_id) else {
+    for manifest_id in &selected_manifest_ids {
+        let Some(manifest) = manifest_by_id.get(manifest_id) else {
             continue;
         };
         let reason = manifest_reasons
-            .remove(&manifest_id)
+            .remove(manifest_id)
             .unwrap_or_else(|| "selected by retention policy".to_string());
         entries.push(RawMirrorPruneEntry {
             kind: "manifest".to_string(),
@@ -482,21 +597,26 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
     let mut selected_blob_paths = selected_blobs.into_iter().collect::<Vec<_>>();
     selected_blob_paths.sort();
     for blob_relative_path in selected_blob_paths {
-        let size = blob_size_by_relative
+        let size = physical_blob_by_relative
             .get(&blob_relative_path)
-            .copied()
+            .map(|blob| blob.size_bytes)
             .unwrap_or(0);
         let blob_blake3 = blob_relative_path
             .rsplit('/')
             .next()
             .and_then(|name| name.strip_suffix(".raw"))
             .map(ToOwned::to_owned);
+        let reason = orphan_blob_reasons
+            .remove(&blob_relative_path)
+            .unwrap_or_else(|| {
+                "no retained manifest references this blob after prune plan".to_string()
+            });
         entries.push(RawMirrorPruneEntry {
             kind: "blob".to_string(),
             path: blob_relative_path,
             blob_blake3,
             size_bytes: size,
-            reason: "no retained manifest references this blob after prune plan".to_string(),
+            reason,
             applied: false,
         });
     }
@@ -511,14 +631,65 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         .map(|entry| entry.size_bytes)
         .fold(0, u64::saturating_add);
 
+    report.entries = entries;
     if options.apply {
-        for entry in &entries {
+        // A destructive apply is authority-bearing. Re-read every selected
+        // manifest and hash every blob it depends on before removing even the
+        // first file, including shared chunks that the plan retains. This
+        // prevents a prune from erasing the last useful pointer after latent
+        // content corruption or manifest drift.
+        let mut verified_blob_paths = HashSet::new();
+        for manifest_id in &selected_manifest_ids {
+            let manifest = read_validated_raw_mirror_manifest(&root, manifest_id)
+                .with_context(|| format!("preflight selected raw mirror manifest {manifest_id}"))?;
+            for reference in raw_mirror_manifest_blob_references(&manifest)? {
+                if verified_blob_paths.insert(reference.blob_relative_path.clone()) {
+                    verify_existing_blob_reference(&root, &reference).with_context(|| {
+                        format!(
+                            "preflight content checksum for selected manifest {manifest_id}"
+                        )
+                    })?;
+                }
+            }
+        }
+        for entry in report.entries.iter().filter(|entry| entry.kind == "blob") {
+            if !verified_blob_paths.insert(entry.path.clone()) {
+                continue;
+            }
+            let physical = physical_blob_by_relative.get(&entry.path).ok_or_else(|| {
+                anyhow!("preflight selected raw mirror blob disappeared: {}", entry.path)
+            })?;
+            verify_existing_blob_reference(
+                &root,
+                &RawMirrorChunkRef {
+                    blob_relative_path: physical.relative_path.clone(),
+                    blob_blake3: physical.blob_blake3.clone(),
+                    blob_size_bytes: physical.size_bytes,
+                },
+            )
+            .with_context(|| format!("preflight selected raw mirror blob {}", entry.path))?;
+        }
+        for entry in &report.entries {
             let path = root.join(&entry.path);
             validate_prune_target_file(&root, &path).with_context(|| {
                 format!("preflight raw mirror prune target {}", path.display())
             })?;
         }
-        for entry in &mut entries {
+
+        // Record and fsync the exact authority-bearing plan before removing
+        // the first file. If the process crashes or a later result append
+        // fails, the audit still contains a durable intent record for every
+        // target that may have been touched.
+        let mut audit = if report.entries.is_empty() {
+            None
+        } else {
+            let (audit_path, mut audit_file) = open_prune_audit_log(&root)?;
+            append_prune_audit_records(&mut audit_file, &audit_path, &report, "intent")?;
+            report.audit_log_path = Some(audit_path.display().to_string());
+            Some((audit_path, audit_file))
+        };
+
+        for entry in &mut report.entries {
             let path = root.join(&entry.path);
             let removed = remove_prune_target_file(&root, &path)
                 .with_context(|| format!("applying raw mirror prune for {}", path.display()))?;
@@ -534,11 +705,12 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
                     .saturating_add(entry.size_bytes);
             }
         }
-    }
-
-    report.entries = entries;
-    if !report.entries.is_empty() {
-        let audit_path = append_prune_audit_log(&root, &report)?;
+        if let Some((audit_path, audit_file)) = audit.as_mut() {
+            append_prune_audit_records(audit_file, audit_path, &report, "result")?;
+        }
+    } else if !report.entries.is_empty() {
+        let (audit_path, mut audit_file) = open_prune_audit_log(&root)?;
+        append_prune_audit_records(&mut audit_file, &audit_path, &report, "result")?;
         report.audit_log_path = Some(audit_path.display().to_string());
     }
     Ok(report)
@@ -731,14 +903,87 @@ fn load_keep_tag_conversation_ids(
     Ok(pinned)
 }
 
-fn blob_file_size(root: &Path, path: &Path) -> Option<u64> {
-    if raw_mirror_path_has_symlink_below_root(root, path) {
-        return None;
+fn collect_raw_mirror_physical_blobs(root: &Path) -> Result<Vec<RawMirrorPhysicalBlob>> {
+    let blobs_root = root.join("blobs").join(RAW_MIRROR_HASH_ALGORITHM);
+    let metadata = match fs::symlink_metadata(&blobs_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("stat raw mirror blob root {}", blobs_root.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(anyhow!(
+            "refusing to inventory invalid raw mirror blob root {}",
+            blobs_root.display()
+        ));
     }
-    fs::symlink_metadata(path)
-        .ok()
-        .filter(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
-        .map(|metadata| metadata.len())
+
+    let mut stack = vec![blobs_root];
+    let mut blobs = Vec::new();
+    while let Some(directory) = stack.pop() {
+        for entry in fs::read_dir(&directory)
+            .with_context(|| format!("read raw mirror blob directory {}", directory.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)
+                .with_context(|| format!("stat raw mirror blob inventory path {}", path.display()))?;
+            if metadata.file_type().is_symlink() {
+                return Err(anyhow!(
+                    "refusing to inventory symlinked raw mirror blob path {}",
+                    path.display()
+                ));
+            }
+            if metadata.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !metadata.is_file() {
+                return Err(anyhow!(
+                    "refusing to inventory non-file raw mirror blob path {}",
+                    path.display()
+                ));
+            }
+            if path.extension().and_then(|extension| extension.to_str())
+                != Some(RAW_MIRROR_BLOB_EXTENSION)
+            {
+                continue;
+            }
+
+            let blob_blake3 = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .ok_or_else(|| anyhow!("raw mirror blob filename is not valid UTF-8"))?
+                .to_string();
+            let expected_relative = raw_mirror_blob_relative_path(&blob_blake3)
+                .ok_or_else(|| anyhow!("raw mirror blob filename has an invalid digest"))?;
+            let actual_relative = path.strip_prefix(root).with_context(|| {
+                format!("raw mirror blob escaped inventory root {}", path.display())
+            })?;
+            if actual_relative != Path::new(&expected_relative) {
+                return Err(anyhow!(
+                    "refusing non-canonical raw mirror blob path {}; expected {}",
+                    path.display(),
+                    root.join(&expected_relative).display()
+                ));
+            }
+            blobs.push(RawMirrorPhysicalBlob {
+                relative_path: expected_relative,
+                blob_blake3,
+                size_bytes: metadata.len(),
+                modified_at_ms: metadata.modified().ok().and_then(system_time_to_ms),
+            });
+        }
+    }
+    blobs.sort_by(|left, right| {
+        left.modified_at_ms
+            .unwrap_or(i64::MAX)
+            .cmp(&right.modified_at_ms.unwrap_or(i64::MAX))
+            .then_with(|| left.relative_path.cmp(&right.relative_path))
+    });
+    Ok(blobs)
 }
 
 fn validate_prune_target_file(root: &Path, path: &Path) -> Result<bool> {
@@ -771,14 +1016,14 @@ fn remove_prune_target_file(root: &Path, path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-fn append_prune_audit_log(root: &Path, report: &RawMirrorPruneReport) -> Result<PathBuf> {
+fn open_prune_audit_log(root: &Path) -> Result<(PathBuf, File)> {
     ensure_private_dir(root)?;
     let audit_path = root.join("pruned.jsonl");
     ensure_prune_audit_log_appendable(&audit_path)?;
     let mut options = OpenOptions::new();
     options.create(true).append(true);
     configure_lock_open_options(&mut options);
-    let mut file = options
+    let file = options
         .open(&audit_path)
         .with_context(|| format!("open raw mirror prune audit {}", audit_path.display()))?;
     let opened_metadata = file
@@ -796,12 +1041,22 @@ fn append_prune_audit_log(root: &Path, report: &RawMirrorPruneReport) -> Result<
         ));
     }
     set_private_open_file_permissions(&file, &audit_path)?;
+    Ok((audit_path, file))
+}
+
+fn append_prune_audit_records(
+    file: &mut File,
+    audit_path: &Path,
+    report: &RawMirrorPruneReport,
+    phase: &str,
+) -> Result<()> {
     let now = now_ms();
     for entry in &report.entries {
         let record = json!({
             "schema_version": 1,
             "recorded_at_ms": now,
             "mode": report.mode,
+            "phase": phase,
             "kind": entry.kind,
             "path": entry.path,
             "blob_blake3": entry.blob_blake3,
@@ -812,11 +1067,11 @@ fn append_prune_audit_log(root: &Path, report: &RawMirrorPruneReport) -> Result<
         writeln!(file, "{record}")
             .with_context(|| format!("write raw mirror prune audit {}", audit_path.display()))?;
     }
-    sync_open_file_if_required(&file, || {
+    sync_open_file_if_required(file, || {
         format!("sync raw mirror prune audit {}", audit_path.display())
     })?;
-    sync_parent(&audit_path)?;
-    Ok(audit_path)
+    sync_parent(audit_path)?;
+    Ok(())
 }
 
 fn ensure_prune_audit_log_appendable(path: &Path) -> Result<()> {
@@ -4054,6 +4309,193 @@ mod tests {
     }
 
     #[test]
+    fn prune_inventories_and_reclaims_crash_orphaned_content_blobs() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let root = ensure_raw_mirror_root(&data_dir).expect("raw mirror root");
+        let orphan_bytes = b"published chunk whose manifest never committed";
+        let orphan_blake3 = blake3::hash(orphan_bytes).to_hex().to_string();
+        let orphan_relative =
+            raw_mirror_blob_relative_path(&orphan_blake3).expect("orphan blob path");
+        let orphan_path = root.join(&orphan_relative);
+        ensure_private_dir_descendant(
+            &root,
+            orphan_path.parent().expect("orphan parent"),
+        )
+        .expect("orphan parent directory");
+        fs::write(&orphan_path, orphan_bytes).expect("plant crash-orphaned blob");
+
+        let summary = storage_summary(&data_dir);
+        assert_eq!(summary.unique_blob_count, 0);
+        assert_eq!(summary.total_blob_bytes, 0);
+        assert_eq!(summary.orphan_blob_count, 1);
+        assert_eq!(summary.orphan_blob_bytes, orphan_bytes.len() as u64);
+
+        let dry_run = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                older_than_ms: Some(0),
+                safety_hold_down_ms: 0,
+                apply: false,
+                ..RawMirrorPruneOptions::default()
+            },
+        )
+        .expect("plan orphan reclaim");
+        assert_eq!(dry_run.manifest_count, 0);
+        assert_eq!(dry_run.unique_blob_count, 1);
+        assert_eq!(dry_run.current_blob_bytes, orphan_bytes.len() as u64);
+        assert_eq!(dry_run.orphan_blob_count, 1);
+        assert_eq!(dry_run.orphan_blob_bytes, orphan_bytes.len() as u64);
+        assert_eq!(dry_run.planned_manifest_count, 0);
+        assert_eq!(dry_run.planned_blob_count, 1);
+        assert!(dry_run.entries.iter().any(|entry| {
+            entry.kind == "blob"
+                && entry.path == orphan_relative
+                && entry.reason.contains("unreferenced blob")
+        }));
+        assert!(orphan_path.exists(), "dry-run must retain orphan evidence");
+
+        let applied = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                older_than_ms: Some(0),
+                safety_hold_down_ms: 0,
+                apply: true,
+                ..RawMirrorPruneOptions::default()
+            },
+        )
+        .expect("apply orphan reclaim");
+        assert_eq!(applied.applied_manifest_count, 0);
+        assert_eq!(applied.applied_blob_count, 1);
+        assert_eq!(applied.applied_reclaim_bytes, orphan_bytes.len() as u64);
+        assert!(!orphan_path.exists());
+    }
+
+    #[test]
+    fn prune_hold_down_keeps_recent_crash_orphaned_blob() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let root = ensure_raw_mirror_root(&data_dir).expect("raw mirror root");
+        let orphan_bytes = b"recent crash orphan";
+        let orphan_blake3 = blake3::hash(orphan_bytes).to_hex().to_string();
+        let orphan_relative =
+            raw_mirror_blob_relative_path(&orphan_blake3).expect("orphan blob path");
+        let orphan_path = root.join(&orphan_relative);
+        ensure_private_dir_descendant(
+            &root,
+            orphan_path.parent().expect("orphan parent"),
+        )
+        .expect("orphan parent directory");
+        fs::write(&orphan_path, orphan_bytes).expect("plant recent orphan");
+
+        let report = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                max_size_bytes: Some(0),
+                safety_hold_down_ms: 7 * 24 * 60 * 60 * 1_000,
+                apply: false,
+                ..RawMirrorPruneOptions::default()
+            },
+        )
+        .expect("plan held-down orphan");
+        assert_eq!(report.orphan_blob_count, 1);
+        assert_eq!(report.pinned_blob_count, 1);
+        assert_eq!(report.planned_blob_count, 0);
+        assert!(orphan_path.exists());
+    }
+
+    #[test]
+    fn prune_apply_hashes_orphan_before_deleting_any_evidence() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let root = ensure_raw_mirror_root(&data_dir).expect("raw mirror root");
+        let expected_bytes = b"expected orphan bytes";
+        let orphan_blake3 = blake3::hash(expected_bytes).to_hex().to_string();
+        let orphan_relative =
+            raw_mirror_blob_relative_path(&orphan_blake3).expect("orphan blob path");
+        let orphan_path = root.join(&orphan_relative);
+        ensure_private_dir_descendant(
+            &root,
+            orphan_path.parent().expect("orphan parent"),
+        )
+        .expect("orphan parent directory");
+        fs::write(&orphan_path, b"corrupted orphan byte").expect("plant corrupt orphan");
+        assert_eq!(
+            fs::metadata(&orphan_path).expect("orphan metadata").len(),
+            expected_bytes.len() as u64,
+            "fixture must preserve size so only the checksum catches corruption"
+        );
+
+        let error = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                older_than_ms: Some(0),
+                safety_hold_down_ms: 0,
+                apply: true,
+                ..RawMirrorPruneOptions::default()
+            },
+        )
+        .expect_err("checksum-drifted orphan must not be deleted");
+        assert!(
+            format!("{error:#}").contains("checksum mismatch"),
+            "unexpected corrupt-orphan error: {error:#}"
+        );
+        assert!(orphan_path.exists());
+        assert!(!root.join("pruned.jsonl").exists());
+    }
+
+    #[test]
+    fn prune_apply_hashes_selected_manifest_blobs_before_deleting_manifest() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("selected.jsonl");
+        let source_bytes = b"{\"type\":\"message\",\"text\":\"safe\"}\n";
+        fs::write(&source_path, source_bytes).expect("write source");
+        let captured = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("capture source");
+        let root = raw_mirror_root(&data_dir);
+        let manifest_path = root.join(&captured.manifest_relative_path);
+        let blob_path = root.join(&captured.blob_relative_path);
+        let mut manifest = read_raw_mirror_manifest(&manifest_path).expect("read manifest");
+        manifest.captured_at_ms = 0;
+        manifest.manifest_blake3 = Some(raw_mirror_manifest_blake3(&manifest));
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize aged manifest"),
+        )
+        .expect("age manifest fixture");
+        let mut corrupted = source_bytes.to_vec();
+        corrupted[0] ^= 1;
+        fs::write(&blob_path, &corrupted).expect("plant same-size blob corruption");
+
+        let error = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                older_than_ms: Some(0),
+                safety_hold_down_ms: 0,
+                apply: true,
+                ..RawMirrorPruneOptions::default()
+            },
+        )
+        .expect_err("corrupt selected evidence must stop prune before deletion");
+        assert!(
+            format!("{error:#}").contains("checksum mismatch"),
+            "unexpected selected-blob checksum error: {error:#}"
+        );
+        assert!(manifest_path.exists());
+        assert!(blob_path.exists());
+        assert!(!root.join("pruned.jsonl").exists());
+    }
+
+    #[test]
     fn prune_apply_refuses_a_held_index_run_lock_without_removing_evidence() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
@@ -4177,10 +4619,10 @@ mod tests {
                 max_size_bytes: None,
                 keep_tags: Vec::new(),
                 safety_hold_down_ms: 0,
-                apply: false,
+                apply: true,
             },
         ) {
-            Ok(_) => anyhow::bail!("symlinked prune audit log was accepted"),
+            Ok(_) => anyhow::bail!("symlinked prune audit log was accepted before deletion"),
             Err(err) => err,
         };
 
@@ -4300,6 +4742,8 @@ mod tests {
         assert!(!blob_path.exists());
         let audit = fs::read_to_string(root.join("pruned.jsonl")).expect("read audit");
         assert!(audit.contains("\"mode\":\"apply\""));
+        assert!(audit.contains("\"phase\":\"intent\""));
+        assert!(audit.contains("\"phase\":\"result\""));
         assert!(audit.contains("\"applied\":true"));
     }
 

@@ -9385,6 +9385,8 @@ fn run_mirror_prune(
     println!("  Manifests: {}", report.manifest_count);
     println!("  Unique blobs: {}", report.unique_blob_count);
     println!("  Current blob bytes: {}", report.current_blob_bytes);
+    println!("  Orphan blobs: {}", report.orphan_blob_count);
+    println!("  Orphan blob bytes: {}", report.orphan_blob_bytes);
     println!("  Pinned manifests: {}", report.pinned_manifest_count);
     println!("  Pinned blobs: {}", report.pinned_blob_count);
     println!("  Planned manifests: {}", report.planned_manifest_count);
@@ -32529,6 +32531,8 @@ fn run_stats(
         println!("  Manifests: {}", raw_mirror_summary.manifest_count);
         println!("  Unique blobs: {}", raw_mirror_summary.unique_blob_count);
         println!("  Blob bytes: {}", raw_mirror_summary.total_blob_bytes);
+        println!("  Orphan blobs: {}", raw_mirror_summary.orphan_blob_count);
+        println!("  Orphan blob bytes: {}", raw_mirror_summary.orphan_blob_bytes);
         println!(
             "  Largest blob bytes: {}",
             raw_mirror_summary.largest_blob_bytes
@@ -42398,6 +42402,8 @@ struct DoctorRawMirrorSummary {
     interrupted_capture_count: usize,
     duplicate_blob_reference_count: usize,
     total_blob_bytes: u64,
+    orphan_blob_count: u64,
+    orphan_blob_bytes: u64,
     amplified_source_count: usize,
     amplified_source_referenced_bytes: u64,
     amplified_source_excess_bytes: u64,
@@ -43941,6 +43947,17 @@ fn collect_doctor_raw_mirror_report_with_thresholds_and_mode(
         return report;
     }
 
+    let physical_inventory = crate::raw_mirror::storage_summary(data_dir);
+    report.summary.orphan_blob_count =
+        usize::try_from(physical_inventory.orphan_blob_count).unwrap_or(usize::MAX);
+    report.summary.orphan_blob_bytes = physical_inventory.orphan_blob_bytes;
+    if report.summary.orphan_blob_count > 0 {
+        report.warnings.push(format!(
+            "raw_mirror.orphan_blobs: {} unreferenced content-addressed blob(s) use {} bytes; inspect `cass mirror prune --older-than 7d --json` before applying cleanup",
+            report.summary.orphan_blob_count, report.summary.orphan_blob_bytes
+        ));
+    }
+
     report.summary.interrupted_capture_count = doctor_raw_mirror_count_interrupted_captures(&root);
     if report.summary.interrupted_capture_count > 0 {
         report.warnings.push(format!(
@@ -44159,6 +44176,7 @@ fn collect_doctor_raw_mirror_report_with_thresholds_and_mode(
         || report.summary.manifest_checksum_mismatch_count > 0
         || report.summary.manifest_checksum_not_recorded_count > 0
         || report.summary.interrupted_capture_count > 0
+        || report.summary.orphan_blob_count > 0
         || report.summary.amplified_source_count > 0
         || doctor_raw_mirror_size_warning(
             report.summary.total_blob_bytes,
@@ -93721,6 +93739,8 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                         "unique_blob_count": { "type": "integer" },
                         "total_blob_bytes": { "type": "integer" },
                         "largest_blob_bytes": { "type": "integer" },
+                        "orphan_blob_count": { "type": "integer" },
+                        "orphan_blob_bytes": { "type": "integer" },
                         "missing_blob_count": { "type": "integer" },
                         "invalid_manifest_count": { "type": "integer" },
                         "oldest_capture_at_ms": { "type": ["integer", "null"] },
