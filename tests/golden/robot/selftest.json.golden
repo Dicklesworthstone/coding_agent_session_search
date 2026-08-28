@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "status": "ok",
+  "functional": true,
+  "archive_accessed": false,
+  "version": "[VERSION]",
+  "contract_version": "1",
+  "latency_ms": "[LATENCY_MS]",
+  "checks": [
+    {
+      "name": "frankensqlite-in-memory-roundtrip",
+      "status": "pass",
+      "detail": "opened an in-memory frankensqlite database and round-tripped a typed value"
+    }
+  ]
+}

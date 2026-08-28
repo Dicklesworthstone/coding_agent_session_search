@@ -1,0 +1,43 @@
+{
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer"
+    },
+    "status": {
+      "type": "string"
+    },
+    "functional": {
+      "type": "boolean"
+    },
+    "archive_accessed": {
+      "type": "boolean"
+    },
+    "version": {
+      "type": "string"
+    },
+    "contract_version": {
+      "type": "string"
+    },
+    "latency_ms": {
+      "type": "integer"
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

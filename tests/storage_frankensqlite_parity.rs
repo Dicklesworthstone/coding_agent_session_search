@@ -11,7 +11,7 @@
 use coding_agent_search::model::types::{
     Agent, AgentKind, Conversation, Message, MessageRole, Snippet,
 };
-use coding_agent_search::franken_sync::compat::{ConnectionExt as _, ParamValue};
+use coding_agent_search::franken_sync::compat::{ConnectionExt as _, ParamValue, RowExt as _};
 use coding_agent_search::sources::provenance::{Source, SourceKind};
 use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, FrankenStorage, SqliteStorage};
 use serde_json::json;
@@ -155,7 +155,36 @@ fn gh402_populated_archive_reopens_readonly_after_page_reclamation_without_mutat
             .expect("count retained conversations"),
         1
     );
+    let freelist_count: i64 = storage
+        .raw()
+        .query_row_map("PRAGMA freelist_count;", &[], |row| row.get_typed(0))
+        .expect("read reclaimed-page count");
+    assert!(
+        freelist_count > 0,
+        "GH #402 fixture did not create any reclaimed pages, so it cannot discriminate the ReservedEmpty reopen regression"
+    );
     storage.close().expect("close populated archive cleanly");
+
+    // Copy only the checkpointed main database to a fresh path. The copied
+    // inode has no machine-local FrankenSQLite namespace sidecars, so the
+    // opens below exercise first contact instead of reusing the writer's
+    // already-established namespace state.
+    let first_contact_db_path = dir.path().join("reserved-empty-first-contact.db");
+    std::fs::copy(&db_path, &first_contact_db_path)
+        .expect("copy reclaimed-page archive without namespace sidecars");
+    let db_path = first_contact_db_path;
+    for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+        let sidecar = db_path.with_file_name(format!(
+            "{}{}",
+            db_path.file_name().expect("db file name").to_string_lossy(),
+            suffix
+        ));
+        assert!(
+            !sidecar.exists(),
+            "first-contact fixture unexpectedly inherited namespace sidecar {}",
+            sidecar.display()
+        );
+    }
 
     let bundle_snapshot = || {
         ["", "-wal", "-shm"]
