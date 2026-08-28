@@ -4499,6 +4499,7 @@ fn lexical_content_truncation_boundary(content: &str, cap: usize) -> usize {
 /// the rebuild pipeline's per-message accounting stays consistent — only indexed
 /// text is dropped. Emits one `lexical_content_truncated` diagnostic per affected
 /// conversation. No-op when total content is within the cap.
+#[cfg(test)]
 fn truncate_lexical_rebuild_conversation_content(
     conversation_id: i64,
     messages: &mut [Message],
@@ -10334,33 +10335,78 @@ impl FrankenStorage {
     /// conversation within budget with a truncated lexical body — lexical search
     /// needs tokens, not the full multi-megabyte blob.
     pub fn fetch_messages_for_lexical_rebuild(&self, conversation_id: i64) -> Result<Vec<Message>> {
-        let mut messages = self.fetch_messages_for_lexical_rebuild_uncapped(conversation_id)?;
-        truncate_lexical_rebuild_conversation_content(
-            conversation_id,
-            &mut messages,
-            lexical_max_conversation_content_bytes(),
-        );
+        let cap = lexical_max_conversation_content_bytes();
+        let hinted_sql = "SELECT id, idx, role, author, created_at, \
+                 substr(content, 1, ?2), COALESCE(LENGTH(CAST(content AS BLOB)), 0) \
+                 FROM messages INDEXED BY sqlite_autoindex_messages_1 \
+                 WHERE conversation_id = ?1 ORDER BY idx";
+        let fallback_sql = "SELECT id, idx, role, author, created_at, \
+                 substr(content, 1, ?2), COALESCE(LENGTH(CAST(content AS BLOB)), 0) \
+                 FROM messages \
+                 WHERE conversation_id = ?1 ORDER BY idx";
+        let (messages, original_bytes) = self
+            .stream_capped_lexical_rebuild_messages(conversation_id, cap, hinted_sql)
+            .or_else(|err| {
+                if format!("{err:#}").contains("no such index: sqlite_autoindex_messages_1")
+                {
+                    return self.stream_capped_lexical_rebuild_messages(
+                        conversation_id,
+                        cap,
+                        fallback_sql,
+                    );
+                }
+                Err(err)
+            })?;
+
+        if original_bytes > cap {
+            let capped_bytes = messages
+                .iter()
+                .map(|message| message.content.len())
+                .sum::<usize>();
+            tracing::warn!(
+                diagnostic = "lexical_content_truncated",
+                conversation_id,
+                original_bytes,
+                capped_bytes,
+                cap,
+                "lexical rebuild conversation content exceeded the per-conversation cap; streamed only the bounded indexed prefix instead of materializing the full body (#290, GH#413)"
+            );
+        }
+
         Ok(messages)
     }
 
-    /// Inner fetch without the per-conversation content cap. Kept separate so the
-    /// cap is applied at exactly one chokepoint (every lexical-rebuild content
-    /// load — batch and streaming — funnels through `fetch_messages_for_lexical_rebuild`).
-    fn fetch_messages_for_lexical_rebuild_uncapped(
+    /// Stream each lexical projection through FrankenSQLite's row callback
+    /// instead of collecting the complete result. SQL bounds the largest
+    /// projected text cell by `cap` Unicode scalar values; the callback applies
+    /// the stricter cumulative UTF-8 byte cap before retaining the row.
+    /// Consequently neither the query result nor CASS's accumulated message
+    /// text scales with the uncapped conversation body (GH#413).
+    fn stream_capped_lexical_rebuild_messages(
         &self,
         conversation_id: i64,
-    ) -> Result<Vec<Message>> {
-        let hinted_sql = "SELECT id, idx, role, author, created_at, content \
-                 FROM messages INDEXED BY sqlite_autoindex_messages_1 \
-                 WHERE conversation_id = ?1 ORDER BY idx";
-        let fallback_sql = "SELECT id, idx, role, author, created_at, content \
-                 FROM messages \
-                 WHERE conversation_id = ?1 ORDER BY idx";
-
+        cap: usize,
+        sql: &str,
+    ) -> Result<(Vec<Message>, usize)> {
+        let mut messages = Vec::new();
+        let mut original_bytes = 0usize;
+        let mut remaining_bytes = cap;
+        let character_limit = i64::try_from(cap).unwrap_or(i64::MAX).max(1);
+        let params = [
+            SqliteValue::from(conversation_id),
+            SqliteValue::from(character_limit),
+        ];
         self.conn
-            .query_map_collect(hinted_sql, fparams![conversation_id], |row| {
+            .query_with_params_for_each(sql, &params, |row| {
                 let role: String = row.get_typed(2)?;
-                Ok(Message {
+                let mut content: String = row.get_typed(5)?;
+                let content_bytes = usize::try_from(row.get_typed::<i64>(6)?.max(0))
+                    .unwrap_or(usize::MAX);
+                original_bytes = original_bytes.saturating_add(content_bytes);
+                let boundary = lexical_content_truncation_boundary(&content, remaining_bytes);
+                content.truncate(boundary);
+                remaining_bytes = remaining_bytes.saturating_sub(content.len());
+                messages.push(Message {
                     id: Some(row.get_typed(0)?),
                     idx: row.get_typed(1)?,
                     role: match role.as_str() {
@@ -10372,45 +10418,18 @@ impl FrankenStorage {
                     },
                     author: row.get_typed(3)?,
                     created_at: row.get_typed(4)?,
-                    content: row.get_typed(5)?,
+                    content,
                     extra_json: serde_json::Value::Null,
                     snippets: Vec::new(),
-                })
-            })
-            .or_else(|err| {
-                if err
-                    .to_string()
-                    .contains("no such index: sqlite_autoindex_messages_1")
-                {
-                    return self.conn.query_map_collect(
-                        fallback_sql,
-                        fparams![conversation_id],
-                        |row| {
-                            let role: String = row.get_typed(2)?;
-                            Ok(Message {
-                                id: Some(row.get_typed(0)?),
-                                idx: row.get_typed(1)?,
-                                role: match role.as_str() {
-                                    "user" => MessageRole::User,
-                                    "agent" | "assistant" => MessageRole::Agent,
-                                    "tool" => MessageRole::Tool,
-                                    "system" => MessageRole::System,
-                                    other => MessageRole::Other(other.to_string()),
-                                },
-                                author: row.get_typed(3)?,
-                                created_at: row.get_typed(4)?,
-                                content: row.get_typed(5)?,
-                                extra_json: serde_json::Value::Null,
-                                snippets: Vec::new(),
-                            })
-                        },
-                    );
-                }
-                Err(err)
+                });
+                Ok(())
             })
             .with_context(|| {
-                format!("fetching messages for lexical rebuild of conversation {conversation_id}")
-            })
+                format!(
+                    "streaming bounded lexical rebuild content for conversation {conversation_id}"
+                )
+            })?;
+        Ok((messages, original_bytes))
     }
 
     /// Fetch messages for multiple conversations during lexical rebuilds.
@@ -22238,15 +22257,13 @@ mod tests {
     /// #290: a conversation whose content exceeds the cap is admitted through the
     /// lexical-rebuild fetch with truncated content, not OOM-quarantined.
     #[test]
+    #[serial]
     fn fetch_messages_for_lexical_rebuild_truncates_oversized_conversation_content() {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use std::path::PathBuf;
 
         // Force a small, deterministic cap independent of host memory.
-        // SAFETY: single-threaded test; the env var is read on each fetch call.
-        unsafe {
-            std::env::set_var("CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES", "1024");
-        }
+        let _cap = set_env_var("CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES", "1025");
 
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("agent_search.db");
@@ -22263,7 +22280,7 @@ mod tests {
 
         // Three messages of 2 KiB each => 6 KiB total content, well over the
         // 1 KiB cap. This models an image/base64-heavy conversation.
-        let big = "x".repeat(2048);
+        let big = "é".repeat(1024);
         let conversation = Conversation {
             id: None,
             agent_slug: "claude_code".into(),
@@ -22308,21 +22325,20 @@ mod tests {
 
         // All message rows survive (count/structure intact) ...
         assert_eq!(messages.len(), 3, "message rows preserved");
-        // ... but the cumulative indexed content is capped, never the raw 6 KiB.
+        // ... but the cumulative indexed content is capped on a UTF-8 boundary,
+        // never the raw 6 KiB. A 1,025-byte cap cannot split a two-byte `é`.
         let total: usize = messages.iter().map(|m| m.content.len()).sum();
         assert_eq!(
             total, 1024,
-            "cumulative content capped at the configured cap"
+            "cumulative content capped at the largest UTF-8 boundary below the configured cap"
         );
         assert!(
             !messages[0].content.is_empty(),
             "earliest content is retained for lexical tokens"
         );
-
-        // SAFETY: single-threaded test cleanup.
-        unsafe {
-            std::env::remove_var("CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES");
-        }
+        assert_eq!(messages[0].content.len(), 1024);
+        assert!(messages[1].content.is_empty());
+        assert!(messages[2].content.is_empty());
     }
 
     #[test]

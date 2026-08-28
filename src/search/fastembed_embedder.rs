@@ -23,7 +23,8 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use super::embedder::{Embedder, EmbedderError, EmbedderResult};
-use frankensearch::{EmbeddingIdentityBundleV1, ModelCategory, ModelTier, NativeEmbedder};
+use frankensearch::core::EmbeddingIdentityBundleV1;
+use frankensearch::{ModelCategory, ModelTier, NativeEmbedder};
 
 /// Pooling strategy for the embedder configuration. The native embedder always
 /// mean-pools over every token (the sentence-transformers all-MiniLM head), so

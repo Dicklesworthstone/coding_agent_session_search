@@ -10,9 +10,8 @@ pub use frankensearch::{
     DaemonClient, DaemonConnectionIdentityV1, DaemonError, DaemonFallbackEmbedder,
     DaemonFallbackReranker, DaemonRetryConfig, NoopDaemonClient, PinnedDaemonVerifierV1,
 };
-use frankensearch::{
-    EmbeddingIdentityBundleV1, ModelCategory, ModelTier, SearchError, SearchResult, SyncEmbed,
-};
+use frankensearch::core::EmbeddingIdentityBundleV1;
+use frankensearch::{ModelCategory, ModelTier, SearchError, SearchResult, SyncEmbed};
 
 /// Local fallback whose advertised identity is pinned by the authenticated
 /// daemon connection and whose actual native model identity is checked before
