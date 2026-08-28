@@ -1,14 +1,14 @@
 //! Golden-file regression tests for cass robot-mode JSON outputs.
 //!
 //! Bead `u9osp`: cass ships a robot/LLM discovery surface via
-//! `cass capabilities --json`, `cass robot-docs --json`, `cass health --json`,
-//! and `cass models status --json`. These payloads are the contract every
+//! `cass capabilities --json`, `cass robot-docs --json`, `cass selftest --json`,
+//! `cass health --json`, and `cass models status --json`. These payloads are the contract every
 //! downstream agent consumes — a single renamed field or moved key silently
 //! breaks every consumer without failing any existing test.
 //!
 //! This file freezes the **shape** of those payloads against scrubbed golden
 //! files under `tests/golden/robot/`. Scrubbing rules live in
-//! [`scrub_robot_json`] below; see `tests/golden/robot/PROVENANCE.md` for
+//! [`scrub_robot_json`] below; see `tests/golden/PROVENANCE.md` for
 //! regeneration procedure.
 //!
 //! ## Regenerating a golden
@@ -1361,6 +1361,30 @@ fn health_shape_matches_golden() {
     let canonical =
         serde_json::to_string_pretty(&json_value_schema(&health)).expect("pretty-print JSON");
     assert_golden("robot/health_shape.json.golden", &canonical);
+}
+
+#[test]
+fn selftest_json_matches_golden() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let scrubbed = capture_robot_json(
+        test_home.path(),
+        &["selftest", "--json"],
+        ExpectStatus::ExitOk,
+    );
+    assert_golden("robot/selftest.json.golden", &scrubbed);
+}
+
+#[test]
+fn selftest_shape_matches_golden() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let selftest = capture_robot_json_value(
+        test_home.path(),
+        &["selftest", "--json"],
+        ExpectStatus::ExitOk,
+    );
+    let canonical =
+        serde_json::to_string_pretty(&json_value_schema(&selftest)).expect("pretty-print JSON");
+    assert_golden("robot/selftest_shape.json.golden", &canonical);
 }
 
 #[test]

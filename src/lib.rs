@@ -925,9 +925,8 @@ pub enum Commands {
         /// Exit code reflects only whether this executable is functional:
         /// archive readiness (stale index, active rebuild, uninitialized or
         /// degraded archive) is still fully REPORTED in the output but never
-        /// fails the exit code. For binary promotion gates and packaging
-        /// smoke tests that must validate a candidate binary on a host whose
-        /// archive happens to be stale (#398).
+        /// fails the exit code. Use `cass selftest` instead when the probe must
+        /// avoid opening the configured archive entirely (#398).
         #[arg(long, default_value_t = false)]
         binary_only: bool,
     },
@@ -3471,7 +3470,15 @@ mod robot_docs_shorthand_regression_tests {
 
     #[test]
     fn other_real_subcommands_are_not_rewritten() {
-        for sub in &["diag", "sources", "analytics", "health", "Doctor", "guide"] {
+        for sub in &[
+            "diag",
+            "sources",
+            "analytics",
+            "health",
+            "selftest",
+            "Doctor",
+            "guide",
+        ] {
             let mut rest = vec![sub.to_string(), "--json".to_string()];
             let mut corrections = Vec::new();
             recover_robot_docs_topic_shorthands(&mut rest, &mut corrections);
@@ -24551,7 +24558,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             // commands` as the authoritative CLI enumeration now see the
             // full advertised surface instead of the ~10-command slice.
             "  cass health [--json]             Minimal readiness probe (<50ms, exit 0=healthy, 1=unhealthy).".to_string(),
-            "    --binary-only     Report the same readiness verdict but exit 0 unless the executable itself fails (binary promotion gates).".to_string(),
+            "    --binary-only     Report the same archive-readiness verdict but exit 0 unless the executable itself fails; use selftest to avoid archive access.".to_string(),
             "  cass selftest [--json]           Archive-independent executable probe for package and binary-promotion gates.".to_string(),
             "  cass doctor [--json] [--fix]     Legacy spelling: --json realizes read-only check; --fix realizes safe-auto-run.".to_string(),
             "                    doctor JSON includes source_inventory; missing upstream provider files are".to_string(),
@@ -79422,6 +79429,7 @@ fn run_selftest(output_format: Option<RobotFormat>) -> CliResult<()> {
             format
         }
     });
+    let structured_output = structured_format.is_some();
     if let Some(format) = structured_format {
         output_structured_value(
             serde_json::json!({
@@ -79453,15 +79461,20 @@ fn run_selftest(output_format: Option<RobotFormat>) -> CliResult<()> {
     if functional {
         Ok(())
     } else {
-        Err(CliError {
+        let error = CliError {
             code: 1,
-            kind: CliErrorKind::Health.kind_str(),
+            kind: CliErrorKind::Selftest.kind_str(),
             message: probe_error.unwrap_or_else(|| "executable self-test failed".to_string()),
             hint: Some(
                 "Reinstall the cass binary from a checksum-verified release artifact.".to_string(),
             ),
             retryable: false,
-        })
+        };
+        if structured_output {
+            Err(CliError::already_reported_from(&error))
+        } else {
+            Err(error)
+        }
     }
 }
 

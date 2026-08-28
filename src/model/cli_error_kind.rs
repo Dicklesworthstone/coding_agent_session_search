@@ -87,6 +87,7 @@ pub enum ErrorKind {
     FileRead,
     FileWrite,
     Health,
+    Selftest,
     IdempotencyMismatch,
     Index,
     IndexBusy,
@@ -192,6 +193,7 @@ impl ErrorKind {
             Self::FileRead => "file-read",
             Self::FileWrite => "file-write",
             Self::Health => "health",
+            Self::Selftest => "selftest",
             Self::IdempotencyMismatch => "idempotency-mismatch",
             Self::Index => "index",
             Self::IndexBusy => "index-busy",
@@ -293,6 +295,7 @@ impl ErrorKind {
             "file-read" => Self::FileRead,
             "file-write" => Self::FileWrite,
             "health" => Self::Health,
+            "selftest" => Self::Selftest,
             "idempotency-mismatch" => Self::IdempotencyMismatch,
             "index" => Self::Index,
             "index-busy" => Self::IndexBusy,
@@ -394,6 +397,7 @@ impl ErrorKind {
             Self::FileRead,
             Self::FileWrite,
             Self::Health,
+            Self::Selftest,
             Self::IdempotencyMismatch,
             Self::Index,
             Self::IndexBusy,
@@ -517,10 +521,10 @@ mod tests {
     /// drift immediately at CI time.
     #[test]
     fn variant_count_matches_audited_lib_rs_kind_literals() {
-        // 92 unique kinds after the `schedule` background-indexing kind
-        // landed. If lib.rs grows a new kind, bump this count AND
-        // add the variant + arms above.
-        const AUDITED_KIND_COUNT: usize = 92;
+        // 93 unique kinds after the archive-independent selftest and the
+        // `schedule` background-indexing kind landed. If lib.rs grows a new
+        // kind, bump this count AND add the variant + arms above.
+        const AUDITED_KIND_COUNT: usize = 93;
         assert_eq!(
             ErrorKind::all_variants().len(),
             AUDITED_KIND_COUNT,

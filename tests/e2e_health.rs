@@ -1451,6 +1451,11 @@ fn selftest_is_archive_independent_and_exercises_the_database_engine() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(
+        output.stderr.is_empty(),
+        "successful structured selftest must not emit diagnostics or a second envelope: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let payload: Value = serde_json::from_slice(&output.stdout).expect("selftest json");
     assert_eq!(payload.get("status").and_then(Value::as_str), Some("ok"));
     assert_eq!(

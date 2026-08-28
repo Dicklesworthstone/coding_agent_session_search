@@ -55,6 +55,7 @@ cass triage --json
 
 # Verify a newly installed executable without opening the configured archive.
 cass selftest --json
+# `health --binary-only` still reports (and therefore probes) archive readiness.
 
 # 2) Search across all agent history. Default search is hybrid-preferred:
 #    lexical is the fast required path; semantic refinement joins when ready.
