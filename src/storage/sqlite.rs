@@ -23309,8 +23309,20 @@ mod tests {
         assert_eq!(rows[0].get_typed::<i64>(0).unwrap(), 3);
         owner.close_without_checkpoint_sync().unwrap();
 
-        let strict_storage = FrankenStorage::open_canonical_strict_readonly(&db_path)
-            .expect("strict canonical storage read open");
+        let mut canonical_owner =
+            open_franken_async_canonical_strict_readonly_connection_with_timeout(
+                &db_path,
+                Duration::from_secs(2),
+            )
+            .expect("strict canonical dedicated-owner read open");
+        let rows = canonical_owner
+            .query_sync("SELECT COUNT(*) FROM t;")
+            .unwrap();
+        assert_eq!(rows[0].get_typed::<i64>(0).unwrap(), 3);
+        canonical_owner.close_without_checkpoint_sync().unwrap();
+
+        let strict_storage =
+            FrankenStorage::open_strict_readonly(&db_path).expect("strict storage read open");
         let count: i64 = strict_storage
             .raw()
             .query_row_map("SELECT COUNT(*) FROM t;", &[] as &[ParamValue], |row| {
@@ -23319,6 +23331,19 @@ mod tests {
             .unwrap();
         assert_eq!(count, 3);
         strict_storage.close_without_checkpoint().unwrap();
+
+        let canonical_strict_storage = FrankenStorage::open_canonical_strict_readonly(&db_path)
+            .expect("strict canonical storage read open");
+        let count: i64 = canonical_strict_storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM t;", &[] as &[ParamValue], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(count, 3);
+        canonical_strict_storage
+            .close_without_checkpoint()
+            .unwrap();
 
         assert_eq!(before, bundle_snapshot());
         assert!(
