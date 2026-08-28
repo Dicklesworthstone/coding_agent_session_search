@@ -17866,7 +17866,8 @@ impl FrankenStorage {
         // Outer `Option`: whether a complete cursor belongs to this migration
         // context. The inner optional id uses `None` as the explicit
         // pre-first-row sentinel, distinct from a legitimate `i64::MIN` id.
-        // Persisting `processed` avoids a second range COUNT on resume.
+        // Persisting `processed` makes a bounded prefix-consistency check
+        // possible on resume without reconstructing progress from rollups.
         let resume_cursor: Option<(Option<i64>, i64)> = if let Some(context) = resume_context {
             let recorded_context: Option<String> = self
                 .conn
@@ -17893,7 +17894,7 @@ impl FrankenStorage {
                 )
                 .optional()?;
             if recorded_context.as_deref() == Some(context) {
-                match (
+                let candidate = match (
                     recorded_last_id,
                     recorded_processed.and_then(|value| value.parse::<i64>().ok()),
                 ) {
@@ -17907,6 +17908,38 @@ impl FrankenStorage {
                             .map(|last_id| (Some(last_id), processed))
                     }
                     _ => None,
+                };
+                match candidate {
+                    Some((Some(last_id), processed)) => {
+                        // The cursor counts every fetched message row, including
+                        // orphaned and out-of-window rows. Verify that its exact
+                        // committed prefix still exists before adding any more
+                        // rollup deltas. A repair or prune between index runs can
+                        // otherwise delete an already-counted row while leaving
+                        // `processed <= total_messages`; blindly resuming would
+                        // preserve the deleted row in additive usage rollups.
+                        let (prefix_count, prefix_last_id): (i64, Option<i64>) = self
+                            .conn
+                            .query_row_map(
+                                "SELECT COUNT(*), MAX(id) FROM messages WHERE id <= ?1",
+                                fparams![last_id],
+                                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+                            )?;
+                        if prefix_count == processed && prefix_last_id == Some(last_id) {
+                            Some((Some(last_id), processed))
+                        } else {
+                            tracing::warn!(
+                                target: "cass::analytics",
+                                cursor_last_id = last_id,
+                                cursor_processed = processed,
+                                observed_prefix_count = prefix_count,
+                                observed_prefix_last_id = ?prefix_last_id,
+                                "legacy OMP analytics cursor prefix changed; restarting from zero"
+                            );
+                            None
+                        }
+                    }
+                    other => other,
                 }
             } else {
                 None
@@ -18300,6 +18333,11 @@ impl FrankenStorage {
         // SQLite's BLOB length both count UTF-8 bytes, so the bounded single-
         // table keyset preserves the existing `total_chars` contract without
         // trusting a potentially stale derived `message_metrics` row.
+        let first_message_scan_sql = "SELECT m.idx, COALESCE(LENGTH(CAST(m.content AS BLOB)), 0)
+             FROM messages m INDEXED BY sqlite_autoindex_messages_1
+             WHERE m.conversation_id = ?1
+             ORDER BY m.idx
+             LIMIT ?2";
         let message_scan_sql = "SELECT m.idx, COALESCE(LENGTH(CAST(m.content AS BLOB)), 0)
              FROM messages m INDEXED BY sqlite_autoindex_messages_1
              WHERE m.conversation_id = ?1
@@ -18312,6 +18350,10 @@ impl FrankenStorage {
         // reached ~10.4 GiB RSS and failed with an internal OOM. The explicit
         // uniqueness-index hint pins the `(conversation_id, idx)` keyset walk;
         // neither memory nor planner work scales with unrelated messages.
+        let first_message_scan_statement = self
+            .conn
+            .prepare(first_message_scan_sql)
+            .with_context(|| "preparing daily_stats initial bounded message scan")?;
         let message_scan_statement = self
             .conn
             .prepare(message_scan_sql)
@@ -18419,35 +18461,53 @@ impl FrankenStorage {
             }
 
             for (conversation_id, day_id, agent_slug, source_id) in conversation_batch_meta {
-                let mut cursor_message_idx = -1_i64;
+                // `messages.idx` is any signed INTEGER; it has no nonnegative
+                // schema constraint. The first page therefore omits a lower
+                // bound instead of using a numeric sentinel that could exclude
+                // a legitimate row (including i64::MIN).
+                let mut cursor_message_idx = i64::MIN;
+                let mut first_message_page = true;
                 loop {
                     let page_start_message_idx = cursor_message_idx;
                     let mut next_message_idx = cursor_message_idx;
                     let mut page_rows = 0_usize;
                     let mut aggregate = StatsAggregator::new();
-                    let scan_params = [
-                        SqliteValue::from(conversation_id),
-                        SqliteValue::from(page_start_message_idx),
-                        SqliteValue::from(message_batch_size as i64),
-                    ];
-                    let scan_result =
-                        message_scan_statement.query_with_params_for_each(&scan_params, |row| {
-                            let message_idx: i64 = row.get_typed(0)?;
-                            let content_len: i64 = row.get_typed(1)?;
-                            next_message_idx = message_idx;
-                            page_rows = page_rows.saturating_add(1);
-                            aggregate.record_delta(
-                                &agent_slug,
-                                &source_id,
-                                day_id,
-                                0,
-                                1,
-                                content_len,
-                            );
-                            Ok(())
-                        });
+                    let mut accumulate_row = |row: &FrankenRow| {
+                        let message_idx: i64 = row.get_typed(0)?;
+                        let content_len: i64 = row.get_typed(1)?;
+                        next_message_idx = message_idx;
+                        page_rows = page_rows.saturating_add(1);
+                        aggregate.record_delta(
+                            &agent_slug,
+                            &source_id,
+                            day_id,
+                            0,
+                            1,
+                            content_len,
+                        );
+                        Ok(())
+                    };
+                    let scan_result = if first_message_page {
+                        let scan_params = [
+                            SqliteValue::from(conversation_id),
+                            SqliteValue::from(message_batch_size as i64),
+                        ];
+                        first_message_scan_statement
+                            .query_with_params_for_each(&scan_params, &mut accumulate_row)
+                    } else {
+                        let scan_params = [
+                            SqliteValue::from(conversation_id),
+                            SqliteValue::from(page_start_message_idx),
+                            SqliteValue::from(message_batch_size as i64),
+                        ];
+                        message_scan_statement
+                            .query_with_params_for_each(&scan_params, &mut accumulate_row)
+                    };
                     match scan_result {
-                        Ok(()) => cursor_message_idx = next_message_idx,
+                        Ok(()) => {
+                            cursor_message_idx = next_message_idx;
+                            first_message_page = false;
+                        }
                         Err(err) if is_out_of_memory_error(&err) && message_batch_size > 1 => {
                             let previous_batch_size = message_batch_size;
                             message_batch_size = (message_batch_size / 2).max(1);
@@ -24488,6 +24548,65 @@ mod tests {
             )?;
             assert_eq!(rows, 0, "ordinary rebuild must invalidate {cursor_key}");
         }
+
+        // Recreate an interrupted prefix, then model a canonical prune plus a
+        // later append before restart. `processed <= total_messages` still
+        // holds, but the additive usage prefix no longer describes the live
+        // message set. The cursor must reject that drift and restart cleanly.
+        let drift_context = "gh424-prefix-drift-context";
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            storage.rebuild_analytics_since_with_chunk_size_and_progress(
+                None,
+                2,
+                Some(&interrupt_after_first_chunk),
+                Some(&heartbeat),
+                Some(drift_context),
+            )
+        }));
+        assert!(
+            interrupted.is_err(),
+            "the second planted interruption must leave a committed prefix"
+        );
+        storage.conn.execute_compat(
+            "DELETE FROM message_metrics WHERE message_id = ?1",
+            fparams![message_ids[0]],
+        )?;
+        storage.conn.execute_compat(
+            "DELETE FROM messages WHERE id = ?1",
+            fparams![message_ids[0]],
+        )?;
+        let conversation_id: i64 = storage.conn.query_row_map(
+            "SELECT conversation_id FROM messages WHERE id = ?1",
+            fparams![message_ids[1]],
+            |row| row.get_typed(0),
+        )?;
+        storage.conn.execute_compat(
+            "INSERT INTO messages(conversation_id, idx, role, created_at, content)
+             VALUES(?1, 99, 'user', ?2, 'replacement after analytics interruption')",
+            fparams![conversation_id, base_ts + 99_000],
+        )?;
+
+        storage.rebuild_analytics_since_with_chunk_size_and_progress(
+            None,
+            2,
+            None,
+            Some(&heartbeat),
+            Some(drift_context),
+        )?;
+        let drift_resumed_usage = usage_snapshot()?;
+        let drift_resumed_metrics: i64 = storage.conn.query_row_map(
+            "SELECT COUNT(*) FROM message_metrics",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(drift_resumed_metrics, 5);
+
+        storage.rebuild_analytics_since_with_chunk_size(None, 2)?;
+        assert_eq!(
+            usage_snapshot()?,
+            drift_resumed_usage,
+            "prefix drift must restart rather than preserve deleted-message rollup deltas"
+        );
         Ok(())
     }
 
@@ -25317,7 +25436,9 @@ mod tests {
                 "INSERT INTO messages (
                     id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin
                  ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, NULL, NULL)",
-                fparams![1_i64, 1_i64, 0_i64, "user", started_at, "hello"],
+                // The schema permits the full signed `idx` domain. Pin the
+                // first-page scan so it cannot silently skip negative indices.
+                fparams![1_i64, 1_i64, i64::MIN, "user", started_at, "hello"],
             )
             .unwrap();
         storage

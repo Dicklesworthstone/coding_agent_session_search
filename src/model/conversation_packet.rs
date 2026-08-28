@@ -450,6 +450,42 @@ impl ConversationPacket {
         Self::from_payload(payload, ConversationPacketBuilder::CanonicalReplay)
     }
 
+    /// Build a canonical replay packet by consuming the source conversation.
+    ///
+    /// The lexical rebuild already owns its fetched rows. Moving their strings
+    /// into the packet avoids retaining a second transcript-sized content copy
+    /// while hashes and sink projections are derived (#320). Callers that need
+    /// to retain their canonical input should use [`Self::from_canonical_replay`].
+    pub(crate) fn from_canonical_replay_owned(
+        conversation: Conversation,
+        provenance: ConversationPacketProvenance,
+    ) -> Self {
+        let messages = conversation
+            .messages
+            .into_iter()
+            .map(packet_message_from_canonical_owned)
+            .collect::<Vec<_>>();
+        let payload = ConversationPacketPayload {
+            identity: ConversationPacketIdentity {
+                conversation_id: conversation.id,
+                agent_slug: conversation.agent_slug,
+                external_id: conversation.external_id,
+                workspace: conversation.workspace.as_deref().map(path_to_packet_string),
+                source_path: path_to_packet_string(&conversation.source_path),
+                title: conversation.title,
+            },
+            provenance,
+            timestamps: timestamps_from_parts(
+                conversation.started_at,
+                conversation.ended_at,
+                &messages,
+            ),
+            metadata_json: conversation.metadata_json,
+            messages,
+        };
+        Self::from_payload(payload, ConversationPacketBuilder::CanonicalReplay)
+    }
+
     pub fn semantically_equivalent_to(&self, other: &Self) -> bool {
         self.version == other.version
             && self.hashes == other.hashes
@@ -608,6 +644,23 @@ fn packet_message_from_canonical(message: &Message) -> ConversationPacketMessage
     }
 }
 
+fn packet_message_from_canonical_owned(message: Message) -> ConversationPacketMessage {
+    ConversationPacketMessage {
+        message_id: message.id,
+        idx: message.idx,
+        role: canonical_role(&message.role),
+        author: message.author,
+        created_at: message.created_at,
+        content: message.content,
+        extra_json: message.extra_json,
+        snippets: message
+            .snippets
+            .into_iter()
+            .map(packet_snippet_from_canonical_owned)
+            .collect(),
+    }
+}
+
 fn packet_snippet_from_normalized(snippet: &NormalizedSnippet) -> ConversationPacketSnippet {
     ConversationPacketSnippet {
         file_path: snippet.file_path.as_deref().map(path_to_packet_string),
@@ -625,6 +678,16 @@ fn packet_snippet_from_canonical(snippet: &Snippet) -> ConversationPacketSnippet
         end_line: snippet.end_line,
         language: snippet.language.clone(),
         snippet_text: snippet.snippet_text.clone(),
+    }
+}
+
+fn packet_snippet_from_canonical_owned(snippet: Snippet) -> ConversationPacketSnippet {
+    ConversationPacketSnippet {
+        file_path: snippet.file_path.as_deref().map(path_to_packet_string),
+        start_line: snippet.start_line,
+        end_line: snippet.end_line,
+        language: snippet.language,
+        snippet_text: snippet.snippet_text,
     }
 }
 
@@ -984,6 +1047,23 @@ mod tests {
         assert_eq!(raw.projections.lexical.message_indices, vec![0, 1]);
         assert_eq!(raw.projections.analytics.user_messages, 1);
         assert_eq!(raw.projections.analytics.assistant_messages, 1);
+    }
+
+    #[test]
+    fn owned_canonical_replay_is_equivalent_to_borrowed_replay() {
+        let conversation = canonical_conversation();
+        let first_content_ptr = conversation.messages[0].content.as_ptr();
+        let provenance = ConversationPacketProvenance::local();
+        let borrowed =
+            ConversationPacket::from_canonical_replay(&conversation, provenance.clone());
+        let owned = ConversationPacket::from_canonical_replay_owned(conversation, provenance);
+
+        assert_eq!(owned, borrowed);
+        assert_eq!(
+            owned.payload.messages[0].content.as_ptr(),
+            first_content_ptr,
+            "the owned replay path must move transcript storage instead of cloning it"
+        );
     }
 
     #[test]

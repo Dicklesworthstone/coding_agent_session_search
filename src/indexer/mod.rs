@@ -4136,8 +4136,8 @@ fn lexical_rebuild_contract_from_canonical_messages(
         source_id: provenance.source_id.clone(),
         origin_host: provenance.origin_host.clone(),
     };
-    ConversationPacket::from_canonical_replay(
-        &canonical,
+    ConversationPacket::from_canonical_replay_owned(
+        canonical,
         lexical_rebuild_contract_provenance(provenance),
     )
 }
@@ -4153,13 +4153,19 @@ impl LexicalRebuildConversationPacket {
             lexical_rebuild_packet_provenance_from_canonical(&conversation, source_map);
         let contract =
             lexical_rebuild_contract_from_grouped_messages(&conversation, &provenance, &messages);
+        let ConversationPacket {
+            hashes: contract_hashes,
+            projections: contract_projections,
+            ..
+        } = contract;
         Self::from_canonical_replay_parts(
             conversation,
             messages,
             last_message_id,
             provenance,
             provenance_mode,
-            contract,
+            contract_hashes,
+            contract_projections,
         )
     }
 
@@ -4170,16 +4176,19 @@ impl LexicalRebuildConversationPacket {
     ) -> Result<Self> {
         let (provenance, provenance_mode) =
             lexical_rebuild_packet_provenance_from_canonical(&conversation, source_map);
-        let contract = lexical_rebuild_contract_from_canonical_messages(
-            &conversation,
-            &provenance,
-            messages.clone(),
-        );
+        let contract =
+            lexical_rebuild_contract_from_canonical_messages(&conversation, &provenance, messages);
+        let ConversationPacket {
+            hashes: contract_hashes,
+            projections: contract_projections,
+            payload,
+            ..
+        } = contract;
         let mut grouped_rows = crate::storage::sqlite::LexicalRebuildGroupedMessageRows::new();
-        grouped_rows.reserve(messages.len());
+        grouped_rows.reserve(payload.messages.len());
         let mut last_message_id = None;
-        for message in messages {
-            let message_id = message.id.ok_or_else(|| {
+        for message in payload.messages {
+            let message_id = message.message_id.ok_or_else(|| {
                 anyhow::anyhow!(
                     "lexical rebuild batch fetch returned message without id for conversation {}",
                     conversation.id.unwrap_or_default()
@@ -4188,7 +4197,7 @@ impl LexicalRebuildConversationPacket {
             last_message_id = Some(last_message_id.unwrap_or(0).max(message_id));
             grouped_rows.push(crate::storage::sqlite::LexicalRebuildGroupedMessageRow {
                 idx: message.idx,
-                is_tool_role: matches!(message.role, crate::model::types::MessageRole::Tool),
+                is_tool_role: message.role == "tool",
                 created_at: message.created_at,
                 content: message.content,
             });
@@ -4199,7 +4208,8 @@ impl LexicalRebuildConversationPacket {
             last_message_id,
             provenance,
             provenance_mode,
-            contract,
+            contract_hashes,
+            contract_projections,
         ))
     }
 
@@ -4209,12 +4219,11 @@ impl LexicalRebuildConversationPacket {
         last_message_id: Option<i64>,
         provenance: LexicalRebuildPacketProvenance,
         provenance_mode: LexicalRebuildPacketProvenanceMode,
-        contract: ConversationPacket,
+        contract_hashes: ConversationPacketHashes,
+        contract_projections: ConversationPacketSinkProjections,
     ) -> Self {
-        let message_count = contract.payload.messages.len();
-        let message_bytes = contract.projections.lexical.total_content_bytes;
-        let contract_hashes = contract.hashes;
-        let contract_projections = contract.projections;
+        let message_count = messages.len();
+        let message_bytes = contract_projections.lexical.total_content_bytes;
         Self {
             diagnostics: LexicalRebuildPacketDiagnostics {
                 version: LEXICAL_REBUILD_PACKET_VERSION,
@@ -11873,7 +11882,7 @@ fn acquire_ordered_lexical_rebuild_page_budget(
     flow_limiter: &StreamingByteLimiter,
     producer_telemetry: &LexicalRebuildProducerTelemetry,
     sequence: u64,
-    page_message_bytes: usize,
+    page_working_set_bytes: usize,
 ) -> Result<(usize, Duration, bool)> {
     producer_telemetry.set_producer_state(LexicalRebuildProducerParkSite::WaitingTurn);
     producer_telemetry.record_reservation_next_sequence(reservation_order.next_sequence());
@@ -11884,7 +11893,7 @@ fn acquire_ordered_lexical_rebuild_page_budget(
         return Err(err);
     }
     producer_telemetry.set_producer_state(LexicalRebuildProducerParkSite::WaitingBudget);
-    let acquired = match flow_limiter.acquire_with_wait(page_message_bytes) {
+    let acquired = match flow_limiter.acquire_with_wait(page_working_set_bytes) {
         Ok(acquired) => {
             reservation_order.finish_turn(sequence);
             producer_telemetry.record_reservation_next_sequence(reservation_order.next_sequence());
@@ -11897,6 +11906,40 @@ fn acquire_ordered_lexical_rebuild_page_budget(
     };
     producer_telemetry.set_producer_state(LexicalRebuildProducerParkSite::Idle);
     acquired
+}
+
+/// Conservative resident-byte reservation for one lexical page while it is
+/// fetched and normalized into Quill packets.
+///
+/// Message text moves through the owned replay path without cloning, but the
+/// input, contract, and grouped-message vector allocations overlap while each
+/// page is transformed. The retained packet also has substantial fixed
+/// structure per message and per conversation, including its SmallVec inline
+/// message slab. Charging content alone let pages with many short messages pass
+/// a nominal byte cap while their real object graphs multiplied RSS (#320).
+fn lexical_rebuild_page_working_set_reservation_bytes(
+    content_bytes: usize,
+    message_count: usize,
+    conversation_count: usize,
+) -> usize {
+    let content_peak = content_bytes;
+    let per_message = std::mem::size_of::<crate::model::types::Message>()
+        .saturating_add(std::mem::size_of::<
+            crate::model::conversation_packet::ConversationPacketMessage,
+        >())
+        .saturating_add(std::mem::size_of::<
+            crate::storage::sqlite::LexicalRebuildGroupedMessageRow,
+        >())
+        .saturating_add(2usize.saturating_mul(std::mem::size_of::<usize>()));
+    let per_conversation =
+        std::mem::size_of::<crate::storage::sqlite::LexicalRebuildConversationRow>()
+            .saturating_add(std::mem::size_of::<LexicalRebuildConversationPacket>())
+            .saturating_add(std::mem::size_of::<ConversationPacket>());
+
+    content_peak
+        .saturating_add(message_count.saturating_mul(per_message))
+        .saturating_add(conversation_count.saturating_mul(per_conversation))
+        .max(1)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12000,13 +12043,10 @@ fn conversation_batch_footprint(conv: &NormalizedConversation) -> StreamingConve
             .saturating_add(
                 message
                     .invocations
-                    .first()
-                    .map_or(0, |invocation| {
-                        message
-                            .invocations
-                            .capacity()
-                            .saturating_mul(std::mem::size_of_val(invocation))
-                    }),
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<
+                        franken_agent_detection::NormalizedInvocation,
+                    >()),
             );
         for invocation in &message.invocations {
             retained_bytes = retained_bytes
@@ -12069,6 +12109,7 @@ struct StreamingBatchSender<'a> {
     conversations: Vec<NormalizedConversation>,
     message_count: usize,
     content_bytes: usize,
+    retained_bytes: usize,
     byte_reservation: usize,
 }
 
@@ -12093,6 +12134,7 @@ impl<'a> StreamingBatchSender<'a> {
             conversations: Vec::new(),
             message_count: 0,
             content_bytes: 0,
+            retained_bytes: 0,
             byte_reservation: 0,
         }
     }
@@ -12108,6 +12150,8 @@ impl<'a> StreamingBatchSender<'a> {
                 || self.message_count.saturating_add(footprint.message_count)
                     > DEFAULT_STREAMING_BATCH_LIMITS.max_messages
                 || self.content_bytes.saturating_add(footprint.content_bytes)
+                    > DEFAULT_STREAMING_BATCH_LIMITS.max_chars
+                || self.retained_bytes.saturating_add(footprint.retained_bytes)
                     > DEFAULT_STREAMING_BATCH_LIMITS.max_chars);
         if would_exceed_limits {
             self.flush()?;
@@ -12120,12 +12164,14 @@ impl<'a> StreamingBatchSender<'a> {
         })?;
         self.message_count = self.message_count.saturating_add(footprint.message_count);
         self.content_bytes = self.content_bytes.saturating_add(footprint.content_bytes);
+        self.retained_bytes = self.retained_bytes.saturating_add(footprint.retained_bytes);
         self.byte_reservation = self.byte_reservation.saturating_add(byte_reservation);
         self.conversations.push(conversation);
 
         let single_conversation_exceeds_limits = self.conversations.len() == 1
             && (self.message_count > DEFAULT_STREAMING_BATCH_LIMITS.max_messages
-                || self.content_bytes > DEFAULT_STREAMING_BATCH_LIMITS.max_chars);
+                || self.content_bytes > DEFAULT_STREAMING_BATCH_LIMITS.max_chars
+                || self.retained_bytes > DEFAULT_STREAMING_BATCH_LIMITS.max_chars);
         if single_conversation_exceeds_limits {
             self.flush()?;
         }
@@ -12139,6 +12185,9 @@ impl<'a> StreamingBatchSender<'a> {
                 self.flow_limiter.release(self.byte_reservation);
                 self.byte_reservation = 0;
             }
+            self.message_count = 0;
+            self.content_bytes = 0;
+            self.retained_bytes = 0;
             return Ok(());
         }
 
@@ -12155,6 +12204,7 @@ impl<'a> StreamingBatchSender<'a> {
             self.flow_limiter.release(byte_reservation);
             self.message_count = 0;
             self.content_bytes = 0;
+            self.retained_bytes = 0;
             self.byte_reservation = 0;
             return Err(anyhow::Error::new(StreamingConsumerDisconnected {
                 connector_name: self.connector_name,
@@ -12162,6 +12212,7 @@ impl<'a> StreamingBatchSender<'a> {
         }
         self.message_count = 0;
         self.content_bytes = 0;
+        self.retained_bytes = 0;
         self.byte_reservation = 0;
         self.next_batch_is_discovered = false;
         Ok(())
@@ -18525,13 +18576,18 @@ fn prepare_lexical_rebuild_page_work(
         .filter_map(|conv| conv.id)
         .collect::<Vec<_>>();
 
+    let requested_working_set_bytes = lexical_rebuild_page_working_set_reservation_bytes(
+        work.pipeline_budget.batch_fetch_message_bytes_limit,
+        work.pipeline_budget.batch_fetch_message_limit,
+        conversation_ids.len(),
+    );
     let (reserved_bytes, budget_wait_duration, waited_for_budget) =
         acquire_ordered_lexical_rebuild_page_budget(
             reservation_order,
             flow_limiter,
             producer_telemetry,
             sequence,
-            work.pipeline_budget.batch_fetch_message_bytes_limit,
+            requested_working_set_bytes,
         )
         .with_context(|| {
             format!(
@@ -18632,6 +18688,7 @@ fn prepare_lexical_rebuild_page_work(
         page_messages = page_message_count,
         page_message_bytes,
         reserved_bytes,
+        requested_working_set_bytes,
         budget_wait_ms = budget_wait_duration.as_millis() as u64,
         waited_for_budget,
         batch_fetch_message_limit = work.pipeline_budget.batch_fetch_message_limit,
@@ -35249,6 +35306,7 @@ mod tests {
         let replay_messages = fetched
             .remove(&inserted.conversation_id)
             .expect("canonical replay messages");
+        let first_replay_content_ptr = replay_messages[0].content.as_ptr();
         let source_map = storage
             .list_sources()
             .unwrap_or_default()
@@ -35278,6 +35336,11 @@ mod tests {
         assert_eq!(
             canonical_packet.diagnostics.provenance_mode,
             LexicalRebuildPacketProvenanceMode::SourceMapLookup
+        );
+        assert_eq!(
+            canonical_packet.messages[0].content.as_ptr(),
+            first_replay_content_ptr,
+            "canonical replay must move fetched transcript content through packet normalization"
         );
         assert_eq!(
             normalized_packet.diagnostics.provenance_mode,
@@ -40805,6 +40868,7 @@ mod tests {
             ..norm_msg(0, 1_000)
         };
         let conversation = norm_conv(Some("huge"), vec![oversized]);
+        let expected_reservation = conversation_batch_footprint(&conversation).retained_bytes;
 
         sender
             .push(conversation)
@@ -40827,7 +40891,8 @@ mod tests {
                 assert_eq!(message_count, 1);
                 assert_eq!(
                     byte_reservation,
-                    DEFAULT_STREAMING_BATCH_LIMITS.max_chars + 1
+                    expected_reservation,
+                    "the limiter must charge the full retained object graph, not content alone"
                 );
             }
             other => panic!(
@@ -40850,7 +40915,6 @@ mod tests {
         let limiter = Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT));
         let mut sender = StreamingBatchSender::new(&tx, limiter.clone(), "codex", true);
         let content = "x".repeat(512);
-        let expected_bytes = content.len();
         let conversation = norm_conv(
             Some("pending"),
             vec![NormalizedMessage {
@@ -40858,6 +40922,7 @@ mod tests {
                 ..norm_msg(0, 1_000)
             }],
         );
+        let expected_bytes = conversation_batch_footprint(&conversation).retained_bytes;
 
         sender
             .push(conversation)
@@ -40899,22 +40964,94 @@ mod tests {
     }
 
     #[test]
+    fn gh320_streaming_batch_limiter_charges_metadata_and_structural_overhead() {
+        let (tx, rx) = bounded(2);
+        let limiter = Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT));
+        let mut sender = StreamingBatchSender::new(&tx, limiter.clone(), "codex", false);
+        let mut conversation = norm_conv(Some("metadata-heavy"), vec![norm_msg(0, 1_000)]);
+        conversation.metadata = serde_json::json!({
+            "nested": [{"blob": "m".repeat(4096)}],
+        });
+        conversation.messages[0].content.clear();
+        conversation.messages[0].extra = serde_json::json!({
+            "tool_result": "e".repeat(8192),
+        });
+        conversation.messages[0].snippets.push(NormalizedSnippet {
+            file_path: Some(PathBuf::from("/tmp/large-snippet.rs")),
+            start_line: Some(1),
+            end_line: Some(2),
+            language: Some("rust".into()),
+            snippet_text: Some("s".repeat(2048)),
+        });
+
+        let footprint = conversation_batch_footprint(&conversation);
+        assert_eq!(footprint.content_bytes, 0);
+        assert!(
+            footprint.retained_bytes >= 14 * 1024,
+            "metadata/extra/snippet allocations must be visible even with empty message content: {footprint:?}"
+        );
+
+        sender.push(conversation).unwrap();
+        assert_eq!(limiter.bytes_in_flight(), footprint.retained_bytes);
+        sender.flush().unwrap();
+        let message = rx.try_recv().expect("flushed metadata-heavy batch");
+        let IndexMessage::Batch {
+            byte_reservation, ..
+        } = message
+        else {
+            panic!("expected a streamed batch")
+        };
+        assert_eq!(byte_reservation, footprint.retained_bytes);
+        limiter.release(byte_reservation);
+        assert_eq!(limiter.bytes_in_flight(), 0);
+    }
+
+    #[test]
+    fn gh320_lexical_page_reservation_charges_preparation_working_set() {
+        let content_bytes = 1_024;
+        let messages = 10;
+        let conversations = 2;
+        let reserved = lexical_rebuild_page_working_set_reservation_bytes(
+            content_bytes,
+            messages,
+            conversations,
+        );
+        assert!(
+            reserved > content_bytes,
+            "reservation must include owned content plus overlapping message/conversation structures"
+        );
+
+        let empty_content_reservation =
+            lexical_rebuild_page_working_set_reservation_bytes(0, 1_000, 1);
+        assert!(
+            empty_content_reservation > 1_000,
+            "one thousand empty messages still retain a material object graph"
+        );
+        assert_eq!(
+            lexical_rebuild_page_working_set_reservation_bytes(usize::MAX, usize::MAX, usize::MAX),
+            usize::MAX,
+            "overflow must saturate rather than wrapping below the configured cap"
+        );
+    }
+
+    #[test]
     fn streaming_batch_sender_drop_releases_unflushed_reservation() {
         let (tx, rx) = bounded(2);
         let limiter = Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT));
         let content = "x".repeat(384);
-        let expected_bytes = content.len();
+        let conversation = norm_conv(
+            Some("unflushed"),
+            vec![NormalizedMessage {
+                content,
+                ..norm_msg(0, 1_000)
+            }],
+        );
+        let expected_bytes = conversation_batch_footprint(&conversation).retained_bytes;
 
         {
             let mut sender = StreamingBatchSender::new(&tx, limiter.clone(), "cursor", false);
             sender
-                .push(norm_conv(
-                    Some("unflushed"),
-                    vec![NormalizedMessage {
-                        content,
-                        ..norm_msg(0, 1_000)
-                    }],
-                ))
+                .push(conversation)
                 .expect("pending conversation should reserve bytes");
 
             assert_eq!(limiter.bytes_in_flight(), expected_bytes);
@@ -40938,16 +41075,17 @@ mod tests {
         let limiter = Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT));
         let mut sender = StreamingBatchSender::new(&tx, limiter.clone(), "amp", false);
         let content = "x".repeat(256);
-        let expected_bytes = content.len();
+        let conversation = norm_conv(
+            Some("disconnected"),
+            vec![NormalizedMessage {
+                content,
+                ..norm_msg(0, 1_000)
+            }],
+        );
+        let expected_bytes = conversation_batch_footprint(&conversation).retained_bytes;
 
         sender
-            .push(norm_conv(
-                Some("disconnected"),
-                vec![NormalizedMessage {
-                    content,
-                    ..norm_msg(0, 1_000)
-                }],
-            ))
+            .push(conversation)
             .expect("push should only reserve bytes before flush");
         assert_eq!(limiter.bytes_in_flight(), expected_bytes);
 

@@ -1643,7 +1643,8 @@ pub(crate) fn process_resident_memory_bytes() -> Option<u64> {
                 .unwrap_or_else(|error| error.into_inner());
             if sample
                 .sampled_at
-                .is_some_and(|sampled_at| now.duration_since(sampled_at) < MACOS_PROCESS_MEMORY_SAMPLE_INTERVAL)
+                .and_then(|sampled_at| now.checked_duration_since(sampled_at))
+                .is_some_and(|age| age < MACOS_PROCESS_MEMORY_SAMPLE_INTERVAL)
             {
                 return sample.bytes;
             }
