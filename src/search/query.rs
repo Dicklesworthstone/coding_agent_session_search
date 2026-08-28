@@ -8819,7 +8819,10 @@ impl SearchClient {
              LEFT JOIN conversation_tail_state ts ON ts.conversation_id = c.id
              LEFT JOIN workspaces w ON c.workspace_id = w.id
              LEFT JOIN sources s ON c.source_id = s.id
-             WHERE 1=1"
+             WHERE EXISTS (
+                 SELECT 1 FROM messages candidate_message
+                 WHERE candidate_message.conversation_id = c.id
+             )"
         );
         let mut params: Vec<ParamValue> = Vec::new();
 
@@ -16362,8 +16365,12 @@ mod tests {
             "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
              VALUES
                 (1, 1, NULL, 'local', NULL, 'first browse title', '/tmp/browse-shared.jsonl'),
-                (2, 1, NULL, 'local', NULL, 'second browse title', '/tmp/browse-shared.jsonl')",
+                (2, 1, NULL, 'local', NULL, 'second browse title', '/tmp/browse-shared.jsonl'),
+                (3, 1, NULL, 'local', NULL, 'empty newest conversation', '/tmp/empty-browse.jsonl')",
         )?;
+        // The newest candidate deliberately has no message. If LIMIT is
+        // applied before excluding empty conversations, it consumes one of
+        // the two page slots and the result is observably under-filled.
         let shared_prefix = "shared-prefix ".repeat(48);
         let first = format!("{shared_prefix}first browse-only tail");
         let second = format!("{shared_prefix}second browse-only tail");
@@ -16392,7 +16399,8 @@ mod tests {
                  conversation_id, ended_at, last_message_idx, last_message_created_at
              ) VALUES
                 (1, 101, 0, 101),
-                (2, 102, 0, 102)",
+                (2, 102, 0, 102),
+                (3, 999, NULL, 999)",
         )?;
 
         let client = SearchClient {
@@ -16415,7 +16423,7 @@ mod tests {
 
         let hits = client.browse_by_date(
             SearchFilters::default(),
-            10,
+            2,
             0,
             true,
             FieldMask::new(false, true, true, true),
