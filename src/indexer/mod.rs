@@ -39849,10 +39849,20 @@ mod tests {
             first_batch_ms < 5_000,
             "producer should deliver first batch within 5s, took {first_batch_ms}ms"
         );
+        // The first batch carries a flow-limiter reservation exactly like the
+        // ones the drain loop below releases. Holding on to it starves the
+        // page-prep workers of budget they can never get back, which parks the
+        // producer in `acquire_with_wait` forever and turns the `join()` at the
+        // end of this test into an unkillable hang.
+        release_lexical_rebuild_prepared_page_reservation(&first_batch, flow_limiter.as_ref());
 
+        let mut saw_done = false;
         while let Ok(msg) = rx.recv_timeout(Duration::from_secs(5)) {
             match msg {
-                LexicalRebuildPipelineMessage::Done => break,
+                LexicalRebuildPipelineMessage::Done => {
+                    saw_done = true;
+                    break;
+                }
                 LexicalRebuildPipelineMessage::Batch(batch) => {
                     release_lexical_rebuild_prepared_page_reservation(
                         &batch,
@@ -39862,6 +39872,12 @@ mod tests {
                 LexicalRebuildPipelineMessage::Error(err) => panic!("producer error: {err}"),
             }
         }
+        // Without this the test would fall straight into `join()` and block
+        // forever whenever the producer goes quiet, hiding the real failure.
+        assert!(
+            saw_done,
+            "producer stopped sending without a Done message; joining it would hang"
+        );
         handle.join().unwrap();
     }
 

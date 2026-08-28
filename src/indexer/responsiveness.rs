@@ -551,9 +551,32 @@ fn read_loadavg() -> Option<f32> {
     first.parse::<f32>().ok()
 }
 
-/// macOS: `sysctl -n vm.loadavg` prints `{ 1.23 1.45 1.50 }`.
+/// macOS: the 1-minute load average, read in-process.
+///
+/// `getloadavg(3)` reads the same `vm.loadavg` sysctl the CLI does, so this is
+/// one syscall instead of a `posix_spawn` + `poll` + reap. The governor samples
+/// this on every tick, and the spawned `sysctl` was visible as real work in
+/// stack samples of long test runs, so the subprocess is now only a fallback
+/// for the (practically unreachable) case where `getloadavg` reports nothing.
 #[cfg(target_os = "macos")]
 fn read_loadavg() -> Option<f32> {
+    let mut samples = [0f64; 3];
+    // SAFETY: `getloadavg` writes at most `nelem` doubles into the buffer, and
+    // we pass the true length of a stack array we exclusively own.
+    let filled =
+        unsafe { libc::getloadavg(samples.as_mut_ptr(), samples.len() as libc::c_int) };
+    if filled >= 1 {
+        let one_minute = samples[0] as f32;
+        if one_minute.is_finite() && one_minute >= 0.0 {
+            return Some(one_minute);
+        }
+    }
+    read_loadavg_via_sysctl()
+}
+
+/// Fallback for [`read_loadavg`]: `sysctl -n vm.loadavg` prints `{ 1.23 1.45 1.50 }`.
+#[cfg(target_os = "macos")]
+fn read_loadavg_via_sysctl() -> Option<f32> {
     let output = std::process::Command::new("sysctl")
         .args(["-n", "vm.loadavg"])
         .output()
