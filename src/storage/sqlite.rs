@@ -17401,7 +17401,8 @@ fn read_token_daily_stats_rebuild_cursor(
             fparams![TOKEN_DAILY_STATS_REBUILD_CURSOR_KEY],
             |row| row.get_typed::<String>(0),
         )
-        .ok();
+        .optional()
+        .context("reading token_daily_stats rebuild cursor")?;
     let Some(raw) = raw else {
         return Ok(None);
     };
@@ -17662,18 +17663,17 @@ impl FrankenStorage {
             }
         }
 
-        // Per-batch commits mean the scan is not one snapshot: a concurrent
-        // writer appending `token_usage` rows during the run leaves them out
-        // of the staged aggregate. Say so rather than hide it; the live
-        // rollup is still replaced (it reflects the ledger as scanned), and
-        // the next rebuild starts clean because the cursor is retired below.
+        // Per-batch commits mean the scan is not one snapshot. Publishing when
+        // the ledger changed would knowingly replace the last-good live rollup
+        // with a potentially incomplete mixture of snapshots. Fail closed and
+        // leave both the live table and resumable stage/cursor untouched. The
+        // next run observes the new fingerprint and safely restarts the stage.
         let ledger_after = token_daily_stats_ledger_fingerprint(&self.conn)?;
         if ledger_after.fingerprint() != ledger.fingerprint() {
-            tracing::warn!(
-                target: "cass::analytics",
-                before = %ledger.fingerprint(),
-                after = %ledger_after.fingerprint(),
-                "token_usage ledger changed during the token_daily_stats rebuild; rows appended during the run are not in this rollup — rerun `cass analytics rebuild --track b` once ingest is idle"
+            bail!(
+                "token_daily_stats phase=pre_publish_consistency: token_usage ledger changed during rebuild (before={}, after={}); the last-good live rollup was preserved — rerun `cass analytics rebuild --track b` once ingest is idle",
+                ledger.fingerprint(),
+                ledger_after.fingerprint()
             );
         }
 
@@ -35043,6 +35043,104 @@ mod tests {
         assert_eq!(
             count("SELECT COUNT(*) FROM token_daily_stats"),
             live_after_full
+        );
+    }
+
+    /// A rebuild scans through separately committed batches, so a concurrent
+    /// ledger writer can otherwise make the stage a mixture of snapshots. The
+    /// pre-publish fingerprint guard must preserve the live rollup rather than
+    /// knowingly replacing it with that inconsistent stage.
+    #[test]
+    fn token_daily_stats_rebuild_refuses_to_publish_when_ledger_changes_mid_run() {
+        use crate::franken_sync::compat::{ConnectionExt as _, RowExt as _};
+        use std::cell::Cell;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("track-b-ledger-change.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let raw = storage.raw();
+        raw.execute_compat(
+            "INSERT INTO agents(id, slug, name, kind, created_at, updated_at) \
+             VALUES(1, 'codex', 'codex', 'cli', 0, 0)",
+            fparams![],
+        )
+        .unwrap();
+        raw.execute_compat(
+            "INSERT INTO conversations(id, agent_id, source_id, source_path, started_at) \
+             VALUES(1, 1, 'local', '/tmp/ledger-change.jsonl', 86400000)",
+            fparams![],
+        )
+        .unwrap();
+        raw.execute_compat(
+            "INSERT INTO messages(id, conversation_id, idx, role, content) VALUES \
+             (1, 1, 0, 'assistant', 'first'), \
+             (2, 1, 1, 'assistant', 'second')",
+            fparams![],
+        )
+        .unwrap();
+        raw.execute_compat(
+            "INSERT INTO token_usage( \
+                 message_id, conversation_id, agent_id, timestamp_ms, day_id, \
+                 role, content_chars, input_tokens, output_tokens, total_tokens \
+             ) VALUES(1, 1, 1, 86400000, 1, 'assistant', 5, 10, 5, 15)",
+            fparams![],
+        )
+        .unwrap();
+        raw.execute_compat(
+            "INSERT INTO token_daily_stats( \
+                 day_id, agent_slug, source_id, model_family, grand_total_tokens, last_updated \
+             ) VALUES(1, 'all', 'all', 'all', 777, 0)",
+            fparams![],
+        )
+        .unwrap();
+
+        let heartbeat_calls = Cell::new(0_usize);
+        let heartbeat = || {
+            let call = heartbeat_calls.get().saturating_add(1);
+            heartbeat_calls.set(call);
+            if call == 2 {
+                raw.execute_compat(
+                    "INSERT INTO token_usage( \
+                         message_id, conversation_id, agent_id, timestamp_ms, day_id, \
+                         role, content_chars, input_tokens, output_tokens, total_tokens \
+                     ) VALUES(2, 1, 1, 86400000, 1, 'assistant', 6, 20, 10, 30)",
+                    fparams![],
+                )
+                .unwrap();
+            }
+        };
+
+        let error = storage
+            .rebuild_token_daily_stats_with_progress(Some(&heartbeat))
+            .expect_err("a changed ledger must reject publication");
+        assert!(
+            error
+                .to_string()
+                .contains("phase=pre_publish_consistency"),
+            "the error must identify the exact rejected publication phase: {error:#}"
+        );
+        let live_total: i64 = raw
+            .query_row_map(
+                "SELECT grand_total_tokens FROM token_daily_stats \
+                 WHERE day_id = 1 AND agent_slug = 'all' \
+                   AND source_id = 'all' AND model_family = 'all'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            live_total, 777,
+            "a rejected mixed-snapshot stage must not replace the last-good live rollup"
+        );
+        assert!(
+            historical_table_exists(raw, TOKEN_DAILY_STATS_REBUILD_STAGE_TABLE).unwrap(),
+            "the rejected stage remains available for deterministic reset on retry"
+        );
+        assert!(
+            read_token_daily_stats_rebuild_cursor(raw)
+                .unwrap()
+                .is_some(),
+            "the rejected stage must retain its matching checkpoint"
         );
     }
 

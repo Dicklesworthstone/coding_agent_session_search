@@ -285,6 +285,8 @@ pub struct RawMirrorPruneEntry {
     pub kind: String,
     pub path: String,
     pub blob_blake3: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_blake3: Option<String>,
     pub size_bytes: u64,
     pub reason: String,
     pub applied: bool,
@@ -293,6 +295,8 @@ pub struct RawMirrorPruneEntry {
 #[derive(Debug, Clone)]
 struct RawMirrorPruneManifest {
     manifest_id: String,
+    manifest_blake3: String,
+    blob_blake3: String,
     relative_path: String,
     size_bytes: u64,
     blob_references: Vec<RawMirrorChunkRef>,
@@ -584,10 +588,8 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         entries.push(RawMirrorPruneEntry {
             kind: "manifest".to_string(),
             path: manifest.relative_path.clone(),
-            blob_blake3: manifest
-                .blob_references
-                .first()
-                .map(|reference| reference.blob_blake3.clone()),
+            blob_blake3: Some(manifest.blob_blake3.clone()),
+            manifest_blake3: Some(manifest.manifest_blake3.clone()),
             size_bytes: manifest.size_bytes,
             reason,
             applied: false,
@@ -615,6 +617,7 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
             kind: "blob".to_string(),
             path: blob_relative_path,
             blob_blake3,
+            manifest_blake3: None,
             size_bytes: size,
             reason,
             applied: false,
@@ -691,7 +694,7 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
 
         for entry in &mut report.entries {
             let path = root.join(&entry.path);
-            let removed = remove_prune_target_file(&root, &path)
+            let removed = remove_prune_entry_file(&root, entry)
                 .with_context(|| format!("applying raw mirror prune for {}", path.display()))?;
             entry.applied = removed;
             if removed {
@@ -758,34 +761,38 @@ fn collect_prune_manifests(root: &Path) -> Result<Vec<RawMirrorPruneManifest>> {
                 expected_path.display()
             );
         }
-        let manifest = read_validated_raw_mirror_manifest(root, &parsed_manifest.manifest_id)
-            .with_context(|| {
-                format!(
-                    "refusing to prune raw mirror manifest without valid identity and checksum {}",
-                    path.display()
-                )
-            })?;
-        let blob_references =
-            raw_mirror_manifest_blob_references(&manifest).with_context(|| {
-                format!(
-                    "refusing to prune invalid raw mirror manifest {}",
-                    path.display()
-                )
-            })?;
+        let blob_references = validate_raw_mirror_manifest_contents(
+            &parsed_manifest,
+            &parsed_manifest.manifest_id,
+        )
+        .with_context(|| {
+            format!(
+                "refusing to prune raw mirror manifest without valid identity and checksum {}",
+                path.display()
+            )
+        })?;
+        let manifest_blake3 = parsed_manifest.manifest_blake3.clone().ok_or_else(|| {
+            anyhow!(
+                "validated raw mirror manifest {} is missing its descriptor checksum",
+                path.display()
+            )
+        })?;
         let relative_path = path
             .strip_prefix(root)
             .unwrap_or(&path)
             .display()
             .to_string();
         manifests.push(RawMirrorPruneManifest {
-            manifest_id: manifest.manifest_id,
+            manifest_id: parsed_manifest.manifest_id,
+            manifest_blake3,
+            blob_blake3: parsed_manifest.blob_blake3,
             relative_path,
             size_bytes: manifest_metadata.len(),
             blob_references,
-            captured_at_ms: manifest.captured_at_ms,
-            provider: manifest.provider,
-            original_path: manifest.original_path,
-            db_links: manifest.db_links,
+            captured_at_ms: parsed_manifest.captured_at_ms,
+            provider: parsed_manifest.provider,
+            original_path: parsed_manifest.original_path,
+            db_links: parsed_manifest.db_links,
         });
     }
     manifests.sort_by(|left, right| {
@@ -1007,12 +1014,89 @@ fn validate_prune_target_file(root: &Path, path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-fn remove_prune_target_file(root: &Path, path: &Path) -> Result<bool> {
-    if !validate_prune_target_file(root, path)? {
+fn remove_prune_entry_file(root: &Path, entry: &RawMirrorPruneEntry) -> Result<bool> {
+    let path = root.join(&entry.path);
+    if !validate_prune_target_file(root, &path)? {
         return Ok(false);
     }
-    fs::remove_file(path).with_context(|| format!("remove raw mirror file {}", path.display()))?;
-    sync_parent(path)?;
+    let metadata = fs::symlink_metadata(&path)
+        .with_context(|| format!("restat raw mirror prune target {}", path.display()))?;
+    if metadata.len() != entry.size_bytes {
+        return Err(anyhow!(
+            "raw mirror prune target {} changed size after preflight: observed {}, expected {}",
+            path.display(),
+            metadata.len(),
+            entry.size_bytes
+        ));
+    }
+
+    match entry.kind.as_str() {
+        "blob" => {
+            let expected_blake3 = entry.blob_blake3.as_deref().ok_or_else(|| {
+                anyhow!(
+                    "raw mirror prune blob target {} is missing its expected checksum",
+                    path.display()
+                )
+            })?;
+            verify_existing_blob_reference(
+                root,
+                &RawMirrorChunkRef {
+                    blob_relative_path: entry.path.clone(),
+                    blob_blake3: expected_blake3.to_string(),
+                    blob_size_bytes: entry.size_bytes,
+                },
+            )
+            .with_context(|| {
+                format!(
+                    "revalidating raw mirror blob immediately before deletion {}",
+                    path.display()
+                )
+            })?;
+        }
+        "manifest" => {
+            let expected_blob_blake3 = entry.blob_blake3.as_deref().ok_or_else(|| {
+                anyhow!(
+                    "raw mirror prune manifest target {} is missing its expected content identity",
+                    path.display()
+                )
+            })?;
+            let expected_manifest_blake3 = entry.manifest_blake3.as_deref().ok_or_else(|| {
+                anyhow!(
+                    "raw mirror prune manifest target {} is missing its expected descriptor checksum",
+                    path.display()
+                )
+            })?;
+            let observed_manifest = validated_existing_manifest(
+                root,
+                &path,
+                expected_blob_blake3,
+            )
+            .with_context(|| {
+                format!(
+                    "revalidating raw mirror manifest immediately before deletion {}",
+                    path.display()
+                )
+            })?;
+            if observed_manifest.manifest_blake3.as_deref() != Some(expected_manifest_blake3) {
+                return Err(anyhow!(
+                    "raw mirror prune manifest checksum changed after preflight for {}: observed {:?}, expected {}",
+                    path.display(),
+                    observed_manifest.manifest_blake3,
+                    expected_manifest_blake3
+                ));
+            }
+        }
+        kind => {
+            return Err(anyhow!(
+                "raw mirror prune target {} has unsupported kind {kind}",
+                path.display()
+            ));
+        }
+    }
+
+    fs::remove_file(&path)
+        .with_context(|| format!("remove raw mirror file {}", path.display()))?;
+    sync_parent(&path)?;
     Ok(true)
 }
 
@@ -1060,6 +1144,7 @@ fn append_prune_audit_records(
             "kind": entry.kind,
             "path": entry.path,
             "blob_blake3": entry.blob_blake3,
+            "manifest_blake3": entry.manifest_blake3,
             "size_bytes": entry.size_bytes,
             "reason": entry.reason,
             "applied": entry.applied,
@@ -2201,7 +2286,7 @@ fn verify_existing_file(path: &Path, expected_blake3: &str) -> Result<()> {
         Ok(())
     } else {
         Err(anyhow!(
-            "existing raw mirror blob {} has blake3 {}, expected {}",
+            "raw mirror blob checksum mismatch for {}: observed blake3 {}, expected {}",
             path.display(),
             actual,
             expected_blake3
@@ -2214,6 +2299,18 @@ fn verify_existing_manifest(
     path: &Path,
     expected_blob_blake3: &str,
 ) -> Result<()> {
+    validated_existing_manifest(root, path, expected_blob_blake3).map(|_| ())
+}
+
+/// Read exactly one descriptor snapshot, then bind its canonical path,
+/// self-checksum, derived identity, and source-content identity together.
+/// Callers authorizing deletion must not validate one read and compare fields
+/// from a later read of the same path.
+fn validated_existing_manifest(
+    root: &Path,
+    path: &Path,
+    expected_blob_blake3: &str,
+) -> Result<RawMirrorManifestFile> {
     let parsed_manifest = read_raw_mirror_manifest(path)?;
     let expected_manifest_path = root.join(raw_mirror_manifest_relative_path(
         &parsed_manifest.manifest_id,
@@ -2225,17 +2322,16 @@ fn verify_existing_manifest(
             expected_manifest_path.display()
         ));
     }
-    let manifest = read_validated_raw_mirror_manifest(root, &parsed_manifest.manifest_id)?;
-    if manifest.blob_blake3 == expected_blob_blake3 {
-        Ok(())
-    } else {
-        Err(anyhow!(
+    validate_raw_mirror_manifest_contents(&parsed_manifest, &parsed_manifest.manifest_id)?;
+    if parsed_manifest.blob_blake3 != expected_blob_blake3 {
+        return Err(anyhow!(
             "existing raw mirror manifest {} points at blob {}, expected {}",
             path.display(),
-            manifest.blob_blake3,
+            parsed_manifest.blob_blake3,
             expected_blob_blake3
-        ))
+        ));
     }
+    Ok(parsed_manifest)
 }
 
 fn read_raw_mirror_manifest(path: &Path) -> Result<RawMirrorManifestFile> {
@@ -3483,6 +3579,23 @@ mod tests {
         .expect("plan chunk-aware prune");
         assert_eq!(prune_report.planned_manifest_count, 1);
         assert_eq!(prune_report.planned_blob_count, 1);
+        let planned_manifest = prune_report
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.kind == "manifest" && entry.path == first.manifest_relative_path
+            })
+            .expect("retired chunked manifest prune entry");
+        assert_eq!(
+            planned_manifest.blob_blake3.as_deref(),
+            Some(first.blob_blake3.as_str()),
+            "a chunked manifest entry must pin its canonical descriptor identity instead of depending on reference ordering"
+        );
+        assert_eq!(
+            planned_manifest.manifest_blake3.as_deref(),
+            old_first_manifest.manifest_blake3.as_deref(),
+            "a manifest prune plan must pin the exact descriptor checksum"
+        );
         assert!(
             prune_report.entries.iter().any(|entry| {
                 entry.kind == "blob" && entry.path == first.blob_relative_path
@@ -3626,6 +3739,54 @@ mod tests {
             7,
             "an append into a partial tail should add only one replacement tail and one descriptor"
         );
+    }
+
+    #[test]
+    fn prune_apply_accepts_exact_chunked_manifest_identity() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("chunked-prune.jsonl");
+        fs::write(&source_path, b"0123456789abcdefABCDEFGHIJKLMNOP")
+            .expect("write chunked source");
+        let captured = capture_source_file_with_chunk_policy(
+            RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "codex",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &source_path,
+                db_links: &[],
+            },
+            1,
+            16,
+        )
+        .expect("capture chunked source");
+        let root = raw_mirror_root(&data_dir);
+        let manifest_path = root.join(&captured.manifest_relative_path);
+        let mut manifest = read_raw_mirror_manifest(&manifest_path).expect("read manifest");
+        manifest.captured_at_ms = 0;
+        manifest.manifest_blake3 = Some(raw_mirror_manifest_blake3(&manifest));
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize aged manifest"),
+        )
+        .expect("age manifest");
+
+        let report = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                older_than_ms: Some(now_ms() / 2),
+                safety_hold_down_ms: 0,
+                apply: true,
+                ..RawMirrorPruneOptions::default()
+            },
+        )
+        .expect("apply chunk-aware prune");
+
+        assert_eq!(report.applied_manifest_count, 1);
+        assert!(report.applied_blob_count >= 3);
+        assert!(!manifest_path.exists());
     }
 
     #[test]
@@ -4579,6 +4740,107 @@ mod tests {
         );
         assert!(orphan_path.exists());
         assert!(!root.join("pruned.jsonl").exists());
+    }
+
+    #[test]
+    fn prune_delete_revalidates_exact_blob_after_plan_preflight() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let root = ensure_raw_mirror_root(&data_dir).expect("raw mirror root");
+        let expected_bytes = b"preflighted raw mirror evidence";
+        let expected_blake3 = blake3::hash(expected_bytes).to_hex().to_string();
+        let relative_path =
+            raw_mirror_blob_relative_path(&expected_blake3).expect("blob path");
+        let blob_path = root.join(&relative_path);
+        ensure_private_dir_descendant(
+            &root,
+            blob_path.parent().expect("blob parent directory"),
+        )
+        .expect("create blob parent directory");
+        fs::write(&blob_path, expected_bytes).expect("plant preflighted blob");
+        let entry = RawMirrorPruneEntry {
+            kind: "blob".to_string(),
+            path: relative_path,
+            blob_blake3: Some(expected_blake3),
+            manifest_blake3: None,
+            size_bytes: expected_bytes.len() as u64,
+            reason: "test target".to_string(),
+            applied: false,
+        };
+
+        let mut replacement = expected_bytes.to_vec();
+        replacement[0] ^= 1;
+        fs::write(&blob_path, replacement).expect("replace blob after plan preflight");
+
+        let error = remove_prune_entry_file(&root, &entry)
+            .expect_err("same-size replacement must not be deleted");
+        assert!(
+            format!("{error:#}").contains("checksum mismatch"),
+            "unexpected changed-target error: {error:#}"
+        );
+        assert!(
+            blob_path.exists(),
+            "a target whose content changed after preflight must remain on disk"
+        );
+    }
+
+    #[test]
+    fn prune_delete_revalidates_exact_manifest_after_plan_preflight() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("session.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"safe\"}\n")
+            .expect("write source");
+        let captured = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("capture source");
+        let root = raw_mirror_root(&data_dir);
+        let manifest_path = root.join(&captured.manifest_relative_path);
+        let mut manifest = read_raw_mirror_manifest(&manifest_path).expect("read manifest");
+        let expected_manifest_blake3 = manifest
+            .manifest_blake3
+            .clone()
+            .expect("captured manifest checksum");
+        let original_size = fs::metadata(&manifest_path)
+            .expect("manifest metadata")
+            .len();
+        let entry = RawMirrorPruneEntry {
+            kind: "manifest".to_string(),
+            path: captured.manifest_relative_path,
+            blob_blake3: Some(captured.blob_blake3),
+            manifest_blake3: Some(expected_manifest_blake3),
+            size_bytes: original_size,
+            reason: "test target".to_string(),
+            applied: false,
+        };
+
+        manifest.captured_at_ms = manifest.captured_at_ms.saturating_add(1);
+        manifest.manifest_blake3 = Some(raw_mirror_manifest_blake3(&manifest));
+        let replacement = serde_json::to_vec_pretty(&manifest).expect("serialize replacement");
+        assert_eq!(
+            replacement.len() as u64,
+            original_size,
+            "fixture must preserve manifest size so the exact checksum is causal"
+        );
+        fs::write(&manifest_path, replacement).expect("replace manifest after preflight");
+
+        let error = remove_prune_entry_file(&root, &entry)
+            .expect_err("same-size valid replacement manifest must not be deleted");
+        assert!(
+            format!("{error:#}").contains("manifest checksum changed after preflight"),
+            "unexpected changed-manifest error: {error:#}"
+        );
+        assert!(
+            manifest_path.exists(),
+            "a manifest whose descriptor changed after preflight must remain on disk"
+        );
     }
 
     #[test]

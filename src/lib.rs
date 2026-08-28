@@ -19336,15 +19336,18 @@ fn corruption_class_franken_error(err: &crate::franken_sync::FrankenError) -> bo
     lower.contains("malformed") || lower.contains("disk image")
 }
 
-/// i6upe: bounded real-column corruption probe.
+/// i6upe: real-column corruption probe used only below a physical archive
+/// bundle-size ceiling.
 ///
 /// `SELECT COUNT(*)` is answered from index B-trees without touching table
 /// pages, so a DB whose table pages are malformed counts perfectly and only
 /// fails when real columns are read (proven on ts2/csd 2026-07-26, where
 /// counts matched while every projection failed). Each probe here projects
-/// real columns from a single row at both ends of the two hot tables —
-/// `id` is `INTEGER PRIMARY KEY` (the rowid), so `ORDER BY id`/`DESC` with
-/// `LIMIT 1` is an O(log n) B-tree edge descent, not a scan.
+/// real columns from a single row at both ends of the two hot tables. The SQL
+/// shape is logically bounded, but GH #413 proved that fsqlite may still read
+/// or hydrate a large fraction of a huge archive while executing it. Callers
+/// must therefore enforce a physical main+sidecar byte ceiling before using
+/// this probe.
 ///
 /// Returns `(Some(Ok), None)` when every probe reads (or the table is
 /// empty), `(Some(Corrupt), Some(detail))` on a corruption-class error, and
@@ -19376,13 +19379,15 @@ fn probe_state_db_integrity(
     (Some(StateDbIntegrity::Ok), None)
 }
 
-/// i6upe: open the canonical DB read-only and run the bounded corruption
-/// probe. `Some(detail)` when the archive is malformed; `None` when the
-/// probe passed or could not run/classify (missing DB, busy archive).
+/// Read the canonical database's fixed-size SQLite header, then run the
+/// stronger real-column probe only when the complete main+sidecar bundle is
+/// below [`STATUS_COUNT_SCAN_MAX_DB_BYTES`]. `Some(detail)` means corruption
+/// was classified; `None` means the bounded checks passed or could not safely
+/// classify the archive.
 ///
-/// This is the pre-index guard's entry: rebuilding on top of a malformed
-/// archive is the worst response to it (`--force-rebuild` also READS the
-/// canonical DB), so `cass index` refuses and points at recovery instead.
+/// This is deliberately not a complete page-integrity check. Large archives
+/// receive only the constant-size header check; deeper corruption still needs
+/// a current doctor integrity attestation or an explicit full integrity scan.
 pub(crate) fn bounded_canonical_db_corruption_probe(
     db_path: &Path,
     reason: &str,
@@ -19390,8 +19395,93 @@ pub(crate) fn bounded_canonical_db_corruption_probe(
     if !db_path.is_file() {
         return None;
     }
-    let conn = open_franken_cli_read_db(db_path.to_path_buf(), reason, STATE_DB_OPEN_TIMEOUT);
-    match conn {
+    // GH #413: this preflight must have a physical-I/O bound, not merely a
+    // SQL row-count bound. fsqlite can currently hydrate a large part of the
+    // B-tree while executing an ORDER BY ... LIMIT 1 edge lookup; the old
+    // four-query "bounded" probe read 8.4 GiB from a 35.7 GB archive before
+    // indexing had even entered its preparing phase. A query timeout would
+    // not repair that contract because the synchronous query cannot be
+    // cancelled safely from this call site.
+    //
+    // Reading the fixed 100-byte SQLite database header is genuinely bounded
+    // regardless of archive size. The stronger real-column probe below is
+    // retained for small bundles, where its worst-case physical work is also
+    // bounded, so the earlier i6upe smashed-page guard does not regress.
+    let mut header = [0_u8; 100];
+    let file_len = std::fs::metadata(db_path).ok()?.len();
+    if file_len == 0 {
+        // SQLite permits a zero-byte file as a new, empty database.
+        return None;
+    }
+    if file_len < header.len() as u64 {
+        return Some(format!(
+            "{reason}: truncated SQLite database header ({} bytes; expected at least {})",
+            file_len,
+            header.len()
+        ));
+    }
+    let mut file = std::fs::File::open(db_path).ok()?;
+    std::io::Read::read_exact(&mut file, &mut header).ok()?;
+
+    const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+    if &header[..SQLITE_MAGIC.len()] != SQLITE_MAGIC {
+        return Some(format!("{reason}: invalid SQLite database header magic"));
+    }
+
+    let encoded_page_size = u16::from_be_bytes([header[16], header[17]]);
+    let page_size = if encoded_page_size == 1 {
+        65_536_u32
+    } else {
+        u32::from(encoded_page_size)
+    };
+    if !(512..=65_536).contains(&page_size) || !page_size.is_power_of_two() {
+        return Some(format!(
+            "{reason}: invalid SQLite database page size {page_size}"
+        ));
+    }
+    if file_len % u64::from(page_size) != 0 {
+        return Some(format!(
+            "{reason}: SQLite database length {file_len} is not a multiple of page size {page_size}"
+        ));
+    }
+    let reserved_bytes = u32::from(header[20]);
+    if page_size.saturating_sub(reserved_bytes) < 480 {
+        return Some(format!(
+            "{reason}: invalid SQLite reserved-byte count {reserved_bytes} for page size {page_size}"
+        ));
+    }
+    if !matches!(header[18], 1 | 2) || !matches!(header[19], 1 | 2) {
+        return Some(format!(
+            "{reason}: invalid SQLite file format versions write={} read={}",
+            header[18], header[19]
+        ));
+    }
+    if header[21..24] != [64, 32, 32] {
+        return Some(format!(
+            "{reason}: invalid SQLite payload fractions {},{},{}",
+            header[21], header[22], header[23]
+        ));
+    }
+
+    let mut bundle_bytes = file_len;
+    for suffix in ["-wal", "-shm"] {
+        let Some(sidecar_path) = doctor_sqlite_sidecar_path(db_path, suffix) else {
+            return None;
+        };
+        match std::fs::symlink_metadata(&sidecar_path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                bundle_bytes = bundle_bytes.saturating_add(metadata.len());
+            }
+            Ok(_) => return None,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    if bundle_bytes > STATUS_COUNT_SCAN_MAX_DB_BYTES {
+        return None;
+    }
+
+    match open_franken_cli_read_db(db_path.to_path_buf(), reason, STATE_DB_OPEN_TIMEOUT) {
         Ok(conn) => {
             let (integrity, detail) = probe_state_db_integrity(&conn);
             let _ = close_franken_cli_read_db(conn, db_path, reason);
@@ -19403,8 +19493,6 @@ pub(crate) fn bounded_canonical_db_corruption_probe(
             }
         }
         Err(err) if !err.retryable => {
-            // A hard open failure on an EXISTING regular file is itself the
-            // corrupt-header/not-a-database class; a busy archive is not.
             let lower = err.message.to_ascii_lowercase();
             (lower.contains("malformed")
                 || lower.contains("disk image")
@@ -37540,8 +37628,9 @@ fn doctor_forensic_bundle_root_is_safe(data_dir: &Path, root: &Path) -> Result<(
 }
 
 fn doctor_sqlite_sidecar_path(db_path: &Path, suffix: &str) -> Option<PathBuf> {
-    let file_name = db_path.file_name()?.to_string_lossy();
-    Some(db_path.with_file_name(format!("{file_name}{suffix}")))
+    let mut file_name = db_path.file_name()?.to_os_string();
+    file_name.push(suffix);
+    Some(db_path.with_file_name(file_name))
 }
 
 struct DoctorForensicCopySpec<'a> {
@@ -114364,12 +114453,78 @@ mod state_db_integrity_probe_tests {
         );
     }
 
-    /// i6upe: smashing the table B-tree pages (while leaving the header
-    /// intact) must surface as a corruption verdict — the exact class that
-    /// `SELECT COUNT(*)` cannot see because counts are answered from index
-    /// pages without reading table pages.
+    /// GH #413: the pre-index corruption guard has a fixed 100-byte I/O
+    /// budget. Corrupt header fields must still fail closed without using a
+    /// SQL query whose physical work can scale with archive size.
     #[test]
-    fn bounded_corruption_probe_flags_smashed_table_pages() {
+    fn bounded_corruption_probe_flags_malformed_header() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("agent_search.db");
+        seed_probe_shaped_db(&db_path);
+        let mut bytes = std::fs::read(&db_path).expect("read fixture database");
+        bytes[16] = 0;
+        bytes[17] = 3;
+        std::fs::write(&db_path, bytes).expect("write malformed page-size header");
+
+        let verdict = bounded_canonical_db_corruption_probe(&db_path, "gh413-corrupt")
+            .expect("invalid fixed header fields must produce a corruption verdict");
+        assert!(
+            verdict.contains("page size 3"),
+            "unexpected verdict: {verdict}"
+        );
+    }
+
+    /// GH #413: once the physical bundle exceeds the explicit ceiling, the
+    /// pre-index guard must stop after the fixed header read and never open
+    /// fsqlite. Namespace identity sidecars are a causal open marker.
+    #[test]
+    fn bounded_corruption_probe_does_not_open_large_archive() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed_path = dir.path().join("seed.db");
+        seed_probe_shaped_db(&seed_path);
+        let seed_header = std::fs::read(&seed_path).expect("read seed database");
+
+        let db_path = dir.path().join("large-agent-search.db");
+        let mut large = std::fs::File::create(&db_path).expect("create sparse large archive");
+        large
+            .write_all(&seed_header[..100])
+            .expect("write valid SQLite header");
+        let encoded_page_size = u16::from_be_bytes([seed_header[16], seed_header[17]]);
+        let page_size = if encoded_page_size == 1 {
+            65_536_u64
+        } else {
+            u64::from(encoded_page_size)
+        };
+        let first_page_boundary_above_limit = STATUS_COUNT_SCAN_MAX_DB_BYTES
+            .saturating_add(page_size)
+            .div_ceil(page_size)
+            .saturating_mul(page_size);
+        large
+            .set_len(first_page_boundary_above_limit)
+            .expect("extend sparse large archive beyond deep-probe ceiling");
+        drop(large);
+
+        assert_eq!(
+            bounded_canonical_db_corruption_probe(&db_path, "gh413-large"),
+            None,
+            "a valid large-file header must not trigger a false corruption verdict"
+        );
+        for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+            let sidecar = doctor_sqlite_sidecar_path(&db_path, suffix).expect("sidecar path");
+            assert!(
+                !sidecar.exists(),
+                "large-archive guard opened fsqlite and created {}",
+                sidecar.display()
+            );
+        }
+    }
+
+    /// i6upe: below the explicit archive-bundle byte ceiling, keep the
+    /// real-column edge probes that catch damage outside the SQLite header.
+    #[test]
+    fn bounded_corruption_probe_flags_smashed_table_pages_for_small_archive() {
         use std::io::{Seek as _, SeekFrom, Write as _};
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -114386,55 +114541,30 @@ mod state_db_integrity_probe_tests {
             .open(&db_path)
             .expect("open fixture for corruption");
         db.seek(SeekFrom::Start(4096)).expect("seek past page 1");
-        let garbage = vec![0xFF_u8; (len - 4096) as usize];
-        db.write_all(&garbage).expect("smash table pages");
+        db.write_all(&vec![0xFF_u8; (len - 4096) as usize])
+            .expect("smash table pages");
         drop(db);
 
-        // The WAL sidecar can still hold valid frames that overlay the
-        // smashed main pages (observed: every probe read succeeded via WAL
-        // replay). Smash it too so reads must hit the malformed pages.
-        let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
-        if let Ok(wal_len) = std::fs::metadata(&wal_path).map(|m| m.len())
+        let wal_path = doctor_sqlite_sidecar_path(&db_path, "-wal").expect("WAL path");
+        if let Ok(wal_len) = std::fs::metadata(&wal_path).map(|metadata| metadata.len())
             && wal_len > 0
         {
             let mut wal = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&wal_path)
-                .expect("open wal sidecar for corruption");
+                .expect("open WAL sidecar for corruption");
             wal.write_all(&vec![0xFF_u8; wal_len as usize])
-                .expect("smash wal frames");
-            drop(wal);
+                .expect("smash WAL frames");
         }
 
-        let verdict = bounded_canonical_db_corruption_probe(&db_path, "i6upe-corrupt");
-        if verdict.is_none() {
-            // Surface what the reader actually said so a classifier gap is
-            // diagnosable from the failure output alone.
-            let mut observed = Vec::new();
-            match open_franken_cli_read_db(db_path.clone(), "i6upe-debug", Duration::from_secs(2)) {
-                Ok(conn) => {
-                    use crate::franken_sync::compat::RowExt;
-                    use crate::franken_sync::params;
-                    for sql in [
-                        "SELECT id, title, source_path FROM conversations ORDER BY id LIMIT 1",
-                        "SELECT id, title, source_path FROM conversations ORDER BY id DESC LIMIT 1",
-                    ] {
-                        let outcome = franken_query_row_map_retry(&conn, sql, params![], |row| {
-                            row.get_typed::<i64>(0).map(|_| ())
-                        });
-                        observed.push(format!("{sql} -> {outcome:?}"));
-                    }
-                    let _ = close_franken_cli_read_db(conn, &db_path, "i6upe-debug");
-                }
-                Err(err) => observed.push(format!(
-                    "open failed: retryable={} message={}",
-                    err.retryable, err.message
-                )),
-            }
-            panic!(
-                "smashed table pages must produce a corruption verdict; observed: {}",
-                observed.join(" | ")
-            );
-        }
+        let verdict = bounded_canonical_db_corruption_probe(&db_path, "i6upe-corrupt")
+            .expect("small smashed archive must produce a corruption verdict");
+        let lower = verdict.to_ascii_lowercase();
+        assert!(
+            lower.contains("malformed")
+                || lower.contains("corrupt")
+                || lower.contains("disk image"),
+            "unexpected smashed-page verdict: {verdict}"
+        );
     }
 }

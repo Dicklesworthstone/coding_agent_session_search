@@ -2610,6 +2610,28 @@ fn nonresumable_pending_lexical_rebuild_status_without_fingerprint(
     db_path: &Path,
     total_conversations: usize,
 ) -> Result<Option<MatchingLexicalRebuildStateStatus>> {
+    let Some(state) = nonresumable_pending_lexical_rebuild_state_for_db(index_path, db_path)? else {
+        return Ok(None);
+    };
+    if state.db.total_conversations != total_conversations {
+        return Ok(None);
+    }
+
+    Ok(Some(MatchingLexicalRebuildStateStatus {
+        has_pending_resume: true,
+        ..MatchingLexicalRebuildStateStatus::default()
+    }))
+}
+
+/// Load and cheaply classify a restart-from-zero checkpoint before touching
+/// the canonical database. In particular, path identity, schema, execution
+/// mode, and checkpoint shape are all available in the small JSON sidecar and
+/// must be rejected before an exact conversation count can hydrate a very
+/// large fsqlite archive (GH #413).
+fn nonresumable_pending_lexical_rebuild_state_for_db(
+    index_path: &Path,
+    db_path: &Path,
+) -> Result<Option<LexicalRebuildState>> {
     let Some(state) = load_lexical_rebuild_state(index_path)? else {
         return Ok(None);
     };
@@ -2618,7 +2640,6 @@ fn nonresumable_pending_lexical_rebuild_status_without_fingerprint(
         || state.version != LEXICAL_REBUILD_STATE_VERSION
         || state.schema_hash != crate::search::tantivy::SCHEMA_HASH
         || !lexical_rebuild_page_size_is_compatible(state.page_size)
-        || state.db.total_conversations != total_conversations
     {
         return Ok(None);
     }
@@ -2630,14 +2651,21 @@ fn nonresumable_pending_lexical_rebuild_status_without_fingerprint(
         return Ok(None);
     }
 
-    Ok(Some(MatchingLexicalRebuildStateStatus {
-        has_pending_resume: true,
-        ..MatchingLexicalRebuildStateStatus::default()
-    }))
+    Ok(Some(state))
 }
 
 fn nonresumable_pending_lexical_rebuild_status_from_readonly_db(
     index_path: &Path,
+    db_path: &Path,
+) -> Result<Option<(MatchingLexicalRebuildStateStatus, usize)>> {
+    let Some(state) = nonresumable_pending_lexical_rebuild_state_for_db(index_path, db_path)? else {
+        return Ok(None);
+    };
+    confirm_nonresumable_pending_lexical_rebuild_state_from_readonly_db(&state, db_path)
+}
+
+fn confirm_nonresumable_pending_lexical_rebuild_state_from_readonly_db(
+    state: &LexicalRebuildState,
     db_path: &Path,
 ) -> Result<Option<(MatchingLexicalRebuildStateStatus, usize)>> {
     let mut storage = FrankenStorage::open_readonly(db_path).with_context(|| {
@@ -2649,12 +2677,16 @@ fn nonresumable_pending_lexical_rebuild_status_from_readonly_db(
     let total_conversations = count_total_conversations_exact(&storage)?;
     storage.close_best_effort_in_place();
 
-    let status = nonresumable_pending_lexical_rebuild_status_without_fingerprint(
-        index_path,
-        db_path,
+    if state.db.total_conversations != total_conversations {
+        return Ok(None);
+    }
+    Ok(Some((
+        MatchingLexicalRebuildStateStatus {
+            has_pending_resume: true,
+            ..MatchingLexicalRebuildStateStatus::default()
+        },
         total_conversations,
-    )?;
-    Ok(status.map(|status| (status, total_conversations)))
+    )))
 }
 
 fn should_try_readonly_nonresumable_lexical_resume(opts: &IndexOptions) -> bool {
@@ -3112,8 +3144,8 @@ impl IndexRunLockGuard {
     }
 
     /// Update only the `phase=` sub-phase breadcrumb without changing
-    /// the `mode=`. Use this at the entry of each watch-startup preflight
-    /// step so cass#265 operators can pinpoint which step wedged — the
+    /// the `mode=`. Use this at the entry of each index preflight step so
+    /// cass#265/GH#413 operators can pinpoint which step wedged — the
     /// previous v0.6.5 lock-file payload only reported `phase=watch_startup`,
     /// which hid the wedge inside a multi-second-to-multi-hour preflight
     /// block.
@@ -3122,7 +3154,7 @@ impl IndexRunLockGuard {
     }
 }
 
-/// cass#265: watch_startup preflight per-op skip + timeout configuration.
+/// cass#265/GH#413: index preflight per-op skip + timeout configuration.
 ///
 /// The v0.6.6 fix `fad3f03d` shipped sub-phase breadcrumbs so operators
 /// could pinpoint which preflight step wedged, but it did NOT add a
@@ -3134,8 +3166,10 @@ impl IndexRunLockGuard {
 /// a usable index and wedges in fsqlite.
 ///
 /// This module turns the diagnostic infrastructure into a *self-
-/// debugging surface*:
-/// 1. Per-op atomic watchdog: every `preflight_phase!(...)` enter
+/// debugging surface*. The hard watchdog applies to watch startup. Plain
+/// index can emit the cheap checkpoint-classification breadcrumb, but its
+/// count-free restart does not inherit a preflight process-abort policy:
+/// 1. Per-op atomic watchdog: every timeout-enforced `preflight_phase!(...)` enter
 ///    records `step_started_at_ms`. A dedicated watchdog thread
 ///    polls it every 5 s; if a step exceeds `CASS_PREFLIGHT_OP_TIMEOUT_SECS`
 ///    (default 180 s), the watchdog rewrites the lock file's
@@ -3378,7 +3412,7 @@ mod watch_startup_preflight {
                         elapsed_ms,
                         timeout_secs,
                         skip_env = %skip_env_name(sub_phase),
-                        "cass#265: watch_startup preflight step exceeded timeout; \
+                        "cass#265/GH#413: index preflight step exceeded timeout; \
                          the indexing process is being aborted to surface the wedge. \
                          Re-run with the documented skip env var set to bypass this step."
                     );
@@ -3422,7 +3456,7 @@ mod watch_startup_preflight {
                         "hint": format!(
                             "Set {} to bypass this preflight step. The wedge \
                              needs a root-cause fix; the skip is a temporary \
-                             workaround. See cass#265 for the running investigation.",
+                             workaround. See cass#265 and cass#413 for the running investigation.",
                             skip_env_name(sub_phase)
                         ),
                     });
@@ -3570,9 +3604,14 @@ use watch_startup_preflight::{
     WatchStartupPreflightWatchdog,
 };
 
-/// Canonical taxonomy of watch_startup preflight sub-phase breadcrumbs,
-/// in the order they execute inside `run_index`. The watchdog uses the
-/// array index as a `u8` step id; the `watch_startup_sub_phase_taxonomy_is_documented_and_stable`
+/// Canonical stable-ID taxonomy of index preflight sub-phase breadcrumbs.
+/// The historical names retain their `watch_startup:` prefix for contract
+/// compatibility. Watch startup emits the active taxonomy; plain incremental
+/// indexing also emits the nonresumable-checkpoint classification phase that it
+/// can run. Retired entries remain reserved so existing numeric step IDs never
+/// move. Newly appended entries need not match execution order. The watchdog
+/// uses the array index as a `u8` step id; the
+/// `watch_startup_sub_phase_taxonomy_is_documented_and_stable`
 /// regression test pins this list against the call sites; and the
 /// public docs / release notes / cass#265 triage runbook reference
 /// these strings verbatim.
@@ -3597,6 +3636,10 @@ const WATCH_STARTUP_SUB_PHASE_TAXONOMY: &[&str] = &[
     "watch_startup:published_index_validate",
     "watch_startup:scan_entry",
     "watch_startup:reclassify_legacy_omp",
+    "watch_startup:classify_nonresumable_checkpoint",
+    // Retired by GH #413's count-free authoritative restart. Keep the slot so
+    // the stable IDs of any future appended phases cannot reuse it.
+    "watch_startup:count_nonresumable_checkpoint_conversations",
 ];
 
 /// Lookup the taxonomy step index for a sub-phase string. Returns
@@ -9242,6 +9285,10 @@ struct IncrementalCanonicalLexicalRepairContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LexicalRebuildOutcome {
+    /// Exact number of canonical conversations observed while streaming the
+    /// authoritative database. This can differ from the startup hint used by
+    /// count-free restart paths when the interrupted checkpoint is stale.
+    pub observed_conversations: usize,
     pub indexed_docs: usize,
     pub observed_messages: Option<usize>,
     pub exact_checkpoint_persisted: bool,
@@ -13627,11 +13674,11 @@ pub fn run_index(
     // Every index mode reads the canonical DB (`--force-rebuild` performs a
     // READONLY authoritative rebuild from it), so indexing a corrupt archive
     // at best fails confusingly and at worst rewrites over recoverable
-    // pages. The probe is bounded (single-row real-column projections at
-    // both B-tree edges of the two hot tables — COUNT(*) is answered from
-    // index pages and cannot see this class); a busy or missing DB never
-    // trips it. CASS_INDEX_ALLOW_MALFORMED_DB=1 bypasses for emergency
-    // flows that knowingly operate on a damaged archive.
+    // pages. The probe always validates the fixed SQLite header; only archives
+    // below its explicit physical bundle-size ceiling also run the stronger
+    // real-column projections. A busy or missing DB never trips it.
+    // CASS_INDEX_ALLOW_MALFORMED_DB=1 bypasses for emergency flows that
+    // knowingly operate on a damaged archive.
     if !dotenvy::var("CASS_INDEX_ALLOW_MALFORMED_DB").is_ok_and(|v| v == "1")
         && let Some(detail) =
             crate::bounded_canonical_db_corruption_probe(&opts.db_path, "index-preflight")
@@ -13687,16 +13734,21 @@ pub fn run_index(
         return Ok(());
     }
 
-    // cass#265: each preflight step gets its own sub-phase breadcrumb so
-    // operators investigating a watch_startup wedge can see WHICH step
-    // stalled instead of an opaque `phase=watch_startup` for the entire
-    // pre-pipeline block. Each `set_phase` call also bumps
-    // `last_progress_at_ms` (in both the atomic and the on-disk field)
-    // and emits a new `phase=` string that `IndexStallWatchdog` treats
-    // as a phase transition (resets its `last_progress_advance` timer).
-    // The macro keeps the call sites compact: noop on non-watch_startup
-    // modes so plain `cass index` runs don't pay the I/O cost on the
-    // initial-state non-watch path.
+    // cass#265 / GH #413: each preflight step gets its own sub-phase
+    // breadcrumb so operators investigating a watch-startup wedge can see
+    // WHICH step stalled instead of an opaque top-level phase for the entire
+    // pre-pipeline block. The historical `watch_startup:` namespace remains a
+    // compatibility contract. Plain incremental indexing additionally exposes
+    // the cheap restart-from-zero checkpoint classification it can enter;
+    // other index modes retain their existing telemetry. The hard watchdog
+    // remains scoped to watch startup; plain restart no longer performs an
+    // exact startup count and therefore needs no preflight abort path.
+    // Each visible `set_phase`
+    // call bumps `last_progress_at_ms` (in both the atomic and the on-disk
+    // field) and emits a new `phase=` string that `IndexStallWatchdog` treats
+    // as a phase transition (resets its `last_progress_advance` timer). The
+    // macro keeps the call sites compact while leaving unrelated full/plain
+    // preflight telemetry unchanged.
     //
     // v0.6.7 extension: the macro also notifies the
     // `WatchStartupPreflightState` so the watchdog thread can detect
@@ -13704,8 +13756,9 @@ pub fn run_index(
     // 180 s) and abort the process with a `<step>_TIMEOUT` breadcrumb
     // instead of hanging forever.
     let preflight_state = WatchStartupPreflightState::new();
-    let _preflight_watchdog = if initial_lock_mode == SearchMaintenanceMode::WatchStartup {
-        Some(WatchStartupPreflightWatchdog::start(
+    let preflight_watchdog_enabled = initial_lock_mode == SearchMaintenanceMode::WatchStartup;
+    let _preflight_watchdog = preflight_watchdog_enabled.then(|| {
+        WatchStartupPreflightWatchdog::start(
             Arc::clone(&preflight_state),
             WATCH_STARTUP_SUB_PHASE_TAXONOMY,
             index_run_lock._path.clone(),
@@ -13716,37 +13769,36 @@ pub fn run_index(
             // INV3: pass the shared write lock so the watchdog's
             // `_TIMEOUT` rewrite is serialised with the heartbeat.
             Arc::clone(&index_run_lock.metadata_write_lock),
-        ))
-    } else {
-        None
-    };
+        )
+    });
     macro_rules! preflight_phase {
         ($phase:expr) => {{
-            if initial_lock_mode == SearchMaintenanceMode::WatchStartup {
-                // Notify the watchdog of the new active step BEFORE
-                // writing the lock-file breadcrumb. If the lock-file
-                // write itself wedges (it shouldn't, but
-                // belt-and-suspenders), the watchdog can still kill
-                // the process with the right `<step>_TIMEOUT` phase.
+            let phase_visible = initial_lock_mode == SearchMaintenanceMode::WatchStartup
+                || $phase == "watch_startup:classify_nonresumable_checkpoint";
+            let timeout_enforced = initial_lock_mode == SearchMaintenanceMode::WatchStartup;
+            if timeout_enforced {
+                // Notify the watchdog of the new active step BEFORE writing
+                // the lock-file breadcrumb. If the write itself wedges, the
+                // watchdog can still kill the process with the right
+                // `<step>_TIMEOUT` phase.
                 if let Some(step_idx) = watch_startup_step_idx($phase) {
-                    preflight_state
-                        .enter(step_idx, FrankenStorage::now_millis());
+                    preflight_state.enter(step_idx, FrankenStorage::now_millis());
                 } else {
-                    // Coding error: an undocumented sub-phase reached
-                    // the macro. Fail loud in debug builds; in release
-                    // we still write the breadcrumb so the operator
-                    // gets *some* signal, just no watchdog coverage.
+                    // Coding error: an undocumented timeout-enforced phase
+                    // reached the macro.
                     debug_assert!(
                         false,
                         "undocumented watch_startup sub-phase `{}`; add it to WATCH_STARTUP_SUB_PHASE_TAXONOMY",
                         $phase
                     );
                 }
+            }
+            if phase_visible {
                 if let Err(err) = index_run_lock.set_phase(initial_lock_mode, $phase) {
                     tracing::debug!(
                         sub_phase = $phase,
                         error = %err,
-                        "watch_startup preflight phase breadcrumb write failed (continuing)"
+                        "index preflight phase breadcrumb write failed (continuing)"
                     );
                 }
             }
@@ -13754,10 +13806,8 @@ pub fn run_index(
     }
     macro_rules! complete_preflight_phase {
         () => {{
-            if initial_lock_mode == SearchMaintenanceMode::WatchStartup {
-                preflight_state.exit();
-                bump_index_run_lock_progress_atomic(&progress_bump);
-            }
+            preflight_state.exit();
+            bump_index_run_lock_progress_atomic(&progress_bump);
         }};
     }
 
@@ -13768,42 +13818,30 @@ pub fn run_index(
     ensure_index_startup_storage_headroom(&opts)?;
     complete_preflight_phase!();
     if should_try_readonly_nonresumable_lexical_resume(&opts) {
-        match nonresumable_pending_lexical_rebuild_status_from_readonly_db(
-            &index_path,
-            &opts.db_path,
-        ) {
-            Ok(Some((_status, total_conversations))) => {
-                if let Some(deferred) = should_defer_incremental_authoritative_lexical_repair(
-                    &opts,
-                    false,
-                    total_conversations,
-                    true,
-                    None,
-                ) {
-                    tracing::warn!(
-                        db_path = %opts.db_path.display(),
-                        canonical_conversations = deferred.canonical_conversations,
-                        db_size_bytes = deferred.db_size_bytes,
-                        max_automatic_repair_db_size_bytes =
-                            deferred.max_automatic_repair_db_size_bytes,
-                        reason = deferred.reason,
-                        "deferring automatic resume of a large authoritative lexical rebuild during routine incremental index"
-                    );
-                    record_lexical_population_strategy(
-                        opts.progress.as_ref(),
-                        LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
-                        deferred.reason,
-                    );
-                    record_deferred_incremental_canonical_lexical_repair(
-                        opts.progress.as_ref(),
-                        &deferred,
-                    );
-                    return Ok(());
-                }
+        // GH #413: classify the small staged-checkpoint sidecar before opening
+        // the canonical DB, then restart the non-resumable build without an
+        // exact COUNT(*). The packet producer enumerates the authoritative DB
+        // to EOF and therefore learns the exact total as part of useful Quill
+        // ingest work. The persisted count is only a progress hint: it may be
+        // stale after an interrupted run and must never authorize an early
+        // return or become the completed generation's fingerprint.
+        let pending_state =
+            if preflight_skip("watch_startup:classify_nonresumable_checkpoint") {
+                Ok(None)
+            } else {
+                preflight_phase!("watch_startup:classify_nonresumable_checkpoint");
+                let result =
+                    nonresumable_pending_lexical_rebuild_state_for_db(&index_path, &opts.db_path);
+                complete_preflight_phase!();
+                result
+            };
+        match pending_state {
+            Ok(Some(state)) => {
+                let total_conversations_hint = state.db.total_conversations;
                 tracing::info!(
                     db_path = %opts.db_path.display(),
-                    total_conversations,
-                    "restarting non-resumable lexical rebuild from a readonly canonical DB before writable storage open"
+                    total_conversations_hint,
+                    "restarting non-resumable lexical rebuild from a readonly canonical DB without an exact startup count"
                 );
                 record_lexical_population_strategy(
                     opts.progress.as_ref(),
@@ -13822,7 +13860,7 @@ pub fn run_index(
                 let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
                     &opts.db_path,
                     &opts.data_dir,
-                    total_conversations,
+                    total_conversations_hint,
                     opts.progress.clone(),
                     Arc::clone(&progress_bump),
                 )?;
@@ -13830,12 +13868,12 @@ pub fn run_index(
                     && let Ok(mut stats) = p.stats.lock()
                 {
                     stats.scan_ms = 0;
-                    stats.total_conversations = total_conversations;
+                    stats.total_conversations = rebuild.observed_conversations;
                 }
                 if let Some(observed_messages) = rebuild.observed_messages {
                     record_exact_total_counts_in_progress(
                         opts.progress.as_ref(),
-                        total_conversations,
+                        rebuild.observed_conversations,
                         observed_messages,
                     );
                 }
@@ -13856,9 +13894,28 @@ pub fn run_index(
     }
 
     preflight_phase!("watch_startup:open_storage");
+    // GH #374: a full rebuild must classify an existing canonical archive on
+    // a strictly read-only connection before `open_storage_for_index`. That
+    // writable open may repair transition/schema objects even on the current
+    // schema, so checking immediately afterward would already be too late.
+    if opts.full
+        && let Some(reason) = full_rebuild_existing_archive_integrity_preflight(&opts.db_path)?
+    {
+        tracing::error!(
+            db_path = %opts.db_path.display(),
+            reason = %reason,
+            "full rebuild detected an unhealthy current-schema canonical db; refusing to replace the canonical archive"
+        );
+        return Err(canonical_archive_unhealthy_for_index_error(
+            &opts.db_path,
+            &reason,
+        ));
+    }
+
     let (mut storage, canonical_storage_rebuilt, opened_fresh_for_full) =
         open_storage_for_index(&opts.db_path, opts.full)?;
     complete_preflight_phase!();
+
     let defer_checkpoints = !opts.watch;
     let mut reopened_after_writable_preflight = false;
 
@@ -14002,22 +14059,6 @@ pub fn run_index(
         );
     }
     complete_preflight_phase!();
-
-    if opts.full
-        && !opened_fresh_for_full
-        && let Some(reason) = full_rebuild_existing_storage_integrity_problem(&storage)?
-    {
-        tracing::error!(
-            db_path = %opts.db_path.display(),
-            reason = %reason,
-            "full rebuild detected an unhealthy current-schema canonical db; refusing to replace the canonical archive"
-        );
-        storage.close_best_effort_in_place();
-        return Err(canonical_archive_unhealthy_for_index_error(
-            &opts.db_path,
-            &reason,
-        ));
-    }
 
     if can_skip_unchanged_explicit_watch_once_index_run(
         &opts,
@@ -17308,7 +17349,10 @@ fn index_integrity_preflight_max_bytes() -> u64 {
         .unwrap_or(DEFAULT_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES)
 }
 
-fn should_run_full_archive_quick_check(bundle_bytes: Option<u64>, max_bytes: u64) -> bool {
+fn should_run_engine_backed_archive_integrity_preflight(
+    bundle_bytes: Option<u64>,
+    max_bytes: u64,
+) -> bool {
     if max_bytes == 0 {
         return true;
     }
@@ -17327,35 +17371,139 @@ fn archive_bundle_size_for_integrity_preflight(storage: &FrankenStorage) -> Opti
     Some(database_bundle_size_bytes(&db_path))
 }
 
+fn incompatible_legacy_fts_shadow_ddl(table: &str, ddl: &str) -> Option<String> {
+    let normalized = ddl
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && *ch != '"' && *ch != '\'')
+        .collect::<String>()
+        .to_ascii_lowercase();
+    (!normalized.contains("withoutrowid")).then(|| {
+        format!(
+            "legacy {table} schema is not WITHOUT ROWID; this pre-fix FTS5 shadow shape can carry a stale implicit autoindex and must be rebuilt before full indexing"
+        )
+    })
+}
+
+/// Detect the exact legacy FTS5 shadow DDL behind GH #374 without walking the
+/// archive. FrankenSQLite versions before its canonical-shadow fix created
+/// `%_config`/`%_idx` as ordinary rowid tables; stock SQLite then reported
+/// `wrong # of entries in index sqlite_autoindex_fts_messages_config_1`, while
+/// fsqlite's own `quick_check` could still return `ok`. The two sqlite_master
+/// rows are tiny, stable metadata and therefore remain suitable for a bounded
+/// full-index preflight.
+fn incompatible_legacy_fts_shadow_problem(storage: &FrankenStorage) -> Result<Option<String>> {
+    let rows = storage
+        .raw()
+        .query(
+            "SELECT name, sql
+             FROM sqlite_master
+             WHERE type = 'table'
+               AND name IN ('fts_messages_config', 'fts_messages_idx')
+             ORDER BY name",
+        )
+        .context("reading canonical FTS shadow DDL for full rebuild preflight")?;
+    for row in rows {
+        let table = row
+            .get_typed::<String>(0)
+            .context("reading canonical FTS shadow table name")?;
+        let ddl = row
+            .get_typed::<String>(1)
+            .context("reading canonical FTS shadow table DDL")?;
+        if let Some(problem) = incompatible_legacy_fts_shadow_ddl(&table, &ddl) {
+            return Ok(Some(problem));
+        }
+    }
+    Ok(None)
+}
+
+/// Ask FrankenSQLite's FTS5 reader to decode the persisted structure,
+/// averages, and every segment leaf. `PRAGMA quick_check` validates SQLite's
+/// b-trees, but it does not understand the payload stored inside `%_data`, so
+/// it can report `ok` for the exact corrupt-segment shape seen in GH #374.
+/// The special command is read-only despite its INSERT syntax.
+fn canonical_fts_segment_integrity_problem(
+    storage: &FrankenStorage,
+) -> Result<Option<String>> {
+    let fts_exists = storage
+        .raw()
+        .query_row_map(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name = 'fts_messages'",
+            &[] as &[ParamValue],
+            |row| row.get_typed::<i64>(0),
+        )
+        .context("checking for canonical FTS before segment integrity preflight")?;
+    if fts_exists == 0 {
+        return Ok(None);
+    }
+
+    match storage
+        .raw()
+        .execute("INSERT INTO fts_messages(fts_messages) VALUES('integrity-check')")
+    {
+        Ok(_) => Ok(None),
+        Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => {
+            Err(anyhow::anyhow!(
+                "full rebuild FTS segment integrity preflight hit transient storage contention: {err}"
+            ))
+        }
+        Err(err) => Ok(Some(format!(
+            "FTS5 segment integrity-check failed: {err}"
+        ))),
+    }
+}
+
 fn full_rebuild_existing_storage_integrity_problem(
     storage: &FrankenStorage,
 ) -> Result<Option<String>> {
     let bundle_bytes = archive_bundle_size_for_integrity_preflight(storage);
     let max_bytes = index_integrity_preflight_max_bytes();
-    if should_run_full_archive_quick_check(bundle_bytes, max_bytes) {
-        let quick_check = match storage.raw().query_row_map(
-            "PRAGMA quick_check(1)",
-            &[] as &[ParamValue],
-            |row| row.get_typed::<String>(0),
-        ) {
-            Ok(status) => status,
-            Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => {
-                return Err(anyhow::anyhow!(
-                    "full rebuild archive integrity preflight hit transient storage contention: {err}"
-                ));
-            }
-            Err(err) => return Ok(Some(format!("quick_check failed: {err}"))),
-        };
-
-        if !quick_check.trim().eq_ignore_ascii_case("ok") {
-            return Ok(Some(format!("quick_check reported {quick_check:?}")));
-        }
-    } else {
+    if !should_run_engine_backed_archive_integrity_preflight(bundle_bytes, max_bytes) {
         tracing::warn!(
             bundle_bytes = bundle_bytes.unwrap_or_default(),
             max_bytes,
-            "skipping the O(database-size) PRAGMA quick_check before a large full rebuild; core-table canaries still run. Use 'cass doctor check --json' for the exhaustive scan, or set CASS_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES=0 to force it here"
+            "skipping every fsqlite-backed integrity query before a large full rebuild; the fixed-size SQLite header guard already ran, and later rebuild phases provide named progress. Use 'cass doctor check --json' for the exhaustive scan, or set CASS_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES=0 to force it here"
         );
+        return Ok(None);
+    }
+
+    match incompatible_legacy_fts_shadow_problem(storage) {
+        Ok(Some(problem)) => return Ok(Some(problem)),
+        Ok(None) => {}
+        Err(err) if anyhow_chain_indicates_retryable_storage_contention(&err) => {
+            return Err(anyhow::anyhow!(
+                "full rebuild FTS shadow-schema preflight hit transient storage contention: {err:#}"
+            ));
+        }
+        Err(err) => {
+            return Ok(Some(format!(
+                "FTS shadow-schema preflight failed: {err:#}"
+            )));
+        }
+    }
+
+    match canonical_fts_segment_integrity_problem(storage) {
+        Ok(Some(problem)) => return Ok(Some(problem)),
+        Ok(None) => {}
+        Err(err) => return Err(err),
+    }
+
+    let quick_check = match storage.raw().query_row_map(
+        "PRAGMA quick_check(1)",
+        &[] as &[ParamValue],
+        |row| row.get_typed::<String>(0),
+    ) {
+        Ok(status) => status,
+        Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => {
+            return Err(anyhow::anyhow!(
+                "full rebuild archive integrity preflight hit transient storage contention: {err}"
+            ));
+        }
+        Err(err) => return Ok(Some(format!("quick_check failed: {err}"))),
+    };
+
+    if !quick_check.trim().eq_ignore_ascii_case("ok") {
+        return Ok(Some(format!("quick_check reported {quick_check:?}")));
     }
 
     for (table, sql) in [
@@ -17382,6 +17530,73 @@ fn full_rebuild_existing_storage_integrity_problem(
     }
 
     Ok(None)
+}
+
+fn full_rebuild_existing_archive_integrity_preflight(db_path: &Path) -> Result<Option<String>> {
+    let archive_bytes = match fs::metadata(db_path) {
+        Ok(metadata) => metadata.len(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "inspecting canonical archive before read-only full-rebuild preflight: {}",
+                    db_path.display()
+                )
+            });
+        }
+    };
+    if archive_bytes == 0 {
+        return Ok(None);
+    }
+
+    // GH #413: decide from filesystem metadata before opening fsqlite. Even a
+    // syntactically tiny sqlite_master or COUNT query can hydrate gigabytes in
+    // the current engine, so an after-open/after-query cap is not a bound.
+    let bundle_bytes = database_bundle_size_bytes(db_path);
+    let max_bytes = index_integrity_preflight_max_bytes();
+    if !should_run_engine_backed_archive_integrity_preflight(Some(bundle_bytes), max_bytes) {
+        tracing::warn!(
+            db_path = %db_path.display(),
+            bundle_bytes,
+            max_bytes,
+            "large full-rebuild archive passed the fixed SQLite header guard; deferring all fsqlite-backed integrity work to named rebuild/doctor phases"
+        );
+        return Ok(None);
+    }
+
+    let storage = match FrankenStorage::open_strict_readonly_with_timeout(
+        db_path,
+        Duration::from_secs(10),
+    ) {
+        Ok(storage) => storage,
+        Err(err) if anyhow_chain_indicates_retryable_storage_contention(&err) => {
+            return Err(anyhow::anyhow!(
+                "full rebuild read-only archive preflight hit transient storage contention: {err:#}"
+            ));
+        }
+        Err(err) => {
+            return Ok(Some(format!(
+                "read-only full-rebuild integrity preflight could not open the canonical archive: {err:#}"
+            )));
+        }
+    };
+    let result = full_rebuild_existing_storage_integrity_problem(&storage);
+    if let Err(close_err) = storage.close_without_checkpoint() {
+        if result.is_ok() {
+            return Err(close_err).with_context(|| {
+                format!(
+                    "closing strict read-only full-rebuild preflight for {}",
+                    db_path.display()
+                )
+            });
+        }
+        tracing::debug!(
+            db_path = %db_path.display(),
+            error = %close_err,
+            "strict read-only full-rebuild preflight also failed to close after its integrity check failed"
+        );
+    }
+    result
 }
 
 fn targeted_watch_once_fts_parity_problem(
@@ -17444,10 +17659,12 @@ fn canonical_archive_unhealthy_for_index_error(db_path: &Path, reason: &str) -> 
          --json' and apply its safe parity repair with '--yes' (if the FTS \
          corruption blocks the open itself so even that repair cannot read the \
          archive — GH #368 — treat it as unopenable and use reconstruct below). \
-         If the archive \
-         cannot be opened at all, rebuild from the checksum-verified raw mirror with \
-         'cass doctor --recover-from-archive <DIR> --json' (it reads the mirror, not \
-         the dead DB). If instead the archive opens read-only but is \
+         If the archive cannot be opened at all, run 'cass doctor --fix --json' \
+         to fully verify the raw mirror and build an isolated reconstruct candidate \
+         under the doctor staging directory; that step does not replace the live \
+         archive. Then inspect 'cass doctor repair --dry-run --json' and apply only \
+         its exact fingerprint-approved candidate-promotion command. If instead the \
+         archive opens read-only but is \
          malformed, 'cass doctor --recover-from-archive <DIR>' rebuilds the source \
          JSONL from cass's preserved extra_json/extra_bin envelopes for re-ingest. \
          An explicit backup restore via 'cass doctor backups list --json' followed \
@@ -18345,7 +18562,15 @@ fn spawn_lexical_rebuild_page_prep_workers(
                 .name(format!("cass-lexical-page-prep-{worker_idx}"))
                 .spawn(move || {
                     tracing::dispatcher::with_default(&worker_dispatch, || {
-                        let mut storage = match FrankenStorage::open_readonly(&worker_db_path) {
+                        // Page-prep workers are pure readers.  The ordinary
+                        // `open_readonly` lane may perform two sanctioned
+                        // recovery writes (duplicate-FTS repair and a dirty-WAL
+                        // checkpoint), which is unsafe to multiply across this
+                        // worker pool while the rebuild's canonical writer is
+                        // active.  Require an already-readable archive here and
+                        // leave any repair to the single mutating owner.
+                        let mut storage =
+                            match FrankenStorage::open_strict_readonly(&worker_db_path) {
                             Ok(storage) => storage,
                             Err(err) => {
                                 let _ = worker_result_tx.send(LexicalRebuildPagePrepResult::Error {
@@ -18422,7 +18647,14 @@ fn spawn_lexical_rebuild_page_prep_workers(
                             }
                         }
 
-                        storage.close_best_effort_in_place();
+                        if let Err(err) = storage.close_without_checkpoint() {
+                            tracing::warn!(
+                                worker_idx,
+                                db = %worker_db_path.display(),
+                                error = %err,
+                                "lexical rebuild page-prep worker failed to close strict readonly storage cleanly"
+                            );
+                        }
                     });
                 })
                 .with_context(|| {
@@ -19976,8 +20208,12 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         p.total.store(total_conversations, Ordering::Relaxed);
         p.current
             .store(rebuild_state.processed_conversations, Ordering::Relaxed);
-        // The rebuild's conversation total is a stable denominator.
-        p.total_is_final.store(true, Ordering::Relaxed);
+        // Count-free restart receives only the interrupted checkpoint's hint.
+        // The exact denominator is known after authoritative enumeration.
+        p.total_is_final.store(
+            !options.defer_initial_content_fingerprint,
+            Ordering::Relaxed,
+        );
         p.discovered_agents.store(0, Ordering::Relaxed);
     }
     let lexical_rebuild_started = Instant::now();
@@ -20256,6 +20492,10 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                     .saturating_add(result.shard.conversation_count);
                 if let Some(p) = &progress {
                     p.current.store(*processed_conversations, Ordering::Relaxed);
+                    if options.defer_initial_content_fingerprint {
+                        p.total
+                            .fetch_max(*processed_conversations, Ordering::Relaxed);
+                    }
                 }
                 bump_index_run_lock_progress_if_present(progress_bump.as_ref());
                 if let Some(transition) = responsiveness_controller.record_first_durable_commit() {
@@ -20701,7 +20941,6 @@ fn rebuild_tantivy_from_db_via_staged_shards(
             ));
         }
 
-        drop(shard_work_tx);
         while !pending_shard_build_jobs.is_empty()
             || received_shard_results < enqueued_shards
             || merge_coordinator.pending_merge_jobs() > 0
@@ -20909,7 +21148,12 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         lexical_rebuild_flow_limiter.close();
     }
     drop(pipeline_rx);
+    // Disconnect both shard-work senders on every exit before joining the
+    // builders.  Previously the original sender was dropped only on the happy
+    // path inside `main_result`; an early error left it alive, so idle builders
+    // remained blocked in `recv()` and this join never returned.
     drop(shard_work_dispatch_tx);
+    drop(shard_work_tx);
     drop(merge_work_tx);
     match producer_handle.join() {
         Ok(()) => {}
@@ -21004,9 +21248,14 @@ fn rebuild_tantivy_from_db_via_staged_shards(
             indexed_docs
         ));
     }
+    let final_total_conversations = if options.defer_initial_content_fingerprint {
+        processed_conversations
+    } else {
+        total_conversations
+    };
     let final_storage_fingerprint = if options.defer_initial_content_fingerprint {
         lexical_rebuild_content_fingerprint_value(
-            total_conversations,
+            final_total_conversations,
             max_conversation_id,
             max_message_id,
         )
@@ -21027,7 +21276,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         &final_merge_artifact.publish_path,
         &final_storage_fingerprint,
         processed_conversations,
-        total_conversations,
+        final_total_conversations,
         final_observed_messages,
         indexed_docs,
         &equivalence_evidence,
@@ -21058,7 +21307,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
             lexical_duration: lexical_rebuild_duration,
             publish_duration: publish_started.elapsed(),
             processed_conversations,
-            total_conversations,
+            total_conversations: final_total_conversations,
             final_observed_messages,
             indexed_docs,
             equivalence_evidence: &equivalence_evidence,
@@ -21073,8 +21322,10 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         )
     })?;
     rebuild_state.db.storage_fingerprint = final_storage_fingerprint;
+    rebuild_state.db.total_conversations = final_total_conversations;
     rebuild_state.db.total_messages = final_observed_messages;
-    rebuild_state.committed_offset = i64::try_from(total_conversations).unwrap_or(i64::MAX);
+    rebuild_state.committed_offset =
+        i64::try_from(final_total_conversations).unwrap_or(i64::MAX);
     rebuild_state.committed_conversation_id = last_processed_conversation_id;
     rebuild_state.processed_conversations = processed_conversations;
     rebuild_state.indexed_docs = indexed_docs;
@@ -21082,6 +21333,11 @@ fn rebuild_tantivy_from_db_via_staged_shards(
     persist_lexical_rebuild_state(index_path, &rebuild_state)?;
 
     if let Some(p) = &progress {
+        p.current
+            .store(final_total_conversations, Ordering::Relaxed);
+        p.total
+            .store(final_total_conversations, Ordering::Relaxed);
+        p.total_is_final.store(true, Ordering::Relaxed);
         p.phase.store(0, Ordering::Relaxed);
         p.is_rebuilding.store(false, Ordering::Relaxed);
     }
@@ -21094,6 +21350,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
     }
 
     Ok(LexicalRebuildOutcome {
+        observed_conversations: final_total_conversations,
         indexed_docs,
         observed_messages: Some(final_observed_messages),
         exact_checkpoint_persisted: true,
@@ -21207,7 +21464,10 @@ fn rebuild_tantivy_from_db_with_options(
 
     log_prep_step("load_checkpoint_state", &mut prep_step_started);
 
-    if rebuild_state.completed || rebuild_state.processed_conversations >= total_conversations {
+    if rebuild_state.completed
+        || (!options.defer_initial_content_fingerprint
+            && rebuild_state.processed_conversations >= total_conversations)
+    {
         storage.close_without_checkpoint().with_context(|| {
             format!(
                 "closing readonly database after confirming completed Tantivy rebuild without checkpoint: {}",
@@ -21219,6 +21479,7 @@ fn rebuild_tantivy_from_db_with_options(
             p.is_rebuilding.store(false, Ordering::Relaxed);
         }
         return Ok(LexicalRebuildOutcome {
+            observed_conversations: rebuild_state.processed_conversations,
             indexed_docs: rebuild_state.indexed_docs,
             observed_messages: Some(
                 rebuild_state
@@ -21595,8 +21856,10 @@ fn rebuild_tantivy_from_db_with_options(
         p.total.store(total_conversations, Ordering::Relaxed);
         p.current
             .store(rebuild_state.processed_conversations, Ordering::Relaxed);
-        // The rebuild's conversation total is a stable denominator.
-        p.total_is_final.store(true, Ordering::Relaxed);
+        p.total_is_final.store(
+            !options.defer_initial_content_fingerprint,
+            Ordering::Relaxed,
+        );
         p.discovered_agents.store(0, Ordering::Relaxed);
     }
 
@@ -21675,6 +21938,9 @@ fn rebuild_tantivy_from_db_with_options(
                     conversations_since_progress_persist.saturating_add(1);
                 if let Some(p) = &progress {
                     p.current.fetch_add(1, Ordering::Relaxed);
+                    if options.defer_initial_content_fingerprint {
+                        p.total.fetch_max(processed_conversations, Ordering::Relaxed);
+                    }
                 }
                 bump_index_run_lock_progress_if_present(progress_bump.as_ref());
                 refresh_and_maybe_apply_lexical_rebuild_pipeline_runtime(
@@ -22209,16 +22475,23 @@ fn rebuild_tantivy_from_db_with_options(
             db_path.display()
         )
     })?;
+    let final_total_conversations = if options.defer_initial_content_fingerprint {
+        processed_conversations
+    } else {
+        total_conversations
+    };
     if options.defer_initial_content_fingerprint {
         rebuild_state.db.storage_fingerprint = lexical_rebuild_content_fingerprint_value(
-            total_conversations,
+            final_total_conversations,
             max_conversation_id,
             max_message_id,
         );
     }
+    rebuild_state.db.total_conversations = final_total_conversations;
     let final_observed_messages = observed_messages.max(indexed_docs);
     rebuild_state.db.total_messages = final_observed_messages;
-    rebuild_state.committed_offset = i64::try_from(total_conversations).unwrap_or(i64::MAX);
+    rebuild_state.committed_offset =
+        i64::try_from(final_total_conversations).unwrap_or(i64::MAX);
     rebuild_state.committed_conversation_id = last_processed_conversation_id;
     rebuild_state.processed_conversations = processed_conversations;
     rebuild_state.indexed_docs = indexed_docs;
@@ -22229,6 +22502,11 @@ fn rebuild_tantivy_from_db_with_options(
     persist_lexical_rebuild_state(&index_path, &rebuild_state)?;
 
     if let Some(p) = &progress {
+        p.current
+            .store(final_total_conversations, Ordering::Relaxed);
+        p.total
+            .store(final_total_conversations, Ordering::Relaxed);
+        p.total_is_final.store(true, Ordering::Relaxed);
         p.phase.store(0, Ordering::Relaxed);
         p.is_rebuilding.store(false, Ordering::Relaxed);
     }
@@ -22247,7 +22525,7 @@ fn rebuild_tantivy_from_db_with_options(
         &index_path,
         &rebuild_state.db.storage_fingerprint,
         rebuild_state.processed_conversations,
-        total_conversations,
+        final_total_conversations,
         final_observed_messages,
         indexed_docs,
         &equivalence_evidence,
@@ -22259,7 +22537,7 @@ fn rebuild_tantivy_from_db_with_options(
             lexical_duration: lexical_rebuild_duration,
             publish_duration: publish_started.elapsed(),
             processed_conversations: rebuild_state.processed_conversations,
-            total_conversations,
+            total_conversations: final_total_conversations,
             final_observed_messages,
             indexed_docs,
             equivalence_evidence: &equivalence_evidence,
@@ -22268,6 +22546,7 @@ fn rebuild_tantivy_from_db_with_options(
     log_lexical_refresh_ledger_published(&refresh_ledger);
 
     Ok(LexicalRebuildOutcome {
+        observed_conversations: final_total_conversations,
         indexed_docs,
         observed_messages: Some(final_observed_messages),
         exact_checkpoint_persisted: true,
@@ -33980,6 +34259,8 @@ mod tests {
             "watch_startup:published_index_validate",
             "watch_startup:scan_entry",
             "watch_startup:reclassify_legacy_omp",
+            "watch_startup:classify_nonresumable_checkpoint",
+            "watch_startup:count_nonresumable_checkpoint_conversations",
         ];
         for sub_phase in documented_sub_phases {
             assert!(
@@ -44437,13 +44718,53 @@ mod tests {
     fn full_rebuild_integrity_preflight_size_gate_is_bounded_and_fail_safe() {
         let gib = 1024_u64 * 1024 * 1024;
 
-        assert!(should_run_full_archive_quick_check(Some(2 * gib), 2 * gib));
-        assert!(!should_run_full_archive_quick_check(
+        assert!(should_run_engine_backed_archive_integrity_preflight(
+            Some(2 * gib),
+            2 * gib
+        ));
+        assert!(!should_run_engine_backed_archive_integrity_preflight(
             Some(2 * gib + 1),
             2 * gib
         ));
-        assert!(should_run_full_archive_quick_check(Some(64 * gib), 0));
-        assert!(should_run_full_archive_quick_check(None, 2 * gib));
+        assert!(should_run_engine_backed_archive_integrity_preflight(
+            Some(64 * gib),
+            0
+        ));
+        assert!(should_run_engine_backed_archive_integrity_preflight(
+            None,
+            2 * gib
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn full_rebuild_integrity_preflight_large_archive_stops_before_fsqlite_open() {
+        let _max_bytes = set_env("CASS_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES", "4096");
+        let tmp = TempDir::new().unwrap();
+        let seed_path = tmp.path().join("seed.db");
+        let seed = FrankenStorage::open(&seed_path).unwrap();
+        drop(seed);
+        let seed_bytes = fs::read(&seed_path).unwrap();
+
+        let db_path = tmp.path().join("large-agent-search.db");
+        let mut large = File::create(&db_path).unwrap();
+        large.write_all(&seed_bytes[..100]).unwrap();
+        large.set_len(8192).unwrap();
+        drop(large);
+
+        assert_eq!(
+            full_rebuild_existing_archive_integrity_preflight(&db_path).unwrap(),
+            None,
+            "a large archive must defer engine-backed integrity work instead of opening fsqlite"
+        );
+        for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+            let sidecar = database_path_with_suffix(&db_path, suffix);
+            assert!(
+                !sidecar.exists(),
+                "large-archive preflight opened fsqlite and created {}",
+                sidecar.display()
+            );
+        }
     }
 
     #[test]
@@ -44451,6 +44772,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("healthy-current-schema.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
+        storage
+            .ensure_search_fallback_fts_consistency()
+            .expect("materialize a healthy canonical FTS shadow");
+        drop(storage);
+
+        let mut storage = FrankenStorage::open_readonly(&db_path).unwrap();
 
         assert_eq!(
             full_rebuild_existing_storage_integrity_problem(&storage)
@@ -44458,6 +44785,120 @@ mod tests {
                 .as_deref(),
             None
         );
+        storage.close_best_effort_in_place();
+    }
+
+    #[test]
+    fn full_rebuild_integrity_preflight_rejects_corrupt_fts_structure_record() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("corrupt-fts-segment.db");
+
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            storage
+                .ensure_search_fallback_fts_consistency()
+                .expect("materialize the canonical FTS shadow");
+            storage
+                .raw()
+                .execute(
+                    "INSERT INTO fts_messages(
+                         rowid, content, title, agent, workspace, source_path, created_at, message_id
+                     ) VALUES(
+                         1, 'segment corruption sentinel', 'title', 'codex', '/workspace',
+                         '/tmp/session.jsonl', 1, 1
+                     )",
+                )
+                .expect("persist one FTS segment");
+        }
+
+        {
+            let conn = crate::franken_sync::Connection::open(
+                db_path.to_string_lossy().into_owned(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE fts_messages_data
+                 SET block = X'FFFFFFFFFFFFFFFFFFFFFFFF'
+                 WHERE id = 10",
+            )
+            .expect("corrupt the persisted FTS structure record");
+        }
+
+        let mut storage = FrankenStorage::open_readonly(&db_path).unwrap();
+        let problem = full_rebuild_existing_storage_integrity_problem(&storage)
+            .unwrap()
+            .expect("a corrupt FTS structure must stop a full rebuild");
+        assert!(
+            problem.contains("FTS5 segment integrity-check failed"),
+            "diagnostic must identify the FTS segment preflight: {problem}"
+        );
+        storage.close_best_effort_in_place();
+    }
+
+    #[test]
+    fn full_rebuild_integrity_preflight_refuses_legacy_fts_before_schema_repair() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("legacy-fts-before-mutation.db");
+        let mut storage = FrankenStorage::open(&db_path).unwrap();
+        storage
+            .raw()
+            .execute(
+                "DROP TABLE _schema_migrations;
+                 CREATE TABLE fts_messages_config(k TEXT PRIMARY KEY, v);
+                 CREATE TABLE fts_messages_idx(segid INTEGER, term BLOB, pgno INTEGER);",
+            )
+            .unwrap();
+        storage.close_best_effort_in_place();
+
+        let problem = full_rebuild_existing_archive_integrity_preflight(&db_path)
+            .unwrap()
+            .expect("legacy rowid FTS shadows must stop a full rebuild");
+        assert!(problem.contains("fts_messages_config"));
+        assert!(problem.contains("WITHOUT ROWID"));
+
+        let readonly = FrankenStorage::open_strict_readonly(&db_path).unwrap();
+        assert!(
+            readonly
+                .raw()
+                .query("SELECT version FROM _schema_migrations LIMIT 1")
+                .is_err(),
+            "the read-only refusal preflight must not recreate transition tables"
+        );
+        readonly.close_without_checkpoint().unwrap();
+    }
+
+    #[test]
+    fn full_rebuild_integrity_preflight_recognizes_legacy_fts_shadow_ddl() {
+        let legacy_config =
+            "CREATE TABLE fts_messages_config(k TEXT PRIMARY KEY, v)";
+        let legacy_idx =
+            "CREATE TABLE fts_messages_idx(segid INTEGER, term BLOB, pgno INTEGER)";
+        for (table, ddl) in [
+            ("fts_messages_config", legacy_config),
+            ("fts_messages_idx", legacy_idx),
+        ] {
+            let problem = incompatible_legacy_fts_shadow_ddl(table, ddl)
+                .expect("legacy rowid FTS shadow DDL must be rejected");
+            assert!(problem.contains(table));
+            assert!(problem.contains("WITHOUT ROWID"));
+        }
+
+        for (table, ddl) in [
+            (
+                "fts_messages_config",
+                "CREATE TABLE 'fts_messages_config'(k PRIMARY KEY, v) WITHOUT ROWID",
+            ),
+            (
+                "fts_messages_idx",
+                "CREATE TABLE \"fts_messages_idx\"(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID",
+            ),
+        ] {
+            assert_eq!(
+                incompatible_legacy_fts_shadow_ddl(table, ddl),
+                None,
+                "canonical FTS shadow DDL must remain accepted"
+            );
+        }
     }
 
     #[test]
@@ -46734,6 +47175,87 @@ mod tests {
         assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 8);
     }
 
+    /// GH #382's one-worker/one-channel reproduction: after the first
+    /// startup-sized flush, the old implementation silently replaced the
+    /// pinned conservative sink limit with the larger steady limit. Two page
+    /// reservations then filled the byte window before the sink could reach
+    /// that larger threshold, leaving producer and consumer parked forever.
+    #[test]
+    #[serial]
+    fn gh382_reduced_pipeline_completes_across_startup_sized_flushes() {
+        let _controller = set_env("CASS_TANTIVY_REBUILD_CONTROLLER_MODE", "conservative");
+        let _workers = set_env("CASS_TANTIVY_REBUILD_WORKERS", "1");
+        let _page_workers = set_env("CASS_TANTIVY_REBUILD_PAGE_PREP_WORKERS", "1");
+        let _channel = set_env("CASS_TANTIVY_REBUILD_PIPELINE_CHANNEL_SIZE", "1");
+        let _steady_fetch = set_env("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", "8");
+        let _startup_fetch = set_env(
+            "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
+            "2",
+        );
+        let _steady_commit_conversations = set_env(
+            "CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS",
+            "4096",
+        );
+        let _startup_commit_conversations = set_env(
+            "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_CONVERSATIONS",
+            "4096",
+        );
+        let _steady_commit_messages =
+            set_env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGES", "4096");
+        let _startup_commit_messages = set_env(
+            "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGES",
+            "4096",
+        );
+        let _steady_commit_bytes = set_env(
+            "CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES",
+            "4096",
+        );
+        let _startup_commit_bytes = set_env(
+            "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGE_BYTES",
+            "4096",
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let conversations = (0..12)
+            .map(|idx| {
+                large_startup_conv(
+                    "codex",
+                    "gh382-reduced",
+                    idx,
+                    2,
+                    128,
+                    1_700_500_000_000,
+                )
+            })
+            .collect::<Vec<_>>();
+        ingest_batch(
+            &storage,
+            None,
+            &data_dir,
+            &conversations,
+            &None,
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            false,
+        )
+        .unwrap();
+        drop(storage);
+
+        let rebuild = rebuild_tantivy_from_db(&db_path, &data_dir, conversations.len(), None)
+            .expect("reduced GH #382 geometry must make forward progress to completion");
+        assert_eq!(rebuild.indexed_docs, conversations.len() * 2);
+        assert_eq!(rebuild.observed_messages, Some(conversations.len() * 2));
+        assert!(rebuild.exact_checkpoint_persisted);
+        assert_eq!(
+            tantivy_doc_count_for_data_dir(&data_dir),
+            (conversations.len() * 2) as u64
+        );
+    }
+
     #[test]
     #[serial]
     fn rebuild_tantivy_from_db_resume_reports_total_observed_messages() {
@@ -46898,7 +47420,8 @@ mod tests {
 
     #[test]
     #[serial]
-    fn rebuild_tantivy_from_db_deferred_startup_fingerprint_persists_exact_completed_fingerprint() {
+    fn rebuild_tantivy_from_db_deferred_startup_ignores_stale_zero_count_and_persists_exact_state()
+    {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -46911,7 +47434,9 @@ mod tests {
         let rebuild = rebuild_tantivy_from_db_with_options(
             &db_path,
             &data_dir,
-            2,
+            // GH #413: an interrupted sidecar is a hint, not authority. A
+            // stale zero must not short-circuit before useful Quill ingest.
+            0,
             None,
             LexicalRebuildStartupOptions {
                 defer_initial_content_fingerprint: true,
@@ -46919,6 +47444,7 @@ mod tests {
             None,
         )
         .unwrap();
+        assert_eq!(rebuild.observed_conversations, 2);
         assert_eq!(rebuild.indexed_docs, 4);
         assert_eq!(rebuild.observed_messages, Some(4));
         assert!(rebuild.exact_checkpoint_persisted);
@@ -46928,6 +47454,9 @@ mod tests {
             .unwrap()
             .expect("completed checkpoint after deferred-fingerprint rebuild");
         assert!(checkpoint.completed);
+        assert_eq!(checkpoint.total_conversations, 2);
+        assert_eq!(checkpoint.processed_conversations, 2);
+        assert_eq!(checkpoint.committed_offset, 2);
         assert_eq!(
             checkpoint.storage_fingerprint,
             lexical_rebuild_storage_fingerprint(&db_path).unwrap()
@@ -55144,6 +55673,104 @@ mod tests {
                 .expect("readonly probe should classify matching staged checkpoint");
         assert!(status.has_pending_resume);
         assert_eq!(total_conversations, 0);
+    }
+
+    /// GH #413: checkpoint fields already prove that this staged rebuild
+    /// belongs to another canonical database. Reject it from the small JSON
+    /// sidecar before opening or exactly counting the current archive. The
+    /// current file is deliberately not SQLite: the assertion can return
+    /// `Ok(None)` only if no database read was attempted.
+    #[test]
+    fn readonly_nonresumable_probe_rejects_mismatched_path_before_db_open() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("agent_search.db");
+        fs::write(&db_path, b"not a sqlite database").unwrap();
+
+        let index_path = tmp.path().join("index");
+        fs::create_dir_all(&index_path).unwrap();
+        let checkpoint_db_state = LexicalRebuildDbState {
+            db_path: tmp
+                .path()
+                .join("different-agent-search.db")
+                .to_string_lossy()
+                .into_owned(),
+            total_conversations: 400,
+            total_messages: 0,
+            storage_fingerprint: "content-v1:400:1200:4800".to_string(),
+        };
+        let mut state = LexicalRebuildState::new(checkpoint_db_state, LEXICAL_REBUILD_PAGE_SIZE);
+        state.set_execution_mode(LexicalRebuildExecutionMode::StagedShardBuild);
+        persist_lexical_rebuild_state(&index_path, &state).unwrap();
+
+        assert!(
+            nonresumable_pending_lexical_rebuild_status_from_readonly_db(&index_path, &db_path)
+                .unwrap()
+                .is_none(),
+            "a path-mismatched checkpoint must be rejected before opening the canonical DB"
+        );
+    }
+
+    /// GH #413: plain `cass index` must turn an interrupted non-resumable
+    /// checkpoint into useful Quill work without first hydrating the archive
+    /// for COUNT(*). The deliberately stale zero count proves that the sidecar
+    /// is only a startup hint; successful completion must publish all rows and
+    /// replace every derived count/fingerprint with streamed observations.
+    #[test]
+    #[serial]
+    fn plain_index_restarts_nonresumable_checkpoint_with_stale_count_to_quill_completion() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        seed_lexical_rebuild_fixture(&storage);
+        drop(storage);
+
+        let index_path = index_dir(&data_dir).unwrap();
+        fs::create_dir_all(&index_path).unwrap();
+        let checkpoint_db_state = LexicalRebuildDbState {
+            db_path: db_path.to_string_lossy().into_owned(),
+            total_conversations: 0,
+            total_messages: 0,
+            storage_fingerprint: lexical_rebuild_deferred_content_fingerprint(0),
+        };
+        let mut state =
+            LexicalRebuildState::new(checkpoint_db_state, LEXICAL_REBUILD_PAGE_SIZE);
+        state.set_execution_mode(LexicalRebuildExecutionMode::StagedShardBuild);
+        persist_lexical_rebuild_state(&index_path, &state).unwrap();
+
+        run_index(
+            IndexOptions {
+                full: false,
+                force_rebuild: false,
+                watch: false,
+                watch_once_paths: None,
+                db_path: db_path.clone(),
+                data_dir: data_dir.clone(),
+                semantic: false,
+                build_hnsw: false,
+                embedder: "hash".to_string(),
+                progress: None,
+                watch_interval_secs: 30,
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 4);
+        let completed = load_lexical_rebuild_checkpoint(&index_path)
+            .unwrap()
+            .expect("completed checkpoint after count-free plain-index restart");
+        assert!(completed.completed);
+        assert_eq!(completed.total_conversations, 2);
+        assert_eq!(completed.processed_conversations, 2);
+        assert_eq!(completed.committed_offset, 2);
+        assert_eq!(completed.indexed_docs, 4);
+        assert_eq!(
+            completed.storage_fingerprint,
+            lexical_rebuild_storage_fingerprint(&db_path).unwrap()
+        );
     }
 
     #[test]
