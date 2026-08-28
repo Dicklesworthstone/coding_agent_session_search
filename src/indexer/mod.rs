@@ -2566,7 +2566,7 @@ fn matching_completed_lexical_rebuild_state_status_without_fingerprint(
 
     let has_completed_checkpoint = state.completed
         && state.pending.is_none()
-        && state.execution_mode == LexicalRebuildExecutionMode::SharedWriter
+        && state.effective_execution_mode() == LexicalRebuildExecutionMode::SharedWriter
         && !state.runtime.is_observed();
     Ok(Some(MatchingLexicalRebuildStateStatus {
         has_pending_resume: false,
@@ -2589,7 +2589,7 @@ fn matching_lexical_rebuild_state_status_for_loaded_state(
 
     let has_completed_checkpoint = state.completed
         && state.pending.is_none()
-        && state.execution_mode == LexicalRebuildExecutionMode::SharedWriter
+        && state.effective_execution_mode() == LexicalRebuildExecutionMode::SharedWriter
         && !state.runtime.is_observed();
 
     MatchingLexicalRebuildStateStatus {
@@ -2634,7 +2634,7 @@ fn nonresumable_pending_lexical_rebuild_state_for_db(
         return Ok(None);
     };
     if !state.is_incomplete()
-        || !state.execution_mode.requires_restart_from_zero_on_resume()
+        || !state.requires_restart_from_zero_on_resume()
         || state.version != LEXICAL_REBUILD_STATE_VERSION
         || state.schema_hash != crate::search::tantivy::SCHEMA_HASH
         || !lexical_rebuild_page_size_is_compatible(state.page_size)
@@ -6413,10 +6413,6 @@ impl LexicalRebuildExecutionMode {
     }
 }
 
-fn lexical_rebuild_execution_mode_is_default(mode: &LexicalRebuildExecutionMode) -> bool {
-    *mode == LexicalRebuildExecutionMode::SharedWriter
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LexicalRebuildState {
@@ -6433,11 +6429,12 @@ struct LexicalRebuildState {
     pending: Option<PendingLexicalCommit>,
     completed: bool,
     updated_at_ms: i64,
-    #[serde(
-        default,
-        skip_serializing_if = "lexical_rebuild_execution_mode_is_default"
-    )]
-    execution_mode: LexicalRebuildExecutionMode,
+    /// `None` means the checkpoint predates explicit execution-mode recording.
+    /// New checkpoints always serialize `Some`, including `shared_writer`, so
+    /// incomplete legacy state can be restarted conservatively without making
+    /// completed legacy generations look staged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    execution_mode: Option<LexicalRebuildExecutionMode>,
     #[serde(default)]
     runtime: LexicalRebuildPipelineRuntimeSnapshot,
 }
@@ -6457,7 +6454,7 @@ impl LexicalRebuildState {
             pending: None,
             completed: false,
             updated_at_ms: FrankenStorage::now_millis(),
-            execution_mode: LexicalRebuildExecutionMode::SharedWriter,
+            execution_mode: Some(LexicalRebuildExecutionMode::SharedWriter),
             runtime: LexicalRebuildPipelineRuntimeSnapshot::default(),
         }
     }
@@ -6521,7 +6518,7 @@ impl LexicalRebuildState {
     }
 
     fn set_execution_mode(&mut self, execution_mode: LexicalRebuildExecutionMode) {
-        self.execution_mode = execution_mode;
+        self.execution_mode = Some(execution_mode);
         self.updated_at_ms = FrankenStorage::now_millis();
     }
 
@@ -6531,7 +6528,18 @@ impl LexicalRebuildState {
         self.clear_runtime();
         self.completed = true;
         self.updated_at_ms = FrankenStorage::now_millis();
-        self.execution_mode = LexicalRebuildExecutionMode::SharedWriter;
+        self.execution_mode = Some(LexicalRebuildExecutionMode::SharedWriter);
+    }
+
+    fn effective_execution_mode(&self) -> LexicalRebuildExecutionMode {
+        self.execution_mode.unwrap_or_default()
+    }
+
+    fn requires_restart_from_zero_on_resume(&self) -> bool {
+        self.execution_mode.is_none()
+            || self
+                .effective_execution_mode()
+                .requires_restart_from_zero_on_resume()
     }
 
     fn is_incomplete(&self) -> bool {
@@ -8256,6 +8264,27 @@ fn bounded_lexical_rebuild_page_reservation_limits(
         .min(max_message_bytes_in_flight / reservation_slots)
         .max(1);
     (batch_fetch_message_bytes_limit, max_message_bytes_in_flight)
+}
+
+/// Bound the number of conversations retained by one prepared page so the
+/// cumulative per-conversation lexical prefixes cannot exceed that page's
+/// content reservation. A single outlier still gets one page and is handled by
+/// the per-conversation fallback in the prep worker.
+fn lexical_rebuild_content_bounded_page_conversation_limit(
+    configured_page_conversation_limit: usize,
+    batch_fetch_message_bytes_limit: usize,
+) -> usize {
+    let batch_fetch_message_bytes_limit = batch_fetch_message_bytes_limit.max(1);
+    let effective_conversation_content_cap =
+        crate::storage::sqlite::lexical_max_conversation_content_bytes()
+            .min(i32::MAX as usize)
+            .min(batch_fetch_message_bytes_limit)
+            .max(1);
+    configured_page_conversation_limit.max(1).min(
+        batch_fetch_message_bytes_limit
+            .saturating_div(effective_conversation_content_cap)
+            .max(1),
+    )
 }
 
 fn lexical_rebuild_pipeline_channel_size() -> usize {
@@ -10939,7 +10968,7 @@ fn persist_completed_lexical_rebuild_checkpoint_from_observations(
         && state.committed_meta_fingerprint == committed_meta_fingerprint
         && state.pending.is_none()
         && state.completed
-        && state.execution_mode == LexicalRebuildExecutionMode::SharedWriter
+        && state.effective_execution_mode() == LexicalRebuildExecutionMode::SharedWriter
         && state.runtime == LexicalRebuildPipelineRuntimeSnapshot::default()
     {
         tracing::debug!(
@@ -18627,12 +18656,32 @@ fn prepare_lexical_rebuild_page_work(
     let mut reservation = StreamingByteReservation::new(flow_limiter, reserved_bytes);
 
     let message_fetch_started = Instant::now();
-    let grouped_messages = match storage.fetch_messages_for_lexical_rebuild_batch(
+    let grouped_messages = storage.fetch_messages_for_lexical_rebuild_batch(
         &conversation_ids,
         Some(work.pipeline_budget.batch_fetch_message_limit),
         Some(work.pipeline_budget.batch_fetch_message_bytes_limit),
-    ) {
-        Ok(grouped) => grouped,
+    );
+    let mut message_fetch_duration = message_fetch_started.elapsed();
+    let mut packet_prepare_duration = Duration::ZERO;
+    let mut prepared_packets = match grouped_messages {
+        Ok(grouped_messages) => {
+            let prepare_started = Instant::now();
+            let prepared = prepare_lexical_rebuild_packet_batch(
+                work.conversation_page,
+                grouped_messages,
+                source_map,
+                lexical_rebuild_worker_pool,
+            )
+            .with_context(|| {
+                format!(
+                    "preparing lexical rebuild packets for ordered page sequence {}",
+                    sequence
+                )
+            })?;
+            packet_prepare_duration =
+                packet_prepare_duration.saturating_add(prepare_started.elapsed());
+            prepared
+        }
         Err(err) if format!("{err:#}").contains("guardrail") => {
             tracing::warn!(
                 sequence,
@@ -18640,21 +18689,47 @@ fn prepare_lexical_rebuild_page_work(
                 max_messages = work.pipeline_budget.batch_fetch_message_limit,
                 max_content_bytes = work.pipeline_budget.batch_fetch_message_bytes_limit,
                 error = %err,
-                "lexical rebuild page exceeded batch-fetch guardrail inside page-prep worker; falling back to per-conversation fetches"
+                "lexical rebuild page exceeded batch-fetch guardrail inside page-prep worker; preparing one conversation at a time"
             );
-            let mut grouped = HashMap::with_capacity(conversation_ids.len());
-            for conversation_id in &conversation_ids {
+            let mut prepared_packets = Vec::with_capacity(work.conversation_page.len());
+            for conversation in work.conversation_page {
+                let conversation_id = conversation.id.ok_or_else(|| {
+                    anyhow!(
+                        "lexical rebuild page sequence {sequence} contains a conversation without an id"
+                    )
+                })?;
+                let fallback_fetch_started = Instant::now();
                 let messages = storage
-                    .fetch_messages_for_lexical_rebuild(*conversation_id)
+                    .fetch_messages_for_lexical_rebuild(conversation_id)
                     .with_context(|| {
                         format!(
                             "fetching lexical rebuild messages for conversation {}",
                             conversation_id
                         )
                     })?;
-                grouped.insert(*conversation_id, messages);
+                message_fetch_duration =
+                    message_fetch_duration.saturating_add(fallback_fetch_started.elapsed());
+                let mut grouped_messages = HashMap::with_capacity(1);
+                if !messages.is_empty() {
+                    grouped_messages.insert(conversation_id, messages);
+                }
+                let fallback_prepare_started = Instant::now();
+                let conversation_packets = prepare_lexical_rebuild_packet_batch(
+                    vec![conversation],
+                    grouped_messages,
+                    source_map,
+                    lexical_rebuild_worker_pool,
+                )
+                .with_context(|| {
+                    format!(
+                        "preparing lexical rebuild packet for conversation {conversation_id} after page guardrail overflow"
+                    )
+                })?;
+                packet_prepare_duration = packet_prepare_duration
+                    .saturating_add(fallback_prepare_started.elapsed());
+                prepared_packets.extend(conversation_packets);
             }
-            grouped
+            prepared_packets
         }
         Err(err) => {
             return Err(err).context(format!(
@@ -18663,22 +18738,6 @@ fn prepare_lexical_rebuild_page_work(
             ));
         }
     };
-    let message_fetch_duration = message_fetch_started.elapsed();
-
-    let packet_prepare_started = Instant::now();
-    let mut prepared_packets = prepare_lexical_rebuild_packet_batch(
-        work.conversation_page,
-        grouped_messages,
-        source_map,
-        lexical_rebuild_worker_pool,
-    )
-    .with_context(|| {
-        format!(
-            "preparing lexical rebuild packets for ordered page sequence {}",
-            sequence
-        )
-    })?;
-    let packet_prepare_duration = packet_prepare_started.elapsed();
 
     let page_message_bytes = prepared_packets
         .iter()
@@ -19098,10 +19157,16 @@ fn spawn_lexical_rebuild_packet_producer(
                             );
                             last_logged_budget = Some(pipeline_budget);
                         }
-                        let conversation_page_limit =
-                            i64::try_from(pipeline_budget.page_conversation_limit.max(1))
-                                .unwrap_or(i64::MAX)
-                                .min(page_size.max(1));
+                        let content_bounded_page_conversation_limit =
+                            lexical_rebuild_content_bounded_page_conversation_limit(
+                                pipeline_budget.page_conversation_limit,
+                                pipeline_budget.batch_fetch_message_bytes_limit,
+                            );
+                        let conversation_page_limit = i64::try_from(
+                            content_bounded_page_conversation_limit,
+                        )
+                        .unwrap_or(i64::MAX)
+                        .min(page_size.max(1));
                         let current_planned_shard = planned_shard_cursor
                             .as_ref()
                             .and_then(LexicalRebuildPlannedShardCursor::current)
@@ -21632,14 +21697,14 @@ fn rebuild_tantivy_from_db_with_options(
     } else {
         match load_lexical_rebuild_state(&index_path)? {
             Some(state) if state.matches_run(&db_state, LEXICAL_REBUILD_PAGE_SIZE) => {
-                if state.is_incomplete()
-                    && state.execution_mode.requires_restart_from_zero_on_resume()
-                {
+                if state.is_incomplete() && state.requires_restart_from_zero_on_resume() {
                     tracing::info!(
                         db_path = %db_path.display(),
-                        execution_mode = state.execution_mode.as_str(),
+                        execution_mode = state
+                            .execution_mode
+                            .map_or("legacy_unspecified", LexicalRebuildExecutionMode::as_str),
                         processed_conversations = state.reported_processed_conversations(),
-                        "discarding non-resumable staged lexical rebuild checkpoint and restarting from zero"
+                    "discarding non-resumable lexical rebuild checkpoint and restarting from zero"
                     );
                     LexicalRebuildState::new(db_state.clone(), LEXICAL_REBUILD_PAGE_SIZE)
                 } else {
@@ -39012,6 +39077,28 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn lexical_rebuild_page_conversation_limit_respects_cumulative_content_cap() {
+        let _cap = set_env("CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES", "8");
+
+        assert_eq!(
+            lexical_rebuild_content_bounded_page_conversation_limit(32, 20),
+            2,
+            "two eight-byte conversation prefixes fit inside a twenty-byte page budget"
+        );
+        assert_eq!(
+            lexical_rebuild_content_bounded_page_conversation_limit(1, 20),
+            1,
+            "the content bound must not enlarge an explicitly smaller page"
+        );
+        assert_eq!(
+            lexical_rebuild_content_bounded_page_conversation_limit(32, 4),
+            1,
+            "a page smaller than one conversation cap must still admit one outlier"
+        );
+    }
+
+    #[test]
     fn gh413_lexical_rebuild_budget_snapshot_normalizes_cap_equal_reservations() {
         let budget = LexicalRebuildPipelineBudgetSnapshot::new(32, 64, 512, 512, 16, 128, 4_096);
 
@@ -47906,7 +47993,7 @@ mod tests {
         assert!(state.completed);
         assert_eq!(
             state.execution_mode,
-            LexicalRebuildExecutionMode::SharedWriter
+            Some(LexicalRebuildExecutionMode::SharedWriter)
         );
         assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 4);
     }
@@ -50253,7 +50340,7 @@ mod tests {
         });
 
         assert!(
-            logs.contains("falling back to per-conversation fetches"),
+            logs.contains("preparing one conversation at a time"),
             "expected oversized single conversation fallback log, got:\n{logs}"
         );
         assert_eq!(tantivy_doc_count_for_data_dir(&data_dir), 3);
@@ -55858,6 +55945,18 @@ mod tests {
             status.completed_storage_fingerprint.as_deref(),
             Some("content-v1:7:42:42")
         );
+
+        state.execution_mode = None;
+        persist_lexical_rebuild_state(&index_path, &state).unwrap();
+        let legacy_status = matching_completed_lexical_rebuild_state_status_without_fingerprint(
+            &index_path,
+            &db_path,
+            7,
+        )
+        .unwrap()
+        .expect("completed legacy checkpoints retain shared-writer semantics");
+        assert!(legacy_status.has_completed_checkpoint);
+        assert_eq!(legacy_status.completed_indexed_docs, Some(42));
     }
 
     #[test]
@@ -55932,6 +56031,30 @@ mod tests {
             .is_none(),
             "shared-writer checkpoints still require the exact fingerprint path"
         );
+
+        let legacy_index_path = tmp.path().join("legacy-index");
+        fs::create_dir_all(&legacy_index_path).unwrap();
+        let mut legacy_state = LexicalRebuildState::new(
+            LexicalRebuildDbState {
+                db_path: db_path.to_string_lossy().into_owned(),
+                total_conversations: 400,
+                total_messages: 0,
+                storage_fingerprint: "content-v1:400:1200:4800".to_string(),
+            },
+            LEXICAL_REBUILD_PAGE_SIZE,
+        );
+        legacy_state.execution_mode = None;
+        persist_lexical_rebuild_state(&legacy_index_path, &legacy_state).unwrap();
+        assert!(
+            nonresumable_pending_lexical_rebuild_status_without_fingerprint(
+                &legacy_index_path,
+                &db_path,
+                400,
+            )
+            .unwrap()
+            .is_some(),
+            "an incomplete checkpoint that predates execution-mode recording must restart without an exact archive count"
+        );
     }
 
     #[test]
@@ -56004,7 +56127,7 @@ mod tests {
     /// replace every derived count/fingerprint with streamed observations.
     #[test]
     #[serial]
-    fn plain_index_restarts_nonresumable_checkpoint_with_stale_count_to_quill_completion() {
+    fn plain_index_restarts_legacy_checkpoint_with_stale_count_to_quill_completion() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         fs::create_dir_all(&data_dir).unwrap();
@@ -56024,7 +56147,7 @@ mod tests {
         };
         let mut state =
             LexicalRebuildState::new(checkpoint_db_state, LEXICAL_REBUILD_PAGE_SIZE);
-        state.set_execution_mode(LexicalRebuildExecutionMode::StagedShardBuild);
+        state.execution_mode = None;
         persist_lexical_rebuild_state(&index_path, &state).unwrap();
 
         run_index(
@@ -57297,6 +57420,10 @@ mod tests {
         state.record_pending_commit(Some(1500), 300, 600, None);
 
         let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains(r#""execution_mode":"shared_writer""#),
+            "new checkpoints must record shared_writer explicitly so absence remains a legacy provenance signal"
+        );
         let restored: LexicalRebuildState = serde_json::from_str(&json).unwrap();
 
         assert_eq!(restored.committed_offset, 250);
@@ -57339,6 +57466,8 @@ mod tests {
         assert_eq!(state.committed_offset, 50);
         assert_eq!(state.committed_conversation_id, None);
         assert_eq!(state.processed_conversations, 50);
+        assert_eq!(state.execution_mode, None);
+        assert!(state.requires_restart_from_zero_on_resume());
 
         let pending = state.pending.as_ref().unwrap();
         assert_eq!(pending.next_offset, 60);

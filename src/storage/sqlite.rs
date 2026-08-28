@@ -10335,24 +10335,34 @@ impl FrankenStorage {
     /// conversation within budget with a truncated lexical body — lexical search
     /// needs tokens, not the full multi-megabyte blob.
     pub fn fetch_messages_for_lexical_rebuild(&self, conversation_id: i64) -> Result<Vec<Message>> {
-        let cap = lexical_max_conversation_content_bytes();
-        let hinted_sql = "SELECT id, idx, role, author, created_at, \
-                 substr(content, 1, ?2), COALESCE(LENGTH(CAST(content AS BLOB)), 0) \
+        // FrankenSQLite's allocation-avoiding ASCII ColumnSubstrPrefix path
+        // requires a literal signed-32-bit prefix length. This value is parsed
+        // from our own numeric cap, never from SQL/user text, so embedding it
+        // cannot introduce SQL injection. Keep the effective byte cap no larger
+        // than that literal so very large environment overrides cannot be
+        // reported inaccurately.
+        let cap = lexical_max_conversation_content_bytes().min(i32::MAX as usize);
+        let hinted_sql = format!(
+            "SELECT id, idx, role, author, created_at, \
+                 substr(content, 1, {cap}), COALESCE(octet_length(content), 0) \
                  FROM messages INDEXED BY sqlite_autoindex_messages_1 \
-                 WHERE conversation_id = ?1 ORDER BY idx";
-        let fallback_sql = "SELECT id, idx, role, author, created_at, \
-                 substr(content, 1, ?2), COALESCE(LENGTH(CAST(content AS BLOB)), 0) \
+                 WHERE conversation_id = ?1 ORDER BY idx"
+        );
+        let fallback_sql = format!(
+            "SELECT id, idx, role, author, created_at, \
+                 substr(content, 1, {cap}), COALESCE(octet_length(content), 0) \
                  FROM messages \
-                 WHERE conversation_id = ?1 ORDER BY idx";
+                 WHERE conversation_id = ?1 ORDER BY idx"
+        );
         let (messages, original_bytes) = self
-            .stream_capped_lexical_rebuild_messages(conversation_id, cap, hinted_sql)
+            .stream_capped_lexical_rebuild_messages(conversation_id, cap, &hinted_sql)
             .or_else(|err| {
                 if format!("{err:#}").contains("no such index: sqlite_autoindex_messages_1")
                 {
                     return self.stream_capped_lexical_rebuild_messages(
                         conversation_id,
                         cap,
-                        fallback_sql,
+                        &fallback_sql,
                     );
                 }
                 Err(err)
@@ -10369,7 +10379,7 @@ impl FrankenStorage {
                 original_bytes,
                 capped_bytes,
                 cap,
-                "lexical rebuild conversation content exceeded the per-conversation cap; streamed only the bounded indexed prefix instead of materializing the full body (#290, GH#413)"
+                "lexical rebuild conversation content exceeded the per-conversation cap; retained only the bounded indexed prefix instead of the full body (#290, GH#413)"
             );
         }
 
@@ -10380,8 +10390,9 @@ impl FrankenStorage {
     /// instead of collecting the complete result. SQL bounds the largest
     /// projected text cell by `cap` Unicode scalar values; the callback applies
     /// the stricter cumulative UTF-8 byte cap before retaining the row.
-    /// Consequently neither the query result nor CASS's accumulated message
-    /// text scales with the uncapped conversation body (GH#413).
+    /// Consequently CASS's retained result does not scale with the uncapped
+    /// conversation body. FrankenSQLite can still transiently materialize a
+    /// full non-ASCII source cell until upstream issue #400 is fixed.
     fn stream_capped_lexical_rebuild_messages(
         &self,
         conversation_id: i64,
@@ -10391,11 +10402,7 @@ impl FrankenStorage {
         let mut messages = Vec::new();
         let mut original_bytes = 0usize;
         let mut remaining_bytes = cap;
-        let character_limit = i64::try_from(cap).unwrap_or(i64::MAX).max(1);
-        let params = [
-            SqliteValue::from(conversation_id),
-            SqliteValue::from(character_limit),
-        ];
+        let params = [SqliteValue::from(conversation_id)];
         self.conn
             .query_with_params_for_each(sql, &params, |row| {
                 let role: String = row.get_typed(2)?;
@@ -22318,6 +22325,30 @@ mod tests {
                 |row| row.get_typed::<i64>(0),
             )
             .unwrap();
+
+        let projection_opcodes: Vec<String> = storage
+            .conn
+            .query_map_collect(
+                "EXPLAIN SELECT id, idx, role, author, created_at, \
+                     substr(content, 1, 1025), COALESCE(octet_length(content), 0) \
+                     FROM messages INDEXED BY sqlite_autoindex_messages_1 \
+                     WHERE conversation_id = ?1 ORDER BY idx",
+                fparams![conversation_id],
+                |row| row.get_typed(1),
+            )
+            .expect("explain bounded lexical projection");
+        assert!(
+            projection_opcodes
+                .iter()
+                .any(|opcode| opcode == "ColumnSubstrPrefix"),
+            "literal prefix cap must compile to the bounded column projection opcode: {projection_opcodes:?}"
+        );
+        assert!(
+            projection_opcodes
+                .iter()
+                .any(|opcode| opcode == "ColumnOctetLength"),
+            "source byte length must come from record metadata without hydrating the full cell: {projection_opcodes:?}"
+        );
 
         let messages = storage
             .fetch_messages_for_lexical_rebuild(conversation_id)
