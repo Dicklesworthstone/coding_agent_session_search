@@ -5,7 +5,7 @@
 </div>
 
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)
-![Rust](https://img.shields.io/badge/Rust-stable-orange.svg)
+![Rust](https://img.shields.io/badge/Rust-pinned%20nightly-orange.svg)
 ![Status](https://img.shields.io/badge/status-alpha-purple.svg)
 [![Coverage](https://codecov.io/gh/Dicklesworthstone/coding_agent_session_search/branch/main/graph/badge.svg)](https://codecov.io/gh/Dicklesworthstone/coding_agent_session_search)
 ![License](https://img.shields.io/badge/license-MIT%2BOpenAI%2FAnthropic%20Rider-green.svg)
@@ -2982,7 +2982,7 @@ The project ships with a robust installer (`install.sh` / `install.ps1`) designe
 
 - **Checksum Verification**: Validates artifacts against a `.sha256` file or explicit `--checksum` flag.
 
-- **Rustup Bootstrap**: Source installs bootstrap Rust stable when Rust 1.85+ is unavailable.
+- **Rustup Bootstrap**: Source installs use the dated nightly and components pinned by the release's `rust-toolchain.toml`. The installer bootstraps rustup without an unrelated default toolchain when needed.
 
 - **Easy Mode**: `--easy-mode` automates installation to `~/.local/bin` without prompts.
 

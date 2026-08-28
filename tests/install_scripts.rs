@@ -148,6 +148,38 @@ fn install_sh_has_no_baseline_artifact_selection() -> Result<(), String> {
 }
 
 #[test]
+fn source_installer_uses_the_checkout_pinned_toolchain() {
+    let script = fs::read_to_string("install.sh").expect("read install.sh");
+
+    for required in [
+        "ensure_rust \"$TMP/src\"",
+        "rustup show active-toolchain",
+        "rustup toolchain install",
+        "--default-toolchain none",
+    ] {
+        assert!(
+            script.contains(required),
+            "source installer is missing pinned-toolchain behavior: {required}"
+        );
+    }
+
+    let clone_offset = script
+        .find("git clone --depth 1 --branch")
+        .expect("source installer must clone the requested release");
+    let bootstrap_offset = script
+        .find("ensure_rust \"$TMP/src\"")
+        .expect("source installer must bootstrap the checkout toolchain");
+    assert!(
+        clone_offset < bootstrap_offset,
+        "the checkout must exist before rustup reads rust-toolchain.toml"
+    );
+    assert!(
+        !script.contains("--default-toolchain stable"),
+        "source bootstrap must not download an unrelated stable toolchain"
+    );
+}
+
+#[test]
 fn install_sh_keeps_tmp_root_warnings_out_of_command_substitution() {
     let script = fs::read_to_string("install.sh").expect("read install.sh");
     assert!(
@@ -268,6 +300,103 @@ fn make_executable_script(path: &std::path::Path, body: &str) {
 #[cfg(not(unix))]
 fn make_executable_script(path: &std::path::Path, body: &str) {
     drop(fs::write(path, body));
+}
+
+#[test]
+#[serial]
+#[cfg(unix)]
+fn source_install_bootstraps_the_toolchain_after_clone() {
+    let harness = tempfile::TempDir::new().expect("source-install harness");
+    let fake_bin = harness.path().join("bin");
+    fs::create_dir(&fake_bin).expect("create fake bin");
+    let event_log = harness.path().join("events.log");
+    let home = isolated_home();
+    let dest = tempfile::TempDir::new().expect("install destination");
+    let tmp_root = isolated_install_tmp_root();
+
+    make_executable_script(
+        &fake_bin.join("git"),
+        r#"#!/bin/sh
+set -eu
+checkout=""
+for argument in "$@"; do checkout="$argument"; done
+printf 'git|%s|%s\n' "$PWD" "$*" >> "$FAKE_INSTALL_EVENT_LOG"
+mkdir -p "$checkout/target/release"
+printf '%s\n' '[toolchain]' 'channel = "nightly-test-date"' > "$checkout/rust-toolchain.toml"
+printf '%s\n' '#!/bin/sh' 'echo source-fixture' > "$checkout/target/release/cass"
+chmod 755 "$checkout/target/release/cass"
+"#,
+    );
+    make_executable_script(
+        &fake_bin.join("rustup"),
+        r#"#!/bin/sh
+set -eu
+printf 'rustup|%s|%s\n' "$PWD" "$*" >> "$FAKE_INSTALL_EVENT_LOG"
+case "${1:-}:${2:-}" in
+  show:active-toolchain) exit 1 ;;
+  toolchain:install)
+    test -f rust-toolchain.toml
+    grep -q 'nightly-test-date' rust-toolchain.toml
+    : > .pinned-toolchain-installed
+    ;;
+  *) exit 2 ;;
+esac
+"#,
+    );
+    make_executable_script(
+        &fake_bin.join("cargo"),
+        r#"#!/bin/sh
+set -eu
+printf 'cargo|%s|%s\n' "$PWD" "$*" >> "$FAKE_INSTALL_EVENT_LOG"
+test -f rust-toolchain.toml
+test -f .pinned-toolchain-installed
+test "${1:-}" = build
+"#,
+    );
+
+    let inherited_path = std::env::var("PATH").expect("PATH should be set");
+    let fake_path = format!("{}:{inherited_path}", fake_bin.display());
+    let output = install_sh_command(&tmp_root)
+        .arg("--version")
+        .arg("vtest")
+        .arg("--dest")
+        .arg(dest.path())
+        .arg("--easy-mode")
+        .arg("--from-source")
+        .env("HOME", home.path())
+        .env("PATH", fake_path)
+        .env("FAKE_INSTALL_EVENT_LOG", &event_log)
+        .env_remove("RUSTUP_INIT_SKIP")
+        .output()
+        .expect("run source installer with fake toolchain commands");
+
+    assert!(
+        output.status.success(),
+        "source install failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(dest.path().join("cass").is_file());
+
+    let events = fs::read_to_string(&event_log).expect("read source-install events");
+    let git_offset = events.find("git|").expect("git clone event");
+    let show_offset = events
+        .find("|show active-toolchain")
+        .expect("active toolchain probe event");
+    let install_offset = events
+        .find("|toolchain install")
+        .expect("pinned toolchain install event");
+    let cargo_offset = events.find("cargo|").expect("cargo build event");
+    assert!(
+        git_offset < show_offset && show_offset < install_offset && install_offset < cargo_offset,
+        "expected clone -> probe -> toolchain install -> build, got:\n{events}"
+    );
+    for event in events.lines().filter(|line| line.starts_with("rustup|") || line.starts_with("cargo|")) {
+        assert!(
+            event.contains("/src|"),
+            "toolchain commands must run from the cloned checkout: {event}"
+        );
+    }
 }
 
 struct HttpFixtureServer {

@@ -68,7 +68,7 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 We only use **Cargo** in this project, NEVER any other package manager.
 
-- **Edition:** Rust 2024 (stable — see `rust-toolchain.toml`)
+- **Edition:** Rust 2024 (dated nightly pinned by `rust-toolchain.toml`)
 - **Dependency versions:** Wildcard constraints (`*`) for all crates
 - **Configuration:** Cargo.toml only (single-crate project, no workspace)
 - **Unsafe code:** Forbidden

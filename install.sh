@@ -279,23 +279,44 @@ maybe_add_path() {
 }
 
 ensure_rust() {
+  local source_dir="$1"
+
   if [ "${RUSTUP_INIT_SKIP:-0}" != "0" ]; then
-    info "Skipping rustup install (RUSTUP_INIT_SKIP set)"
+    info "Skipping repository toolchain bootstrap (RUSTUP_INIT_SKIP set)"
     return 0
   fi
-  # Require Rust 1.85+ (edition 2024 support) or any future major version (2.x+)
-  if command -v cargo >/dev/null 2>&1 && rustc --version 2>/dev/null | grep -qE 'rustc ([2-9]+|1\.(8[5-9]|9[0-9]|[1-9][0-9]{2,}))\.'; then return 0; fi
+
+  # Prefer an existing rustup installation even when the current shell has not
+  # picked up ~/.cargo/bin yet. The checkout's rust-toolchain.toml is the sole
+  # source of truth for the compiler channel and required components.
+  if ! command -v rustup >/dev/null 2>&1 && [ -x "$HOME/.cargo/bin/rustup" ]; then
+    export PATH="$HOME/.cargo/bin:$PATH"
+  fi
+  if command -v rustup >/dev/null 2>&1 \
+    && (cd "$source_dir" && rustup show active-toolchain >/dev/null 2>&1); then
+    return 0
+  fi
+
   if [ "$EASY" -ne 1 ]; then
     if [ -t 0 ]; then
-      echo -n "Install Rust stable via rustup? (y/N): "
+      echo -n "Install the repository-pinned Rust toolchain via rustup? (y/N): "
       read -r ans
-      case "$ans" in y|Y) :;; *) warn "Skipping rustup install"; return 0;; esac
+      case "$ans" in
+        y|Y) :;;
+        *) err "The repository-pinned Rust toolchain is required for a source build"; return 1;;
+      esac
     fi
   fi
-  info "Installing rustup (stable)"
-  curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
-  export PATH="$HOME/.cargo/bin:$PATH"
-  rustup component add rustfmt clippy || true
+
+  if ! command -v rustup >/dev/null 2>&1; then
+    info "Installing rustup (without an unrelated default toolchain)"
+    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+      | sh -s -- -y --default-toolchain none --profile minimal
+    export PATH="$HOME/.cargo/bin:$PATH"
+  fi
+
+  info "Installing the Rust toolchain pinned by rust-toolchain.toml"
+  (cd "$source_dir" && rustup toolchain install)
 }
 
 usage() {
@@ -447,9 +468,9 @@ if [ "$FROM_SOURCE" -eq 0 ]; then
 fi
 
 if [ "$FROM_SOURCE" -eq 1 ]; then
-  info "Building from source (requires git and a working Rust stable toolchain)"
-  ensure_rust
+  info "Building from source (requires git and the repository-pinned Rust toolchain)"
   git clone --depth 1 --branch "$VERSION" "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"
+  ensure_rust "$TMP/src"
   (cd "$TMP/src" && cargo build --locked --release)
   BIN="$TMP/src/target/release/$INSTALL_BASENAME"
   if [ ! -f "$BIN" ] || [ ! -x "$BIN" ]; then
