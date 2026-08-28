@@ -9472,9 +9472,11 @@ fn can_skip_unchanged_explicit_watch_once_index_run(
     opts: &IndexOptions,
     storage: &FrankenStorage,
     index_path: &Path,
-    canonical_rebuild_required: bool,
+    lexical_rebuild_required: bool,
+    analytics_rebuild_required: bool,
 ) -> Result<bool> {
-    if canonical_rebuild_required
+    if lexical_rebuild_required
+        || analytics_rebuild_required
         || opts.watch
         || opts.full
         || opts.force_rebuild
@@ -14022,6 +14024,7 @@ pub fn run_index(
         &storage,
         &index_path,
         legacy_omp_upgrade.lexical_rebuild_required,
+        legacy_omp_upgrade.analytics_rebuild_required,
     )? {
         let now_ms = FrankenStorage::now_millis();
         persist_final_index_run_metadata(&storage, &opts.db_path, false, now_ms, now_ms)?;
@@ -52270,8 +52273,14 @@ mod tests {
 
         let startup_skip = {
             let guard = storage.lock().unwrap();
-            can_skip_unchanged_explicit_watch_once_index_run(&opts, &guard, &index_path, false)
-                .unwrap()
+            can_skip_unchanged_explicit_watch_once_index_run(
+                &opts,
+                &guard,
+                &index_path,
+                false,
+                false,
+            )
+            .unwrap()
         };
         assert!(
             startup_skip,
@@ -52279,12 +52288,33 @@ mod tests {
         );
         let migration_skip = {
             let guard = storage.lock().unwrap();
-            can_skip_unchanged_explicit_watch_once_index_run(&opts, &guard, &index_path, true)
-                .unwrap()
+            can_skip_unchanged_explicit_watch_once_index_run(
+                &opts,
+                &guard,
+                &index_path,
+                true,
+                false,
+            )
+            .unwrap()
         };
         assert!(
             !migration_skip,
             "a pending canonical identity migration must publish fresh lexical assets"
+        );
+        let analytics_migration_skip = {
+            let guard = storage.lock().unwrap();
+            can_skip_unchanged_explicit_watch_once_index_run(
+                &opts,
+                &guard,
+                &index_path,
+                false,
+                true,
+            )
+            .unwrap()
+        };
+        assert!(
+            !analytics_migration_skip,
+            "an analytics-only legacy OMP migration must resume after lexical publication"
         );
 
         let second = reindex_paths(
