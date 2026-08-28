@@ -18756,8 +18756,15 @@ fn prepare_lexical_rebuild_page_work(
     let configured_page_size = usize::try_from(work.configured_page_size.max(1))
         .unwrap_or(usize::MAX)
         .max(1);
+    let content_bounded_page_conversation_limit =
+        lexical_rebuild_content_bounded_page_conversation_limit(
+            work.pipeline_budget.page_conversation_limit,
+            work.pipeline_budget.batch_fetch_message_bytes_limit,
+        );
     let budget_shrink_decision =
-        if work.pipeline_budget.page_conversation_limit < configured_page_size {
+        if content_bounded_page_conversation_limit < work.pipeline_budget.page_conversation_limit {
+            "bounded_by_content_reservation"
+        } else if work.pipeline_budget.page_conversation_limit < configured_page_size {
             "bounded_below_configured_page"
         } else {
             "using_configured_page"
@@ -18766,6 +18773,7 @@ fn prepare_lexical_rebuild_page_work(
         sequence,
         configured_page_size = work.configured_page_size,
         page_conversation_limit = work.pipeline_budget.page_conversation_limit,
+        content_bounded_page_conversation_limit,
         budget_generation = work.budget_generation,
         budget_shrink_decision,
         page_conversations = prepared_packets.len(),
