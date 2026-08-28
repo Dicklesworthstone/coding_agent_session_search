@@ -1656,7 +1656,7 @@ impl TantivyIndex {
                             "attempted to assemble Tantivy index directories with different index settings"
                         ));
                     }
-                    // tantivy 0.26.1 (the registry pin frankensearch 0.4.0
+                    // tantivy 0.26.1 (the registry pin frankensearch 0.4.1
                     // re-exports) has no persisted custom plugin extensions on
                     // `IndexMeta`; the 0.27-only extension-mismatch guard
                     // returns with the 0.27 upgrade.
