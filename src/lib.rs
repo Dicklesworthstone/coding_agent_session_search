@@ -21031,7 +21031,13 @@ fn auto_refresh_is_scratch_data_dir(data_dir: &Path) -> bool {
     let temp = std::env::temp_dir();
     let canon_temp = std::fs::canonicalize(&temp).unwrap_or(temp);
     let canon_dir = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
-    canon_dir.starts_with(&canon_temp) || canon_dir.starts_with("/tmp")
+    // `/tmp` is a symlink to `/private/tmp` on macOS, so a canonicalized
+    // Linux-style `/tmp/...` data dir lands under `/private/tmp` there.
+    canon_dir.starts_with(&canon_temp)
+        || canon_dir.starts_with("/tmp")
+        || canon_dir.starts_with("/private/tmp")
+        || canon_dir.starts_with("/var/tmp")
+        || canon_dir.starts_with("/private/var/tmp")
 }
 
 fn state_index_freshness(state: &serde_json::Value) -> Option<serde_json::Value> {
@@ -113460,7 +113466,17 @@ fn schedule_binary_path() -> CliResult<PathBuf> {
         hint: None,
         retryable: false,
     })?;
-    Ok(std::fs::canonicalize(&exe).unwrap_or(exe))
+    // Deliberately NOT canonicalized: a package-manager launcher path such as
+    // /opt/homebrew/bin/cass is a stable symlink that survives upgrades,
+    // while its canonical Cellar/<version>/bin/cass target is deleted on the
+    // next `brew upgrade` — baking that into launchd/systemd units would
+    // break every scheduled job after an upgrade. current_exe() is already
+    // absolute on every supported platform; canonicalize only as a fallback.
+    if exe.is_absolute() {
+        Ok(exe)
+    } else {
+        Ok(std::fs::canonicalize(&exe).unwrap_or(exe))
+    }
 }
 
 fn run_schedule_command(subcmd: ScheduleCommand, cli: &Cli) -> CliResult<()> {
@@ -113692,7 +113708,7 @@ fn run_schedule_command(subcmd: ScheduleCommand, cli: &Cli) -> CliResult<()> {
             if report.ok {
                 Ok(())
             } else {
-                Err(CliError {
+                let err = CliError {
                     code: 9,
                     kind: CliErrorKind::Schedule.kind_str(),
                     message: format!(
@@ -113704,7 +113720,15 @@ fn run_schedule_command(subcmd: ScheduleCommand, cli: &Cli) -> CliResult<()> {
                         "Run `cass schedule status` for the per-step breakdown.".to_string(),
                     ),
                     retryable: true,
-                })
+                };
+                if structured_format.is_some() {
+                    // The full report is already on stdout as the single JSON
+                    // document; only propagate the exit code, never a second
+                    // error envelope (stdout must stay one-document).
+                    Err(CliError::already_reported_from(&err))
+                } else {
+                    Err(err)
+                }
             }
         }
     }

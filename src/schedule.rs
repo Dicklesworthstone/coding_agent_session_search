@@ -10,8 +10,9 @@
 //!   "daily"` never had.
 //! * **nightly** (default 03:00 local): remote syncs that are due, a full
 //!   `cass index --full --background`, then bounded semantic backfill batches
-//!   (`cass models backfill --scheduled`) until the backlog drains or the
-//!   scheduler gates (load, console idle) say stop.
+//!   (`cass models backfill --scheduled`) — first the fast (hash) tier, then
+//!   the quality (MiniLM) tier when the model is installed — until the
+//!   backlog drains or the scheduler gates (load, console idle) say stop.
 //!
 //! Priority is delegated to the OS: launchd `ProcessType=Background` +
 //! `Nice` + `LowPriorityIO`, systemd `Nice=19` + `IOSchedulingClass=idle` +
@@ -745,17 +746,29 @@ fn last_json_document(stdout: &str) -> Option<serde_json::Value> {
         .find_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
 }
 
-fn run_step(name: &str, binary: &Path, args: &[String], log: Option<&mut File>) -> StepReport {
+fn run_step(
+    name: &str,
+    binary: &Path,
+    data_dir: &Path,
+    args: &[String],
+    log: Option<&mut File>,
+) -> StepReport {
     let started = Instant::now();
     let mut argv = vec![binary.display().to_string()];
     argv.extend(args.iter().cloned());
-    // ubs:ignore — `binary` is the canonicalized `std::env::current_exe()`
+    // ubs:ignore — `binary` is the absolute `std::env::current_exe()` path
     // resolved by the CLI layer, never user-supplied input.
+    //
+    // CASS_DATA_DIR is exported to every step because some child commands
+    // (`sources sync`, `models status`) have no `--data-dir` flag and fall
+    // back to the platform default otherwise — which would silently target
+    // the wrong archive when `schedule run --data-dir` names a custom one.
     let output = Command::new(binary)
         .args(args)
         .stdin(Stdio::null())
         .env("CASS_INDEX_NO_PROGRESS_EVENTS", "1")
         .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_DATA_DIR", data_dir)
         .output();
     let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     match output {
@@ -908,35 +921,39 @@ fn run_job_with_gate(
                     "--json".to_string(),
                 ];
                 info!(source = %name, reason = %why, "scheduled remote sync");
-                let mut step = run_step(
+                steps.push(run_step(
                     &format!("sources-sync:{name}"),
                     &cfg.binary,
+                    &cfg.data_dir,
                     &args,
                     log.as_mut(),
-                );
-                if step.skipped_reason.is_none() {
-                    step.skipped_reason = None;
-                }
-                steps.push(step);
+                ));
             }
         }
 
-        // 2. Index.
+        // 2. Index. Exit 7 (`index-busy`: a human or another job holds the
+        // index lock) is an expected outcome for a scheduled run, not a
+        // failure — the next timer firing simply tries again.
         let full = matches!(job, ScheduleJob::Nightly);
         let args: Vec<String> = background_index_args(&cfg.data_dir, &cfg.db_path, full)
             .into_iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        let index_step = run_step(
+        let mut index_step = run_step(
             if full { "index-full" } else { "index" },
             &cfg.binary,
+            &cfg.data_dir,
             &args,
             log.as_mut(),
         );
-        let index_busy = index_step.exit_code == Some(7);
+        let index_busy = soften_busy_index_step(&mut index_step);
         steps.push(index_step);
 
-        // 3. Semantic backfill (nightly only).
+        // 3. Semantic backfill (nightly only). Two tiers: the fast (hash)
+        // tier needs no model files; the quality (MiniLM) tier only runs
+        // when the model is installed — requesting it without the model
+        // fails with a model-domain exit code, which must read as "tier not
+        // available", never as a failed nightly.
         if full {
             if !cfg.semantic {
                 steps.push(skipped_step(
@@ -949,37 +966,55 @@ fn run_job_with_gate(
                     "index run was busy; leaving semantic backfill for the next night",
                 ));
             } else {
+                let (probe, model_installed) =
+                    minilm_model_probe(&cfg.binary, &cfg.data_dir, log.as_mut());
+                steps.push(probe);
+                let mut tiers = vec!["fast"];
+                if model_installed {
+                    tiers.push("quality");
+                } else {
+                    steps.push(skipped_step(
+                        "semantic-backfill:quality",
+                        "MiniLM model not installed (`cass models install`); quality tier skipped",
+                    ));
+                }
                 let mut batches = 0u32;
-                loop {
-                    if batches >= cfg.max_backfill_batches {
-                        steps.push(skipped_step(
-                            "semantic-backfill",
-                            format!("stopped after {batches} batches (CASS_SCHEDULE_MAX_BACKFILL_BATCHES)"),
-                        ));
-                        break;
-                    }
-                    let args = vec![
-                        "--db".to_string(),
-                        cfg.db_path.display().to_string(),
-                        "--color=never".to_string(),
-                        "models".to_string(),
-                        "backfill".to_string(),
-                        "--scheduled".to_string(),
-                        "--data-dir".to_string(),
-                        cfg.data_dir.display().to_string(),
-                        "--json".to_string(),
-                    ];
-                    batches += 1;
-                    let step = run_step(
-                        &format!("semantic-backfill:{batches}"),
-                        &cfg.binary,
-                        &args,
-                        log.as_mut(),
-                    );
-                    let stop = backfill_batch_should_stop(&step);
-                    steps.push(step);
-                    if stop {
-                        break;
+                'tiers: for tier in tiers {
+                    loop {
+                        if batches >= cfg.max_backfill_batches {
+                            steps.push(skipped_step(
+                                "semantic-backfill",
+                                format!("stopped after {batches} batches (CASS_SCHEDULE_MAX_BACKFILL_BATCHES)"),
+                            ));
+                            break 'tiers;
+                        }
+                        let args = vec![
+                            "--db".to_string(),
+                            cfg.db_path.display().to_string(),
+                            "--color=never".to_string(),
+                            "models".to_string(),
+                            "backfill".to_string(),
+                            "--tier".to_string(),
+                            tier.to_string(),
+                            "--scheduled".to_string(),
+                            "--data-dir".to_string(),
+                            cfg.data_dir.display().to_string(),
+                            "--json".to_string(),
+                        ];
+                        batches += 1;
+                        let mut step = run_step(
+                            &format!("semantic-backfill:{tier}:{batches}"),
+                            &cfg.binary,
+                            &cfg.data_dir,
+                            &args,
+                            log.as_mut(),
+                        );
+                        let model_unavailable = soften_model_unavailable_backfill_step(&mut step);
+                        let stop = model_unavailable || backfill_batch_should_stop(&step);
+                        steps.push(step);
+                        if stop {
+                            break;
+                        }
                     }
                 }
             }
@@ -1009,6 +1044,74 @@ fn run_job_with_gate(
         warn!(error = %error, "failed to append schedule run history");
     }
     report
+}
+
+/// Exit codes that mean "the semantic model / embedder is unavailable"
+/// rather than "the batch failed": 15 (semantic/embedder unavailable) and
+/// 20–24 (model acquisition, verify, and model-handling I/O domain — see the
+/// exit-code table in AGENTS.md).
+const MODEL_UNAVAILABLE_EXIT_CODES: [i32; 6] = [15, 20, 21, 22, 23, 24];
+
+/// Convert a backfill batch that failed because the model is unavailable
+/// into a skipped (non-failing) step. Returns true when the conversion
+/// applied, which also ends that tier's loop.
+pub fn soften_model_unavailable_backfill_step(step: &mut StepReport) -> bool {
+    if step.ok {
+        return false;
+    }
+    let Some(code) = step.exit_code else {
+        return false;
+    };
+    if !MODEL_UNAVAILABLE_EXIT_CODES.contains(&code) {
+        return false;
+    }
+    step.ok = true;
+    step.skipped_reason = Some(format!(
+        "semantic model unavailable (exit {code}); run `cass models install` to enable this tier"
+    ));
+    true
+}
+
+/// Convert an exit-7 (`index-busy`) index step into a skipped step: a
+/// scheduled run losing the lock race to a human `cass index` is routine.
+pub fn soften_busy_index_step(step: &mut StepReport) -> bool {
+    if step.exit_code != Some(7) {
+        return false;
+    }
+    step.ok = true;
+    step.skipped_reason =
+        Some("another index run already holds the index lock; skipped this cycle".to_string());
+    true
+}
+
+/// Probe whether the MiniLM model is installed via `models status --json`.
+/// A failed probe is downgraded to "assume not installed" so it can never
+/// fail the nightly job on its own.
+fn minilm_model_probe(
+    binary: &Path,
+    data_dir: &Path,
+    log: Option<&mut File>,
+) -> (StepReport, bool) {
+    let args = vec![
+        "--color=never".to_string(),
+        "models".to_string(),
+        "status".to_string(),
+        "--json".to_string(),
+    ];
+    let mut step = run_step("models-status", binary, data_dir, &args, log);
+    let installed = step
+        .result
+        .as_ref()
+        .and_then(|r| r.get("installed"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !step.ok {
+        step.ok = true;
+        step.skipped_reason = Some(
+            "models status probe failed; assuming the MiniLM model is not installed".to_string(),
+        );
+    }
+    (step, installed)
 }
 
 /// Stop looping `models backfill --scheduled` when the batch failed, the
@@ -1285,6 +1388,62 @@ mod tests {
         let empty =
             serde_json::json!({"scheduler": {"state": "running"}, "conversations_processed": 0});
         assert!(backfill_batch_should_stop(&step(true, Some(empty))));
+    }
+
+    #[test]
+    fn model_unavailable_backfill_batches_soften_to_skips() {
+        let step = |exit: Option<i32>, ok: bool| StepReport {
+            name: "b".into(),
+            argv: vec![],
+            exit_code: exit,
+            ok,
+            duration_ms: 0,
+            skipped_reason: None,
+            result: None,
+            stderr_tail: None,
+        };
+        for code in [15, 20, 21, 22, 23, 24] {
+            let mut s = step(Some(code), false);
+            assert!(soften_model_unavailable_backfill_step(&mut s), "{code}");
+            assert!(s.ok);
+            assert!(
+                s.skipped_reason
+                    .as_deref()
+                    .unwrap()
+                    .contains("models install")
+            );
+        }
+        let mut real_failure = step(Some(1), false);
+        assert!(!soften_model_unavailable_backfill_step(&mut real_failure));
+        assert!(!real_failure.ok);
+        let mut spawn_failure = step(None, false);
+        assert!(!soften_model_unavailable_backfill_step(&mut spawn_failure));
+        let mut fine = step(Some(0), true);
+        assert!(!soften_model_unavailable_backfill_step(&mut fine));
+        assert!(fine.skipped_reason.is_none());
+    }
+
+    #[test]
+    fn busy_index_step_softens_to_skip() {
+        let step = |exit: Option<i32>, ok: bool| StepReport {
+            name: "index".into(),
+            argv: vec![],
+            exit_code: exit,
+            ok,
+            duration_ms: 0,
+            skipped_reason: None,
+            result: None,
+            stderr_tail: None,
+        };
+        let mut busy = step(Some(7), false);
+        assert!(soften_busy_index_step(&mut busy));
+        assert!(busy.ok);
+        assert!(busy.skipped_reason.is_some());
+        let mut fine = step(Some(0), true);
+        assert!(!soften_busy_index_step(&mut fine));
+        let mut failed = step(Some(3), false);
+        assert!(!soften_busy_index_step(&mut failed));
+        assert!(!failed.ok);
     }
 
     #[test]
