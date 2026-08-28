@@ -49,7 +49,8 @@ which = "8.0.2"
 shell-words = "1.1.1"
 dotenvy = "0.15.7"
 notify = "8.2.0"
-# fsqlite 0.3.11 (crates.io) carries the 0.3.0 asupersync-0.4.3 runtime migration
+# fsqlite 0.3.11 at the exact source revision below carries the 0.3.0
+# asupersync-0.4.3 runtime migration
 # and bug-fix wave (GH#333 concurrent-open BusyRecovery retries, GH#334
 # FileIdentity re-derivation after file replacement — the cass#393
 # st_dev/namespace-sidecar repair d29339c — 8-writer rollback cascade,
@@ -58,14 +59,19 @@ notify = "8.2.0"
 # refusal, shared concurrent-writer EOF high-water, sidecar-less read-only
 # first-contact opens (GH#140), Darwin OFD locking; and the 0.3.9 Windows
 # sidecar-less read-only close fix (GH#438), without which CASS cannot reopen
-# its canonical archive during indexing on Windows. The engine API is async
+# its canonical archive during indexing on Windows. Revisions 22af0753 and
+# 027f62f2 admit FTS5's semantically read-only `integrity-check` command through
+# both the physically read-only pager and `PRAGMA query_only` guards while
+# retaining `ReadOnly` for every mutating FTS maintenance command. That exact
+# behavior is required by CASS's pre-mutation full-rebuild integrity gate on
+# Windows. The engine API is async
 # (!Send futures); CASS's synchronous call shape is preserved by
 # src/franken_sync.rs, which drives every engine future on a private
 # current-thread asupersync runtime.
-frankensqlite = { version = "=0.3.11", package = "fsqlite", features = ["fts5", "async-api"] }
+frankensqlite = { version = "=0.3.11", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "027f62f22c3a70a05338e47af2a76c622df3ca57", package = "fsqlite", features = ["fts5", "async-api"] }
 # The production storage-integrity probe calls FrankenSQLite's public VFS API
 # directly so it can inspect native writer locks without opening the pager.
-fsqlite-types = { version = "=0.3.11", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.3.11", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "027f62f22c3a70a05338e47af2a76c622df3ca57", package = "fsqlite-types" }
 rayon = "1.12.0"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
@@ -209,12 +215,15 @@ rand_chacha = "0.10"
 rusqlite = { version = "0.40.2", features = ["bundled", "modern_sqlite"] }
 # The manifest-policy build gate requires this explicit dev entry for compat
 # fixture assertions, even though production also uses the same pinned crate.
-fsqlite-types = { version = "=0.3.11", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.3.11", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "027f62f22c3a70a05338e47af2a76c622df3ca57", package = "fsqlite-types" }
 
-# The fsqlite family now resolves from crates.io (0.3.11) for every direct and
-# transitive consumer, so the former [patch.crates-io] git override is gone.
-# build.rs enforces the registry identity (single 0.3.11 fsqlite family in the
-# lockfile, no patch reintroduction) as the dependency source contract.
+# The fsqlite family resolves from one immutable upstream revision for every
+# direct and transitive consumer. franken-agent-detection names the registry
+# facade, so this exact patch is required to keep that transitive entry point
+# in the same engine universe as CASS's direct git dependencies. build.rs
+# enforces the patch identity, exact git source, and single 0.3.11 family.
+[patch.crates-io]
+fsqlite = { version = "=0.3.11", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "027f62f22c3a70a05338e47af2a76c622df3ca57" }
 
 [[bin]]
 name = "cass"
@@ -283,7 +292,7 @@ strip = false
 # fresh-clone CI guard (.github/workflows/fresh-clone-build.yml) will
 # fail if any [patch] block pointing at sibling paths is committed:
 #
-# [patch.crates-io]
+# Add these entries to the committed [patch.crates-io] table above:
 # asupersync = { path = "../asupersync" }
 # franken-decision = { path = "../asupersync/franken_decision" }
 # franken-evidence = { path = "../asupersync/franken_evidence" }
@@ -298,7 +307,7 @@ strip = false
 # specific directory layout. See build.rs for validation details.
 #
 # A fresh-clone build regression guard runs in CI (.github/workflows/fresh-clone-build.yml)
-# — if you re-enable any of these [patch] blocks, that workflow will fail.
+# — if you re-enable any of these sibling-path [patch] blocks, that workflow will fail.
 #
 # [patch."https://github.com/Dicklesworthstone/frankensqlite"]
 # fsqlite = { path = "../frankensqlite/crates/fsqlite" }

@@ -45161,6 +45161,13 @@ mod tests {
             .expect("materialize a healthy canonical FTS shadow");
         drop(storage);
 
+        assert_eq!(
+            full_rebuild_existing_archive_integrity_preflight(&db_path)
+                .expect("strict read-only archive preflight"),
+            None,
+            "a healthy canonical FTS shadow must pass through the same strict read-only opener used before a production full rebuild"
+        );
+
         let mut storage = FrankenStorage::open_readonly(&db_path).unwrap();
 
         assert_eq!(
