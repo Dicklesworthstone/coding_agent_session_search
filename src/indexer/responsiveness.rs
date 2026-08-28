@@ -632,6 +632,17 @@ pub(crate) struct MachinePressure {
 }
 
 pub(crate) fn machine_pressure_now() -> MachinePressure {
+    // `CASS_RESPONSIVENESS_DISABLE=1` pins the governor at 100%; the
+    // scheduled-work gates built on this probe must honor the same kill
+    // switch, or "skip governor" would still load-gate cron/daemon jobs.
+    if disabled_via_env() {
+        return MachinePressure {
+            load_per_core: None,
+            psi_cpu_some_avg10: None,
+            pressured: false,
+            severe: false,
+        };
+    }
     let cfg = GovernorConfig::from_env();
     let snapshot = ProcHealthReader::new().snapshot();
     machine_pressure_for(&snapshot, &cfg)
@@ -1850,6 +1861,42 @@ mod tests {
 
         let away = user_idle_gate_for(600, Some(600));
         assert!(away.satisfied);
+    }
+
+    #[test]
+    fn machine_pressure_classifies_against_config_thresholds() {
+        let c = cfg();
+        let idle = HealthSnapshot {
+            load_per_core: Some(0.2),
+            psi_cpu_some_avg10: Some(1.0),
+        };
+        let p = machine_pressure_for(&idle, &c);
+        assert!(!p.pressured);
+        assert!(!p.severe);
+
+        let pressured = HealthSnapshot {
+            load_per_core: Some(1.5),
+            psi_cpu_some_avg10: None,
+        };
+        let p = machine_pressure_for(&pressured, &c);
+        assert!(p.pressured);
+        assert!(!p.severe);
+
+        let severe = HealthSnapshot {
+            load_per_core: Some(3.0),
+            psi_cpu_some_avg10: None,
+        };
+        let p = machine_pressure_for(&severe, &c);
+        assert!(p.severe);
+
+        // Unknown signals (non-Linux/macOS platforms) must fail open.
+        let unknown = HealthSnapshot {
+            load_per_core: None,
+            psi_cpu_some_avg10: None,
+        };
+        let p = machine_pressure_for(&unknown, &c);
+        assert!(!p.pressured);
+        assert!(!p.severe);
     }
 
     #[test]

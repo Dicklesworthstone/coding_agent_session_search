@@ -23,6 +23,12 @@
 //! Everything the job does is recorded under `<data_dir>/schedule/`:
 //! `state.json` (last run per job), `runs.jsonl` (append-only history), and
 //! per-job log files the OS scheduler writes stdout/stderr into.
+//!
+//! Known honest failure: on a machine with **zero** agent sessions, the
+//! nightly `index --full` fails cass's own post-publish validation (there is
+//! no lexical index to read back), so `schedule status` shows a failed
+//! nightly until the first session exists. Incremental runs succeed on an
+//! empty corpus.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
