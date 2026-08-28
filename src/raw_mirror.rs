@@ -3557,6 +3557,143 @@ mod tests {
     }
 
     #[test]
+    fn growing_source_with_partial_tail_reuses_only_complete_prefix_chunks() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("partial-tail.jsonl");
+        let first_bytes = b"0123456789abcdefABCDEFGHIJKLMNOPqrstuvwxyz!@#$%^xyz";
+        assert_eq!(first_bytes.len(), 51);
+        fs::write(&source_path, first_bytes).expect("write first partial-tail version");
+
+        let first = capture_source_file_with_chunk_policy(
+            RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "codex",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &source_path,
+                db_links: &[],
+            },
+            1,
+            16,
+        )
+        .expect("capture first partial-tail version");
+
+        let mut second_bytes = first_bytes.to_vec();
+        second_bytes.extend_from_slice(b"tail!");
+        fs::write(&source_path, &second_bytes).expect("append partial tail");
+        let second = capture_source_file_with_chunk_policy(
+            RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "codex",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &source_path,
+                db_links: &[],
+            },
+            1,
+            16,
+        )
+        .expect("capture extended partial-tail version");
+
+        let root = raw_mirror_root(&data_dir);
+        let first_storage = read_raw_mirror_manifest(&root.join(&first.manifest_relative_path))
+            .expect("first manifest")
+            .content_storage
+            .expect("first chunk storage");
+        let second_storage = read_raw_mirror_manifest(&root.join(&second.manifest_relative_path))
+            .expect("second manifest")
+            .content_storage
+            .expect("second chunk storage");
+        assert_eq!(first_storage.chunks.len(), 4);
+        assert_eq!(first_storage.chunks[3].blob_size_bytes, 3);
+        assert_eq!(second_storage.chunks.len(), 4);
+        assert_eq!(second_storage.chunks[3].blob_size_bytes, 8);
+        assert_eq!(first_storage.chunks[..3], second_storage.chunks[..3]);
+        assert_ne!(first_storage.chunks[3], second_storage.chunks[3]);
+        assert_eq!(
+            read_source_bytes(&data_dir, &first.manifest_id).expect("reconstruct first snapshot"),
+            first_bytes
+        );
+        assert_eq!(
+            read_source_bytes(&data_dir, &second.manifest_id).expect("reconstruct second snapshot"),
+            second_bytes
+        );
+        assert_eq!(
+            storage_summary(&data_dir).unique_blob_count,
+            7,
+            "an append into a partial tail should add only one replacement tail and one descriptor"
+        );
+    }
+
+    #[test]
+    fn sparse_page_store_mutation_reuses_unchanged_middle_chunks() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("page-store.sqlite");
+        let first_bytes = b"0123456789abcdefABCDEFGHIJKLMNOPqrstuvwxyz!@#$%^&*()-_=+[]{}<>?!";
+        assert_eq!(first_bytes.len(), 64);
+        fs::write(&source_path, first_bytes).expect("write first page-store snapshot");
+
+        let first = capture_source_file_with_chunk_policy(
+            RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "cursor",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &source_path,
+                db_links: &[],
+            },
+            1,
+            16,
+        )
+        .expect("capture first page-store snapshot");
+
+        let mut second_bytes = first_bytes.to_vec();
+        second_bytes[2] ^= 0x20;
+        second_bytes[50] ^= 0x20;
+        fs::write(&source_path, &second_bytes).expect("write sparse page-store mutation");
+        let second = capture_source_file_with_chunk_policy(
+            RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "cursor",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &source_path,
+                db_links: &[],
+            },
+            1,
+            16,
+        )
+        .expect("capture sparse page-store mutation");
+
+        let root = raw_mirror_root(&data_dir);
+        let first_storage = read_raw_mirror_manifest(&root.join(&first.manifest_relative_path))
+            .expect("first page-store manifest")
+            .content_storage
+            .expect("first page-store chunks");
+        let second_storage = read_raw_mirror_manifest(&root.join(&second.manifest_relative_path))
+            .expect("second page-store manifest")
+            .content_storage
+            .expect("second page-store chunks");
+        assert_eq!(first_storage.chunks.len(), 4);
+        assert_eq!(second_storage.chunks.len(), 4);
+        assert_ne!(first_storage.chunks[0], second_storage.chunks[0]);
+        assert_eq!(first_storage.chunks[1], second_storage.chunks[1]);
+        assert_eq!(first_storage.chunks[2], second_storage.chunks[2]);
+        assert_ne!(first_storage.chunks[3], second_storage.chunks[3]);
+        assert_eq!(
+            read_source_bytes(&data_dir, &second.manifest_id)
+                .expect("reconstruct sparse page-store mutation"),
+            second_bytes
+        );
+    }
+
+    #[test]
     fn blob_cache_does_not_cross_chunk_policy_boundaries() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
