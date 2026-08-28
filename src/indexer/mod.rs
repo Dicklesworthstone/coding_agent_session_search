@@ -2652,6 +2652,7 @@ fn nonresumable_pending_lexical_rebuild_state_for_db(
     Ok(Some(state))
 }
 
+#[cfg(test)]
 fn nonresumable_pending_lexical_rebuild_status_from_readonly_db(
     index_path: &Path,
     db_path: &Path,
@@ -2662,6 +2663,7 @@ fn nonresumable_pending_lexical_rebuild_status_from_readonly_db(
     confirm_nonresumable_pending_lexical_rebuild_state_from_readonly_db(&state, db_path)
 }
 
+#[cfg(test)]
 fn confirm_nonresumable_pending_lexical_rebuild_state_from_readonly_db(
     state: &LexicalRebuildState,
     db_path: &Path,

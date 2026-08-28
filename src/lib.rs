@@ -19476,9 +19476,7 @@ pub(crate) fn bounded_canonical_db_corruption_probe(
 
     let mut bundle_bytes = file_len;
     for suffix in ["-wal", "-shm"] {
-        let Some(sidecar_path) = doctor_sqlite_sidecar_path(db_path, suffix) else {
-            return None;
-        };
+        let sidecar_path = doctor_sqlite_sidecar_path(db_path, suffix)?;
         match std::fs::symlink_metadata(&sidecar_path) {
             Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
                 bundle_bytes = bundle_bytes.saturating_add(metadata.len());
@@ -43778,9 +43776,17 @@ fn doctor_raw_mirror_bounded_amplification_reports(
         inventory_truncated,
         ratio_warn_threshold_milli,
         excess_warn_threshold_bytes,
-        DOCTOR_RAW_MIRROR_BOUNDED_AMPLIFICATION_MANIFEST_LIMIT,
-        DOCTOR_RAW_MIRROR_BOUNDED_AMPLIFICATION_BYTE_LIMIT,
+        DoctorRawMirrorBoundedScanLimits {
+            manifest_count: DOCTOR_RAW_MIRROR_BOUNDED_AMPLIFICATION_MANIFEST_LIMIT,
+            byte_count: DOCTOR_RAW_MIRROR_BOUNDED_AMPLIFICATION_BYTE_LIMIT,
+        },
     )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DoctorRawMirrorBoundedScanLimits {
+    manifest_count: usize,
+    byte_count: u64,
 }
 
 fn doctor_raw_mirror_bounded_amplification_reports_with_limits(
@@ -43790,8 +43796,7 @@ fn doctor_raw_mirror_bounded_amplification_reports_with_limits(
     inventory_truncated: bool,
     ratio_warn_threshold_milli: u64,
     excess_warn_threshold_bytes: u64,
-    manifest_limit: usize,
-    byte_limit: u64,
+    limits: DoctorRawMirrorBoundedScanLimits,
 ) -> DoctorRawMirrorBoundedAmplificationScan {
     let mut versions = Vec::new();
     let mut scanned_manifest_count = 0_usize;
@@ -43813,7 +43818,9 @@ fn doctor_raw_mirror_bounded_amplification_reports_with_limits(
             truncated = true;
             break;
         };
-        if scanned_manifest_count >= manifest_limit || next_scanned_bytes > byte_limit {
+        if scanned_manifest_count >= limits.manifest_count
+            || next_scanned_bytes > limits.byte_count
+        {
             truncated = true;
             break;
         }
@@ -74568,8 +74575,10 @@ paths = ["~/.claude/projects"]
             false,
             2_000,
             1,
-            2,
-            u64::MAX,
+            DoctorRawMirrorBoundedScanLimits {
+                manifest_count: 2,
+                byte_count: u64::MAX,
+            },
         );
         assert_eq!(capped_scan.scanned_manifest_count, 2);
         assert!(capped_scan.truncated);

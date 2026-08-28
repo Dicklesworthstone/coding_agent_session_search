@@ -2879,7 +2879,7 @@ fn validate_raw_mirror_manifest_contents(
     manifest: &RawMirrorManifestFile,
     expected_manifest_id: &str,
 ) -> Result<Vec<RawMirrorChunkRef>> {
-    let expected_manifest_checksum = raw_mirror_manifest_blake3(&manifest);
+    let expected_manifest_checksum = raw_mirror_manifest_blake3(manifest);
     let expected_original_path_blake3 = raw_mirror_original_path_blake3(&manifest.original_path);
     let derived_manifest_id = raw_mirror_manifest_id(
         &manifest.provider,
