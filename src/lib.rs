@@ -42439,6 +42439,99 @@ const CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_BYTE_LIMIT: &str =
     "CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_BYTE_LIMIT";
 const DOCTOR_RAW_MIRROR_DEFAULT_FULL_VERIFY_MANIFEST_LIMIT: usize = 256;
 const DOCTOR_RAW_MIRROR_DEFAULT_FULL_VERIFY_BYTE_LIMIT: u64 = 512 * 1024 * 1024;
+/// ub29t (gh#374 issue 4): `cass doctor check --json` emitted 17MB on a live
+/// data dir, almost all of it per-manifest raw-mirror enumeration. By default
+/// the `manifests` array now keeps every problem manifest plus at most this
+/// many healthy ones; `--verbose` restores the full listing. Summary counts
+/// are always computed over the complete set.
+const DOCTOR_RAW_MIRROR_DEFAULT_LISTED_HEALTHY_MANIFESTS: usize = 64;
+
+/// Keep every item flagged by `is_problem` (in original order) and at most
+/// `healthy_cap` of the rest. Returns the kept items and how many healthy
+/// items were omitted. Pure, so the elision policy is unit-testable without
+/// building manifest reports.
+fn doctor_bound_healthy_listing<T>(
+    items: Vec<T>,
+    healthy_cap: usize,
+    is_problem: impl Fn(&T) -> bool,
+) -> (Vec<T>, usize) {
+    let mut kept = Vec::with_capacity(items.len().min(healthy_cap.saturating_add(16)));
+    let mut healthy_kept = 0usize;
+    let mut omitted = 0usize;
+    for item in items {
+        if is_problem(&item) {
+            kept.push(item);
+        } else if healthy_kept < healthy_cap {
+            healthy_kept += 1;
+            kept.push(item);
+        } else {
+            omitted += 1;
+        }
+    }
+    (kept, omitted)
+}
+
+fn doctor_raw_mirror_manifest_is_problem(manifest: &DoctorRawMirrorManifestReport) -> bool {
+    manifest.invalid_reason.is_some()
+        || manifest.status.as_str().cmp("verified").is_ne()
+        || manifest.upstream_path_exists.is_some_and(|exists| !exists)
+        || matches!(
+            manifest.blob_checksum_status,
+            DoctorArtifactChecksumStatus::Mismatched | DoctorArtifactChecksumStatus::Missing
+        )
+}
+
+/// Apply the ub29t bounded listing to a doctor raw-mirror report in place.
+/// `full` (from `--verbose`) keeps everything and only records the mode.
+fn doctor_apply_raw_mirror_listing_bound(report: &mut DoctorRawMirrorReport, full: bool) {
+    let total = report.manifests.len();
+    if full {
+        report.summary.listed_manifest_count = total;
+        report.summary.omitted_healthy_manifest_count = 0;
+        report.summary.listing_mode = "full";
+        return;
+    }
+    let manifests = std::mem::take(&mut report.manifests);
+    let (kept, omitted) = doctor_bound_healthy_listing(
+        manifests,
+        DOCTOR_RAW_MIRROR_DEFAULT_LISTED_HEALTHY_MANIFESTS,
+        doctor_raw_mirror_manifest_is_problem,
+    );
+    report.summary.listed_manifest_count = kept.len();
+    report.summary.omitted_healthy_manifest_count = omitted;
+    report.summary.listing_mode = "bounded";
+    report.manifests = kept;
+    if omitted > 0 {
+        report.notes.push(format!(
+            "manifests listing is bounded: {} of {total} manifests shown ({omitted} healthy manifests elided; every problem manifest is retained). Re-run with --verbose for the full listing.",
+            report.summary.listed_manifest_count
+        ));
+    }
+}
+
+#[cfg(test)]
+mod doctor_raw_mirror_listing_bound_tests {
+    use super::doctor_bound_healthy_listing;
+
+    #[test]
+    fn keeps_every_problem_and_caps_healthy_in_order() {
+        // odd numbers are "problems"; cap healthy (even) at 2.
+        let items: Vec<u32> = (1..=10).collect();
+        let (kept, omitted) = doctor_bound_healthy_listing(items, 2, |n| !n.is_multiple_of(2));
+        assert_eq!(kept, vec![1, 2, 3, 4, 5, 7, 9]);
+        assert_eq!(omitted, 3);
+    }
+
+    #[test]
+    fn small_sets_are_untouched_and_zero_cap_keeps_only_problems() {
+        let (kept, omitted) = doctor_bound_healthy_listing(vec![2u32, 4], 64, |n| !n.is_multiple_of(2));
+        assert_eq!(kept, vec![2, 4]);
+        assert_eq!(omitted, 0);
+        let (kept, omitted) = doctor_bound_healthy_listing(vec![1u32, 2, 4], 0, |n| !n.is_multiple_of(2));
+        assert_eq!(kept, vec![1]);
+        assert_eq!(omitted, 2);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DoctorRawMirrorVerificationMode {
@@ -42585,6 +42678,19 @@ struct DoctorRawMirrorSummary {
     amplified_source_referenced_bytes: u64,
     amplified_source_excess_bytes: u64,
     max_source_amplification_ratio_milli: Option<u64>,
+    /// ub29t (gh#374 issue 4): how many manifests the `manifests` array
+    /// actually carries. Equal to `manifest_count` under `--verbose` or when
+    /// the archive is small; smaller when healthy entries were elided.
+    #[serde(default)]
+    listed_manifest_count: usize,
+    /// Healthy (`verified`, upstream present, no invalid reason) manifests
+    /// elided from `manifests` by the bounded default listing. Problem
+    /// manifests are never elided.
+    #[serde(default)]
+    omitted_healthy_manifest_count: usize,
+    /// `"full"` or `"bounded"`.
+    #[serde(default)]
+    listing_mode: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -84834,6 +84940,9 @@ pub(crate) fn run_doctor_impl(
             "raw mirror backfill plan was evaluated without provider source mutation".to_string()
         }],
     );
+    // ub29t: bound the per-manifest listing (summary counts stay complete;
+    // problem manifests are never elided; --verbose restores everything).
+    doctor_apply_raw_mirror_listing_bound(&mut raw_mirror, verbose);
     let recovery_evidence_deferred_reason = archive_wide_collectors_deferred_reason
         .clone()
         .or_else(|| {
@@ -92442,7 +92551,10 @@ fn response_schema_doctor_raw_mirror() -> serde_json::Value {
                     "amplified_source_count": { "type": "integer" },
                     "amplified_source_referenced_bytes": { "type": "integer" },
                     "amplified_source_excess_bytes": { "type": "integer" },
-                    "max_source_amplification_ratio_milli": { "type": ["integer", "null"] }
+                    "max_source_amplification_ratio_milli": { "type": ["integer", "null"] },
+                    "listed_manifest_count": { "type": "integer" },
+                    "omitted_healthy_manifest_count": { "type": "integer" },
+                    "listing_mode": { "type": "string", "enum": ["full", "bounded"] }
                 }
             },
             "manifests": {
