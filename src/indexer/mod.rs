@@ -25343,7 +25343,108 @@ fn build_watch_roots(additional_scan_roots: Vec<ScanRoot>) -> Vec<(ConnectorKind
         }
     }
 
-    roots
+    coalesce_nested_watch_roots(roots)
+}
+
+/// txy4o: a connector's detection can return both a sessions directory and
+/// its parent (OMP does). Every root is watched recursively and every event
+/// is classified against every root, so one file change under the nested
+/// pair used to trigger the parse/capture/persist/lexical work twice. Keep,
+/// per (connector, origin, platform), only the shallowest root of each
+/// nested chain — the ancestor's recursive watch already covers the
+/// descendant, so coverage is unchanged — and drop exact duplicates.
+/// Roots for different connectors, origins, or platforms never coalesce.
+fn coalesce_nested_watch_roots(
+    roots: Vec<(ConnectorKind, ScanRoot)>,
+) -> Vec<(ConnectorKind, ScanRoot)> {
+    let same_family = |a: &(ConnectorKind, ScanRoot), b: &(ConnectorKind, ScanRoot)| {
+        a.0.cmp_key_eq(&b.0)
+            && a.1.origin.cmp_key_eq(&b.1.origin)
+            && a.1.platform.cmp_key_eq(&b.1.platform)
+    };
+    let mut kept: Vec<(ConnectorKind, ScanRoot)> = Vec::with_capacity(roots.len());
+    for candidate in roots {
+        // Covered by an already-kept ancestor (or an exact duplicate)?
+        if kept.iter().any(|existing| {
+            same_family(existing, &candidate) && candidate.1.path.starts_with(&existing.1.path)
+        }) {
+            continue;
+        }
+        // The candidate is an ancestor of previously kept roots: it replaces
+        // them so the shallowest root of the chain wins regardless of order.
+        kept.retain(|existing| {
+            !(same_family(existing, &candidate) && existing.1.path.starts_with(&candidate.1.path))
+        });
+        kept.push(candidate);
+    }
+    kept
+}
+
+/// Structural equality without `==` (kept `PartialEq`-based but explicit so
+/// the coalescing key is obvious at the call site).
+trait CmpKeyEq {
+    fn cmp_key_eq(&self, other: &Self) -> bool;
+}
+
+impl<T: PartialEq> CmpKeyEq for T {
+    fn cmp_key_eq(&self, other: &Self) -> bool {
+        self.eq(other)
+    }
+}
+
+#[cfg(test)]
+mod watch_root_coalescing_tests {
+    use super::{ConnectorKind, ScanRoot, coalesce_nested_watch_roots};
+    use std::path::PathBuf;
+
+    fn local(kind: ConnectorKind, path: &str) -> (ConnectorKind, ScanRoot) {
+        (kind, ScanRoot::local(PathBuf::from(path)))
+    }
+
+    #[test]
+    fn nested_roots_for_one_connector_collapse_to_the_shallowest() {
+        let roots = vec![
+            local(ConnectorKind::Omp, "/home/u/.omp/sessions"),
+            local(ConnectorKind::Omp, "/home/u/.omp"),
+            local(ConnectorKind::Omp, "/home/u/.omp/profiles/work/sessions"),
+            local(ConnectorKind::Omp, "/home/u/.omp"),
+        ];
+        let kept = coalesce_nested_watch_roots(roots);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].1.path, PathBuf::from("/home/u/.omp"));
+    }
+
+    #[test]
+    fn order_independent_and_siblings_survive() {
+        let kept = coalesce_nested_watch_roots(vec![
+            local(ConnectorKind::Omp, "/a/b"),
+            local(ConnectorKind::Omp, "/a/c"),
+            local(ConnectorKind::Omp, "/a/b/deep"),
+        ]);
+        let paths: Vec<_> = kept.iter().map(|(_, r)| r.path.clone()).collect();
+        assert_eq!(paths, vec![PathBuf::from("/a/b"), PathBuf::from("/a/c")]);
+    }
+
+    #[test]
+    fn different_connectors_never_coalesce() {
+        let kept = coalesce_nested_watch_roots(vec![
+            local(ConnectorKind::Omp, "/shared"),
+            local(ConnectorKind::PiAgent, "/shared/sessions"),
+            local(ConnectorKind::Codex, "/shared"),
+        ]);
+        assert_eq!(kept.len(), 3);
+    }
+
+    #[test]
+    fn prefix_only_names_are_not_ancestors() {
+        // `/a/b` is not an ancestor of `/a/bc`; Path::starts_with is
+        // component-wise, so both must survive.
+        let kept = coalesce_nested_watch_roots(vec![
+            local(ConnectorKind::Omp, "/a/b"),
+            local(ConnectorKind::Omp, "/a/bc"),
+        ]);
+        assert_eq!(kept.len(), 2);
+    }
 }
 
 impl ConnectorKind {
