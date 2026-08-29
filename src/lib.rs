@@ -9567,12 +9567,33 @@ fn load_lessons_evidence(path: &Path) -> CliResult<crate::lessons_extraction::Le
 struct GatheredLessonsSource<T> {
     accepted: Vec<T>,
     rejected: usize,
+    /// 98anf.1: read / missing / unreadable, separate from record validity.
+    status: crate::lessons_extraction::EvidenceSourceReadStatus,
 }
 
 /// Normalized repository evidence plus raw-free live-intake diagnostics.
 struct GatheredLessonsEvidence {
     evidence: crate::lessons_extraction::LessonsEvidence,
     rejected_records: crate::lessons_extraction::RejectedEvidenceRecords,
+    source_status: crate::lessons_extraction::EvidenceSourceStatus,
+}
+
+/// 98anf.1: read one live JSONL evidence source, classifying the outcome
+/// without carrying the path or the OS error text. Absent = `Missing`
+/// (optional evidence, never fatal); any other failure — permissions, I/O,
+/// invalid UTF-8 — is `Unreadable`, which marks the intake incomplete.
+fn read_lessons_evidence_source(
+    path: &Path,
+) -> (
+    Option<String>,
+    crate::lessons_extraction::EvidenceSourceReadStatus,
+) {
+    use crate::lessons_extraction::EvidenceSourceReadStatus as Status;
+    match std::fs::read_to_string(path) {
+        Ok(body) => (Some(body), Status::Read),
+        Err(err) if matches!(err.kind(), std::io::ErrorKind::NotFound) => (None, Status::Missing),
+        Err(_) => (None, Status::Unreadable),
+    }
 }
 
 /// Gather live lessons evidence from the local repository.
@@ -9637,6 +9658,10 @@ fn gather_repository_lessons_evidence(repo: &Path) -> GatheredLessonsEvidence {
             beads: beads.rejected,
             proofs: proofs.rejected,
         },
+        source_status: crate::lessons_extraction::EvidenceSourceStatus {
+            beads: beads.status,
+            proofs: proofs.status,
+        },
     }
 }
 
@@ -9657,12 +9682,14 @@ fn gather_closed_bead_evidence(
     let mut gathered = GatheredLessonsSource {
         accepted: Vec::new(),
         rejected: 0,
+        status: crate::lessons_extraction::EvidenceSourceReadStatus::Missing,
     };
-    // Source-read status is separate from record validity. Missing/unreadable
-    // sources remain fail-open here; coding_agent_session_search-98anf.1 tracks
-    // the bounded, raw-free status contract rather than miscounting an I/O
-    // failure as one malformed record.
-    let Ok(body) = std::fs::read_to_string(path) else {
+    // Source-read status is separate from record validity (98anf.1): an I/O
+    // failure is reported as the source's status, never miscounted as one
+    // malformed record. Missing/unreadable sources stay fail-open.
+    let (body, status) = read_lessons_evidence_source(path);
+    gathered.status = status;
+    let Some(body) = body else {
         return gathered;
     };
     for line in body.lines() {
@@ -9835,10 +9862,13 @@ fn gather_proof_evidence(
     let mut gathered = GatheredLessonsSource {
         accepted: Vec::new(),
         rejected: 0,
+        status: crate::lessons_extraction::EvidenceSourceReadStatus::Missing,
     };
-    // See coding_agent_session_search-98anf.1: read status must be modeled
-    // separately, so an I/O failure is not fabricated as one rejected record.
-    let Ok(body) = std::fs::read_to_string(path) else {
+    // 98anf.1: read status is modeled separately, so an I/O failure is never
+    // fabricated as one rejected record.
+    let (body, status) = read_lessons_evidence_source(path);
+    gathered.status = status;
+    let Some(body) = body else {
         return gathered;
     };
     for line in body.lines() {
@@ -9862,7 +9892,55 @@ fn gather_proof_evidence(
 
 #[cfg(test)]
 mod lessons_live_evidence_tests {
-    use super::{gather_closed_bead_evidence, gather_proof_evidence};
+    use super::{gather_closed_bead_evidence, gather_proof_evidence, read_lessons_evidence_source};
+
+    /// 98anf.1: source read status is classified without paths or OS
+    /// error text — absent = missing (nonfatal), everything else unreadable.
+    #[test]
+    fn evidence_source_reader_classifies_missing_unreadable_and_read() {
+        use crate::lessons_extraction::EvidenceSourceReadStatus as Status;
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let (body, status) = read_lessons_evidence_source(&dir.path().join("absent.jsonl"));
+        assert!(body.is_none());
+        assert!(matches!(status, Status::Missing));
+
+        let invalid = dir.path().join("invalid-utf8.jsonl");
+        std::fs::write(&invalid, [0xff_u8, 0xfe, b'{', b'}']).expect("write invalid utf-8");
+        let (body, status) = read_lessons_evidence_source(&invalid);
+        assert!(body.is_none());
+        assert!(matches!(status, Status::Unreadable));
+        let gathered = gather_closed_bead_evidence(&invalid);
+        assert!(matches!(gathered.status, Status::Unreadable));
+        assert!(
+            gathered.rejected.cmp(&0).is_eq(),
+            "unreadable is not a rejected record"
+        );
+
+        let readable = dir.path().join("empty.jsonl");
+        std::fs::write(&readable, "").expect("write empty");
+        let (body, status) = read_lessons_evidence_source(&readable);
+        assert!(body.is_some());
+        assert!(matches!(status, Status::Read));
+        let gathered = gather_proof_evidence(&readable);
+        assert!(matches!(gathered.status, Status::Read));
+        assert!(gathered.accepted.is_empty());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = dir.path().join("locked.jsonl");
+            std::fs::write(&locked, "{}\n").expect("write locked");
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+                .expect("chmod 000");
+            let (_, status) = read_lessons_evidence_source(&locked);
+            // Root can read anything; only assert when the OS enforces it.
+            if std::fs::read_to_string(&locked).is_err() {
+                assert!(matches!(status, Status::Unreadable));
+            }
+            let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600));
+        }
+    }
 
     #[test]
     fn bead_gatherer_separates_accepted_ignored_and_rejected_lines()
@@ -9995,19 +10073,27 @@ fn build_lessons_state(
     &'static str,
 )> {
     let evidence_path = resolve_lessons_fixture_path(fixture, fixture_dir, fixture_id)?;
-    let (evidence, rejected_records, mode) = match evidence_path {
+    let (evidence, rejected_records, source_status, mode) = match evidence_path {
         Some(path) => (
             load_lessons_evidence(&path)?,
             crate::lessons_extraction::RejectedEvidenceRecords::default(),
+            crate::lessons_extraction::EvidenceSourceStatus::fixture(),
             "fixture",
         ),
         None => {
             let gathered = gather_live_lessons_evidence();
-            (gathered.evidence, gathered.rejected_records, "live")
+            (
+                gathered.evidence,
+                gathered.rejected_records,
+                gathered.source_status,
+                "live",
+            )
         }
     };
     let mut extraction = crate::lessons_extraction::extract(&evidence);
     extraction.manifest.rejected_records = rejected_records;
+    extraction.manifest.source_status = source_status;
+    extraction.manifest.intake_complete = source_status.intake_complete();
     let graph = crate::lessons::LessonGraph::build(extraction.candidates);
     Ok((graph, extraction.manifest, mode))
 }
@@ -10062,6 +10148,15 @@ fn warn_rejected_lessons_evidence(manifest: &crate::lessons_extraction::Extracti
         eprintln!(
             "Warning: lessons evidence is partial; skipped {total} malformed record(s) (Beads: {}, proofs: {}).",
             rejected.beads, rejected.proofs
+        );
+    }
+    // 98anf.1: an unreadable source is a different, stronger signal than
+    // malformed records — nothing from it was consulted at all.
+    let unreadable = manifest.source_status.unreadable_sources();
+    if !unreadable.is_empty() {
+        eprintln!(
+            "Warning: lessons intake is incomplete; evidence source(s) unreadable: {}.",
+            unreadable.join(", ")
         );
     }
 }

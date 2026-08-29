@@ -481,6 +481,68 @@ impl RejectedEvidenceRecords {
     }
 }
 
+/// 98anf.1: how one live evidence source was read. Rejected-record counts
+/// only describe malformed lines inside a *successfully decoded* source, so
+/// they can never stand in for source completeness: a missing, unreadable,
+/// or invalid-UTF-8 source used to look identical to a readable empty one.
+/// Raw paths and OS error strings are deliberately not carried.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceSourceReadStatus {
+    /// The source file was opened and decoded as UTF-8 (possibly empty).
+    Read,
+    /// The source file does not exist. Optional evidence; never fatal.
+    #[default]
+    Missing,
+    /// The source exists but could not be read or decoded (permissions,
+    /// I/O failure, invalid UTF-8). The intake is incomplete.
+    Unreadable,
+    /// Fixture mode: evidence came from an explicit fixture file, so the
+    /// live sources were intentionally not consulted.
+    Fixture,
+}
+
+/// Per-source read status for the live intake.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceSourceStatus {
+    /// `.beads/issues.jsonl` (closed Beads).
+    pub beads: EvidenceSourceReadStatus,
+    /// `.cass/proofs/proof-manifest.jsonl` (proof runs).
+    pub proofs: EvidenceSourceReadStatus,
+}
+
+impl EvidenceSourceStatus {
+    /// Fixture-mode status for both sources.
+    #[must_use]
+    pub const fn fixture() -> Self {
+        Self {
+            beads: EvidenceSourceReadStatus::Fixture,
+            proofs: EvidenceSourceReadStatus::Fixture,
+        }
+    }
+
+    /// True when no source was unreadable. A missing source is complete
+    /// (there was nothing to read); an unreadable one is not.
+    #[must_use]
+    pub fn intake_complete(&self) -> bool {
+        !matches!(self.beads, EvidenceSourceReadStatus::Unreadable)
+            && !matches!(self.proofs, EvidenceSourceReadStatus::Unreadable)
+    }
+
+    /// Bounded, raw-free labels of the unreadable sources.
+    #[must_use]
+    pub fn unreadable_sources(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if matches!(self.beads, EvidenceSourceReadStatus::Unreadable) {
+            out.push("beads");
+        }
+        if matches!(self.proofs, EvidenceSourceReadStatus::Unreadable) {
+            out.push("proofs");
+        }
+        out
+    }
+}
+
 /// An auditable summary of one extraction pass.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtractionManifest {
@@ -499,6 +561,15 @@ pub struct ExtractionManifest {
     /// A non-zero count means the resulting lesson set is partial. Fixture
     /// inputs use zero because malformed fixture JSON fails before extraction.
     pub rejected_records: RejectedEvidenceRecords,
+    /// 98anf.1: per-source read status of the live intake (fixture mode is
+    /// explicit). Zero rejected records with an `unreadable` source is NOT a
+    /// complete intake.
+    #[serde(default)]
+    pub source_status: EvidenceSourceStatus,
+    /// Whether every consulted source was readable (`false` iff any source
+    /// is `unreadable`).
+    #[serde(default)]
+    pub intake_complete: bool,
     /// Candidates emitted (before dedup in the graph).
     pub candidates_emitted: usize,
     /// Candidate count by [`LessonKind`] wire label (deterministic order).
@@ -660,6 +731,8 @@ pub fn extract(evidence: &LessonsEvidence) -> ExtractionResult {
         beads_scanned: evidence.beads.len(),
         proofs_scanned: evidence.proofs.len(),
         rejected_records: RejectedEvidenceRecords::default(),
+        source_status: EvidenceSourceStatus::default(),
+        intake_complete: true,
         candidates_emitted: candidates.len(),
         by_kind,
         redaction,

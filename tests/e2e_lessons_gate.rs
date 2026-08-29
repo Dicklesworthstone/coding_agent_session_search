@@ -248,6 +248,86 @@ fn seed_live_lessons_repo() -> Result<TempDir, String> {
     Ok(repo)
 }
 
+fn leak_msg(label: &str, what: &str) -> String {
+    format!("{label} leaked {what}")
+}
+
+fn bool_at(v: &Value, ptr: &str) -> Option<bool> {
+    v.pointer(ptr).and_then(Value::as_bool)
+}
+
+/// 98anf.1: a missing source is `missing` (nonfatal, intake complete); an
+/// unreadable one (invalid UTF-8, or permission-denied where the OS enforces
+/// it) is `unreadable`, the intake is incomplete, the rejected-record counts
+/// stay zero, and no path or OS error text leaks into stdout/stderr.
+#[test]
+fn live_mode_distinguishes_missing_and_unreadable_sources() -> Result<(), String> {
+    let repo = seed_live_lessons_repo()?;
+    let beads_path = repo.path().join(".beads/issues.jsonl");
+    let proofs_path = repo.path().join(".cass/proofs/proof-manifest.jsonl");
+    let mut failures = Vec::new();
+
+    // Invalid UTF-8 Beads source; proof manifest moved aside => missing.
+    std::fs::write(&beads_path, [0xff_u8, 0xfe, b'{', b'}', b'\n'])
+        .map_err(|e| format!("write invalid utf-8 beads fixture: {e}"))?;
+    let parked_manifest = repo.path().join(".cass/proofs/proof-manifest.jsonl.parked");
+    std::fs::rename(&proofs_path, &parked_manifest)
+        .map_err(|e| format!("park proof manifest: {e}"))?;
+    let (v, raw, stderr) = run_live_lessons(repo.path(), &["list", "--status", "all"])?;
+    if str_at(&v, "/manifest/source_status/beads") != Some("unreadable") {
+        failures.push(format!(
+            "invalid utf-8 beads source should be unreadable: {:?}",
+            str_at(&v, "/manifest/source_status/beads")
+        ));
+    }
+    if str_at(&v, "/manifest/source_status/proofs") != Some("missing") {
+        failures.push(format!(
+            "absent proof manifest should be missing: {:?}",
+            str_at(&v, "/manifest/source_status/proofs")
+        ));
+    }
+    if bool_at(&v, "/manifest/intake_complete") != Some(false) {
+        failures.push("an unreadable source must not report a complete intake".to_string());
+    }
+    if u64_at(&v, "/manifest/rejected_records/beads") != Some(0) {
+        failures.push("an unreadable source must not be counted as rejected records".to_string());
+    }
+    if !stderr.contains("evidence source(s) unreadable: beads") {
+        failures.push(format!(
+            "stderr omitted the bounded unreadable-source warning: {}",
+            head(&stderr)
+        ));
+    }
+    let repo_str = repo.path().to_string_lossy().into_owned();
+    for (label, text) in [("stdout", &raw), ("stderr", &stderr)] {
+        if text.contains(&repo_str) || text.contains("issues.jsonl") {
+            failures.push(leak_msg(label, "a source path"));
+        }
+        if text.contains("os error") || text.contains("stream did not contain valid UTF-8") {
+            failures.push(leak_msg(label, "an OS/decoder error string"));
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&beads_path, "{}\n").map_err(|e| format!("rewrite beads: {e}"))?;
+        std::fs::set_permissions(&beads_path, std::fs::Permissions::from_mode(0o000))
+            .map_err(|e| format!("chmod 000: {e}"))?;
+        let enforced = std::fs::read_to_string(&beads_path).is_err();
+        let outcome = run_live_lessons(repo.path(), &["list", "--status", "all"]);
+        let _ = std::fs::set_permissions(&beads_path, std::fs::Permissions::from_mode(0o600));
+        let (v, _, _) = outcome?;
+        if enforced && str_at(&v, "/manifest/source_status/beads") != Some("unreadable") {
+            failures.push(format!(
+                "permission-denied beads source should be unreadable: {:?}",
+                str_at(&v, "/manifest/source_status/beads")
+            ));
+        }
+    }
+    finish(failures)
+}
+
 fn head(s: &str) -> String {
     s.chars().take(400).collect()
 }
@@ -581,6 +661,13 @@ fn view_round_trips_a_lesson_id() -> Result<(), String> {
     {
         failures.push("fixture view omitted or corrupted its extraction manifest".to_string());
     }
+    // 98anf.1: fixture mode is explicit — live sources were not consulted.
+    if str_at(&view, "/manifest/source_status/beads") != Some("fixture")
+        || str_at(&view, "/manifest/source_status/proofs") != Some("fixture")
+        || bool_at(&view, "/manifest/intake_complete") != Some(true)
+    {
+        failures.push("fixture manifest did not report explicit fixture source status".to_string());
+    }
 
     // A bogus id is a clean not-found, not a crash or stdout pollution.
     let (missing, _r3, _e3) = run_lessons(&["view", "lsn-deadbeefdeadbeef"])?;
@@ -636,6 +723,19 @@ fn live_mode_mines_repository_metadata_without_raw_leakage() -> Result<(), Strin
         failures.push(format!(
             "live stderr omitted bounded malformed-evidence warning: {}",
             head(&stderr)
+        ));
+    }
+    // 98anf.1: both live sources were read; rejected records inside a read
+    // source still leave the intake complete.
+    if str_at(&v, "/manifest/source_status/beads") != Some("read")
+        || str_at(&v, "/manifest/source_status/proofs") != Some("read")
+        || bool_at(&v, "/manifest/intake_complete") != Some(true)
+    {
+        failures.push(format!(
+            "live manifest source status drifted: {:?}/{:?} complete={:?}",
+            str_at(&v, "/manifest/source_status/beads"),
+            str_at(&v, "/manifest/source_status/proofs"),
+            bool_at(&v, "/manifest/intake_complete")
         ));
     }
     let lessons = lessons_array(&v);
