@@ -342,7 +342,14 @@ impl PagesConfig {
         self.deployment.target.trim().to_ascii_lowercase()
     }
 
+    /// 019i2: `bundle.hide_metadata` promises hidden workspace paths and
+    /// file names, so it forces the obfuscating `hash` policy on the
+    /// non-wizard path too (the wizard already maps it to `PathMode::Hash`).
+    /// With `hide_metadata` off, the configured `path_mode` stays explicit.
     fn resolved_path_mode(&self) -> String {
+        if self.bundle.hide_metadata {
+            return "hash".to_string();
+        }
         self.normalized_path_mode()
             .unwrap_or_else(|| DEFAULT_PATH_MODE.to_string())
     }
@@ -687,10 +694,10 @@ impl PagesConfig {
 
     /// Parse path mode from config.
     pub fn path_mode(&self) -> PathMode {
-        match self.normalized_path_mode().as_deref() {
-            Some("basename") => PathMode::Basename,
-            Some("full") => PathMode::Full,
-            Some("hash") => PathMode::Hash,
+        match self.resolved_path_mode().as_str() {
+            "basename" => PathMode::Basename,
+            "full" => PathMode::Full,
+            "hash" => PathMode::Hash,
             _ => PathMode::Relative,
         }
     }
@@ -998,6 +1005,20 @@ mod tests {
                 .iter()
                 .any(|e| e.contains("account_id") && e.contains("empty"))
         );
+    }
+
+    /// 019i2: hide_metadata forces the obfuscating hash policy regardless of
+    /// the configured path_mode; with it off, path_mode stays explicit.
+    #[test]
+    fn hide_metadata_forces_hash_path_mode() {
+        let mut config = PagesConfig::default();
+        config.filters.path_mode = Some("full".to_string());
+        config.bundle.hide_metadata = false;
+        assert!(matches!(config.path_mode(), PathMode::Full));
+        config.bundle.hide_metadata = true;
+        assert!(matches!(config.path_mode(), PathMode::Hash));
+        config.filters.path_mode = None;
+        assert!(matches!(config.path_mode(), PathMode::Hash));
     }
 
     #[test]

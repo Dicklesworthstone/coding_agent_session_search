@@ -81,7 +81,59 @@ mod tests {
              VALUES (2, 0, 'user', 'rust code', 1700000000000)",
         )?;
 
+        // 019i2: a snippet carrying an exact local code-file path sentinel.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE snippets (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                file_path TEXT,
+                start_line INTEGER,
+                end_line INTEGER,
+                language TEXT,
+                snippet_text TEXT NOT NULL
+            );
+            "#,
+        )?;
+        conn.execute(
+            "INSERT INTO snippets (message_id, file_path, start_line, end_line, language, snippet_text)
+             VALUES (1, '/home/user/proj1/src/secret_module_sentinel.rs', 1, 3, 'rust', 'fn main() {}')",
+        )?;
+
         Ok(())
+    }
+
+    /// Every cell of every user table in the export, cast to text and
+    /// concatenated — the haystack for "no exact path survives anywhere".
+    fn all_text_cells(conn: &Connection) -> Result<String> {
+        let tables: Vec<String> = conn.query_map_collect(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            &[],
+            |row: &FrankenRow| row.get_typed(0),
+        )?;
+        let mut haystack = String::new();
+        for table in tables {
+            if table.contains("_fts") {
+                continue;
+            }
+            let columns: Vec<String> = conn.query_map_collect(
+                &format!("PRAGMA table_info(\"{table}\")"),
+                &[],
+                |row: &FrankenRow| row.get_typed(1),
+            )?;
+            for column in columns {
+                let cells: Vec<Option<String>> = conn.query_map_collect(
+                    &format!("SELECT CAST(\"{column}\" AS TEXT) FROM \"{table}\""),
+                    &[],
+                    |row: &FrankenRow| row.get_typed(0),
+                )?;
+                for cell in cells.into_iter().flatten() {
+                    haystack.push_str(&cell);
+                    haystack.push('\n');
+                }
+            }
+        }
+        Ok(haystack)
     }
 
     fn open_franken_db(path: &Path) -> Result<Connection> {
@@ -336,6 +388,114 @@ mod tests {
         assert_eq!(path.len(), 16); // 16 chars hex
         assert_ne!(path, "/home/user/proj1/.claude/1.json");
 
+        Ok(())
+    }
+
+    /// 019i2: `hide_metadata` (= `PathMode::Hash`) must hide EVERY exported
+    /// path-bearing field — workspace and snippet file paths, not only
+    /// `conversations.source_path` — while keeping workspace joins stable.
+    #[test]
+    fn hash_mode_hides_workspace_and_snippet_paths_everywhere() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let source_path = temp_dir.path().join("source.db");
+        let output_path = temp_dir.path().join("export.db");
+        setup_source_db(&source_path)?;
+
+        let filter = ExportFilter {
+            agents: None,
+            workspaces: None,
+            since: None,
+            until: None,
+            path_mode: PathMode::Hash,
+        };
+        ExportEngine::new(&source_path, &output_path, filter).execute(|_, _| {}, None)?;
+
+        let conn = open_franken_db(&output_path)?;
+        let haystack = all_text_cells(&conn)?;
+        for sentinel in [
+            "/home/user/proj1",
+            "/home/user/proj2",
+            "secret_module_sentinel",
+            ".claude/1.json",
+            ".codex/session.json",
+        ] {
+            assert!(
+                !haystack.contains(sentinel),
+                "exact path fragment {sentinel:?} survived a hash-mode export:\n{haystack}"
+            );
+        }
+        let workspace = query_string(&conn, "SELECT workspace FROM conversations WHERE id=1")?;
+        assert_eq!(workspace.len(), 16, "workspace should be a 16-hex digest");
+        let snippet_path =
+            query_string(&conn, "SELECT file_path FROM snippets WHERE message_id=1")?;
+        assert_eq!(
+            snippet_path.len(),
+            16,
+            "snippet file_path should be a 16-hex digest"
+        );
+        let policy = query_string(&conn, "SELECT value FROM export_meta WHERE key='path_mode'")?;
+        assert_eq!(policy, "hash");
+        Ok(())
+    }
+
+    /// The explicit modes keep their documented behaviour: `Full` leaves
+    /// workspace and snippet paths verbatim; `Relative` strips the workspace
+    /// prefix from snippet paths but keeps the workspace itself.
+    #[test]
+    fn explicit_path_modes_keep_workspace_and_snippet_semantics() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let source_path = temp_dir.path().join("source.db");
+        setup_source_db(&source_path)?;
+
+        let full_out = temp_dir.path().join("full.db");
+        ExportEngine::new(
+            &source_path,
+            &full_out,
+            ExportFilter {
+                agents: None,
+                workspaces: None,
+                since: None,
+                until: None,
+                path_mode: PathMode::Full,
+            },
+        )
+        .execute(|_, _| {}, None)?;
+        let conn = open_franken_db(&full_out)?;
+        assert_eq!(
+            query_string(&conn, "SELECT workspace FROM conversations WHERE id=1")?,
+            "/home/user/proj1"
+        );
+        assert_eq!(
+            query_string(&conn, "SELECT file_path FROM snippets WHERE message_id=1")?,
+            "/home/user/proj1/src/secret_module_sentinel.rs"
+        );
+        assert_eq!(
+            query_string(&conn, "SELECT value FROM export_meta WHERE key='path_mode'")?,
+            "full"
+        );
+
+        let rel_out = temp_dir.path().join("relative.db");
+        ExportEngine::new(
+            &source_path,
+            &rel_out,
+            ExportFilter {
+                agents: None,
+                workspaces: None,
+                since: None,
+                until: None,
+                path_mode: PathMode::Relative,
+            },
+        )
+        .execute(|_, _| {}, None)?;
+        let conn = open_franken_db(&rel_out)?;
+        assert_eq!(
+            query_string(&conn, "SELECT workspace FROM conversations WHERE id=1")?,
+            "/home/user/proj1"
+        );
+        assert_eq!(
+            query_string(&conn, "SELECT file_path FROM snippets WHERE message_id=1")?,
+            "src/secret_module_sentinel.rs"
+        );
         Ok(())
     }
 

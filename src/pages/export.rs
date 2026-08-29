@@ -388,6 +388,11 @@ impl ExportEngine {
 
                     // Transform Path
                     let transformed_path = self.transform_path(source_path, workspace);
+                    // 019i2: the workspace is a path too. Under the
+                    // obfuscating modes (hash/basename) it must not survive
+                    // verbatim — a "hidden metadata" bundle previously kept
+                    // every exact local workspace path here.
+                    let transformed_workspace = self.transform_workspace(workspace);
 
                     tx.execute_compat(
                     "INSERT INTO conversations (id, agent, workspace, title, source_path, started_at, ended_at, message_count, metadata_json)
@@ -395,7 +400,7 @@ impl ExportEngine {
                     params![
                         *id,
                         agent.as_str(),
-                        workspace.as_deref(),
+                        transformed_workspace.as_deref(),
                         title.as_deref(),
                         transformed_path.as_str(),
                         *started_at,
@@ -488,6 +493,12 @@ impl ExportEngine {
                         };
 
                         for (fpath, start, end, lang, stext) in snip_rows {
+                            // 019i2: snippet file paths follow the same path
+                            // policy as source paths (relative strips the
+                            // workspace; hash/basename obfuscate).
+                            let fpath = fpath
+                                .as_deref()
+                                .map(|path| self.transform_path(path, workspace));
                             tx.execute_compat(
                                 "INSERT INTO snippets (message_id, file_path, start_line, end_line, language, snippet_text)
                                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -504,6 +515,12 @@ impl ExportEngine {
 
                 // Metadata
                 tx.execute("INSERT INTO export_meta (key, value) VALUES ('schema_version', '1')")?;
+                // 019i2: record the realized path policy so verify/summary
+                // surfaces can report what the bundle actually contains.
+                tx.execute_compat(
+                    "INSERT INTO export_meta (key, value) VALUES ('path_mode', ?1)",
+                    params![self.filter.path_mode.as_meta_str()],
+                )?;
                 let exported_at = Utc::now().to_rfc3339();
                 tx.execute_compat(
                     "INSERT INTO export_meta (key, value) VALUES ('exported_at', ?1)",
@@ -629,6 +646,22 @@ impl ExportEngine {
         }
     }
 
+    /// 019i2: workspace paths under the obfuscating modes. `Relative` and
+    /// `Full` keep the workspace verbatim (relative source paths are only
+    /// meaningful against it); `Basename` keeps the last component; `Hash`
+    /// keeps a stable 16-hex digest so per-workspace grouping still joins.
+    fn transform_workspace(&self, workspace: &Option<String>) -> Option<String> {
+        let ws = workspace.as_deref()?;
+        Some(match self.filter.path_mode {
+            PathMode::Relative | PathMode::Full => ws.to_string(),
+            PathMode::Basename => Path::new(ws)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| ws.to_string()),
+            PathMode::Hash => hash_path16(ws),
+        })
+    }
+
     fn transform_path(&self, path: &str, workspace: &Option<String>) -> String {
         match self.filter.path_mode {
             PathMode::Relative => {
@@ -649,13 +682,29 @@ impl ExportEngine {
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| path.to_string()),
             PathMode::Full => path.to_string(),
-            PathMode::Hash => {
-                let mut hasher = Sha256::new();
-                hasher.update(path.as_bytes());
-                // sha2 ≥ 0.11 dropped `LowerHex` on the digest output;
-                // `hex::encode` gives the same lowercase-hex string.
-                hex::encode(hasher.finalize())[..16].to_string()
-            }
+            PathMode::Hash => hash_path16(path),
+        }
+    }
+}
+
+/// Stable 16-hex-char SHA-256 prefix used by `PathMode::Hash` for every
+/// exported path-bearing field (source, workspace, snippet).
+fn hash_path16(path: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(path.as_bytes());
+    // sha2 ≥ 0.11 dropped `LowerHex` on the digest output;
+    // `hex::encode` gives the same lowercase-hex string.
+    hex::encode(hasher.finalize())[..16].to_string()
+}
+
+impl PathMode {
+    /// Stable lowercase name recorded in `export_meta.path_mode`.
+    pub fn as_meta_str(self) -> &'static str {
+        match self {
+            PathMode::Relative => "relative",
+            PathMode::Basename => "basename",
+            PathMode::Full => "full",
+            PathMode::Hash => "hash",
         }
     }
 }
