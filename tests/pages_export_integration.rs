@@ -362,6 +362,65 @@ fn export_engine_exports_all_conversations_with_no_filter() {
     assert_eq!(msg_count, 14);
 }
 
+/// gz8xg: a successful publish must leave nothing of the staged candidate
+/// behind — including fsqlite's `-fsqlite-ns-gate` / `-fsqlite-ns-use`
+/// identity records stamped beside the `VACUUM INTO` target — on both the
+/// first publication and a re-publish over an existing output.
+#[test]
+fn export_engine_publish_leaves_no_staged_candidate_litter() {
+    fn staged_litter(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".export.db.tmp."))
+            .collect();
+        names.sort();
+        names
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let source_path = tmp.path().join("source.db");
+    let output_path = tmp.path().join("export.db");
+    let src_conn = open_db(&source_path).unwrap();
+    create_source_db(&src_conn).unwrap();
+    insert_test_data(&src_conn).unwrap();
+    drop(src_conn);
+    let filter = || ExportFilter {
+        agents: None,
+        workspaces: None,
+        since: None,
+        until: None,
+        path_mode: PathMode::Full,
+    };
+
+    ExportEngine::new(&source_path, &output_path, filter())
+        .execute(|_, _| {}, None)
+        .unwrap();
+    assert!(output_path.is_file());
+    let after_first = staged_litter(tmp.path());
+    assert!(
+        after_first.is_empty(),
+        "first publish left staged-candidate entries: {after_first:?}"
+    );
+
+    // Re-publish over the existing output (the park-prior / backup path).
+    ExportEngine::new(&source_path, &output_path, filter())
+        .execute(|_, _| {}, None)
+        .unwrap();
+    assert!(output_path.is_file());
+    let after_second = staged_litter(tmp.path());
+    assert!(
+        after_second.is_empty(),
+        "re-publish left staged-candidate entries: {after_second:?}"
+    );
+    let out_conn = open_db(&output_path).unwrap();
+    assert_eq!(
+        query_i64(&out_conn, "SELECT COUNT(*) FROM conversations").unwrap(),
+        4
+    );
+}
+
 #[test]
 fn export_engine_filters_by_single_agent() {
     let tmp = TempDir::new().unwrap();

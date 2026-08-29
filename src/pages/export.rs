@@ -1833,6 +1833,19 @@ fn cleanup_sqlite_sidecars(artifacts: Vec<PathBuf>) -> Result<()> {
     first_error.map_or(Ok(()), Err)
 }
 
+/// gz8xg: fsqlite stamps two zero-content namespace identity records
+/// (`-fsqlite-ns-gate` / `-fsqlite-ns-use`) beside every `VACUUM INTO`
+/// target. Once the staged candidate has been renamed onto the destination
+/// its main file is gone, so those two records would otherwise remain as
+/// unpredictable-named litter in the output directory. Remove exactly that
+/// pair, tolerating absence (older engines may not stamp them).
+fn cleanup_candidate_namespace_identity_records(temp_path: &Path) -> Result<()> {
+    cleanup_sqlite_sidecars(vec![
+        super::sqlite_sidecar_path(temp_path, "-fsqlite-ns-gate"),
+        super::sqlite_sidecar_path(temp_path, "-fsqlite-ns-use"),
+    ])
+}
+
 fn finalize_staged_sqlite_sidecars(path: &Path) -> Result<()> {
     // The publishable path is a VACUUM INTO image and is never opened through
     // a read-write FrankenSQLite connection. It therefore owns no companion
@@ -2332,6 +2345,7 @@ fn replace_file_from_temp_via_backup(
                     backup_path.display()
                 )
             })?;
+            cleanup_candidate_namespace_identity_records(temp_path)?;
             remove_prior_export_backup_after_publish(
                 &backup_path,
                 final_path,
@@ -2579,6 +2593,7 @@ fn replace_file_from_temp(
                 final_path.display()
             )
         })?;
+        cleanup_candidate_namespace_identity_records(temp_path)?;
         bail!(
             "new Pages export is live at {}, but Windows std cannot prove durable directory-entry publication; no prior generation existed to retain",
             final_path.display()
@@ -2611,7 +2626,8 @@ fn replace_file_from_temp(
                 "new Pages export is live at {}, but its publication could not be durably synced",
                 final_path.display()
             )
-        })
+        })?;
+        cleanup_candidate_namespace_identity_records(temp_path)
     }
 }
 
