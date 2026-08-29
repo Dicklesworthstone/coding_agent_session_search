@@ -254,10 +254,112 @@ type SqliteFtsMessageRow = (
     Option<String>,
     Option<String>,
 );
+/// 1t79z: how one scan term part matches a normalized haystack token. The
+/// primary lexical index supports suffix/substring/complex wildcards through
+/// regex expansion, so the SQLite-only scan lane must honour the same
+/// patterns on token boundaries instead of returning a false-empty result.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SqliteMessageScanTermMatch {
+    Exact,
+    Prefix,
+    Suffix,
+    Substring,
+    /// Interior wildcards (`f*o*bar`): the lowercased pattern with stars kept.
+    Complex(String),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct SqliteMessageScanTermPart {
     text: String,
-    prefix: bool,
+    matcher: SqliteMessageScanTermMatch,
+}
+
+impl SqliteMessageScanTermPart {
+    /// Classify one wildcard-preserving term part (see
+    /// `normalize_wildcard_term_parts`). Returns `None` for a bare `*`.
+    fn parse(part: &str) -> Option<Self> {
+        let (text, matcher) = match FsCassWildcardPattern::parse(part) {
+            FsCassWildcardPattern::Exact(core) => (core, SqliteMessageScanTermMatch::Exact),
+            FsCassWildcardPattern::Prefix(core) => (core, SqliteMessageScanTermMatch::Prefix),
+            FsCassWildcardPattern::Suffix(core) => (core, SqliteMessageScanTermMatch::Suffix),
+            FsCassWildcardPattern::Substring(core) => (core, SqliteMessageScanTermMatch::Substring),
+            FsCassWildcardPattern::Complex(full) => (
+                full.trim_matches('*').to_string(),
+                SqliteMessageScanTermMatch::Complex(full),
+            ),
+        };
+        (!text.is_empty()).then_some(Self { text, matcher })
+    }
+
+    fn matches_token(&self, token: &str) -> bool {
+        match &self.matcher {
+            SqliteMessageScanTermMatch::Exact => token.cmp(self.text.as_str()).is_eq(),
+            SqliteMessageScanTermMatch::Prefix => token.starts_with(self.text.as_str()),
+            SqliteMessageScanTermMatch::Suffix => token.ends_with(self.text.as_str()),
+            SqliteMessageScanTermMatch::Substring => token.contains(self.text.as_str()),
+            SqliteMessageScanTermMatch::Complex(pattern) => glob_token_matches(pattern, token),
+        }
+    }
+}
+
+/// Match a lowercased glob (`*` = any run of characters, including empty)
+/// against one whole token. Anchored at both ends unless the pattern itself
+/// starts/ends with `*`.
+fn glob_token_matches(pattern: &str, token: &str) -> bool {
+    let anchored_start = !pattern.starts_with('*');
+    let anchored_end = !pattern.ends_with('*');
+    let pieces: Vec<&str> = pattern
+        .split('*')
+        .filter(|piece| !piece.is_empty())
+        .collect();
+    if pieces.is_empty() {
+        return true;
+    }
+    let mut rest = token;
+    let last = pieces.len() - 1;
+    for (idx, piece) in pieces.iter().enumerate() {
+        if matches!(idx, 0) && anchored_start {
+            if !rest.starts_with(piece) {
+                return false;
+            }
+            rest = &rest[piece.len()..];
+            if idx.cmp(&last).is_eq() && anchored_end {
+                return rest.is_empty();
+            }
+            continue;
+        }
+        if idx.cmp(&last).is_eq() && anchored_end {
+            return rest.ends_with(piece);
+        }
+        let Some(at) = rest.find(piece) else {
+            return false;
+        };
+        rest = &rest[at + piece.len()..];
+    }
+    true
+}
+
+/// Like `normalize_term_parts`, but keeps every `*` inside a token so leading
+/// and interior wildcards survive for the scan lane (the FTS5 transpiler only
+/// tolerates a trailing star).
+fn normalize_wildcard_term_parts(raw: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    for token in nfc_sanitize_query(raw).split_whitespace() {
+        let mut current = String::new();
+        for ch in token.chars() {
+            if ch.is_alphanumeric() || matches!(ch, '_' | '*') {
+                current.push(ch);
+                continue;
+            }
+            if !current.is_empty() {
+                parts.push(std::mem::take(&mut current));
+            }
+        }
+        if !current.is_empty() {
+            parts.push(current);
+        }
+    }
+    parts
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -4272,17 +4374,12 @@ impl SearchClient {
             return Ok(Vec::new());
         }
 
-        // Skip SQLite fallback when the query contains leading/internal wildcards that
-        // FTS5 cannot parse (e.g., "*handler" or "f*o").
-        // We ALLOW trailing wildcards ("foo*") as FTS5 supports prefix matching.
-        let unsupported_wildcards = sanitized.split_whitespace().any(|t| {
-            let core = t.trim_end_matches('*');
-            core.contains('*') // Any star remaining after trimming end is unsupported (leading or internal)
-        });
-
-        if unsupported_wildcards {
-            return Ok(Vec::new());
-        }
+        // 1t79z: leading/internal wildcards ("*handler", "f*o") are not
+        // representable in FTS5, but the primary index supports them, so they
+        // must not become a false-empty result here. `transpile_to_fts5`
+        // returns None for them and the SQLite lane routes such queries to the
+        // bounded source-table scan, which honours the patterns on token
+        // boundaries.
 
         let has_sqlite_backend = {
             let sqlite_guard = self
@@ -7793,11 +7890,7 @@ impl SearchClient {
         fn scan_parts(parts: Vec<String>) -> Vec<SqliteMessageScanTermPart> {
             parts
                 .into_iter()
-                .filter_map(|part| {
-                    let prefix = part.ends_with('*');
-                    let text = part.trim_end_matches('*').to_lowercase();
-                    (!text.is_empty()).then_some(SqliteMessageScanTermPart { text, prefix })
-                })
+                .filter_map(|part| SqliteMessageScanTermPart::parse(&part))
                 .collect()
         }
 
@@ -7878,7 +7971,7 @@ impl SearchClient {
                     next_negated = true;
                 }
                 FsCassQueryToken::Term(term) => {
-                    let parts = scan_parts(normalize_term_parts(&term));
+                    let parts = scan_parts(normalize_wildcard_term_parts(&term));
                     if parts.is_empty() {
                         continue;
                     }
@@ -7942,13 +8035,7 @@ impl SearchClient {
                         let matches = tokenized_haystacks
                             .iter()
                             .flatten()
-                            .filter(|token| {
-                                if term.prefix {
-                                    token.starts_with(term.text.as_str())
-                                } else {
-                                    token.as_str() == term.text
-                                }
-                            })
+                            .filter(|token| term.matches_token(token.as_str()))
                             .count();
                         if matches < 1 {
                             return 0.0;
@@ -13050,10 +13137,41 @@ mod tests {
         Ok(())
     }
 
+    /// 1t79z: a SQLite-only client no longer short-circuits leading-wildcard
+    /// queries to a false-empty result; they reach the bounded source scan.
     #[test]
-    fn sqlite_backend_skips_wildcard_queries() -> Result<()> {
-        // Build a client with SQLite only; wildcard queries should short-circuit without errors.
+    fn sqlite_backend_routes_wildcard_queries_to_the_scan_lane() -> Result<()> {
         let conn = SearchSqliteFixture::in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL);
+             CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
+                source_id TEXT,
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT NOT NULL
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER,
+                content TEXT NOT NULL,
+                created_at INTEGER
+             );
+             CREATE TABLE fts_messages (marker TEXT);
+             INSERT INTO sources(id, kind) VALUES('local', 'local');
+             INSERT INTO agents(id, slug) VALUES(1, 'codex');
+             INSERT INTO workspaces(id, path) VALUES(1, '/workspace');
+             INSERT INTO conversations(
+                id, agent_id, workspace_id, source_id, origin_host, title, source_path
+             ) VALUES(1, 1, 1, 'local', NULL, 'routing title', '/tmp/routing.jsonl');
+             INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES
+                (1, 1, 0, 'the error_handler fired', 1);",
+        )?;
         let client = SearchClient {
             reader: None,
             sqlite: Mutex::new(Some(conn.into_connection())),
@@ -13073,10 +13191,12 @@ mod tests {
         };
 
         let hits = client.search("*handler", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
-        assert!(
-            hits.is_empty(),
-            "wildcard should skip sqlite fallback, not error"
+        assert_eq!(
+            hits.len(),
+            1,
+            "suffix wildcard must be answered by the scan lane"
         );
+        assert!(hits[0].content.contains("error_handler"));
 
         Ok(())
     }
@@ -14767,6 +14887,56 @@ mod tests {
         assert!(score("gamma delta", &permissive) > 0.0);
     }
 
+    /// 1t79z: the scan lane honours suffix / substring / complex wildcards
+    /// on token boundaries, matching the primary index's regex expansion.
+    #[test]
+    fn sqlite_message_scan_matches_primary_wildcard_patterns() {
+        fn score(haystack: &str, query: &SqliteMessageScanQuery) -> f32 {
+            SearchClient::sqlite_message_scan_score(&[haystack.to_lowercase()], query)
+        }
+
+        let suffix = SearchClient::sqlite_message_scan_query("*handler").expect("suffix query");
+        assert!(score("the error_handler fired", &suffix) > 0.0);
+        assert!(score("handler", &suffix) > 0.0);
+        assert_eq!(score("handlers everywhere", &suffix), 0.0);
+
+        let substring = SearchClient::sqlite_message_scan_query("*andl*").expect("substring query");
+        assert!(score("handlers everywhere", &substring) > 0.0);
+        assert_eq!(score("hand over", &substring), 0.0);
+
+        let complex = SearchClient::sqlite_message_scan_query("h*ler").expect("complex query");
+        assert!(score("handler", &complex) > 0.0);
+        assert!(score("hauler", &complex) > 0.0);
+        assert_eq!(score("handlers", &complex), 0.0);
+        assert_eq!(score("ler", &complex), 0.0);
+
+        // Exact and prefix semantics are unchanged (the sanitizer splits
+        // `error_handler` into `error` + `handler`, so exact `handler` still
+        // matches it on the token boundary; `handlers` is a different token).
+        let exact = SearchClient::sqlite_message_scan_query("handler").expect("exact query");
+        assert!(score("handler", &exact) > 0.0);
+        assert!(score("error_handler", &exact) > 0.0);
+        assert_eq!(score("handlers", &exact), 0.0);
+        let prefix = SearchClient::sqlite_message_scan_query("hand*").expect("prefix query");
+        assert!(score("handlers", &prefix) > 0.0);
+        assert_eq!(score("shand", &prefix), 0.0);
+
+        // A bare star carries no term and yields no scan query.
+        assert!(SearchClient::sqlite_message_scan_query("*").is_none());
+    }
+
+    #[test]
+    fn glob_token_matches_is_anchored_unless_the_pattern_says_otherwise() {
+        assert!(glob_token_matches("h*ler", "handler"));
+        assert!(!glob_token_matches("h*ler", "handlers"));
+        assert!(glob_token_matches("*h*ler", "ahandler"));
+        assert!(glob_token_matches("h*ler*", "handlers"));
+        assert!(glob_token_matches("a*b*c", "axxbyyc"));
+        assert!(glob_token_matches("a*b", "abxb"));
+        assert!(!glob_token_matches("a*b*c", "acb"));
+        assert!(glob_token_matches("*", "anything"));
+    }
+
     #[test]
     fn sqlite_message_scan_preserves_phrase_adjacency_within_one_field() {
         fn score(fields: &[&str], query: &SqliteMessageScanQuery) -> f32 {
@@ -15097,6 +15267,98 @@ mod tests {
             .map(|hit| hit.content.as_str())
             .collect::<HashSet<_>>();
         assert_eq!(contents, HashSet::from(["alpha beta", "gamma delta"]));
+        Ok(())
+    }
+
+    /// 1t79z: through the public `search()` entry point, a SQLite-only client
+    /// must answer suffix / substring / complex wildcard queries from the
+    /// bounded source scan instead of a false-empty short-circuit.
+    #[test]
+    fn sqlite_only_search_answers_leading_and_interior_wildcards_via_scan() -> Result<()> {
+        let conn = SearchSqliteFixture::in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
+             CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL);
+             CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                workspace_id INTEGER,
+                source_id TEXT,
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT NOT NULL
+             );
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER,
+                content TEXT NOT NULL,
+                created_at INTEGER
+             );
+             CREATE TABLE fts_messages (marker TEXT);
+             INSERT INTO sources(id, kind) VALUES('local', 'local');
+             INSERT INTO agents(id, slug) VALUES(1, 'codex');
+             INSERT INTO workspaces(id, path) VALUES(1, '/workspace');
+             INSERT INTO conversations(
+                id, agent_id, workspace_id, source_id, origin_host, title, source_path
+             ) VALUES(1, 1, 1, 'local', NULL, 'wildcard title', '/tmp/wildcard.jsonl');
+             INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES
+                (1, 1, 0, 'the error_handler fired', 1),
+                (2, 1, 1, 'handlers everywhere', 2),
+                (3, 1, 2, 'plain hauler text', 3);",
+        )?;
+        let client = SearchClient {
+            reader: None,
+            sqlite: Mutex::new(Some(conn.into_connection())),
+            sqlite_path: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: false,
+            strict_read_only: false,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:wildcard-scan-fallback"),
+            semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
+        };
+        let contents = |query: &str| -> Result<HashSet<String>> {
+            Ok(client
+                .search(query, SearchFilters::default(), 10, 0, FieldMask::FULL)?
+                .into_iter()
+                .map(|hit| hit.content)
+                .collect())
+        };
+
+        assert_eq!(
+            contents("*handler")?,
+            HashSet::from(["the error_handler fired".to_string()]),
+            "suffix wildcard must match on token boundaries"
+        );
+        assert_eq!(
+            contents("*andl*")?,
+            HashSet::from([
+                "the error_handler fired".to_string(),
+                "handlers everywhere".to_string()
+            ]),
+            "substring wildcard must match every token containing the core"
+        );
+        assert_eq!(
+            contents("h*ler")?,
+            HashSet::from([
+                "plain hauler text".to_string(),
+                "the error_handler fired".to_string()
+            ]),
+            "complex wildcard is anchored at both token ends (`handler` and `hauler` \
+             match, `handlers` does not)"
+        );
+        assert!(
+            contents("*zzqx")?.is_empty(),
+            "a pattern matching nothing stays empty"
+        );
         Ok(())
     }
 
