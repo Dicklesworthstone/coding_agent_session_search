@@ -15491,6 +15491,61 @@ pub fn run_index(
                 (None, _) => false,
             };
 
+        // tpndx (#394 remainder): a one-shot `index --semantic` whose
+        // watermark merely TRAILS the corpus used to fall through to the
+        // full re-embed. Reuse the watch callback's incremental path (fetch
+        // canonical packets since the watermark, embed, WAL-append to the
+        // existing .fsvi, advance the watermark) so a routine refresh costs
+        // the delta, not the corpus. Identity changes still force the bulk
+        // rebuild, and any delta failure falls back to the bulk pass so the
+        // artifact never ends up less complete than before.
+        let one_shot_delta_eligible = !opts.watch
+            && !semantic_identity_rebuild_required
+            && has_existing_index
+            && has_watermark
+            && !watermark_covers_corpus;
+        let mut one_shot_delta_embedded: Option<usize> = None;
+        if one_shot_delta_eligible {
+            prepare_progress_for_semantic_build(opts.progress.as_ref());
+            if let Err(err) = index_run_lock.set_phase(initial_lock_mode, "semantic:incremental") {
+                tracing::debug!(
+                    error = %err,
+                    "semantic incremental phase breadcrumb write failed (continuing)"
+                );
+            }
+            set_semantic_progress_phase(
+                opts.progress.as_ref(),
+                &progress_bump,
+                INDEX_PHASE_SEMANTIC_INITIALIZE,
+                0,
+                0,
+            );
+            let storage_cell = Mutex::new(storage);
+            let outcome = incremental_semantic_embed(&opts.embedder, &opts.data_dir, &storage_cell);
+            storage = storage_cell
+                .into_inner()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match outcome {
+                Ok(count) => {
+                    tracing::info!(
+                        dir = %vi_dir.display(),
+                        watermark = last_embedded.unwrap_or(0),
+                        embedded = count,
+                        "one-shot semantic delta embed: appended messages past the \
+                         watermark instead of re-embedding the corpus (tpndx / #394)"
+                    );
+                    one_shot_delta_embedded = Some(count);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "one-shot semantic delta embed failed; falling back to the \
+                         bulk semantic pass"
+                    );
+                }
+            }
+        }
+
         if opts.watch && !semantic_identity_rebuild_required && has_existing_index && has_watermark
         {
             tracing::info!(
@@ -15504,6 +15559,12 @@ pub fn run_index(
                 watermark = last_embedded.unwrap_or(0),
                 "skipping bulk semantic re-embed: watermark already covers the \
                  newest message and a vector index exists (issue #394)"
+            );
+        } else if let Some(count) = one_shot_delta_embedded {
+            tracing::info!(
+                embedded = count,
+                "skipping bulk semantic re-embed: one-shot delta embed covered the \
+                 trailing watermark (tpndx)"
             );
         } else {
             // The lexical pass may leave the shared progress atomics in phase
