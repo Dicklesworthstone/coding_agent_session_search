@@ -28665,20 +28665,41 @@ fn run_cli_search(
     } else {
         None
     };
-    let index_freshness = state_meta.as_ref().and_then(state_index_freshness);
+    let robot_freshness = state_meta.as_ref().and_then(state_index_freshness);
     // Stale-on-read catch-up: never blocks this search; a detached
     // low-priority `cass index --background` makes the *next* search fresh.
     let auto_refresh = if no_maintenance {
         None
     } else {
-        maybe_auto_refresh_index_after_read(&data_dir, &db_path, index_freshness.as_ref())
+        maybe_auto_refresh_index_after_read(&data_dir, &db_path, robot_freshness.as_ref())
     };
-    let index_freshness = index_freshness.map(|mut freshness| {
+    let robot_freshness = robot_freshness.map(|mut freshness| {
         if let (Some(outcome), serde_json::Value::Object(map)) = (&auto_refresh, &mut freshness) {
             map.insert("auto_refresh".to_string(), outcome.clone());
         }
         freshness
     });
+    // i6tyy (GH #375 / #353): human search previously never learned the
+    // index was stale — `state_meta` is a `--robot-meta`-only probe, so the
+    // v6vuz stderr readiness banner below could never fire and a stale
+    // index returning zero hits read as "that history does not exist".
+    // Derive the same freshness verdict for human output from the
+    // filesystem-only strict-read state (no DB open, no checkpoint or lock
+    // mutation, the `--no-maintenance` surface) so the common healthy
+    // search stays cheap and mutation-free. Deliberately NOT fed into the
+    // stale-on-read auto-refresh above: human search must not start
+    // spawning background index runs as a side effect of this warning.
+    let human_freshness =
+        if effective_robot.is_none() && state_meta.is_none() && state_meta_budget_available {
+            state_index_freshness(&state_meta_json_for_strict_read(
+                &data_dir,
+                &db_path,
+                DEFAULT_STALE_THRESHOLD_SECS,
+            ))
+        } else {
+            None
+        };
+    let index_freshness = robot_freshness.or(human_freshness);
     // qfswx: project the `.14.1` storage-integrity verdict for --robot-meta
     // (Some only when state_meta is, i.e. with --robot-meta) so search agrees
     // with doctor/status on the canonical StorageState vocabulary. Computed
@@ -28776,6 +28797,13 @@ fn run_cli_search(
     // `effective_robot` are conditionally moved into the robot branch below.
     let is_human_search = effective_robot.is_none();
     let has_readiness_warning = warning.is_some();
+    // i6tyy: keep the human copy before `warning` is moved into the robot
+    // envelope below.
+    let human_warning = if is_human_search {
+        warning.clone()
+    } else {
+        None
+    };
 
     if let Some(format) = effective_robot {
         let recommended_next_probe =
@@ -28869,6 +28897,12 @@ fn run_cli_search(
     // probe runs only on the already-degraded path (a staleness/partial
     // `warning` exists), so the common healthy search stays probe-free.
     if is_human_search && has_readiness_warning {
+        // i6tyy: the one-line note itself — byte-identical to the robot
+        // `_meta._warning` string so human and agent readers are told the
+        // same thing (zero hits on a stale index is coverage, not absence).
+        if let Some(warn) = &human_warning {
+            eprintln!("Warning: {warn}");
+        }
         let table =
             build_truth_table_for_data_dir(&data_dir, &db_path, DEFAULT_STALE_THRESHOLD_SECS);
         let summary = crate::search::human_readiness_summary::project_human_summary(
@@ -58021,6 +58055,122 @@ fn build_doctor_lock_diagnostics(
         .collect()
 }
 
+/// siekg: last doctor phase that completed, read by the stderr liveness
+/// heartbeat so a multi-minute run says *where* it is, not just that it is
+/// alive. Process-global on purpose: doctor runs once per process and the
+/// value is advisory message text only.
+static DOCTOR_HEARTBEAT_LAST_PHASE: Mutex<String> = Mutex::new(String::new());
+
+/// Default liveness cadence for long doctor runs; `CASS_DOCTOR_HEARTBEAT_SECS`
+/// overrides it (`0` disables).
+const DOCTOR_HEARTBEAT_DEFAULT_SECS: u64 = 15;
+
+fn doctor_heartbeat_interval() -> Option<std::time::Duration> {
+    doctor_heartbeat_interval_from(std::env::var("CASS_DOCTOR_HEARTBEAT_SECS").ok().as_deref())
+}
+
+/// Pure resolver for the heartbeat cadence: unset/unparseable → default,
+/// `0` → disabled (`None`).
+fn doctor_heartbeat_interval_from(raw: Option<&str>) -> Option<std::time::Duration> {
+    let secs = raw
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DOCTOR_HEARTBEAT_DEFAULT_SECS);
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+#[cfg(test)]
+mod doctor_heartbeat_tests {
+    use super::{DOCTOR_HEARTBEAT_DEFAULT_SECS, doctor_heartbeat_interval_from};
+    use std::time::Duration;
+
+    #[test]
+    fn unset_or_garbage_uses_default_cadence() {
+        let default = Duration::from_secs(DOCTOR_HEARTBEAT_DEFAULT_SECS);
+        assert!(doctor_heartbeat_interval_from(None).is_some_and(|d| d.cmp(&default).is_eq()));
+        assert!(
+            doctor_heartbeat_interval_from(Some("nope")).is_some_and(|d| d.cmp(&default).is_eq())
+        );
+    }
+
+    #[test]
+    fn zero_disables_and_positive_overrides() {
+        assert!(doctor_heartbeat_interval_from(Some("0")).is_none());
+        assert!(
+            doctor_heartbeat_interval_from(Some(" 3 "))
+                .is_some_and(|d| d.as_secs().cmp(&3).is_eq())
+        );
+    }
+}
+
+/// siekg (bead `doctor-check-no-progress-output-siekg`): `cass doctor --check`
+/// legitimately runs for 3–16 minutes on multi-GB or corrupt archives and
+/// used to emit *nothing* until it finished, so with stdout redirected it was
+/// indistinguishable from a hang and operators killed it. This guard prints a
+/// one-line heartbeat to stderr (the diagnostics channel in every output
+/// mode; stdout stays data-only) at a fixed cadence while the run is live,
+/// naming elapsed time and the last completed phase. First tick fires only
+/// after one full interval, so quick runs stay byte-identical on stderr.
+struct DoctorHeartbeat {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DoctorHeartbeat {
+    fn start(surface: &str) -> Option<Self> {
+        let interval = doctor_heartbeat_interval()?;
+        if let Ok(mut last) = DOCTOR_HEARTBEAT_LAST_PHASE.lock() {
+            last.clear();
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_for_thread = stop.clone();
+        let surface = surface.to_string();
+        let handle = std::thread::Builder::new()
+            .name("cass-doctor-heartbeat".to_string())
+            .spawn(move || {
+                let started = std::time::Instant::now();
+                let mut next = interval;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    if stop_for_thread.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let elapsed = started.elapsed();
+                    if elapsed < next {
+                        continue;
+                    }
+                    next += interval;
+                    let last_phase = DOCTOR_HEARTBEAT_LAST_PHASE
+                        .lock()
+                        .map(|p| p.clone())
+                        .unwrap_or_default();
+                    let phase_note = if last_phase.is_empty() {
+                        "no phase completed yet".to_string()
+                    } else {
+                        format!("last completed phase: {last_phase}")
+                    };
+                    eprintln!(
+                        "[cass doctor {surface}] still running ({}s elapsed; {phase_note}). Multi-minute runs are normal on multi-GB or corrupt archives; set CASS_DOCTOR_HEARTBEAT_SECS=0 to silence.",
+                        elapsed.as_secs()
+                    );
+                }
+            })
+            .ok()?;
+        Some(Self {
+            stop,
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for DoctorHeartbeat {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 fn doctor_push_timing_span(
     spans: &mut Vec<DoctorTimingSpanReport>,
     name: &str,
@@ -58030,6 +58180,10 @@ fn doctor_push_timing_span(
     threshold_ms: u64,
     notes: Vec<String>,
 ) {
+    if let Ok(mut last) = DOCTOR_HEARTBEAT_LAST_PHASE.lock() {
+        last.clear();
+        last.push_str(name);
+    }
     let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     spans.push(DoctorTimingSpanReport {
         schema_version: 1,
@@ -83489,6 +83643,9 @@ pub(crate) fn run_doctor_impl(
     use std::time::Instant;
 
     let start = Instant::now();
+    // siekg: liveness heartbeat on stderr for the whole run; dropped (and
+    // joined) when this function returns, after the report is written.
+    let _heartbeat = DoctorHeartbeat::start(if fix { "--fix" } else { "--check" });
     let data_dir = resolve_data_dir(data_dir_override, db_override.as_ref());
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
