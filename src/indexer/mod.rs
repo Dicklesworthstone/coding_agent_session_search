@@ -15520,6 +15520,7 @@ pub fn run_index(
                 0,
                 0,
             );
+            let delta_started_at_ms = semantic_indexing_now_ms();
             let storage_cell = Mutex::new(storage);
             let outcome = incremental_semantic_embed(&opts.embedder, &opts.data_dir, &storage_cell);
             storage = storage_cell
@@ -15534,6 +15535,32 @@ pub fn run_index(
                         "one-shot semantic delta embed: appended messages past the \
                          watermark instead of re-embedding the corpus (tpndx / #394)"
                     );
+                    // The appended artifact is searchable only once the manifest
+                    // agrees with the canonical DB again (otherwise readiness
+                    // reports "backfill in progress" and search falls back to
+                    // lexical). Mirror the watch-once tail: compact the WAL,
+                    // count live records, republish the manifest.
+                    match finalize_one_shot_semantic_delta(
+                        &opts.embedder,
+                        &opts.data_dir,
+                        &storage,
+                        delta_started_at_ms,
+                    ) {
+                        Ok(doc_count) => {
+                            tracing::info!(
+                                doc_count,
+                                "one-shot semantic delta: manifest republished"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "one-shot semantic delta appended to disk but manifest \
+                                 update failed; cass status may report backfill pending \
+                                 until the next semantic run"
+                            );
+                        }
+                    }
                     one_shot_delta_embedded = Some(count);
                 }
                 Err(err) => {
@@ -17425,6 +17452,45 @@ fn incremental_semantic_embed_from_delta(
         "advancing incremental semantic watermark for filtered packet delta",
         "updating incremental semantic watermark from packet delta",
     )
+}
+
+/// tpndx: after a one-shot delta append, make the artifact publishable —
+/// compact any WAL tail, count live records, and republish the semantic
+/// manifest against the current canonical DB (the same tail the targeted
+/// watch-once path performs). Returns the published document count.
+fn finalize_one_shot_semantic_delta(
+    embedder: &str,
+    data_dir: &Path,
+    storage: &FrankenStorage,
+    build_started_at_ms: i64,
+) -> Result<u64> {
+    let semantic_indexer = SemanticIndexer::new(embedder, Some(data_dir))?;
+    let index_path =
+        crate::search::vector_index::vector_index_path(data_dir, semantic_indexer.embedder_id());
+    let mut index = FsVectorIndex::open(&index_path).map_err(|err| {
+        anyhow::anyhow!(
+            "open appended one-shot semantic index {}: {err}",
+            index_path.display()
+        )
+    })?;
+    if index.wal_record_count() > 0 {
+        index
+            .compact()
+            .map_err(|err| anyhow::anyhow!("compact appended one-shot semantic index: {err}"))?;
+    }
+    drop(index);
+    let inventory = inspect_semantic_artifact(&index_path)?;
+    let doc_count = u64::try_from(inventory.live_record_count()).unwrap_or(u64::MAX);
+    publish_direct_semantic_artifact(
+        storage,
+        data_dir,
+        &index_path,
+        semantic_indexer.embedder_id(),
+        semantic_indexer.embedder_dimension(),
+        doc_count,
+        build_started_at_ms,
+    )?;
+    Ok(doc_count)
 }
 
 /// Perform incremental semantic embedding for messages added since the last
