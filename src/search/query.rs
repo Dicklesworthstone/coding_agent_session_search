@@ -7592,17 +7592,26 @@ impl SearchClient {
         .is_ok()
     }
 
+    /// k0lo1: the SQLite FTS lane must honour the same field contract as the
+    /// primary lexical index (title + content only). Table-wide MATCH used to
+    /// search agent/workspace/source_path too, so a query term that exists
+    /// only in metadata became a false-positive hit whenever the primary
+    /// index was unavailable. Those fields remain filterable through the
+    /// ordinary structured filters; they are simply not query text.
     fn sqlite_fts5_match_clause(match_mode: SqliteFtsMatchMode) -> &'static str {
         match match_mode {
             SqliteFtsMatchMode::Table => "fts_messages MATCH ?",
-            SqliteFtsMatchMode::IndexedColumns => {
-                "(content MATCH ?
-                  OR title MATCH ?
-                  OR agent MATCH ?
-                  OR workspace MATCH ?
-                  OR source_path MATCH ?)"
-            }
+            SqliteFtsMatchMode::IndexedColumns => "(content MATCH ? OR title MATCH ?)",
         }
+    }
+
+    /// FTS5 column-filter prefix restricting a table-wide MATCH to the
+    /// primary lexical fields (`{content title} : (<query>)`).
+    fn sqlite_fts5_scoped_table_query(fts_query: &str) -> String {
+        if fts_query.trim().is_empty() {
+            return fts_query.to_string();
+        }
+        format!("{{content title}} : ({fts_query})")
     }
 
     fn push_sqlite_fts5_match_params(
@@ -7610,12 +7619,17 @@ impl SearchClient {
         fts_query: &str,
         match_mode: SqliteFtsMatchMode,
     ) {
-        let copies = match match_mode {
-            SqliteFtsMatchMode::Table => 1,
-            SqliteFtsMatchMode::IndexedColumns => 5,
-        };
-        for _ in 0..copies {
-            params.push(ParamValue::from(fts_query));
+        match match_mode {
+            SqliteFtsMatchMode::Table => {
+                params.push(ParamValue::from(Self::sqlite_fts5_scoped_table_query(
+                    fts_query,
+                )));
+            }
+            SqliteFtsMatchMode::IndexedColumns => {
+                for _ in 0..2 {
+                    params.push(ParamValue::from(fts_query));
+                }
+            }
         }
     }
 
@@ -13591,6 +13605,106 @@ mod tests {
         Ok(())
     }
 
+    /// k0lo1: metadata-only text (agent / workspace / source_path) must not
+    /// match in the SQLite fallback lane; title/content text must.
+    #[test]
+    fn sqlite_fts_fallback_ignores_metadata_only_terms() -> Result<()> {
+        fn fts_match_count(conn: &FrankenConnection, fts_query: &str) -> Result<Option<usize>> {
+            let probe_params = [ParamValue::from("__cass_fts_probe_no_match__")];
+            let match_mode = match conn.query_map_collect(
+                "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH ?",
+                &probe_params,
+                |row| row.get_typed::<i64>(0),
+            ) {
+                Ok(_) => SqliteFtsMatchMode::Table,
+                Err(err)
+                    if err
+                        .to_string()
+                        .contains("no such column: fts_messages in table fts_messages") =>
+                {
+                    SqliteFtsMatchMode::IndexedColumns
+                }
+                Err(err) => return Err(err.into()),
+            };
+            let sql = format!(
+                "SELECT COUNT(*) FROM fts_messages WHERE {}",
+                SearchClient::sqlite_fts5_match_clause(match_mode)
+            );
+            let mut params = Vec::new();
+            SearchClient::push_sqlite_fts5_match_params(&mut params, fts_query, match_mode);
+            match conn.query_map_collect(&sql, &params, |row| row.get_typed::<i64>(0)) {
+                Ok(rows) => {
+                    let count = rows.into_iter().next().unwrap_or(0);
+                    Ok(Some(usize::try_from(count.max(0)).unwrap_or(usize::MAX)))
+                }
+                Err(err) if err.to_string().contains("no such function: MATCH/2") => Ok(None),
+                Err(err) => Err(err.into()),
+            }
+        }
+
+        let temp_dir = TempDir::new()?;
+        let db_path = temp_dir.path().join("metadata-only-fallback.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        storage.ensure_search_fallback_fts_consistency()?;
+        let conn = storage.raw();
+        let seed = |rowid: i64, content: &str, title: &str, agent: &str, ws: &str, src: &str| {
+            conn.execute_compat(
+                "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                &[
+                    ParamValue::from(rowid),
+                    ParamValue::from(content),
+                    ParamValue::from(title),
+                    ParamValue::from(agent),
+                    ParamValue::from(ws),
+                    ParamValue::from(src),
+                    ParamValue::from(rowid),
+                ],
+            )
+        };
+        // Sentinel only in metadata fields — must NOT match.
+        seed(
+            1,
+            "plain body text",
+            "plain title",
+            "zebraterm",
+            "/ws/zebraterm",
+            "/tmp/zebraterm.jsonl",
+        )?;
+        // Sentinel in content — must match.
+        seed(
+            2,
+            "body mentions zebraterm here",
+            "plain title",
+            "codex",
+            "/ws/alpha",
+            "/tmp/a.jsonl",
+        )?;
+        // Sentinel in title — must match.
+        seed(
+            3,
+            "plain body text",
+            "zebraterm title",
+            "codex",
+            "/ws/alpha",
+            "/tmp/b.jsonl",
+        )?;
+
+        let transpiled = transpile_to_fts5("zebraterm").expect("transpiled query");
+        if let Some(count) = fts_match_count(conn, transpiled.as_str())? {
+            assert_eq!(
+                count, 2,
+                "only the content/title rows may match; metadata-only text is not query text"
+            );
+        }
+        // Control: a term nowhere in the table matches nothing.
+        let absent = transpile_to_fts5("quokkaterm").expect("transpiled query");
+        if let Some(count) = fts_match_count(conn, absent.as_str())? {
+            assert_eq!(count, 0);
+        }
+        Ok(())
+    }
+
     #[test]
     fn sqlite_path_rusqlite_fallback_matches_hyphenated_ids_with_workspace_filter() -> Result<()> {
         fn fts_match_count_async(
@@ -13781,7 +13895,10 @@ mod tests {
             0,
             FieldMask::FULL,
         )?;
-        assert_eq!(dotted_hits.len(), 2);
+        // k0lo1: `jsonl` exists only in source_path, which is a filter field,
+        // not query text — the SQLite lane must agree with the primary index
+        // (title/content only) and report no hits rather than a metadata match.
+        assert_eq!(dotted_hits.len(), 0);
 
         let dotted_prefix_hits = client.search(
             "br-123.json*",
@@ -13790,7 +13907,7 @@ mod tests {
             0,
             FieldMask::FULL,
         )?;
-        assert_eq!(dotted_prefix_hits.len(), 2);
+        assert_eq!(dotted_prefix_hits.len(), 0);
 
         let prefix_hits =
             client.search("br-12*", SearchFilters::default(), 10, 0, FieldMask::FULL)?;
