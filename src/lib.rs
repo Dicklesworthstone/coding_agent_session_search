@@ -26795,6 +26795,28 @@ mod search_lexical_self_heal_tests {
     }
 
     #[test]
+    fn incremental_success_postcondition_tolerates_an_empty_archive_but_not_a_populated_one() {
+        // A watch-once / incremental run that had nothing to publish (no
+        // canonical DB at all) is not a "success with missing assets".
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let absent_db = data_dir.join("agent_search.db");
+        validate_successful_index_artifacts(data_dir, &absent_db, false, false)
+            .expect("incremental run over an absent archive has nothing to validate");
+
+        // But once the archive holds messages, a missing lexical index is
+        // still a postcondition failure even for incremental runs.
+        let db_path = seed_canonical_search_db(data_dir);
+        let err = validate_successful_index_artifacts(data_dir, &db_path, false, false)
+            .expect_err("populated archive without a lexical index must fail");
+        assert!(err.message.contains("no readable lexical index"));
+        // And full/forced rebuilds never get the empty-archive tolerance.
+        let err = validate_successful_index_artifacts(data_dir, &absent_db, true, false)
+            .expect_err("full rebuild must always publish a lexical index");
+        assert!(err.message.contains("no readable lexical index"));
+    }
+
+    #[test]
     fn gh422_full_rebuild_success_postcondition_rejects_incomplete_checkpoint_metadata() {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path();
@@ -96880,6 +96902,19 @@ fn index_result_counts_from_progress(progress: &indexer::IndexingProgress) -> Op
     ))
 }
 
+/// True only when it is PROVEN that the canonical archive holds no messages:
+/// the DB file is absent, or it opens read-only and reports no message id.
+/// Any open error keeps the strict postcondition (an unreadable archive is
+/// not evidence of an empty one).
+fn canonical_archive_has_no_messages(db_path: &Path) -> bool {
+    if !db_path.exists() {
+        return true;
+    }
+    crate::storage::sqlite::FrankenStorage::open_readonly(db_path)
+        .and_then(|storage| storage.max_message_id())
+        .is_ok_and(|max_id| max_id.is_none())
+}
+
 fn validate_successful_index_artifacts(
     data_dir: &Path,
     db_path: &Path,
@@ -96888,6 +96923,15 @@ fn validate_successful_index_artifacts(
 ) -> CliResult<()> {
     let index_path = crate::search::tantivy::expected_index_dir(data_dir);
     if !crate::search::tantivy::searchable_index_exists(&index_path) {
+        // An incremental / watch-once run that found nothing to publish (no
+        // canonical messages at all — e.g. a targeted path that was not a
+        // session, or a skipped active source into a fresh data dir) has no
+        // lexical asset to validate; only a full/forced rebuild, or a run
+        // over an archive that does hold messages, is a genuine
+        // "success with missing assets" (gh#422 postcondition).
+        if !full && !force_rebuild && canonical_archive_has_no_messages(db_path) {
+            return Ok(());
+        }
         return Err(CliError {
             code: 9,
             kind: CliErrorKind::Index.kind_str(),
