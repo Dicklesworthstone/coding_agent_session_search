@@ -20,6 +20,7 @@ use serde_json::Value;
 use util::timeout::spawn_with_timeout_or_diag;
 
 const HEARTBEAT_MARKER: &str = "[cass doctor --check] still running";
+const STATUS_MARKER: &str = "[cass status] still running";
 const TIMEOUT: Duration = Duration::from_secs(180);
 
 struct Fixture {
@@ -128,6 +129,40 @@ fn check() -> Result<(), String> {
         return Err(format!(
             "CASS_DOCTOR_HEARTBEAT_SECS=0 still emitted a heartbeat: {silent_err}"
         ));
+    }
+
+    // k2k20 ask #1: `cass status` shares the heartbeat (it opens the DB and
+    // was the silent surface in the 9.3GB field report). Same contract:
+    // stdout stays valid JSON, liveness only on stderr, `0` is silent.
+    let started = Instant::now();
+    let status = run(
+        &fixture,
+        "status_heartbeat_1s",
+        &["status", "--json"],
+        &[("CASS_DOCTOR_HEARTBEAT_SECS", "1")],
+    );
+    let wall = started.elapsed();
+    let status_out = String::from_utf8_lossy(&status.stdout).into_owned();
+    let status_err = String::from_utf8_lossy(&status.stderr).into_owned();
+    serde_json::from_str::<Value>(status_out.trim())
+        .map_err(|e| format!("status --json stdout not JSON: {e}"))?;
+    if status_out.contains(STATUS_MARKER) {
+        return Err("status heartbeat leaked onto stdout".to_string());
+    }
+    if wall >= Duration::from_secs(3) && !status_err.contains(STATUS_MARKER) {
+        return Err(format!(
+            "status ran {:.1}s with a 1s heartbeat but stderr carried no liveness line; stderr: {status_err}",
+            wall.as_secs_f64()
+        ));
+    }
+    let status_silent = run(
+        &fixture,
+        "status_heartbeat_off",
+        &["status", "--json"],
+        &[("CASS_DOCTOR_HEARTBEAT_SECS", "0")],
+    );
+    if String::from_utf8_lossy(&status_silent.stderr).contains(STATUS_MARKER) {
+        return Err("CASS_DOCTOR_HEARTBEAT_SECS=0 still emitted a status heartbeat".to_string());
     }
     Ok(())
 }

@@ -58208,7 +58208,7 @@ mod doctor_heartbeat_tests {
     }
 }
 
-/// siekg (bead `doctor-check-no-progress-output-siekg`): `cass doctor --check`
+/// siekg (bead `doctor-check-no-progress-output-siekg`) + k2k20 ask #1: `cass doctor --check`
 /// legitimately runs for 3–16 minutes on multi-GB or corrupt archives and
 /// used to emit *nothing* until it finished, so with stdout redirected it was
 /// indistinguishable from a hang and operators killed it. This guard prints a
@@ -58216,12 +58216,12 @@ mod doctor_heartbeat_tests {
 /// mode; stdout stays data-only) at a fixed cadence while the run is live,
 /// naming elapsed time and the last completed phase. First tick fires only
 /// after one full interval, so quick runs stay byte-identical on stderr.
-struct DoctorHeartbeat {
+struct CliHeartbeat {
     stop: Arc<std::sync::atomic::AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
-impl DoctorHeartbeat {
+impl CliHeartbeat {
     fn start(surface: &str) -> Option<Self> {
         let interval = doctor_heartbeat_interval()?;
         if let Ok(mut last) = DOCTOR_HEARTBEAT_LAST_PHASE.lock() {
@@ -58250,12 +58250,12 @@ impl DoctorHeartbeat {
                         .map(|p| p.clone())
                         .unwrap_or_default();
                     let phase_note = if last_phase.is_empty() {
-                        "no phase completed yet".to_string()
+                        String::new()
                     } else {
-                        format!("last completed phase: {last_phase}")
+                        format!("; last completed phase: {last_phase}")
                     };
                     eprintln!(
-                        "[cass doctor {surface}] still running ({}s elapsed; {phase_note}). Multi-minute runs are normal on multi-GB or corrupt archives; set CASS_DOCTOR_HEARTBEAT_SECS=0 to silence.",
+                        "[cass {surface}] still running ({}s elapsed{phase_note}). Multi-minute runs are normal on multi-GB or corrupt archives; set CASS_DOCTOR_HEARTBEAT_SECS=0 to silence.",
                         elapsed.as_secs()
                     );
                 }
@@ -58268,7 +58268,7 @@ impl DoctorHeartbeat {
     }
 }
 
-impl Drop for DoctorHeartbeat {
+impl Drop for CliHeartbeat {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
@@ -78858,6 +78858,10 @@ fn run_status(
     stale_threshold: u64,
     _robot_meta: bool,
 ) -> CliResult<()> {
+    // k2k20 ask #1: status opens the canonical DB and was observed silent
+    // for 13+ minutes on a 9.3GB corpus; share the doctor liveness heartbeat
+    // (stderr only, first tick after one full interval).
+    let _heartbeat = CliHeartbeat::start("status");
     let data_dir = resolve_data_dir(data_dir_override, db_override.as_ref());
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     // Bounded execution budget for the robot surface (uojcg.2.2): when the
@@ -83751,7 +83755,11 @@ pub(crate) fn run_doctor_impl(
     let start = Instant::now();
     // siekg: liveness heartbeat on stderr for the whole run; dropped (and
     // joined) when this function returns, after the report is written.
-    let _heartbeat = DoctorHeartbeat::start(if fix { "--fix" } else { "--check" });
+    let _heartbeat = CliHeartbeat::start(if fix {
+        "doctor --fix"
+    } else {
+        "doctor --check"
+    });
     let data_dir = resolve_data_dir(data_dir_override, db_override.as_ref());
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
