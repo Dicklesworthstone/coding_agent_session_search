@@ -25964,17 +25964,34 @@ mod tests {
             elapsed < std::time::Duration::from_secs(60),
             "512 prepared streaming pages took {elapsed:?}"
         );
-        if let (Some(before), Some(after)) = (rss_before, rss_after) {
-            assert!(
-                after.saturating_sub(before) < 256 * 1024 * 1024,
-                "prepared streaming rebuild grew RSS by {} bytes",
-                after.saturating_sub(before)
-            );
-        }
-
         // The staging/publish sequence must be idempotent, not additive.
         let repeated = storage.rebuild_daily_stats().unwrap();
         assert_eq!(repeated, rebuilt);
+
+        // pd5nw: /proc RSS is process-wide, so inside the parallel lib-test
+        // process one sample includes every neighbour's allocator churn
+        // (observed 289 MB..1.38 GB while the same revision passes alone).
+        // Sample twice — re-measure a settled second rebuild only when the
+        // first sample exceeds the bound — and judge the smaller growth: a
+        // genuine per-rebuild leak shows in both samples, transient
+        // neighbour churn does not.
+        const RSS_GROWTH_BOUND: u64 = 256 * 1024 * 1024;
+        if let (Some(before), Some(after)) = (rss_before, rss_after) {
+            let mut growth = after.saturating_sub(before);
+            if growth >= RSS_GROWTH_BOUND {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let settled_before = linux_rss_bytes();
+                let _ = storage.rebuild_daily_stats().unwrap();
+                let settled_after = linux_rss_bytes();
+                if let (Some(b), Some(a)) = (settled_before, settled_after) {
+                    growth = growth.min(a.saturating_sub(b));
+                }
+            }
+            assert!(
+                growth < RSS_GROWTH_BOUND,
+                "prepared streaming rebuild grew RSS by {growth} bytes in both samples"
+            );
+        }
     }
 
     #[test]

@@ -34913,9 +34913,12 @@ mod tests {
         state.enter(step_idx, started_at_ms);
 
         // Give the watchdog enough wall-clock to poll, decide, and
-        // rewrite the lock file. 750 ms = many poll ticks at 25 ms
-        // — even a heavily loaded CI runner finishes that.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(750);
+        // rewrite the lock file. 3pp5m: 750 ms was observed to be too
+        // tight on a saturated worker (the trip landed just after the
+        // deadline, then its timeout event was emitted — the mechanism
+        // worked, the window did not). 5 s is still a hard bound on a
+        // genuinely broken watchdog while absorbing scheduler starvation.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
             if state.tripped.load(Ordering::Relaxed) {
                 break;
