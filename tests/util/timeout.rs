@@ -82,6 +82,11 @@ pub fn spawn_with_timeout_or_diag(
     let mut child = cmd
         .spawn()
         .unwrap_or_else(|err| panic!("spawn_with_timeout_or_diag({label}): spawn failed: {err}"));
+    // 1j6x8: if the harness itself is killed (`timeout N cargo test`,
+    // SIGKILL), nothing below runs and the child's process group would
+    // outlive us. The reaper is an independent process that notices our
+    // death and kills the group on our behalf.
+    let mut reaper = spawn_harness_death_reaper(child.id());
     let stdout_reader = spawn_pipe_reader(child.stdout.take());
     let stderr_reader = spawn_pipe_reader(child.stderr.take());
 
@@ -90,6 +95,7 @@ pub fn spawn_with_timeout_or_diag(
         match child.try_wait() {
             Ok(Some(status)) => {
                 kill_child_process_group(child.id());
+                retire_harness_death_reaper(&mut reaper);
                 let stdout = join_pipe_reader(stdout_reader, label, "stdout");
                 let stderr = join_pipe_reader(stderr_reader, label, "stderr");
                 let stdout = full_output_or_panic(stdout, label, "stdout");
@@ -111,6 +117,7 @@ pub fn spawn_with_timeout_or_diag(
                     kill_child_process_group(pid);
                     let _ = child.kill();
                     let _ = child.wait();
+                    retire_harness_death_reaper(&mut reaper);
                     let stdout = join_pipe_reader(stdout_reader, label, "stdout");
                     let stderr = join_pipe_reader(stderr_reader, label, "stderr");
                     let stdout_tail = stream_tail(&stdout.bytes);
@@ -200,6 +207,48 @@ fn kill_child_process_group(pid: u32) {
 
 #[cfg(not(unix))]
 fn kill_child_process_group(_pid: u32) {}
+
+/// 1j6x8: spawn a detached reaper that kills `child_pid`'s process group
+/// once the current (harness) process is gone. The reaper lives in its own
+/// process group so a harness-group kill does not take it down first; it
+/// exits on its own as soon as either the harness or the child is gone, so
+/// a normal run leaves nothing behind. Pure `std::process` — no `unsafe`,
+/// no `prctl`. Unix only; elsewhere returns `None`.
+#[cfg(unix)]
+fn spawn_harness_death_reaper(child_pid: u32) -> Option<std::process::Child> {
+    spawn_death_reaper_for(std::process::id(), child_pid)
+}
+
+#[cfg(unix)]
+fn spawn_death_reaper_for(watched_pid: u32, child_pid: u32) -> Option<std::process::Child> {
+    use std::os::unix::process::CommandExt;
+    const REAPER_SCRIPT: &str = "while kill -0 \"$1\" 2>/dev/null && kill -0 \"$2\" 2>/dev/null; do sleep 1; done; /bin/kill -KILL \"-$2\" 2>/dev/null";
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg(REAPER_SCRIPT)
+        .arg("cass-e2e-reaper")
+        .arg(watched_pid.to_string())
+        .arg(child_pid.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    cmd.process_group(0);
+    cmd.spawn().ok()
+}
+
+#[cfg(not(unix))]
+fn spawn_harness_death_reaper(_child_pid: u32) -> Option<std::process::Child> {
+    None
+}
+
+/// The child is already reaped by the harness: stop the reaper (it would
+/// exit within a second on its own) and collect it.
+fn retire_harness_death_reaper(reaper: &mut Option<std::process::Child>) {
+    if let Some(mut reaper) = reaper.take() {
+        let _ = reaper.kill();
+        let _ = reaper.wait();
+    }
+}
 
 fn spawn_pipe_reader<R>(handle: Option<R>) -> JoinHandle<PipeCapture>
 where
@@ -332,6 +381,46 @@ fn list_dir_bounded(root: &Path, limit: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// 1j6x8: with a watched pid that is not alive, the reaper must kill the
+    /// child's process group promptly instead of leaving it orphaned.
+    #[cfg(unix)]
+    #[test]
+    fn death_reaper_kills_child_group_when_watched_process_is_gone() -> Result<(), String> {
+        use std::os::unix::process::CommandExt;
+        let mut sleeper = std::process::Command::new("/bin/sh");
+        sleeper
+            .args(["-c", "sleep 30"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        sleeper.process_group(0);
+        let mut child = sleeper.spawn().map_err(|e| format!("spawn sleeper: {e}"))?;
+        // A pid that cannot be alive: pid_max is at most 2^22 on Linux.
+        let dead_pid: u32 = 4_194_303;
+        let mut reaper = super::spawn_death_reaper_for(dead_pid, child.id())
+            .ok_or_else(|| "spawn reaper".to_string())?;
+        let started = std::time::Instant::now();
+        let mut exited = false;
+        while started.elapsed() < std::time::Duration::from_secs(10) {
+            if child
+                .try_wait()
+                .map_err(|e| format!("try_wait: {e}"))?
+                .is_some()
+            {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = reaper.wait();
+        if !exited {
+            return Err("reaper did not kill the orphaned child within 10s".to_string());
+        }
+        Ok(())
+    }
+
     use super::*;
 
     /// Proves the happy path: a fast-exiting child returns Output
