@@ -17814,9 +17814,18 @@ where
 {
     let deadline = std::time::Instant::now() + CLI_DB_QUERY_RETRY_TIMEOUT;
     let mut backoff = Duration::from_millis(4);
+    // negs9: a failure raised by the row-mapping callback is NOT engine
+    // contention, even when its text resembles one ("busy"/"locked"), and
+    // must never cause the query — and the callback — to be replayed.
+    let callback_failed = std::cell::Cell::new(false);
     loop {
-        match conn.query_row_map(sql, params, |row| map(row)) {
+        callback_failed.set(false);
+        let mapped = conn.query_row_map(sql, params, |row| {
+            map(row).inspect_err(|_| callback_failed.set(true))
+        });
+        match mapped {
             Ok(value) => return Ok(value),
+            Err(err) if callback_failed.get() => return Err(err),
             Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => {
                 let now = std::time::Instant::now();
                 if now >= deadline {
@@ -17845,9 +17854,16 @@ where
 {
     let deadline = std::time::Instant::now() + CLI_DB_QUERY_RETRY_TIMEOUT;
     let mut backoff = Duration::from_millis(4);
+    // negs9: callback failures are propagated exactly once, never replayed.
+    let callback_failed = std::cell::Cell::new(false);
     loop {
-        match conn.query_map_collect(sql, params, |row| map(row)) {
+        callback_failed.set(false);
+        let mapped = conn.query_map_collect(sql, params, |row| {
+            map(row).inspect_err(|_| callback_failed.set(true))
+        });
+        match mapped {
             Ok(values) => return Ok(values),
+            Err(err) if callback_failed.get() => return Err(err),
             Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => {
                 let now = std::time::Instant::now();
                 if now >= deadline {
@@ -17862,6 +17878,54 @@ where
             }
             Err(err) => return Err(err),
         }
+    }
+}
+
+#[cfg(test)]
+mod franken_query_retry_callback_tests {
+    use super::{franken_query_map_collect_retry, franken_query_row_map_retry};
+    use crate::franken_sync::{Connection, FrankenError};
+    use std::cell::Cell;
+
+    fn seeded_connection(dir: &std::path::Path) -> Connection {
+        let path = dir.join("callback-once.db");
+        let conn = Connection::open(path.to_string_lossy().into_owned()).expect("open");
+        conn.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t (x) VALUES (1);")
+            .expect("seed");
+        conn
+    }
+
+    /// negs9: a callback failure whose class resembles engine contention
+    /// (`Busy`) must be propagated exactly once, never replayed until the
+    /// 10s CLI retry deadline.
+    #[test]
+    fn row_map_callback_failure_is_not_replayed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let conn = seeded_connection(tmp.path());
+        let calls = Cell::new(0u32);
+        let started = std::time::Instant::now();
+        let result: Result<i64, FrankenError> =
+            franken_query_row_map_retry(&conn, "SELECT x FROM t", &[], |_row| {
+                calls.set(calls.get() + 1);
+                Err(FrankenError::Busy)
+            });
+        assert!(result.is_err());
+        assert!(calls.get().cmp(&1).is_eq(), "callback invoked {} times", calls.get());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn map_collect_callback_failure_is_not_replayed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let conn = seeded_connection(tmp.path());
+        let calls = Cell::new(0u32);
+        let result: Result<Vec<i64>, FrankenError> =
+            franken_query_map_collect_retry(&conn, "SELECT x FROM t", &[], |_row| {
+                calls.set(calls.get() + 1);
+                Err(FrankenError::Busy)
+            });
+        assert!(result.is_err());
+        assert!(calls.get().cmp(&1).is_eq(), "callback invoked {} times", calls.get());
     }
 }
 
