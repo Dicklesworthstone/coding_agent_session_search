@@ -487,6 +487,12 @@ fn cass_command(home: &Path, codex_home: &Path, args: &[&str]) -> Command {
         .env("XDG_CONFIG_HOME", home.join("xdg-config"))
         .env("XDG_CACHE_HOME", home.join("xdg-cache"))
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        // The dedicated typed storage probes (schema snapshot, contention)
+        // default to a 100ms budget; under this suite's co-load the isolated
+        // snapshot copy+open can miss it and the honest `unchecked` verdict
+        // replaces the expected typed state. Widen the budget so the gate
+        // asserts classification, not host speed.
+        .env("CASS_STORAGE_PROBE_TIMEOUT_MS", "2000")
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         .env("CASS_SEMANTIC_EMBEDDER", "hash")
         .env("NO_COLOR", "1")
@@ -2180,7 +2186,7 @@ fn assert_dedicated_surface_state(
         .ok_or_else(|| format!("{} {surface}: missing source_of_truth_risk", fixture.id))?;
     if !state.cmp(fixture.expected_state).is_eq() || !risk.cmp(fixture.expected_risk).is_eq() {
         return Err(format!(
-            "{} {surface}: observed state/risk={state}/{risk}, expected={}/{}",
+            "{} {surface}: observed state/risk={state}/{risk}, expected={}/{}; block={block}",
             fixture.id, fixture.expected_state, fixture.expected_risk
         ));
     }

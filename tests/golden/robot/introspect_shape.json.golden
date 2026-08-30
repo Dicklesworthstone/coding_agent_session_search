@@ -57330,6 +57330,17 @@
                     }
                   }
                 },
+                "manifest_recorded": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "description": {
+                      "type": "string"
+                    }
+                  }
+                },
                 "current": {
                   "type": "object",
                   "properties": {

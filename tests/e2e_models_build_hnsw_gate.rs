@@ -148,7 +148,12 @@ fn check() -> Result<(), String> {
     {
         failures.push(format!("check should name the build command: {before}"));
     }
-    if manifest_hnsw(&fixture.data_dir)?.is_some() {
+    if manifest_hnsw(&fixture.data_dir)?.is_some()
+        || before
+            .get("manifest_recorded")
+            .and_then(Value::as_bool)
+            .is_none_or(|r| r)
+    {
         failures.push("--check must not record an accelerator in the manifest".to_string());
     }
     let hnsw_path = fixture.data_dir.join(str_at(&before, "hnsw_path"));
@@ -173,6 +178,10 @@ fn check() -> Result<(), String> {
             .get("current")
             .and_then(Value::as_bool)
             .is_none_or(|c| !c)
+        || built
+            .get("manifest_recorded")
+            .and_then(Value::as_bool)
+            .is_none_or(|r| !r)
     {
         failures.push(format!(
             "build should rebuild to native_valid and publish: {built}"

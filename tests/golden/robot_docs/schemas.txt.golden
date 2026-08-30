@@ -3094,6 +3094,7 @@ schemas: (auto-generated from contract)
     - embedder_id: string
     - hnsw_path: string
     - manifest_published: boolean
+    - manifest_recorded: boolean
     - next_command: ?
     - state_after: string
     - state_before: string

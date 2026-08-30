@@ -1802,6 +1802,13 @@
           "default": "1800"
         },
         {
+          "name": "timeout",
+          "description": "Hard wall-clock budget in milliseconds (overrides CASS_TRIAGE_BUDGET_MS)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
           "name": "robot-format",
           "description": "Output format for robot mode (overrides --json when specified)",
           "arg_type": "option",
@@ -2056,6 +2063,13 @@
             "true",
             "false"
           ]
+        },
+        {
+          "name": "timeout",
+          "description": "Hard wall-clock budget in milliseconds (overrides CASS_VIEW_BUDGET_MS)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
         },
         {
           "name": "robot-format",
@@ -30446,6 +30460,10 @@
         "manifest_published": {
           "type": "boolean",
           "description": "True when an HnswRecord was written to the semantic manifest in this run"
+        },
+        "manifest_recorded": {
+          "type": "boolean",
+          "description": "True when the semantic manifest now carries a ready HnswRecord for this tier/embedder (written this run or already present)"
         },
         "current": {
           "type": "boolean",

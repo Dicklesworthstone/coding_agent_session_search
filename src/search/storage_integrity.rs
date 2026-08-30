@@ -477,6 +477,23 @@ pub(crate) fn build_readiness_storage_integrity(
 /// be classified without upgrading it. Any open/query error is inspected by
 /// concrete `FrankenError` type; text and the generic CLI retryability flag
 /// never imply contention.
+/// Wall-clock budget for [`probe_dedicated_storage_state`]'s bounded typed
+/// probes (contention / schema snapshot / sidecar shape). Defaults to 100ms so
+/// lightweight readiness surfaces stay fast; `CASS_STORAGE_PROBE_TIMEOUT_MS`
+/// (clamped to 10..=10_000) widens it on hosts where the isolated-snapshot
+/// copy + open cannot finish inside the default (observed flaking the
+/// storage-failure E2E gate under co-load: the `schema_version` stage times
+/// out and the honest-but-unclassified `unchecked`/`ok` verdict replaces
+/// `schema_drift`).
+pub(crate) fn dedicated_storage_probe_timeout() -> std::time::Duration {
+    let default_ms = 100_u64;
+    let ms = std::env::var("CASS_STORAGE_PROBE_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map_or(default_ms, |value| value.clamp(10, 10_000));
+    std::time::Duration::from_millis(ms)
+}
+
 pub(crate) fn probe_dedicated_storage_state(
     db_path: &std::path::Path,
     timeout: std::time::Duration,

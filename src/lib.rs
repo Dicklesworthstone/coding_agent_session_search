@@ -19824,7 +19824,13 @@ fn probe_state_db_strict_bounded(
     include_counts: bool,
 ) -> StateDbSnapshot {
     let display_path = db_path.display().to_string();
-    if let Some(err) = sqlite_header_preflight_error(db_path, &display_path, reason) {
+    // SQLite treats a zero-byte file as a valid, empty database; only a
+    // non-empty file that cannot carry a header is a corruption signal.
+    let zero_byte_db =
+        std::fs::metadata(db_path).is_ok_and(|meta| meta.is_file() && matches!(meta.len(), 0));
+    if !zero_byte_db
+        && let Some(err) = sqlite_header_preflight_error(db_path, &display_path, reason)
+    {
         // A truncated or non-SQLite header is a durable fault, never a
         // "temporarily busy" one, whatever the CLI error class says.
         return StateDbSnapshot {
@@ -19952,7 +19958,44 @@ fn probe_state_db_strict_worker(
     }
     set_phase("connection_close");
     let _ = close_franken_cli_owner_read_db(conn, db_path, reason);
+    if include_counts {
+        // Mirror the ordinary lane's belt-and-braces re-read: a zero count is
+        // re-checked once on a fresh strict connection (a stale snapshot must
+        // not make `cass status` report an empty archive).
+        set_phase("row_count_recheck");
+        if snapshot.conversation_count <= 0 {
+            snapshot.conversation_count = strict_owner_fresh_count(
+                db_path,
+                busy_timeout,
+                "SELECT COUNT(*) FROM conversations",
+            )
+            .unwrap_or(snapshot.conversation_count);
+        }
+        if snapshot.message_count <= 0 {
+            snapshot.message_count =
+                strict_owner_fresh_count(db_path, busy_timeout, "SELECT COUNT(*) FROM messages")
+                    .unwrap_or(snapshot.message_count);
+        }
+    }
     snapshot
+}
+
+/// One COUNT read on a fresh strict dedicated-owner connection.
+fn strict_owner_fresh_count(db_path: &Path, busy_timeout: Duration, sql: &str) -> Option<i64> {
+    use crate::franken_sync::compat::RowExt;
+
+    let mut conn =
+        crate::storage::sqlite::open_franken_owner_strict_readonly_connection_with_timeout(
+            db_path,
+            busy_timeout,
+        )
+        .ok()?;
+    let _ = conn.execute("PRAGMA query_only = 1;");
+    let count = owner_query_row_map_retry(&conn, sql, |row| row.get_typed::<i64>(0)).ok();
+    if let Err(err) = conn.close_without_checkpoint_sync() {
+        tracing::debug!(error = %err, db = %db_path.display(), "strict fresh-count close failed");
+    }
+    count
 }
 
 fn probe_state_db(
@@ -20693,7 +20736,10 @@ fn storage_integrity_value_from_state(
     if open_skipped {
         return serde_json::to_value(report).unwrap_or(serde_json::Value::Null);
     }
-    let dedicated = probe_dedicated_storage_state(db_path, Duration::from_millis(100));
+    let dedicated = probe_dedicated_storage_state(
+        db_path,
+        crate::search::storage_integrity::dedicated_storage_probe_timeout(),
+    );
     serde_json::to_value(apply_dedicated_storage_probe(report, dedicated))
         .unwrap_or(serde_json::Value::Null)
 }
@@ -25305,6 +25351,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_INDEX_INGEST_WAL_CHECKPOINT_MODE=PASSIVE|FULL|RESTART|TRUNCATE  in-run bulk WAL checkpoint mode (default TRUNCATE)".to_string(),
             "  CASS_MIGRATION_LEGACY_FTS_DROP_BUDGET_BYTES=<N>  refuse the unbounded V14 legacy-FTS teardown on archives above N bytes (default 536870912; 0 disables the refusal)".to_string(),
             "  CASS_DEFER_ANALYTICS_UPDATES=1             defer derived analytics writes during indexing; a pending legacy OMP rebuild resumes on a later run with this unset".to_string(),
+            "  CASS_STORAGE_PROBE_TIMEOUT_MS=<N>        budget for the dedicated typed storage probes on status/search/doctor (default 100; clamped 10..10000) — widen on slow hosts where schema/contention classification times out to `unchecked`".to_string(),
             "  CASS_AUTO_REFRESH=0                      disable stale-on-read catch-up (detached `cass index --background` after a stale search/pack/TUI launch)".to_string(),
             "  CASS_AUTO_REFRESH_COOLDOWN_SECS=<N>      min seconds between auto-spawned catch-up runs (default 300)".to_string(),
             "  CASS_BACKGROUND_NICE=<N>                 nice value for `cass index --background` (default 15)".to_string(),
@@ -26521,7 +26568,7 @@ fn search_lexical_self_heal_diagnosis(
         Err(err) => {
             let dedicated = crate::search::storage_integrity::probe_dedicated_storage_state(
                 db_path,
-                Duration::from_millis(100),
+                crate::search::storage_integrity::dedicated_storage_probe_timeout(),
             );
             if dedicated.busy_or_locked {
                 return Ok(Some(SearchLexicalSelfHealDiagnosis::existing_index(
@@ -86209,7 +86256,7 @@ pub(crate) fn run_doctor_impl(
     let mut storage_attestation_detail: Option<String> = None;
     let dedicated_storage_probe = crate::search::storage_integrity::probe_dedicated_storage_state(
         &db_path,
-        Duration::from_millis(100),
+        crate::search::storage_integrity::dedicated_storage_probe_timeout(),
     );
     let matching_cached_integrity_attestation =
         crate::search::storage_integrity::load_matching_integrity_attestation(&data_dir, &db_path);
@@ -97497,6 +97544,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "state_after": { "type": "string", "description": "Same vocabulary as state_before; equals state_before for check_only" },
                 "action": { "type": "string", "description": "check_only | unchanged | rebuilt" },
                 "manifest_published": { "type": "boolean", "description": "True when an HnswRecord was written to the semantic manifest in this run" },
+                "manifest_recorded": { "type": "boolean", "description": "True when the semantic manifest now carries a ready HnswRecord for this tier/embedder (written this run or already present)" },
                 "current": { "type": "boolean", "description": "True when state_after is native_valid (approximate search usable)" },
                 "next_command": { "type": ["string", "null"], "description": "cass models build-hnsw when the accelerator is not current" }
             },
@@ -116007,6 +116055,7 @@ fn run_models_build_hnsw(
                 "state_after": after.as_str(),
                 "action": action,
                 "manifest_published": manifest_published,
+                "manifest_recorded": manifest_published || manifest_records_current,
                 "current": after.is_current(),
                 "next_command": if after.is_current() {
                     serde_json::Value::Null
@@ -116028,7 +116077,15 @@ fn run_models_build_hnsw(
     );
     println!("  Accelerator: {relative_ann_path}");
     match action {
-        "check_only" => println!("  State: {}", before.as_str()),
+        "check_only" => println!(
+            "  State: {}{}",
+            before.as_str(),
+            if before.is_current() && !manifest_records_current {
+                " (native graph present but not recorded in the semantic manifest; run without --check to record it)"
+            } else {
+                ""
+            }
+        ),
         "unchanged" => println!(
             "  State: {} (already current{})",
             after.as_str(),
