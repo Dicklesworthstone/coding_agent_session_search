@@ -83597,16 +83597,82 @@ enum DoctorBoundedArchiveDbProbeOutcome {
     TimedOut { phase: &'static str },
 }
 
-/// Hard deadline for the bounded archive-DB doctor probe (#287). Matches the
-/// 30s DB-open hard timeout by default; override via
-/// `CASS_DOCTOR_DB_PROBE_TIMEOUT_SECS`.
-fn doctor_archive_db_probe_hard_timeout() -> Duration {
-    let secs = dotenvy::var("CASS_DOCTOR_DB_PROBE_TIMEOUT_SECS")
+/// Hard deadline for the bounded archive-DB doctor probe (#287).
+/// `CASS_DOCTOR_DB_PROBE_TIMEOUT_SECS` overrides it; otherwise the budget
+/// scales with the archive bundle size (ub29t / gh#374 issue 5: a fixed 30s
+/// was unmeetable on a healthy 1.4GB archive, so the probe effectively never
+/// ran at normal scale — every run reported `timeout_or_busy_spin_guard`).
+fn doctor_archive_db_probe_hard_timeout(bundle_bytes: u64) -> Duration {
+    dotenvy::var("CASS_DOCTOR_DB_PROBE_TIMEOUT_SECS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|&secs| secs > 0)
-        .unwrap_or(30);
+        .map_or_else(
+            || doctor_probe_timeout_for_bundle(bundle_bytes),
+            Duration::from_secs,
+        )
+}
+
+/// Pure size-scaled budget: 30s base plus 20s per started GiB of archive
+/// bundle (main file + WAL), capped at 10 minutes so the doctor stays
+/// bounded on multi-GB archives.
+fn doctor_probe_timeout_for_bundle(bundle_bytes: u64) -> Duration {
+    const BASE_SECS: u64 = 30;
+    const SECS_PER_GIB: u64 = 20;
+    const CAP_SECS: u64 = 600;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let started_gib = bundle_bytes.div_ceil(GIB);
+    let secs = BASE_SECS
+        .saturating_add(started_gib.saturating_mul(SECS_PER_GIB))
+        .min(CAP_SECS);
     Duration::from_secs(secs)
+}
+
+/// Archive bundle size the probe budget scales with: the main database file
+/// plus its `-wal` sidecar when present. Unreadable metadata counts as zero
+/// (the base budget still applies).
+fn doctor_archive_bundle_bytes(db_path: &Path) -> u64 {
+    let main = std::fs::metadata(db_path)
+        .ok()
+        .filter(|m| m.file_type().is_file())
+        .map_or(0, |m| m.len());
+    let wal_path = {
+        let mut name = db_path
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_default();
+        name.push("-wal");
+        db_path.with_file_name(name)
+    };
+    let wal = std::fs::metadata(wal_path)
+        .ok()
+        .filter(|m| m.file_type().is_file())
+        .map_or(0, |m| m.len());
+    main.saturating_add(wal)
+}
+
+#[cfg(test)]
+mod doctor_probe_timeout_tests {
+    use super::doctor_probe_timeout_for_bundle;
+
+    #[test]
+    fn budget_scales_with_started_gib_and_is_capped() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let secs = |bytes: u64| doctor_probe_timeout_for_bundle(bytes).as_secs();
+        // (bundle bytes, expected seconds): 30s base + 20s per started GiB,
+        // capped at 600s. 1.4GB is the reporter's healthy archive -> 70s.
+        let table = [
+            (0_u64, 30_u64),
+            (200 * 1024 * 1024, 50),
+            (1_400_000_000, 70),
+            (9 * GIB, 210),
+            (100 * GIB, 600),
+            (u64::MAX, 600),
+        ];
+        for (bytes, want) in table {
+            assert!(secs(bytes).cmp(&want).is_eq(), "{bytes} bytes -> {} s", secs(bytes));
+        }
+    }
 }
 
 // `PRAGMA quick_check(1)` limits the number of diagnostics returned; it does
@@ -84422,7 +84488,8 @@ pub(crate) fn run_doctor_impl(
                     // deadline-bounded worker. Known-large full-page integrity
                     // PRAGMAs are deferred before execution because a thread timeout
                     // cannot cancel FrankenSQLite's synchronous PRAGMA executor.
-                    let probe_timeout = doctor_archive_db_probe_hard_timeout();
+                    let probe_timeout =
+                        doctor_archive_db_probe_hard_timeout(doctor_archive_bundle_bytes(&db_path));
                     match run_bounded_doctor_archive_db_probe(conn, &db_path, probe_timeout) {
                         DoctorBoundedArchiveDbProbeOutcome::Completed(probe) => {
                             if let (Some(conv_count), Some(msg_count)) =
