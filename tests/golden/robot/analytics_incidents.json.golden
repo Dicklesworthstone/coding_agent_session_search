@@ -126,7 +126,7 @@
           "argv": [
             "cass",
             "--db",
-            "/private[TEST_HOME]/analytics-incidents.db",
+            "[TEST_HOME]/analytics-incidents.db",
             "view",
             "[TEST_HOME]/sessions/codex-primary.jsonl",
             "--source",
@@ -135,7 +135,7 @@
             "1",
             "--json"
           ],
-          "display": "cass --db /private[TEST_HOME]/analytics-incidents.db view [TEST_HOME]/sessions/codex-primary.jsonl --source local --conversation-id 1 --json"
+          "display": "cass --db [TEST_HOME]/analytics-incidents.db view [TEST_HOME]/sessions/codex-primary.jsonl --source local --conversation-id 1 --json"
         }
       },
       {
@@ -170,7 +170,7 @@
           "argv": [
             "cass",
             "--db",
-            "/private[TEST_HOME]/analytics-incidents.db",
+            "[TEST_HOME]/analytics-incidents.db",
             "view",
             "/remote/archive/remote-session.jsonl",
             "--source",
@@ -179,7 +179,7 @@
             "2",
             "--json"
           ],
-          "display": "cass --db /private[TEST_HOME]/analytics-incidents.db view /remote/archive/remote-session.jsonl --source remote-fixture --conversation-id 2 --json"
+          "display": "cass --db [TEST_HOME]/analytics-incidents.db view /remote/archive/remote-session.jsonl --source remote-fixture --conversation-id 2 --json"
         }
       }
     ],

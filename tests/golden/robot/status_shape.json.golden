@@ -291,10 +291,10 @@
               "type": "integer"
             },
             "controller_loadavg_high_watermark_1m": {
-              "type": "null"
+              "type": "number"
             },
             "controller_loadavg_low_watermark_1m": {
-              "type": "null"
+              "type": "number"
             },
             "runtime": {
               "type": "null"
@@ -714,10 +714,10 @@
               "type": "integer"
             },
             "memory_total_bytes": {
-              "type": "null"
+              "type": "integer"
             },
             "memory_available_bytes": {
-              "type": "null"
+              "type": "integer"
             }
           }
         },

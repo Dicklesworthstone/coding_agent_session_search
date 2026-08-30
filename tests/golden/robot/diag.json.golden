@@ -1,8 +1,8 @@
 {
   "version": "[VERSION]",
   "platform": {
-    "os": "macos",
-    "arch": "aarch64"
+    "os": "[OS]",
+    "arch": "[ARCH]"
   },
   "paths": {
     "data_dir": "[TEST_HOME]/coding-agent-search",

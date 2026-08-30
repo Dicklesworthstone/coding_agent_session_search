@@ -492,6 +492,14 @@ fn normalize_live_robot_values(value: &mut Value) {
                 }
 
                 match key.as_str() {
+                    "os" | "arch" if child.is_string() => {
+                        *child = if key == "os" {
+                            json!("[OS]")
+                        } else {
+                            json!("[ARCH]")
+                        };
+                        continue;
+                    }
                     "last_snapshot" | "last_reason" => {
                         *child = json!("[LIVE_SAMPLE]");
                         continue;
@@ -917,6 +925,12 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
     //    shape-relevant and stay in the golden.
     let home_str = test_home.display().to_string();
     if !home_str.is_empty() {
+        // macOS may report the same temporary directory through its canonical
+        // `/private` alias even when `tempfile` returned the `/var/...` spelling.
+        // Replace the longer alias first so both spellings collapse to one
+        // portable fixture root instead of leaving `/private[TEST_HOME]`.
+        let private_home_str = format!("/private{home_str}");
+        out = out.replace(&private_home_str, "[TEST_HOME]");
         out = out.replace(&home_str, "[TEST_HOME]");
     }
 
@@ -2419,13 +2433,46 @@ fn doctor_json_matches_golden() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn status_shape_matches_golden() {
+fn status_shape_matches_golden() -> Result<(), &'static str> {
     let test_home = tempfile::tempdir().expect("create temp home");
     let mut status = capture_robot_json_value(
         test_home.path(),
         &["status", "--json"],
         ExpectStatus::ExitOk,
     );
+    // The load-average controller is Linux-only by default, so these fields
+    // are numbers on Linux and null elsewhere. Validate that runtime contract,
+    // then pin one representative number so the shape golden is portable.
+    for (pointer, representative) in [
+        (
+            "/rebuild/pipeline/controller_loadavg_high_watermark_1m",
+            121.0,
+        ),
+        (
+            "/rebuild/pipeline/controller_loadavg_low_watermark_1m",
+            120.0,
+        ),
+    ] {
+        let Some(value) = status.pointer_mut(pointer) else {
+            return Err("status shape fixture missing a load-average controller field");
+        };
+        if !(value.is_null() || value.is_number()) {
+            return Err("status shape fixture load-average field was not null|number");
+        }
+        *value = json!(representative);
+    }
+    for pointer in [
+        "/topology_budget/topology/memory_total_bytes",
+        "/topology_budget/topology/memory_available_bytes",
+    ] {
+        let Some(value) = status.pointer_mut(pointer) else {
+            return Err("status shape fixture missing a topology memory field");
+        };
+        if !(value.is_null() || value.is_u64()) {
+            return Err("status shape fixture topology memory field was not null|u64");
+        }
+        *value = json!(536_870_912_u64);
+    }
     // Keep the warnings array item schema pinned even when this fixture has no
     // warning instances.
     if let Some(warnings) = status
@@ -2438,6 +2485,7 @@ fn status_shape_matches_golden() {
     let canonical =
         serde_json::to_string_pretty(&json_value_schema(&status)).expect("pretty-print JSON");
     assert_golden("robot/status_shape.json.golden", &canonical);
+    Ok(())
 }
 
 #[test]
