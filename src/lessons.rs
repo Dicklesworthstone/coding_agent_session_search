@@ -513,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn independent_lessons_on_same_topic_remain_active() {
+    fn independent_lessons_on_same_topic_remain_active() -> Result<(), &'static str> {
         let g = LessonGraph::build(vec![
             candidate(
                 "search",
@@ -533,18 +533,21 @@ mod tests {
             ),
         ]);
 
-        assert_eq!(g.summary.total, 2);
-        assert_eq!(g.summary.active, 2);
-        assert_eq!(g.summary.superseded, 0);
-        assert!(
-            g.lessons
-                .iter()
-                .all(|lesson| lesson.status == LessonStatus::Active)
-        );
+        if g.summary.total != 2 || g.summary.active != 2 || g.summary.superseded != 0 {
+            return Err("independent same-topic lessons must both remain active");
+        }
+        if !g
+            .lessons
+            .iter()
+            .all(|lesson| lesson.status == LessonStatus::Active)
+        {
+            return Err("independent same-topic lessons must retain active status");
+        }
+        Ok(())
     }
 
     #[test]
-    fn newer_gotcha_does_not_supersede_failed_approach() {
+    fn newer_gotcha_does_not_supersede_failed_approach() -> Result<(), &'static str> {
         let g = LessonGraph::build(vec![
             candidate(
                 "search",
@@ -564,12 +567,15 @@ mod tests {
             ),
         ]);
 
-        assert_eq!(g.summary.active, 2);
-        assert_eq!(g.summary.superseded, 0);
+        if g.summary.active != 2 || g.summary.superseded != 0 {
+            return Err("a newer gotcha must not supersede a failed approach");
+        }
+        Ok(())
     }
 
     #[test]
-    fn one_shared_topical_word_does_not_supersede_unrelated_failed_approach() {
+    fn one_shared_topical_word_does_not_supersede_unrelated_failed_approach()
+    -> Result<(), &'static str> {
         let g = LessonGraph::build(vec![
             candidate(
                 "search",
@@ -589,16 +595,21 @@ mod tests {
             ),
         ]);
 
-        assert_eq!(g.summary.active, 2);
-        assert_eq!(g.summary.superseded, 0);
+        if g.summary.active != 2 || g.summary.superseded != 0 {
+            return Err("one shared topical word must not establish replacement context");
+        }
+        Ok(())
     }
 
     #[test]
-    fn redaction_placeholders_do_not_create_supersession_overlap() {
-        assert!(!summaries_share_replacement_context(
+    fn redaction_placeholders_do_not_create_supersession_overlap() -> Result<(), &'static str> {
+        if summaries_share_replacement_context(
             "failed at <home> for <email>",
-            "decision at <home> for <email>"
-        ));
+            "decision at <home> for <email>",
+        ) {
+            return Err("redaction placeholders must not establish replacement context");
+        }
+        Ok(())
     }
 
     #[test]
@@ -638,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn record_serializes_only_the_explicit_candidate_metadata() {
+    fn record_serializes_only_the_explicit_candidate_metadata() -> Result<(), &'static str> {
         // Redaction is the caller's contract. The graph neither invents a hidden
         // raw-text field nor claims to sanitize the explicit metadata itself.
         let mut c = candidate(
@@ -651,19 +662,20 @@ mod tests {
         );
         c.applies_to.push("src/storage".to_string());
         let rec = LessonRecord::from_candidate(c);
-        assert_eq!(rec.summary, "REDACTED-SUMMARY");
-        let value = serde_json::to_value(&rec).unwrap();
-        assert_eq!(value["summary"], "REDACTED-SUMMARY");
-        let mut keys: Vec<&str> = value
+        if rec.summary != "REDACTED-SUMMARY" {
+            return Err("record must preserve the redacted summary");
+        }
+        let value = serde_json::to_value(&rec).map_err(|_| "record must serialize")?;
+        if value.get("summary").and_then(serde_json::Value::as_str) != Some("REDACTED-SUMMARY") {
+            return Err("serialized record must preserve the redacted summary");
+        }
+        let object = value
             .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
+            .ok_or("serialized record must be a JSON object")?;
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
         keys.sort_unstable();
-        assert_eq!(
-            keys,
-            vec![
+        if keys
+            != [
                 "applies_to",
                 "confidence",
                 "freshness_ms",
@@ -676,11 +688,15 @@ mod tests {
                 "summary",
                 "topic",
             ]
-        );
+        {
+            return Err("serialized record exposed an unexpected metadata field");
+        }
+        Ok(())
     }
 
     #[test]
-    fn duplicate_candidates_union_applicability_independent_of_input_order() {
+    fn duplicate_candidates_union_applicability_independent_of_input_order()
+    -> Result<(), &'static str> {
         let mut first = candidate(
             "storage",
             LessonKind::Gotcha,
@@ -702,18 +718,20 @@ mod tests {
 
         let forward = LessonGraph::build(vec![first.clone(), second.clone()]);
         let reverse = LessonGraph::build(vec![second, first]);
-        assert_eq!(
-            forward, reverse,
-            "candidate order must not change the graph"
-        );
-        assert_eq!(
-            forward.lessons[0].applies_to,
-            vec![
-                "src/indexer".to_string(),
-                "src/storage".to_string(),
-                "tests/storage".to_string(),
-            ]
-        );
+        if forward != reverse {
+            return Err("candidate order must not change the graph");
+        }
+        let Some(lesson) = forward.lessons.first() else {
+            return Err("deduplicated graph must contain the merged lesson");
+        };
+        if lesson.applies_to.iter().map(String::as_str).ne([
+            "src/indexer",
+            "src/storage",
+            "tests/storage",
+        ]) {
+            return Err("duplicate candidates must union, sort, and deduplicate applicability");
+        }
+        Ok(())
     }
 
     #[test]
