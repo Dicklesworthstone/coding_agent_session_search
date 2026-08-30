@@ -430,10 +430,38 @@ fn capabilities_are_self_describing_for_agents() {
         "CASS_TRACE_MAX_EVENTS",
         "CASS_OMP_DATA_ROOT",
         "PI_SESSIONS_DIR",
+        "CASS_STATUS_BUDGET_MS",
+        "CASS_DOCTOR_BUDGET_MS",
+        "CASS_VIEW_BUDGET_MS",
+        "CASS_SEARCH_BUDGET_MS",
+        "CASS_TRIAGE_BUDGET_MS",
+        "CASS_PACK_BUDGET_MS",
+        "CASS_FLEET_PER_HOST_BUDGET_MS",
+        "CASS_FLEET_BUDGET_MS",
     ] {
         assert!(
             env_vars.iter().any(|env_var| env_var["name"] == expected),
             "capabilities should include env var {expected}"
+        );
+    }
+    for (name, expected_default) in [
+        ("CASS_STATUS_BUDGET_MS", "8000"),
+        ("CASS_DOCTOR_BUDGET_MS", "8000"),
+        ("CASS_VIEW_BUDGET_MS", "10000"),
+        ("CASS_SEARCH_BUDGET_MS", "120000"),
+        ("CASS_TRIAGE_BUDGET_MS", "8000"),
+        ("CASS_PACK_BUDGET_MS", "10000"),
+        ("CASS_FLEET_PER_HOST_BUDGET_MS", "8000"),
+        ("CASS_FLEET_BUDGET_MS", "60000"),
+    ] {
+        let capability = env_vars
+            .iter()
+            .find(|env_var| env_var["name"] == name)
+            .expect("budget environment variable should be advertised");
+        assert_eq!(
+            capability["default"].as_str(),
+            Some(expected_default),
+            "capabilities should advertise the runtime default for {name}"
         );
     }
     let pi_sessions_dir = env_vars
@@ -2291,6 +2319,14 @@ fn robot_docs_env_lists_key_vars_and_no_ansi() {
         "CODING_AGENT_SEARCH_NO_UPDATE_PROMPT",
         "CASS_DATA_DIR",
         "TUI_HEADLESS",
+        "CASS_STATUS_BUDGET_MS",
+        "CASS_DOCTOR_BUDGET_MS",
+        "CASS_VIEW_BUDGET_MS",
+        "CASS_SEARCH_BUDGET_MS",
+        "CASS_TRIAGE_BUDGET_MS",
+        "CASS_PACK_BUDGET_MS",
+        "CASS_FLEET_PER_HOST_BUDGET_MS",
+        "CASS_FLEET_BUDGET_MS",
     ] {
         assert!(stdout.contains(needle), "env topic should include {needle}");
     }
@@ -5744,37 +5780,33 @@ fn implicit_robot_pack_query_uses_pack_when_pack_only_flags_present() {
 }
 
 #[test]
-fn timed_out_robot_pack_preserves_evidence_and_names_shed_work() -> Result<(), Box<dyn Error>> {
+fn timed_out_robot_pack_returns_bounded_partial_and_names_shed_work() -> Result<(), Box<dyn Error>>
+{
     let data_dir = isolated_search_demo_data()?;
-    // The scenario needs BOTH margins to hold, or the assertions below cannot
-    // mean what they say:
-    //   budget > cold pre-search + search   -> search completes, so evidence EXISTS
-    //   delay  > budget                     -> the budget trips AFTER evidence exists
-    //
-    // The original 250ms/350ms pair satisfied neither once cold-start pre-search
-    // work (refresh + self-heal on a freshly copied fixture) grew past 250ms:
-    // `search` was shed BEFORE it ran, so the payload had no evidence to preserve
-    // and this test failed while never once exercising the contract it names.
-    // Measured on a cold fixture, the injected delay was irrelevant — 250ms with
-    // NO delay fails identically.
-    //
-    // 3000/6000 clears both margins with room and was verified reachable on three
-    // consecutive cold runs (timed_out=true AND evidence=1). The assertions are
-    // unchanged; only the timing parameters moved.
+    let started = std::time::Instant::now();
     let output = base_cmd()
-        .env("CASS_PACK_BUDGET_MS", "3000")
-        .env("CASS_TEST_PACK_SLOW_MS", "6000")
+        .env("CASS_PACK_BUDGET_MS", "100")
+        .env("CASS_TEST_PACK_SLOW_MS", "2000")
         .args([
             "pack",
             "hello",
             "--json",
             "--mode",
             "lexical",
+            "--agent",
+            "codex",
+            "--source",
+            "local",
+            "--limit",
+            "7",
             "--explain-selection",
             "--data-dir",
             data_dir.path().to_str().ok_or("non-utf8 data dir")?,
         ])
         .output()?;
+    if started.elapsed() >= std::time::Duration::from_millis(1500) {
+        return Err("pack command waited for the simulated two-second search stall".into());
+    }
     if !output.status.success() {
         return Err(format!(
             "timed-out pack failed: status={:?}; stderr={}",
@@ -5791,22 +5823,300 @@ fn timed_out_robot_pack_preserves_evidence_and_names_shed_work() -> Result<(), B
     if budget["timed_out"] != true {
         return Err(format!("pack timeout was not reported: {budget}").into());
     }
-    if !payload["evidence"]
+    if payload["evidence"]
         .as_array()
-        .is_some_and(|evidence| !evidence.is_empty())
+        .is_none_or(|evidence| !evidence.is_empty())
     {
-        return Err("pack timeout discarded completed evidence".into());
+        return Err("timed-out core search must not invent completed evidence".into());
     }
-    if !skipped
-        .iter()
-        .any(|section| section == "selection_explanations")
-    {
-        return Err(format!("pack timeout omitted its shed selection work: {budget}").into());
+    if payload["query"]["text"] != "hello" {
+        return Err("pack timeout discarded the requested query identity".into());
+    }
+    if !["search", "selection_explanations"].iter().all(|expected| {
+        skipped
+            .iter()
+            .any(|section| section.as_str() == Some(*expected))
+    }) {
+        return Err(format!("pack timeout omitted shed work: {budget}").into());
     }
     if payload["_meta"]["partial"] != true
-        || budget["recommended_next_probe"] != "cass health --json"
+        || !budget["recommended_next_probe"]
+            .as_str()
+            .is_some_and(|probe| {
+                probe.starts_with("cass pack ")
+                    && probe.contains("--agent codex")
+                    && probe.contains("--source local")
+                    && probe.contains("--limit 7")
+                    && probe.contains("--data-dir")
+            })
     {
         return Err(format!("pack partial metadata is inconsistent: {payload}").into());
+    }
+    Ok(())
+}
+
+#[test]
+fn timed_out_robot_pack_setup_returns_bounded_partial_before_asset_validation_finishes()
+-> Result<(), Box<dyn Error>> {
+    let data_dir = isolated_search_demo_data()?;
+    let started = std::time::Instant::now();
+    let output = base_cmd()
+        .env("CASS_TEST_SEARCH_SETUP_SLOW_MS", "2000")
+        .args([
+            "pack",
+            "hello",
+            "--json",
+            "--mode",
+            "lexical",
+            "--timeout",
+            "120",
+            "--data-dir",
+            data_dir.path().to_str().ok_or("non-utf8 data dir")?,
+        ])
+        .output()?;
+    if started.elapsed() >= std::time::Duration::from_millis(1500) {
+        return Err("pack waited for the simulated two-second search-setup stall".into());
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "timed-out pack setup failed: status={:?}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+
+    let payload: Value = serde_json::from_slice(&output.stdout)?;
+    let budget = &payload["budget"];
+    let skipped = budget["skipped_sections"]
+        .as_array()
+        .ok_or("pack setup skipped_sections is not an array")?;
+    if budget["timed_out"] != true || budget["budget_ms"] != 120 {
+        return Err(format!("pack setup timeout metadata was false: {budget}").into());
+    }
+    for section in ["search_setup", "search"] {
+        if !skipped.iter().any(|value| value == section) {
+            return Err(format!("pack setup timeout omitted {section}: {budget}").into());
+        }
+    }
+    if payload["query"]["text"] != "hello"
+        || payload["evidence"]
+            .as_array()
+            .is_none_or(|evidence| !evidence.is_empty())
+        || payload["_meta"]["partial"] != true
+    {
+        return Err(format!(
+            "pack setup timeout lost request identity or fabricated evidence: {payload}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn blocking_sessions_file_pack_returns_bounded_partial_without_fabricated_evidence()
+-> Result<(), Box<dyn Error>> {
+    let data_dir = isolated_search_demo_data()?;
+    let sessions_fifo = data_dir.path().join("pack-sessions.fifo");
+    let mkfifo = std::process::Command::new("mkfifo")
+        .arg(&sessions_fifo)
+        .status()?;
+    if !mkfifo.success() {
+        return Err(format!("mkfifo failed with status {mkfifo:?}").into());
+    }
+
+    let started = std::time::Instant::now();
+    let output = base_cmd()
+        .timeout(std::time::Duration::from_secs(3))
+        .args([
+            "pack",
+            "hello",
+            "--json",
+            "--mode",
+            "lexical",
+            "--timeout",
+            "120",
+            "--sessions-from",
+        ])
+        .arg(&sessions_fifo)
+        .args(["--data-dir"])
+        .arg(data_dir.path())
+        .output()?;
+    if started.elapsed() >= std::time::Duration::from_millis(1500) {
+        return Err("pack waited for the blocking sessions FIFO".into());
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "FIFO-scoped pack failed: status={:?}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+
+    let payload: Value = serde_json::from_slice(&output.stdout)?;
+    let budget = &payload["budget"];
+    let skipped = budget["skipped_sections"]
+        .as_array()
+        .ok_or("pack FIFO skipped_sections is not an array")?;
+    if budget["timed_out"] != true {
+        return Err(format!("pack FIFO timeout was not reported: {budget}").into());
+    }
+    for section in ["sessions_from", "search"] {
+        if !skipped.iter().any(|value| value == section) {
+            return Err(format!("pack FIFO timeout omitted {section}: {budget}").into());
+        }
+    }
+    if payload["evidence"]
+        .as_array()
+        .is_none_or(|evidence| !evidence.is_empty())
+    {
+        return Err(format!("pack FIFO timeout fabricated evidence: {payload}").into());
+    }
+    let recommendation = budget["recommended_next_probe"]
+        .as_str()
+        .ok_or("pack FIFO timeout omitted its file-scope retry")?;
+    if !recommendation.contains("--sessions-from")
+        || !recommendation.contains(&sessions_fifo.display().to_string())
+    {
+        return Err(
+            format!("pack FIFO retry lost its session file scope: {recommendation}").into(),
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn timed_out_robot_pack_renderer_emits_fixed_size_partial_fallback() -> Result<(), Box<dyn Error>> {
+    let data_dir = isolated_search_demo_data()?;
+    let started = std::time::Instant::now();
+    let output = base_cmd()
+        .env("CASS_TEST_PACK_RENDER_SLOW_MS", "2000")
+        .args([
+            "pack",
+            "hello",
+            "--json",
+            "--mode",
+            "lexical",
+            "--timeout",
+            "500",
+            "--data-dir",
+            data_dir.path().to_str().ok_or("non-utf8 data dir")?,
+        ])
+        .output()?;
+    if started.elapsed() >= std::time::Duration::from_millis(1500) {
+        return Err("pack command waited for the simulated two-second render stall".into());
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "timed-out pack renderer failed: status={:?}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let payload: Value = serde_json::from_slice(&output.stdout)?;
+    let budget = &payload["budget"];
+    if budget["timed_out"] != true
+        || !budget["skipped_sections"]
+            .as_array()
+            .is_some_and(|sections| {
+                sections
+                    .iter()
+                    .any(|section| section == "trust_correlation")
+                    && sections
+                        .iter()
+                        .any(|section| section == "answer_pack_render")
+            })
+    {
+        return Err(format!(
+            "pack renderer timeout did not name the advisory work it shed: {budget}"
+        )
+        .into());
+    }
+    if payload["realized"]["candidate_count"]
+        .as_u64()
+        .is_none_or(|count| count == 0)
+        || payload["realized"]["selected_evidence_count"] != 0
+        || payload["evidence"]
+            .as_array()
+            .is_none_or(|evidence| !evidence.is_empty())
+    {
+        return Err(format!(
+            "pack renderer timeout must retain candidate accounting without traversing the timed-out evidence render: {payload}"
+        )
+        .into());
+    }
+    if payload["_meta"]["partial"] != true
+        || !budget["recommended_next_probe"]
+            .as_str()
+            .is_some_and(|probe| {
+                probe.starts_with("cass pack ")
+                    && probe.contains("--data-dir")
+                    && probe.contains("--timeout 1000")
+            })
+    {
+        return Err(format!(
+            "pack renderer timeout emitted inconsistent partial metadata: {payload}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[test]
+fn timed_out_robot_pack_planner_does_not_fabricate_selection() -> Result<(), Box<dyn Error>> {
+    let data_dir = isolated_search_demo_data()?;
+    let started = std::time::Instant::now();
+    let output = base_cmd()
+        .env("CASS_TEST_PACK_PLAN_SLOW_MS", "2000")
+        .args([
+            "pack",
+            "hello",
+            "--json",
+            "--mode",
+            "lexical",
+            "--timeout",
+            "500",
+            "--data-dir",
+            data_dir.path().to_str().ok_or("non-utf8 data dir")?,
+        ])
+        .output()?;
+    if started.elapsed() >= std::time::Duration::from_millis(1500) {
+        return Err("pack command waited for the simulated two-second planner stall".into());
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "timed-out pack planner failed: status={:?}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let payload: Value = serde_json::from_slice(&output.stdout)?;
+    let budget = &payload["budget"];
+    if budget["timed_out"] != true
+        || !budget["skipped_sections"]
+            .as_array()
+            .is_some_and(|sections| sections.iter().any(|section| section == "pack_planning"))
+    {
+        return Err(
+            format!("pack planner timeout did not name the work it skipped: {budget}").into(),
+        );
+    }
+    if payload["realized"]["candidate_count"]
+        .as_u64()
+        .is_none_or(|count| count == 0)
+        || payload["realized"]["selected_evidence_count"] != 0
+        || payload["evidence"]
+            .as_array()
+            .is_none_or(|evidence| !evidence.is_empty())
+    {
+        return Err(format!(
+            "pack planner timeout fabricated or discarded candidate accounting: {payload}"
+        )
+        .into());
     }
     Ok(())
 }

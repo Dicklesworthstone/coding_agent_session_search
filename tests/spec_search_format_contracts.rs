@@ -19,6 +19,7 @@
 use std::error::Error;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use tempfile::TempDir;
@@ -83,6 +84,23 @@ fn copy_search_demo_fixture(test_home: &Path) -> Result<PathBuf, Box<dyn Error>>
                 fs::create_dir_all(parent)?;
             }
             fs::copy(entry.path(), &dst)?;
+        }
+    }
+    // The lexical checkpoint intentionally binds a generation to its source
+    // database. This isolated copy is byte-identical except for location, so
+    // rewrite only that copied locator; otherwise the production robot
+    // no-repair guard correctly refuses the mismatch before search begins.
+    let copied_db_path = dst_root.join("agent_search.db");
+    for entry in WalkDir::new(dst_root.join("index")) {
+        let entry = entry?;
+        if entry.file_type().is_file()
+            && entry.file_name() == std::ffi::OsStr::new(".lexical-rebuild-state.json")
+        {
+            let mut checkpoint: serde_json::Value =
+                serde_json::from_slice(&fs::read(entry.path())?)?;
+            checkpoint["db"]["db_path"] =
+                serde_json::Value::String(copied_db_path.display().to_string());
+            fs::write(entry.path(), serde_json::to_vec_pretty(&checkpoint)?)?;
         }
     }
     Ok(dst_root)
@@ -201,13 +219,13 @@ fn json_format_parses_as_a_single_json_document() -> TestResult {
 }
 
 #[test]
-fn timed_out_search_preserves_hits_and_names_shed_sections() -> TestResult {
+fn timed_out_search_returns_before_slow_operation_and_names_shed_sections() -> TestResult {
     let tmp = TempDir::new()?;
     let data_dir = copy_search_demo_fixture(tmp.path())?;
+    let started = Instant::now();
     let output = Command::cargo_bin("cass")?
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .env("CASS_SEARCH_BUDGET_MS", "250")
-        .env("CASS_TEST_SEARCH_SLOW_MS", "350")
+        .env("CASS_TEST_SEARCH_SLOW_MS", "2000")
         .args([
             "--color=never",
             "search",
@@ -220,10 +238,13 @@ fn timed_out_search_preserves_hits_and_names_shed_sections() -> TestResult {
             "--explain",
             "--aggregate",
             "agent",
+            "--timeout",
+            "120",
             "--data-dir",
             data_dir.to_str().ok_or("non-utf8 path")?,
         ])
         .output()?;
+    let wall_time = started.elapsed();
     ensure(
         output.status.success(),
         format!(
@@ -243,24 +264,496 @@ fn timed_out_search_preserves_hits_and_names_shed_sections() -> TestResult {
         format!("search timeout was not reported: {budget}"),
     )?;
     ensure(
-        payload["hits"]
-            .as_array()
-            .is_some_and(|hits| !hits.is_empty()),
-        "search timeout discarded completed hits",
+        payload["hits"].as_array().is_some(),
+        "search timeout did not return a valid partial hits array",
     )?;
-    for section in ["reranking", "explanation", "aggregations", "state_meta"] {
+    for section in [
+        "search",
+        "reranking",
+        "explanation",
+        "aggregations",
+        "state_meta",
+    ] {
         ensure(
             skipped.iter().any(|value| value == section),
             format!("search timeout omitted skipped section {section}: {budget}"),
         )?;
     }
     ensure(
-        budget["recommended_next_probe"] == "cass health --json",
-        "search timeout did not recommend the bounded health probe",
+        budget["recommended_next_probe"]
+            .as_str()
+            .is_some_and(|probe| probe.contains("cass search") && probe.contains("--timeout")),
+        "search timeout did not recommend a bounded search retry",
     )?;
     ensure(
         payload.get("aggregations").is_none() && payload.get("explanation").is_none(),
         "search timeout serialized work that its budget says was skipped",
     )?;
+    ensure(
+        wall_time < Duration::from_millis(1_500),
+        format!(
+            "120ms search deadline waited for the 2000ms operation delay: wall_time={wall_time:?}"
+        ),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn timed_out_search_setup_returns_partial_before_asset_validation_finishes() -> TestResult {
+    let tmp = TempDir::new()?;
+    let data_dir = copy_search_demo_fixture(tmp.path())?;
+    let started = Instant::now();
+    let output = Command::cargo_bin("cass")?
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_TEST_SEARCH_SETUP_SLOW_MS", "2000")
+        .args([
+            "--color=never",
+            "search",
+            "hello",
+            "--robot",
+            "--mode",
+            "lexical",
+            "--timeout",
+            "120",
+            "--data-dir",
+            data_dir.to_str().ok_or("non-utf8 path")?,
+        ])
+        .output()?;
+    ensure(
+        output.status.success(),
+        format!(
+            "timed-out search setup failed: status={:?}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )?;
+    ensure(
+        started.elapsed() < Duration::from_millis(1_500),
+        "search setup escaped the configured hard deadline",
+    )?;
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let skipped = payload["budget"]["skipped_sections"]
+        .as_array()
+        .ok_or_else(|| test_error("search setup skipped_sections is not an array"))?;
+    ensure(payload["budget"]["timed_out"] == true, payload.to_string())?;
+    for section in ["search_setup", "search"] {
+        ensure(
+            skipped.iter().any(|value| value == section),
+            format!("search setup timeout omitted {section}: {payload}"),
+        )?;
+    }
+    ensure(
+        payload["hits"].as_array().is_some_and(Vec::is_empty),
+        "timed-out search setup fabricated hits",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn timed_out_search_meta_preserves_completed_hits_and_names_metadata_gaps() -> TestResult {
+    let tmp = TempDir::new()?;
+    let data_dir = copy_search_demo_fixture(tmp.path())?;
+    let started = Instant::now();
+    let output = Command::cargo_bin("cass")?
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_TEST_SEARCH_META_SLOW_MS", "6000")
+        .args([
+            "--color=never",
+            "search",
+            "hello",
+            "--robot",
+            "--robot-meta",
+            "--mode",
+            "lexical",
+            "--timeout",
+            "3000",
+            "--data-dir",
+            data_dir.to_str().ok_or("non-utf8 path")?,
+        ])
+        .output()?;
+    ensure(
+        output.status.success(),
+        format!(
+            "timed-out search metadata failed: status={:?}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )?;
+    ensure(
+        started.elapsed() < Duration::from_millis(4_200),
+        "search metadata escaped the configured hard deadline",
+    )?;
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let skipped = payload["budget"]["skipped_sections"]
+        .as_array()
+        .ok_or_else(|| test_error("search metadata skipped_sections is not an array"))?;
+    ensure(
+        payload["budget"]["timed_out"] == true,
+        format!("search metadata timeout omitted timed_out=true: {payload}"),
+    )?;
+    for section in ["state_meta", "search_completeness"] {
+        ensure(
+            skipped.iter().any(|value| value == section),
+            format!("search metadata timeout omitted {section}: {payload}"),
+        )?;
+    }
+    ensure(
+        payload["hits"]
+            .as_array()
+            .is_some_and(|hits| !hits.is_empty()),
+        "advisory metadata timeout discarded completed search evidence",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn timed_out_search_trust_projection_is_shed_without_discarding_hits() -> TestResult {
+    let tmp = TempDir::new()?;
+    let data_dir = copy_search_demo_fixture(tmp.path())?;
+    let started = Instant::now();
+    let output = Command::cargo_bin("cass")?
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_TEST_SEARCH_TRUST_SLOW_MS", "6000")
+        .args([
+            "--color=never",
+            "search",
+            "hello",
+            "--robot",
+            "--robot-meta",
+            "--mode",
+            "lexical",
+            "--timeout",
+            "3000",
+            "--data-dir",
+            data_dir.to_str().ok_or("non-utf8 path")?,
+        ])
+        .output()?;
+    ensure(
+        output.status.success(),
+        format!(
+            "timed-out trust projection failed: status={:?}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )?;
+    ensure(
+        started.elapsed() < Duration::from_millis(4_200),
+        "trust projection escaped the configured hard deadline",
+    )?;
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    ensure(
+        payload["budget"]["timed_out"] == true,
+        format!("trust timeout omitted timed_out=true: {payload}"),
+    )?;
+    ensure(
+        payload["budget"]["skipped_sections"]
+            .as_array()
+            .is_some_and(|sections| sections.iter().any(|value| value == "trust_correlation")),
+        format!("trust timeout was not named: {payload}"),
+    )?;
+    ensure(
+        payload["hits"]
+            .as_array()
+            .is_some_and(|hits| !hits.is_empty()),
+        "advisory trust timeout discarded completed search evidence",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn timed_out_sessions_format_fails_closed_with_empty_stdout() -> TestResult {
+    let tmp = TempDir::new()?;
+    let data_dir = copy_search_demo_fixture(tmp.path())?;
+    let output = Command::cargo_bin("cass")?
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_TEST_SEARCH_SLOW_MS", "2000")
+        .args([
+            "--color=never",
+            "search",
+            "hello",
+            "--robot-format",
+            "sessions",
+            "--mode",
+            "lexical",
+            "--timeout",
+            "120",
+            "--data-dir",
+            data_dir.to_str().ok_or("non-utf8 path")?,
+        ])
+        .output()?;
+    ensure(
+        !output.status.success(),
+        "partial sessions stream must fail closed",
+    )?;
+    ensure(
+        output.stdout.is_empty(),
+        "partial sessions stream corrupted stdout pipeline input",
+    )?;
+    let diagnostic: serde_json::Value = serde_json::from_slice(&output.stderr)?;
+    ensure(
+        diagnostic["budget"]["timed_out"] == true,
+        format!("sessions timeout diagnostic omitted its budget: {diagnostic}"),
+    )?;
+    ensure(
+        diagnostic["budget"]["skipped_sections"]
+            .as_array()
+            .is_some_and(|sections| sections.iter().any(|value| value == "search")),
+        format!("sessions timeout diagnostic omitted search: {diagnostic}"),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn robot_search_refresh_is_deferred_to_explicit_index_command() -> TestResult {
+    let tmp = TempDir::new()?;
+    let data_dir = copy_search_demo_fixture(tmp.path())?;
+    let output = Command::cargo_bin("cass")?
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .args([
+            "--color=never",
+            "search",
+            "hello",
+            "--robot",
+            "--mode",
+            "lexical",
+            "--refresh",
+            "--data-dir",
+            data_dir.to_str().ok_or("non-utf8 path")?,
+        ])
+        .output()?;
+    ensure(
+        output.status.success(),
+        format!(
+            "robot refresh deferral failed: status={:?}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )?;
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let skipped = payload["budget"]["skipped_sections"]
+        .as_array()
+        .ok_or_else(|| test_error("robot refresh skipped_sections is not an array"))?;
+    ensure(
+        matches!(payload["budget"]["timed_out"].as_bool(), Some(false)),
+        format!("deferred refresh was misreported as a timeout: {payload}"),
+    )?;
+    ensure(
+        matches!(
+            skipped.as_slice(),
+            [section] if section.as_str().is_some_and(|value| value.eq("refresh"))
+        ),
+        format!("robot search did not isolate deferred refresh work: {payload}"),
+    )?;
+    let retry = payload["budget"]["recommended_next_probe"]
+        .as_str()
+        .ok_or_else(|| test_error("robot refresh omitted explicit index recommendation"))?;
+    ensure(
+        retry.contains("index") && retry.contains("--json") && retry.contains("--data-dir"),
+        format!("robot refresh recommendation is not dataset-scoped: {retry}"),
+    )?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn blocking_sessions_file_search_returns_bounded_partial_without_broadening_scope() -> TestResult {
+    let tmp = TempDir::new()?;
+    let data_dir = copy_search_demo_fixture(tmp.path())?;
+    let sessions_fifo = tmp.path().join("sessions.fifo");
+    let mkfifo = std::process::Command::new("mkfifo")
+        .arg(&sessions_fifo)
+        .status()?;
+    ensure(
+        mkfifo.success(),
+        format!("mkfifo failed with status {mkfifo:?}"),
+    )?;
+
+    let started = Instant::now();
+    let output = Command::cargo_bin("cass")?
+        .timeout(Duration::from_secs(3))
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .args([
+            "--color=never",
+            "search",
+            "hello",
+            "--robot",
+            "--mode",
+            "lexical",
+            "--timeout",
+            "120",
+            "--sessions-from",
+        ])
+        .arg(&sessions_fifo)
+        .args(["--data-dir"])
+        .arg(&data_dir)
+        .output()?;
+    let wall_time = started.elapsed();
+    ensure(
+        output.status.success(),
+        format!(
+            "FIFO-scoped search failed: status={:?}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )?;
+    ensure(
+        wall_time < Duration::from_millis(1_500),
+        format!("FIFO-scoped search exceeded its hard wall: {wall_time:?}"),
+    )?;
+
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let budget = &payload["budget"];
+    let skipped = budget["skipped_sections"]
+        .as_array()
+        .ok_or_else(|| test_error("search FIFO skipped_sections is not an array"))?;
+    ensure(
+        budget["timed_out"] == true,
+        format!("search FIFO timeout was not reported: {budget}"),
+    )?;
+    for section in ["sessions_from", "search"] {
+        ensure(
+            skipped.iter().any(|value| value == section),
+            format!("search FIFO timeout omitted {section}: {budget}"),
+        )?;
+    }
+    ensure(
+        payload["hits"].as_array().is_some_and(Vec::is_empty),
+        format!("search FIFO timeout broadened into archive hits: {payload}"),
+    )?;
+    let recommendation = budget["recommended_next_probe"]
+        .as_str()
+        .ok_or_else(|| test_error("search FIFO timeout omitted its file-scope retry"))?;
+    ensure(
+        recommendation.contains("--sessions-from")
+            && recommendation.contains(&sessions_fifo.display().to_string()),
+        format!("search FIFO retry lost its session file scope: {recommendation}"),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn explicit_semantic_timeout_never_substitutes_lexical_hits() -> TestResult {
+    let tmp = TempDir::new()?;
+    let data_dir = copy_search_demo_fixture(tmp.path())?;
+    let output = Command::cargo_bin("cass")?
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("CASS_TEST_SEARCH_SEMANTIC_SETUP_SLOW_MS", "2000")
+        .args([
+            "--color=never",
+            "search",
+            "hello",
+            "--robot",
+            "--robot-meta",
+            "--mode",
+            "semantic",
+            "--timeout",
+            "120",
+            "--data-dir",
+            data_dir.to_str().ok_or("non-utf8 path")?,
+        ])
+        .output()?;
+    ensure(
+        output.status.success(),
+        format!(
+            "semantic timeout failed: status={:?}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )?;
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    ensure(
+        payload["_meta"]["requested_search_mode"] == "semantic",
+        "semantic timeout lost requested mode",
+    )?;
+    ensure(
+        payload["_meta"]["search_mode"] == "semantic",
+        "semantic timeout silently substituted lexical mode",
+    )?;
+    ensure(
+        payload["_meta"]["fallback_tier"].is_null(),
+        "semantic timeout reported a lexical fallback tier",
+    )?;
+    ensure(
+        payload["_meta"]["semantic_refinement"] == false,
+        "semantic timeout claimed incomplete semantic work was completed",
+    )?;
+    ensure(
+        payload["hits"].as_array().is_some_and(Vec::is_empty),
+        "semantic timeout must not return lexical hits",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn timeout_budget_contract_is_present_in_compact_jsonl_and_toon() -> TestResult {
+    let tmp = TempDir::new()?;
+    let data_dir = copy_search_demo_fixture(tmp.path())?;
+
+    for format in ["compact", "jsonl", "toon"] {
+        let output = Command::cargo_bin("cass")?
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("CASS_TEST_SEARCH_SLOW_MS", "2000")
+            .args([
+                "--color=never",
+                "search",
+                "hello",
+                "--robot-format",
+                format,
+                "--mode",
+                "lexical",
+                "--timeout",
+                "120",
+                "--data-dir",
+                data_dir.to_str().ok_or("non-utf8 path")?,
+            ])
+            .output()?;
+        ensure(
+            output.status.success(),
+            format!(
+                "{format} timeout failed: status={:?}; stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        )?;
+        let stdout = String::from_utf8(output.stdout)?;
+        if format == "toon" {
+            ensure(
+                stdout.contains("budget")
+                    && stdout.contains("timed_out")
+                    && stdout.contains("skipped_sections")
+                    && stdout.contains("search")
+                    && stdout.contains("--robot-format toon")
+                    && !stdout.contains("&&"),
+                format!("TOON timeout omitted the budget contract:\n{stdout}"),
+            )?;
+        } else {
+            let document = if format == "jsonl" {
+                stdout
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .ok_or_else(|| test_error("JSONL timeout emitted no header"))?
+            } else {
+                stdout.trim()
+            };
+            let payload: serde_json::Value = serde_json::from_str(document)?;
+            ensure(
+                payload["budget"]["timed_out"] == true,
+                format!("{format} timeout omitted budget.timed_out"),
+            )?;
+            ensure(
+                payload["budget"]["skipped_sections"]
+                    .as_array()
+                    .is_some_and(|sections| sections.iter().any(|section| section == "search")),
+                format!("{format} timeout omitted the skipped search section"),
+            )?;
+            let retry = payload["budget"]["recommended_next_probe"]
+                .as_str()
+                .ok_or_else(|| test_error(format!("{format} timeout omitted retry command")))?;
+            ensure(
+                retry.contains(&format!("--robot-format {format}")) && !retry.contains("&&"),
+                format!("{format} retry did not preserve its encoding: {retry}"),
+            )?;
+        }
+    }
     Ok(())
 }

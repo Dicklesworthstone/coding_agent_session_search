@@ -11,6 +11,7 @@ use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
 
 use super::bucketing;
 use super::types::*;
+use crate::metric_integrity::{MetricOutcome, classify_aggregate};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -100,17 +101,65 @@ fn normalized_analytics_source_identity_value(source_id: &str, origin_host: &str
     }
 }
 
-fn breakdown_row_with_value(key: String, bucket: UsageBucket, value: i64) -> BreakdownRow {
+fn breakdown_row_with_outcome(
+    key: String,
+    bucket: UsageBucket,
+    legacy_value: i64,
+    metric_outcome: MetricOutcome,
+) -> BreakdownRow {
     BreakdownRow {
         message_count: bucket.message_count,
         key,
-        value,
+        value: legacy_value,
         bucket,
+        metric_outcome,
     }
 }
 
 fn analytics_query_error(context: &str, err: impl std::fmt::Display) -> AnalyticsError {
     AnalyticsError::Db(format!("{context}: {err}"))
+}
+
+fn exact_time_schema_error(surface: &str, detail: &str) -> AnalyticsError {
+    AnalyticsError::SchemaIncompatible(format!(
+        "{surface} requires exact millisecond timestamps, but {detail}"
+    ))
+}
+
+fn aggregate_outcome(row_count: usize, value: f64) -> MetricOutcome {
+    classify_aggregate(row_count as u64, value)
+}
+
+fn counted_metric_outcome(row_count: i64, value: f64) -> MetricOutcome {
+    if row_count < 0 {
+        MetricOutcome::InvalidInput
+    } else {
+        classify_aggregate(row_count as u64, value)
+    }
+}
+
+fn breakdown_result_outcome(rows: &[BreakdownRow]) -> MetricOutcome {
+    if rows.is_empty() {
+        return MetricOutcome::NoData;
+    }
+
+    for outcome in rows.iter().map(|row| row.metric_outcome) {
+        match outcome {
+            MetricOutcome::InvalidInput => return MetricOutcome::InvalidInput,
+            MetricOutcome::SchemaIncompatible => return MetricOutcome::SchemaIncompatible,
+            MetricOutcome::RebuildRequired => return MetricOutcome::RebuildRequired,
+            MetricOutcome::AggregateFailed => return MetricOutcome::AggregateFailed,
+            MetricOutcome::NoData => return MetricOutcome::NoData,
+            MetricOutcome::Value(_) | MetricOutcome::TrueZero => {}
+        }
+    }
+
+    aggregate_outcome(
+        rows.len(),
+        rows.iter()
+            .filter_map(|row| row.metric_outcome.as_value())
+            .sum(),
+    )
 }
 
 fn normalized_analytics_source_id_sql_expr(column: &str) -> String {
@@ -298,7 +347,9 @@ fn push_source_filter_clause(
             if local_source_ids.is_empty() {
                 parts.push("0 = 1".to_string());
             } else {
-                parts.push(format!("{normalized_source_sql} IN ({local_source_literals})"));
+                parts.push(format!(
+                    "{normalized_source_sql} IN ({local_source_literals})"
+                ));
             }
         }
         SourceFilter::Remote => {
@@ -327,13 +378,15 @@ struct RollupStats {
     last_updated: Option<i64>,
 }
 
-fn rollup_stats_from_summary_row(row: &Row) -> RollupStats {
-    RollupStats {
-        row_count: row.get_typed::<i64>(0).unwrap_or(0),
-        min_day: row.get_typed::<Option<i64>>(1).unwrap_or(None),
-        max_day: row.get_typed::<Option<i64>>(2).unwrap_or(None),
-        last_updated: row.get_typed::<Option<i64>>(3).unwrap_or(None),
-    }
+fn rollup_stats_from_summary_row(
+    row: &Row,
+) -> Result<RollupStats, crate::franken_sync::FrankenError> {
+    Ok(RollupStats {
+        row_count: row.get_typed::<i64>(0)?,
+        min_day: row.get_typed::<Option<i64>>(1)?,
+        max_day: row.get_typed::<Option<i64>>(2)?,
+        last_updated: row.get_typed::<Option<i64>>(3)?,
+    })
 }
 
 /// Time-column kind for analytics filter application.
@@ -519,7 +572,8 @@ fn message_metrics_time_sql(conn: &Connection) -> Option<String> {
         joins_available && table_has_column(conn, "messages", "created_at");
     let has_conversation_started_at =
         joins_available && table_has_column(conn, "conversations", "started_at");
-    let has_message_metrics_created_at = table_has_column(conn, "message_metrics", "created_at_ms");
+    let has_message_metrics_created_at = canonical_message_metrics_from_sql(conn).is_some()
+        && table_has_column(conn, "message_metrics", "created_at_ms");
 
     let mut timestamp_terms: Vec<&str> = Vec::new();
     if has_message_created_at {
@@ -683,9 +737,9 @@ fn query_table_stats_from_source<'a>(
     agent_column_sql: Option<String>,
     source_column_sql: String,
     time_column: Option<AnalyticsTimeColumn<'a>>,
-) -> RollupStats {
+) -> AnalyticsResult<RollupStats> {
     if !table_exists(conn, required_table) {
-        return RollupStats::default();
+        return Ok(RollupStats::default());
     }
 
     let (where_sql, params) = build_filtered_where_sql(
@@ -701,26 +755,25 @@ fn query_table_stats_from_source<'a>(
         "SELECT COUNT(*), MIN({bucket_col}), MAX({bucket_col}), {updated_expr} FROM {from_sql}{where_sql}"
     );
 
-    conn.query_row_map(&sql, &params, |row: &Row| {
-        Ok(rollup_stats_from_summary_row(row))
-    })
-    .unwrap_or_default()
+    conn.query_row_map(&sql, &params, rollup_stats_from_summary_row)
+        .map_err(|error| analytics_query_error("Analytics status aggregate failed", error))
 }
 
-fn query_scalar_i64(conn: &Connection, sql: &str, params: &[ParamValue]) -> i64 {
+fn query_scalar_i64(conn: &Connection, sql: &str, params: &[ParamValue]) -> AnalyticsResult<i64> {
     conn.query_row_map(sql, params, |row: &Row| row.get_typed(0))
-        .unwrap_or(0)
+        .map_err(|error| analytics_query_error("Analytics scalar aggregate failed", error))
 }
 
-fn query_total_messages_filtered(conn: &Connection, filter: &AnalyticsFilter) -> i64 {
+fn query_total_messages_filtered(
+    conn: &Connection,
+    filter: &AnalyticsFilter,
+) -> AnalyticsResult<i64> {
     if !table_exists(conn, "messages") || !table_exists(conn, "conversations") {
-        return 0;
+        return Ok(0);
     }
 
     let has_agents = table_exists(conn, "agents");
     let canonical_message_metrics_sql = canonical_message_metrics_from_sql(conn);
-    let has_message_metrics_created_at = canonical_message_metrics_sql.is_some()
-        && table_has_column(conn, "message_metrics", "created_at_ms");
     let mut from_sql = if has_agents {
         "messages m JOIN conversations c ON c.id = m.conversation_id LEFT JOIN agents a ON a.id = c.agent_id"
             .to_string()
@@ -737,18 +790,22 @@ fn query_total_messages_filtered(conn: &Connection, filter: &AnalyticsFilter) ->
     } else {
         normalized_analytics_source_id_sql_expr("c.source_id")
     };
-    let message_time_sql = if has_message_metrics_created_at {
-        "COALESCE(m.created_at, mm.created_at_ms, c.started_at, 0)"
-    } else {
-        "COALESCE(m.created_at, c.started_at, 0)"
-    };
+    let message_time_sql = message_metrics_time_sql(conn);
+    if analytics_requires_exact_raw_time_filter(filter) && message_time_sql.is_none() {
+        return Err(exact_time_schema_error(
+            "analytics message count",
+            "no message-level timestamp column is available",
+        ));
+    }
     let (where_sql, params) = build_filtered_where_sql(
         conn,
         filter,
         Some("c.workspace_id"),
         has_agents.then(|| normalized_analytics_agent_sql_expr("a.slug")),
         source_sql,
-        Some(AnalyticsTimeColumn::TimestampMs(message_time_sql)),
+        message_time_sql
+            .as_deref()
+            .map(AnalyticsTimeColumn::TimestampMs),
     );
 
     query_scalar_i64(
@@ -762,13 +819,19 @@ fn query_message_metrics_filtered_count(
     conn: &Connection,
     filter: &AnalyticsFilter,
     extra_condition: Option<&str>,
-) -> i64 {
+) -> AnalyticsResult<i64> {
     if !table_exists(conn, "message_metrics") {
-        return 0;
+        return Ok(0);
     }
 
     let (from_sql, source_sql) = message_metrics_from_sql_and_source_sql(conn);
     let message_metrics_time_sql = message_metrics_time_sql(conn);
+    if analytics_requires_exact_raw_time_filter(filter) && message_metrics_time_sql.is_none() {
+        return Err(exact_time_schema_error(
+            "analytics message-metrics coverage",
+            "no message-level timestamp column is available",
+        ));
+    }
     let time_column = message_metrics_time_sql
         .as_deref()
         .map(AnalyticsTimeColumn::TimestampMs)
@@ -796,13 +859,19 @@ fn query_token_usage_filtered_count(
     conn: &Connection,
     filter: &AnalyticsFilter,
     extra_condition: Option<&str>,
-) -> i64 {
+) -> AnalyticsResult<i64> {
     if !table_exists(conn, "token_usage") {
-        return 0;
+        return Ok(0);
     }
 
     let (from_sql, agent_sql, source_sql) = token_usage_from_sql_agent_and_source_sql(conn);
     let token_usage_time_sql = token_usage_time_sql(conn);
+    if analytics_requires_exact_raw_time_filter(filter) && token_usage_time_sql.is_none() {
+        return Err(exact_time_schema_error(
+            "analytics token-usage coverage",
+            "no token-usage timestamp column is available",
+        ));
+    }
     let time_column = token_usage_time_sql
         .as_deref()
         .map(AnalyticsTimeColumn::TimestampMs)
@@ -845,7 +914,8 @@ fn token_usage_supports_track_b_metric(conn: &Connection, metric: Metric) -> boo
         Metric::ContentEstTotal => table_has_column(conn, "token_usage", "content_chars"),
         Metric::ToolCalls => table_has_column(conn, "token_usage", "tool_call_count"),
         Metric::EstimatedCostUsd => table_has_column(conn, "token_usage", "estimated_cost_usd"),
-        Metric::PlanCount | Metric::CoveragePct | Metric::MessageCount => true,
+        Metric::PlanCount => false,
+        Metric::CoveragePct | Metric::MessageCount => true,
     }
 }
 
@@ -947,11 +1017,20 @@ fn query_track_a_rollup_status_with_message_metrics_fallback(
     table: &str,
     bucket_col: &str,
     filter: &AnalyticsFilter,
-) -> RollupStats {
+) -> AnalyticsResult<RollupStats> {
     if !table_exists(conn, table) {
-        return RollupStats::default();
+        return Ok(RollupStats::default());
     }
 
+    let rollup_time_column = match bucket_col {
+        "hour_id" => AnalyticsTimeColumn::Hour("hour_id"),
+        "day_id" => AnalyticsTimeColumn::Day("day_id"),
+        _ => {
+            return Err(AnalyticsError::SchemaIncompatible(format!(
+                "unsupported Track A rollup bucket column '{bucket_col}'"
+            )));
+        }
+    };
     let default_stats = || {
         query_table_stats_from_source(
             conn,
@@ -963,21 +1042,25 @@ fn query_track_a_rollup_status_with_message_metrics_fallback(
             Some("workspace_id"),
             Some(normalized_analytics_agent_sql_expr("agent_slug")),
             normalized_analytics_source_id_sql_expr("source_id"),
-            Some(match bucket_col {
-                "hour_id" => AnalyticsTimeColumn::Hour("hour_id"),
-                "day_id" => AnalyticsTimeColumn::Day("day_id"),
-                _ => return RollupStats::default(),
-            }),
+            Some(rollup_time_column),
         )
     };
 
+    let raw_schema_available = table_exists(conn, "message_metrics")
+        && table_exists(conn, "messages")
+        && table_exists(conn, "conversations")
+        && table_has_column(conn, "message_metrics", "message_id")
+        && table_has_column(conn, "message_metrics", bucket_col);
+    if analytics_requires_exact_raw_time_filter(filter) && !raw_schema_available {
+        return Err(exact_time_schema_error(
+            "analytics status Track A rollup coverage",
+            "the canonical message/message_metrics join is unavailable",
+        ));
+    }
+
     if !(track_a_timeseries_requires_source_fallback(filter)
         || analytics_requires_exact_raw_time_filter(filter))
-        || !table_exists(conn, "message_metrics")
-        || !table_exists(conn, "messages")
-        || !table_exists(conn, "conversations")
-        || !table_has_column(conn, "message_metrics", "message_id")
-        || !table_has_column(conn, "message_metrics", bucket_col)
+        || !raw_schema_available
     {
         return default_stats();
     }
@@ -987,10 +1070,16 @@ fn query_track_a_rollup_status_with_message_metrics_fallback(
     let message_metrics_bucket_col = match bucket_col {
         "hour_id" => "mm.hour_id",
         "day_id" => "mm.day_id",
-        _ => return default_stats(),
+        _ => unreachable!("rollup bucket column validated above"),
     };
     let message_metrics_agent_sql = normalized_analytics_agent_sql_expr("mm.agent_slug");
     let message_metrics_time_sql = message_metrics_time_sql(conn);
+    if analytics_requires_exact_raw_time_filter(filter) && message_metrics_time_sql.is_none() {
+        return Err(exact_time_schema_error(
+            "analytics status Track A rollup coverage",
+            "no message-level timestamp column is available",
+        ));
+    }
     let (where_sql, params) = build_filtered_where_sql(
         conn,
         filter,
@@ -1004,7 +1093,7 @@ fn query_track_a_rollup_status_with_message_metrics_fallback(
                 .unwrap_or(match bucket_col {
                     "hour_id" => AnalyticsTimeColumn::Hour("mm.hour_id"),
                     "day_id" => AnalyticsTimeColumn::Day("mm.day_id"),
-                    _ => return default_stats(),
+                    _ => unreachable!("rollup bucket column validated above"),
                 }),
         ),
     );
@@ -1017,15 +1106,23 @@ fn query_track_a_rollup_status_with_message_metrics_fallback(
         "SELECT COUNT(*), MIN(bucket_id), MAX(bucket_id), MAX(last_updated)\n         FROM (\n             SELECT DISTINCT\n                    rollup.{bucket_col} AS bucket_id,\n                    rollup.last_updated AS last_updated\n               FROM {table} rollup\n               JOIN (\n                  SELECT {message_metrics_bucket_col} AS bucket_id,\n                         {message_metrics_agent_sql} AS agent_slug,\n                         mm.workspace_id AS workspace_id,\n                         {message_metrics_source_sql} AS source_id\n                    FROM {message_metrics_from_sql}\n                  {where_sql}\n                   GROUP BY {message_metrics_bucket_col},\n                            {message_metrics_agent_sql},\n                            mm.workspace_id,\n                            {message_metrics_source_sql}\n              ) filtered_keys\n                 ON rollup.{bucket_col} = filtered_keys.bucket_id\n                AND {rollup_agent_sql} = filtered_keys.agent_slug\n                AND rollup.workspace_id = filtered_keys.workspace_id\n                AND {rollup_source_sql} = filtered_keys.source_id\n         ) matched_track_a_rollups"
     );
 
-    conn.query_row_map(&sql, &params, |row: &Row| {
-        Ok(rollup_stats_from_summary_row(row))
-    })
-    .unwrap_or_default()
+    conn.query_row_map(&sql, &params, rollup_stats_from_summary_row)
+        .map_err(|error| analytics_query_error("Track A status aggregate failed", error))
 }
 
-fn query_token_daily_stats_status(conn: &Connection, filter: &AnalyticsFilter) -> RollupStats {
+fn query_token_daily_stats_status(
+    conn: &Connection,
+    filter: &AnalyticsFilter,
+) -> AnalyticsResult<RollupStats> {
     if !table_exists(conn, "token_daily_stats") {
-        return RollupStats::default();
+        return Ok(RollupStats::default());
+    }
+
+    if analytics_requires_exact_raw_time_filter(filter) && !table_exists(conn, "token_usage") {
+        return Err(exact_time_schema_error(
+            "analytics status Track B rollup coverage",
+            "the token_usage ledger is unavailable",
+        ));
     }
 
     if !(track_b_requires_token_usage_fallback(filter)
@@ -1051,6 +1148,12 @@ fn query_token_daily_stats_status(conn: &Connection, filter: &AnalyticsFilter) -
     let token_usage_agent_sql = token_usage_agent_sql_or_unknown(token_usage_agent_sql);
     let token_usage_model_sql = normalized_analytics_model_family_sql_expr("tu.model_family");
     let token_usage_time_sql = token_usage_time_sql(conn);
+    if analytics_requires_exact_raw_time_filter(filter) && token_usage_time_sql.is_none() {
+        return Err(exact_time_schema_error(
+            "analytics status Track B rollup coverage",
+            "no token-usage timestamp column is available",
+        ));
+    }
     let (where_sql, params) = build_filtered_where_sql(
         conn,
         filter,
@@ -1074,10 +1177,8 @@ fn query_token_daily_stats_status(conn: &Connection, filter: &AnalyticsFilter) -
         "SELECT COUNT(*), MIN(day_id), MAX(day_id), MAX(last_updated)          FROM (             SELECT DISTINCT                    tds.day_id AS day_id,                    tds.agent_slug AS agent_slug,                    tds.source_id AS source_id,                    tds.model_family AS model_family,                    tds.last_updated AS last_updated               FROM token_daily_stats tds               JOIN (                  SELECT tu.day_id AS day_id,                         {token_usage_agent_sql} AS agent_slug,                         {token_usage_source_sql} AS source_id,                         {token_usage_model_sql} AS model_family                   FROM {token_usage_from_sql}                  {where_sql}                   GROUP BY tu.day_id, {token_usage_agent_sql}, {token_usage_source_sql}, {token_usage_model_sql}              ) filtered_keys                 ON tds.day_id = filtered_keys.day_id                AND {tds_agent_sql} = filtered_keys.agent_slug                AND {tds_source_sql} = filtered_keys.source_id                AND {tds_model_sql} = filtered_keys.model_family         ) matched_token_daily_stats"
     );
 
-    conn.query_row_map(&sql, &params, |row: &Row| {
-        Ok(rollup_stats_from_summary_row(row))
-    })
-    .unwrap_or_default()
+    conn.query_row_map(&sql, &params, rollup_stats_from_summary_row)
+        .map_err(|error| analytics_query_error("Track B status aggregate failed", error))
 }
 
 // ---------------------------------------------------------------------------
@@ -1101,6 +1202,15 @@ pub fn query_status(conn: &Connection, filter: &AnalyticsFilter) -> AnalyticsRes
     let (message_metrics_from_sql, message_metrics_source_sql) =
         message_metrics_from_sql_and_source_sql(conn);
     let message_metrics_time_sql = message_metrics_time_sql(conn);
+    if analytics_requires_exact_raw_time_filter(filter)
+        && has_message_metrics
+        && message_metrics_time_sql.is_none()
+    {
+        return Err(exact_time_schema_error(
+            "analytics status message metrics",
+            "no message-level timestamp column is available",
+        ));
+    }
     let mm = query_table_stats_from_source(
         conn,
         TABLE_MESSAGE_METRICS,
@@ -1117,22 +1227,31 @@ pub fn query_status(conn: &Connection, filter: &AnalyticsFilter) -> AnalyticsRes
                 .map(AnalyticsTimeColumn::TimestampMs)
                 .unwrap_or(AnalyticsTimeColumn::Day("mm.day_id")),
         ),
-    );
+    )?;
     let uh = query_track_a_rollup_status_with_message_metrics_fallback(
         conn,
         TABLE_USAGE_HOURLY,
         "hour_id",
         filter,
-    );
+    )?;
     let ud = query_track_a_rollup_status_with_message_metrics_fallback(
         conn,
         TABLE_USAGE_DAILY,
         "day_id",
         filter,
-    );
+    )?;
     let (token_usage_from_sql, token_usage_agent_sql, token_usage_source_sql) =
         token_usage_from_sql_agent_and_source_sql(conn);
     let token_usage_time_sql = token_usage_time_sql(conn);
+    if analytics_requires_exact_raw_time_filter(filter)
+        && has_token_usage
+        && token_usage_time_sql.is_none()
+    {
+        return Err(exact_time_schema_error(
+            "analytics status token usage",
+            "no token-usage timestamp column is available",
+        ));
+    }
     let tu = query_table_stats_from_source(
         conn,
         TABLE_TOKEN_USAGE,
@@ -1149,14 +1268,14 @@ pub fn query_status(conn: &Connection, filter: &AnalyticsFilter) -> AnalyticsRes
                 .map(AnalyticsTimeColumn::TimestampMs)
                 .unwrap_or(AnalyticsTimeColumn::Day("tu.day_id")),
         ),
-    );
-    let tds = query_token_daily_stats_status(conn, filter);
+    )?;
+    let tds = query_token_daily_stats_status(conn, filter)?;
 
-    let total_messages = query_total_messages_filtered(conn, filter);
+    let total_messages = query_total_messages_filtered(conn, filter)?;
 
     let api_coverage_pct = if has_message_metrics && mm.row_count > 0 {
         let api_count =
-            query_message_metrics_filtered_count(conn, filter, Some("api_data_source = 'api'"));
+            query_message_metrics_filtered_count(conn, filter, Some("api_data_source = 'api'"))?;
         super::derive::safe_pct(api_count, mm.row_count)
     } else if total_messages > 0 {
         crate::metric_integrity::MetricOutcome::RebuildRequired
@@ -1169,7 +1288,7 @@ pub fn query_status(conn: &Connection, filter: &AnalyticsFilter) -> AnalyticsRes
             conn,
             filter,
             Some("model_name IS NOT NULL AND TRIM(model_name) != ''"),
-        );
+        )?;
         super::derive::safe_pct(with_model, tu.row_count)
     } else if total_messages > 0 {
         crate::metric_integrity::MetricOutcome::RebuildRequired
@@ -1179,7 +1298,7 @@ pub fn query_status(conn: &Connection, filter: &AnalyticsFilter) -> AnalyticsRes
 
     let estimate_only_pct = if has_token_usage && tu.row_count > 0 {
         let estimates =
-            query_token_usage_filtered_count(conn, filter, Some("data_source = 'estimated'"));
+            query_token_usage_filtered_count(conn, filter, Some("data_source = 'estimated'"))?;
         super::derive::safe_pct(estimates, tu.row_count)
     } else if total_messages > 0 {
         crate::metric_integrity::MetricOutcome::RebuildRequired
@@ -1348,6 +1467,27 @@ pub fn query_tokens_timeseries(
 ) -> AnalyticsResult<TimeseriesResult> {
     let query_start = std::time::Instant::now();
 
+    if analytics_requires_exact_raw_time_filter(filter) {
+        if !table_exists(conn, "messages") || !table_exists(conn, "conversations") {
+            return Err(exact_time_schema_error(
+                "token timeseries",
+                "the canonical messages/conversations tables are unavailable",
+            ));
+        }
+        if message_metrics_time_sql(conn).is_none() {
+            return Err(exact_time_schema_error(
+                "token timeseries",
+                "no message-level timestamp column is available",
+            ));
+        }
+        if !message_metrics_supports_track_a_metric(conn, Metric::ApiTotal) {
+            return Err(AnalyticsError::SchemaIncompatible(
+                "token timeseries requires the Track A API-token columns for an exact-ms query"
+                    .to_string(),
+            ));
+        }
+    }
+
     if track_a_timeseries_requires_raw_fallback(filter)
         && table_exists(conn, "messages")
         && table_exists(conn, "conversations")
@@ -1370,6 +1510,11 @@ pub fn query_tokens_timeseries(
             group_by,
             elapsed_ms: query_start.elapsed().as_millis() as u64,
             path: "none".into(),
+            metric_outcome: if table_exists(conn, "messages") {
+                MetricOutcome::RebuildRequired
+            } else {
+                MetricOutcome::NoData
+            },
         });
     }
 
@@ -1517,6 +1662,7 @@ pub fn query_tokens_timeseries(
     let elapsed_ms = query_start.elapsed().as_millis() as u64;
 
     Ok(TimeseriesResult {
+        metric_outcome: aggregate_outcome(final_buckets.len(), totals.api_tokens_total as f64),
         buckets: final_buckets,
         totals,
         source_table: table.into(),
@@ -1536,8 +1682,11 @@ fn query_track_a_timeseries_from_raw(
     let has_origin_host = table_has_column(conn, "conversations", "origin_host");
     let canonical_message_metrics_sql = canonical_message_metrics_from_sql(conn);
     let join_message_metrics = canonical_message_metrics_sql.is_some();
-    let has_message_metrics_created_at =
-        join_message_metrics && table_has_column(conn, "message_metrics", "created_at_ms");
+    if !message_metrics_supports_track_a_metric(conn, Metric::ApiTotal) {
+        return Err(AnalyticsError::SchemaIncompatible(
+            "raw token timeseries requires the Track A API-token columns".to_string(),
+        ));
+    }
     let has_content_tokens_est =
         join_message_metrics && table_has_column(conn, "message_metrics", "content_tokens_est");
     let has_api_input_tokens =
@@ -1578,22 +1727,19 @@ fn query_track_a_timeseries_from_raw(
         source: SourceFilter::All,
         ..filter.clone()
     };
-    let message_time_sql = if has_message_metrics_created_at {
-        if join_message_metrics {
-            "COALESCE(m.created_at, mm.created_at_ms, c.started_at, 0)"
-        } else {
-            "COALESCE(m.created_at, (SELECT MAX(message_metrics.created_at_ms) FROM message_metrics WHERE message_metrics.message_id = m.id), c.started_at, 0)"
-        }
-    } else {
-        "COALESCE(m.created_at, c.started_at, 0)"
-    };
+    let message_time_sql = message_metrics_time_sql(conn).ok_or_else(|| {
+        exact_time_schema_error(
+            "raw token timeseries",
+            "no message-level timestamp column is available",
+        )
+    })?;
     let (where_sql, params) = build_filtered_where_sql(
         conn,
         &filter_for_sql,
         Some("c.workspace_id"),
         has_agents.then(|| normalized_analytics_agent_sql_expr("a.slug")),
         sql_string_literal("all"),
-        Some(AnalyticsTimeColumn::TimestampMs(message_time_sql)),
+        Some(AnalyticsTimeColumn::TimestampMs(&message_time_sql)),
     );
 
     let content_tokens_expr = if has_content_tokens_est {
@@ -1732,11 +1878,8 @@ fn query_track_a_timeseries_from_raw(
     let mut grouped_buckets: BTreeMap<i64, UsageBucket> = BTreeMap::new();
     for (source_id, origin_host, bucket_id, bucket) in row_buckets {
         let normalized_key = normalized_analytics_source_identity_value(&source_id, &origin_host);
-        if !analytics_source_filter_matches_key(
-            &filter.source,
-            &normalized_key,
-            &local_source_ids,
-        ) {
+        if !analytics_source_filter_matches_key(&filter.source, &normalized_key, &local_source_ids)
+        {
             continue;
         }
         grouped_buckets.entry(bucket_id).or_default().merge(&bucket);
@@ -1776,6 +1919,7 @@ fn query_track_a_timeseries_from_raw(
     }
 
     Ok(TimeseriesResult {
+        metric_outcome: aggregate_outcome(final_buckets.len(), totals.api_tokens_total as f64),
         buckets: final_buckets,
         totals,
         source_table: if join_message_metrics {
@@ -1813,6 +1957,7 @@ fn query_cost_timeseries_from_token_usage(
             group_by,
             elapsed_ms: query_start.elapsed().as_millis() as u64,
             path: "none".into(),
+            metric_outcome: MetricOutcome::NoData,
         });
     }
 
@@ -1830,6 +1975,14 @@ fn query_cost_timeseries_from_token_usage(
         token_usage_from_sql_agent_and_source_sql(conn);
     let token_usage_time_sql = token_usage_time_sql(conn);
     let has_exact_time = token_usage_time_sql.is_some();
+    if (analytics_requires_exact_raw_time_filter(filter) || matches!(group_by, GroupBy::Hour))
+        && !has_exact_time
+    {
+        return Err(exact_time_schema_error(
+            "cost timeseries",
+            "no token-usage timestamp column is available",
+        ));
+    }
     let time_column = token_usage_time_sql
         .as_deref()
         .map(AnalyticsTimeColumn::TimestampMs)
@@ -1993,6 +2146,7 @@ fn query_cost_timeseries_from_token_usage(
     }
 
     Ok(TimeseriesResult {
+        metric_outcome: aggregate_outcome(final_buckets.len(), totals.estimated_cost_usd),
         buckets: final_buckets,
         totals,
         source_table: "token_usage".into(),
@@ -2011,6 +2165,32 @@ pub fn query_cost_timeseries(
 
     let table = "token_daily_stats";
 
+    if analytics_requires_exact_raw_time_filter(filter) || matches!(group_by, GroupBy::Hour) {
+        if !table_exists(conn, "token_usage") {
+            if table_exists(conn, table) {
+                return Err(exact_time_schema_error(
+                    "cost timeseries",
+                    "the token_usage ledger needed for exact/hourly bucketing is unavailable",
+                ));
+            }
+        } else {
+            if token_usage_time_sql(conn).is_none() {
+                return Err(exact_time_schema_error(
+                    "cost timeseries",
+                    "no token-usage timestamp column is available for exact/hourly bucketing",
+                ));
+            }
+            if !token_usage_supports_track_b_metric(conn, Metric::ApiTotal)
+                || !token_usage_supports_track_b_metric(conn, Metric::EstimatedCostUsd)
+            {
+                return Err(AnalyticsError::SchemaIncompatible(
+                    "cost timeseries requires total_tokens and estimated_cost_usd for exact/hourly queries"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
     if track_b_cost_timeseries_requires_token_usage_fallback(filter, group_by)
         && token_usage_supports_track_b_metric(conn, Metric::ApiTotal)
         && token_usage_supports_track_b_metric(conn, Metric::EstimatedCostUsd)
@@ -2026,6 +2206,11 @@ pub fn query_cost_timeseries(
             group_by,
             elapsed_ms: query_start.elapsed().as_millis() as u64,
             path: "none".into(),
+            metric_outcome: if table_exists(conn, "token_usage") {
+                MetricOutcome::RebuildRequired
+            } else {
+                MetricOutcome::NoData
+            },
         });
     }
 
@@ -2153,6 +2338,7 @@ pub fn query_cost_timeseries(
     let elapsed_ms = query_start.elapsed().as_millis() as u64;
 
     Ok(TimeseriesResult {
+        metric_outcome: aggregate_outcome(final_buckets.len(), totals.estimated_cost_usd),
         buckets: final_buckets,
         totals,
         source_table: table.into(),
@@ -2192,6 +2378,7 @@ fn query_track_b_breakdown_from_token_usage(
             metric,
             source_table: "token_usage".into(),
             elapsed_ms: query_start.elapsed().as_millis() as u64,
+            metric_outcome: MetricOutcome::NoData,
         });
     }
 
@@ -2263,6 +2450,12 @@ fn query_track_b_breakdown_from_token_usage(
     };
 
     let token_usage_time_sql = token_usage_time_sql(conn);
+    if analytics_requires_exact_raw_time_filter(filter) && token_usage_time_sql.is_none() {
+        return Err(exact_time_schema_error(
+            "Track B breakdown",
+            "no token-usage timestamp column is available",
+        ));
+    }
     let time_column = token_usage_time_sql
         .as_deref()
         .map(AnalyticsTimeColumn::TimestampMs)
@@ -2341,38 +2534,74 @@ fn query_track_b_breakdown_from_token_usage(
         })
         .map_err(|e| analytics_query_error("Breakdown query failed", e))?;
 
-    let rows = raw_rows
+    let rows: Vec<BreakdownRow> = raw_rows
         .into_iter()
         .map(|(key, bucket)| {
-            let value = match metric {
-                Metric::ApiTotal => bucket.api_tokens_total,
-                Metric::ApiInput => bucket.api_input_tokens_total,
-                Metric::ApiOutput => bucket.api_output_tokens_total,
-                Metric::CacheRead => bucket.api_cache_read_tokens_total,
-                Metric::CacheCreation => bucket.api_cache_creation_tokens_total,
-                Metric::Thinking => bucket.api_thinking_tokens_total,
-                Metric::ContentEstTotal => bucket.content_tokens_est_total,
-                Metric::ToolCalls => bucket.tool_call_count,
-                Metric::PlanCount => 0,
+            let (value, metric_outcome) = match metric {
+                Metric::ApiTotal => (
+                    bucket.api_tokens_total,
+                    aggregate_outcome(1, bucket.api_tokens_total as f64),
+                ),
+                Metric::ApiInput => (
+                    bucket.api_input_tokens_total,
+                    aggregate_outcome(1, bucket.api_input_tokens_total as f64),
+                ),
+                Metric::ApiOutput => (
+                    bucket.api_output_tokens_total,
+                    aggregate_outcome(1, bucket.api_output_tokens_total as f64),
+                ),
+                Metric::CacheRead => (
+                    bucket.api_cache_read_tokens_total,
+                    aggregate_outcome(1, bucket.api_cache_read_tokens_total as f64),
+                ),
+                Metric::CacheCreation => (
+                    bucket.api_cache_creation_tokens_total,
+                    aggregate_outcome(1, bucket.api_cache_creation_tokens_total as f64),
+                ),
+                Metric::Thinking => (
+                    bucket.api_thinking_tokens_total,
+                    aggregate_outcome(1, bucket.api_thinking_tokens_total as f64),
+                ),
+                Metric::ContentEstTotal => (
+                    bucket.content_tokens_est_total,
+                    aggregate_outcome(1, bucket.content_tokens_est_total as f64),
+                ),
+                Metric::ToolCalls => (
+                    bucket.tool_call_count,
+                    aggregate_outcome(1, bucket.tool_call_count as f64),
+                ),
+                Metric::PlanCount => (0, MetricOutcome::SchemaIncompatible),
                 Metric::CoveragePct => {
-                    super::derive::safe_pct(bucket.api_coverage_message_count, bucket.message_count)
-                        .as_value()
-                        .unwrap_or_default()
-                        .round() as i64
+                    let outcome = super::derive::safe_pct(
+                        bucket.api_coverage_message_count,
+                        bucket.message_count,
+                    );
+                    (
+                        outcome.as_value().unwrap_or_default().round() as i64,
+                        outcome,
+                    )
                 }
-                Metric::MessageCount => bucket.message_count,
-                Metric::EstimatedCostUsd => bucket.estimated_cost_usd.round() as i64,
+                Metric::MessageCount => (
+                    bucket.message_count,
+                    aggregate_outcome(1, bucket.message_count as f64),
+                ),
+                Metric::EstimatedCostUsd => (
+                    bucket.estimated_cost_usd.round() as i64,
+                    aggregate_outcome(1, bucket.estimated_cost_usd),
+                ),
             };
-            breakdown_row_with_value(key, bucket, value)
+            breakdown_row_with_outcome(key, bucket, value, metric_outcome)
         })
         .collect();
 
+    let metric_outcome = breakdown_result_outcome(&rows);
     Ok(BreakdownResult {
         rows,
         dim,
         metric,
         source_table: "token_usage".into(),
         elapsed_ms: query_start.elapsed().as_millis() as u64,
+        metric_outcome,
     })
 }
 
@@ -2387,18 +2616,13 @@ fn query_track_a_breakdown_from_raw(
     let has_agents = table_exists(conn, "agents");
     let has_origin_host = table_has_column(conn, "conversations", "origin_host");
     let canonical_message_metrics_sql = canonical_message_metrics_from_sql(conn);
-    let join_message_metrics =
-        !matches!(metric, Metric::MessageCount) && canonical_message_metrics_sql.is_some();
-    let message_metrics_has_message_id = table_exists(conn, "message_metrics")
-        && table_has_column(conn, "message_metrics", "message_id");
+    let join_message_metrics = canonical_message_metrics_sql.is_some();
     let has_api_data_source =
         join_message_metrics && table_has_column(conn, "message_metrics", "api_data_source");
     let has_tool_call_count =
         join_message_metrics && table_has_column(conn, "message_metrics", "tool_call_count");
     let has_has_plan =
         join_message_metrics && table_has_column(conn, "message_metrics", "has_plan");
-    let has_message_metrics_created_at = message_metrics_has_message_id
-        && table_has_column(conn, "message_metrics", "created_at_ms");
 
     let source_id_sql = "TRIM(COALESCE(c.source_id, ''))";
     let origin_host_sql = if has_origin_host {
@@ -2421,22 +2645,19 @@ fn query_track_a_breakdown_from_raw(
         source: SourceFilter::All,
         ..filter.clone()
     };
-    let message_time_sql = if has_message_metrics_created_at {
-        if join_message_metrics {
-            "COALESCE(m.created_at, mm.created_at_ms, c.started_at, 0)"
-        } else {
-            "COALESCE(m.created_at, (SELECT MAX(message_metrics.created_at_ms) FROM message_metrics WHERE message_metrics.message_id = m.id), c.started_at, 0)"
-        }
-    } else {
-        "COALESCE(m.created_at, c.started_at, 0)"
-    };
+    let message_time_sql = message_metrics_time_sql(conn).ok_or_else(|| {
+        exact_time_schema_error(
+            "Track A breakdown",
+            "no message-level timestamp column is available",
+        )
+    })?;
     let (where_sql, params) = build_filtered_where_sql(
         conn,
         &filter_for_sql,
         Some("c.workspace_id"),
         has_agents.then(|| normalized_analytics_agent_sql_expr("a.slug")),
         sql_string_literal("all"),
-        Some(AnalyticsTimeColumn::TimestampMs(message_time_sql)),
+        Some(AnalyticsTimeColumn::TimestampMs(&message_time_sql)),
     );
 
     let dim_key_expr = match dim {
@@ -2590,42 +2811,80 @@ fn query_track_a_breakdown_from_raw(
     let mut rows: Vec<BreakdownRow> = grouped_buckets
         .into_iter()
         .map(|(key, bucket)| {
-            let value = match metric {
-                Metric::ApiTotal => bucket.api_tokens_total,
-                Metric::ApiInput => bucket.api_input_tokens_total,
-                Metric::ApiOutput => bucket.api_output_tokens_total,
-                Metric::CacheRead => bucket.api_cache_read_tokens_total,
-                Metric::CacheCreation => bucket.api_cache_creation_tokens_total,
-                Metric::Thinking => bucket.api_thinking_tokens_total,
-                Metric::ContentEstTotal => bucket.content_tokens_est_total,
-                Metric::ToolCalls => bucket.tool_call_count,
-                Metric::PlanCount => bucket.plan_message_count,
+            let (value, metric_outcome) = match metric {
+                Metric::ApiTotal => (
+                    bucket.api_tokens_total,
+                    aggregate_outcome(1, bucket.api_tokens_total as f64),
+                ),
+                Metric::ApiInput => (
+                    bucket.api_input_tokens_total,
+                    aggregate_outcome(1, bucket.api_input_tokens_total as f64),
+                ),
+                Metric::ApiOutput => (
+                    bucket.api_output_tokens_total,
+                    aggregate_outcome(1, bucket.api_output_tokens_total as f64),
+                ),
+                Metric::CacheRead => (
+                    bucket.api_cache_read_tokens_total,
+                    aggregate_outcome(1, bucket.api_cache_read_tokens_total as f64),
+                ),
+                Metric::CacheCreation => (
+                    bucket.api_cache_creation_tokens_total,
+                    aggregate_outcome(1, bucket.api_cache_creation_tokens_total as f64),
+                ),
+                Metric::Thinking => (
+                    bucket.api_thinking_tokens_total,
+                    aggregate_outcome(1, bucket.api_thinking_tokens_total as f64),
+                ),
+                Metric::ContentEstTotal => (
+                    bucket.content_tokens_est_total,
+                    aggregate_outcome(1, bucket.content_tokens_est_total as f64),
+                ),
+                Metric::ToolCalls => (
+                    bucket.tool_call_count,
+                    aggregate_outcome(1, bucket.tool_call_count as f64),
+                ),
+                Metric::PlanCount => (
+                    bucket.plan_message_count,
+                    aggregate_outcome(1, bucket.plan_message_count as f64),
+                ),
                 Metric::CoveragePct => {
-                    super::derive::safe_pct(bucket.api_coverage_message_count, bucket.message_count)
-                        .as_value()
-                        .unwrap_or_default()
-                        .round() as i64
+                    let outcome = super::derive::safe_pct(
+                        bucket.api_coverage_message_count,
+                        bucket.message_count,
+                    );
+                    (
+                        outcome.as_value().unwrap_or_default().round() as i64,
+                        outcome,
+                    )
                 }
-                Metric::MessageCount => bucket.message_count,
-                Metric::EstimatedCostUsd => bucket.estimated_cost_usd.round() as i64,
+                Metric::MessageCount => (
+                    bucket.message_count,
+                    aggregate_outcome(1, bucket.message_count as f64),
+                ),
+                Metric::EstimatedCostUsd => (0, MetricOutcome::SchemaIncompatible),
             };
-            breakdown_row_with_value(key, bucket, value)
+            breakdown_row_with_outcome(key, bucket, value, metric_outcome)
         })
         .collect();
 
     rows.sort_by(|a, b| b.value.cmp(&a.value).then_with(|| a.key.cmp(&b.key)));
     rows.truncate(limit);
 
+    let metric_outcome = breakdown_result_outcome(&rows);
     Ok(BreakdownResult {
         rows,
         dim,
         metric,
-        source_table: if join_message_metrics {
+        source_table: if matches!(metric, Metric::MessageCount) {
+            "messages".into()
+        } else if join_message_metrics {
             "message_metrics".into()
         } else {
             "messages".into()
         },
         elapsed_ms: query_start.elapsed().as_millis() as u64,
+        metric_outcome,
     })
 }
 
@@ -2646,6 +2905,47 @@ pub fn query_breakdown(
     // Track B has model_family and estimated_cost_usd.
     // Workspace is Track A-only (usage_daily) because Track B has no workspace_id.
     let (table, dim_col, use_track_b) = breakdown_route(dim, metric);
+    if analytics_requires_exact_raw_time_filter(filter) {
+        if use_track_b {
+            if table_exists(conn, "token_usage") {
+                if token_usage_time_sql(conn).is_none() {
+                    return Err(exact_time_schema_error(
+                        "Track B breakdown",
+                        "no token-usage timestamp column is available",
+                    ));
+                }
+                if !token_usage_supports_track_b_metric(conn, metric) {
+                    return Err(AnalyticsError::SchemaIncompatible(format!(
+                        "Track B breakdown metric '{}' is unavailable in token_usage",
+                        metric.as_str()
+                    )));
+                }
+            } else if table_exists(conn, table) {
+                return Err(exact_time_schema_error(
+                    "Track B breakdown",
+                    "the token_usage ledger is unavailable",
+                ));
+            }
+        } else if table_exists(conn, "messages") && table_exists(conn, "conversations") {
+            if message_metrics_time_sql(conn).is_none() {
+                return Err(exact_time_schema_error(
+                    "Track A breakdown",
+                    "no message-level timestamp column is available",
+                ));
+            }
+            if !track_a_breakdown_supports_raw_metric(conn, metric) {
+                return Err(AnalyticsError::SchemaIncompatible(format!(
+                    "Track A breakdown metric '{}' is unavailable in raw message metrics",
+                    metric.as_str()
+                )));
+            }
+        } else if table_exists(conn, table) {
+            return Err(exact_time_schema_error(
+                "Track A breakdown",
+                "the canonical messages/conversations tables are unavailable",
+            ));
+        }
+    }
     if use_track_b
         && token_usage_supports_track_b_metric(conn, metric)
         && track_b_breakdown_requires_token_usage_fallback(filter, dim)
@@ -2678,6 +2978,13 @@ pub fn query_breakdown(
             metric,
             source_table: table.into(),
             elapsed_ms: query_start.elapsed().as_millis() as u64,
+            metric_outcome: if (use_track_b && table_exists(conn, "token_usage"))
+                || (!use_track_b && table_exists(conn, "messages"))
+            {
+                MetricOutcome::RebuildRequired
+            } else {
+                MetricOutcome::NoData
+            },
         });
     }
 
@@ -2767,6 +3074,7 @@ pub fn query_breakdown(
     }
 
     let elapsed_ms = query_start.elapsed().as_millis() as u64;
+    let metric_outcome = breakdown_result_outcome(&rows);
 
     Ok(BreakdownResult {
         rows,
@@ -2774,6 +3082,7 @@ pub fn query_breakdown(
         metric,
         source_table: table.into(),
         elapsed_ms,
+        metric_outcome,
     })
 }
 
@@ -2789,7 +3098,7 @@ fn build_breakdown_sql_track_a(
         Metric::CoveragePct => (
             "SUM(api_coverage_message_count)".to_string(),
             "CASE
-                WHEN SUM(message_count) = 0 THEN 0.0
+                WHEN SUM(message_count) = 0 THEN NULL
                 ELSE CAST(SUM(api_coverage_message_count) AS REAL) / CAST(SUM(message_count) AS REAL)
              END"
                 .to_string(),
@@ -2941,21 +3250,28 @@ fn read_breakdown_rows_track_a(
     let mut result = Vec::new();
     for (key, bucket, sort_value) in raw_rows {
         // Some metrics are derived when reading Track A rows.
-        let value = match metric {
+        let (value, metric_outcome) = match metric {
             Metric::CoveragePct => {
-                let pct = super::derive::safe_pct(
+                let outcome = super::derive::safe_pct(
                     bucket.api_coverage_message_count,
                     bucket.message_count,
+                );
+                (
+                    outcome.as_value().unwrap_or_default().round() as i64,
+                    outcome,
                 )
-                .as_value()
-                .unwrap_or_default();
-                pct.round() as i64
             }
-            // Track A has no cost column; expose stable zero values.
-            Metric::EstimatedCostUsd => 0,
-            _ => sort_value,
+            // Track A has no cost column. Keep the legacy numeric projection
+            // for compatibility, but make the missing schema explicit.
+            Metric::EstimatedCostUsd => (0, MetricOutcome::SchemaIncompatible),
+            _ => (sort_value, aggregate_outcome(1, sort_value as f64)),
         };
-        result.push(breakdown_row_with_value(key, bucket, value));
+        result.push(breakdown_row_with_outcome(
+            key,
+            bucket,
+            value,
+            metric_outcome,
+        ));
     }
     Ok(result)
 }
@@ -3014,18 +3330,33 @@ fn read_breakdown_rows_track_b(
 
     let mut result = Vec::new();
     for (key, bucket, sort_value) in raw_rows {
-        let value = match metric {
+        let (value, metric_outcome) = match metric {
             Metric::CoveragePct => {
-                super::derive::safe_pct(bucket.api_coverage_message_count, bucket.message_count)
-                    .as_value()
-                    .unwrap_or_default()
-                    .round() as i64
+                let outcome = super::derive::safe_pct(
+                    bucket.api_coverage_message_count,
+                    bucket.message_count,
+                );
+                (
+                    outcome.as_value().unwrap_or_default().round() as i64,
+                    outcome,
+                )
             }
-            Metric::ContentEstTotal => bucket.content_tokens_est_total,
-            Metric::PlanCount => 0,
-            _ => sort_value,
+            Metric::ContentEstTotal => (
+                bucket.content_tokens_est_total,
+                aggregate_outcome(1, bucket.content_tokens_est_total as f64),
+            ),
+            Metric::PlanCount => (0, MetricOutcome::SchemaIncompatible),
+            Metric::EstimatedCostUsd => {
+                (sort_value, aggregate_outcome(1, bucket.estimated_cost_usd))
+            }
+            _ => (sort_value, aggregate_outcome(1, sort_value as f64)),
         };
-        result.push(breakdown_row_with_value(key, bucket, value));
+        result.push(breakdown_row_with_outcome(
+            key,
+            bucket,
+            value,
+            metric_outcome,
+        ));
     }
     Ok(result)
 }
@@ -3047,8 +3378,6 @@ fn query_tools_from_raw(
     let has_agents = table_exists(conn, "agents");
     let has_origin_host = table_has_column(conn, "conversations", "origin_host");
     let canonical_message_metrics_sql = canonical_message_metrics_from_sql(conn);
-    let has_message_metrics_created_at = canonical_message_metrics_sql.is_some()
-        && table_has_column(conn, "message_metrics", "created_at_ms");
     let has_content_tokens_est = table_has_column(conn, "message_metrics", "content_tokens_est");
     let has_api_input_tokens = table_has_column(conn, "message_metrics", "api_input_tokens");
     let has_api_output_tokens = table_has_column(conn, "message_metrics", "api_output_tokens");
@@ -3079,18 +3408,19 @@ fn query_tools_from_raw(
         source: SourceFilter::All,
         ..filter.clone()
     };
-    let message_time_sql = if has_message_metrics_created_at {
-        "COALESCE(m.created_at, mm.created_at_ms, c.started_at, 0)"
-    } else {
-        "COALESCE(m.created_at, c.started_at, 0)"
-    };
+    let message_time_sql = message_metrics_time_sql(conn).ok_or_else(|| {
+        exact_time_schema_error(
+            "tool report",
+            "no message-level timestamp column is available",
+        )
+    })?;
     let (where_sql, params) = build_filtered_where_sql(
         conn,
         &filter_for_sql,
         Some("c.workspace_id"),
         has_agents.then(|| normalized_analytics_agent_sql_expr("a.slug")),
         sql_string_literal("all"),
-        Some(AnalyticsTimeColumn::TimestampMs(message_time_sql)),
+        Some(AnalyticsTimeColumn::TimestampMs(&message_time_sql)),
     );
 
     let agent_sql = if has_agents {
@@ -3234,6 +3564,7 @@ fn query_tools_from_raw(
 
     rows.truncate(limit);
 
+    let metric_outcome = counted_metric_outcome(total_messages, total_tool_calls as f64);
     Ok(ToolReport {
         rows,
         total_tool_calls,
@@ -3241,6 +3572,7 @@ fn query_tools_from_raw(
         total_api_tokens,
         source_table: "message_metrics".into(),
         elapsed_ms: query_start.elapsed().as_millis() as u64,
+        metric_outcome,
     })
 }
 
@@ -3251,6 +3583,26 @@ pub fn query_tools(
     limit: usize,
 ) -> AnalyticsResult<ToolReport> {
     let query_start = std::time::Instant::now();
+
+    if analytics_requires_exact_raw_time_filter(filter) {
+        if !track_a_tools_supports_raw_source_fallback(conn) {
+            let rollup_exists = match group_by {
+                GroupBy::Hour => table_exists(conn, "usage_hourly"),
+                GroupBy::Day | GroupBy::Week | GroupBy::Month => table_exists(conn, "usage_daily"),
+            };
+            if rollup_exists {
+                return Err(AnalyticsError::SchemaIncompatible(
+                    "tool report requires canonical messages and message_metrics.tool_call_count for an exact-ms query"
+                        .to_string(),
+                ));
+            }
+        } else if message_metrics_time_sql(conn).is_none() {
+            return Err(exact_time_schema_error(
+                "tool report",
+                "no message-level timestamp column is available",
+            ));
+        }
+    }
 
     if track_a_timeseries_requires_raw_fallback(filter)
         && track_a_tools_supports_raw_source_fallback(conn)
@@ -3271,6 +3623,11 @@ pub fn query_tools(
             total_api_tokens: 0,
             source_table: table.into(),
             elapsed_ms: query_start.elapsed().as_millis() as u64,
+            metric_outcome: if table_exists(conn, "message_metrics") {
+                MetricOutcome::RebuildRequired
+            } else {
+                MetricOutcome::NoData
+            },
         });
     }
 
@@ -3373,6 +3730,7 @@ pub fn query_tools(
     rows.truncate(limit);
 
     let elapsed_ms = query_start.elapsed().as_millis() as u64;
+    let metric_outcome = counted_metric_outcome(total_messages, total_tool_calls as f64);
 
     Ok(ToolReport {
         rows,
@@ -3381,6 +3739,7 @@ pub fn query_tools(
         total_api_tokens,
         source_table: table.into(),
         elapsed_ms,
+        metric_outcome,
     })
 }
 
@@ -5230,16 +5589,13 @@ mod tests {
         let local_status = query_status(&conn, &local_filter).unwrap();
         assert_eq!(local_status.coverage.total_messages, 2);
         assert_eq!(status_table_row_count(&local_status, "usage_daily"), 1);
-        assert_eq!(status_table_row_count(&local_status, "token_daily_stats"), 1);
+        assert_eq!(
+            status_table_row_count(&local_status, "token_daily_stats"),
+            1
+        );
 
-        let local_sources = query_breakdown(
-            &conn,
-            &local_filter,
-            Dim::Source,
-            Metric::MessageCount,
-            10,
-        )
-        .unwrap();
+        let local_sources =
+            query_breakdown(&conn, &local_filter, Dim::Source, Metric::MessageCount, 10).unwrap();
         assert_eq!(local_sources.rows.len(), 1);
         assert_eq!(local_sources.rows[0].key, "desktop-local");
         assert_eq!(local_sources.rows[0].value, 2);
@@ -6301,6 +6657,7 @@ mod tests {
         let filter = AnalyticsFilter::default();
         let result = query_breakdown(&conn, &filter, Dim::Agent, Metric::ApiTotal, 10).unwrap();
         assert!(result.rows.is_empty());
+        assert_eq!(result.metric_outcome, MetricOutcome::NoData);
     }
 
     #[test]
@@ -6315,6 +6672,9 @@ mod tests {
         assert!(json["rows"].is_array());
         assert!(json["row_count"].is_number());
         assert!(json["_meta"]["elapsed_ms"].is_number());
+        assert_eq!(json["_meta"]["metric_status"], "value");
+        assert!(json["rows"][0]["value_numeric"].is_number());
+        assert_eq!(json["rows"][0]["value_status"], "value");
     }
 
     #[test]
@@ -6597,6 +6957,7 @@ mod tests {
         let result = query_tools(&conn, &filter, GroupBy::Day, 10).unwrap();
         assert!(result.rows.is_empty());
         assert_eq!(result.total_tool_calls, 0);
+        assert_eq!(result.metric_outcome, MetricOutcome::NoData);
     }
 
     #[test]
@@ -6609,6 +6970,11 @@ mod tests {
         assert!(json["rows"].is_array());
         assert!(json["totals"]["tool_call_count"].is_number());
         assert!(json["_meta"]["elapsed_ms"].is_number());
+        assert_eq!(json["_meta"]["metric_status"], "value");
+        assert_eq!(
+            json["totals"]["tool_calls_per_1k_api_tokens_status"],
+            "value"
+        );
     }
 
     #[test]
@@ -6634,7 +7000,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(query_total_messages_filtered(&conn, &filter), 2);
+        assert_eq!(query_total_messages_filtered(&conn, &filter).unwrap(), 2);
     }
 
     #[test]
@@ -6651,7 +7017,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(query_total_messages_filtered(&conn, &filter), 2);
+        assert_eq!(query_total_messages_filtered(&conn, &filter).unwrap(), 2);
     }
 
     #[test]
@@ -7458,6 +7824,7 @@ mod tests {
         assert!(result.buckets.is_empty());
         assert_eq!(result.totals.estimated_cost_usd, 0.0);
         assert_eq!(result.path, "none");
+        assert_eq!(result.metric_outcome, MetricOutcome::NoData);
     }
 
     #[test]
@@ -7497,7 +7864,7 @@ mod tests {
     }
 
     #[test]
-    fn query_breakdown_workspace_with_cost_metric_uses_track_a_zero_values() {
+    fn query_breakdown_workspace_cost_marks_missing_track_a_metric_schema() {
         let conn = setup_usage_daily_db();
         let filter = AnalyticsFilter::default();
         let result =
@@ -7506,6 +7873,14 @@ mod tests {
         assert_eq!(result.source_table, "usage_daily");
         assert!(!result.rows.is_empty());
         assert!(result.rows.iter().all(|r| r.value == 0));
+        assert!(
+            result
+                .rows
+                .iter()
+                .all(|r| r.metric_outcome == MetricOutcome::SchemaIncompatible)
+        );
+        assert_eq!(result.metric_outcome, MetricOutcome::SchemaIncompatible);
+        assert!(result.rows[0].to_json()["value_numeric"].is_null());
         assert!(
             result
                 .rows
@@ -7551,12 +7926,108 @@ mod tests {
     }
 
     #[test]
-    fn query_breakdown_model_plan_count_is_zero_on_track_b() {
+    fn query_breakdown_model_plan_count_marks_missing_track_b_metric_schema() {
         let conn = setup_token_daily_stats_db();
         let filter = AnalyticsFilter::default();
         let result = query_breakdown(&conn, &filter, Dim::Model, Metric::PlanCount, 10).unwrap();
 
         assert!(!result.rows.is_empty());
         assert!(result.rows.iter().all(|r| r.value == 0));
+        assert!(
+            result
+                .rows
+                .iter()
+                .all(|r| r.metric_outcome == MetricOutcome::SchemaIncompatible)
+        );
+        assert_eq!(result.metric_outcome, MetricOutcome::SchemaIncompatible);
+    }
+
+    #[test]
+    fn exact_time_track_a_queries_reject_rollup_only_schema() {
+        let conn = setup_usage_daily_db();
+        let filter = AnalyticsFilter {
+            since_ms: Some(0),
+            until_ms: Some(1),
+            ..Default::default()
+        };
+
+        let tokens_error = query_tokens_timeseries(&conn, &filter, GroupBy::Day)
+            .err()
+            .expect("rollup-only token query must not widen exact-ms bounds");
+        assert_eq!(
+            tokens_error.metric_outcome(),
+            MetricOutcome::SchemaIncompatible
+        );
+
+        let breakdown_error = query_breakdown(&conn, &filter, Dim::Agent, Metric::ApiTotal, 10)
+            .err()
+            .expect("rollup-only breakdown must not widen exact-ms bounds");
+        assert_eq!(
+            breakdown_error.metric_outcome(),
+            MetricOutcome::SchemaIncompatible
+        );
+
+        let tools_error = query_tools(&conn, &filter, GroupBy::Day, 10)
+            .err()
+            .expect("rollup-only tool report must not widen exact-ms bounds");
+        assert_eq!(
+            tools_error.metric_outcome(),
+            MetricOutcome::SchemaIncompatible
+        );
+
+        let status_error = query_status(&conn, &filter)
+            .err()
+            .expect("rollup-only status must not widen exact-ms bounds");
+        assert_eq!(
+            status_error.metric_outcome(),
+            MetricOutcome::SchemaIncompatible
+        );
+    }
+
+    #[test]
+    fn exact_time_cost_query_rejects_rollup_only_schema() {
+        let conn = setup_token_daily_stats_db();
+        let filter = AnalyticsFilter {
+            since_ms: Some(0),
+            until_ms: Some(1),
+            ..Default::default()
+        };
+
+        let error = query_cost_timeseries(&conn, &filter, GroupBy::Day)
+            .err()
+            .expect("rollup-only cost query must not widen exact-ms bounds");
+        assert_eq!(error.metric_outcome(), MetricOutcome::SchemaIncompatible);
+    }
+
+    #[test]
+    fn status_aggregate_failure_is_not_smoothed_into_empty_stats() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE usage_daily (
+                day_id INTEGER NOT NULL
+            );
+            INSERT INTO usage_daily (day_id) VALUES (1);",
+        )
+        .unwrap();
+
+        let error = query_status(&conn, &AnalyticsFilter::default())
+            .err()
+            .expect("missing aggregate columns must remain an error");
+        assert_eq!(error.metric_outcome(), MetricOutcome::AggregateFailed);
+    }
+
+    #[test]
+    fn missing_rollup_with_canonical_rows_is_rebuild_required_not_zero() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY)")
+            .unwrap();
+
+        let result =
+            query_tokens_timeseries(&conn, &AnalyticsFilter::default(), GroupBy::Day).unwrap();
+        assert!(result.buckets.is_empty());
+        assert_eq!(result.metric_outcome, MetricOutcome::RebuildRequired);
+        let json = result.to_cli_json();
+        assert_eq!(json["_meta"]["metric_status"], "rebuild-required");
+        assert_eq!(json["_meta"]["metric_display"], "—");
     }
 }

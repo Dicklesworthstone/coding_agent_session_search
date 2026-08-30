@@ -793,6 +793,7 @@ pub enum Commands {
         /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
+
     },
     /// Collapse pre-existing duplicate conversation rows (projects/<rel> vs <rel> external_id twins) created before the dedup fix
     Dedup {
@@ -844,6 +845,10 @@ pub enum Commands {
         /// Staleness threshold in seconds (default: 1800 = 30 minutes)
         #[arg(long, default_value_t = 1800)]
         stale_threshold: u64,
+
+        /// Hard wall-clock budget in milliseconds (overrides CASS_TRIAGE_BUDGET_MS)
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: Option<u64>,
     },
     /// Assemble a redacted, share-safe recovery/support evidence bundle
     SupportBundle {
@@ -915,6 +920,10 @@ pub enum Commands {
         /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
+
+        /// Hard wall-clock budget in milliseconds (overrides CASS_VIEW_BUDGET_MS)
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        timeout: Option<u64>,
     },
     /// Minimal health check (<50ms). Exit 0=healthy, 1=unhealthy. For agent pre-flight checks.
     Health {
@@ -2234,6 +2243,12 @@ pub enum SourcesCommand {
         /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
+        /// Overall wall-clock budget in milliseconds
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        budget_ms: Option<u64>,
+        /// Per-source wall-clock budget in milliseconds
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        per_host_budget_ms: Option<u64>,
     },
     /// Synchronize sessions from remote sources
     Sync {
@@ -2552,6 +2567,12 @@ pub enum FleetCommand {
         /// Output as JSON (`--robot` also works).
         #[arg(long, visible_alias = "robot")]
         json: bool,
+        /// Overall wall-clock budget in milliseconds.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        budget_ms: Option<u64>,
+        /// Per-remote-host wall-clock budget in milliseconds.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        per_host_budget_ms: Option<u64>,
     },
 }
 
@@ -3247,7 +3268,7 @@ fn root_structured_triage_rewrite(args: &[String]) -> Option<Vec<String>> {
                 saw_structured_request = true;
                 i += 1;
             }
-            "--data-dir" | "--stale-threshold" => {
+            "--data-dir" | "--stale-threshold" | "--timeout" => {
                 let value = args.get(i + 1)?;
                 if value.starts_with('-') {
                     return None;
@@ -3256,7 +3277,10 @@ fn root_structured_triage_rewrite(args: &[String]) -> Option<Vec<String>> {
                 rewritten.push(value.clone());
                 i += 2;
             }
-            arg if arg.starts_with("--data-dir=") || arg.starts_with("--stale-threshold=") => {
+            arg if arg.starts_with("--data-dir=")
+                || arg.starts_with("--stale-threshold=")
+                || arg.starts_with("--timeout=") =>
+            {
                 rewritten.push(arg.to_string());
                 i += 1;
             }
@@ -6842,6 +6866,7 @@ async fn execute_cli(
                 data_dir: None,
                 json: true,
                 stale_threshold: 1800,
+                timeout: None,
             }
         } else {
             Commands::Tui {
@@ -7184,14 +7209,6 @@ async fn execute_cli(
                         );
                     }
 
-                    // --refresh runs *after* flag validation so an invocation
-                    // like `cass search --refresh --two-tier --fast-only`
-                    // rejects fast on the bad flag combo instead of burning a
-                    // ~30s incremental index before failing usage.
-                    if refresh {
-                        refresh_index_inline(cli.db.clone(), data_dir.clone());
-                    }
-
                     // Build semantic options from new flags
                     let tier_mode = if two_tier {
                         crate::search::query::SemanticTierMode::Progressive
@@ -7272,6 +7289,7 @@ async fn execute_cli(
                         sessions_from,
                         eff_mode,
                         semantic_opts,
+                        refresh,
                     )?;
                 }
                 Commands::Pack {
@@ -7408,6 +7426,7 @@ async fn execute_cli(
                     data_dir,
                     json,
                     stale_threshold,
+                    timeout,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
                     run_triage(
@@ -7415,6 +7434,7 @@ async fn execute_cli(
                         cli.db.clone(),
                         structured_format,
                         stale_threshold,
+                        timeout,
                     )?;
                 }
                 Commands::SupportBundle {
@@ -7441,6 +7461,7 @@ async fn execute_cli(
                     line,
                     context,
                     json,
+                    timeout,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
                     run_view(
@@ -7448,9 +7469,9 @@ async fn execute_cli(
                         cli.db.clone(),
                         source.as_deref(),
                         conversation_id,
-                        line,
-                        context,
+                        ViewWindow { line, context },
                         structured_format,
+                        timeout,
                     )?;
                 }
                 Commands::Pages {
@@ -21634,42 +21655,58 @@ fn state_db_count_json(count: i64, counts_skipped: bool) -> serde_json::Value {
     }
 }
 
-fn refresh_state_database_counts_if_needed(
-    state: &mut serde_json::Value,
-    db_path: &Path,
-    reason: &str,
-) {
+fn state_database_counts_need_refresh(state: &serde_json::Value, db_path: &Path) -> bool {
     let current_opened = state
         .get("database")
         .and_then(|db| db.get("opened"))
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     let current_counts_skipped = state
         .get("database")
         .and_then(|db| db.get("counts_skipped"))
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(true);
     let current_conversations = state
         .get("database")
         .and_then(|db| db.get("conversations"))
-        .and_then(|v| v.as_i64())
+        .and_then(serde_json::Value::as_i64)
         .unwrap_or(0);
     let current_messages = state
         .get("database")
         .and_then(|db| db.get("messages"))
-        .and_then(|v| v.as_i64())
+        .and_then(serde_json::Value::as_i64)
         .unwrap_or(0);
 
     let count_refresh_allowed = std::fs::metadata(db_path).ok().is_some_and(|metadata| {
         metadata.is_file() && metadata.len() <= STATUS_COUNT_SCAN_MAX_DB_BYTES
     });
-    let needs_refresh = (!current_counts_skipped || count_refresh_allowed)
-        && (!current_opened || current_conversations <= 0 || current_messages <= 0);
-    if !needs_refresh || !db_path.exists() {
-        return;
-    }
+    ((!current_counts_skipped || count_refresh_allowed)
+        && (!current_opened || current_conversations <= 0 || current_messages <= 0))
+        && db_path.exists()
+}
 
-    let refreshed = probe_state_db(db_path, reason, Duration::from_secs(30), true);
+fn apply_state_database_count_snapshot(state: &mut serde_json::Value, refreshed: StateDbSnapshot) {
+    let current_opened = state
+        .get("database")
+        .and_then(|db| db.get("opened"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let current_counts_skipped = state
+        .get("database")
+        .and_then(|db| db.get("counts_skipped"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let current_conversations = state
+        .get("database")
+        .and_then(|db| db.get("conversations"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let current_messages = state
+        .get("database")
+        .and_then(|db| db.get("messages"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+
     let improved = (!current_opened && refreshed.opened)
         || (current_counts_skipped && !refreshed.counts_skipped)
         || (current_conversations <= 0 && refreshed.conversation_count > 0)
@@ -21708,9 +21745,8 @@ fn refresh_state_database_counts_if_needed(
         "counts_skipped".to_string(),
         serde_json::Value::Bool(refreshed.counts_skipped),
     );
-    // i6upe: the refresh probe also ran the bounded integrity probe; a
-    // classified verdict upgrades a prior "unknown" (never downgrades a
-    // known verdict to unknown — a transient busy refresh proves nothing).
+    // i6upe: a classified integrity verdict upgrades prior unknown state. A
+    // transient refresh result never downgrades an existing verdict.
     if let Some(integrity) = refreshed.integrity {
         database.insert(
             "integrity".to_string(),
@@ -21726,10 +21762,74 @@ fn refresh_state_database_counts_if_needed(
             "integrity_detail".to_string(),
             refreshed
                 .integrity_detail
-                .clone()
                 .map(serde_json::Value::String)
                 .unwrap_or(serde_json::Value::Null),
         );
+    }
+}
+
+fn refresh_state_database_counts_if_needed(
+    state: &mut serde_json::Value,
+    db_path: &Path,
+    reason: &str,
+) {
+    if !state_database_counts_need_refresh(state, db_path) {
+        return;
+    }
+
+    let refreshed = probe_state_db(db_path, reason, Duration::from_secs(30), true);
+    apply_state_database_count_snapshot(state, refreshed);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundedCountRefresh {
+    NotNeeded,
+    Completed,
+    TimedOut,
+}
+
+fn maybe_test_triage_worker_delay(variable: &str) {
+    if let Ok(raw) = dotenvy::var(variable)
+        && let Ok(milliseconds) = raw.parse::<u64>()
+        && milliseconds > 0
+    {
+        std::thread::sleep(Duration::from_millis(milliseconds));
+    }
+}
+
+fn refresh_state_database_counts_with_hard_timeout(
+    state: &mut serde_json::Value,
+    db_path: &Path,
+    reason: &str,
+    timeout: Duration,
+) -> BoundedCountRefresh {
+    if !state_database_counts_need_refresh(state, db_path) {
+        return BoundedCountRefresh::NotNeeded;
+    }
+
+    let path = db_path.to_path_buf();
+    let reason = reason.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let Ok(_count_worker) = std::thread::Builder::new()
+        .name("cass-triage-count-probe".to_string())
+        .spawn(move || {
+            maybe_test_triage_worker_delay("CASS_TEST_TRIAGE_COUNT_SLOW_MS");
+            let snapshot = probe_state_db(&path, &reason, timeout, true);
+            let _ = tx.send(snapshot);
+        })
+    else {
+        return BoundedCountRefresh::TimedOut;
+    };
+
+    match rx.recv_timeout(timeout) {
+        Ok(snapshot) => {
+            apply_state_database_count_snapshot(state, snapshot);
+            BoundedCountRefresh::Completed
+        }
+        Err(
+            std::sync::mpsc::RecvTimeoutError::Timeout
+            | std::sync::mpsc::RecvTimeoutError::Disconnected,
+        ) => BoundedCountRefresh::TimedOut,
     }
 }
 
@@ -25183,6 +25283,14 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_SEARCH_TIMEOUT_MS=<N>               default `cass search`/`pack` timeout in ms (--timeout overrides; 0=none)".to_string(),
             "  CASS_SEARCH_LIMIT=<N>                    default search/pack limit (--limit overrides; 0=no limit)".to_string(),
             "  CASS_SEARCH_MODE=lexical|semantic|hybrid default search/pack mode (--mode overrides)".to_string(),
+            "  CASS_STATUS_BUDGET_MS=<N>                robot status budget in ms (default 8000; sheds optional sections after expiry)".to_string(),
+            "  CASS_DOCTOR_BUDGET_MS=<N>                structured doctor reporting budget in ms (default 8000; marks overruns timed_out)".to_string(),
+            "  CASS_VIEW_BUDGET_MS=<N>                  structured view worker deadline in ms (default 10000)".to_string(),
+            "  CASS_SEARCH_BUDGET_MS=<N>                structured search worker budget in ms (default 120000; a positive effective search timeout overrides)".to_string(),
+            "  CASS_TRIAGE_BUDGET_MS=<N>                robot triage probe budget in ms (default 8000; sheds incomplete readiness sections after expiry)".to_string(),
+            "  CASS_PACK_BUDGET_MS=<N>                  structured pack budget in ms (default 10000; a positive effective search timeout overrides)".to_string(),
+            "  CASS_FLEET_PER_HOST_BUDGET_MS=<N>        per-host source/fleet probe budget in ms (default 8000)".to_string(),
+            "  CASS_FLEET_BUDGET_MS=<N>                 overall source/fleet probe budget in ms (default 60000)".to_string(),
             "  TOON_DEFAULT_FORMAT=toon|json            fallback structured output for all tools".to_string(),
             "  TOON_INDENT=<N>                           pretty-print TOON with indent".to_string(),
             "  TOON_KEY_FOLDING=off|safe                 TOON key folding mode".to_string(),
@@ -27997,6 +28105,57 @@ fn search_budget_ms(timeout_ms: Option<u64>) -> u64 {
     })
 }
 
+/// Deterministic slowdown injected inside a bounded read-only worker for E2E
+/// coverage. Production callers never set these test-only environment variables.
+fn maybe_test_search_worker_delay(variable: &str) {
+    if let Ok(raw) = dotenvy::var(variable)
+        && let Ok(milliseconds) = raw.parse::<u64>()
+        && milliseconds > 0
+    {
+        std::thread::sleep(Duration::from_millis(milliseconds));
+    }
+}
+
+/// Execute read-only work on a detached worker and return at the hard deadline.
+/// Callers must not use this for repairs, writes, downloads, or persistent
+/// process spawning.
+fn run_read_only_search_worker<T, F>(remaining_ms: u64, work: F) -> CliResult<Option<T>>
+where
+    T: Send + 'static,
+    F: FnOnce() -> CliResult<T> + Send + 'static,
+{
+    use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+
+    if remaining_ms == 0 {
+        return Ok(None);
+    }
+    let (sender, receiver) = sync_channel(1);
+    std::thread::Builder::new()
+        .name("cass-bounded-read-only".to_string())
+        .spawn(move || {
+            let _ = sender.send(work());
+        })
+        .map_err(|error| CliError {
+            code: 9,
+            kind: CliErrorKind::Search.kind_str(),
+            message: format!("failed to start bounded read-only worker: {error}"),
+            hint: Some("Retry the bounded read-only operation.".to_string()),
+            retryable: true,
+        })?;
+
+    match receiver.recv_timeout(Duration::from_millis(remaining_ms)) {
+        Ok(result) => result.map(Some),
+        Err(RecvTimeoutError::Timeout) => Ok(None),
+        Err(RecvTimeoutError::Disconnected) => Err(CliError {
+            code: 9,
+            kind: CliErrorKind::Search.kind_str(),
+            message: "bounded read-only worker stopped before returning a result".to_string(),
+            hint: Some("Retry the bounded read-only operation.".to_string()),
+            retryable: true,
+        }),
+    }
+}
+
 /// Deterministic slowdown for bounded-search E2E coverage. Production callers
 /// never set this test-only environment variable.
 fn maybe_test_search_delay() {
@@ -28006,6 +28165,588 @@ fn maybe_test_search_delay() {
     {
         std::thread::sleep(Duration::from_millis(milliseconds));
     }
+}
+
+fn search_budget_retry_command(
+    query: &str,
+    format: RobotFormat,
+    budget_ms: u64,
+    data_dir: &Path,
+    sessions_from: Option<&str>,
+) -> Option<String> {
+    if sessions_from == Some("-") {
+        return None;
+    }
+    let mut command = vec![
+        "cass".to_string(),
+        "search".to_string(),
+        shell_quote_arg(query),
+    ];
+    match format {
+        RobotFormat::Json => command.push("--robot".to_string()),
+        RobotFormat::Jsonl => {
+            command.extend(["--robot-format".to_string(), "jsonl".to_string()]);
+        }
+        RobotFormat::Compact => {
+            command.extend(["--robot-format".to_string(), "compact".to_string()]);
+        }
+        RobotFormat::Sessions => {
+            command.extend(["--robot-format".to_string(), "sessions".to_string()]);
+        }
+        RobotFormat::Toon => {
+            command.extend(["--robot-format".to_string(), "toon".to_string()]);
+        }
+    }
+    command.extend([
+        "--timeout".to_string(),
+        budget_ms
+            .saturating_mul(2)
+            .clamp(1_000, 300_000)
+            .to_string(),
+    ]);
+    if let Some(sessions_from) = sessions_from {
+        command.push("--sessions-from".to_string());
+        command.push(shell_quote_arg(sessions_from));
+    }
+    command.push("--data-dir".to_string());
+    command.push(shell_quote_arg(&data_dir.display().to_string()));
+    Some(command.join(" "))
+}
+
+fn output_search_budget_partial(
+    query: &str,
+    format: RobotFormat,
+    budget: &crate::robot_budget_envelope::RobotBudget,
+    skipped_sections: Vec<String>,
+    data_dir: &Path,
+    sessions_from: Option<&str>,
+) -> CliResult<()> {
+    let retry =
+        search_budget_retry_command(query, format, budget.total_ms(), data_dir, sessions_from);
+    let mut budget_block = crate::robot_budget_envelope::BudgetBlock::from_budget(
+        budget,
+        skipped_sections,
+        retry.clone(),
+    );
+    budget_block.elapsed_ms = budget_block.elapsed_ms.max(budget_block.budget_ms);
+    budget_block.timed_out = true;
+
+    if matches!(format, RobotFormat::Sessions) {
+        let error_payload = serde_json::json!({
+            "error": {
+                "code": 10,
+                "kind": CliErrorKind::Timeout.kind_str(),
+                "message": "sessions-format search did not complete within its robot budget",
+                "hint": retry.clone(),
+                "retryable": true,
+            },
+            "budget": budget_block,
+        });
+        return Err(CliError {
+            code: 10,
+            kind: CliErrorKind::Timeout.kind_str(),
+            message: error_payload.to_string(),
+            hint: retry,
+            retryable: true,
+        });
+    }
+
+    output_structured_value(
+        serde_json::json!({
+            "query": query,
+            "hits": [],
+            "total_matches": 0,
+            "has_more": false,
+            "budget": budget_block,
+        }),
+        format,
+    )
+}
+
+struct CliSearchSetup {
+    self_heal: SearchLexicalSelfHeal,
+    client: std::sync::Arc<crate::search::query::SearchClient>,
+    rebuild_active: bool,
+}
+
+fn empty_search_result() -> crate::search::query::SearchResult {
+    crate::search::query::SearchResult {
+        hits: Vec::new(),
+        wildcard_fallback: false,
+        cache_stats: crate::search::query::CacheStats::default(),
+        suggestions: Vec::new(),
+        ann_stats: None,
+        ann_unavailable_reason: None,
+        total_count: None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_search_operation(
+    client: std::sync::Arc<crate::search::query::SearchClient>,
+    query: String,
+    filters: crate::search::query::SearchFilters,
+    search_limit: usize,
+    search_offset: usize,
+    search_sparse_threshold: usize,
+    field_mask: crate::search::query::FieldMask,
+    approximate: bool,
+    semantic_execution_tier: crate::search::query::SemanticTierMode,
+    mut mode_meta: SearchModeMeta,
+) -> CliResult<(crate::search::query::SearchResult, SearchModeMeta)> {
+    use crate::search::query::SearchMode;
+
+    maybe_test_search_worker_delay("CASS_TEST_SEARCH_SLOW_MS");
+    let hybrid_fail_open = mode_meta.fail_open_on_semantic_unavailable();
+    let result = match mode_meta.realized {
+        SearchMode::Lexical => client
+            .search_with_fallback(
+                &query,
+                filters.clone(),
+                search_limit,
+                search_offset,
+                search_sparse_threshold,
+                field_mask,
+            )
+            .map_err(|error| CliError {
+                code: 9,
+                kind: CliErrorKind::Search.kind_str(),
+                message: format!("search failed: {error}"),
+                hint: None,
+                retryable: true,
+            })?,
+        SearchMode::Semantic => {
+            let (hits, ann_stats) = client
+                .search_semantic_with_tier(
+                    &query,
+                    filters.clone(),
+                    search_limit,
+                    search_offset,
+                    field_mask,
+                    approximate,
+                    semantic_execution_tier,
+                )
+                .map_err(|error| {
+                    let message = error.to_string();
+                    if message.contains("HNSW index") {
+                        CliError {
+                            code: 15,
+                            kind: CliErrorKind::SemanticUnavailable.kind_str(),
+                            message: "Approximate search unavailable (HNSW index missing)"
+                                .to_string(),
+                            hint: Some(
+                                "Run 'cass index --semantic --build-hnsw' to build the ANN index, or omit --approximate"
+                                    .to_string(),
+                            ),
+                            retryable: false,
+                        }
+                    } else if message.contains("unavailable") || message.contains("no embedder") {
+                        CliError {
+                            code: 15,
+                            kind: CliErrorKind::SemanticUnavailable.kind_str(),
+                            message: "Semantic search not available".to_string(),
+                            hint: Some(
+                                "Run 'cass tui' and press Alt+S to set up semantic search, or omit --mode semantic when lexical evidence is acceptable"
+                                    .to_string(),
+                            ),
+                            retryable: false,
+                        }
+                    } else {
+                        CliError {
+                            code: 9,
+                            kind: CliErrorKind::Search.kind_str(),
+                            message: format!("semantic search failed: {error}"),
+                            hint: Some(
+                                "Retry with the default hybrid-preferred mode when lexical evidence is acceptable"
+                                    .to_string(),
+                            ),
+                            retryable: true,
+                        }
+                    }
+                })?;
+            let ann_unavailable_reason = if approximate {
+                client
+                    .ann_unavailability_reason()
+                    .map_err(|error| CliError {
+                        code: 9,
+                        kind: CliErrorKind::Search.kind_str(),
+                        message: format!("failed to inspect ANN fallback state: {error}"),
+                        hint: Some(
+                            "Retry the search; CASS could not read the active semantic context"
+                                .to_string(),
+                        ),
+                        retryable: true,
+                    })?
+            } else {
+                None
+            };
+            crate::search::query::SearchResult {
+                hits,
+                wildcard_fallback: false,
+                cache_stats: crate::search::query::CacheStats::default(),
+                suggestions: Vec::new(),
+                ann_stats,
+                ann_unavailable_reason,
+                total_count: None,
+            }
+        }
+        SearchMode::Hybrid => match client.search_hybrid(
+            &query,
+            &query,
+            filters.clone(),
+            search_limit,
+            search_offset,
+            search_sparse_threshold,
+            field_mask,
+            approximate,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                let message = error.to_string();
+                if hybrid_fail_open
+                    && (message.contains("unavailable") || message.contains("no embedder"))
+                {
+                    mode_meta
+                        .fall_back_to_lexical(format!("hybrid execution unavailable: {error}"));
+                    client
+                        .search_with_fallback(
+                            &query,
+                            filters,
+                            search_limit,
+                            search_offset,
+                            search_sparse_threshold,
+                            field_mask,
+                        )
+                        .map_err(|fallback_error| CliError {
+                            code: 9,
+                            kind: CliErrorKind::Search.kind_str(),
+                            message: format!(
+                                "hybrid search failed ({error}); lexical fallback failed: {fallback_error}"
+                            ),
+                            hint: None,
+                            retryable: true,
+                        })?
+                } else if message.contains("unavailable") || message.contains("no embedder") {
+                    return Err(CliError {
+                        code: 15,
+                        kind: CliErrorKind::SemanticUnavailable.kind_str(),
+                        message: "Hybrid search not available (requires semantic search)".to_string(),
+                        hint: Some(
+                            "Run 'cass tui' and press Alt+S to set up semantic search, or omit --mode hybrid when lexical evidence is acceptable"
+                                .to_string(),
+                        ),
+                        retryable: false,
+                    });
+                } else {
+                    return Err(CliError {
+                        code: 9,
+                        kind: CliErrorKind::Search.kind_str(),
+                        message: format!("hybrid search failed: {error}"),
+                        hint: Some(
+                            "Retry with the default hybrid-preferred mode when lexical evidence is acceptable"
+                                .to_string(),
+                        ),
+                        retryable: true,
+                    });
+                }
+            }
+        },
+    };
+    Ok((result, mode_meta))
+}
+
+fn configure_bounded_search_semantics(
+    client: std::sync::Arc<crate::search::query::SearchClient>,
+    data_dir: PathBuf,
+    db_path: PathBuf,
+    mut mode_meta: SearchModeMeta,
+    semantic_opts: SemanticSearchOptions,
+    no_maintenance: bool,
+) -> CliResult<(SearchModeMeta, Option<String>)> {
+    use crate::search::embedder_registry::{EmbedderRegistry, HASH_EMBEDDER};
+    use crate::search::model_manager::{
+        load_hash_semantic_context, load_hash_semantic_context_strict, load_semantic_context,
+        load_semantic_context_deferred, load_semantic_context_deferred_strict,
+        load_semantic_context_for_embedder, load_semantic_context_for_embedder_deferred,
+        load_semantic_context_for_embedder_deferred_strict,
+        load_semantic_context_for_embedder_strict, load_semantic_context_strict,
+    };
+    use std::sync::Arc;
+
+    maybe_test_search_worker_delay("CASS_TEST_SEARCH_SEMANTIC_SETUP_SLOW_MS");
+
+    let registry = EmbedderRegistry::new(&data_dir);
+    let env_model = dotenvy::var("CASS_SEMANTIC_EMBEDDER")
+        .ok()
+        .and_then(|value| {
+            if value.trim().eq_ignore_ascii_case("hash") {
+                Some("hash")
+            } else {
+                crate::search::fastembed_embedder::FastEmbedder::canonical_name(&value)
+            }
+        });
+    let requested_model = semantic_opts.model.as_deref().or(env_model);
+    if let Some(model_name) = semantic_opts.model.as_deref()
+        && let Err(error) = registry.validate(model_name)
+    {
+        return Err(CliError {
+            code: 15,
+            kind: CliErrorKind::EmbedderUnavailable.kind_str(),
+            message: format!("Embedder validation failed: {error}"),
+            hint: Some("Run 'cass models list' to see available embedders".to_string()),
+            retryable: false,
+        });
+    }
+
+    let embedder_info = match requested_model {
+        Some(name) => registry.get(name),
+        None => Some(registry.best_available()),
+    };
+    let daemon_embedder_id = embedder_info
+        .filter(|entry| entry.is_semantic)
+        .map(|entry| entry.id.to_string());
+    let prefer_hash = semantic_opts.tier_mode == crate::search::query::SemanticTierMode::FastOnly
+        || embedder_info.is_some_and(|entry| entry.name == HASH_EMBEDDER);
+    let setup = if prefer_hash {
+        if no_maintenance {
+            load_hash_semantic_context_strict(&data_dir, &db_path)
+        } else {
+            load_hash_semantic_context(&data_dir, &db_path)
+        }
+    } else if let Some(model_name) = requested_model {
+        if semantic_opts.use_daemon && no_maintenance {
+            load_semantic_context_for_embedder_deferred_strict(&data_dir, &db_path, model_name)
+        } else if semantic_opts.use_daemon {
+            load_semantic_context_for_embedder_deferred(&data_dir, &db_path, model_name)
+        } else if no_maintenance {
+            load_semantic_context_for_embedder_strict(&data_dir, &db_path, model_name)
+        } else {
+            load_semantic_context_for_embedder(&data_dir, &db_path, model_name)
+        }
+    } else if semantic_opts.use_daemon && no_maintenance {
+        load_semantic_context_deferred_strict(&data_dir, &db_path)
+    } else if semantic_opts.use_daemon {
+        load_semantic_context_deferred(&data_dir, &db_path)
+    } else if no_maintenance {
+        load_semantic_context_strict(&data_dir, &db_path)
+    } else {
+        load_semantic_context(&data_dir, &db_path)
+    };
+
+    if let Some(context) = setup.context {
+        let embedder = context.embedder;
+        let artifacts = context.artifacts;
+        let quality_artifact = context.quality_artifact;
+        let filter_maps = context.filter_maps;
+        let roles = context.roles;
+        let daemon_embedder_compatible =
+            crate::search::fastembed_embedder::FastEmbedder::canonical_name(embedder.id())
+                .is_some();
+        let embedder: Arc<dyn crate::search::embedder::Embedder> =
+            if semantic_opts.use_daemon && !prefer_hash && daemon_embedder_compatible {
+                #[cfg(unix)]
+                {
+                    // A bounded robot worker never spawns a persistent daemon. It
+                    // may use an already-running, attested daemon or fall back to
+                    // the in-process embedder.
+                    let daemon =
+                        crate::daemon::client::try_connect_for_embedder(embedder.id(), &data_dir);
+                    let config = crate::search::daemon_client::DaemonRetryConfig::from_env();
+                    match daemon {
+                        Some(daemon) => match daemon.attestation_channel(&data_dir) {
+                            Ok((connection, verifier)) => {
+                                let daemon: Arc<dyn crate::search::daemon_client::DaemonClient> =
+                                    daemon;
+                                compose_verified_daemon_embedder_or_local(
+                                    daemon, embedder, config, connection, verifier,
+                                )
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    error = %error,
+                                    embedder_id = %embedder.id(),
+                                    "Daemon attestation channel could not be established"
+                                );
+                                embedder
+                            }
+                        },
+                        None => embedder,
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    embedder
+                }
+            } else {
+                embedder
+            };
+
+        if let Err(error) = client.set_semantic_artifacts_context(
+            embedder,
+            artifacts,
+            quality_artifact,
+            filter_maps,
+            roles,
+        ) {
+            let hint = if prefer_hash {
+                "Run 'cass index --semantic --embedder hash' to rebuild the hash vector index, or omit --mode semantic when lexical evidence is acceptable"
+                    .to_string()
+            } else {
+                "Run 'cass models install' and then 'cass index --semantic', or omit --mode semantic when lexical evidence is acceptable"
+                    .to_string()
+            };
+            if mode_meta.fail_open_on_semantic_unavailable() {
+                mode_meta.fall_back_to_lexical(format!("semantic context rejected: {error}"));
+                let _ = client.clear_semantic_context();
+            } else {
+                return Err(CliError {
+                    code: 15,
+                    kind: CliErrorKind::SemanticUnavailable.kind_str(),
+                    message: format!("Semantic search not available: {error}"),
+                    hint: Some(hint),
+                    retryable: false,
+                });
+            }
+        }
+    } else {
+        let _ = client.clear_semantic_context();
+        let summary = setup.availability.summary();
+        let hint = if prefer_hash {
+            "Run 'cass index --semantic --embedder hash' to build the hash vector index, or omit --mode semantic when lexical evidence is acceptable"
+                .to_string()
+        } else {
+            "Run 'cass models install' and then 'cass index --semantic', or omit --mode semantic when lexical evidence is acceptable"
+                .to_string()
+        };
+        if mode_meta.fail_open_on_semantic_unavailable() {
+            mode_meta.fall_back_to_lexical(format!("semantic context unavailable: {summary}"));
+        } else {
+            return Err(CliError {
+                code: 15,
+                kind: CliErrorKind::SemanticUnavailable.kind_str(),
+                message: format!("Semantic search not available: {summary}"),
+                hint: Some(hint),
+                retryable: false,
+            });
+        }
+    }
+
+    Ok((mode_meta, daemon_embedder_id))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_cli_search_setup(
+    data_dir: &Path,
+    db_path: &Path,
+    index_path: &Path,
+    mode: Option<crate::search::query::SearchMode>,
+    timeout_ms: Option<u64>,
+    started_at: Instant,
+    no_maintenance: bool,
+    robot_bounded_degraded: bool,
+) -> CliResult<CliSearchSetup> {
+    use crate::search::query::{SearchClient, SearchClientOptions};
+
+    maybe_test_search_worker_delay("CASS_TEST_SEARCH_SETUP_SLOW_MS");
+    let self_heal = if search_request_skips_lexical_self_heal(mode) {
+        SearchLexicalSelfHeal::skipped()
+    } else if no_maintenance {
+        inspect_lexical_assets_for_search_read_only(data_dir, db_path, index_path)?
+    } else {
+        ensure_lexical_assets_for_search(
+            data_dir,
+            db_path,
+            index_path,
+            timeout_ms,
+            started_at,
+            false,
+            robot_bounded_degraded,
+        )?
+    };
+    let lexical_initialized = crate::search::tantivy::searchable_index_exists(index_path);
+    let rebuild_active = probe_index_run_lock(data_dir, db_path).active;
+    let db_exists = db_path.exists();
+    let client = std::sync::Arc::new(
+        SearchClient::open_with_options(
+            index_path,
+            Some(db_path),
+            SearchClientOptions {
+                enable_reload: false,
+                enable_warm: false,
+                strict_read_only: no_maintenance,
+            },
+        )
+        .map_err(|error| CliError {
+            code: 9,
+            kind: CliErrorKind::OpenIndex.kind_str(),
+            message: format!("failed to open index: {error}"),
+            hint: Some("try cass index --full".to_string()),
+            retryable: true,
+        })?
+        .ok_or_else(|| {
+            let (message, hint) = if rebuild_active && !lexical_initialized {
+                (
+                    format!(
+                        "cass is already building the initial search index in {}. Search will become available when that index run finishes.",
+                        data_dir.display()
+                    ),
+                    Some("Wait for the active 'cass index' run to finish, or inspect progress with 'cass status --json'.".to_string()),
+                )
+            } else if cass_not_initialized(db_exists, lexical_initialized, rebuild_active) {
+                (
+                    format!(
+                        "cass has not been initialized in {} yet, so search cannot run until the first index completes.",
+                        data_dir.display()
+                    ),
+                    Some(cass_not_initialized_recommended_action()),
+                )
+            } else if db_exists && !lexical_initialized {
+                (
+                    format!(
+                        "Search index not found at {}. The archive database exists, but the lexical index has not been built yet.",
+                        index_path.display()
+                    ),
+                    Some("Run 'cass index --full' to build the search index for this archive.".to_string()),
+                )
+            } else if !db_exists && lexical_initialized {
+                (
+                    format!(
+                        "Search index exists at {}, but the archive database {} is missing.",
+                        index_path.display(),
+                        db_path.display()
+                    ),
+                    Some(
+                        "Restore the canonical archive from backup if historical coverage matters; otherwise run 'cass index --full' to create a new archive from currently available source sessions."
+                            .to_string(),
+                    ),
+                )
+            } else {
+                (
+                    format!(
+                        "Index not found at {}. Run 'cass index --full' first.",
+                        index_path.display()
+                    ),
+                    Some(
+                        "Run 'cass index --full' to create the local archive and search index."
+                            .to_string(),
+                    ),
+                )
+            };
+            CliError {
+                code: 3,
+                kind: CliErrorKind::MissingIndex.kind_str(),
+                message,
+                hint,
+                retryable: true,
+            }
+        })?,
+    );
+
+    Ok(CliSearchSetup {
+        self_heal,
+        client,
+        rebuild_active,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -28040,6 +28781,7 @@ fn run_cli_search(
     sessions_from: Option<String>,
     mode: Option<crate::search::query::SearchMode>,
     semantic_opts: SemanticSearchOptions,
+    refresh: bool,
 ) -> CliResult<()> {
     use crate::search::model_manager::{
         load_hash_semantic_context, load_hash_semantic_context_strict, load_semantic_context,
@@ -28048,9 +28790,7 @@ fn run_cli_search(
         load_semantic_context_for_embedder_deferred_strict,
         load_semantic_context_for_embedder_strict, load_semantic_context_strict,
     };
-    use crate::search::query::{
-        QueryExplanation, SearchClient, SearchClientOptions, SearchFilters, SearchMode,
-    };
+    use crate::search::query::{QueryExplanation, SearchFilters, SearchMode};
 
     use crate::sources::provenance::SourceFilter;
     use std::collections::HashSet;
@@ -28061,8 +28801,27 @@ fn run_cli_search(
 
     let data_dir = resolve_data_dir(data_dir_override, db_override.as_ref());
     let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
+    let refresh_db_override = db_override.clone();
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-    let db_exists = db_path.exists();
+
+    // Resolve robot mode before reading any user-supplied session scope so a
+    // FIFO/stdin/file reader shares the same hard deadline as the search.
+    let effective_robot = robot_format
+        .or(if *json { Some(RobotFormat::Json) } else { None })
+        .or_else(robot_format_from_env)
+        .or(if robot_auto {
+            Some(RobotFormat::Json)
+        } else {
+            None
+        });
+    let search_budget = effective_robot.map(|_| {
+        crate::robot_budget_envelope::RobotBudget::with_start(
+            search_budget_ms(timeout_ms),
+            start_time,
+        )
+    });
+    let mut skipped_sections = Vec::<String>::new();
+    let mut session_paths_timed_out = false;
 
     let mut filters = SearchFilters::default();
     if !agents.is_empty() {
@@ -28081,14 +28840,20 @@ fn run_cli_search(
 
     // Apply session paths filter (for chained searches)
     if let Some(ref sessions_from_arg) = sessions_from {
-        let session_paths = read_session_paths(sessions_from_arg).map_err(|e| CliError {
-            code: 2,
-            kind: CliErrorKind::SessionsFrom.kind_str(),
-            message: format!("failed to read session paths: {e}"),
-            hint: Some("Provide a file path or '-' for stdin".to_string()),
-            retryable: false,
-        })?;
-        filters.session_paths = session_paths;
+        match read_session_paths_bounded(
+            sessions_from_arg,
+            search_budget
+                .as_ref()
+                .map(crate::robot_budget_envelope::RobotBudget::remaining_ms),
+        )? {
+            BoundedSessionPaths::Complete(session_paths) => {
+                filters.session_paths = session_paths;
+            }
+            BoundedSessionPaths::TimedOut => {
+                session_paths_timed_out = true;
+                skipped_sections.push("sessions_from".to_string());
+            }
+        }
     }
     // GH#414: resolve how many requested session paths the index has seen, so
     // "your filter selected zero sessions" is distinguishable from "your
@@ -28096,7 +28861,7 @@ fn run_cli_search(
     let sessions_filter_stats: Option<SessionsFilterStats> =
         sessions_from.as_ref().map(|_| SessionsFilterStats {
             requested: filters.session_paths.len(),
-            matched: if no_maintenance {
+            matched: if no_maintenance || effective_robot.is_some() {
                 None
             } else {
                 count_indexed_session_paths(&db_path, &filters.session_paths)
@@ -28133,23 +28898,6 @@ fn run_cli_search(
         }
     }
 
-    // Determine the effective output format
-    // Priority: robot_format CLI > json flag > CASS_OUTPUT_FORMAT > TOON_DEFAULT_FORMAT > robot_auto > None
-    let effective_robot = robot_format
-        .or(if *json { Some(RobotFormat::Json) } else { None })
-        .or_else(robot_format_from_env)
-        .or(if robot_auto {
-            Some(RobotFormat::Json)
-        } else {
-            None
-        });
-    let search_budget = effective_robot.map(|_| {
-        crate::robot_budget_envelope::RobotBudget::with_start(
-            search_budget_ms(timeout_ms),
-            start_time,
-        )
-    });
-    let mut skipped_sections = Vec::<String>::new();
     let mut daemon_embedder_id_for_rerank = None::<String>;
     let field_mask_visible_limit = token_budget_field_mask_visible_limit(max_tokens, limit_val);
     let field_mask = resolve_field_mask(
@@ -28168,6 +28916,27 @@ fn run_cli_search(
         .transpose()?
         .unwrap_or_default();
     let has_aggregation = !agg_fields.is_empty();
+
+    // All fallible request parsing is complete before the opt-in human refresh
+    // can mutate derived assets. Robot refresh remains a deferred, explicit
+    // dataset-scoped recommendation.
+    if refresh && effective_robot.is_none() {
+        refresh_index_inline(refresh_db_override, data_dir_override.clone());
+    } else if refresh {
+        skipped_sections.push("refresh".to_string());
+    }
+
+    if session_paths_timed_out {
+        skipped_sections.push("search".to_string());
+        return output_search_budget_partial(
+            query,
+            effective_robot.expect("bounded session reader is robot-only"),
+            search_budget.as_ref().expect("robot search has a budget"),
+            skipped_sections,
+            &data_dir,
+            sessions_from.as_deref(),
+        );
+    }
 
     // Handle dry-run mode before touching derived search assets. A dry run is
     // query analysis only, so it must work on a fresh data dir with no DB/index.
@@ -28207,32 +28976,49 @@ fn run_cli_search(
         return Ok(());
     }
 
-    // Lexical self-heal only matters for requests that can be served by the
-    // lexical tier. An explicit `--mode semantic` never fails open to lexical
-    // (see `SearchModeMeta::fail_open_on_semantic_unavailable`), so rebuilding
-    // or lock-waiting on a stale lexical checkpoint before it can reach the
-    // vector/HNSW assets is pure latency — on a large archive it turned a
-    // read-only ANN query into a multi-minute rebuild wait. Hybrid and lexical
-    // requests keep the full repair path.
-    let search_self_heal = if search_request_skips_lexical_self_heal(mode) {
-        tracing::debug!(
-            "search lexical self-heal skipped: explicit semantic request does not consume the lexical tier"
-        );
-        SearchLexicalSelfHeal::skipped()
-    } else if no_maintenance {
-        inspect_lexical_assets_for_search_read_only(&data_dir, &db_path, &index_path)?
+    let setup = if let Some(budget) = search_budget.as_ref() {
+        let worker_data_dir = data_dir.clone();
+        let worker_db_path = db_path.clone();
+        let worker_index_path = index_path.clone();
+        run_read_only_search_worker(budget.remaining_ms(), move || {
+            open_cli_search_setup(
+                &worker_data_dir,
+                &worker_db_path,
+                &worker_index_path,
+                mode,
+                timeout_ms,
+                start_time,
+                no_maintenance,
+                true,
+            )
+        })?
     } else {
-        ensure_lexical_assets_for_search(
+        Some(open_cli_search_setup(
             &data_dir,
             &db_path,
             &index_path,
+            mode,
             timeout_ms,
             start_time,
-            dry_run,
-            // #287: robot callers get a bounded degraded refusal (stable reason
-            // code) instead of a silent multi-minute inline lexical rebuild.
-            effective_robot.is_some(),
-        )?
+            no_maintenance,
+            false,
+        )?)
+    };
+    let Some(CliSearchSetup {
+        self_heal: search_self_heal,
+        client,
+        ..
+    }) = setup
+    else {
+        skipped_sections.extend(["search_setup".to_string(), "search".to_string()]);
+        return output_search_budget_partial(
+            query,
+            effective_robot.expect("bounded setup is robot-only"),
+            search_budget.as_ref().expect("robot search has a budget"),
+            skipped_sections,
+            &data_dir,
+            sessions_from.as_deref(),
+        );
     };
     if search_self_heal.action != "skipped" {
         tracing::info!(
@@ -28242,80 +29028,6 @@ fn run_cli_search(
             "search lexical self-heal completed"
         );
     }
-    let tantivy_index_initialized = crate::search::tantivy::searchable_index_exists(&index_path);
-    let rebuild_active = probe_index_run_lock(&data_dir, &db_path).active;
-
-    let client = SearchClient::open_with_options(
-        &index_path,
-        Some(&db_path),
-        SearchClientOptions {
-            enable_reload: false,
-            enable_warm: false,
-            strict_read_only: no_maintenance,
-        },
-    )
-    .map_err(|e| CliError {
-        code: 9,
-        kind: CliErrorKind::OpenIndex.kind_str(),
-        message: format!("failed to open index: {e}"),
-        hint: Some("try cass index --full".to_string()),
-        retryable: true,
-    })?
-    .ok_or_else(|| {
-        let (message, hint) = if rebuild_active && !tantivy_index_initialized {
-            (
-                format!(
-                    "cass is already building the initial search index in {}. Search will become available when that index run finishes.",
-                    data_dir.display()
-                ),
-                Some("Wait for the active 'cass index' run to finish, or inspect progress with 'cass status --json'.".to_string()),
-            )
-        } else if cass_not_initialized(db_exists, tantivy_index_initialized, rebuild_active) {
-            (
-                format!(
-                    "cass has not been initialized in {} yet, so search cannot run until the first index completes.",
-                    data_dir.display()
-                ),
-                Some(cass_not_initialized_recommended_action()),
-            )
-        } else if db_exists && !tantivy_index_initialized {
-            (
-                format!(
-                    "Search index not found at {}. The archive database exists, but the lexical index has not been built yet.",
-                    index_path.display()
-                ),
-                Some("Run 'cass index --full' to build the search index for this archive.".to_string()),
-            )
-        } else if !db_exists && tantivy_index_initialized {
-            (
-                format!(
-                    "Search index exists at {}, but the archive database {} is missing.",
-                    index_path.display(),
-                    db_path.display()
-                ),
-                Some(
-                    "Restore the canonical archive from backup if historical coverage matters; otherwise run 'cass index --full' to create a new archive from currently available source sessions."
-                        .to_string(),
-                ),
-            )
-        } else {
-            (
-                format!(
-                    "Index not found at {}. Run 'cass index --full' first.",
-                    index_path.display()
-                ),
-                Some("Run 'cass index --full' to create the local archive and search index.".to_string()),
-            )
-        };
-        CliError {
-            code: 3,
-            kind: CliErrorKind::MissingIndex.kind_str(),
-            message,
-            hint,
-            retryable: true,
-        }
-    })?;
-
     if !client.has_tantivy() {
         eprintln!(
             "Warning: Tantivy search index not found at {}. \
@@ -28339,10 +29051,51 @@ fn run_cli_search(
         eprintln!("Warning: tier flags currently only affect --mode semantic.");
     }
 
+    let semantic_requested = matches!(
+        mode_meta.requested,
+        SearchMode::Semantic | SearchMode::Hybrid
+    );
+    let mut semantic_setup_timed_out = false;
+    if semantic_requested && let Some(budget) = search_budget.as_ref() {
+        let worker_client = Arc::clone(&client);
+        let worker_data_dir = data_dir.clone();
+        let worker_db_path = db_path.clone();
+        let worker_mode_meta = mode_meta.clone();
+        let mut worker_options = semantic_opts.clone();
+        worker_options.auto_spawn_daemon = false;
+        let configured = run_read_only_search_worker(budget.remaining_ms(), move || {
+            configure_bounded_search_semantics(
+                worker_client,
+                worker_data_dir,
+                worker_db_path,
+                worker_mode_meta,
+                worker_options,
+                no_maintenance,
+            )
+        })?;
+        if let Some((configured_mode, daemon_embedder_id)) = configured {
+            mode_meta = configured_mode;
+            daemon_embedder_id_for_rerank = daemon_embedder_id;
+        } else {
+            semantic_setup_timed_out = true;
+            mode_meta.semantic_work_completed = false;
+            skipped_sections.push("semantic_setup".to_string());
+            if mode_meta.fail_open_on_semantic_unavailable() {
+                mode_meta.fall_back_to_lexical(
+                    "semantic setup did not complete within the robot search budget",
+                );
+            }
+        }
+    }
+
     let semantic_budget_available = search_budget
         .as_ref()
         .is_none_or(|budget| budget.is_healthy());
-    if matches!(
+    if semantic_requested && search_budget.is_some() {
+        // Structured searches configure semantic assets on the bounded worker
+        // above. An explicit semantic timeout remains semantic and later emits
+        // an empty partial result; it must never substitute lexical evidence.
+    } else if matches!(
         mode_meta.requested,
         SearchMode::Semantic | SearchMode::Hybrid
     ) && !semantic_budget_available
@@ -28594,7 +29347,8 @@ fn run_cli_search(
 
     // Check if we're already past timeout before starting search
     let timeout_duration = timeout_ms.map(Duration::from_millis);
-    if let Some(timeout) = timeout_duration
+    if search_budget.is_none()
+        && let Some(timeout) = timeout_duration
         && start_time.elapsed() >= timeout
     {
         return Err(CliError {
@@ -28630,20 +29384,40 @@ fn run_cli_search(
 
     // Track search timing breakdown (T7.4)
     let search_start = Instant::now();
-    let result = if search_budget
-        .as_ref()
-        .is_some_and(crate::robot_budget_envelope::RobotBudget::is_exhausted)
-    {
-        skipped_sections.push("search".to_string());
-        crate::search::query::SearchResult {
-            hits: Vec::new(),
-            wildcard_fallback: false,
-            cache_stats: crate::search::query::CacheStats::default(),
-            suggestions: Vec::new(),
-            ann_stats: None,
-            ann_unavailable_reason: None,
-            total_count: None,
+    let bounded_result =
+        if semantic_setup_timed_out && matches!(mode_meta.requested, SearchMode::Semantic) {
+            None
+        } else if let Some(budget) = search_budget.as_ref() {
+            let worker_client = Arc::clone(&client);
+            let worker_query = query.to_string();
+            let worker_filters = filters.clone();
+            let worker_mode_meta = mode_meta.clone();
+            run_read_only_search_worker(budget.remaining_ms(), move || {
+                execute_search_operation(
+                    worker_client,
+                    worker_query,
+                    worker_filters,
+                    search_limit,
+                    search_offset,
+                    search_sparse_threshold,
+                    field_mask,
+                    approximate,
+                    semantic_execution_tier,
+                    worker_mode_meta,
+                )
+            })?
+        } else {
+            None
+        };
+    let result = if let Some((result, realized_mode_meta)) = bounded_result {
+        mode_meta = realized_mode_meta;
+        result
+    } else if search_budget.is_some() {
+        if semantic_requested {
+            mode_meta.semantic_work_completed = false;
         }
+        skipped_sections.push("search".to_string());
+        empty_search_result()
     } else {
         match mode_meta.realized {
             SearchMode::Lexical => client
@@ -28808,7 +29582,9 @@ fn run_cli_search(
         }
     };
     let search_ms = search_start.elapsed().as_millis() as u64;
-    maybe_test_search_delay();
+    if search_budget.is_none() {
+        maybe_test_search_delay();
+    }
 
     // Apply reranking if enabled (bd-2t2d)
     let rerank_start = Instant::now();
@@ -28862,9 +29638,7 @@ fn run_cli_search(
                                 connection,
                                 verifier,
                             ) {
-                                Ok(reranker) => {
-                                    Some(Arc::new(reranker) as Arc<dyn Reranker>)
-                                }
+                                Ok(reranker) => Some(Arc::new(reranker) as Arc<dyn Reranker>),
                                 Err(error) => {
                                     tracing::warn!(
                                         error = %error,
@@ -29116,12 +29890,44 @@ fn run_cli_search(
     };
 
     // Gather state meta for robot output (index/db freshness)
-    let state_meta_budget_available = search_budget
+    let mut state_meta_budget_available = search_budget
         .as_ref()
         .is_none_or(|budget| budget.is_healthy());
     let state_meta = if robot_meta && !state_meta_budget_available {
         skipped_sections.push("state_meta".to_string());
         None
+    } else if robot_meta && search_budget.is_some() {
+        let worker_data_dir = data_dir.clone();
+        let worker_db_path = db_path.clone();
+        let state = run_read_only_search_worker(
+            search_budget
+                .as_ref()
+                .expect("robot metadata has a search budget")
+                .remaining_ms(),
+            move || {
+                maybe_test_search_worker_delay("CASS_TEST_SEARCH_META_SLOW_MS");
+                Ok(if no_maintenance {
+                    state_meta_json_for_strict_read(
+                        &worker_data_dir,
+                        &worker_db_path,
+                        DEFAULT_STALE_THRESHOLD_SECS,
+                    )
+                } else {
+                    state_meta_json(
+                        &worker_data_dir,
+                        &worker_db_path,
+                        DEFAULT_STALE_THRESHOLD_SECS,
+                        true,
+                    )
+                })
+            },
+        )?;
+        if state.is_none() {
+            state_meta_budget_available = false;
+            skipped_sections.push("state_meta".to_string());
+            skipped_sections.push("search_completeness".to_string());
+        }
+        state
     } else if robot_meta {
         Some(if no_maintenance {
             state_meta_json_for_strict_read(&data_dir, &db_path, DEFAULT_STALE_THRESHOLD_SECS)
@@ -29134,7 +29940,11 @@ fn run_cli_search(
     let robot_freshness = state_meta.as_ref().and_then(state_index_freshness);
     // Stale-on-read catch-up: never blocks this search; a detached
     // low-priority `cass index --background` makes the *next* search fresh.
-    let auto_refresh = if no_maintenance {
+    let auto_refresh = if no_maintenance
+        || search_budget
+            .as_ref()
+            .is_some_and(crate::robot_budget_envelope::RobotBudget::is_exhausted)
+    {
         None
     } else {
         maybe_auto_refresh_index_after_read(&data_dir, &db_path, robot_freshness.as_ref())
@@ -29272,8 +30082,70 @@ fn run_cli_search(
     };
 
     if let Some(format) = effective_robot {
-        let recommended_next_probe =
-            (!skipped_sections.is_empty()).then(|| "cass health --json".to_string());
+        let expanded_trust_fields = expand_field_presets(&fields);
+        let minimal_trust_projection = expanded_trust_fields.as_ref().is_some_and(|fields| {
+            fields.len() == 3
+                && fields[0] == "source_path"
+                && fields[1] == "line_number"
+                && fields[2] == "agent"
+        });
+        let trust_projection_requested =
+            robot_meta && !minimal_trust_projection && !display_result.hits.is_empty();
+        let trust_values = if trust_projection_requested {
+            let budget = search_budget
+                .as_ref()
+                .expect("robot output always establishes a search budget");
+            if budget.is_healthy() {
+                let trust_hits = display_result.hits.clone();
+                let realized = trust_realized_mode(mode_meta.realized);
+                run_read_only_search_worker(budget.remaining_ms(), move || {
+                    maybe_test_search_worker_delay("CASS_TEST_SEARCH_TRUST_SLOW_MS");
+                    let correlation = crate::search::trust_correlation::build_for_cwd();
+                    let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+                    let query_workspace = correlation.project_workspace();
+                    Ok(trust_hits
+                        .iter()
+                        .map(|hit| {
+                            trust_value_for_hit(
+                                hit,
+                                now_ms,
+                                realized,
+                                &correlation,
+                                query_workspace.as_deref(),
+                            )
+                        })
+                        .collect::<Vec<_>>())
+                })?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if trust_projection_requested && trust_values.is_none() {
+            skipped_sections.push("trust_correlation".to_string());
+        }
+        let refresh_skipped = skipped_sections.iter().any(|section| section == "refresh");
+        let recommended_next_probe = if skipped_sections.is_empty() {
+            None
+        } else if refresh_skipped {
+            Some(cass_dataset_command(
+                &data_dir,
+                &db_path,
+                &["index", "--json"],
+            ))
+        } else {
+            search_budget_retry_command(
+                query,
+                format,
+                search_budget
+                    .as_ref()
+                    .expect("robot output always establishes a search budget")
+                    .total_ms(),
+                &data_dir,
+                sessions_from.as_deref(),
+            )
+        };
         let budget = crate::robot_budget_envelope::BudgetBlock::from_budget(
             search_budget
                 .as_ref()
@@ -29282,6 +30154,28 @@ fn run_cli_search(
             recommended_next_probe,
         );
         let timed_out = budget.timed_out;
+        if matches!(format, RobotFormat::Sessions)
+            && (budget.timed_out || !budget.skipped_sections.is_empty())
+        {
+            let retry_hint = budget.recommended_next_probe.clone();
+            let error_payload = serde_json::json!({
+                "error": {
+                    "code": 10,
+                    "kind": CliErrorKind::Timeout.kind_str(),
+                    "message": "sessions-format search did not complete within its robot budget",
+                    "hint": retry_hint.clone(),
+                    "retryable": true,
+                },
+                "budget": budget,
+            });
+            return Err(CliError {
+                code: 10,
+                kind: CliErrorKind::Timeout.kind_str(),
+                message: error_payload.to_string(),
+                hint: retry_hint,
+                retryable: true,
+            });
+        }
         // Robot output mode (JSON)
         output_robot_results(
             query,
@@ -29310,6 +30204,7 @@ fn run_cli_search(
             timed_out,
             Some(budget.budget_ms),
             &budget,
+            trust_values.as_deref(),
             mode_meta,
             search_ms,
             rerank_ms,
@@ -29397,15 +30292,199 @@ fn pack_budget_ms(timeout_ms: Option<u64>) -> u64 {
     })
 }
 
-/// Deterministic slowdown for bounded-pack E2E coverage. Production callers
-/// never set this test-only environment variable.
-fn maybe_test_pack_delay() {
-    if let Ok(raw) = dotenvy::var("CASS_TEST_PACK_SLOW_MS")
+/// Deterministic slowdowns for bounded-pack E2E coverage. Production callers
+/// never set these test-only environment variables.
+fn maybe_test_pack_worker_delay(variable: &str) {
+    if let Ok(raw) = dotenvy::var(variable)
         && let Ok(milliseconds) = raw.parse::<u64>()
         && milliseconds > 0
     {
         std::thread::sleep(Duration::from_millis(milliseconds));
     }
+}
+
+fn maybe_test_pack_delay() {
+    maybe_test_pack_worker_delay("CASS_TEST_PACK_SLOW_MS");
+}
+
+fn maybe_test_pack_plan_delay() {
+    maybe_test_pack_worker_delay("CASS_TEST_PACK_PLAN_SLOW_MS");
+}
+
+fn maybe_test_pack_render_delay() {
+    maybe_test_pack_worker_delay("CASS_TEST_PACK_RENDER_SLOW_MS");
+}
+
+fn pack_budget_block(
+    budget: &crate::robot_budget_envelope::RobotBudget,
+    skipped_sections: Vec<String>,
+    recommended_next_probe: Option<String>,
+    hard_deadline_reached: bool,
+) -> crate::robot_budget_envelope::BudgetBlock {
+    let mut block = crate::robot_budget_envelope::BudgetBlock::from_budget(
+        budget,
+        skipped_sections,
+        recommended_next_probe,
+    );
+    if hard_deadline_reached {
+        block.elapsed_ms = block.elapsed_ms.max(block.budget_ms);
+        block.timed_out = true;
+    }
+    block
+}
+
+fn update_pack_value_runtime_metadata(
+    value: &mut serde_json::Value,
+    budget: &crate::robot_budget_envelope::BudgetBlock,
+    elapsed_ms: u64,
+) -> Result<(), serde_json::Error> {
+    if let Some(object) = value.as_object_mut() {
+        object.insert("budget".to_string(), serde_json::to_value(budget)?);
+        if let Some(meta) = object
+            .get_mut("_meta")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            meta.insert("elapsed_ms".to_string(), elapsed_ms.into());
+            meta.insert(
+                "partial".to_string(),
+                (budget.timed_out || !budget.skipped_sections.is_empty()).into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn update_pack_jsonl_runtime_metadata(
+    rendered: String,
+    budget: &crate::robot_budget_envelope::BudgetBlock,
+    elapsed_ms: u64,
+) -> Result<String, serde_json::Error> {
+    let mut lines = rendered.lines();
+    let Some(header) = lines.next() else {
+        return Ok(rendered);
+    };
+    let mut header: serde_json::Value = serde_json::from_str(header)?;
+    update_pack_value_runtime_metadata(&mut header, budget, elapsed_ms)?;
+    let mut updated = serde_json::to_string(&header)?;
+    for line in lines {
+        updated.push('\n');
+        updated.push_str(line);
+    }
+    Ok(updated)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pack_retry_command(
+    data_dir: &Path,
+    db_path: &Path,
+    query: &str,
+    agents: &[String],
+    workspaces: &[String],
+    limit: usize,
+    fields: Option<&Vec<String>>,
+    max_tokens: usize,
+    max_sessions: usize,
+    max_evidence: usize,
+    context_lines: usize,
+    max_excerpt_chars: usize,
+    request_id: Option<&str>,
+    time_filter: &TimeFilter,
+    source: Option<&str>,
+    sessions_from: Option<&str>,
+    mode: Option<crate::search::query::SearchMode>,
+    freshness_policy: crate::search::pack_planner::PackFreshnessPolicy,
+    freshness_window_seconds: i64,
+    require_evidence: bool,
+    explain_selection: bool,
+    render_format: crate::search::pack_planner::PackRenderFormat,
+    retry_budget_ms: u64,
+) -> String {
+    use crate::search::pack_planner::{PackFreshnessPolicy, PackRenderFormat};
+
+    let mut args = vec!["pack".to_string(), shell_quote_arg(query)];
+    for agent in agents {
+        args.push("--agent".to_string());
+        args.push(shell_quote_arg(agent));
+    }
+    for workspace in workspaces {
+        args.push("--workspace".to_string());
+        args.push(shell_quote_arg(workspace));
+    }
+    args.extend([
+        "--limit".to_string(),
+        limit.to_string(),
+        "--max-tokens".to_string(),
+        max_tokens.to_string(),
+        "--max-sessions".to_string(),
+        max_sessions.to_string(),
+        "--max-evidence".to_string(),
+        max_evidence.to_string(),
+        "--context-lines".to_string(),
+        context_lines.to_string(),
+        "--max-excerpt-chars".to_string(),
+        max_excerpt_chars.to_string(),
+    ]);
+    if let Some(fields) = fields {
+        args.push("--fields".to_string());
+        args.push(shell_quote_arg(&fields.join(",")));
+    }
+    if let Some(request_id) = request_id {
+        args.push("--request-id".to_string());
+        args.push(shell_quote_arg(request_id));
+    }
+    if let Some(since) = time_filter.since {
+        args.push("--since".to_string());
+        args.push(since.to_string());
+    }
+    if let Some(until) = time_filter.until {
+        args.push("--until".to_string());
+        args.push(until.to_string());
+    }
+    if let Some(source) = source {
+        args.push("--source".to_string());
+        args.push(shell_quote_arg(source));
+    }
+    if let Some(sessions_from) = sessions_from {
+        args.push("--sessions-from".to_string());
+        args.push(shell_quote_arg(sessions_from));
+    }
+    if let Some(mode) = mode {
+        args.push("--mode".to_string());
+        args.push(search_mode_label(mode).to_string());
+    }
+    args.push("--freshness-policy".to_string());
+    args.push(
+        match freshness_policy {
+            PackFreshnessPolicy::PreferRecent => "prefer-recent",
+            PackFreshnessPolicy::Strict => "strict",
+            PackFreshnessPolicy::AllowStale => "allow-stale",
+        }
+        .to_string(),
+    );
+    args.push("--freshness-window-seconds".to_string());
+    args.push(freshness_window_seconds.to_string());
+    if require_evidence {
+        args.push("--require-evidence".to_string());
+    }
+    if explain_selection {
+        args.push("--explain-selection".to_string());
+    }
+    match render_format {
+        PackRenderFormat::Json => args.push("--json".to_string()),
+        PackRenderFormat::CompactJson => {
+            args.extend(["--robot-format".to_string(), "compact".to_string()]);
+        }
+        PackRenderFormat::Jsonl => {
+            args.extend(["--robot-format".to_string(), "jsonl".to_string()]);
+        }
+        PackRenderFormat::Toon => {
+            args.extend(["--robot-format".to_string(), "toon".to_string()]);
+        }
+        PackRenderFormat::Markdown => {}
+    }
+    args.extend(["--timeout".to_string(), retry_budget_ms.to_string()]);
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    cass_dataset_command(data_dir, db_path, &arg_refs)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -29439,10 +30518,12 @@ fn run_cli_pack(
 ) -> CliResult<()> {
     use crate::search::pack_planner::{
         PackLexicalReadiness, PackPlanRequest, PackPlannerLimits, PackReadinessSnapshot,
-        PackRenderFormat, PackRenderRequest, PackSemanticReadiness, pack_candidate_fetch_limit,
-        plan_answer_pack, render_answer_pack, render_answer_pack_value,
+        PackRenderFormat, PackRenderRequest, PackSemanticReadiness, budget_fallback_answer_pack,
+        pack_candidate_fetch_limit, plan_answer_pack, render_answer_pack, render_answer_pack_value,
+        render_answer_pack_value_without_trust_correlation,
+        render_answer_pack_without_trust_correlation,
     };
-    use crate::search::query::{FieldMask, SearchClient, SearchClientOptions, SearchFilters};
+    use crate::search::query::{FieldMask, SearchFilters};
     use crate::sources::provenance::SourceFilter;
 
     let start_time = Instant::now();
@@ -29470,6 +30551,8 @@ fn run_cli_pack(
         start_time,
     );
     let mut skipped_sections = Vec::<String>::new();
+    let mut hard_deadline_reached = false;
+    let mut session_scope_empty = false;
     let freshness_policy = parse_pack_freshness_policy(freshness_policy)?;
     if freshness_window_seconds <= 0 {
         return Err(CliError {
@@ -29498,10 +30581,11 @@ fn run_cli_pack(
     let db_path = db_override
         .clone()
         .unwrap_or_else(|| data_dir.join("agent_search.db"));
-    let db_exists = db_path.exists();
-    // Stale-on-read catch-up: pack reads the same lexical assets as search,
-    // so a stale index here also schedules a detached incremental refresh.
-    if let Some(outcome) = maybe_auto_refresh_index_after_read(&data_dir, &db_path, None) {
+    // Human pack retains stale-on-read catch-up. Structured pack is a bounded,
+    // mutation-free probe and routes refresh to an explicit index command.
+    if !structured_pack
+        && let Some(outcome) = maybe_auto_refresh_index_after_read(&data_dir, &db_path, None)
+    {
         tracing::debug!(?outcome, "pack: auto-refresh evaluated");
     }
 
@@ -29517,69 +30601,13 @@ fn run_cli_pack(
     if let Some(ref source_str) = source {
         filters.source_filter = SourceFilter::parse(source_str);
     }
-    if let Some(ref sessions_from_arg) = sessions_from {
-        filters.session_paths = read_session_paths(sessions_from_arg).map_err(|e| CliError {
-            code: 2,
-            kind: CliErrorKind::SessionsFrom.kind_str(),
-            message: format!("failed to read session paths: {e}"),
-            hint: Some("Provide a file path or '-' for stdin".to_string()),
-            retryable: false,
-        })?;
-    }
     validate_pack_fields(fields.as_ref())?;
 
-    if refresh && pack_budget.is_healthy() {
+    if refresh && !structured_pack && pack_budget.is_healthy() {
         refresh_index_inline(db_override.clone(), data_dir_override.clone());
     } else if refresh {
         skipped_sections.push("refresh".to_string());
     }
-
-    let search_self_heal = ensure_lexical_assets_for_search(
-        &data_dir,
-        &db_path,
-        &index_path,
-        timeout_ms,
-        start_time,
-        false,
-        structured_pack,
-    )?;
-    if search_self_heal.action != "skipped" {
-        tracing::info!(
-            action = search_self_heal.action,
-            reason = search_self_heal.reason.as_deref(),
-            indexed_docs = search_self_heal.indexed_docs,
-            "pack lexical self-heal completed"
-        );
-    }
-
-    let tantivy_index_initialized = crate::search::tantivy::searchable_index_exists(&index_path);
-    let rebuild_active = probe_index_run_lock(&data_dir, &db_path).active;
-    let client = SearchClient::open_with_options(
-        &index_path,
-        Some(&db_path),
-        SearchClientOptions {
-            enable_reload: false,
-            enable_warm: false,
-            strict_read_only: false,
-        },
-    )
-    .map_err(|e| CliError {
-        code: 9,
-        kind: CliErrorKind::OpenIndex.kind_str(),
-        message: format!("failed to open index: {e}"),
-        hint: Some("try cass index --full".to_string()),
-        retryable: true,
-    })?
-    .ok_or_else(|| {
-        pack_missing_index_error(
-            &data_dir,
-            &db_path,
-            &index_path,
-            db_exists,
-            tantivy_index_initialized,
-            rebuild_active,
-        )
-    })?;
 
     let requested_mode = mode.unwrap_or_default();
     let mut mode_meta = SearchModeMeta::new(requested_mode, mode.is_none());
@@ -29595,6 +30623,78 @@ fn run_cli_pack(
     if matches!(requested_mode, crate::search::query::SearchMode::Hybrid) {
         mode_meta
             .fall_back_to_lexical("pack semantic enrichment unavailable; using lexical evidence");
+    }
+
+    if let Some(ref sessions_from_arg) = sessions_from {
+        match read_session_paths_bounded(
+            sessions_from_arg,
+            structured_pack.then(|| pack_budget.remaining_ms()),
+        )? {
+            BoundedSessionPaths::Complete(session_paths) => {
+                session_scope_empty = session_paths.is_empty();
+                filters.session_paths = session_paths;
+            }
+            BoundedSessionPaths::TimedOut => {
+                hard_deadline_reached = true;
+                skipped_sections.push("sessions_from".to_string());
+            }
+        }
+    }
+
+    let setup = if structured_pack && !hard_deadline_reached {
+        let worker_data_dir = data_dir.clone();
+        let worker_db_path = db_path.clone();
+        let worker_index_path = index_path.clone();
+        run_read_only_search_worker(pack_budget.remaining_ms(), move || {
+            open_cli_search_setup(
+                &worker_data_dir,
+                &worker_db_path,
+                &worker_index_path,
+                Some(crate::search::query::SearchMode::Lexical),
+                timeout_ms,
+                start_time,
+                false,
+                true,
+            )
+        })?
+    } else if structured_pack {
+        None
+    } else {
+        Some(open_cli_search_setup(
+            &data_dir,
+            &db_path,
+            &index_path,
+            Some(crate::search::query::SearchMode::Lexical),
+            timeout_ms,
+            start_time,
+            false,
+            false,
+        )?)
+    };
+    let (search_self_heal, client, rebuild_active) = if let Some(CliSearchSetup {
+        self_heal,
+        client,
+        rebuild_active,
+    }) = setup
+    {
+        (self_heal, Some(client), rebuild_active)
+    } else {
+        hard_deadline_reached = true;
+        if !skipped_sections
+            .iter()
+            .any(|section| section == "search_setup")
+        {
+            skipped_sections.push("search_setup".to_string());
+        }
+        (SearchLexicalSelfHeal::skipped(), None, false)
+    };
+    if search_self_heal.action != "skipped" {
+        tracing::info!(
+            action = search_self_heal.action,
+            reason = search_self_heal.reason.as_deref(),
+            indexed_docs = search_self_heal.indexed_docs,
+            "pack lexical self-heal completed"
+        );
     }
 
     let timeout_duration = timeout_ms.map(Duration::from_millis);
@@ -29620,39 +30720,54 @@ fn run_cli_pack(
         limit
     };
     let search_sparse_threshold = sparse_threshold_for_visible_limit(3, candidate_limit, false);
-    let result = if structured_pack && pack_budget.is_exhausted() {
-        skipped_sections.push("search".to_string());
-        crate::search::query::SearchResult {
-            hits: Vec::new(),
-            wildcard_fallback: false,
-            cache_stats: crate::search::query::CacheStats::default(),
-            suggestions: Vec::new(),
-            ann_stats: None,
-            ann_unavailable_reason: None,
-            total_count: None,
+    let result = if session_scope_empty {
+        empty_search_result()
+    } else if structured_pack && (hard_deadline_reached || pack_budget.is_exhausted()) {
+        hard_deadline_reached = true;
+        if !skipped_sections.iter().any(|section| section == "search") {
+            skipped_sections.push("search".to_string());
         }
+        empty_search_result()
     } else {
-        client
-            .search_with_fallback(
-                query,
-                filters,
-                candidate_limit,
-                0,
-                search_sparse_threshold,
-                FieldMask::FULL,
-            )
-            .map_err(|e| CliError {
-                code: 9,
-                kind: CliErrorKind::Search.kind_str(),
-                message: format!("pack search failed: {e}"),
-                hint: Some(
-                    "Try `cass search <query> --robot --robot-meta` to inspect the search path."
-                        .to_string(),
-                ),
-                retryable: true,
-            })?
+        let client = client.expect("completed pack setup provides a search client");
+        let query = query.to_string();
+        let search_task = move || {
+            maybe_test_pack_delay();
+            client
+                .search_with_fallback(
+                    &query,
+                    filters,
+                    candidate_limit,
+                    0,
+                    search_sparse_threshold,
+                    FieldMask::FULL,
+                )
+                .map_err(|error| {
+                    CliError {
+                        code: 9,
+                        kind: CliErrorKind::Search.kind_str(),
+                        message: format!("pack search failed: {error}"),
+                        hint: Some(
+                            "Try `cass search <query> --robot --robot-meta` to inspect the search path."
+                                .to_string(),
+                        ),
+                        retryable: true,
+                    }
+                })
+        };
+        if structured_pack {
+            match run_read_only_search_worker(pack_budget.remaining_ms(), search_task)? {
+                Some(result) => result,
+                None => {
+                    hard_deadline_reached = true;
+                    skipped_sections.push("search".to_string());
+                    empty_search_result()
+                }
+            }
+        } else {
+            search_task()?
+        }
     };
-    maybe_test_pack_delay();
 
     let query_term_count = pack_query_term_count(query);
     let query_phrase_count = pack_query_phrase_count(query);
@@ -29688,9 +30803,55 @@ fn run_cli_pack(
         candidates,
         explain_selection: realized_explain_selection,
     };
-    let plan = plan_answer_pack(plan_request).map_err(pack_invalid_limit_error)?;
+    let candidate_count = plan_request.candidates.len();
+    let mut plan = if structured_pack {
+        if pack_budget.is_exhausted() {
+            hard_deadline_reached = true;
+            skipped_sections.push("pack_planning".to_string());
+            budget_fallback_answer_pack(&limits, candidate_count)
+                .map_err(pack_invalid_limit_error)?
+        } else {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            std::thread::Builder::new()
+                .name("cass-pack-budgeted-planner".to_string())
+                .spawn(move || {
+                    maybe_test_pack_plan_delay();
+                    let _ = sender.send(plan_answer_pack(plan_request));
+                })
+                .map_err(|error| {
+                    CliError::unknown(format!(
+                        "failed to start bounded pack planner worker: {error}"
+                    ))
+                })?;
+            match receiver.recv_timeout(Duration::from_millis(pack_budget.remaining_ms().max(1))) {
+                Ok(result) => result.map_err(pack_invalid_limit_error)?,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    hard_deadline_reached = true;
+                    skipped_sections.push("pack_planning".to_string());
+                    if realized_explain_selection {
+                        skipped_sections.push("selection_explanations".to_string());
+                    }
+                    budget_fallback_answer_pack(&limits, candidate_count)
+                        .map_err(pack_invalid_limit_error)?
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(CliError::unknown(
+                        "bounded pack planner worker disconnected before reporting a result",
+                    ));
+                }
+            }
+        }
+    } else {
+        plan_answer_pack(plan_request).map_err(pack_invalid_limit_error)?
+    };
+    if skipped_sections
+        .iter()
+        .any(|section| section == "pack_planning")
+    {
+        plan.candidate_count = candidate_count;
+    }
 
-    if require_evidence && plan.evidence.is_empty() && !pack_budget.is_exhausted() {
+    if require_evidence && plan.evidence.is_empty() && !hard_deadline_reached {
         return Err(CliError {
             code: 13,
             kind: CliErrorKind::NotFound.kind_str(),
@@ -29700,22 +30861,62 @@ fn run_cli_pack(
         });
     }
 
-    let recommended_next_probe =
-        (!skipped_sections.is_empty()).then(|| "cass health --json".to_string());
-    let budget = crate::robot_budget_envelope::BudgetBlock::from_budget(
+    let recommended_probe_for = |sections: &[String]| {
+        let refresh_skipped = sections.iter().any(|section| section == "refresh");
+        if sections.is_empty() {
+            None
+        } else if refresh_skipped {
+            Some(cass_dataset_command(
+                &data_dir,
+                &db_path,
+                &["index", "--json"],
+            ))
+        } else if sessions_from.as_deref() == Some("-") {
+            None
+        } else {
+            let retry_budget_ms = pack_budget.total_ms().saturating_mul(2).max(1_000);
+            Some(pack_retry_command(
+                &data_dir,
+                &db_path,
+                query,
+                agents,
+                workspaces,
+                limit,
+                fields.as_ref(),
+                max_tokens,
+                max_sessions,
+                max_evidence,
+                context_lines,
+                max_excerpt_chars,
+                request_id.as_deref(),
+                &time_filter,
+                source.as_deref(),
+                sessions_from.as_deref(),
+                mode,
+                freshness_policy,
+                freshness_window_seconds,
+                require_evidence,
+                explain_selection,
+                render_format,
+                retry_budget_ms,
+            ))
+        }
+    };
+    let budget = pack_budget_block(
         &pack_budget,
-        skipped_sections,
-        recommended_next_probe,
+        skipped_sections.clone(),
+        recommended_probe_for(&skipped_sections),
+        hard_deadline_reached,
     );
-    let render_request = PackRenderRequest {
+    let mut render_request = PackRenderRequest {
         query_text: query.to_string(),
         normalized_query: query.trim().to_string(),
         generated_at_ms,
         elapsed_ms: start_time.elapsed().as_millis() as u64,
         budget,
-        request_id,
+        request_id: request_id.clone(),
         format: render_format,
-        limits,
+        limits: limits.clone(),
         search_mode: search_mode_label(mode_meta.realized).to_string(),
         fallback_mode: mode_meta.fallback_tier.map(str::to_string),
         semantic_joined: mode_meta.semantic_refinement(),
@@ -29747,20 +30948,161 @@ fn run_cli_pack(
         },
     };
 
-    match render_format {
-        PackRenderFormat::Json | PackRenderFormat::CompactJson | PackRenderFormat::Toon => {
-            let mut value =
-                render_answer_pack_value(&plan, &render_request).map_err(|err| CliError {
-                    code: 9,
-                    kind: CliErrorKind::EncodeJson.kind_str(),
-                    message: format!(
-                        "failed to render answer pack as {}: {}",
-                        err.format, err.message
-                    ),
-                    hint: None,
-                    retryable: false,
-                })?;
-            value = filter_pack_fields(value, fields.as_ref())?;
+    if !structured_pack {
+        let rendered = render_answer_pack(&plan, &render_request).map_err(|err| CliError {
+            code: 9,
+            kind: CliErrorKind::EncodeJson.kind_str(),
+            message: format!(
+                "failed to render answer pack as {}: {}",
+                err.format, err.message
+            ),
+            hint: None,
+            retryable: false,
+        })?;
+        println!("{rendered}");
+        return Ok(());
+    }
+
+    enum BoundedPackRender {
+        Value(serde_json::Value),
+        Jsonl(String),
+    }
+
+    let render_with_correlation = {
+        let plan = plan.clone();
+        let request = render_request.clone();
+        move || {
+            maybe_test_pack_render_delay();
+            match request.format {
+                PackRenderFormat::Json | PackRenderFormat::CompactJson | PackRenderFormat::Toon => {
+                    render_answer_pack_value(&plan, &request).map(BoundedPackRender::Value)
+                }
+                PackRenderFormat::Jsonl => {
+                    render_answer_pack(&plan, &request).map(BoundedPackRender::Jsonl)
+                }
+                PackRenderFormat::Markdown => unreachable!(),
+            }
+        }
+    };
+    let render_without_correlation =
+        |plan: &crate::search::pack_planner::PlannedAnswerPack, request: &PackRenderRequest| {
+            match request.format {
+                PackRenderFormat::Json | PackRenderFormat::CompactJson | PackRenderFormat::Toon => {
+                    render_answer_pack_value_without_trust_correlation(plan, request)
+                        .map(BoundedPackRender::Value)
+                }
+                PackRenderFormat::Jsonl => {
+                    render_answer_pack_without_trust_correlation(plan, request)
+                        .map(BoundedPackRender::Jsonl)
+                }
+                PackRenderFormat::Markdown => unreachable!(),
+            }
+        };
+    let render_budget_fallback =
+        budget_fallback_answer_pack(&limits, candidate_count).map_err(pack_invalid_limit_error)?;
+
+    let render_result = if pack_budget.is_exhausted() {
+        hard_deadline_reached = true;
+        if !skipped_sections
+            .iter()
+            .any(|section| section == "answer_pack_render")
+        {
+            skipped_sections.push("answer_pack_render".to_string());
+        }
+        if !skipped_sections
+            .iter()
+            .any(|section| section == "trust_correlation")
+        {
+            skipped_sections.push("trust_correlation".to_string());
+        }
+        render_request.budget = pack_budget_block(
+            &pack_budget,
+            skipped_sections.clone(),
+            recommended_probe_for(&skipped_sections),
+            hard_deadline_reached,
+        );
+        render_request.elapsed_ms = render_request.budget.elapsed_ms;
+        render_without_correlation(&render_budget_fallback, &render_request)
+    } else {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("cass-pack-budgeted-renderer".to_string())
+            .spawn(move || {
+                let _ = sender.send(render_with_correlation());
+            })
+            .map_err(|error| {
+                CliError::unknown(format!(
+                    "failed to start bounded pack renderer worker: {error}"
+                ))
+            })?;
+        match receiver.recv_timeout(Duration::from_millis(pack_budget.remaining_ms().max(1))) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                hard_deadline_reached = true;
+                if !skipped_sections
+                    .iter()
+                    .any(|section| section == "answer_pack_render")
+                {
+                    skipped_sections.push("answer_pack_render".to_string());
+                }
+                if !skipped_sections
+                    .iter()
+                    .any(|section| section == "trust_correlation")
+                {
+                    skipped_sections.push("trust_correlation".to_string());
+                }
+                render_request.budget = pack_budget_block(
+                    &pack_budget,
+                    skipped_sections.clone(),
+                    recommended_probe_for(&skipped_sections),
+                    hard_deadline_reached,
+                );
+                render_request.elapsed_ms = render_request.budget.elapsed_ms;
+                render_without_correlation(&render_budget_fallback, &render_request)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(CliError::unknown(
+                    "bounded pack renderer worker disconnected before reporting a result",
+                ));
+            }
+        }
+    };
+    let mut rendered = render_result.map_err(|err| CliError {
+        code: 9,
+        kind: CliErrorKind::EncodeJson.kind_str(),
+        message: format!(
+            "failed to render answer pack as {}: {}",
+            err.format, err.message
+        ),
+        hint: None,
+        retryable: false,
+    })?;
+
+    if !hard_deadline_reached {
+        render_request.budget = pack_budget_block(
+            &pack_budget,
+            skipped_sections.clone(),
+            recommended_probe_for(&skipped_sections),
+            false,
+        );
+        render_request.elapsed_ms = start_time.elapsed().as_millis() as u64;
+    }
+
+    match &mut rendered {
+        BoundedPackRender::Value(value) => {
+            update_pack_value_runtime_metadata(
+                value,
+                &render_request.budget,
+                render_request.elapsed_ms,
+            )
+            .map_err(|err| CliError {
+                code: 9,
+                kind: CliErrorKind::EncodeJson.kind_str(),
+                message: format!("failed to update answer-pack budget metadata: {err}"),
+                hint: None,
+                retryable: false,
+            })?;
+            let value = filter_pack_fields(std::mem::take(value), fields.as_ref())?;
             let output_format = match render_format {
                 PackRenderFormat::Json => RobotFormat::Json,
                 PackRenderFormat::CompactJson => RobotFormat::Compact,
@@ -29769,21 +31111,23 @@ fn run_cli_pack(
             };
             output_structured_value(value, output_format)?;
         }
-        PackRenderFormat::Jsonl | PackRenderFormat::Markdown => {
-            if fields.is_some() && matches!(render_format, PackRenderFormat::Jsonl) {
+        BoundedPackRender::Jsonl(rendered) => {
+            if fields.is_some() {
                 eprintln!("Warning: --fields is ignored for pack JSONL output.");
             }
-            let rendered = render_answer_pack(&plan, &render_request).map_err(|err| CliError {
+            let updated = update_pack_jsonl_runtime_metadata(
+                std::mem::take(rendered),
+                &render_request.budget,
+                render_request.elapsed_ms,
+            )
+            .map_err(|err| CliError {
                 code: 9,
                 kind: CliErrorKind::EncodeJson.kind_str(),
-                message: format!(
-                    "failed to render answer pack as {}: {}",
-                    err.format, err.message
-                ),
+                message: format!("failed to update answer-pack JSONL budget metadata: {err}"),
                 hint: None,
                 retryable: false,
             })?;
-            println!("{rendered}");
+            println!("{updated}");
         }
     }
 
@@ -29870,70 +31214,6 @@ fn pack_query_term_count(query: &str) -> usize {
 
 fn pack_query_phrase_count(query: &str) -> usize {
     query.matches('"').count() / 2
-}
-
-fn pack_missing_index_error(
-    data_dir: &Path,
-    db_path: &Path,
-    index_path: &Path,
-    db_exists: bool,
-    tantivy_index_initialized: bool,
-    rebuild_active: bool,
-) -> CliError {
-    let (message, hint) = if rebuild_active && !tantivy_index_initialized {
-        (
-            format!(
-                "cass is already building the initial search index in {}. Pack generation will become available when that index run finishes.",
-                data_dir.display()
-            ),
-            Some("Wait for the active 'cass index' run to finish, or inspect progress with 'cass status --json'.".to_string()),
-        )
-    } else if cass_not_initialized(db_exists, tantivy_index_initialized, rebuild_active) {
-        (
-            format!(
-                "cass has not been initialized in {} yet, so pack generation cannot run until the first index completes.",
-                data_dir.display()
-            ),
-            Some(cass_not_initialized_recommended_action()),
-        )
-    } else if db_exists && !tantivy_index_initialized {
-        (
-            format!(
-                "Search index not found at {}. The archive database exists, but the lexical index has not been built yet.",
-                index_path.display()
-            ),
-            Some("Run 'cass index --full' to build the search index for this archive.".to_string()),
-        )
-    } else if !db_exists && tantivy_index_initialized {
-        (
-            format!(
-                "Search index exists at {}, but the archive database {} is missing.",
-                index_path.display(),
-                db_path.display()
-            ),
-            Some(
-                "Restore the canonical archive from backup if historical coverage matters; otherwise run 'cass index --full' to create a new archive from currently available source sessions."
-                    .to_string(),
-            ),
-        )
-    } else {
-        (
-            format!(
-                "Index not found at {}. Run 'cass index --full' first.",
-                index_path.display()
-            ),
-            Some(
-                "Run 'cass index --full' to create the local archive and search index.".to_string(),
-            ),
-        )
-    };
-    CliError {
-        code: 3,
-        kind: CliErrorKind::MissingIndex.kind_str(),
-        message,
-        hint,
-        retryable: true,
-    }
 }
 
 fn filter_pack_fields(
@@ -31067,6 +32347,7 @@ struct SearchModeMeta {
     fallback_tier: Option<&'static str>,
     fallback_reason: Option<String>,
     quality_tier_refined: bool,
+    semantic_work_completed: bool,
 }
 
 impl SearchModeMeta {
@@ -31078,14 +32359,18 @@ impl SearchModeMeta {
             fallback_tier: None,
             fallback_reason: None,
             quality_tier_refined: true,
+            semantic_work_completed: true,
         }
     }
 
     fn semantic_refinement(&self) -> bool {
-        matches!(
-            self.realized,
-            crate::search::query::SearchMode::Semantic | crate::search::query::SearchMode::Hybrid
-        ) && self.fallback_tier.is_none()
+        self.semantic_work_completed
+            && matches!(
+                self.realized,
+                crate::search::query::SearchMode::Semantic
+                    | crate::search::query::SearchMode::Hybrid
+            )
+            && self.fallback_tier.is_none()
     }
 
     fn fail_open_on_semantic_unavailable(&self) -> bool {
@@ -31219,6 +32504,25 @@ fn toon_encode_options_from_env() -> toon::EncodeOptions {
         flatten_depth: None,
         replacer: None,
     }
+}
+
+fn encode_structured_value(payload: serde_json::Value, format: RobotFormat) -> CliResult<String> {
+    match format {
+        RobotFormat::Json => serde_json::to_string_pretty(&payload),
+        RobotFormat::Jsonl | RobotFormat::Compact | RobotFormat::Sessions => {
+            serde_json::to_string(&payload)
+        }
+        RobotFormat::Toon => {
+            return Ok(toon::encode(payload, Some(toon_encode_options_from_env())));
+        }
+    }
+    .map_err(|error| CliError {
+        code: 9,
+        kind: CliErrorKind::EncodeJson.kind_str(),
+        message: format!("failed to encode structured output: {error}"),
+        hint: None,
+        retryable: false,
+    })
 }
 
 fn output_structured_value(payload: serde_json::Value, format: RobotFormat) -> CliResult<()> {
@@ -31553,6 +32857,7 @@ fn output_robot_results(
     timed_out: bool,
     timeout_ms: Option<u64>,
     budget: &crate::robot_budget_envelope::BudgetBlock,
+    trust_values: Option<&[serde_json::Value]>,
     search_mode_meta: SearchModeMeta,
     search_ms: u64,
     rerank_ms: u64,
@@ -31930,26 +33235,13 @@ fn output_robot_results(
     // Advisory metadata — result ordering is untouched. `filtered_hits` is a
     // prefix projection of `result.hits` (same order; clamp only drops the
     // tail), so zip aligns each verdict with its hit.
-    if include_meta && !minimal_projection && !result.hits.is_empty() {
-        let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
-        let realized = trust_realized_mode(search_mode_meta.realized);
-        // q4pau: build the commit/bead/release correlation index once per query
-        // (fail-open: an empty index when cwd is not a git repo) and use its repo
-        // root as the cwd workspace anchor for cwd-relative workspace matching.
-        let correlation = crate::search::trust_correlation::build_for_cwd();
-        let query_workspace = correlation.project_workspace();
-        for (hit, value) in result.hits.iter().zip(filtered_hits.iter_mut()) {
+    if include_meta
+        && !minimal_projection
+        && let Some(trust_values) = trust_values
+    {
+        for (trust, value) in trust_values.iter().zip(filtered_hits.iter_mut()) {
             if let serde_json::Value::Object(map) = value {
-                map.insert(
-                    "trust".to_string(),
-                    trust_value_for_hit(
-                        hit,
-                        now_ms,
-                        realized,
-                        &correlation,
-                        query_workspace.as_deref(),
-                    ),
-                );
+                map.insert("trust".to_string(), trust.clone());
             }
         }
     }
@@ -79948,12 +81240,14 @@ fn run_status(
 
 /// One-shot first stop for agents: never starts repair/indexing, but returns
 /// exact next commands and discovery pointers for the current dataset.
-fn triage_budget_ms() -> u64 {
-    dotenvy::var("CASS_TRIAGE_BUDGET_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|&milliseconds| milliseconds > 0)
-        .unwrap_or(8_000)
+fn triage_budget_ms(timeout_ms: Option<u64>) -> u64 {
+    timeout_ms.unwrap_or_else(|| {
+        dotenvy::var("CASS_TRIAGE_BUDGET_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|&milliseconds| milliseconds > 0)
+            .unwrap_or(8_000)
+    })
 }
 
 /// Deterministic slowdown for the bounded triage E2E. This is inert unless the
@@ -79967,21 +81261,254 @@ fn maybe_test_triage_delay() {
     }
 }
 
+const TRIAGE_RESPONSE_RESERVE_MS: u64 = 25;
+
+fn triage_remaining_operation_timeout(
+    budget: &crate::robot_budget_envelope::RobotBudget,
+) -> Option<Duration> {
+    let milliseconds = budget
+        .remaining_ms()
+        .saturating_sub(TRIAGE_RESPONSE_RESERVE_MS);
+    (milliseconds > 0).then(|| Duration::from_millis(milliseconds))
+}
+
+#[derive(Clone, Copy)]
+struct TriageCoreReadiness {
+    db_exists: bool,
+    lexical_exists: bool,
+}
+
+enum TriageReadinessWorkerMessage {
+    Core(TriageCoreReadiness),
+    Complete(serde_json::Value),
+}
+
+fn triage_budget_fallback_state(
+    data_dir: &Path,
+    db_path: &Path,
+    core: Option<TriageCoreReadiness>,
+) -> serde_json::Value {
+    let db_exists = core
+        .map(|facts| serde_json::Value::Bool(facts.db_exists))
+        .unwrap_or(serde_json::Value::Null);
+    let lexical_exists = core
+        .map(|facts| serde_json::Value::Bool(facts.lexical_exists))
+        .unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "index": {
+            "exists": lexical_exists,
+            "status": "not_inspected",
+            "inspected": false,
+            "reason": "Detailed index readiness was skipped because the triage execution budget was exhausted."
+        },
+        "database": {
+            "exists": db_exists,
+            "inspected": false,
+            "open_error": "Database readiness probe was skipped because the triage execution budget was exhausted.",
+            "counts_skipped": true,
+            "open_skipped": true,
+        },
+        "pending": { "inspected": false },
+        "rebuild": { "inspected": false },
+        "semantic": {
+            "status": "not_inspected",
+            "inspected": false,
+            "summary": "Semantic readiness was skipped because the triage execution budget was exhausted.",
+            "hint": "Retry the recommended bounded triage probe to recover semantic readiness.",
+        },
+        "ingest_quarantine": {
+            "status": "not_inspected",
+            "inspected": false,
+        },
+        "_meta": {
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "data_dir": data_dir.display().to_string(),
+            "db_path": db_path.display().to_string(),
+        }
+    })
+}
+
+fn triage_readiness_state_with_hard_timeout(
+    data_dir: &Path,
+    db_path: &Path,
+    stale_threshold: u64,
+    budget: &crate::robot_budget_envelope::RobotBudget,
+) -> (serde_json::Value, bool) {
+    let Some(timeout) = triage_remaining_operation_timeout(budget) else {
+        return (triage_budget_fallback_state(data_dir, db_path, None), true);
+    };
+
+    let worker_data_dir = data_dir.to_path_buf();
+    let worker_db_path = db_path.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let Ok(_state_worker) = std::thread::Builder::new()
+        .name("cass-triage-readiness-probe".to_string())
+        .spawn(move || {
+            maybe_test_triage_worker_delay("CASS_TEST_TRIAGE_CORE_SLOW_MS");
+            let core = TriageCoreReadiness {
+                db_exists: worker_db_path.is_file(),
+                lexical_exists: cass_lexical_index_initialized(&worker_data_dir),
+            };
+            if tx.send(TriageReadinessWorkerMessage::Core(core)).is_err() {
+                return;
+            }
+            maybe_test_triage_delay();
+            maybe_test_triage_worker_delay("CASS_TEST_TRIAGE_STATE_DB_SLOW_MS");
+            let state =
+                state_meta_json_for_status(&worker_data_dir, &worker_db_path, stale_threshold);
+            let _ = tx.send(TriageReadinessWorkerMessage::Complete(state));
+        })
+    else {
+        return (triage_budget_fallback_state(data_dir, db_path, None), true);
+    };
+
+    let wait_start = std::time::Instant::now();
+    match rx.recv_timeout(timeout) {
+        Ok(TriageReadinessWorkerMessage::Complete(state)) => (state, false),
+        Ok(TriageReadinessWorkerMessage::Core(core)) => {
+            let remaining = timeout.saturating_sub(wait_start.elapsed());
+            if remaining.is_zero() {
+                (
+                    triage_budget_fallback_state(data_dir, db_path, Some(core)),
+                    true,
+                )
+            } else {
+                match rx.recv_timeout(remaining) {
+                    Ok(TriageReadinessWorkerMessage::Complete(state)) => (state, false),
+                    Ok(TriageReadinessWorkerMessage::Core(_))
+                    | Err(
+                        std::sync::mpsc::RecvTimeoutError::Timeout
+                        | std::sync::mpsc::RecvTimeoutError::Disconnected,
+                    ) => (
+                        triage_budget_fallback_state(data_dir, db_path, Some(core)),
+                        true,
+                    ),
+                }
+            }
+        }
+        Err(
+            std::sync::mpsc::RecvTimeoutError::Timeout
+            | std::sync::mpsc::RecvTimeoutError::Disconnected,
+        ) => (triage_budget_fallback_state(data_dir, db_path, None), true),
+    }
+}
+
+fn triage_recovery_probe(
+    data_dir: &Path,
+    db_path: &Path,
+    budget: &crate::robot_budget_envelope::RobotBudget,
+    stale_threshold: u64,
+) -> String {
+    let retry_budget_ms = budget.total_ms().saturating_mul(4).max(60_000);
+    cass_dataset_command(
+        data_dir,
+        db_path,
+        &[
+            "triage",
+            "--json",
+            "--stale-threshold",
+            &stale_threshold.to_string(),
+            "--timeout",
+            &retry_budget_ms.to_string(),
+        ],
+    )
+}
+
+fn triage_uninspected_search_completeness(recovery_probe: &str) -> serde_json::Value {
+    serde_json::json!({
+        "inspected": false,
+        "quarantine_status": "not_inspected",
+        "quarantined_conversations": serde_json::Value::Null,
+        "complete": serde_json::Value::Null,
+        "can_search": serde_json::Value::Null,
+        "coverage_suspect": serde_json::Value::Null,
+        "impact": "Search completeness was not inspected before the triage budget expired.",
+        "next_command": recovery_probe,
+    })
+}
+
+fn triage_uninspected_root_cause(recovery_probe: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": crate::root_cause_taxonomy::ROOT_CAUSE_TAXONOMY_VERSION,
+        "inspected": false,
+        "family": "unknown",
+        "locus": "unknown",
+        "confidence": "unknown",
+        "evidence_refs": [],
+        "summary": "No root cause was attributed because readiness probes did not complete.",
+        "recommended_next_probe": recovery_probe,
+    })
+}
+
+fn triage_recovery_recommended_commands(recovery_probe: &str) -> Vec<serde_json::Value> {
+    vec![readiness_command_recommendation(
+        ReadinessCommandRecommendation {
+            id: "retry-bounded-triage",
+            command: recovery_probe.to_string(),
+            purpose: "Recover the readiness sections skipped by the bounded triage probe.",
+            safety: "read-only",
+            run_when: "Run when triage budget.skipped_sections is non-empty.",
+            success_signal: "budget.skipped_sections=[]",
+            parse_fields: &[
+                "status",
+                "readiness",
+                "search_completeness",
+                "root_cause",
+                "budget",
+            ],
+            retry_after_ms: None,
+        },
+    )]
+}
+
 fn run_triage(
     data_dir_override: &Option<PathBuf>,
     db_override: Option<PathBuf>,
     output_format: Option<RobotFormat>,
     stale_threshold: u64,
+    timeout_ms: Option<u64>,
 ) -> CliResult<()> {
     let data_dir = resolve_data_dir(data_dir_override, db_override.as_ref());
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-    let triage_budget = crate::robot_budget_envelope::RobotBudget::new(triage_budget_ms());
-    let mut state = state_meta_json_for_status(&data_dir, &db_path, stale_threshold);
-    maybe_test_triage_delay();
+    let triage_budget =
+        crate::robot_budget_envelope::RobotBudget::new(triage_budget_ms(timeout_ms));
+    let (mut state, readiness_state_skipped) = triage_readiness_state_with_hard_timeout(
+        &data_dir,
+        &db_path,
+        stale_threshold,
+        &triage_budget,
+    );
+    let mut hard_probe_timed_out = readiness_state_skipped;
     let mut skipped_sections = Vec::<String>::new();
-    if triage_budget.is_healthy() {
-        refresh_state_database_counts_if_needed(&mut state, &db_path, "triage");
-    } else {
+    if readiness_state_skipped {
+        skipped_sections.extend(
+            [
+                "readiness_state",
+                "index_readiness",
+                "database_readiness",
+                "pending_readiness",
+                "rebuild_readiness",
+                "semantic_readiness",
+                "ingest_quarantine_readiness",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+    }
+    if !readiness_state_skipped && state_database_counts_need_refresh(&state, &db_path) {
+        match triage_remaining_operation_timeout(&triage_budget) {
+            Some(timeout) => {
+                if refresh_state_database_counts_with_hard_timeout(
+                    &mut state, &db_path, "triage", timeout,
+                ) == BoundedCountRefresh::TimedOut
+                {
+                    hard_probe_timed_out = true;
+                    skipped_sections.push("database_counts".to_string());
+                }
+            }
+            None => skipped_sections.push("database_counts".to_string()),
+        }
+    } else if readiness_state_skipped {
         skipped_sections.push("database_counts".to_string());
     }
 
@@ -80055,28 +81582,40 @@ fn run_triage(
         .and_then(|q| q.get("circuit_breaker_active"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let search_completeness = serde_json::to_value(
-        crate::search::quarantine_status::project_search_completeness(
-            quarantined_conversations,
-            ingest_quarantine_critical,
-        ),
-    )
-    .unwrap_or(serde_json::Value::Null);
+    let recovery_probe =
+        triage_recovery_probe(&data_dir, &db_path, &triage_budget, stale_threshold);
+    let search_completeness = if readiness_state_skipped {
+        triage_uninspected_search_completeness(&recovery_probe)
+    } else {
+        let mut completeness = serde_json::to_value(
+            crate::search::quarantine_status::project_search_completeness(
+                quarantined_conversations,
+                ingest_quarantine_critical,
+            ),
+        )
+        .unwrap_or(serde_json::Value::Null);
+        if let Some(object) = completeness.as_object_mut() {
+            object.insert("inspected".to_string(), serde_json::Value::Bool(true));
+        }
+        completeness
+    };
     let db_available = db_opened || (db_exists && db_open_retryable);
-    let lexical_index_initialized = cass_lexical_index_initialized(&data_dir);
+    // Reuse the bounded readiness snapshot. A fresh filesystem probe here
+    // would escape triage's hard deadline on a degraded or remote mount.
+    let lexical_index_initialized = index_exists;
     let not_initialized =
         cass_not_initialized(db_exists, lexical_index_initialized, rebuild_active);
-    let healthy = db_exists
+    let observed_healthy = db_exists
         && db_available
         && index_exists
         && index_fresh
         && !rebuild_active
         && !index_empty_with_messages;
-    let status = if rebuild_stalled {
+    let observed_status = if rebuild_stalled {
         "stalled"
     } else if rebuild_active {
         "rebuilding"
-    } else if healthy {
+    } else if observed_healthy {
         "healthy"
     } else if not_initialized {
         "not_initialized"
@@ -80085,12 +81624,12 @@ fn run_triage(
     } else {
         "unhealthy"
     };
-    let explanation = if not_initialized {
+    let observed_explanation = if not_initialized {
         Some(cass_not_initialized_explanation(&data_dir))
     } else {
         None
     };
-    let recommended_action = if rebuild_stalled {
+    let observed_recommended_action = if rebuild_stalled {
         Some(
             "Index rebuild is wedged; capture diagnostics for issue #258 and restart the watcher"
                 .to_string(),
@@ -80124,20 +81663,65 @@ fn run_triage(
     } else {
         semantic_recommended_action(&state, not_initialized)
     };
-    let recommended_commands = readiness_recommended_commands(
+    let observed_recommended_commands = readiness_recommended_commands(
         &data_dir,
         &db_path,
         &state,
-        status,
-        healthy,
+        observed_status,
+        observed_healthy,
         not_initialized,
-        recommended_action.as_deref(),
+        observed_recommended_action.as_deref(),
     );
-    let next_command = recommended_commands
+    let observed_next_command = observed_recommended_commands
         .first()
         .and_then(|command| command.get("command"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
+    let mut observed_root_cause =
+        serde_json::to_value(crate::root_cause_projection::project_root_cause(
+            &gather_projection_signals_from_state(&state, None, None),
+        ))
+        .unwrap_or(serde_json::Value::Null);
+    if let Some(object) = observed_root_cause.as_object_mut() {
+        object.insert("inspected".to_string(), serde_json::Value::Bool(true));
+    }
+    let (
+        status,
+        healthy,
+        initialized,
+        explanation,
+        recommended_action,
+        recommended_commands,
+        next_command,
+        root_cause,
+        rebuild_progress,
+    ) = if readiness_state_skipped {
+        (
+            "partial",
+            false,
+            db_exists || lexical_index_initialized,
+            Some(
+                "Readiness probes did not complete within the triage execution budget.".to_string(),
+            ),
+            Some(recovery_probe.clone()),
+            triage_recovery_recommended_commands(&recovery_probe),
+            Some(recovery_probe.clone()),
+            triage_uninspected_root_cause(&recovery_probe),
+            serde_json::json!({ "inspected": false }),
+        )
+    } else {
+        (
+            observed_status,
+            observed_healthy,
+            !not_initialized,
+            observed_explanation,
+            observed_recommended_action,
+            observed_recommended_commands,
+            observed_next_command,
+            observed_root_cause,
+            rebuild_progress_summary_json(&state),
+        )
+    };
 
     let starter_workflows = if triage_budget.is_healthy() {
         build_workflow_capabilities()
@@ -80154,39 +81738,42 @@ fn run_triage(
     let recommended_next_probe = if skipped_sections.is_empty() {
         None
     } else {
-        Some("cass health --json".to_string())
+        Some(recovery_probe)
     };
-    let budget = crate::robot_budget_envelope::BudgetBlock::from_budget(
+    let mut budget = crate::robot_budget_envelope::BudgetBlock::from_budget(
         &triage_budget,
         skipped_sections,
         recommended_next_probe,
     );
+    if hard_probe_timed_out {
+        // The readiness/count worker reached its hard sub-deadline. Reserve
+        // time is intentionally kept for emitting valid JSON, so wall-clock
+        // sampling may be just below the outer cap; make the timeout explicit
+        // and keep the budget snapshot internally consistent.
+        budget.elapsed_ms = budget.elapsed_ms.max(budget.budget_ms);
+        budget.timed_out = true;
+    }
 
     let payload = serde_json::json!({
         "surface": "triage",
         "schema_version": 1,
         "status": status,
         "healthy": healthy,
-        "initialized": !not_initialized,
+        "initialized": initialized,
         "explanation": explanation,
         "recommended_action": recommended_action,
         "recommended_commands": recommended_commands,
         "next_command": next_command,
         "search_completeness": search_completeness,
-        // uojcg.9.2/9.5: same conservative root-cause attribution as status, so
-        // an agent's one-shot triage already names the likely fault family.
-        "root_cause": serde_json::to_value(
-            crate::root_cause_projection::project_root_cause(
-                &gather_projection_signals_from_state(&state, None, None),
-            ),
-        )
-        .unwrap_or(serde_json::Value::Null),
+        // uojcg.9.2/9.5: same conservative root-cause attribution as status
+        // when inspected; an exhausted readiness probe is explicitly unknown.
+        "root_cause": root_cause,
         "readiness": {
             "index": state.get("index").cloned().unwrap_or(serde_json::Value::Null),
             "database": state.get("database").cloned().unwrap_or(serde_json::Value::Null),
             "pending": state.get("pending").cloned().unwrap_or(serde_json::Value::Null),
             "rebuild": state.get("rebuild").cloned().unwrap_or(serde_json::Value::Null),
-            "rebuild_progress": rebuild_progress_summary_json(&state),
+            "rebuild_progress": rebuild_progress,
             "semantic": state.get("semantic").cloned().unwrap_or(serde_json::Value::Null),
             "ingest_quarantine": state.get("ingest_quarantine").cloned().unwrap_or(serde_json::Value::Null),
         },
@@ -80228,21 +81815,28 @@ fn run_triage(
         println!("Next command: {command}");
     }
     if payload
-        .pointer("/budget/timed_out")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
+        .pointer("/budget/skipped_sections")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|sections| !sections.is_empty())
     {
-        println!("Budget exhausted: optional triage sections were skipped");
-        println!("Cheaper probe: cass health --json");
+        println!("Budget-limited result: optional triage sections were skipped");
+        if let Some(probe) = payload
+            .pointer("/budget/recommended_next_probe")
+            .and_then(serde_json::Value::as_str)
+        {
+            println!("Recovery probe: {probe}");
+        }
     }
     println!("Machine output: cass triage --json");
 
     // Bead v6vuz: same bounded readiness summary as `status`, in triage's
     // agent-oriented vocabulary, so the human and `--json` triage agree.
-    print_human_readiness_section(
-        &state,
-        crate::search::readiness_projection::SurfaceKind::Triage,
-    );
+    if !readiness_state_skipped {
+        print_human_readiness_section(
+            &state,
+            crate::search::readiness_projection::SurfaceKind::Triage,
+        );
+    }
 
     Ok(())
 }
@@ -88962,6 +90556,46 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
             "Default search/pack mode: lexical, semantic, or hybrid. The --mode flag overrides; also [search].mode in ~/.config/cass/cass.toml.",
         ),
         env_var_capability(
+            "CASS_STATUS_BUDGET_MS",
+            Some("8000"),
+            "Robot status execution budget in milliseconds. After expiry, optional or expensive sections are reported in budget.skipped_sections.",
+        ),
+        env_var_capability(
+            "CASS_DOCTOR_BUDGET_MS",
+            Some("8000"),
+            "Structured doctor reporting budget in milliseconds. Reports whose elapsed time exceeds it set budget.timed_out.",
+        ),
+        env_var_capability(
+            "CASS_VIEW_BUDGET_MS",
+            Some("10000"),
+            "Structured view read-only worker deadline in milliseconds. On expiry, view returns a partial budget envelope with an exact retry probe.",
+        ),
+        env_var_capability(
+            "CASS_SEARCH_BUDGET_MS",
+            Some("120000"),
+            "Fallback structured search worker budget in milliseconds when --timeout, CASS_SEARCH_TIMEOUT_MS, and [search].timeout_ms do not supply a positive effective timeout.",
+        ),
+        env_var_capability(
+            "CASS_TRIAGE_BUDGET_MS",
+            Some("8000"),
+            "Robot triage read-only probe budget in milliseconds. On expiry, incomplete readiness sections are reported in budget.skipped_sections.",
+        ),
+        env_var_capability(
+            "CASS_PACK_BUDGET_MS",
+            Some("10000"),
+            "Fallback structured pack execution budget in milliseconds when --timeout, CASS_SEARCH_TIMEOUT_MS, and [search].timeout_ms do not supply a positive effective timeout.",
+        ),
+        env_var_capability(
+            "CASS_FLEET_PER_HOST_BUDGET_MS",
+            Some("8000"),
+            "Maximum read-only probe budget per host, in milliseconds, for sources doctor and fleet upgrade rehearsal.",
+        ),
+        env_var_capability(
+            "CASS_FLEET_BUDGET_MS",
+            Some("60000"),
+            "Overall read-only probe budget, in milliseconds, for sources doctor and fleet upgrade rehearsal.",
+        ),
+        env_var_capability(
             "TOON_DEFAULT_FORMAT",
             None,
             "Fallback structured output format for tools that support TOON.",
@@ -97370,15 +99004,459 @@ fn try_load_indexed_conversation_from_db(
     try_load_indexed_conversation_from_db_with_source(source_path, db_path, None, None)
 }
 
-fn run_view(
+struct ResolvedViewLine {
+    number: usize,
+    content: String,
+    highlighted: bool,
+}
+
+struct ResolvedView {
+    lines: Vec<ResolvedViewLine>,
+    total_lines: usize,
+    source_exists: bool,
+    archive_only: bool,
+}
+
+enum BoundedViewResolution {
+    Completed(CliResult<ResolvedView>),
+    TimedOut,
+}
+
+fn resolve_view(
+    path: &Path,
+    db_path: &Path,
+    source_id: Option<&str>,
+    conversation_id: Option<i64>,
+    line: Option<usize>,
+    context: usize,
+) -> CliResult<ResolvedView> {
+    // The deterministic stall lives inside the same worker as the real
+    // file/archive read, so the deadline covers the operation itself.
+    maybe_test_view_delay();
+
+    let indexed_view = try_load_indexed_conversation_from_db_with_source(
+        path,
+        db_path,
+        source_id,
+        conversation_id,
+    );
+    let allow_direct_file =
+        conversation_id.is_none() && (followup_source_is_local(source_id) || source_id.is_none());
+    let prefer_direct_file = conversation_id.is_none() && prefers_direct_view_file(path, source_id);
+    let source_exists = path.exists();
+
+    let (lines, archive_used): (Vec<String>, bool) = if prefer_direct_file {
+        match read_followup_file_lines(path) {
+            Ok(lines) => (lines, false),
+            Err(err) => {
+                if let Some(view) = indexed_view.as_ref() {
+                    (serialize_indexed_view_lines(view)?, true)
+                } else {
+                    return Err(err);
+                }
+            }
+        }
+    } else if let Some(view) = indexed_view.as_ref() {
+        (serialize_indexed_view_lines(view)?, true)
+    } else if allow_direct_file && source_exists {
+        (read_followup_file_lines(path)?, false)
+    } else {
+        let (kind, message, hint) = match (conversation_id, source_id) {
+            (Some(conversation_id), _) => (
+                CliErrorKind::IndexedSessionRequired.kind_str(),
+                format!(
+                    "No archived row matched conversation_id {conversation_id}, source {}, and path {}",
+                    source_id.unwrap_or("[unspecified]"),
+                    path.display()
+                ),
+                "Use the exact --db, --conversation-id, --source, and path from the incident report's suggested_command.argv."
+                    .to_string(),
+            ),
+            (None, Some(source_id)) => (
+                CliErrorKind::IndexedSessionRequired.kind_str(),
+                format!(
+                    "No archived row for source '{source_id}' at {} (archive row missing)",
+                    path.display()
+                ),
+                "Use the exact source_id from search output, or re-run index to archive this session."
+                    .to_string(),
+            ),
+            (None, None) if !source_exists => (
+                CliErrorKind::FileNotFound.kind_str(),
+                format!(
+                    "Source file missing and no archived row found: {}",
+                    path.display()
+                ),
+                "The source file moved or was pruned and is not archived; re-run index, then use the source_path from search output."
+                    .to_string(),
+            ),
+            (None, None) => (
+                CliErrorKind::FileNotFound.kind_str(),
+                format!("File not found: {}", path.display()),
+                "Path may be virtual (e.g. Cursor composer). Re-run index, then use the exact source_path from search output."
+                    .to_string(),
+            ),
+        };
+        return Err(CliError {
+            code: 3,
+            kind,
+            message,
+            hint: Some(hint),
+            retryable: false,
+        });
+    };
+    let archive_only = archive_used && !source_exists;
+
+    if lines.is_empty() {
+        return Err(CliError {
+            code: 9,
+            kind: CliErrorKind::EmptyFile.kind_str(),
+            message: format!("File is empty: {}", path.display()),
+            hint: None,
+            retryable: false,
+        });
+    }
+
+    let target_line = line.unwrap_or(1);
+    if target_line > lines.len() {
+        return Err(CliError {
+            code: 2,
+            kind: CliErrorKind::LineOutOfRange.kind_str(),
+            message: format!(
+                "Line {} exceeds file length ({} lines)",
+                target_line,
+                lines.len()
+            ),
+            hint: Some(format!("Use -n {} for the last line", lines.len())),
+            retryable: false,
+        });
+    }
+
+    let start = target_line.saturating_sub(context.saturating_add(1));
+    let end = target_line.saturating_add(context).min(lines.len());
+    let highlight_line = line.is_some();
+    let total_lines = lines.len();
+    let lines = lines
+        .into_iter()
+        .enumerate()
+        .skip(start)
+        .take(end - start)
+        .map(|(index, content)| ResolvedViewLine {
+            number: index + 1,
+            content,
+            highlighted: highlight_line && index + 1 == target_line,
+        })
+        .collect();
+
+    Ok(ResolvedView {
+        lines,
+        total_lines,
+        source_exists,
+        archive_only,
+    })
+}
+
+fn resolve_view_with_hard_timeout(
+    path: PathBuf,
+    db_path: PathBuf,
+    source_id: Option<String>,
+    conversation_id: Option<i64>,
+    line: Option<usize>,
+    context: usize,
+    timeout: Duration,
+) -> CliResult<BoundedViewResolution> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _view_worker = std::thread::Builder::new()
+        .name("cass-view-reader".to_string())
+        .spawn(move || {
+            let result = resolve_view(
+                &path,
+                &db_path,
+                source_id.as_deref(),
+                conversation_id,
+                line,
+                context,
+            );
+            let _ = tx.send(result);
+        })
+        .map_err(|err| CliError {
+            code: 9,
+            kind: CliErrorKind::FileRead.kind_str(),
+            message: format!("Failed to start bounded view reader: {err}"),
+            hint: Some("Retry `cass view`; the archive and source file were not modified.".into()),
+            retryable: true,
+        })?;
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => Ok(BoundedViewResolution::Completed(result)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(BoundedViewResolution::TimedOut),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(CliError {
+            code: 9,
+            kind: CliErrorKind::FileRead.kind_str(),
+            message: "Bounded view reader disconnected before returning a result".to_string(),
+            hint: Some("Retry `cass view`; the archive and source file were not modified.".into()),
+            retryable: true,
+        }),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ViewWindow {
+    line: Option<usize>,
+    context: usize,
+}
+
+fn bounded_view_retry_command(
+    path: &Path,
+    db_path: &Path,
+    source_id: Option<&str>,
+    conversation_id: Option<i64>,
+    window: ViewWindow,
+    previous_budget_ms: u64,
+    format: RobotFormat,
+) -> String {
+    let retry_budget_ms = previous_budget_ms.saturating_mul(2).max(10_000);
+    let mut command = vec![
+        "cass".to_string(),
+        "--db".to_string(),
+        shell_quote_arg(&db_path.display().to_string()),
+        "view".to_string(),
+        shell_quote_arg(&path.display().to_string()),
+    ];
+    if let Some(source_id) = source_id {
+        command.push("--source".to_string());
+        command.push(shell_quote_arg(source_id));
+    }
+    if let Some(conversation_id) = conversation_id {
+        command.push("--conversation-id".to_string());
+        command.push(conversation_id.to_string());
+    }
+    if let Some(line) = window.line {
+        command.push("--line".to_string());
+        command.push(line.to_string());
+    }
+    command.push("--context".to_string());
+    command.push(window.context.to_string());
+    match format {
+        RobotFormat::Json => command.push("--json".to_string()),
+        RobotFormat::Jsonl => {
+            command.extend(["--robot-format".to_string(), "jsonl".to_string()]);
+        }
+        RobotFormat::Compact | RobotFormat::Sessions => {
+            command.extend(["--robot-format".to_string(), "compact".to_string()]);
+        }
+        RobotFormat::Toon => {
+            command.extend(["--robot-format".to_string(), "toon".to_string()]);
+        }
+    }
+    command.push("--timeout".to_string());
+    command.push(retry_budget_ms.to_string());
+    command.join(" ")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn output_bounded_view_partial(
+    path: &Path,
+    db_path: &Path,
+    source_id: Option<&str>,
+    conversation_id: Option<i64>,
+    line: Option<usize>,
+    context: usize,
+    view_budget_ms: u64,
+    view_budget: &crate::robot_budget_envelope::RobotBudget,
+    format: RobotFormat,
+    skipped_sections: Vec<String>,
+) -> CliResult<()> {
+    let recommended_next_probe = bounded_view_retry_command(
+        path,
+        db_path,
+        source_id,
+        conversation_id,
+        ViewWindow { line, context },
+        view_budget_ms,
+        format,
+    );
+    let mut budget = crate::robot_budget_envelope::BudgetBlock::from_budget(
+        view_budget,
+        skipped_sections,
+        Some(recommended_next_probe),
+    );
+    budget.elapsed_ms = budget.elapsed_ms.max(view_budget_ms);
+    budget.timed_out = true;
+    output_structured_value(
+        serde_json::json!({
+            "path": path.display().to_string(),
+            "target_line": line,
+            "context": context,
+            "lines": [],
+            "budget": budget,
+        }),
+        format,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_bounded_view(
     path: &Path,
     db_override: Option<PathBuf>,
     source_id: Option<&str>,
     conversation_id: Option<i64>,
     line: Option<usize>,
     context: usize,
-    output_format: Option<RobotFormat>,
+    format: RobotFormat,
+    timeout_ms: Option<u64>,
 ) -> CliResult<()> {
+    let view_start = std::time::Instant::now();
+    let view_budget_ms = timeout_ms.unwrap_or_else(|| {
+        dotenvy::var("CASS_VIEW_BUDGET_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|&milliseconds| milliseconds > 0)
+            .unwrap_or(10_000)
+    });
+    if let Some(source_id) = source_id {
+        validate_followup_source_id(source_id, "cass view")?;
+    }
+    let target_line = line.unwrap_or(1);
+    if target_line == 0 {
+        return Err(CliError {
+            code: 2,
+            kind: CliErrorKind::InvalidLine.kind_str(),
+            message: "Line numbers start at 1, not 0".to_string(),
+            hint: Some("Use -n 1 for the first line".to_string()),
+            retryable: false,
+        });
+    }
+
+    let normalized_source_id = canonical_followup_source_id(source_id);
+    let source_id = normalized_source_id.as_deref();
+    let db_path = db_override.unwrap_or_else(default_db_path);
+    let highlight_line = line.is_some();
+    let view_budget =
+        crate::robot_budget_envelope::RobotBudget::with_start(view_budget_ms, view_start);
+    let outcome = if view_budget.is_exhausted() {
+        BoundedViewResolution::TimedOut
+    } else {
+        resolve_view_with_hard_timeout(
+            path.to_path_buf(),
+            db_path.clone(),
+            normalized_source_id.clone(),
+            conversation_id,
+            line,
+            context,
+            Duration::from_millis(view_budget.remaining_ms().max(1)),
+        )?
+    };
+    let resolved = match outcome {
+        BoundedViewResolution::Completed(result) => result?,
+        BoundedViewResolution::TimedOut => {
+            return output_bounded_view_partial(
+                path,
+                &db_path,
+                source_id,
+                conversation_id,
+                line,
+                context,
+                view_budget_ms,
+                &view_budget,
+                format,
+                vec!["view_content".to_string(), "source_provenance".to_string()],
+            );
+        }
+    };
+
+    let remaining_ms = view_budget.remaining_ms();
+    let path_text = path.display().to_string();
+    let projection_budget = view_budget;
+    let encoded = run_read_only_search_worker(remaining_ms, move || {
+        maybe_test_search_worker_delay("CASS_TEST_VIEW_PROJECTION_SLOW_MS");
+        let content_lines: Vec<serde_json::Value> = resolved
+            .lines
+            .iter()
+            .map(|line| {
+                serde_json::json!({
+                    "line": line.number,
+                    "content": line.content,
+                    "highlighted": line.highlighted,
+                })
+            })
+            .collect();
+        let budget = crate::robot_budget_envelope::BudgetBlock::from_budget(
+            &projection_budget,
+            Vec::new(),
+            None,
+        );
+        encode_structured_value(
+            serde_json::json!({
+                "path": path_text,
+                "target_line": if highlight_line { Some(target_line) } else { None::<usize> },
+                "context": context,
+                "lines": content_lines,
+                "total_lines": resolved.total_lines,
+                "source_exists": resolved.source_exists,
+                "archive_only": resolved.archive_only,
+                "budget": budget,
+            }),
+            format,
+        )
+    })?;
+    if let Some(encoded) = encoded {
+        if matches!(format, RobotFormat::Toon) {
+            print!("{encoded}");
+        } else {
+            println!("{encoded}");
+        }
+        return Ok(());
+    }
+
+    output_bounded_view_partial(
+        path,
+        &db_path,
+        source_id,
+        conversation_id,
+        line,
+        context,
+        view_budget_ms,
+        &view_budget,
+        format,
+        vec![
+            "view_content".to_string(),
+            "source_provenance".to_string(),
+            "output_projection".to_string(),
+        ],
+    )
+}
+
+fn run_view(
+    path: &Path,
+    db_override: Option<PathBuf>,
+    source_id: Option<&str>,
+    conversation_id: Option<i64>,
+    window: ViewWindow,
+    output_format: Option<RobotFormat>,
+    timeout_ms: Option<u64>,
+) -> CliResult<()> {
+    let ViewWindow { line, context } = window;
+    let structured_format = output_format.or_else(robot_format_from_env).map(|format| {
+        if matches!(format, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            format
+        }
+    });
+    if let Some(format) = structured_format {
+        return run_bounded_view(
+            path,
+            db_override,
+            source_id,
+            conversation_id,
+            line,
+            context,
+            format,
+            timeout_ms,
+        );
+    }
+
     // Bounded-budget signal (uojcg.2.6 / 2.2): the report saw `cass view` fail
     // under a 10s cap. View is a single bounded read (file fast-path or DB/archive
     // fallback), so it sheds nothing; this reports whether the read exceeded its
@@ -100640,6 +102718,55 @@ fn read_session_paths(source: &str) -> Result<std::collections::HashSet<String>,
     }
 
     Ok(paths)
+}
+
+enum BoundedSessionPaths {
+    Complete(std::collections::HashSet<String>),
+    TimedOut,
+}
+
+fn sessions_from_error(error: impl std::fmt::Display) -> CliError {
+    CliError {
+        code: 2,
+        kind: CliErrorKind::SessionsFrom.kind_str(),
+        message: format!("failed to read session paths: {error}"),
+        hint: Some("Provide a file path or '-' for stdin".to_string()),
+        retryable: false,
+    }
+}
+
+/// Materialize a session-path scope all-or-nothing behind the caller's robot
+/// deadline. The caller never searches against a partially read scope.
+fn read_session_paths_bounded(
+    source: &str,
+    remaining_ms: Option<u64>,
+) -> CliResult<BoundedSessionPaths> {
+    let Some(remaining_ms) = remaining_ms else {
+        return read_session_paths(source)
+            .map(BoundedSessionPaths::Complete)
+            .map_err(sessions_from_error);
+    };
+    if remaining_ms == 0 {
+        return Ok(BoundedSessionPaths::TimedOut);
+    }
+
+    let source = source.to_string();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("cass-bounded-session-paths".to_string())
+        .spawn(move || {
+            let _ = sender.send(read_session_paths(&source));
+        })
+        .map_err(|error| sessions_from_error(format!("could not start reader: {error}")))?;
+    match receiver.recv_timeout(Duration::from_millis(remaining_ms)) {
+        Ok(result) => result
+            .map(BoundedSessionPaths::Complete)
+            .map_err(sessions_from_error),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(BoundedSessionPaths::TimedOut),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(sessions_from_error("session-path reader disconnected"))
+        }
+    }
 }
 
 /// GH#414: how many of the requested `--sessions-from` paths the index has
@@ -105771,9 +107898,12 @@ mod indexed_conversation_fallback_tests {
             Some(db_path),
             None,
             None,
-            Some(2),
-            0,
+            ViewWindow {
+                line: Some(2),
+                context: 0,
+            },
             Some(RobotFormat::Json),
+            None,
         )
         .expect("view should prefer the local JSONL file over stale indexed content");
     }
@@ -105835,9 +107965,12 @@ local second line
             Some(db_path),
             None,
             None,
-            Some(2),
-            0,
+            ViewWindow {
+                line: Some(2),
+                context: 0,
+            },
             Some(RobotFormat::Json),
+            None,
         )
         .expect("view should prefer the local markdown file over stale indexed content");
     }
@@ -106355,9 +108488,12 @@ This should stay behind the indexed html export.
             Some(db_path),
             None,
             None,
-            Some(1),
-            0,
+            ViewWindow {
+                line: Some(1),
+                context: 0,
+            },
             Some(RobotFormat::Json),
+            None,
         )
         .expect("view should fall back to indexed content when the local JSONL cannot be read");
     }
@@ -106471,9 +108607,12 @@ This should stay behind the indexed html export.
             Some(db_path),
             None,
             None,
-            Some(1),
-            0,
+            ViewWindow {
+                line: Some(1),
+                context: 0,
+            },
             Some(RobotFormat::Json),
+            None,
         )
         .expect("view should prefer indexed conversation over unreadable backing file");
     }
@@ -108942,9 +111081,19 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
             no_test,
         } => run_sources_add(&url, name, preset, paths, no_test),
         SourcesCommand::Remove { name, purge, yes } => run_sources_remove(&name, purge, yes),
-        SourcesCommand::Doctor { source, json } => {
+        SourcesCommand::Doctor {
+            source,
+            json,
+            budget_ms,
+            per_host_budget_ms,
+        } => {
             let structured_format = resolve_subcommand_structured_format(cli, json);
-            run_sources_doctor(source.as_deref(), structured_format)
+            run_sources_doctor(
+                source.as_deref(),
+                structured_format,
+                budget_ms,
+                per_host_budget_ms,
+            )
         }
         SourcesCommand::Sync {
             source,
@@ -109813,7 +111962,10 @@ struct SourcesDoctorOutput<'a> {
 const SOURCE_DOCTOR_FIXTURE_MAX_BYTES: usize = 16 * 1024;
 const SOURCE_DOCTOR_FIXTURE_MAX_DELAY_MS: u64 = 100;
 
-fn configured_fleet_probe_budget() -> crate::fleet_probe::ProbeBudget {
+fn configured_fleet_probe_budget(
+    total_override_ms: Option<u64>,
+    per_host_override_ms: Option<u64>,
+) -> crate::fleet_probe::ProbeBudget {
     let defaults = crate::fleet_probe::ProbeBudget::default();
     let positive_env = |name: &str, default| {
         dotenvy::var(name)
@@ -109823,9 +111975,28 @@ fn configured_fleet_probe_budget() -> crate::fleet_probe::ProbeBudget {
             .unwrap_or(default)
     };
     crate::fleet_probe::ProbeBudget {
-        per_host_ms: positive_env("CASS_FLEET_PER_HOST_BUDGET_MS", defaults.per_host_ms),
-        total_ms: positive_env("CASS_FLEET_BUDGET_MS", defaults.total_ms),
+        per_host_ms: per_host_override_ms
+            .unwrap_or_else(|| positive_env("CASS_FLEET_PER_HOST_BUDGET_MS", defaults.per_host_ms)),
+        total_ms: total_override_ms
+            .unwrap_or_else(|| positive_env("CASS_FLEET_BUDGET_MS", defaults.total_ms)),
     }
+}
+
+fn maybe_test_fleet_verify_delay(max_delay_ms: u64) -> bool {
+    if let Ok(raw) = dotenvy::var("CASS_TEST_FLEET_VERIFY_SLOW_MS")
+        && let Ok(milliseconds) = raw.parse::<u64>()
+        && milliseconds > 0
+    {
+        if max_delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(milliseconds.min(max_delay_ms)));
+        }
+        return milliseconds >= max_delay_ms;
+    }
+    false
+}
+
+fn record_remote_fleet_probe_skip(skipped_sections: &mut Vec<String>, source_name: &str) {
+    skipped_sections.push(format!("source:{source_name}:remote_probe"));
 }
 
 fn remaining_probe_timeout(
@@ -110072,11 +112243,14 @@ fn source_doctor_observation_from_checks(
 fn run_sources_doctor(
     source_filter: Option<&str>,
     output_format: Option<RobotFormat>,
+    total_budget_override_ms: Option<u64>,
+    per_host_budget_override_ms: Option<u64>,
 ) -> CliResult<()> {
     use crate::sources::config::{SourcesConfig, source_names_equal, source_path_entry_error};
     use colored::Colorize;
 
-    let probe_limits = configured_fleet_probe_budget();
+    let probe_limits =
+        configured_fleet_probe_budget(total_budget_override_ms, per_host_budget_override_ms);
     let total_budget = crate::robot_budget_envelope::RobotBudget::new(probe_limits.total_ms);
     let config = SourcesConfig::load().map_err(|e| CliError {
         code: 9,
@@ -111953,6 +114127,8 @@ fn run_fleet_command(cmd: FleetCommand, cli: &Cli) -> CliResult<()> {
             verify,
             data_dir,
             json,
+            budget_ms,
+            per_host_budget_ms,
         } => {
             let structured_format = resolve_subcommand_structured_format(cli, json);
             run_fleet_upgrade_rehearsal(
@@ -111962,9 +114138,19 @@ fn run_fleet_command(cmd: FleetCommand, cli: &Cli) -> CliResult<()> {
                 verify,
                 &data_dir,
                 structured_format,
+                FleetProbeBudgetOverrides {
+                    total_ms: budget_ms,
+                    per_host_ms: per_host_budget_ms,
+                },
             )
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct FleetProbeBudgetOverrides {
+    total_ms: Option<u64>,
+    per_host_ms: Option<u64>,
 }
 
 /// The `cass fleet upgrade-rehearsal` envelope (bead sc8sp): the fleet upgrade
@@ -111986,6 +114172,7 @@ struct FleetUpgradeRehearsalOutput {
     rehearsal: crate::fleet_upgrade_rehearsal::FleetUpgradeRehearsal,
     #[serde(skip_serializing_if = "Option::is_none")]
     local_verification: Option<crate::fleet_upgrade_rehearsal::PostUpgradeVerification>,
+    budget: crate::robot_budget_envelope::BudgetBlock,
     mutation_free: bool,
     generated_by: &'static str,
 }
@@ -112004,12 +114191,17 @@ fn run_fleet_upgrade_rehearsal(
     verify: bool,
     data_dir_override: &Option<PathBuf>,
     output_format: Option<RobotFormat>,
+    budget_overrides: FleetProbeBudgetOverrides,
 ) -> CliResult<()> {
     use crate::fleet_upgrade_rehearsal::{
         FLEET_UPGRADE_REHEARSAL_SCHEMA_VERSION, HostRehearsalInput, RehearsalMode, rehearse_fleet,
     };
 
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
+    let probe_limits =
+        configured_fleet_probe_budget(budget_overrides.total_ms, budget_overrides.per_host_ms);
+    let overall_budget = crate::robot_budget_envelope::RobotBudget::new(probe_limits.total_ms);
+    let mut skipped_sections = Vec::<String>::new();
     let target = target_version
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
@@ -112073,7 +114265,15 @@ fn run_fleet_upgrade_rehearsal(
                 continue;
             }
             live_remote_hosts_requested += 1;
-            let (report, coverage) = probe_remote_host_for_rehearsal(&source.name, host);
+            let (report, coverage) = probe_remote_host_for_rehearsal(
+                &source.name,
+                host,
+                probe_limits.per_host_ms,
+                &overall_budget,
+            );
+            if report.timed_out {
+                record_remote_fleet_probe_skip(&mut skipped_sections, &source.name);
+            }
             if report.unreachable {
                 live_remote_hosts_unreachable += 1;
             }
@@ -112097,11 +114297,65 @@ fn run_fleet_upgrade_rehearsal(
     // against this binary via the shared E2E runner, classified into proof
     // artifacts. The local coverage state feeds the "still-stale derived assets"
     // trap so a binary-only swap can never read as a true fix.
-    let local_verification = if verify {
-        Some(verify_local_post_upgrade(&data_dir, local_coverage_state))
-    } else {
-        None
-    };
+    let fixture_forced_verification_timeout =
+        verify && maybe_test_fleet_verify_delay(overall_budget.remaining_ms());
+    let local_verification =
+        if verify && !fixture_forced_verification_timeout && overall_budget.is_healthy() {
+            Some(verify_local_post_upgrade(
+                &data_dir,
+                local_coverage_state,
+                &overall_budget,
+                &mut skipped_sections,
+            ))
+        } else if verify {
+            skipped_sections.push("local_verification".to_string());
+            None
+        } else {
+            None
+        };
+
+    let recommended_next_probe = (!skipped_sections.is_empty()).then(|| {
+        let mut args = vec![
+            "fleet".to_string(),
+            "upgrade-rehearsal".to_string(),
+            "--target-version".to_string(),
+            shell_quote_arg(&target),
+        ];
+        if live {
+            args.push("--live".to_string());
+        }
+        if let Some(source) = source_filter {
+            args.push("--source".to_string());
+            args.push(shell_quote_arg(source));
+        }
+        if verify {
+            args.push("--verify".to_string());
+        }
+        args.push("--json".to_string());
+        args.push("--budget-ms".to_string());
+        args.push(
+            probe_limits
+                .total_ms
+                .saturating_mul(2)
+                .clamp(1_000, 300_000)
+                .to_string(),
+        );
+        args.push("--per-host-budget-ms".to_string());
+        args.push(
+            probe_limits
+                .per_host_ms
+                .saturating_mul(2)
+                .clamp(1_000, 120_000)
+                .to_string(),
+        );
+        let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        cass_dataset_command(&data_dir, &data_dir.join("agent_search.db"), &arg_refs)
+    });
+    let budget = crate::robot_budget_envelope::BudgetBlock::from_budget(
+        &overall_budget,
+        skipped_sections,
+        recommended_next_probe,
+    );
 
     let output = FleetUpgradeRehearsalOutput {
         schema_version: FLEET_UPGRADE_REHEARSAL_SCHEMA_VERSION,
@@ -112111,6 +114365,7 @@ fn run_fleet_upgrade_rehearsal(
         deferred_remote_sources,
         rehearsal,
         local_verification,
+        budget,
         mutation_free: true,
         generated_by: "cass fleet upgrade-rehearsal",
     };
@@ -112130,6 +114385,7 @@ fn run_fleet_upgrade_rehearsal(
         live,
         live_remote_hosts_requested,
         live_remote_hosts_unreachable,
+        verify,
         output
             .local_verification
             .as_ref()
@@ -112145,10 +114401,11 @@ fn fleet_upgrade_rehearsal_failed(
     live: bool,
     live_remote_hosts_requested: usize,
     live_remote_hosts_unreachable: usize,
+    verification_requested: bool,
     verification_status: Option<crate::proof_artifact::ProofStatus>,
 ) -> bool {
-    let verification_failed =
-        verification_status.is_some_and(|status| !status.is_trustworthy_pass());
+    let verification_failed = verification_requested
+        && verification_status.is_none_or(|status| !status.is_trustworthy_pass());
     let all_requested_remotes_unreachable = live
         && live_remote_hosts_requested > 0
         && live_remote_hosts_unreachable == live_remote_hosts_requested;
@@ -112166,6 +114423,7 @@ mod fleet_upgrade_rehearsal_exit_tests {
             false,
             0,
             0,
+            true,
             Some(ProofStatus::Pass),
         ));
         for status in [
@@ -112176,16 +114434,24 @@ mod fleet_upgrade_rehearsal_exit_tests {
             ProofStatus::StaleArtifact,
             ProofStatus::Timeout,
         ] {
-            assert!(fleet_upgrade_rehearsal_failed(false, 0, 0, Some(status),));
+            assert!(fleet_upgrade_rehearsal_failed(
+                false,
+                0,
+                0,
+                true,
+                Some(status),
+            ));
         }
+        assert!(fleet_upgrade_rehearsal_failed(false, 0, 0, true, None));
+        assert!(!fleet_upgrade_rehearsal_failed(false, 0, 0, false, None));
     }
 
     #[test]
     fn live_rehearsal_fails_only_when_every_requested_remote_is_unreachable() {
-        assert!(!fleet_upgrade_rehearsal_failed(true, 0, 0, None));
-        assert!(fleet_upgrade_rehearsal_failed(true, 2, 2, None));
-        assert!(!fleet_upgrade_rehearsal_failed(true, 2, 1, None));
-        assert!(!fleet_upgrade_rehearsal_failed(false, 2, 2, None));
+        assert!(!fleet_upgrade_rehearsal_failed(true, 0, 0, false, None));
+        assert!(fleet_upgrade_rehearsal_failed(true, 2, 2, false, None));
+        assert!(!fleet_upgrade_rehearsal_failed(true, 2, 1, false, None));
+        assert!(!fleet_upgrade_rehearsal_failed(false, 2, 2, false, None));
     }
 }
 
@@ -112272,14 +114538,34 @@ fn archive_coverage_summary(
 fn probe_remote_host_for_rehearsal(
     name: &str,
     host: &str,
+    per_host_budget_ms: u64,
+    overall_budget: &crate::robot_budget_envelope::RobotBudget,
 ) -> (
     crate::fleet_doctor_schema::HostDoctorReport,
     crate::fleet_archive_coverage::ArchiveCoverageSummary,
 ) {
     use crate::fleet_doctor_schema::{HostDoctorReport, HostProbeStatus, Platform};
     let start = std::time::Instant::now();
-    let probe_budget = configured_fleet_probe_budget();
-    let probe = check_remote_cass(host, Duration::from_millis(probe_budget.per_host_ms));
+    let host_budget =
+        crate::robot_budget_envelope::RobotBudget::with_start(per_host_budget_ms, start);
+    let probe = if host_budget.is_exhausted() || overall_budget.is_exhausted() {
+        RemoteCassProbe {
+            os: None,
+            cass_version: None,
+            cass_found: false,
+            timed_out: true,
+        }
+    } else {
+        check_remote_cass(
+            host,
+            Duration::from_millis(
+                host_budget
+                    .remaining_ms()
+                    .min(overall_budget.remaining_ms())
+                    .max(1),
+            ),
+        )
+    };
     let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     let platform = probe
         .os
@@ -112301,19 +114587,56 @@ fn probe_remote_host_for_rehearsal(
     report.unreachable = matches!(status, HostProbeStatus::Unreachable);
     report.timed_out = matches!(status, HostProbeStatus::TimedOut);
     (
-        crate::fleet_probe::finalize_host(report, elapsed, probe_budget.per_host_ms),
+        crate::fleet_probe::finalize_host(report, elapsed, per_host_budget_ms),
         unknown_archive_coverage(),
     )
+}
+
+fn skipped_post_upgrade_proof_run(
+    command: String,
+    binary_path: &str,
+    data_dir: &Path,
+) -> crate::proof_artifact::ProofRun {
+    crate::proof_artifact::ProofRun {
+        command,
+        binary_path: Some(binary_path.to_string()),
+        binary_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        data_dir_or_fixture: Some(data_dir.display().to_string()),
+        exit_code: None,
+        elapsed_ms: 0,
+        timeout_ms: 0,
+        timed_out: false,
+        skipped: true,
+        assertions_ran: false,
+        produced_artifact: false,
+        completed: false,
+        artifact_age_ms: None,
+        stdout_path: None,
+        stderr_path: None,
+    }
+}
+
+fn record_local_verification_skip(
+    skipped_sections: &mut Vec<String>,
+    check: crate::fleet_upgrade_rehearsal::PostUpgradeCheck,
+) {
+    let section = format!("local_verification:{}", check.as_str());
+    if !skipped_sections.iter().any(|item| item == &section) {
+        skipped_sections.push(section);
+    }
 }
 
 /// Drive the bounded post-upgrade check battery against the local binary and
 /// classify each into a proof artifact (bead sc8sp, composing 12.2 + 12.3). Each
 /// distinct check command runs once (facets sharing a command reuse the result),
-/// bounded by its own timeout. Read-only: every battery command is a `--json`
-/// inspection of the local host.
+/// Every child timeout is capped by the fleet budget still remaining, and
+/// unstarted facets become explicit skipped proofs. Read-only: every battery
+/// command is a `--json` inspection of the local host.
 fn verify_local_post_upgrade(
     data_dir: &Path,
     coverage_state: crate::fleet_archive_coverage::CoverageState,
+    overall_budget: &crate::robot_budget_envelope::RobotBudget,
+    skipped_sections: &mut Vec<String>,
 ) -> crate::fleet_upgrade_rehearsal::PostUpgradeVerification {
     use crate::e2e_runner::{RunExpectation, RunMode, RunSpec, run};
     use crate::fleet_archive_coverage::CoverageState;
@@ -112338,10 +114661,14 @@ fn verify_local_post_upgrade(
     let mut checks: Vec<(PostUpgradeCheck, ProofRun)> = Vec::new();
     for check in PostUpgradeCheck::battery() {
         let command = check.command().to_string();
-        let timeout_ms = check.timeout_ms();
         let proof_run = run_cache
             .entry(command.clone())
             .or_insert_with(|| {
+                let remaining_ms = overall_budget.remaining_ms();
+                if remaining_ms == 0 {
+                    return skipped_post_upgrade_proof_run(command, &binary_path, data_dir);
+                }
+                let timeout_ms = check.timeout_ms().min(remaining_ms);
                 let args: Vec<String> = command
                     .split_whitespace()
                     .skip(1) // drop the leading "cass"
@@ -112370,6 +114697,9 @@ fn verify_local_post_upgrade(
                 run_event_to_proof_run(&event, &command, &binary_path, timeout_ms)
             })
             .clone();
+        if proof_run.skipped || proof_run.timed_out {
+            record_local_verification_skip(skipped_sections, check);
+        }
         checks.push((check, proof_run));
     }
 
