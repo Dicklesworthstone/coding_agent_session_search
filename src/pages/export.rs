@@ -1839,11 +1839,21 @@ fn cleanup_sqlite_sidecars(artifacts: Vec<PathBuf>) -> Result<()> {
 /// its main file is gone, so those two records would otherwise remain as
 /// unpredictable-named litter in the output directory. Remove exactly that
 /// pair, tolerating absence (older engines may not stamp them).
-fn cleanup_candidate_namespace_identity_records(temp_path: &Path) -> Result<()> {
-    cleanup_sqlite_sidecars(vec![
+///
+/// Runs only after the export is live and durably synced, so a failure here
+/// is logged, never surfaced: cosmetic litter must not turn a successful
+/// publish into an error.
+fn cleanup_candidate_namespace_identity_records(temp_path: &Path) {
+    if let Err(err) = cleanup_sqlite_sidecars(vec![
         super::sqlite_sidecar_path(temp_path, "-fsqlite-ns-gate"),
         super::sqlite_sidecar_path(temp_path, "-fsqlite-ns-use"),
-    ])
+    ]) {
+        tracing::warn!(
+            error = %err,
+            candidate = %temp_path.display(),
+            "published Pages export is live, but its staged candidate's fsqlite namespace identity records could not be removed"
+        );
+    }
 }
 
 fn finalize_staged_sqlite_sidecars(path: &Path) -> Result<()> {
@@ -2345,7 +2355,7 @@ fn replace_file_from_temp_via_backup(
                     backup_path.display()
                 )
             })?;
-            cleanup_candidate_namespace_identity_records(temp_path)?;
+            cleanup_candidate_namespace_identity_records(temp_path);
             remove_prior_export_backup_after_publish(
                 &backup_path,
                 final_path,
@@ -2593,7 +2603,7 @@ fn replace_file_from_temp(
                 final_path.display()
             )
         })?;
-        cleanup_candidate_namespace_identity_records(temp_path)?;
+        cleanup_candidate_namespace_identity_records(temp_path);
         bail!(
             "new Pages export is live at {}, but Windows std cannot prove durable directory-entry publication; no prior generation existed to retain",
             final_path.display()
@@ -2627,7 +2637,8 @@ fn replace_file_from_temp(
                 final_path.display()
             )
         })?;
-        cleanup_candidate_namespace_identity_records(temp_path)
+        cleanup_candidate_namespace_identity_records(temp_path);
+        Ok(())
     }
 }
 

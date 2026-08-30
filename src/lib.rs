@@ -42652,9 +42652,17 @@ fn doctor_bound_healthy_listing<T>(
     (kept, omitted)
 }
 
+/// A manifest is a "problem" (never elided from the bounded listing) when it
+/// is invalid, its blob is missing or mismatched, its manifest checksum
+/// drifted, or its upstream source is gone. `manifest_unverified` (a legacy
+/// manifest that never recorded a checksum) is a warning-class count, not a
+/// per-manifest problem, and is elided like a healthy entry.
 fn doctor_raw_mirror_manifest_is_problem(manifest: &DoctorRawMirrorManifestReport) -> bool {
     manifest.invalid_reason.is_some()
-        || manifest.status.as_str().cmp("verified").is_ne()
+        || matches!(
+            manifest.status.as_str(),
+            "invalid_manifest" | "manifest_drift" | "checksum_mismatch" | "missing_blob"
+        )
         || manifest.upstream_path_exists.is_some_and(|exists| !exists)
         || matches!(
             manifest.blob_checksum_status,
@@ -42705,10 +42713,12 @@ mod doctor_raw_mirror_listing_bound_tests {
 
     #[test]
     fn small_sets_are_untouched_and_zero_cap_keeps_only_problems() {
-        let (kept, omitted) = doctor_bound_healthy_listing(vec![2u32, 4], 64, |n| !n.is_multiple_of(2));
+        let (kept, omitted) =
+            doctor_bound_healthy_listing(vec![2u32, 4], 64, |n| !n.is_multiple_of(2));
         assert_eq!(kept, vec![2, 4]);
         assert_eq!(omitted, 0);
-        let (kept, omitted) = doctor_bound_healthy_listing(vec![1u32, 2, 4], 0, |n| !n.is_multiple_of(2));
+        let (kept, omitted) =
+            doctor_bound_healthy_listing(vec![1u32, 2, 4], 0, |n| !n.is_multiple_of(2));
         assert_eq!(kept, vec![1]);
         assert_eq!(omitted, 2);
     }
@@ -42841,7 +42851,7 @@ struct DoctorRawMirrorPublicExportPolicyReport {
     public_artifact_contract: String,
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize)]
 struct DoctorRawMirrorSummary {
     manifest_count: usize,
     verified_blob_count: usize,
@@ -42862,16 +42872,40 @@ struct DoctorRawMirrorSummary {
     /// ub29t (gh#374 issue 4): how many manifests the `manifests` array
     /// actually carries. Equal to `manifest_count` under `--verbose` or when
     /// the archive is small; smaller when healthy entries were elided.
-    #[serde(default)]
     listed_manifest_count: usize,
     /// Healthy (`verified`, upstream present, no invalid reason) manifests
     /// elided from `manifests` by the bounded default listing. Problem
     /// manifests are never elided.
-    #[serde(default)]
     omitted_healthy_manifest_count: usize,
-    /// `"full"` or `"bounded"`.
-    #[serde(default)]
+    /// `"full"` or `"bounded"`. Surfaces that never apply the bound
+    /// (baseline snapshots, archive scans) report `"full"`.
     listing_mode: &'static str,
+}
+
+impl Default for DoctorRawMirrorSummary {
+    fn default() -> Self {
+        Self {
+            manifest_count: 0,
+            verified_blob_count: 0,
+            missing_blob_count: 0,
+            checksum_mismatch_count: 0,
+            manifest_checksum_mismatch_count: 0,
+            manifest_checksum_not_recorded_count: 0,
+            invalid_manifest_count: 0,
+            interrupted_capture_count: 0,
+            duplicate_blob_reference_count: 0,
+            total_blob_bytes: 0,
+            orphan_blob_count: 0,
+            orphan_blob_bytes: 0,
+            amplified_source_count: 0,
+            amplified_source_referenced_bytes: 0,
+            amplified_source_excess_bytes: 0,
+            max_source_amplification_ratio_milli: None,
+            listed_manifest_count: 0,
+            omitted_healthy_manifest_count: 0,
+            listing_mode: "full",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -58398,7 +58432,9 @@ mod doctor_heartbeat_tests {
 /// naming elapsed time and the last completed phase. First tick fires only
 /// after one full interval, so quick runs stay byte-identical on stderr.
 struct CliHeartbeat {
-    stop: Arc<std::sync::atomic::AtomicBool>,
+    /// Dropping the sender wakes the thread immediately, so retiring the
+    /// heartbeat never adds latency to a fast `status`/`doctor` exit.
+    stop: Option<std::sync::mpsc::Sender<()>>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -58408,8 +58444,7 @@ impl CliHeartbeat {
         if let Ok(mut last) = DOCTOR_HEARTBEAT_LAST_PHASE.lock() {
             last.clear();
         }
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stop_for_thread = stop.clone();
+        let (stop, wake) = std::sync::mpsc::channel::<()>();
         let surface = surface.to_string();
         let handle = std::thread::Builder::new()
             .name("cass-doctor-heartbeat".to_string())
@@ -58417,9 +58452,12 @@ impl CliHeartbeat {
                 let started = std::time::Instant::now();
                 let mut next = interval;
                 loop {
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                    if stop_for_thread.load(std::sync::atomic::Ordering::Relaxed) {
-                        break;
+                    // Sleep until the next tick or until the owner drops the
+                    // sender (disconnect), whichever comes first.
+                    let remaining = next.saturating_sub(started.elapsed());
+                    match wake.recv_timeout(remaining) {
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                     let elapsed = started.elapsed();
                     if elapsed < next {
@@ -58443,7 +58481,7 @@ impl CliHeartbeat {
             })
             .ok()?;
         Some(Self {
-            stop,
+            stop: Some(stop),
             handle: Some(handle),
         })
     }
@@ -58451,7 +58489,8 @@ impl CliHeartbeat {
 
 impl Drop for CliHeartbeat {
     fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Disconnect first so a sleeping thread wakes at once, then join.
+        drop(self.stop.take());
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }

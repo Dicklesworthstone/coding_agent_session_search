@@ -222,7 +222,11 @@ fn spawn_harness_death_reaper(child_pid: u32) -> Option<std::process::Child> {
 #[cfg(unix)]
 fn spawn_death_reaper_for(watched_pid: u32, child_pid: u32) -> Option<std::process::Child> {
     use std::os::unix::process::CommandExt;
-    const REAPER_SCRIPT: &str = "while kill -0 \"$1\" 2>/dev/null && kill -0 \"$2\" 2>/dev/null; do sleep 1; done; /bin/kill -KILL \"-$2\" 2>/dev/null";
+    // Loop while both are alive; afterwards kill the group only if the CHILD
+    // is the one still alive (the harness died). If the child is already
+    // gone, do nothing — its pid could have been reused by an unrelated
+    // process group.
+    const REAPER_SCRIPT: &str = "while kill -0 \"$1\" 2>/dev/null && kill -0 \"$2\" 2>/dev/null; do sleep 1; done; if kill -0 \"$2\" 2>/dev/null; then /bin/kill -KILL \"-$2\" 2>/dev/null; fi";
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c")
         .arg(REAPER_SCRIPT)

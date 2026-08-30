@@ -17481,6 +17481,22 @@ fn finalize_one_shot_semantic_delta(
     drop(index);
     let inventory = inspect_semantic_artifact(&index_path)?;
     let doc_count = u64::try_from(inventory.live_record_count()).unwrap_or(u64::MAX);
+    // The append changed the vector row set, so any HNSW graph built over the
+    // previous rows is stale. The loader rejects it independently, but the
+    // durable manifest must stop advertising it as ready (same rule as the
+    // targeted watch-once publish).
+    if let Some(tier) = semantic_tier_for_embedder_id(semantic_indexer.embedder_id()) {
+        let mut manifest = SemanticManifest::load_or_default(data_dir)
+            .map_err(|err| anyhow::anyhow!("loading semantic manifest for delta publish: {err}"))?;
+        if manifest.hnsw.as_ref().is_some_and(|hnsw| {
+            hnsw.base_tier == tier && hnsw.embedder_id == semantic_indexer.embedder_id()
+        }) {
+            manifest.hnsw = None;
+            manifest
+                .save(data_dir)
+                .map_err(|err| anyhow::anyhow!("revoking stale HNSW after delta append: {err}"))?;
+        }
+    }
     publish_direct_semantic_artifact(
         storage,
         data_dir,
