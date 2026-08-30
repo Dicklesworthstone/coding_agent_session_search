@@ -1737,7 +1737,7 @@
         },
         {
           "name": "binary-only",
-          "description": "Exit code reflects only whether this executable is functional: archive readiness (stale index, active rebuild, uninitialized or degraded archive) is still fully REPORTED in the output but never fails the exit code. For binary promotion gates and packaging smoke tests that must validate a candidate binary on a host whose archive happens to be stale (#398)",
+          "description": "Exit code reflects only whether this executable is functional: archive readiness (stale index, active rebuild, uninitialized or degraded archive) is still fully REPORTED in the output but never fails the exit code. Use `cass selftest` instead when the probe must avoid opening the configured archive entirely (#398)",
           "arg_type": "flag",
           "required": false,
           "default": "false",

@@ -338,6 +338,18 @@ schemas: (auto-generated from contract)
         - safe_to_rebuild: boolean
         - safety_classification: string
         - status: string
+    - detail_output: object
+      - details_truncated: boolean
+      - full_details_command: ?
+      - limit_per_collection: ?
+      - mode: string
+      - note: string
+      - raw_mirror_backfill_receipts_omitted: integer
+      - raw_mirror_backfill_receipts_returned: integer
+      - raw_mirror_backfill_receipts_total: integer
+      - sole_copy_warnings_omitted: integer
+      - sole_copy_warnings_returned: integer
+      - sole_copy_warnings_total: integer
     - doctor_command: object
     - doctor_contract_version: integer
     - doctor_v2_contract: object
@@ -485,11 +497,14 @@ schemas: (auto-generated from contract)
         - duplicate_blob_reference_count: integer
         - interrupted_capture_count: integer
         - invalid_manifest_count: integer
+        - listed_manifest_count: integer
+        - listing_mode: string
         - manifest_checksum_mismatch_count: integer
         - manifest_checksum_not_recorded_count: integer
         - manifest_count: integer
         - max_source_amplification_ratio_milli: ?
         - missing_blob_count: integer
+        - omitted_healthy_manifest_count: integer
         - total_blob_bytes: integer
         - verified_blob_count: integer
       - warnings: array
@@ -787,6 +802,18 @@ schemas: (auto-generated from contract)
       - semantic_vector_delta: ?
       - status: string
       - visible_source_conversation_count: ?
+    - detail_output: object
+      - details_truncated: boolean
+      - full_details_command: ?
+      - limit_per_collection: ?
+      - mode: string
+      - note: string
+      - raw_mirror_backfill_receipts_omitted: integer
+      - raw_mirror_backfill_receipts_returned: integer
+      - raw_mirror_backfill_receipts_total: integer
+      - sole_copy_warnings_omitted: integer
+      - sole_copy_warnings_returned: integer
+      - sole_copy_warnings_total: integer
     - event_log_path: ?
     - fallback_mode: string
     - forensic_bundle: object
@@ -898,6 +925,18 @@ schemas: (auto-generated from contract)
       - unknown_mapping_count: integer
       - visible_current_source_bytes: integer
       - visible_current_source_count: integer
+    - detail_output: object
+      - details_truncated: boolean
+      - full_details_command: ?
+      - limit_per_collection: ?
+      - mode: string
+      - note: string
+      - raw_mirror_backfill_receipts_omitted: integer
+      - raw_mirror_backfill_receipts_returned: integer
+      - raw_mirror_backfill_receipts_total: integer
+      - sole_copy_warnings_omitted: integer
+      - sole_copy_warnings_returned: integer
+      - sole_copy_warnings_total: integer
     - event_log_path: ?
     - fallback_mode: string
     - mode: string
@@ -969,11 +1008,14 @@ schemas: (auto-generated from contract)
         - duplicate_blob_reference_count: integer
         - interrupted_capture_count: integer
         - invalid_manifest_count: integer
+        - listed_manifest_count: integer
+        - listing_mode: string
         - manifest_checksum_mismatch_count: integer
         - manifest_checksum_not_recorded_count: integer
         - manifest_count: integer
         - max_source_amplification_ratio_milli: ?
         - missing_blob_count: integer
+        - omitted_healthy_manifest_count: integer
         - total_blob_bytes: integer
         - verified_blob_count: integer
       - warnings: array
@@ -3659,6 +3701,8 @@ schemas: (auto-generated from contract)
       - newest_source_mtime_ms: ?
       - oldest_capture_at_ms: ?
       - oldest_source_mtime_ms: ?
+      - orphan_blob_bytes: integer
+      - orphan_blob_count: integer
       - root_path: string
       - total_blob_bytes: integer
       - total_storage_bytes: integer

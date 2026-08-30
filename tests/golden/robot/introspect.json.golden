@@ -694,7 +694,7 @@
         },
         {
           "name": "embedder",
-          "description": "Embedder to use for semantic indexing (hash, fastembed)",
+          "description": "Embedder to use for semantic indexing (hash, minilm, multilingual-minilm)",
           "arg_type": "option",
           "value_type": "string",
           "required": false,
@@ -2116,7 +2116,7 @@
         },
         {
           "name": "binary-only",
-          "description": "Exit code reflects only whether this executable is functional: archive readiness (stale index, active rebuild, uninitialized or degraded archive) is still fully REPORTED in the output but never fails the exit code. For binary promotion gates and packaging smoke tests that must validate a candidate binary on a host whose archive happens to be stale (#398)",
+          "description": "Exit code reflects only whether this executable is functional: archive readiness (stale index, active rebuild, uninitialized or degraded archive) is still fully REPORTED in the output but never fails the exit code. Use `cass selftest` instead when the probe must avoid opening the configured archive entirely (#398)",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -7079,6 +7079,19 @@
                     "integer",
                     "null"
                   ]
+                },
+                "listed_manifest_count": {
+                  "type": "integer"
+                },
+                "omitted_healthy_manifest_count": {
+                  "type": "integer"
+                },
+                "listing_mode": {
+                  "type": "string",
+                  "enum": [
+                    "full",
+                    "bounded"
+                  ]
                 }
               }
             },
@@ -7103,6 +7116,15 @@
                     "type": "string"
                   },
                   "blob_size_bytes": {
+                    "type": "integer"
+                  },
+                  "storage_kind": {
+                    "type": "string"
+                  },
+                  "source_content_blake3": {
+                    "type": "string"
+                  },
+                  "chunk_count": {
                     "type": "integer"
                   },
                   "provider": {
@@ -7589,6 +7611,30 @@
                       "null"
                     ]
                   },
+                  "raw_mirror_source_content_blake3": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "raw_mirror_source_size_bytes": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "raw_mirror_storage_kind": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "raw_mirror_chunk_count": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
                   "backfill_generation": {
                     "type": "integer"
                   },
@@ -7854,6 +7900,65 @@
             "type": "object",
             "additionalProperties": true
           }
+        },
+        "detail_output": {
+          "type": "object",
+          "description": "Bounds for per-record doctor JSON details. Summary counts and safety decisions always use the complete internal evidence collections.",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "description": "bounded_summary | full_verbose"
+            },
+            "limit_per_collection": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "details_truncated": {
+              "type": "boolean"
+            },
+            "raw_mirror_backfill_receipts_total": {
+              "type": "integer"
+            },
+            "raw_mirror_backfill_receipts_returned": {
+              "type": "integer"
+            },
+            "raw_mirror_backfill_receipts_omitted": {
+              "type": "integer"
+            },
+            "sole_copy_warnings_total": {
+              "type": "integer"
+            },
+            "sole_copy_warnings_returned": {
+              "type": "integer"
+            },
+            "sole_copy_warnings_omitted": {
+              "type": "integer"
+            },
+            "full_details_command": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "note": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "mode",
+            "limit_per_collection",
+            "details_truncated",
+            "raw_mirror_backfill_receipts_total",
+            "raw_mirror_backfill_receipts_returned",
+            "raw_mirror_backfill_receipts_omitted",
+            "sole_copy_warnings_total",
+            "sole_copy_warnings_returned",
+            "sole_copy_warnings_omitted",
+            "full_details_command",
+            "note"
+          ]
         },
         "coverage_risk": {
           "type": "object",
@@ -10477,6 +10582,7 @@
         "raw_mirror_backfill",
         "coverage_summary",
         "sole_copy_warnings",
+        "detail_output",
         "coverage_risk",
         "source_authority",
         "candidate_staging",
@@ -11078,6 +11184,65 @@
               }
             }
           }
+        },
+        "detail_output": {
+          "type": "object",
+          "description": "Bounds for per-record doctor JSON details. Summary counts and safety decisions always use the complete internal evidence collections.",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "description": "bounded_summary | full_verbose"
+            },
+            "limit_per_collection": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "details_truncated": {
+              "type": "boolean"
+            },
+            "raw_mirror_backfill_receipts_total": {
+              "type": "integer"
+            },
+            "raw_mirror_backfill_receipts_returned": {
+              "type": "integer"
+            },
+            "raw_mirror_backfill_receipts_omitted": {
+              "type": "integer"
+            },
+            "sole_copy_warnings_total": {
+              "type": "integer"
+            },
+            "sole_copy_warnings_returned": {
+              "type": "integer"
+            },
+            "sole_copy_warnings_omitted": {
+              "type": "integer"
+            },
+            "full_details_command": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "note": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "mode",
+            "limit_per_collection",
+            "details_truncated",
+            "raw_mirror_backfill_receipts_total",
+            "raw_mirror_backfill_receipts_returned",
+            "raw_mirror_backfill_receipts_omitted",
+            "sole_copy_warnings_total",
+            "sole_copy_warnings_returned",
+            "sole_copy_warnings_omitted",
+            "full_details_command",
+            "note"
+          ]
         }
       },
       "required": [
@@ -11964,6 +12129,19 @@
                     "integer",
                     "null"
                   ]
+                },
+                "listed_manifest_count": {
+                  "type": "integer"
+                },
+                "omitted_healthy_manifest_count": {
+                  "type": "integer"
+                },
+                "listing_mode": {
+                  "type": "string",
+                  "enum": [
+                    "full",
+                    "bounded"
+                  ]
                 }
               }
             },
@@ -11988,6 +12166,15 @@
                     "type": "string"
                   },
                   "blob_size_bytes": {
+                    "type": "integer"
+                  },
+                  "storage_kind": {
+                    "type": "string"
+                  },
+                  "source_content_blake3": {
+                    "type": "string"
+                  },
+                  "chunk_count": {
                     "type": "integer"
                   },
                   "provider": {
@@ -12269,6 +12456,65 @@
             "type": "object",
             "additionalProperties": true
           }
+        },
+        "detail_output": {
+          "type": "object",
+          "description": "Bounds for per-record doctor JSON details. Summary counts and safety decisions always use the complete internal evidence collections.",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "description": "bounded_summary | full_verbose"
+            },
+            "limit_per_collection": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "details_truncated": {
+              "type": "boolean"
+            },
+            "raw_mirror_backfill_receipts_total": {
+              "type": "integer"
+            },
+            "raw_mirror_backfill_receipts_returned": {
+              "type": "integer"
+            },
+            "raw_mirror_backfill_receipts_omitted": {
+              "type": "integer"
+            },
+            "sole_copy_warnings_total": {
+              "type": "integer"
+            },
+            "sole_copy_warnings_returned": {
+              "type": "integer"
+            },
+            "sole_copy_warnings_omitted": {
+              "type": "integer"
+            },
+            "full_details_command": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "note": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "mode",
+            "limit_per_collection",
+            "details_truncated",
+            "raw_mirror_backfill_receipts_total",
+            "raw_mirror_backfill_receipts_returned",
+            "raw_mirror_backfill_receipts_omitted",
+            "sole_copy_warnings_total",
+            "sole_copy_warnings_returned",
+            "sole_copy_warnings_omitted",
+            "full_details_command",
+            "note"
+          ]
         },
         "source_authority": {
           "type": "object",
@@ -34513,6 +34759,12 @@
               "type": "integer"
             },
             "largest_blob_bytes": {
+              "type": "integer"
+            },
+            "orphan_blob_count": {
+              "type": "integer"
+            },
+            "orphan_blob_bytes": {
               "type": "integer"
             },
             "missing_blob_count": {

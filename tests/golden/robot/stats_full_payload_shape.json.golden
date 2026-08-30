@@ -73,6 +73,12 @@
         "largest_blob_bytes": {
           "type": "integer"
         },
+        "orphan_blob_count": {
+          "type": "integer"
+        },
+        "orphan_blob_bytes": {
+          "type": "integer"
+        },
         "missing_blob_count": {
           "type": "integer"
         },

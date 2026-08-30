@@ -2570,11 +2570,11 @@
       "manifest_path_template": "manifests/<manifest-id>.json",
       "verification_path_template": "verification/<manifest-id>.json",
       "temp_path_template": "tmp/<operation-id>/<file>.tmp",
-      "content_address_scope": "global within the cass data dir; identical bytes share one blob across providers and sources",
+      "content_address_scope": "global within the cass data dir; identical whole files, chunk descriptors, and fixed-size source chunks share blobs across versions, providers, and sources",
       "source_identity_scope": "manifest metadata records provider, source_id, origin_kind, origin_host, original path hash, and db_links back to archive conversations/messages",
       "db_link_contract": "db_links entries identify archived conversations without embedding raw session content in manifests",
       "case_insensitive_collision_behavior": "no original path segment is used as a storage directory; path identity is hashed from exact bytes, so case-folding filesystems cannot collide user paths",
-      "migration_contract": "schema_version and raw-mirror/vN keep future layouts side-by-side; v1 readers ignore unknown manifest fields"
+      "migration_contract": "schema_version and raw-mirror/vN keep future layouts side-by-side; v1 manifests without content_storage remain whole-blob captures, while new large-source manifests declare fixed_chunks_v1 metadata"
     },
     "policy": {
       "append_only": true,
@@ -2585,8 +2585,8 @@
       "directory_mode_octal": "0700",
       "file_mode_octal": "0600",
       "enforce_private_files": true,
-      "atomic_publish": "write temp file under tmp, fsync file, rename into content-addressed destination, fsync parent directory, then publish manifest",
-      "fsync_required": true,
+      "atomic_publish": "write whole-file or fixed-size chunk temps under tmp, verify the stable source, publish immutable content-addressed blobs, then publish the integrity-bound manifest",
+      "fsync_required": false,
       "path_traversal_defense": "manifest blob paths must be relative normal components under raw-mirror/v1 and may not contain absolute paths, prefixes, dot-dot, or empty components",
       "symlink_defense": "doctor verification refuses symlinked blob or manifest paths and never follows symlinks while validating mirror evidence",
       "default_report_contract": "default doctor reports expose redacted paths, content hashes, sizes, timestamps, provider/source identity, and codec/encryption metadata; exact paths and raw bytes stay internal unless a future explicit sensitive-evidence mode requests them",
@@ -2600,6 +2600,9 @@
           "redacted_blob_path",
           "blob_blake3",
           "blob_size_bytes",
+          "storage_kind",
+          "source_content_blake3",
+          "chunk_count",
           "provider",
           "source_id",
           "origin_kind",
@@ -2701,7 +2704,7 @@
         "default_robot_json_includes_raw_content": false,
         "public_artifact_contract": "Pages, HTML exports, robot logs, and default support bundles must not include raw mirror bytes, exact source paths, prompts, attachment payloads, or decrypted/encrypted evidence blobs"
       },
-      "compression_contract": "v1 stores plain bytes by default; future compression must be declared in the compression envelope and preserve uncompressed size/hash metadata",
+      "compression_contract": "v1 stores plain bytes by default; large sources use fixed_chunks_v1 content-addressed chunking without compression, while future compression must be declared in the compression envelope and preserve uncompressed size/hash metadata",
       "encryption_contract": "v1 stores unencrypted local evidence by default; future encryption must be explicit in the encryption envelope and must not weaken manifest integrity checks",
       "support_bundle_redaction_contract": "support bundles use redacted_original_path and original_path_blake3; raw bytes are not exported unless an operator explicitly asks for evidence export",
       "missing_upstream_semantics": "missing upstream provider files are distinct from missing cass mirror evidence; a verified mirror blob is preserved archive evidence even if the original source path was pruned"
@@ -2717,10 +2720,15 @@
       "interrupted_capture_count": 0,
       "duplicate_blob_reference_count": 0,
       "total_blob_bytes": 0,
+      "orphan_blob_count": 0,
+      "orphan_blob_bytes": 0,
       "amplified_source_count": 0,
       "amplified_source_referenced_bytes": 0,
       "amplified_source_excess_bytes": 0,
-      "max_source_amplification_ratio_milli": null
+      "max_source_amplification_ratio_milli": null,
+      "listed_manifest_count": 0,
+      "omitted_healthy_manifest_count": 0,
+      "listing_mode": "bounded"
     },
     "manifests": [],
     "amplified_sources": [],
@@ -2806,6 +2814,19 @@
     ]
   },
   "sole_copy_warnings": [],
+  "detail_output": {
+    "mode": "bounded_summary",
+    "limit_per_collection": 64,
+    "details_truncated": false,
+    "raw_mirror_backfill_receipts_total": 0,
+    "raw_mirror_backfill_receipts_returned": 0,
+    "raw_mirror_backfill_receipts_omitted": 0,
+    "sole_copy_warnings_total": 0,
+    "sole_copy_warnings_returned": 0,
+    "sole_copy_warnings_omitted": 0,
+    "full_details_command": null,
+    "note": "Counts and safety decisions use the complete internal collections; only per-record robot details are capped unless --verbose is requested."
+  },
   "coverage_risk": {
     "schema_version": 1,
     "status": "ok",

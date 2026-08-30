@@ -68,7 +68,7 @@ commands:
   cass robot-docs <topic>
   cass --robot-help
   cass health [--json]             Minimal readiness probe (<50ms, exit 0=healthy, 1=unhealthy).
-    --binary-only     Report the same readiness verdict but exit 0 unless the executable itself fails (binary promotion gates).
+    --binary-only     Report the same archive-readiness verdict but exit 0 unless the executable itself fails; use selftest to avoid archive access.
   cass selftest [--json]           Archive-independent executable probe for package and binary-promotion gates.
   cass doctor [--json] [--fix]     Legacy spelling: --json realizes read-only check; --fix realizes safe-auto-run.
                     doctor JSON includes source_inventory; missing upstream provider files are

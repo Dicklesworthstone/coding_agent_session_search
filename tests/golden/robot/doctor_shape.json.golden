@@ -2368,6 +2368,12 @@
             "total_blob_bytes": {
               "type": "integer"
             },
+            "orphan_blob_count": {
+              "type": "integer"
+            },
+            "orphan_blob_bytes": {
+              "type": "integer"
+            },
             "amplified_source_count": {
               "type": "integer"
             },
@@ -2379,6 +2385,15 @@
             },
             "max_source_amplification_ratio_milli": {
               "type": "null"
+            },
+            "listed_manifest_count": {
+              "type": "integer"
+            },
+            "omitted_healthy_manifest_count": {
+              "type": "integer"
+            },
+            "listing_mode": {
+              "type": "string"
             }
           }
         },
@@ -2622,6 +2637,44 @@
       "type": "array",
       "items": {
         "type": "unknown"
+      }
+    },
+    "detail_output": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string"
+        },
+        "limit_per_collection": {
+          "type": "integer"
+        },
+        "details_truncated": {
+          "type": "boolean"
+        },
+        "raw_mirror_backfill_receipts_total": {
+          "type": "integer"
+        },
+        "raw_mirror_backfill_receipts_returned": {
+          "type": "integer"
+        },
+        "raw_mirror_backfill_receipts_omitted": {
+          "type": "integer"
+        },
+        "sole_copy_warnings_total": {
+          "type": "integer"
+        },
+        "sole_copy_warnings_returned": {
+          "type": "integer"
+        },
+        "sole_copy_warnings_omitted": {
+          "type": "integer"
+        },
+        "full_details_command": {
+          "type": "null"
+        },
+        "note": {
+          "type": "string"
+        }
       }
     },
     "coverage_risk": {
