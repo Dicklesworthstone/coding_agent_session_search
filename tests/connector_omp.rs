@@ -5,6 +5,7 @@ mod util;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
 use coding_agent_search::connectors::{
     Connector, Origin, Platform, ScanContext, ScanRoot, extract_tokens_for_agent,
     get_connector_factories, omp::OmpConnector,
@@ -266,6 +267,99 @@ fn sanitized_remote_omp_roots_keep_provider_identity() {
             "a sanitized marker outside remotes/<source>/mirror must not claim OMP ownership"
         );
     }
+}
+
+#[test]
+fn sanitized_remote_omp_profile_root_preserves_profile_subagents_and_provenance()
+-> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mirror = temp.path().join("cass/remotes/build-host/mirror");
+    let root = mirror.join(path_to_safe_dirname("~/.omp/profiles"));
+    let profile_agent = root.join("work/agent");
+    let main_session = write_omp_session(
+        &profile_agent,
+        "omp-mirrored-profile",
+        "Mirrored profile session",
+    );
+    write_omp_subagent(&main_session, "omp-mirrored-profile-researcher");
+
+    let ctx = ScanContext::with_roots(
+        temp.path().join("cass-state"),
+        vec![ScanRoot::remote(
+            root,
+            Origin::remote_with_host("build-host", "build-host.example"),
+            Some(Platform::Linux),
+        )],
+        None,
+    );
+    let connector = OmpConnector::new();
+    let sources = connector.discover_source_files(&ctx)?;
+    anyhow::ensure!(
+        sources.len().cmp(&2).is_eq(),
+        "expected the mirrored OMP profile and its sub-agent"
+    );
+    anyhow::ensure!(sources.iter().all(|source| {
+        source.provider_slug.eq("omp")
+            && source.origin.is_remote()
+            && matches!(source.platform, Some(Platform::Linux))
+    }));
+
+    let conversations = connector.scan(&ctx)?;
+    anyhow::ensure!(
+        conversations.len().cmp(&2).is_eq(),
+        "expected two indexed OMP conversations"
+    );
+    anyhow::ensure!(conversations.iter().all(|conversation| {
+        conversation.agent_slug.eq("omp")
+            && conversation
+                .metadata
+                .get("profile")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|profile| profile.eq("work"))
+    }));
+    anyhow::ensure!(conversations.iter().any(|conversation| {
+        conversation.source_path.ends_with("Researcher.jsonl")
+            && conversation
+                .messages
+                .iter()
+                .any(|message| message.content.eq("OMP sub-agent task"))
+    }));
+
+    let resume = std::process::Command::new(env!("CARGO_BIN_EXE_cass"))
+        .arg("resume")
+        .arg(&main_session)
+        .arg("--json")
+        .output()?;
+    anyhow::ensure!(
+        resume.status.success(),
+        "cass resume failed: {}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+    let resume_payload: serde_json::Value = serde_json::from_slice(&resume.stdout)?;
+    let resume_command = resume_payload
+        .get("command")
+        .context("cass resume response omitted command")?;
+    let expected_command = json!([
+        "omp",
+        "--profile",
+        "work",
+        "--session-dir",
+        profile_agent.join("sessions").display().to_string(),
+        "--resume",
+        "omp-mirrored-profile"
+    ]);
+    anyhow::ensure!(
+        resume_command.eq(&expected_command),
+        "resume must preserve the mirrored profile identity and exact session store"
+    );
+
+    let pi_conversations = runtime_connector("pi_agent").scan(&ctx)?;
+    anyhow::ensure!(
+        pi_conversations.is_empty(),
+        "a mirrored OMP profile and its sub-agent must each index once"
+    );
+
+    Ok(())
 }
 
 #[test]

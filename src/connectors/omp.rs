@@ -362,6 +362,15 @@ fn safe_mirror_name_has_omp_layout(name: &str) -> bool {
         || encoded_path_has_marker(encoded, ".local_share_omp")
 }
 
+fn safe_mirror_name_is_omp_profiles_root(name: &str) -> bool {
+    let Some((encoded, hash)) = name.rsplit_once('_') else {
+        return false;
+    };
+    is_safe_mirror_hash(hash)
+        && encoded.ends_with(".omp_profiles")
+        && encoded_path_has_marker(encoded, ".omp_profiles")
+}
+
 fn has_sanitized_omp_mirror_marker(parts: &[String]) -> bool {
     // `sources sync` preserves a configured remote path in the mirror
     // container name. A tilde path starts with the provider marker, while an
@@ -625,6 +634,37 @@ pub(crate) fn configured_session_root(path: &Path) -> Option<PathBuf> {
 #[must_use]
 pub(crate) fn profile_from_session_path(path: &Path) -> Option<String> {
     let parts = path_parts(path)?;
+
+    // `sources sync` flattens the `~/.omp/profiles` preset into one
+    // provider-qualified mirror container. The profile then sits directly
+    // below the safe name instead of below a literal `profiles` component:
+    //
+    //   remotes/<source>/mirror/.omp_profiles_<hash>/<profile>/agent/sessions
+    //
+    // Recover it only from that exact production slot. A marker-shaped
+    // directory elsewhere is not authoritative profile provenance.
+    for window in parts.windows(7) {
+        let [
+            remotes,
+            _source,
+            mirror,
+            safe_root,
+            profile,
+            agent,
+            sessions,
+        ] = window
+        else {
+            continue;
+        };
+        if remotes == "remotes"
+            && mirror == "mirror"
+            && safe_mirror_name_is_omp_profiles_root(safe_root)
+            && agent == "agent"
+            && sessions == "sessions"
+        {
+            return normalize_profile_name(profile);
+        }
+    }
 
     for window in parts.windows(4) {
         if window[0] == "profiles" && window[2] == "agent" && window[3] == "sessions" {
@@ -1009,6 +1049,46 @@ mod tests {
             None,
             "reserved profile names must never reach `omp --profile`"
         );
+    }
+
+    #[test]
+    fn sanitized_remote_profile_paths_require_the_production_mirror_slot() -> anyhow::Result<()> {
+        fn check_valid_root(remote_root: &str) -> anyhow::Result<()> {
+            let safe_name = crate::sources::sync::path_to_safe_dirname(remote_root);
+            let production_path = PathBuf::from("/cass/remotes/build-host/mirror")
+                .join(&safe_name)
+                .join("work/agent/sessions/project/session.jsonl");
+            anyhow::ensure!(
+                profile_from_session_path(&production_path)
+                    .as_deref()
+                    .is_some_and(|profile| profile.eq("work")),
+                "production mirror profile was not recovered from {production_path:?}"
+            );
+
+            let incidental_path = PathBuf::from("/cass/ordinary-cache")
+                .join(&safe_name)
+                .join("work/agent/sessions/project/session.jsonl");
+            anyhow::ensure!(
+                profile_from_session_path(&incidental_path).is_none(),
+                "a sanitized profile root outside remotes/<source>/mirror is not provenance"
+            );
+
+            Ok(())
+        }
+
+        check_valid_root("~/.omp/profiles")?;
+        check_valid_root("/home/dev/.omp/profiles")?;
+
+        let safe_name = crate::sources::sync::path_to_safe_dirname("~/.omp/profiles");
+        let invalid_profile = PathBuf::from("/cass/remotes/build-host/mirror")
+            .join(safe_name)
+            .join("con/agent/sessions/project/session.jsonl");
+        anyhow::ensure!(
+            profile_from_session_path(&invalid_profile).is_none(),
+            "reserved profile names must stay invalid after mirror flattening"
+        );
+
+        Ok(())
     }
 
     #[test]
