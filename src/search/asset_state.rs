@@ -404,6 +404,11 @@ pub(crate) struct SearchAssetSnapshot {
 pub(crate) struct LexicalAssetState {
     pub status: &'static str,
     pub exists: bool,
+    /// b4uax (gh#382): the on-disk generation was written by the legacy
+    /// Tantivy engine (`meta.json`, no Quill `MANIFEST`) and cannot be read
+    /// by the current engine. It "exists" (so the flip is REBUILD, not
+    /// "empty"), but it is not searchable until a full lexical rebuild runs.
+    pub engine_incompatible: bool,
     pub fresh: bool,
     pub stale: bool,
     pub rebuilding: bool,
@@ -1367,6 +1372,11 @@ struct LexicalObservationInput<'a> {
     current_db_fingerprint: Option<&'a str>,
 }
 
+/// b4uax: the exact operator contract for a legacy Tantivy generation. Names
+/// the command and the expected cost so `status`/`triage` never leave an
+/// established archive guessing after the engine flip.
+pub(crate) const LEGACY_ENGINE_STATUS_REASON: &str = "lexical index was built by the legacy Tantivy engine and the current Quill engine cannot read it; search is unavailable until `cass index --full` completes a one-time full lexical rebuild (cost scales with message count: minutes on small archives, an hour-scale run on multi-million-message archives; `--force-rebuild` skips the filesystem rescan)";
+
 fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> LexicalAssetState {
     let LexicalObservationInput {
         index_path,
@@ -1379,6 +1389,16 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         current_db_fingerprint,
     } = input;
     let exists = crate::search::tantivy::searchable_index_exists(index_path);
+    // b4uax: a Tantivy-era `meta.json` without a Quill `MANIFEST` (or a
+    // federated manifest) is an index generation the current engine cannot
+    // open. `exists` stays true; the state must say "rebuild required", not
+    // "ready".
+    let engine_incompatible = exists
+        && !index_path
+            .join(crate::search::quill_bridge::QUILL_INDEX_MARKER)
+            .exists()
+        && !crate::search::tantivy::federated_search_manifest_path(index_path).exists()
+        && index_path.join("meta.json").exists();
     let checkpoint_db_matches =
         checkpoint.map(|state| crate::stored_path_identity_matches(&state.db_path, db_path));
     let schema_matches = checkpoint.map(|state| state.schema_hash == SCHEMA_HASH);
@@ -1448,10 +1468,11 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         // A stalled rebuild leaves the on-disk index unchanged; if it
         // existed before the stall it is still searchable, so treat
         // `stalled` like the indexer just hadn't gotten there yet.
-        !exists || contract_mismatch
+        !exists || contract_mismatch || engine_incompatible
     } else {
         exists
-            && (age_stale
+            && (engine_incompatible
+                || age_stale
                 || checkpoint_db_mismatch
                 || checkpoint_incomplete
                 || contract_mismatch
@@ -1464,6 +1485,8 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         "building"
     } else if !exists {
         "missing"
+    } else if engine_incompatible {
+        "legacy_engine"
     } else if stale {
         "stale"
     } else {
@@ -1478,6 +1501,8 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         Some("lexical rebuild is in progress".to_string())
     } else if !exists {
         Some("lexical index metadata missing".to_string())
+    } else if engine_incompatible {
+        Some(LEGACY_ENGINE_STATUS_REASON.to_string())
     } else if checkpoint_db_mismatch {
         Some("lexical rebuild checkpoint points at a different database".to_string())
     } else if contract_mismatch {
@@ -1524,6 +1549,7 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
     LexicalAssetState {
         status,
         exists,
+        engine_incompatible,
         fresh,
         stale,
         rebuilding,
@@ -2431,15 +2457,51 @@ mod tests {
         }
     }
 
+    /// b4uax (gh#382): a Tantivy-era `meta.json` without a Quill MANIFEST is
+    /// an existing-but-unreadable generation: not fresh, not "ready", and the
+    /// reason names the exact rebuild command.
+    #[test]
+    fn legacy_tantivy_generation_reports_engine_incompatible() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v9-quill");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write legacy meta.json");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db file");
+
+        let state = lexical_state_from_observations(LexicalObservationInput {
+            index_path: &index_path,
+            db_path: &db_path,
+            stale_threshold: 3600,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_ms: 1_733_000_001_000,
+            maintenance: SearchMaintenanceSnapshot::default(),
+            checkpoint: None,
+            current_db_fingerprint: None,
+        });
+        assert!(state.exists, "a legacy generation still counts as existing");
+        assert!(state.engine_incompatible);
+        assert!(!state.fresh);
+        assert!(state.stale);
+        assert_eq!(state.status, "legacy_engine");
+        let reason = state.status_reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("cass index --full"));
+        assert!(reason.contains("Tantivy"));
+    }
+
     #[test]
     fn lexical_state_marks_fingerprint_mismatch_stale() {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        // Simulate an existing tantivy index (meta.json present) so the
+        // Simulate an existing Quill generation (MANIFEST present) so the
         // "missing" branch in lexical_state_from_observations doesn't short
         // circuit before the fingerprint check we want to exercise.
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
 
@@ -2490,7 +2552,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
         let db_path = temp.path().join("agent_search.db");
         let other_db_path = temp.path().join("other_agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
@@ -2572,7 +2638,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
 
@@ -2633,7 +2703,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
 
@@ -2732,7 +2806,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
         let other_db_path = temp.path().join("other.db");
@@ -2798,7 +2876,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
         let other_db_path = temp.path().join("other.db");
@@ -2847,7 +2929,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
 
@@ -2919,7 +3005,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
 
@@ -2965,7 +3055,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
 
@@ -3019,7 +3113,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
         let db_path = temp.path().join("agent_search.db");
         std::fs::write(&db_path, b"db").expect("write db file");
 
@@ -3112,7 +3210,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
 
         let db_path = temp.path().join("agent_search.db");
         std::fs::create_dir_all(&db_path).expect("create unopenable db path");
@@ -3148,7 +3250,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
 
         let db_path = temp.path().join("agent_search.db");
         std::fs::create_dir_all(&db_path).expect("create unopenable db path");
@@ -3183,7 +3289,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_path = temp.path().join("index").join("v4");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
 
         let db_path = temp.path().join("agent_search.db");
         std::fs::create_dir_all(&db_path).expect("create unopenable db path");

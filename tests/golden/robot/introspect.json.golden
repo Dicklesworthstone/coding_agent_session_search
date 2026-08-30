@@ -5543,6 +5543,9 @@
             "stale_threshold_seconds": {
               "type": "integer"
             },
+            "engine_incompatible": {
+              "type": "boolean"
+            },
             "rebuilding": {
               "type": "boolean"
             },
@@ -29263,6 +29266,9 @@
                 "stale_threshold_seconds": {
                   "type": "integer"
                 },
+                "engine_incompatible": {
+                  "type": "boolean"
+                },
                 "rebuilding": {
                   "type": "boolean"
                 },
@@ -31684,6 +31690,9 @@
                     "stale_threshold_seconds": {
                       "type": "integer"
                     },
+                    "engine_incompatible": {
+                      "type": "boolean"
+                    },
                     "rebuilding": {
                       "type": "boolean"
                     },
@@ -32432,6 +32441,9 @@
                 "stale_threshold_seconds": {
                   "type": "integer"
                 },
+                "engine_incompatible": {
+                  "type": "boolean"
+                },
                 "rebuilding": {
                   "type": "boolean"
                 },
@@ -32874,6 +32886,9 @@
             },
             "stale_threshold_seconds": {
               "type": "integer"
+            },
+            "engine_incompatible": {
+              "type": "boolean"
             },
             "rebuilding": {
               "type": "boolean"
@@ -34934,6 +34949,9 @@
             "stale_threshold_seconds": {
               "type": "integer"
             },
+            "engine_incompatible": {
+              "type": "boolean"
+            },
             "rebuilding": {
               "type": "boolean"
             },
@@ -36971,6 +36989,9 @@
                 },
                 "stale_threshold_seconds": {
                   "type": "integer"
+                },
+                "engine_incompatible": {
+                  "type": "boolean"
                 },
                 "rebuilding": {
                   "type": "boolean"

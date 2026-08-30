@@ -375,6 +375,7 @@
       "stale_threshold_seconds": 1800,
       "rebuilding": false,
       "stalled": false,
+      "engine_incompatible": false,
       "activity_at": null,
       "documents": null,
       "empty_with_messages": false,
@@ -414,6 +415,7 @@
     "rebuild": {
       "active": false,
       "stalled": false,
+      "engine_incompatible": false,
       "last_progress_at": null,
       "last_progress_age_ms": null,
       "orphaned": false,

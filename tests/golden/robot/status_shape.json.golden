@@ -64,6 +64,9 @@
         "stalled": {
           "type": "boolean"
         },
+        "engine_incompatible": {
+          "type": "boolean"
+        },
         "activity_at": {
           "type": "null"
         },
@@ -177,6 +180,9 @@
           "type": "boolean"
         },
         "stalled": {
+          "type": "boolean"
+        },
+        "engine_incompatible": {
           "type": "boolean"
         },
         "last_progress_at": {

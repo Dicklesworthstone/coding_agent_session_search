@@ -4195,6 +4195,14 @@
                             }
                           }
                         },
+                        "engine_incompatible": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
                         "rebuilding": {
                           "type": "object",
                           "properties": {
@@ -54663,6 +54671,14 @@
                                     }
                                   }
                                 },
+                                "engine_incompatible": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
                                 "rebuilding": {
                                   "type": "object",
                                   "properties": {
@@ -60232,6 +60248,14 @@
                                             }
                                           }
                                         },
+                                        "engine_incompatible": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
                                         "rebuilding": {
                                           "type": "object",
                                           "properties": {
@@ -61834,6 +61858,14 @@
                                     }
                                   }
                                 },
+                                "engine_incompatible": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
                                 "rebuilding": {
                                   "type": "object",
                                   "properties": {
@@ -62797,6 +62829,14 @@
                           }
                         },
                         "stale_threshold_seconds": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "engine_incompatible": {
                           "type": "object",
                           "properties": {
                             "type": {
@@ -67242,6 +67282,14 @@
                             }
                           }
                         },
+                        "engine_incompatible": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
                         "rebuilding": {
                           "type": "object",
                           "properties": {
@@ -71597,6 +71645,14 @@
                                   }
                                 },
                                 "stale_threshold_seconds": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "engine_incompatible": {
                                   "type": "object",
                                   "properties": {
                                     "type": {

@@ -392,6 +392,7 @@ schemas: (auto-generated from contract)
         - schema_matches: ?
       - documents: ?
       - empty_with_messages: boolean
+      - engine_incompatible: boolean
       - exists: boolean
       - fingerprint: object
         - checkpoint_fingerprint: ?
@@ -2987,6 +2988,7 @@ schemas: (auto-generated from contract)
         - checkpoint: object
         - documents: ?
         - empty_with_messages: boolean
+        - engine_incompatible: boolean
         - exists: boolean
         - fingerprint: object
         - fresh: boolean
@@ -3227,6 +3229,7 @@ schemas: (auto-generated from contract)
       - index_freshness: object
         - age_seconds: ?
         - auto_refresh: ?
+        - engine_incompatible: boolean
         - exists: boolean
         - fresh: boolean
         - last_indexed_at: ?
@@ -3462,6 +3465,7 @@ schemas: (auto-generated from contract)
         - schema_matches: ?
       - documents: ?
       - empty_with_messages: boolean
+      - engine_incompatible: boolean
       - exists: boolean
       - fingerprint: object
         - checkpoint_fingerprint: ?
@@ -3847,6 +3851,7 @@ schemas: (auto-generated from contract)
         - schema_matches: ?
       - documents: ?
       - empty_with_messages: boolean
+      - engine_incompatible: boolean
       - exists: boolean
       - fingerprint: object
         - checkpoint_fingerprint: ?
@@ -4108,6 +4113,7 @@ schemas: (auto-generated from contract)
         - checkpoint: object
         - documents: ?
         - empty_with_messages: boolean
+        - engine_incompatible: boolean
         - exists: boolean
         - fingerprint: object
         - fresh: boolean

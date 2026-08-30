@@ -20721,6 +20721,7 @@ fn state_meta_json_inner(
             lexical: crate::search::asset_state::LexicalAssetState {
                 status: "error",
                 exists: lexical_index_initialized,
+                engine_incompatible: false,
                 fresh: false,
                 stale: true,
                 rebuilding: index_run
@@ -21026,6 +21027,8 @@ fn state_meta_json_inner(
             "stale_threshold_seconds": stale_threshold,
             "rebuilding": lexical.rebuilding,
             "stalled": lexical.stalled,
+            // b4uax: legacy Tantivy generation the current engine cannot read.
+            "engine_incompatible": lexical.engine_incompatible,
             "activity_at": lexical.activity_at_ms.map(|ts| {
                 chrono::DateTime::from_timestamp_millis(ts)
                     .unwrap_or_else(chrono::Utc::now)
@@ -21076,6 +21079,8 @@ fn state_meta_json_inner(
             // can tell a slow-but-progressing rebuild apart from a
             // wedged one. Regression #258.
             "stalled": lexical.stalled,
+            // b4uax: legacy Tantivy generation the current engine cannot read.
+            "engine_incompatible": lexical.engine_incompatible,
             "last_progress_at": lexical.last_progress_at_ms.and_then(|ts| {
                 chrono::DateTime::from_timestamp_millis(ts).map(|dt| dt.to_rfc3339())
             }),
@@ -21316,6 +21321,8 @@ fn state_index_freshness(state: &serde_json::Value) -> Option<serde_json::Value>
         "age_seconds": index.get("age_seconds"),
         "stale": index.get("stale"),
         "stale_threshold_seconds": index.get("stale_threshold_seconds"),
+        // b4uax: legacy Tantivy generation the current engine cannot read.
+        "engine_incompatible": index.get("engine_incompatible"),
         "rebuilding": index.get("rebuilding"),
         // [coding_agent_session_search #301] propagate the incomplete-index
         // markers so `cass search --robot-meta` can warn that the index is
@@ -21644,6 +21651,17 @@ fn lexical_readiness_from_state(
     if status == "error" {
         return LexicalReadinessState::CorruptQuarantined;
     }
+    // b4uax (gh#382): a legacy Tantivy generation exists on disk but no
+    // reader can open it. Search is unavailable until the rebuild runs, so it
+    // is the Missing class (repair now), never "stale but searchable".
+    if status == "legacy_engine"
+        || index
+            .and_then(|idx| idx.get("engine_incompatible"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+    {
+        return LexicalReadinessState::Missing;
+    }
     if status == "stale"
         || index
             .and_then(|idx| idx.get("fresh"))
@@ -21838,6 +21856,13 @@ fn readiness_recommended_commands(
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
 
+    // b4uax: legacy Tantivy generation — the only fix is a full rebuild.
+    let index_engine_incompatible = state
+        .get("index")
+        .and_then(|index| index.get("engine_incompatible"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
     let mut commands = Vec::new();
     if rebuild_active {
         commands.push(readiness_command_recommendation(
@@ -21892,6 +21917,41 @@ fn readiness_recommended_commands(
                     "errors",
                     "recommended_commands",
                 ],
+                retry_after_ms: None,
+            },
+        ));
+        return commands;
+    }
+
+    if index_engine_incompatible && !not_initialized && db_exists {
+        // Deterministic, known fix: no doctor inspection needed first, and an
+        // incremental `cass index` cannot help (it would refresh an index the
+        // engine cannot open).
+        commands.push(readiness_command_recommendation(
+            ReadinessCommandRecommendation {
+                id: "rebuild-lexical-index-for-current-engine",
+                command: cass_dataset_command(
+                    data_dir,
+                    db_path,
+                    &["index", "--full", "--json", "--no-progress-events"],
+                ),
+                purpose: "Rebuild the lexical index for the current search engine; the existing generation was written by the legacy Tantivy engine and cannot be read.",
+                safety: "writes-derived-index",
+                run_when: "Run once after upgrading past the Tantivy->Quill engine flip; expect a full rebuild whose cost scales with message count.",
+                success_signal: "success=true, then status reports index.status=ready and index.engine_incompatible=false",
+                parse_fields: &["success", "indexing_stats", "error"],
+                retry_after_ms: None,
+            },
+        ));
+        commands.push(readiness_command_recommendation(
+            ReadinessCommandRecommendation {
+                id: "verify-lexical-index",
+                command: cass_dataset_command(data_dir, db_path, &["status", "--json"]),
+                purpose: "Verify lexical readiness after the engine-flip rebuild.",
+                safety: "read-only",
+                run_when: "Run after rebuild-lexical-index-for-current-engine finishes.",
+                success_signal: "healthy=true or status changes to the next blocker",
+                parse_fields: &["status", "healthy", "index", "recommended_commands"],
                 retry_after_ms: None,
             },
         ));
@@ -79099,6 +79159,13 @@ fn run_status(
         .and_then(|i| i.get("exists"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // b4uax: legacy Tantivy generation — exists, but unreadable by the
+    // current engine; the only fix is a full rebuild, not a refresh.
+    let index_engine_incompatible = state
+        .get("index")
+        .and_then(|i| i.get("engine_incompatible"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let index_fresh = state
         .get("index")
         .and_then(|i| i.get("fresh"))
@@ -79309,6 +79376,11 @@ fn run_status(
         Some("Run 'cass doctor check --json' before any repair; indexing will not replace an unreadable canonical database".to_string())
     } else if !index_exists {
         Some("Run 'cass index --full' to rebuild the search index".to_string())
+    } else if index_engine_incompatible {
+        Some(
+            "Run 'cass index --full' to rebuild the search index for the current engine (a legacy Tantivy generation was found; one-time full lexical rebuild, cost scales with message count — `--force-rebuild` skips the filesystem rescan)"
+                .to_string(),
+        )
     } else if index_empty_with_messages {
         Some("Run 'cass index --full' to populate the empty search index".to_string())
     } else if ingest_quarantine_critical {
@@ -79694,6 +79766,13 @@ fn run_triage(
         .and_then(|index| index.get("exists"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    // b4uax: legacy Tantivy generation — exists, but unreadable by the
+    // current engine; the only fix is a full rebuild, not a refresh.
+    let index_engine_incompatible = state
+        .get("index")
+        .and_then(|index| index.get("engine_incompatible"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let index_fresh = state
         .get("index")
         .and_then(|index| index.get("fresh"))
@@ -79802,6 +79881,11 @@ fn run_triage(
         Some("Run 'cass doctor check --json' before any repair; indexing will not replace an unreadable canonical database".to_string())
     } else if !index_exists {
         Some("Run 'cass index --full' to rebuild the search index".to_string())
+    } else if index_engine_incompatible {
+        Some(
+            "Run 'cass index --full' to rebuild the search index for the current engine (a legacy Tantivy generation was found; one-time full lexical rebuild, cost scales with message count — `--force-rebuild` skips the filesystem rescan)"
+                .to_string(),
+        )
     } else if index_empty_with_messages {
         Some("Run 'cass index --full' to populate the empty search index".to_string())
     } else if is_stale || pending_sessions > 0 {
@@ -80234,6 +80318,13 @@ fn run_health(
         .and_then(|i| i.get("exists"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // b4uax: legacy Tantivy generation — exists, but unreadable by the
+    // current engine; the only fix is a full rebuild, not a refresh.
+    let index_engine_incompatible = state
+        .get("index")
+        .and_then(|i| i.get("engine_incompatible"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let index_fresh = state
         .get("index")
         .and_then(|i| i.get("fresh"))
@@ -80335,6 +80426,10 @@ fn run_health(
         Some(cass_not_initialized_recommended_action())
     } else if db_degraded {
         Some("Run 'cass doctor check --json' before any repair; indexing will not replace an unreadable canonical database.".to_string())
+    } else if index_engine_incompatible {
+        // b4uax: mirror run_status — a legacy Tantivy generation needs the
+        // one-time full rebuild, and an incremental refresh cannot help.
+        Some("Run 'cass index --full' to rebuild the search index for the current engine (a legacy Tantivy generation was found; one-time full lexical rebuild, cost scales with message count).".to_string())
     } else if ingest_quarantine_critical || (healthy && quarantined_conversations > 0) {
         ingest_quarantine_recommended_action
     } else if !healthy {
@@ -90280,6 +90375,7 @@ fn response_schema_index_state() -> serde_json::Value {
             "age_seconds": { "type": ["integer", "null"] },
             "stale": { "type": "boolean" },
             "stale_threshold_seconds": { "type": "integer" },
+            "engine_incompatible": { "type": "boolean" },
             "rebuilding": { "type": "boolean" },
             "stalled": { "type": "boolean" },
             "activity_at": { "type": ["string", "null"] },
@@ -90771,6 +90867,7 @@ fn response_schema_index_freshness() -> serde_json::Value {
             "age_seconds": { "type": ["integer", "null"] },
             "stale": { "type": "boolean" },
             "stale_threshold_seconds": { "type": "integer" },
+            "engine_incompatible": { "type": "boolean" },
             "rebuilding": { "type": "boolean" },
             "pending_sessions": { "type": "integer" },
             "auto_refresh": {

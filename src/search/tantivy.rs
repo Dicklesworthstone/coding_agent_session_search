@@ -484,7 +484,7 @@ struct FederatedSearchShardManifest {
     meta_fingerprint: String,
 }
 
-fn federated_search_manifest_path(index_path: &Path) -> PathBuf {
+pub(crate) fn federated_search_manifest_path(index_path: &Path) -> PathBuf {
     index_path.join(FEDERATED_SEARCH_MANIFEST_FILE)
 }
 
