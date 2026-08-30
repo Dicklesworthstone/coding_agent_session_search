@@ -225,7 +225,9 @@ fn seed_semantic_progress_fixture(
 
     let index_path = index_dir(data_dir).expect("index dir");
     fs::create_dir_all(&index_path).expect("create index dir");
-    fs::write(index_path.join("meta.json"), b"{}").expect("write index meta");
+    // An existing, usable Quill generation (a bare Tantivy `meta.json` is now
+    // reported as legacy_engine, bead b4uax).
+    fs::write(index_path.join("MANIFEST"), b"{}").expect("write index manifest");
 
     let mut manifest = SemanticManifest::default();
     if fast_tier_ready {

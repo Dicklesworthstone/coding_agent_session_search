@@ -974,6 +974,18 @@ pub(crate) fn open_franken_owner_readonly_connection_with_timeout(
     open_franken_async_readonly_connection_with_timeout(path, timeout).map(FrankenOwnerConnection)
 }
 
+/// Dedicated-owner facade over the strict (mutation-free) readonly opener:
+/// no doctor-lock creation, no schema-row dedupe, no dirty-WAL checkpoint.
+/// Readiness reads (`cass status`, k2k20) use this so a truth surface never
+/// changes the archive it is describing.
+pub(crate) fn open_franken_owner_strict_readonly_connection_with_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> Result<FrankenOwnerConnection> {
+    open_franken_async_strict_readonly_connection_with_timeout(path, timeout)
+        .map(FrankenOwnerConnection)
+}
+
 pub(crate) fn retryable_franken_error(err: &crate::franken_sync::FrankenError) -> bool {
     matches!(
         err,

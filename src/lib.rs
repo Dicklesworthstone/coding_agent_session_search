@@ -19454,6 +19454,11 @@ mod chatgpt_import_scan_root_tests {
 
 /// Compute lightweight state snapshot (index/db freshness) for robot meta and state command reuse
 const STATE_DB_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+/// k2k20: one end-to-end wall-clock ceiling for the status-class state probe
+/// (strict open + watermark reads + bounded integrity probe + row counts).
+/// fsqlite's open and even single-row lookups can hydrate a large part of a
+/// multi-GB archive, so a busy timeout alone never bounded `cass status`.
+const STATE_DB_PROBE_HARD_TIMEOUT: Duration = Duration::from_secs(30);
 const STATUS_COUNT_SCAN_MAX_DB_BYTES: u64 = 256 * 1024 * 1024;
 const CLI_DB_QUERY_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
 const CLI_DIAG_DB_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -19529,11 +19534,13 @@ fn corruption_class_franken_error(err: &crate::franken_sync::FrankenError) -> bo
 /// empty), `(Some(Corrupt), Some(detail))` on a corruption-class error, and
 /// `(None, None)` when a transient error prevents classification — never a
 /// false-positive `Corrupt` from a busy archive.
+///
+/// `run_probe` executes one probe statement and reads its first column, so
+/// the classification is shared by the ordinary-connection lane and the
+/// dedicated-owner strict lane (`probe_state_db_strict_bounded`).
 fn probe_state_db_integrity(
-    conn: &crate::franken_sync::Connection,
+    run_probe: impl Fn(&str) -> Result<(), crate::franken_sync::FrankenError>,
 ) -> (Option<StateDbIntegrity>, Option<String>) {
-    use crate::franken_sync::compat::RowExt;
-    use crate::franken_sync::params;
     const PROBES: [&str; 4] = [
         "SELECT id, title, source_path FROM conversations ORDER BY id LIMIT 1",
         "SELECT id, title, source_path FROM conversations ORDER BY id DESC LIMIT 1",
@@ -19541,9 +19548,7 @@ fn probe_state_db_integrity(
         "SELECT id, conversation_id, role FROM messages ORDER BY id DESC LIMIT 1",
     ];
     for sql in PROBES {
-        match franken_query_row_map_retry(conn, sql, params![], |row| {
-            row.get_typed::<i64>(0).map(|_| ())
-        }) {
+        match run_probe(sql) {
             Ok(()) => {}
             Err(crate::franken_sync::FrankenError::QueryReturnedNoRows) => {}
             Err(err) if corruption_class_franken_error(&err) => {
@@ -19657,7 +19662,12 @@ pub(crate) fn bounded_canonical_db_corruption_probe(
 
     match open_franken_cli_read_db(db_path.to_path_buf(), reason, STATE_DB_OPEN_TIMEOUT) {
         Ok(conn) => {
-            let (integrity, detail) = probe_state_db_integrity(&conn);
+            let (integrity, detail) = probe_state_db_integrity(|sql| {
+                use crate::franken_sync::compat::RowExt;
+                franken_query_row_map_retry(&conn, sql, &[], |row| {
+                    row.get_typed::<i64>(0).map(|_| ())
+                })
+            });
             let _ = close_franken_cli_read_db(conn, db_path, reason);
             match integrity {
                 Some(StateDbIntegrity::Corrupt) => {
@@ -19675,6 +19685,233 @@ pub(crate) fn bounded_canonical_db_corruption_probe(
         }
         Err(_) => None,
     }
+}
+
+/// Dedicated-owner twin of [`franken_query_row_map_retry`]: bounded retry on
+/// engine contention only, never replaying a query whose row-mapping
+/// callback failed (negs9).
+fn owner_query_row_map_retry<T, F>(
+    conn: &crate::storage::sqlite::FrankenOwnerConnection,
+    sql: &str,
+    map: F,
+) -> Result<T, crate::franken_sync::FrankenError>
+where
+    F: Copy + Fn(&crate::franken_sync::Row) -> Result<T, crate::franken_sync::FrankenError>,
+{
+    let deadline = std::time::Instant::now() + CLI_DB_QUERY_RETRY_TIMEOUT;
+    let mut backoff = Duration::from_millis(4);
+    let callback_failed = std::cell::Cell::new(false);
+    loop {
+        callback_failed.set(false);
+        let mapped = conn.query_row_map(sql, &[], |row| {
+            map(row).inspect_err(|_| callback_failed.set(true))
+        });
+        match mapped {
+            Ok(value) => return Ok(value),
+            Err(err) if callback_failed.get() => return Err(err),
+            Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(err);
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                crate::storage::sqlite::sleep_with_franken_retry_backoff(
+                    &mut backoff,
+                    remaining,
+                    Duration::from_millis(64),
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Size of a non-empty (frames present) `-wal` sidecar next to `db_path`, or
+/// `None` when there is nothing to recover. Mirrors the shape test the
+/// ordinary opener's dirty-WAL recovery uses, without performing it.
+fn unpublished_wal_sidecar_bytes(db_path: &Path) -> Option<u64> {
+    let wal_path = doctor_sqlite_sidecar_path(db_path, "-wal")?;
+    let meta = std::fs::symlink_metadata(wal_path).ok()?;
+    (meta.file_type().is_file() && meta.len() > 32).then_some(meta.len())
+}
+
+/// Message for a strict readonly open failure on the status lane. A hard
+/// failure next to an unpublished WAL sidecar is the unclean-shutdown shape
+/// the ordinary opener would silently checkpoint; a readiness read reports
+/// it and names the command that performs the recovery write instead.
+fn state_db_strict_open_error_message(
+    db_path: &Path,
+    reason: &str,
+    err: &anyhow::Error,
+    retryable: bool,
+) -> String {
+    let base = format!(
+        "Failed to open {reason} database at {}: strict readonly open failed ({err:#})",
+        db_path.display()
+    );
+    if retryable {
+        return base;
+    }
+    match unpublished_wal_sidecar_bytes(db_path) {
+        Some(wal_bytes) => format!(
+            "{base}; an unpublished {wal_bytes}-byte WAL sidecar from an unclean shutdown is present and this read-only probe never modifies the archive, so it was not recovered here — run 'cass index' (or 'cass doctor') to checkpoint it"
+        ),
+        None => base,
+    }
+}
+
+/// k2k20 ask #2: the status-class state probe (every non-watermark caller of
+/// [`probe_state_db_modes`]) — a readiness READ that must neither modify the
+/// archive nor block for minutes on it.
+///
+/// - Mutation-free: the strict opener never creates the doctor lock
+///   hierarchy, deduplicates schema rows, or checkpoints a dirty WAL. An
+///   archive that needs a recovery write is reported with the command that
+///   performs it (`state_db_strict_open_error_message`).
+/// - Bounded: open + watermarks + integrity probe + counts run on a dedicated
+///   owner thread; overrunning [`STATE_DB_PROBE_HARD_TIMEOUT`] abandons the
+///   worker and reports a retryable open failure naming the last phase, so
+///   `cass status` answers instead of sitting silent (GH #413 showed fsqlite
+///   can hydrate gigabytes even for an ORDER BY … LIMIT 1 edge lookup).
+/// - The real-column integrity probe honors the same physical bundle
+///   ceiling as [`bounded_canonical_db_corruption_probe`]; above it the
+///   integrity stays `unknown` rather than paying an archive-sized read.
+fn probe_state_db_strict_bounded(
+    db_path: &Path,
+    reason: &str,
+    busy_timeout: Duration,
+    include_counts: bool,
+) -> StateDbSnapshot {
+    let display_path = db_path.display().to_string();
+    if let Some(err) = sqlite_header_preflight_error(db_path, &display_path, reason) {
+        // A truncated or non-SQLite header is a durable fault, never a
+        // "temporarily busy" one, whatever the CLI error class says.
+        return StateDbSnapshot {
+            counts_skipped: !include_counts,
+            open_error: Some(err.message),
+            open_retryable: false,
+            ..StateDbSnapshot::default()
+        };
+    }
+    let integrity_probe_allowed =
+        doctor_archive_bundle_bytes(db_path) <= STATUS_COUNT_SCAN_MAX_DB_BYTES;
+    let phase = std::sync::Arc::new(std::sync::Mutex::new("open"));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker_phase = std::sync::Arc::clone(&phase);
+    let worker_path = db_path.to_path_buf();
+    let worker_reason = reason.to_string();
+    let _probe_worker = std::thread::spawn(move || {
+        let snapshot = probe_state_db_strict_worker(
+            &worker_path,
+            &worker_reason,
+            busy_timeout,
+            include_counts,
+            integrity_probe_allowed,
+            &worker_phase,
+        );
+        let _ = tx.send(snapshot);
+    });
+    match rx.recv_timeout(STATE_DB_PROBE_HARD_TIMEOUT) {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            let last_phase = phase.lock().map(|current| *current).unwrap_or("unknown");
+            StateDbSnapshot {
+                counts_skipped: true,
+                open_error: Some(format!(
+                    "state probe of {reason} database at {display_path} exceeded {}s (last phase: {last_phase}); the archive is very large or busy and this read-only probe did not modify it — run 'cass doctor check --json' for a bounded diagnosis",
+                    STATE_DB_PROBE_HARD_TIMEOUT.as_secs()
+                )),
+                open_retryable: true,
+                ..StateDbSnapshot::default()
+            }
+        }
+    }
+}
+
+fn probe_state_db_strict_worker(
+    db_path: &Path,
+    reason: &str,
+    busy_timeout: Duration,
+    include_counts: bool,
+    integrity_probe_allowed: bool,
+    phase: &std::sync::Mutex<&'static str>,
+) -> StateDbSnapshot {
+    use crate::franken_sync::compat::RowExt;
+
+    let set_phase = |value: &'static str| {
+        if let Ok(mut current) = phase.lock() {
+            *current = value;
+        }
+    };
+    let mut snapshot = StateDbSnapshot {
+        counts_skipped: !include_counts,
+        ..StateDbSnapshot::default()
+    };
+    let conn =
+        match crate::storage::sqlite::open_franken_owner_strict_readonly_connection_with_timeout(
+            db_path,
+            busy_timeout,
+        ) {
+            Ok(conn) => conn,
+            Err(err) => {
+                let retryable = crate::storage::sqlite::retryable_franken_anyhow(&err);
+                snapshot.open_error = Some(state_db_strict_open_error_message(
+                    db_path, reason, &err, retryable,
+                ));
+                snapshot.open_retryable = retryable;
+                return snapshot;
+            }
+        };
+    let busy_ms = busy_timeout.as_millis().clamp(1, u128::from(u32::MAX));
+    let _ = conn.execute(&format!("PRAGMA busy_timeout = {busy_ms};"));
+    let _ = conn.execute("PRAGMA query_only = 1;");
+    snapshot.opened = true;
+
+    set_phase("meta_watermarks");
+    let meta_value = |key: &str| {
+        owner_query_row_map_retry(
+            &conn,
+            &format!("SELECT value FROM meta WHERE key = '{key}'"),
+            |row| row.get_typed::<String>(0),
+        )
+        .ok()
+    };
+    snapshot.last_indexed_at = meta_value("last_indexed_at").and_then(|s| s.parse::<i64>().ok());
+    snapshot.last_scan_ts = meta_value("last_scan_ts").and_then(|s| s.parse::<i64>().ok());
+    snapshot.fallback_repair_pending =
+        meta_value("fts_fallback_repair_pending").filter(|detail| !detail.is_empty());
+    snapshot.lexical_repair_deferred_runs = meta_value("lexical_repair_deferred_consecutive_runs")
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|runs| *runs > 0);
+    snapshot.lexical_repair_deferred_reason =
+        meta_value("lexical_repair_deferred_reason").filter(|detail| !detail.is_empty());
+
+    // i6upe: real-column corruption probe on the status surface, gated by the
+    // physical bundle ceiling (GH #413) — the exact configuration in which
+    // corruption previously had NO fast signal is still covered below it.
+    if integrity_probe_allowed {
+        set_phase("integrity_probe");
+        let (integrity, integrity_detail) = probe_state_db_integrity(|sql| {
+            owner_query_row_map_retry(&conn, sql, |row| row.get_typed::<i64>(0).map(|_| ()))
+        });
+        snapshot.integrity = integrity;
+        snapshot.integrity_detail = integrity_detail;
+    }
+    if include_counts {
+        set_phase("row_count_conversations");
+        snapshot.conversation_count =
+            owner_query_row_map_retry(&conn, "SELECT COUNT(*) FROM conversations", |r| {
+                r.get_typed(0)
+            })
+            .unwrap_or(0);
+        set_phase("row_count_messages");
+        snapshot.message_count =
+            owner_query_row_map_retry(&conn, "SELECT COUNT(*) FROM messages", |r| r.get_typed(0))
+                .unwrap_or(0);
+    }
+    set_phase("connection_close");
+    let _ = close_franken_cli_owner_read_db(conn, db_path, reason);
+    snapshot
 }
 
 fn probe_state_db(
@@ -19712,6 +19949,13 @@ fn probe_state_db_modes(
 ) -> StateDbSnapshot {
     if !db_path.exists() {
         return StateDbSnapshot::default();
+    }
+    // k2k20 ask #2: every non-watermark caller (status / diag / index --json /
+    // the count refresh) is a readiness READ. It opens strictly read-only on
+    // a dedicated owner thread under one hard deadline; the health
+    // watermark lane below keeps its own fast contract.
+    if !watermarks_only {
+        return probe_state_db_strict_bounded(db_path, reason, timeout, include_counts);
     }
 
     let mut snapshot = StateDbSnapshot {
@@ -19796,50 +20040,6 @@ fn probe_state_db_modes(
     )
     .ok()
     .filter(|reason| !reason.is_empty());
-    // i6upe: bounded real-column integrity probe on the STATUS surface only.
-    // The watermarks-only health path keeps its <50ms d0rmo/gi4oy contract
-    // untouched. Runs even when counts are skipped for big archives — the
-    // exact configuration in which corruption previously had NO fast signal.
-    if !watermarks_only {
-        let (integrity, integrity_detail) = probe_state_db_integrity(&conn);
-        snapshot.integrity = integrity;
-        snapshot.integrity_detail = integrity_detail;
-    }
-    if include_counts && !watermarks_only {
-        snapshot.conversation_count = franken_query_row_map_retry(
-            &conn,
-            "SELECT COUNT(*) FROM conversations",
-            params![],
-            |r| r.get_typed(0),
-        )
-        .unwrap_or(0);
-        snapshot.message_count =
-            franken_query_row_map_retry(&conn, "SELECT COUNT(*) FROM messages", params![], |r| {
-                r.get_typed(0)
-            })
-            .unwrap_or(0);
-        if snapshot.conversation_count == 0 {
-            snapshot.conversation_count = fresh_franken_count_retry(
-                db_path,
-                reason,
-                timeout,
-                "SELECT COUNT(*) FROM conversations",
-                params![],
-            )
-            .unwrap_or(0);
-        }
-        if snapshot.message_count == 0 {
-            snapshot.message_count = fresh_franken_count_retry(
-                db_path,
-                reason,
-                timeout,
-                "SELECT COUNT(*) FROM messages",
-                params![],
-            )
-            .unwrap_or(0);
-        }
-    }
-
     if let Err(err) = close_franken_cli_read_db(conn, db_path, reason) {
         snapshot.open_error = Some(err.message);
     }
@@ -81458,6 +81658,56 @@ mod cli_read_db_tests {
         );
     }
 
+    /// k2k20 ask #2: the status-class probe opens strictly read-only on the
+    /// dedicated-owner lane, still reads watermarks, counts and the bounded
+    /// integrity probe, and leaves the archive bytes untouched.
+    #[test]
+    fn status_state_probe_counts_and_integrity_without_mutating_archive() {
+        let (_temp, db_path) = seed_cli_db();
+        let before = std::fs::read(&db_path).expect("read db before probe");
+        let snapshot = probe_state_db(&db_path, "status", STATE_DB_OPEN_TIMEOUT, true);
+
+        assert!(snapshot.opened, "strict probe should open the seeded archive");
+        assert!(!snapshot.open_skipped);
+        assert!(!snapshot.counts_skipped, "counts were requested");
+        // The seeded archive carries watermarks only; the counts are read
+        // (not skipped) and honestly zero.
+        assert_eq!(snapshot.conversation_count, 0);
+        assert_eq!(snapshot.message_count, 0);
+        assert_eq!(snapshot.last_indexed_at, Some(1_733_000_000_000));
+        assert_eq!(snapshot.integrity, Some(StateDbIntegrity::Ok));
+        assert!(
+            snapshot.open_error.is_none(),
+            "strict probe should not report an error: {:?}",
+            snapshot.open_error
+        );
+        assert_eq!(
+            std::fs::read(&db_path).expect("read db after probe"),
+            before,
+            "a readiness read must not modify the archive"
+        );
+    }
+
+    /// The strict lane never performs the ordinary opener's recovery writes;
+    /// a hard open failure next to an unpublished WAL sidecar names the
+    /// command that recovers it.
+    #[test]
+    fn strict_open_error_message_names_recovery_for_unpublished_wal() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db placeholder");
+        std::fs::write(temp.path().join("agent_search.db-wal"), vec![0_u8; 4096])
+            .expect("write wal placeholder");
+        let err = anyhow::anyhow!("unable to open database file");
+        let message = state_db_strict_open_error_message(&db_path, "status", &err, false);
+        assert!(message.contains("4096-byte WAL sidecar"), "{message}");
+        assert!(message.contains("cass index"), "{message}");
+
+        let busy = state_db_strict_open_error_message(&db_path, "status", &err, true);
+        assert!(!busy.contains("WAL sidecar"), "{busy}");
+        assert!(unpublished_wal_sidecar_bytes(temp.path().join("missing.db").as_path()).is_none());
+    }
+
     #[test]
     fn status_state_probes_large_regular_db_instead_of_trusting_index_mtime() {
         let temp = TempDir::new().expect("tempdir");
@@ -81978,7 +82228,11 @@ mod cli_read_db_tests {
         let (temp, db_path) = seed_cli_db();
         let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
         std::fs::write(
             index_path.join(".lexical-rebuild-state.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
@@ -82127,7 +82381,11 @@ mod cli_read_db_tests {
         let (temp, db_path) = seed_cli_db();
         let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
         std::fs::write(
             index_path.join(".lexical-rebuild-state.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
@@ -82186,7 +82444,11 @@ mod cli_read_db_tests {
         let (temp, db_path) = seed_cli_db();
         let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
         std::fs::write(
             index_path.join(".lexical-rebuild-state.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
@@ -82247,7 +82509,11 @@ mod cli_read_db_tests {
         let (temp, db_path) = seed_cli_db();
         let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
         std::fs::write(
             index_path.join(".lexical-rebuild-state.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
@@ -82314,7 +82580,11 @@ mod cli_read_db_tests {
         let db_path_variant = temp.path().join(".").join("agent_search.db");
         let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
 
         let lock_path = temp.path().join("index-run.lock");
         let mut lock_file = std::fs::OpenOptions::new()
@@ -82386,7 +82656,11 @@ mod cli_read_db_tests {
         let (temp, db_path) = seed_cli_db();
         let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
 
         let lock_path = temp.path().join("index-run.lock");
         let mut lock_file = std::fs::OpenOptions::new()
@@ -82444,7 +82718,11 @@ mod cli_read_db_tests {
         let (temp, db_path) = seed_cli_db();
         let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
 
         let lock_path = temp.path().join("index-run.lock");
         let mut lock_file = std::fs::OpenOptions::new()
@@ -82485,7 +82763,11 @@ mod cli_read_db_tests {
         let (temp, db_path) = seed_cli_db();
         let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
 
         let lock_path = temp.path().join("index-run.lock");
         let mut lock_file = std::fs::OpenOptions::new()
@@ -82521,7 +82803,11 @@ mod cli_read_db_tests {
         let (temp, db_path) = seed_cli_db();
         let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
 
         let lock_path = temp.path().join("index-run.lock");
         std::fs::write(
@@ -82565,7 +82851,11 @@ mod cli_read_db_tests {
         let (temp, db_path) = seed_cli_db();
         let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
         std::fs::create_dir_all(index_path.join(".lexical-rebuild-state.json"))
             .expect("create unreadable rebuild state path");
 
@@ -82614,7 +82904,11 @@ mod cli_read_db_tests {
         let (temp, db_path) = seed_cli_db();
         let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
         std::fs::write(
             temp.path().join("watch_state.json"),
             br#"{"amp":1700000000000}"#,
@@ -82631,7 +82925,11 @@ mod cli_read_db_tests {
         let (temp, db_path) = seed_cli_db();
         let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
         std::fs::write(
             index_path.join(".lexical-rebuild-state.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
@@ -82686,7 +82984,11 @@ mod cli_read_db_tests {
         let (temp, db_path) = seed_cli_db();
         let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
-        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
 
         let pointer_path =
             crate::search::semantic_manifest::SemanticCurrentPointerV1::path(temp.path());
