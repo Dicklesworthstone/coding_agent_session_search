@@ -83670,7 +83670,11 @@ mod doctor_probe_timeout_tests {
             (u64::MAX, 600),
         ];
         for (bytes, want) in table {
-            assert!(secs(bytes).cmp(&want).is_eq(), "{bytes} bytes -> {} s", secs(bytes));
+            assert!(
+                secs(bytes).cmp(&want).is_eq(),
+                "{bytes} bytes -> {} s",
+                secs(bytes)
+            );
         }
     }
 }
