@@ -1423,6 +1423,13 @@
           "default": "1800"
         },
         {
+          "name": "timeout",
+          "description": "Hard wall-clock budget in milliseconds (overrides CASS_TRIAGE_BUDGET_MS)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
           "name": "robot-format",
           "description": "Output format for robot mode (overrides --json when specified)",
           "arg_type": "option",
@@ -1677,6 +1684,13 @@
             "true",
             "false"
           ]
+        },
+        {
+          "name": "timeout",
+          "description": "Hard wall-clock budget in milliseconds (overrides CASS_VIEW_BUDGET_MS)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
         },
         {
           "name": "robot-format",
@@ -3397,6 +3411,46 @@
     {
       "name": "CASS_SEARCH_MODE",
       "description": "Default search/pack mode: lexical, semantic, or hybrid. The --mode flag overrides; also [search].mode in ~/.config/cass/cass.toml."
+    },
+    {
+      "name": "CASS_STATUS_BUDGET_MS",
+      "default": "8000",
+      "description": "Robot status execution budget in milliseconds. After expiry, optional or expensive sections are reported in budget.skipped_sections."
+    },
+    {
+      "name": "CASS_DOCTOR_BUDGET_MS",
+      "default": "8000",
+      "description": "Structured doctor reporting budget in milliseconds. Reports whose elapsed time exceeds it set budget.timed_out."
+    },
+    {
+      "name": "CASS_VIEW_BUDGET_MS",
+      "default": "10000",
+      "description": "Structured view read-only worker deadline in milliseconds. On expiry, view returns a partial budget envelope with an exact retry probe."
+    },
+    {
+      "name": "CASS_SEARCH_BUDGET_MS",
+      "default": "120000",
+      "description": "Fallback structured search worker budget in milliseconds when --timeout, CASS_SEARCH_TIMEOUT_MS, and [search].timeout_ms do not supply a positive effective timeout."
+    },
+    {
+      "name": "CASS_TRIAGE_BUDGET_MS",
+      "default": "8000",
+      "description": "Robot triage read-only probe budget in milliseconds. On expiry, incomplete readiness sections are reported in budget.skipped_sections."
+    },
+    {
+      "name": "CASS_PACK_BUDGET_MS",
+      "default": "10000",
+      "description": "Fallback structured pack execution budget in milliseconds when --timeout, CASS_SEARCH_TIMEOUT_MS, and [search].timeout_ms do not supply a positive effective timeout."
+    },
+    {
+      "name": "CASS_FLEET_PER_HOST_BUDGET_MS",
+      "default": "8000",
+      "description": "Maximum read-only probe budget per host, in milliseconds, for sources doctor and fleet upgrade rehearsal."
+    },
+    {
+      "name": "CASS_FLEET_BUDGET_MS",
+      "default": "60000",
+      "description": "Overall read-only probe budget, in milliseconds, for sources doctor and fleet upgrade rehearsal."
     },
     {
       "name": "TOON_DEFAULT_FORMAT",

@@ -203,6 +203,29 @@
         }
       }
     },
+    "budget": {
+      "type": "object",
+      "properties": {
+        "elapsed_ms": {
+          "type": "integer"
+        },
+        "budget_ms": {
+          "type": "integer"
+        },
+        "timed_out": {
+          "type": "boolean"
+        },
+        "skipped_sections": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "recommended_next_probe": {
+          "type": "null"
+        }
+      }
+    },
     "mutation_free": {
       "type": "boolean"
     },

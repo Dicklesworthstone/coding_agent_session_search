@@ -2062,14 +2062,22 @@ paths = ["~/.codex/sessions"]
     let wall_start = std::time::Instant::now();
     let mut robot_cmd = tracker.cass_std_command();
     robot_cmd
-        .args(["sources", "doctor", "--json"])
+        .args([
+            "sources",
+            "doctor",
+            "--json",
+            "--budget-ms",
+            "1",
+            "--per-host-budget-ms",
+            "20",
+        ])
         .current_dir(tmp.path())
         .env("HOME", tmp.path())
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("CASS_DATA_DIR", &data_dir)
         .env("CASS_TEST_SOURCES_DOCTOR_PROBE", &probe_path)
-        .env("CASS_FLEET_PER_HOST_BUDGET_MS", "20")
-        .env("CASS_FLEET_BUDGET_MS", "1")
+        .env("CASS_FLEET_PER_HOST_BUDGET_MS", "60000")
+        .env("CASS_FLEET_BUDGET_MS", "60000")
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         .env("NO_COLOR", "1");
     let robot_output = util::timeout::spawn_with_timeout_or_diag(
@@ -2165,14 +2173,21 @@ paths = ["~/.codex/sessions"]
     );
     let mut human_cmd = tracker.cass_std_command();
     human_cmd
-        .args(["sources", "doctor"])
+        .args([
+            "sources",
+            "doctor",
+            "--budget-ms",
+            "1",
+            "--per-host-budget-ms",
+            "20",
+        ])
         .current_dir(tmp.path())
         .env("HOME", tmp.path())
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("CASS_DATA_DIR", &data_dir)
         .env("CASS_TEST_SOURCES_DOCTOR_PROBE", &probe_path)
-        .env("CASS_FLEET_PER_HOST_BUDGET_MS", "20")
-        .env("CASS_FLEET_BUDGET_MS", "1")
+        .env("CASS_FLEET_PER_HOST_BUDGET_MS", "60000")
+        .env("CASS_FLEET_BUDGET_MS", "60000")
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         .env("NO_COLOR", "1");
     let human_output = util::timeout::spawn_with_timeout_or_diag(

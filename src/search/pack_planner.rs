@@ -759,6 +759,29 @@ pub fn pack_planner_budget(
     Ok(pack_planner_budget_unchecked(limits.max_tokens))
 }
 
+/// Build the fixed-size empty plan used after a bounded pack request exhausts
+/// its execution budget. This performs no candidate traversal or allocation
+/// proportional to `candidate_count`.
+pub fn budget_fallback_answer_pack(
+    limits: &PackPlannerLimits,
+    candidate_count: usize,
+) -> Result<PlannedAnswerPack, PackPlannerLimitError> {
+    limits.validate()?;
+    let diagnostics = PackPlannerDiagnostics {
+        candidate_fetch_limit: pack_candidate_fetch_limit(limits)?,
+        budget: pack_planner_budget_unchecked(limits.max_tokens),
+    };
+    Ok(PlannedAnswerPack {
+        candidate_count,
+        selected_evidence_count: 0,
+        selected_session_count: 0,
+        estimated_tokens: 0,
+        diagnostics,
+        evidence: Vec::new(),
+        omitted: Vec::new(),
+    })
+}
+
 fn pack_planner_budget_unchecked(max_tokens: usize) -> PackPlannerBudget {
     let metadata_tokens = percent_tokens(max_tokens, 15);
     let outline_tokens = percent_tokens(max_tokens, 15);
@@ -1399,6 +1422,44 @@ pub fn render_answer_pack_value(
         .map_err(|err| render_error(request, err))
 }
 
+/// Render without live commit/Bead/release correlation. This is the bounded
+/// fallback when advisory trust collection misses the robot deadline.
+pub fn render_answer_pack_without_trust_correlation(
+    plan: &PlannedAnswerPack,
+    request: &PackRenderRequest,
+) -> Result<String, PackRenderError> {
+    let correlation = crate::search::trust_correlation::CorrelationIndex::default();
+    let envelope = rendered_answer_pack_with_correlation(plan, request, &correlation);
+    match request.format {
+        PackRenderFormat::Json => {
+            serde_json::to_string_pretty(&envelope).map_err(|err| render_error(request, err))
+        }
+        PackRenderFormat::CompactJson => {
+            serde_json::to_string(&envelope).map_err(|err| render_error(request, err))
+        }
+        PackRenderFormat::Jsonl => render_answer_pack_jsonl(&envelope, request),
+        PackRenderFormat::Toon => {
+            let value =
+                serde_json::to_value(&envelope).map_err(|err| render_error(request, err))?;
+            Ok(toon::encode(value, Some(pack_toon_encode_options())))
+        }
+        PackRenderFormat::Markdown => Ok(render_answer_pack_markdown(&envelope)),
+    }
+}
+
+pub fn render_answer_pack_value_without_trust_correlation(
+    plan: &PlannedAnswerPack,
+    request: &PackRenderRequest,
+) -> Result<serde_json::Value, PackRenderError> {
+    let correlation = crate::search::trust_correlation::CorrelationIndex::default();
+    serde_json::to_value(rendered_answer_pack_with_correlation(
+        plan,
+        request,
+        &correlation,
+    ))
+    .map_err(|err| render_error(request, err))
+}
+
 fn render_error(error: &PackRenderRequest, err: serde_json::Error) -> PackRenderError {
     PackRenderError {
         format: error.format.label(),
@@ -1414,11 +1475,19 @@ fn rendered_answer_pack(
     // (fail-open empty index off-repo); its repo root anchors cwd-relative
     // workspace matching for each evidence item.
     let correlation = crate::search::trust_correlation::build_for_cwd();
+    rendered_answer_pack_with_correlation(plan, request, &correlation)
+}
+
+fn rendered_answer_pack_with_correlation(
+    plan: &PlannedAnswerPack,
+    request: &PackRenderRequest,
+    correlation: &crate::search::trust_correlation::CorrelationIndex,
+) -> RenderedAnswerPack {
     let query_workspace = correlation.project_workspace();
     let evidence = plan
         .evidence
         .iter()
-        .map(|item| rendered_evidence(item, request, &correlation, query_workspace.as_deref()))
+        .map(|item| rendered_evidence(item, request, correlation, query_workspace.as_deref()))
         .collect::<Vec<_>>();
     let mut envelope_redactions = Vec::new();
     let query_text = redact_pack_output_text(&request.query_text, &mut envelope_redactions);
@@ -3250,6 +3319,45 @@ mod tests {
         assert_eq!(plan.diagnostics.candidate_fetch_limit, 192);
         assert!(plan.evidence.is_empty());
         assert!(plan.omitted.is_empty());
+    }
+
+    #[test]
+    fn budget_fallback_preserves_candidate_count_with_normal_diagnostics() {
+        let limits = PackPlannerLimits {
+            max_tokens: 20_000,
+            max_sessions: 2,
+            max_evidence: 3,
+            context_lines: 5,
+            max_excerpt_chars: 800,
+        };
+        let normal_plan = plan_answer_pack(PackPlanRequest {
+            limits: limits.clone(),
+            ..PackPlanRequest::default()
+        })
+        .unwrap();
+        let fallback = budget_fallback_answer_pack(&limits, usize::MAX).unwrap();
+
+        assert_eq!(fallback.candidate_count, usize::MAX);
+        assert_eq!(fallback.selected_evidence_count, 0);
+        assert_eq!(fallback.selected_session_count, 0);
+        assert_eq!(fallback.estimated_tokens, 0);
+        assert_eq!(fallback.diagnostics, normal_plan.diagnostics);
+        assert!(fallback.evidence.is_empty());
+        assert!(fallback.omitted.is_empty());
+    }
+
+    #[test]
+    fn budget_fallback_rejects_invalid_limits() {
+        let limits = PackPlannerLimits {
+            max_tokens: 1_023,
+            ..PackPlannerLimits::default()
+        };
+        let error = budget_fallback_answer_pack(&limits, 17).unwrap_err();
+
+        assert_eq!(error.field, "max_tokens");
+        assert_eq!(error.value, 1_023);
+        assert_eq!(error.min, 1_024);
+        assert_eq!(error.max, 200_000);
     }
 
     #[test]

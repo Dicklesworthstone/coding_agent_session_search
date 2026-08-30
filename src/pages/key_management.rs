@@ -21,6 +21,7 @@ use crate::pages::encrypt::{
     decompress_archive_chunk, load_config, max_archive_ciphertext_chunk_size,
     validate_supported_payload_format,
 };
+use crate::pages::errors::DecryptError;
 use crate::pages::qr::RecoverySecret;
 use aes_gcm::{
     Aes256Gcm, Nonce,
@@ -1737,13 +1738,18 @@ pub fn key_rotate(
 
 /// Unwrap DEK using password (tries all password slots)
 fn unwrap_dek_with_password(config: &EncryptionConfig, password: &str) -> Result<[u8; 32]> {
+    if password.is_empty() {
+        return Err(DecryptError::EmptyPassword.into());
+    }
     validate_password_input(password)?;
     let export_id = BASE64_STANDARD.decode(&config.export_id)?;
+    let mut password_slot_found = false;
 
     for slot in &config.key_slots {
         if slot.slot_type != SlotType::Password {
             continue;
         }
+        password_slot_found = true;
 
         let salt = BASE64_STANDARD.decode(&slot.salt)?;
         let wrapped_dek = BASE64_STANDARD.decode(&slot.wrapped_dek)?;
@@ -1757,18 +1763,27 @@ fn unwrap_dek_with_password(config: &EncryptionConfig, password: &str) -> Result
         }
     }
 
-    bail!("Invalid password or no matching key slot")
+    if password_slot_found {
+        Err(DecryptError::AuthenticationFailed.into())
+    } else {
+        Err(DecryptError::NoMatchingKeySlot.into())
+    }
 }
 
 /// Unwrap DEK and return which slot was used
 fn unwrap_dek_with_slot_id(config: &EncryptionConfig, password: &str) -> Result<(u8, [u8; 32])> {
+    if password.is_empty() {
+        return Err(DecryptError::EmptyPassword.into());
+    }
     validate_password_input(password)?;
     let export_id = BASE64_STANDARD.decode(&config.export_id)?;
+    let mut password_slot_found = false;
 
     for slot in &config.key_slots {
         if slot.slot_type != SlotType::Password {
             continue;
         }
+        password_slot_found = true;
 
         let salt = BASE64_STANDARD.decode(&slot.salt)?;
         let wrapped_dek = BASE64_STANDARD.decode(&slot.wrapped_dek)?;
@@ -1782,7 +1797,11 @@ fn unwrap_dek_with_slot_id(config: &EncryptionConfig, password: &str) -> Result<
         }
     }
 
-    bail!("Invalid password or no matching key slot")
+    if password_slot_found {
+        Err(DecryptError::AuthenticationFailed.into())
+    } else {
+        Err(DecryptError::NoMatchingKeySlot.into())
+    }
 }
 
 /// Derive KEK from password using Argon2id
@@ -1991,6 +2010,12 @@ fn wrap_key(
     Ok((wrapped, nonce))
 }
 
+fn corrupt_decrypt_payload(detail: impl Into<String>) -> anyhow::Error {
+    let detail = detail.into();
+    anyhow::Error::new(DecryptError::CorruptPayload(detail.clone()))
+        .context(format!("Encrypted archive payload is corrupt: {detail}"))
+}
+
 /// Decrypt all chunks and return plaintext
 fn decrypt_all_chunks(
     archive_dir: &Path,
@@ -2108,20 +2133,11 @@ fn decrypt_all_chunks(
                     aad: &aad,
                 },
             )
-            .map_err(|err| {
-                // [coding_agent_session_search-htiim] Chain the aead error
-                // so operators can correlate: which chunk failed, how
-                // big the ciphertext was, and what the cipher layer
-                // reported. The aead crate keeps the sub-failure type
-                // opaque (timing-attack hardening) but the source is
-                // preserved in the error chain. Mirrors encrypt.rs::
-                // decrypt_all_chunks fix landed in 0b81b601.
-                anyhow::anyhow!(
-                    "Decryption failed for chunk {} ({} bytes ciphertext): {}",
-                    chunk_index,
-                    ciphertext.len(),
-                    err
-                )
+            .map_err(|error| {
+                corrupt_decrypt_payload(format!(
+                    "chunk {chunk_index} authentication failed for {} ciphertext bytes: {error}",
+                    ciphertext.len()
+                ))
             })?;
 
         let chunk_plaintext =
@@ -2692,7 +2708,6 @@ mod tests {
     };
     use crate::pages::bundle::BundleBuilder;
     use crate::pages::encrypt::{DecryptionEngine, EncryptionEngine, MAX_CHUNK_SIZE, PayloadMeta};
-    use crate::pages::errors::DecryptError;
     use crate::pages::verify::verify_bundle;
     use std::cell::Cell;
     use tempfile::TempDir;
@@ -3234,6 +3249,45 @@ mod tests {
 
         let decrypted = std::fs::read(&decrypted_path).unwrap();
         assert_eq!(decrypted, b"Test data for key management");
+    }
+
+    #[test]
+    fn test_key_rotate_reports_tampered_payload_and_preserves_live_archive() {
+        let (_temp_dir, archive_dir) = setup_test_archive();
+        let site_dir = super::super::resolve_site_dir(&archive_dir).unwrap();
+        let chunk_path = site_dir.join("payload/chunk-00000.bin");
+        let mut chunk = std::fs::read(&chunk_path).unwrap();
+        let final_byte = chunk
+            .last_mut()
+            .expect("encrypted test payload must contain an authentication tag");
+        *final_byte ^= 0x5a;
+        std::fs::write(&chunk_path, chunk).unwrap();
+
+        let err =
+            key_rotate(&archive_dir, "test-password", "new-password", false, |_| {}).unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<DecryptError>(),
+                Some(DecryptError::CorruptPayload(detail))
+                    if detail.contains("chunk 0") && detail.contains("authentication failed")
+            ),
+            "unexpected corrupt-payload taxonomy: {err:#}"
+        );
+
+        let config = load_config(&archive_dir).unwrap();
+        assert!(
+            unwrap_dek_with_password(&config, "test-password").is_ok(),
+            "failed rotation must preserve the original password slot"
+        );
+        assert!(
+            matches!(
+                unwrap_dek_with_password(&config, "new-password")
+                    .unwrap_err()
+                    .downcast_ref::<DecryptError>(),
+                Some(DecryptError::AuthenticationFailed)
+            ),
+            "failed rotation must not publish the replacement password slot"
+        );
     }
 
     #[test]

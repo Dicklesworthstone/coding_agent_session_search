@@ -23665,6 +23665,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn migration_v13_from_v10() {
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("test.db");
@@ -28891,6 +28892,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn seed_canonical_from_best_historical_bundle_copies_data_and_resets_runtime_meta() {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use std::path::PathBuf;
@@ -30324,6 +30326,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn discover_historical_database_bundles_prefers_healthy_backup_over_replay_priority() {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 
@@ -35287,10 +35290,10 @@ mod tests {
         assert!(apply_conversation_tail_state_cache_migration(&conn).unwrap());
         let (post_applied, _) =
             run_attributed_migration_steps(&conn, POST_TAIL_CACHE_MIGRATION_STEPS).unwrap();
-        applied.extend(post_applied);
 
         assert!(was_fresh);
         applied.push(15);
+        applied.extend(post_applied);
         assert_eq!(
             applied,
             (13..=CURRENT_SCHEMA_VERSION).collect::<Vec<i64>>(),

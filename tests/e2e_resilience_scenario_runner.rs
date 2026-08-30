@@ -6,13 +6,9 @@
 //! persists stdout, stderr, the structured event, a classified proof, fixture
 //! provenance, and a fail-closed suite manifest.
 //!
-//! TEMPORARILY DISABLED (`#![cfg(any())]`): this suite was authored against the
-//! `e2e_runner` artifact APIs (`ArtifactRunSpec`, `run_with_artifacts`,
-//! `ScenarioArtifactManifest`, public `search::e2e_scenarios`) from commit
-//! f6cd6376, whose feature series still needs re-landing on the repaired main
-//! line (see the merge-repair commit and its follow-up bead). Re-enable by
-//! removing the `cfg` below once those APIs are restored.
-#![cfg(any())]
+//! The artifact runner and public scenario registry are part of the executable
+//! proof contract: this target must compile and run rather than existing as a
+//! source-only fixture.
 
 mod util;
 
@@ -490,7 +486,7 @@ platform = "linux"
             .map_err(|error| format!("write sources config: {error}"))?;
             fs::write(
                 &probe_path,
-                br#"{"host":"fixture@reachable.test","os":"Linux","cass_version":"0.0.1","remote_path":"nonempty"}"#,
+                br#"{"host":"fixture@reachable.test","os":"Linux","cass_version":"0.0.1","remote_path":"nonempty","delay_ms":5}"#,
             )
             .map_err(|error| format!("write source doctor probe: {error}"))?;
             fixture
@@ -632,7 +628,7 @@ fn command_expectation(
                         .rev()
                         .find(|line| !line.trim().is_empty())
                         .and_then(|line| serde_json::from_str::<Value>(line.trim()).ok())
-                        .is_some_and(|summary| summary["cmd"] == "status")
+                        .is_some_and(|summary| summary["fields"]["cmd"] == "status")
                 })
             }),
         ));

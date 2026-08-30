@@ -64,7 +64,10 @@ fn fleet_command(home: &Path, args: &[&str], ignore_sources: bool) -> Command {
         .env("CASS_SEMANTIC_EMBEDDER", "hash")
         .env("NO_COLOR", "1")
         .env_remove("CODEX_HOME")
-        .env_remove("CLAUDE_CONFIG_DIR");
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CASS_FLEET_BUDGET_MS")
+        .env_remove("CASS_FLEET_PER_HOST_BUDGET_MS")
+        .env_remove("CASS_TEST_FLEET_VERIFY_SLOW_MS");
     if ignore_sources {
         cmd.env("CASS_IGNORE_SOURCES_CONFIG", "1");
     }
@@ -144,6 +147,12 @@ fn assert_envelope_invariants(v: &Value, expected_mode: &str) {
         v["target_version"].as_str().is_some_and(|s| !s.is_empty()),
         "target_version must be a non-empty string"
     );
+    assert!(
+        v["budget"].is_object(),
+        "rehearsal must expose its bounded execution contract"
+    );
+    assert!(v["budget"]["elapsed_ms"].as_u64().is_some());
+    assert!(v["budget"]["budget_ms"].as_u64().is_some());
 }
 
 /// A safe next command carries no recommendation-shaped destructive token. It is
@@ -170,7 +179,10 @@ fn write_unreachable_remote_source(home: &Path) {
     let config_dir = home.join("xdg-config").join("cass");
     std::fs::create_dir_all(&config_dir).expect("create config dir");
     let sources_toml = config_dir.join("sources.toml");
-    let toml = "[[sources]]\nname = \"unreachable-host\"\ntype = \"ssh\"\nhost = \"nobody@unreachable.invalid\"\npaths = [\"~/.claude/projects\"]\n";
+    // Loopback fails at transport/auth immediately and deterministically on CI;
+    // a reserved DNS name can instead consume the entire host budget while the
+    // resolver retries, turning this unreachable fixture into a timeout.
+    let toml = "[[sources]]\nname = \"unreachable-host\"\ntype = \"ssh\"\nhost = \"nobody@127.0.0.1\"\npaths = [\"~/.claude/projects\"]\n";
     std::fs::write(sources_toml, toml).expect("write sources.toml");
 }
 
@@ -364,6 +376,73 @@ fn verify_drives_the_bounded_local_post_upgrade_battery() {
             .is_some_and(|s| !s.is_empty()),
         "verification must carry a one-line summary"
     );
+}
+
+#[test]
+fn cli_budget_override_bounds_requested_verification_and_takes_precedence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let home = tempfile::tempdir()?;
+    let data_dir = home.path().join("xdg-data").join("coding-agent-search");
+    let mut cmd = fleet_command(
+        home.path(),
+        &[
+            "fleet",
+            "upgrade-rehearsal",
+            "--verify",
+            "--json",
+            "--budget-ms",
+            "50",
+            "--per-host-budget-ms",
+            "25",
+        ],
+        true,
+    );
+    cmd.env("CASS_FLEET_BUDGET_MS", "60000")
+        .env("CASS_FLEET_PER_HOST_BUDGET_MS", "60000")
+        .env("CASS_TEST_FLEET_VERIFY_SLOW_MS", "2000");
+    let out = spawn_with_timeout_or_diag(
+        cmd,
+        "fleet-upgrade-rehearsal-cli-budget",
+        Some(&data_dir),
+        REHEARSAL_TIMEOUT,
+    );
+
+    if out.status.code() != Some(1) {
+        return Err("requested verification without proof must exit one".into());
+    }
+    let payload: Value = serde_json::from_slice(&out.stdout)?;
+    if payload.get("local_verification").is_some() {
+        return Err("budget-shed verification must not claim a proof report".into());
+    }
+    if payload.pointer("/budget/budget_ms").and_then(Value::as_u64) != Some(50) {
+        return Err("CLI budget must override the poisoned environment value".into());
+    }
+    if payload
+        .pointer("/budget/timed_out")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Err("fleet envelope must report the exhausted CLI budget".into());
+    }
+    let skipped_local_verification = payload
+        .pointer("/budget/skipped_sections")
+        .and_then(Value::as_array)
+        .is_some_and(|sections| {
+            sections
+                .iter()
+                .any(|section| section.as_str() == Some("local_verification"))
+        });
+    if !skipped_local_verification {
+        return Err("budget must name the unproved verification battery".into());
+    }
+    if payload
+        .pointer("/budget/elapsed_ms")
+        .and_then(Value::as_u64)
+        .is_none_or(|elapsed_ms| elapsed_ms > 1_200)
+    {
+        return Err("verification fixture escaped the CLI fleet budget".into());
+    }
+    Ok(())
 }
 
 #[test]
