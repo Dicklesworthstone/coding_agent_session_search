@@ -24911,6 +24911,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_INDEX_NO_PROGRESS_EVENTS=1          suppress NDJSON events from `cass index --json`".to_string(),
             "  CASS_INDEX_INGEST_WAL_CHECKPOINT_BYTES=<N>  reset a deferred bulk-ingest WAL after N bytes (default 536870912; 0 disables)".to_string(),
             "  CASS_INDEX_INGEST_WAL_CHECKPOINT_MODE=PASSIVE|FULL|RESTART|TRUNCATE  in-run bulk WAL checkpoint mode (default TRUNCATE)".to_string(),
+            "  CASS_MIGRATION_LEGACY_FTS_DROP_BUDGET_BYTES=<N>  refuse the unbounded V14 legacy-FTS teardown on archives above N bytes (default 536870912; 0 disables the refusal)".to_string(),
             "  CASS_DEFER_ANALYTICS_UPDATES=1             defer derived analytics writes during indexing; a pending legacy OMP rebuild resumes on a later run with this unset".to_string(),
             "  CASS_AUTO_REFRESH=0                      disable stale-on-read catch-up (detached `cass index --background` after a stale search/pack/TUI launch)".to_string(),
             "  CASS_AUTO_REFRESH_COOLDOWN_SECS=<N>      min seconds between auto-spawned catch-up runs (default 300)".to_string(),

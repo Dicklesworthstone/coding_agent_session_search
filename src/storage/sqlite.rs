@@ -5538,29 +5538,26 @@ impl FrankenStorage {
     /// V13 or newer already; additive post-V13 migrations are applied normally.
     pub fn run_migrations(&self) -> Result<()> {
         transition_from_meta_version(&self.conn)?;
+        self.refuse_unbounded_legacy_fts_teardown()?;
 
-        let base_result = build_cass_migrations_before_tail_cache()
-            .run(&self.conn)
-            .with_context(|| "running base schema migrations")?;
-
-        let mut applied = base_result.applied;
+        let (mut applied, was_fresh) =
+            run_attributed_migration_steps(&self.conn, BASE_MIGRATION_STEPS)?;
         if apply_conversation_tail_state_cache_migration(&self.conn)
             .with_context(|| "running conversation tail-state cache migration")?
         {
             applied.push(15);
         }
 
-        let post_result = build_cass_migrations_after_tail_cache()
-            .run(&self.conn)
-            .with_context(|| "running post-tail-cache schema migrations")?;
-        applied.extend(post_result.applied);
+        let (post_applied, _) =
+            run_attributed_migration_steps(&self.conn, POST_TAIL_CACHE_MIGRATION_STEPS)?;
+        applied.extend(post_applied);
 
         let current = self.schema_version()?;
         if !applied.is_empty() {
             info!(
                 applied = ?applied,
                 current,
-                was_fresh = base_result.was_fresh,
+                was_fresh,
                 "frankensqlite schema migrations applied"
             );
         }
@@ -5569,6 +5566,56 @@ impl FrankenStorage {
         self.sync_meta_schema_version(current)?;
 
         Ok(())
+    }
+
+    /// GH #349: bounded pre-flight for the V14 `fts_contentless` migration.
+    ///
+    /// When the archive still carries a legacy `fts_messages` FTS5 shadow,
+    /// the migration must DROP it, and that teardown is unbounded inside
+    /// frankensqlite — on multi-GB archives it aborts with `out of memory`
+    /// after minutes at multi-GiB RSS. Above the configured byte budget this
+    /// refuses up front with a typed, actionable error instead of attempting
+    /// the drop, leaving the archive untouched. Small archives migrate
+    /// exactly as before, and `CASS_MIGRATION_LEGACY_FTS_DROP_BUDGET_BYTES`
+    /// (see [`LEGACY_FTS_TEARDOWN_BUDGET_ENV`]) tunes or disables the gate.
+    ///
+    /// Every probe here is bounded: one indexed sqlite_master row read, one
+    /// `_schema_migrations` point query, and file metadata for the archive
+    /// family. Probes that themselves fail fail open — the migration then
+    /// runs and any real failure surfaces attributed per step.
+    fn refuse_unbounded_legacy_fts_teardown(&self) -> Result<()> {
+        let carries_fts_messages = self
+            .conn
+            .query(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' \
+                 AND name = 'fts_messages' LIMIT 1;",
+            )
+            .map(|rows| !rows.is_empty())
+            .unwrap_or(false);
+        if !carries_fts_messages {
+            return Ok(());
+        }
+        let Some(budget_bytes) = legacy_fts_teardown_budget_bytes() else {
+            return Ok(());
+        };
+        let v14_pending = !schema_migration_is_applied(&self.conn, 14).unwrap_or(true);
+        if !v14_pending {
+            return Ok(());
+        }
+        let archive_bytes = archive_family_bytes(&self.db_path);
+        if archive_bytes <= budget_bytes {
+            return Ok(());
+        }
+        tracing::warn!(
+            archive_bytes,
+            budget_bytes,
+            env = LEGACY_FTS_TEARDOWN_BUDGET_ENV,
+            "refusing unbounded legacy fts_messages teardown during schema migration"
+        );
+        Err(anyhow::Error::new(LegacyFtsTeardownRefusal {
+            archive_bytes,
+            budget_bytes,
+        }))
     }
 
     /// Some historical canonical rebuild paths produced databases whose
@@ -5886,30 +5933,126 @@ impl FrankenStorage {
 // Frankensqlite migration helpers
 // -------------------------------------------------------------------------
 
-/// Build the `MigrationRunner` for the frankensqlite migration path.
+/// Pending-migration steps applied before the V15 tail-state migration.
 ///
-/// Uses a single combined migration (version 13) that creates the complete
-/// final schema in one step. This avoids the V5 `DROP TABLE conversations`
-/// operation which triggers a known frankensqlite limitation: autoindex entries
-/// in sqlite_master are not properly cleaned up during DROP TABLE, causing
-/// "sqlite_master entry not found" errors.
+/// Uses the single combined V13 migration that creates the complete final
+/// schema in one step. This avoids the V5 `DROP TABLE conversations`
+/// operation which triggers a known frankensqlite limitation: autoindex
+/// entries in sqlite_master are not properly cleaned up during DROP TABLE,
+/// causing "sqlite_master entry not found" errors.
 ///
-/// For existing databases transitioned from SqliteStorage, the transition
-/// function backfills `_schema_migrations`; post-V13 additive migrations then
-/// run normally.
-fn build_cass_migrations_before_tail_cache() -> MigrationRunner {
-    MigrationRunner::new()
-        .add(13, "full_schema_v13", MIGRATION_FRESH_SCHEMA)
-        .add(14, "fts_contentless", MIGRATION_V14)
+/// Each step runs through its own single-migration [`MigrationRunner`]
+/// invocation so a failure is attributed to the exact version and name
+/// instead of an opaque "base schema migrations" context (GH #349). Every
+/// migration already runs inside its own transaction inside the runner, so
+/// splitting the runner is behavior-preserving.
+const BASE_MIGRATION_STEPS: &[(i64, &str, &str)] = &[
+    (13, "full_schema_v13", MIGRATION_FRESH_SCHEMA),
+    (14, "fts_contentless", MIGRATION_V14),
+];
+
+/// Pending-migration steps applied after the V15 tail-state migration, run
+/// one-per-runner for failure attribution (see [`BASE_MIGRATION_STEPS`]).
+const POST_TAIL_CACHE_MIGRATION_STEPS: &[(i64, &str, &str)] = &[
+    (16, "drop_redundant_message_conv_idx", MIGRATION_V16),
+    (17, "drop_message_created_idx", MIGRATION_V17),
+    (18, "conversation_tail_state_hot_table", MIGRATION_V18),
+    (19, "conversation_external_lookup", MIGRATION_V19),
+    (20, "conversation_external_tail_lookup", MIGRATION_V20),
+];
+
+/// Run each pending migration through its own single-migration runner so an
+/// error names the exact failing step. Returns the applied versions plus the
+/// first step's `was_fresh` signal — the same value the combined-runner form
+/// this replaces used to report.
+fn run_attributed_migration_steps(
+    conn: &FrankenConnection,
+    steps: &[(i64, &'static str, &'static str)],
+) -> Result<(Vec<i64>, bool)> {
+    let mut applied = Vec::new();
+    let mut was_fresh = false;
+    for (index, &(version, name, sql)) in steps.iter().enumerate() {
+        let result = MigrationRunner::new()
+            .add(version, name, sql)
+            .run(conn)
+            .with_context(|| format!("running schema migration v{version} ({name})"))?;
+        if index == 0 {
+            was_fresh = result.was_fresh;
+        }
+        applied.extend(result.applied);
+    }
+    Ok((applied, was_fresh))
 }
 
-fn build_cass_migrations_after_tail_cache() -> MigrationRunner {
-    MigrationRunner::new()
-        .add(16, "drop_redundant_message_conv_idx", MIGRATION_V16)
-        .add(17, "drop_message_created_idx", MIGRATION_V17)
-        .add(18, "conversation_tail_state_hot_table", MIGRATION_V18)
-        .add(19, "conversation_external_lookup", MIGRATION_V19)
-        .add(20, "conversation_external_tail_lookup", MIGRATION_V20)
+/// Environment override for the GH #349 legacy-FTS teardown refusal budget,
+/// in bytes of on-disk archive family (main db + sidecars). `0` disables the
+/// refusal entirely and forces the unbounded teardown attempt.
+const LEGACY_FTS_TEARDOWN_BUDGET_ENV: &str = "CASS_MIGRATION_LEGACY_FTS_DROP_BUDGET_BYTES";
+
+/// Default refusal budget: archives above this size never attempt the V14
+/// legacy `fts_messages` teardown automatically.
+const DEFAULT_LEGACY_FTS_TEARDOWN_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Typed refusal of the V14 `fts_contentless` teardown of a large legacy
+/// `fts_messages` FTS5 shadow (GH #349).
+///
+/// The drop is unbounded inside frankensqlite (WITHOUT-ROWID shadow teardown)
+/// and aborts with `out of memory` after minutes and multi-GiB RSS on
+/// multi-GB archives. Refusing up front keeps the archive untouched, names
+/// the failing migration, and carries the safe next actions.
+#[derive(Debug, Error)]
+#[error(
+    "migration v14 (fts_contentless) refused: this archive still carries a legacy fts_messages \
+     FTS5 shadow whose teardown is unbounded in frankensqlite (GH #345/#349: the drop aborts \
+     with 'out of memory' after minutes on multi-GB archives); archive family is \
+     {archive_bytes} bytes, above the {budget_bytes}-byte refusal budget. The archive was not \
+     modified. Next actions: run 'cass doctor check --json' for a bounded read-only diagnosis; \
+     upgrade to a cass build carrying the frankensqlite bounded WITHOUT-ROWID teardown fix and \
+     retry 'cass index --full'; or back up the archive and rebuild a fresh one from provider \
+     session logs. To force the unbounded attempt anyway, set \
+     CASS_MIGRATION_LEGACY_FTS_DROP_BUDGET_BYTES to a byte value above the archive size \
+     (0 disables the refusal entirely)."
+)]
+pub(crate) struct LegacyFtsTeardownRefusal {
+    pub(crate) archive_bytes: u64,
+    pub(crate) budget_bytes: u64,
+}
+
+/// Total on-disk size of the archive family: the main db plus its WAL, SHM,
+/// and journal sidecars. Missing members contribute zero.
+fn archive_family_bytes(db_path: &Path) -> u64 {
+    ["", "-wal", "-shm", "-journal"]
+        .into_iter()
+        .filter_map(|suffix| {
+            std::fs::symlink_metadata(database_sidecar_path(db_path, suffix))
+                .ok()
+                .filter(|meta| meta.is_file())
+                .map(|meta| meta.len())
+        })
+        .sum()
+}
+
+/// Resolve the legacy-FTS teardown refusal budget. `None` means the operator
+/// explicitly disabled the refusal via a `0` budget; an unparsable value
+/// falls back to the default with a warning rather than silently disabling
+/// the gate.
+fn legacy_fts_teardown_budget_bytes() -> Option<u64> {
+    match std::env::var(LEGACY_FTS_TEARDOWN_BUDGET_ENV) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(bytes) => Some(bytes),
+            Err(_) => {
+                tracing::warn!(
+                    value = %raw,
+                    env = LEGACY_FTS_TEARDOWN_BUDGET_ENV,
+                    default = DEFAULT_LEGACY_FTS_TEARDOWN_BUDGET_BYTES,
+                    "unparsable refusal budget; using the default"
+                );
+                Some(DEFAULT_LEGACY_FTS_TEARDOWN_BUDGET_BYTES)
+            }
+        },
+        Err(_) => Some(DEFAULT_LEGACY_FTS_TEARDOWN_BUDGET_BYTES),
+    }
 }
 
 fn schema_migration_is_applied(conn: &FrankenConnection, version: i64) -> Result<bool> {
@@ -34177,6 +34320,164 @@ mod tests {
         assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     }
 
+    /// The V13-era internal-content `fts_messages` CREATE injected by the
+    /// legacy-teardown fixtures (mirrors the catalog row MIGRATION_V14 drops).
+    const LEGACY_V13_FTS_MESSAGES_SQL: &str = "CREATE VIRTUAL TABLE fts_messages USING fts5(content, title, agent, workspace, source_path, created_at UNINDEXED, content='', tokenize='porter')";
+
+    #[test]
+    fn attributed_migration_steps_report_applied_versions_freshness_and_failing_step() {
+        // Virgin connection: exercise the helper directly, without the
+        // storage open path that runs migrations first.
+        let conn = FrankenConnection::open(":memory:").unwrap();
+
+        let (applied, was_fresh) =
+            run_attributed_migration_steps(&conn, BASE_MIGRATION_STEPS).unwrap();
+        assert_eq!(applied, vec![13, 14]);
+        assert!(was_fresh, "first pass over an empty database is fresh");
+
+        // Second pass: everything already applied, and the initial version is
+        // no longer zero, so was_fresh mirrors the combined-runner semantics.
+        let (applied, was_fresh) =
+            run_attributed_migration_steps(&conn, BASE_MIGRATION_STEPS).unwrap();
+        assert!(applied.is_empty());
+        assert!(!was_fresh);
+
+        // A failing step must be attributed to its exact version and name.
+        let err = run_attributed_migration_steps(
+            &conn,
+            &[(99, "bogus_step", "THIS IS NOT VALID SQL")],
+        )
+        .unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("running schema migration v99 (bogus_step)"),
+            "failure should name the failing step: {rendered}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_fts_teardown_refusal_names_migration_and_leaves_archive_untouched() {
+        let _budget = set_env_var(LEGACY_FTS_TEARDOWN_BUDGET_ENV, "1");
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("canonical.db");
+
+        // Seed a fully-migrated archive. No conversation is written, so the
+        // V14 drop leaves no fts_messages catalog row behind.
+        drop(FrankenStorage::open(&db_path).unwrap());
+
+        // Downgrade to a V14-pending legacy state and inject the legacy
+        // internal-content fts_messages catalog row (rootpage 0; the refusal
+        // only reads the catalog, so absent shadow tables are fine here).
+        {
+            let fixture = rusqlite_test_fixture_conn(&db_path);
+            fixture
+                .execute_batch(
+                    "PRAGMA writable_schema = ON;
+                     UPDATE meta SET value = '13' WHERE key = 'schema_version';
+                     DELETE FROM _schema_migrations WHERE version = 14;
+                     DELETE FROM sqlite_master WHERE name = 'fts_messages';",
+                )
+                .unwrap();
+            fixture
+                .execute(
+                    "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+                     VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
+                    [LEGACY_V13_FTS_MESSAGES_SQL],
+                )
+                .unwrap();
+            fixture
+                .execute_batch("PRAGMA writable_schema = OFF;")
+                .unwrap();
+        }
+
+        let err = match FrankenStorage::open(&db_path) {
+            Ok(_) => panic!("open must refuse the unbounded V14 teardown above the budget"),
+            Err(err) => err,
+        };
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("v14") && rendered.contains("fts_contentless"),
+            "refusal should name the failing migration: {rendered}"
+        );
+        assert!(
+            rendered.contains(LEGACY_FTS_TEARDOWN_BUDGET_ENV),
+            "refusal should name the budget override: {rendered}"
+        );
+        assert!(
+            rendered.contains("cass doctor check --json"),
+            "refusal should carry the bounded-diagnosis next action: {rendered}"
+        );
+
+        // The archive is untouched: still V14-pending, still meta version 13.
+        let check = rusqlite_test_fixture_conn(&db_path);
+        let v14_rows: i64 = check
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 14",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(v14_rows, 0, "refusal must not record the migration");
+        let meta_version: String = check
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(meta_version, "13", "refusal must not modify the archive");
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_fts_teardown_zero_budget_disables_the_refusal() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("canonical.db");
+        drop(FrankenStorage::open(&db_path).unwrap());
+
+        {
+            let fixture = rusqlite_test_fixture_conn(&db_path);
+            fixture
+                .execute_batch(
+                    "PRAGMA writable_schema = ON;
+                     UPDATE meta SET value = '13' WHERE key = 'schema_version';
+                     DELETE FROM _schema_migrations WHERE version = 14;
+                     DELETE FROM sqlite_master WHERE name = 'fts_messages';",
+                )
+                .unwrap();
+            fixture
+                .execute(
+                    "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql)
+                     VALUES('table', 'fts_messages', 'fts_messages', 0, ?1)",
+                    [LEGACY_V13_FTS_MESSAGES_SQL],
+                )
+                .unwrap();
+            fixture
+                .execute_batch("PRAGMA writable_schema = OFF;")
+                .unwrap();
+        }
+
+        let _budget = set_env_var(LEGACY_FTS_TEARDOWN_BUDGET_ENV, "0");
+        let storage = FrankenStorage::open(&db_path)
+            .expect("zero budget must disable the refusal and allow the migration");
+        assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_fts_teardown_refusal_skips_current_archives_entirely() {
+        let _budget = set_env_var(LEGACY_FTS_TEARDOWN_BUDGET_ENV, "1");
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("canonical.db");
+
+        drop(FrankenStorage::open(&db_path).unwrap());
+        // Reopen: V14 is already applied, so even an absurdly small budget
+        // must never fire the refusal on a current archive.
+        let again = FrankenStorage::open(&db_path).unwrap();
+        assert_eq!(again.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    }
+
     #[test]
     fn migration_v20_backfills_conversation_external_tail_lookup() {
         let storage = franken_storage_in_memory();
@@ -34969,16 +35270,15 @@ mod tests {
     #[test]
     fn build_cass_migrations_applies_combined_v13() {
         let conn = FrankenConnection::open(":memory:").unwrap();
-        let base_result = build_cass_migrations_before_tail_cache()
-            .run(&conn)
-            .unwrap();
+        let (mut applied, was_fresh) =
+            run_attributed_migration_steps(&conn, BASE_MIGRATION_STEPS).unwrap();
         assert!(apply_conversation_tail_state_cache_migration(&conn).unwrap());
-        let post_result = build_cass_migrations_after_tail_cache().run(&conn).unwrap();
+        let (post_applied, _) =
+            run_attributed_migration_steps(&conn, POST_TAIL_CACHE_MIGRATION_STEPS).unwrap();
+        applied.extend(post_applied);
 
-        assert!(base_result.was_fresh);
-        let mut applied = base_result.applied;
+        assert!(was_fresh);
         applied.push(15);
-        applied.extend(post_result.applied);
         assert_eq!(
             applied,
             (13..=CURRENT_SCHEMA_VERSION).collect::<Vec<i64>>(),
