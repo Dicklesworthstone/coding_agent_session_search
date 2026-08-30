@@ -637,15 +637,18 @@ mod tests {
     }
 
     #[test]
-    fn unknown_macro_id_yields_empty_selection() {
+    fn unknown_macro_id_yields_empty_selection() -> Result<(), &'static str> {
         let src = json!({"macro": "does-not-exist"});
         let out = render_workflow_macros_fixture("macros-unknown", Some(&src));
         assert_eq!(out["summary"]["macro_count"], json!(0));
-        assert_eq!(out["status"], json!("warning"));
+        if out.get("status").and_then(Value::as_str) != Some("warning") {
+            return Err("unknown macro filters must report warning status");
+        }
         assert_eq!(
             out["summary"]["recommended_action"],
             json!("unknown-macro-id")
         );
+        Ok(())
     }
 
     #[test]
