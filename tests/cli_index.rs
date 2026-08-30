@@ -1684,3 +1684,164 @@ fn plain_index_self_heals_when_entire_lexical_index_directory_is_missing() {
          (one lexical doc per canonical message)"
     );
 }
+
+/// GH#413 (bead cjugu) end-to-end receipt: a #413-shaped corpus — few
+/// conversations, one far exceeding the in-flight byte budget — must complete
+/// `cass index --full` instead of wedging at a batch boundary. Before the
+/// sink starvation flush (424765b3), `pending_batch` retained byte
+/// reservations with only count and shard-boundary flush triggers, so once
+/// the oversized page was retained downstream the turn-holding page-prep
+/// worker parked in `acquire_with_wait` forever (every later sequence in
+/// `wait_for_turn`, producer in waiting_result, ~0 CPU). A tiny
+/// `CASS_TANTIVY_REBUILD_PIPELINE_MAX_MESSAGE_BYTES_IN_FLIGHT` below the
+/// oversized conversation's page bytes makes that wedge deterministic on a
+/// pre-fix binary; the starvation flush must release the budget and let the
+/// run drain.
+///
+/// Currently ignore-gated: on current main the ingest path parks on the
+/// oversized conversation itself (heartbeat shows `rebuild_pipeline` fully
+/// idle — `page_prep_workers=0`, `producer_state=null` — while ingest crawls
+/// at ~0.02 conv/s), so the run never reaches the lexical pipeline phase
+/// where the GH#413 retention wedge lives. That is the same mwkw0-class
+/// ingest park MossyBridge documented when first attempting a tiny GH#413
+/// repro, not this fix. Un-ignore once ingest bounding lands; this then
+/// becomes the definitive pipeline-level receipt for cjugu.
+#[ignore = "ingest path parks on multi-MiB conversations before the lexical pipeline starts (mwkw0-class); see bead cjugu comments"]
+#[test]
+fn gh413_full_rebuild_drains_when_one_conversation_exceeds_the_inflight_budget() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    let codex_root = data_dir.join(".codex").join("sessions");
+    fs::create_dir_all(&codex_root).unwrap();
+
+    let huge_marker = "gh413-huge-needle";
+    let filler_line = "gh413 filler 0123456789012345678901234567890123456789\n";
+    let mut huge_text = String::with_capacity(5 * 1024 * 1024);
+    while huge_text.len() < 4 * 1024 * 1024 {
+        huge_text.push_str(filler_line);
+    }
+    huge_text.push_str(huge_marker);
+
+    let write_session = |name: &str, user_text: &str, session_id: &str| {
+        let sample = format!(
+            concat!(
+                "{{\"timestamp\":\"2025-09-30T15:42:34.559Z\",\"type\":\"session_meta\",",
+                "\"payload\":{{\"id\":\"{session_id}\",\"cwd\":\"/test/workspace\",\"cli_version\":\"0.42.0\"}}}}\n",
+                "{{\"timestamp\":\"2025-09-30T15:42:36.190Z\",\"type\":\"response_item\",",
+                "\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",",
+                "\"text\":\"{user_text}\"}}]}}}}\n",
+                "{{\"timestamp\":\"2025-09-30T15:42:43.000Z\",\"type\":\"response_item\",",
+                "\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",",
+                "\"text\":\"acknowledged\"}}]}}}}\n"
+            ),
+            session_id = session_id,
+            user_text = user_text
+        );
+        fs::write(codex_root.join(name), sample).unwrap();
+    };
+    write_session("rollout-huge.jsonl", &huge_text, "gh413-huge");
+    write_session("rollout-small-a.jsonl", "gh413 small marker alpha", "gh413-a");
+    write_session("rollout-small-b.jsonl", "gh413 small marker beta", "gh413-b");
+
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+    cmd.args([
+        "index",
+        "--full",
+        "--data-dir",
+        data_dir.to_str().unwrap(),
+        "--json",
+        "--no-progress-events",
+    ])
+    .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+    .env("HOME", tmp.path())
+    .env("XDG_DATA_HOME", tmp.path().join(".local/share"))
+    .env("CODEX_HOME", data_dir.join(".codex"))
+    // Far below the oversized conversation's ~4 MiB page: after the huge
+    // page is retained by the sink, every later budget acquisition must
+    // depend on the starvation flush releasing retained bytes, which is
+    // exactly the pre-fix wedge site.
+    .env(
+        "CASS_TANTIVY_REBUILD_PIPELINE_MAX_MESSAGE_BYTES_IN_FLIGHT",
+        "2097152",
+    );
+    let stdout_path = tmp.path().join("gh413-index-stdout.json");
+    let stderr_path = tmp.path().join("gh413-index-stderr.log");
+    let stdout_file = fs::File::create(&stdout_path).unwrap();
+    let stderr_file = fs::File::create(&stderr_path).unwrap();
+    cmd.stdout(stdout_file).stderr(stderr_file);
+    let mut child = cmd.spawn().expect("spawn cass index --full");
+
+    // Bounded wait: the pre-fix wedge was a permanent park with ~0 CPU, so a
+    // generous wall-clock deadline turns a regression into a failed test
+    // instead of a hung suite.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    let status = loop {
+        match child.try_wait().expect("poll cass index") {
+            Some(status) => break status,
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "GH#413 regression: index --full wedged past the 600s deadline on a \
+                         #413-shaped corpus (one conversation exceeding the in-flight budget)"
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+    };
+    assert!(
+        status.success(),
+        "index --full must succeed on the GH#413-shaped corpus (exit: {status:?}); \
+         stderr tail: {}",
+        fs::read_to_string(&stderr_path)
+            .map(|log| {
+                let tail: String = log.chars().rev().take(12000).collect();
+                tail.chars().rev().collect()
+            })
+            .unwrap_or_else(|err| format!("<unreadable: {err}>"))
+    );
+
+    // Completeness: the huge and the small conversations must all be
+    // searchable after the drain.
+    for (query, needle) in [
+        (huge_marker, huge_marker),
+        ("gh413 small marker alpha", "gh413 small marker alpha"),
+        ("gh413 small marker beta", "gh413 small marker beta"),
+    ] {
+        let output = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+            .args([
+                "search",
+                query,
+                "--json",
+                "--data-dir",
+                data_dir.to_str().unwrap(),
+            ])
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("HOME", tmp.path())
+            .env("XDG_DATA_HOME", tmp.path().join(".local/share"))
+            .env("XDG_CONFIG_HOME", tmp.path().join(".config"))
+            .env("CODEX_HOME", data_dir.join(".codex"))
+            .output()
+            .expect("run cass search");
+        assert!(
+            output.status.success(),
+            "search for {query:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let hits = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .expect("parse search json")["hits"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            hits.iter().any(|hit| {
+                hit.get("content")
+                    .and_then(|content| content.as_str())
+                    .is_some_and(|content| content.contains(needle))
+            }),
+            "expected a search hit containing {needle:?} after the GH#413-shaped drain"
+        );
+    }
+}
