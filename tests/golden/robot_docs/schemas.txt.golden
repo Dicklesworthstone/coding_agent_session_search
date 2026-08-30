@@ -3087,6 +3087,18 @@ schemas: (auto-generated from contract)
       - schema_version: integer
       - subsystem_count: integer
       - subsystems: array
+  models-build-hnsw:
+    - action: string
+    - artifact_path: string
+    - current: boolean
+    - embedder_id: string
+    - hnsw_path: string
+    - manifest_published: boolean
+    - next_command: ?
+    - state_after: string
+    - state_before: string
+    - tier: string
+    - vector_count: integer
   models-check-update:
     - current_revision: ?
     - latest_revision: ?

@@ -2414,6 +2414,26 @@ pub enum ModelsCommand {
         #[arg(long, visible_alias = "robot")]
         json: bool,
     },
+    /// Build (or verify) the HNSW accelerator for an already-published
+    /// semantic vector artifact without opening the archive or embedding
+    BuildHnsw {
+        /// Semantic tier whose published artifact to accelerate: fast or
+        /// quality (default: quality when published, else fast)
+        #[arg(long)]
+        tier: Option<String>,
+        /// Verify the current accelerator against the artifact; never write
+        #[arg(long)]
+        check: bool,
+        /// Rebuild even when the current accelerator already matches
+        #[arg(long)]
+        force: bool,
+        /// Override data dir
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
     /// Download and install the semantic search model
     Install {
         /// Model to install (default: all-minilm-l6-v2)
@@ -24729,6 +24749,9 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         Commands::Models(ModelsCommand::CheckUpdate { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
+        Commands::Models(ModelsCommand::BuildHnsw { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
         Commands::Fleet(FleetCommand::UpgradeRehearsal { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
@@ -25132,6 +25155,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass models verify [--model NAME] [--json]  Per-file SHA-256 verification of an explicit installed model.".to_string(),
             "  cass models check-update [--model NAME] [--json]  Compare an explicit installed revision against its pin.".to_string(),
             "  cass models backfill             Re-embed conversations against a newly acquired model.".to_string(),
+            "  cass models build-hnsw [--tier fast|quality] [--check] [--force] [--json]  Build/verify the HNSW accelerator for a published semantic artifact (no archive open, no embedding).".to_string(),
             "  cass expand <path> --line N [-C CONTEXT] [--json]  Show messages around a specific line in a session.".to_string(),
             "  cass resume <path> [--shell]     Resolve a session path into its native-harness resume command.".to_string(),
             "  cass timeline [--since DATE] [--until DATE] [--json]  Activity timeline over a time range.".to_string(),
@@ -95825,6 +95849,28 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
     );
 
     schemas.insert(
+        "models-build-hnsw".to_string(),
+        json!({
+            "type": "object",
+            "description": "cass models build-hnsw --json (gh#408): builds or verifies (--check) the HNSW accelerator for an already-published semantic artifact without opening the archive or embedding; state_* use the runtime loader's admissibility vocabulary.",
+            "properties": {
+                "tier": { "type": "string", "description": "fast | quality" },
+                "embedder_id": { "type": "string" },
+                "vector_count": { "type": "integer" },
+                "artifact_path": { "type": "string", "description": "Published .fsvi path relative to data_dir" },
+                "hnsw_path": { "type": "string", "description": "Accelerator metadata path relative to data_dir" },
+                "state_before": { "type": "string", "description": "missing | invalid_entry | native_valid | stale_or_legacy | unreadable" },
+                "state_after": { "type": "string", "description": "Same vocabulary as state_before; equals state_before for check_only" },
+                "action": { "type": "string", "description": "check_only | unchanged | rebuilt" },
+                "manifest_published": { "type": "boolean", "description": "True when an HnswRecord was written to the semantic manifest in this run" },
+                "current": { "type": "boolean", "description": "True when state_after is native_valid (approximate search usable)" },
+                "next_command": { "type": ["string", "null"], "description": "cass models build-hnsw when the accelerator is not current" }
+            },
+            "required": ["tier", "embedder_id", "vector_count", "hnsw_path", "state_before", "state_after", "action", "manifest_published", "current"]
+        }),
+    );
+
+    schemas.insert(
         "models-check-update".to_string(),
         json!({
             "type": "object",
@@ -111871,6 +111917,16 @@ fn run_models_command(cmd: ModelsCommand, cli: &Cli) -> CliResult<()> {
                 structured_format,
             )
         }
+        ModelsCommand::BuildHnsw {
+            tier,
+            check,
+            force,
+            data_dir,
+            json,
+        } => {
+            let structured_format = resolve_subcommand_structured_format(cli, json);
+            run_models_build_hnsw(tier.as_deref(), check, force, data_dir, structured_format)
+        }
         ModelsCommand::Remove {
             model,
             yes,
@@ -113349,6 +113405,322 @@ fn run_models_verify(
         }
     }
 
+    Ok(())
+}
+
+/// Admissibility of the on-disk HNSW accelerator for one published artifact,
+/// as the runtime loader would judge it (`cass models build-hnsw`, gh#408).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HnswAcceleratorState {
+    /// No accelerator metadata at the canonical path.
+    Missing,
+    /// The path exists but is a symlink or not a regular file; never loaded.
+    InvalidEntry,
+    /// The exact native graph matches the published artifact (ids, vector
+    /// fingerprint, dimension, topology).
+    NativeValid,
+    /// Readable metadata, but the graph is legacy, stale, incomplete, or
+    /// corrupt — search silently falls back to exact scans.
+    StaleOrLegacy,
+    /// Metadata unreadable or dimensionally incompatible.
+    Unreadable,
+}
+
+impl HnswAcceleratorState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::InvalidEntry => "invalid_entry",
+            Self::NativeValid => "native_valid",
+            Self::StaleOrLegacy => "stale_or_legacy",
+            Self::Unreadable => "unreadable",
+        }
+    }
+
+    fn is_current(self) -> bool {
+        matches!(self, Self::NativeValid)
+    }
+}
+
+/// Classify the accelerator at `ann_path` against `fs_index` without writing.
+fn inspect_hnsw_accelerator(
+    ann_path: &Path,
+    fs_index: &crate::search::vector_index::VectorIndex,
+) -> HnswAcceleratorState {
+    match std::fs::symlink_metadata(ann_path) {
+        Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound) => {
+            return HnswAcceleratorState::Missing;
+        }
+        Err(_) => return HnswAcceleratorState::Unreadable,
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.file_type().is_file() => {
+            return HnswAcceleratorState::InvalidEntry;
+        }
+        Ok(_) => {}
+    }
+    match frankensearch::index::HnswIndex::try_load_native(ann_path, fs_index) {
+        Ok(Some(_)) => HnswAcceleratorState::NativeValid,
+        Ok(None) => HnswAcceleratorState::StaleOrLegacy,
+        Err(_) => HnswAcceleratorState::Unreadable,
+    }
+}
+
+/// `cass models build-hnsw` (bead uaulb, gh#408): build or verify the HNSW
+/// accelerator for an ALREADY-PUBLISHED semantic vector artifact.
+///
+/// Reads only the semantic manifest and the published `.fsvi`; never opens
+/// the canonical archive and never embeds. The graph is written through
+/// frankensearch's generation-atomic saver (metadata is the commit point),
+/// proven loadable as the exact native artifact, and only then recorded in
+/// the semantic manifest. `--check` classifies and writes nothing.
+fn run_models_build_hnsw(
+    tier_raw: Option<&str>,
+    check: bool,
+    force: bool,
+    data_dir_override: Option<PathBuf>,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    use crate::search::ann_index::hnsw_index_path;
+    use crate::search::semantic_manifest::{HnswRecord, SemanticManifest, TierKind};
+    use crate::search::vector_index::VectorIndex as FsVectorIndex;
+    use colored::Colorize;
+
+    let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
+    let mut manifest = SemanticManifest::load(&data_dir)
+        .map_err(|err| CliError {
+            code: 5,
+            kind: CliErrorKind::Storage.kind_str(),
+            message: format!("semantic manifest unreadable: {err}"),
+            hint: Some("Run 'cass doctor check --json' to diagnose the semantic assets".into()),
+            retryable: false,
+        })?
+        .ok_or_else(|| CliError {
+            code: 3,
+            kind: CliErrorKind::IndexMissing.kind_str(),
+            message: format!(
+                "no semantic manifest under {}; nothing is published to accelerate",
+                data_dir.display()
+            ),
+            hint: Some("Run 'cass index --semantic' first".into()),
+            retryable: true,
+        })?;
+
+    let tier = match tier_raw {
+        Some(raw) => parse_models_backfill_tier(raw)?,
+        None if manifest
+            .quality_tier
+            .as_ref()
+            .is_some_and(|record| record.ready) =>
+        {
+            TierKind::Quality
+        }
+        None => TierKind::Fast,
+    };
+    let record = match tier {
+        TierKind::Fast => manifest.fast_tier.clone(),
+        TierKind::Quality => manifest.quality_tier.clone(),
+    }
+    .filter(|record| record.ready)
+    .ok_or_else(|| CliError {
+        code: 3,
+        kind: CliErrorKind::IndexMissing.kind_str(),
+        message: format!(
+            "no published {} semantic artifact in the manifest",
+            tier.as_str()
+        ),
+        hint: Some(format!(
+            "Run 'cass index --semantic' (or 'cass models backfill --tier {}') first",
+            tier.as_str()
+        )),
+        retryable: true,
+    })?;
+    if !crate::search::semantic_manifest::semantic_shard_artifact_path_is_safe(&record.index_path) {
+        return Err(CliError {
+            code: 5,
+            kind: CliErrorKind::Storage.kind_str(),
+            message: format!(
+                "manifest {} artifact path is not a safe relative path: {:?}",
+                tier.as_str(),
+                record.index_path
+            ),
+            hint: Some(
+                "Run 'cass index --semantic --force-rebuild' to republish the artifact".into(),
+            ),
+            retryable: false,
+        });
+    }
+    let index_path = data_dir.join(&record.index_path);
+    let fs_index = FsVectorIndex::open(&index_path).map_err(|err| CliError {
+        code: 5,
+        kind: CliErrorKind::Storage.kind_str(),
+        message: format!(
+            "published {} artifact {} cannot be opened: {err}",
+            tier.as_str(),
+            index_path.display()
+        ),
+        hint: Some("Run 'cass index --semantic --force-rebuild' to republish the artifact".into()),
+        retryable: false,
+    })?;
+    if fs_index
+        .embedder_id()
+        .cmp(record.embedder_id.as_str())
+        .is_ne()
+    {
+        return Err(CliError {
+            code: 5,
+            kind: CliErrorKind::Storage.kind_str(),
+            message: format!(
+                "published {} artifact reports embedder '{}' but the manifest records '{}'",
+                tier.as_str(),
+                fs_index.embedder_id(),
+                record.embedder_id
+            ),
+            hint: Some(
+                "Run 'cass index --semantic --force-rebuild' to republish the artifact".into(),
+            ),
+            retryable: false,
+        });
+    }
+    let vector_count = fs_index.record_count();
+    let ann_path = hnsw_index_path(&data_dir, &record.embedder_id);
+    let relative_ann_path = ann_path
+        .strip_prefix(&data_dir)
+        .unwrap_or(ann_path.as_path())
+        .to_string_lossy()
+        .to_string();
+    let before = inspect_hnsw_accelerator(&ann_path, &fs_index);
+    let manifest_records_current = manifest.hnsw.as_ref().is_some_and(|hnsw| {
+        hnsw.ready
+            && hnsw.base_tier.as_str().cmp(tier.as_str()).is_eq()
+            && hnsw.embedder_id.cmp(&record.embedder_id).is_eq()
+    });
+
+    let (action, after, manifest_published) = if check {
+        ("check_only", before, false)
+    } else if before.is_current() && !force {
+        // Re-record a current graph the manifest forgot (e.g. revoked by an
+        // earlier delta) without rebuilding it.
+        let published = !manifest_records_current;
+        ("unchanged", before, published)
+    } else {
+        let hnsw = frankensearch::index::HnswIndex::build_from_vector_index(
+            &fs_index,
+            frankensearch::index::HnswConfig::default(),
+        )
+        .map_err(|err| CliError {
+            code: 5,
+            kind: CliErrorKind::Storage.kind_str(),
+            message: format!("building HNSW accelerator failed: {err}"),
+            hint: None,
+            retryable: false,
+        })?;
+        hnsw.save(&ann_path).map_err(|err| CliError {
+            code: 5,
+            kind: CliErrorKind::Storage.kind_str(),
+            message: format!(
+                "saving HNSW accelerator to {} failed: {err}",
+                ann_path.display()
+            ),
+            hint: None,
+            retryable: false,
+        })?;
+        drop(hnsw);
+        let after = inspect_hnsw_accelerator(&ann_path, &fs_index);
+        if !after.is_current() {
+            return Err(CliError {
+                code: 5,
+                kind: CliErrorKind::Storage.kind_str(),
+                message: format!(
+                    "HNSW accelerator was written but does not load back as the native graph for {} (state: {}); the manifest was left unchanged",
+                    index_path.display(),
+                    after.as_str()
+                ),
+                hint: Some("Retry; if it persists run 'cass doctor check --json'".into()),
+                retryable: true,
+            });
+        }
+        ("rebuilt", after, true)
+    };
+
+    if manifest_published {
+        let size_bytes = std::fs::metadata(&ann_path).map(|m| m.len()).unwrap_or(0);
+        manifest.publish_hnsw(HnswRecord {
+            base_tier: tier,
+            embedder_id: record.embedder_id.clone(),
+            ef_search: frankensearch::index::HNSW_DEFAULT_EF_SEARCH,
+            index_path: relative_ann_path.clone(),
+            size_bytes,
+            built_at_ms: chrono::Utc::now().timestamp_millis(),
+            ready: true,
+        });
+        manifest.save(&data_dir).map_err(|err| CliError {
+            code: 5,
+            kind: CliErrorKind::Storage.kind_str(),
+            message: format!(
+                "HNSW accelerator is on disk but recording it in the semantic manifest failed: {err}"
+            ),
+            hint: Some("Re-run 'cass models build-hnsw' to record it".into()),
+            retryable: true,
+        })?;
+    }
+
+    let structured_format = output_format.or_else(robot_format_from_env);
+    if structured_format.is_some() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "tier": tier.as_str(),
+                "embedder_id": record.embedder_id,
+                "vector_count": vector_count,
+                "artifact_path": record.index_path,
+                "hnsw_path": relative_ann_path,
+                "state_before": before.as_str(),
+                "state_after": after.as_str(),
+                "action": action,
+                "manifest_published": manifest_published,
+                "current": after.is_current(),
+                "next_command": if after.is_current() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String("cass models build-hnsw".to_string())
+                },
+            }))
+            .unwrap_or_default()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{} tier: {} ({} vectors, embedder {})",
+        "Semantic artifact".bold(),
+        tier.as_str(),
+        vector_count,
+        record.embedder_id
+    );
+    println!("  Accelerator: {relative_ann_path}");
+    match action {
+        "check_only" => println!("  State: {}", before.as_str()),
+        "unchanged" => println!(
+            "  State: {} (already current{})",
+            after.as_str(),
+            if manifest_published {
+                "; recorded in the semantic manifest"
+            } else {
+                ""
+            }
+        ),
+        _ => println!(
+            "  {} rebuilt: {} -> {} (recorded in the semantic manifest)",
+            "✓".green(),
+            before.as_str(),
+            after.as_str()
+        ),
+    }
+    if !after.is_current() {
+        println!(
+            "  {} approximate search is unavailable; run 'cass models build-hnsw' to build it",
+            "!".yellow()
+        );
+    }
     Ok(())
 }
 

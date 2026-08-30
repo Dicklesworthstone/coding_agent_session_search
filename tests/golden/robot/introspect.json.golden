@@ -30409,6 +30409,68 @@
         }
       }
     },
+    "models-build-hnsw": {
+      "type": "object",
+      "description": "cass models build-hnsw --json (gh#408): builds or verifies (--check) the HNSW accelerator for an already-published semantic artifact without opening the archive or embedding; state_* use the runtime loader's admissibility vocabulary.",
+      "properties": {
+        "tier": {
+          "type": "string",
+          "description": "fast | quality"
+        },
+        "embedder_id": {
+          "type": "string"
+        },
+        "vector_count": {
+          "type": "integer"
+        },
+        "artifact_path": {
+          "type": "string",
+          "description": "Published .fsvi path relative to data_dir"
+        },
+        "hnsw_path": {
+          "type": "string",
+          "description": "Accelerator metadata path relative to data_dir"
+        },
+        "state_before": {
+          "type": "string",
+          "description": "missing | invalid_entry | native_valid | stale_or_legacy | unreadable"
+        },
+        "state_after": {
+          "type": "string",
+          "description": "Same vocabulary as state_before; equals state_before for check_only"
+        },
+        "action": {
+          "type": "string",
+          "description": "check_only | unchanged | rebuilt"
+        },
+        "manifest_published": {
+          "type": "boolean",
+          "description": "True when an HnswRecord was written to the semantic manifest in this run"
+        },
+        "current": {
+          "type": "boolean",
+          "description": "True when state_after is native_valid (approximate search usable)"
+        },
+        "next_command": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "cass models build-hnsw when the accelerator is not current"
+        }
+      },
+      "required": [
+        "tier",
+        "embedder_id",
+        "vector_count",
+        "hnsw_path",
+        "state_before",
+        "state_after",
+        "action",
+        "manifest_published",
+        "current"
+      ]
+    },
     "models-check-update": {
       "type": "object",
       "description": "cass models check-update --json: compares installed model revision against the pinned registry revision.",

@@ -110,6 +110,7 @@ commands:
   cass models verify [--model NAME] [--json]  Per-file SHA-256 verification of an explicit installed model.
   cass models check-update [--model NAME] [--json]  Compare an explicit installed revision against its pin.
   cass models backfill             Re-embed conversations against a newly acquired model.
+  cass models build-hnsw [--tier fast|quality] [--check] [--force] [--json]  Build/verify the HNSW accelerator for a published semantic artifact (no archive open, no embedding).
   cass expand <path> --line N [-C CONTEXT] [--json]  Show messages around a specific line in a session.
   cass resume <path> [--shell]     Resolve a session path into its native-harness resume command.
   cass timeline [--since DATE] [--until DATE] [--json]  Activity timeline over a time range.
