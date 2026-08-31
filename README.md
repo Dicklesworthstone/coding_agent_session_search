@@ -3148,7 +3148,7 @@ Update check state is stored in the data directory:
 
 ## Dependency Source Contract
 
-`cass` pins its contract-critical ecosystem dependencies with exact registry requirements in [`Cargo.toml`](Cargo.toml); other direct dependencies use normal semver requirements, and `Cargo.lock` freezes the complete resolved graph. Since gh#416 closed, no active dependency or patch resolves from git. Optional sibling-path overrides stay commented out by default and must never be committed active.
+`cass` pins its contract-critical ecosystem dependencies with exact registry requirements in [`Cargo.toml`](Cargo.toml); other direct dependencies use normal semver requirements, and `Cargo.lock` freezes the complete resolved graph. The `frankensqlite` / `fsqlite-types` family is the only active dependency that resolves from a git revision; every other contract-critical dependency resolves from crates.io. Optional sibling-path overrides stay commented out by default and must never be committed active.
 
 | Dependency | Pinned source |
 |------------|-----------------|

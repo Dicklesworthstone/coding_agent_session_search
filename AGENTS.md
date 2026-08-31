@@ -71,7 +71,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 - **Edition:** Rust 2024 (dated nightly pinned by `rust-toolchain.toml`)
 - **Dependency versions:** Wildcard constraints (`*`) for all crates
 - **Configuration:** Cargo.toml only (single-crate project, no workspace)
-- **Unsafe code:** Forbidden
+- **Unsafe code:** Forbidden as a general tool. Tightly scoped, narrowly audited `unsafe` is allowed only where it is unavoidable (e.g., the few Rust 2024 `std::env::set_var`/`remove_var` calls at controlled startup/teardown, or unavoidable FFI with no safe wrapper). Unsafe cross-thread connection wrappers and unjustified `Send`/`Sync` impls remain prohibited and must be UBS-gated.
 
 ### Async Runtime: asupersync
 
@@ -138,11 +138,11 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 | Dependency | Pinned source |
 |------------|-----------------|
 | `frankensqlite` / `fsqlite-types` | git `=0.3.13` at rev `2d8a68b9` (0.3.0 asupersync-0.4.3 migration + GH#333/GH#334 fix wave incl. cass#393 st_dev namespace-sidecar repair, + 0.3.1 allocator/freelist/concurrent-writer correctness wave; carries the FTS5 overlong-term skip cap [cass#362], the 0.3.9 Windows sidecar-less read-only close fix, the FTS5 read-only integrity-check admission, and the 0.3.13 autoindex-vanish corruption-writer fixes [cass#434]; single-family redirect via `[patch.crates-io].fsqlite`) |
-| `franken-agent-detection` | `82424dc8` (v0.2.1, 2026-08-23: first-class Oh My Pi v18 connector/profile/XDG discovery plus pi-family remote-provenance preservation, on the fsqlite 0.3.x + asupersync 0.4.x line) |
+| `franken-agent-detection` | crates.io `=0.2.1` (2026-08-24; `src/` byte-identical to the previously pinned git rev `82424dc8` — first-class Oh My Pi v18 connector with profile, XDG, direct-root, and sub-agent discovery; preserves pi-family remote provenance; includes Muse Code and VS Code Copilot; aligned with fsqlite 0.3.x + asupersync 0.4.x) |
 | `asupersync` | `=0.4.9` (crates.io; fsqlite 0.3.x requires the 0.4.x line; asupersync 0.3.x and 0.4.x are non-interchangeable; 0.4.x preserves the 0.4.3 public API) |
-| `frankensearch` | `22859f74` (the v1.7.0 tag commit, 2026-08-23, aligned with fsqlite 0.3.8 + asupersync 0.4.9; explicit `cass-compat` → `lexical-tantivy`; pure-Rust `native` feature: frankentorch NativeEmbedder + NativeReranker; frankentorch pinned by git rev inside frankensearch — cass #308, bd-8nqz.5) |
+| `frankensearch` | crates.io `=0.4.2` (2026-08-28, cass#410/frankensearch#40: adds the distinct opt-in `paraphrase-multilingual-MiniLM-L12-v2` native embedding space, immutable artifact/producer identity, explicit-only acquisition, and dynamic 6/12-layer Frankentorch loading to the 0.4.1 Windows Quill publication line. It retains the CASS→Quill lexical flip with `cass-compat` → `lexical-tantivy` for the differential oracle and schema-generation sentinel, pure-Rust `native`, architecture-safe HNSW, consumer-owned `TwoTierIndexPaths`, non-mutating lexical admission, cancellation-safe facade opening, and generation-pinned Quill hydration. Registry `0.3.2` is a stale same-version twin of an older tree (no quill/cass-compat/native) — the exact pin exists so resolution can never reach it. frankentorch resolves from crates.io as `frankentorch-*`; the HNSW fork is registry `frankenhnsw 0.3.5`; tantivy is registry `=0.26.1` (RUSTSEC-2026-0253 on its lru is unreachable: the advisory needs a panicking `Drop` on a cache key under `catch_unwind`, and tantivy’s cache keys are trivially droppable) — cass #308, #333, #410, bd-8nqz.5, bd-07os, bd-r65a.1) |
 | `frankentui` (`ftui`, `ftui-runtime`, `ftui-tty`, `ftui-extras`) | crates.io `=0.5.0` (2026-08-21; previously git `5f78cfa0` / 0.3.1 — the 0.5 API compiled with zero call-site changes) |
-| `toon` (`tru`) | `d7185c78` (0.2.3) |
+| `toon` (`tru`) | crates.io `=0.2.4` (2026-08-24; production sources byte-identical to the previously pinned git rev `d7185c78` — registry 0.2.3 was rejected because its tree differs from the rev in real source despite the matching version field) |
 
 ### Release Profile
 
