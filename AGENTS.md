@@ -137,7 +137,7 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 
 | Dependency | Pinned source |
 |------------|-----------------|
-| `frankensqlite` / `fsqlite-types` | crates.io `=0.3.8` (0.3.0 asupersync-0.4.3 migration + GH#333/GH#334 fix wave incl. cass#393 st_dev namespace-sidecar repair, + 0.3.1 allocator/freelist/concurrent-writer correctness wave; carries the FTS5 overlong-term skip cap [cass#362]) |
+| `frankensqlite` / `fsqlite-types` | git `=0.3.13` at rev `2d8a68b9` (0.3.0 asupersync-0.4.3 migration + GH#333/GH#334 fix wave incl. cass#393 st_dev namespace-sidecar repair, + 0.3.1 allocator/freelist/concurrent-writer correctness wave; carries the FTS5 overlong-term skip cap [cass#362], the 0.3.9 Windows sidecar-less read-only close fix, the FTS5 read-only integrity-check admission, and the 0.3.13 autoindex-vanish corruption-writer fixes [cass#434]; single-family redirect via `[patch.crates-io].fsqlite`) |
 | `franken-agent-detection` | `82424dc8` (v0.2.1, 2026-08-23: first-class Oh My Pi v18 connector/profile/XDG discovery plus pi-family remote-provenance preservation, on the fsqlite 0.3.x + asupersync 0.4.x line) |
 | `asupersync` | `=0.4.9` (crates.io; fsqlite 0.3.x requires the 0.4.x line; asupersync 0.3.x and 0.4.x are non-interchangeable; 0.4.x preserves the 0.4.3 public API) |
 | `frankensearch` | `22859f74` (the v1.7.0 tag commit, 2026-08-23, aligned with fsqlite 0.3.8 + asupersync 0.4.9; explicit `cass-compat` → `lexical-tantivy`; pure-Rust `native` feature: frankentorch NativeEmbedder + NativeReranker; frankentorch pinned by git rev inside frankensearch — cass #308, bd-8nqz.5) |

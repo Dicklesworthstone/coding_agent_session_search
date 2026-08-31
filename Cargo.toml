@@ -49,7 +49,7 @@ which = "8.0.2"
 shell-words = "1.1.1"
 dotenvy = "0.15.7"
 notify = "8.2.0"
-# fsqlite 0.3.11 at the exact source revision below carries the 0.3.0
+# fsqlite 0.3.13 at the exact source revision below carries the 0.3.0
 # asupersync-0.4.3 runtime migration
 # and bug-fix wave (GH#333 concurrent-open BusyRecovery retries, GH#334
 # FileIdentity re-derivation after file replacement — the cass#393
@@ -64,14 +64,16 @@ notify = "8.2.0"
 # both the physically read-only pager and `PRAGMA query_only` guards while
 # retaining `ReadOnly` for every mutating FTS maintenance command. That exact
 # behavior is required by CASS's pre-mutation full-rebuild integrity gate on
-# Windows. The engine API is async
+# Windows. 0.3.13 adds the
+# autoindex-vanish corruption-writer fixes (the cass#434 writer class).
+# The engine API is async
 # (!Send futures); CASS's synchronous call shape is preserved by
 # src/franken_sync.rs, which drives every engine future on a private
 # current-thread asupersync runtime.
-frankensqlite = { version = "=0.3.11", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "027f62f22c3a70a05338e47af2a76c622df3ca57", package = "fsqlite", features = ["fts5", "async-api"] }
+frankensqlite = { version = "=0.3.13", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4", package = "fsqlite", features = ["fts5", "async-api"] }
 # The production storage-integrity probe calls FrankenSQLite's public VFS API
 # directly so it can inspect native writer locks without opening the pager.
-fsqlite-types = { version = "=0.3.11", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "027f62f22c3a70a05338e47af2a76c622df3ca57", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.3.13", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4", package = "fsqlite-types" }
 rayon = "1.12.0"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
@@ -216,15 +218,15 @@ rand_chacha = "0.10"
 rusqlite = { version = "0.40.2", features = ["bundled", "modern_sqlite"] }
 # The manifest-policy build gate requires this explicit dev entry for compat
 # fixture assertions, even though production also uses the same pinned crate.
-fsqlite-types = { version = "=0.3.11", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "027f62f22c3a70a05338e47af2a76c622df3ca57", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.3.13", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4", package = "fsqlite-types" }
 
 # The fsqlite family resolves from one immutable upstream revision for every
 # direct and transitive consumer. franken-agent-detection names the registry
 # facade, so this exact patch is required to keep that transitive entry point
 # in the same engine universe as CASS's direct git dependencies. build.rs
-# enforces the patch identity, exact git source, and single 0.3.11 family.
+# enforces the patch identity, exact git source, and single 0.3.13 family.
 [patch.crates-io]
-fsqlite = { version = "=0.3.11", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "027f62f22c3a70a05338e47af2a76c622df3ca57" }
+fsqlite = { version = "=0.3.13", git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4" }
 
 [[bin]]
 name = "cass"

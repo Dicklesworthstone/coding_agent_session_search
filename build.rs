@@ -48,7 +48,7 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "fsqlite",
         manifest_package_field: Some("fsqlite"),
         // Exact upstream source pin (established with the fsqlite 0.2.1
-        // migration, bead bo000; now at 0.3.11, which carries the asupersync
+        // migration, bead bo000; now at 0.3.13, which carries the asupersync
         // 0.4.3 runtime migration, the GH#333/GH#334 bug-fix wave, the
         // cass#393 namespace-sidecar st_dev repair, the 0.3.1
         // allocator/freelist/concurrent-writer correctness wave, and the
@@ -57,10 +57,12 @@ const CONTRACTS: &[DependencyContract] = &[
         // 027f62f2 admit the semantically read-only FTS5 integrity command
         // through both the physically read-only pager and `PRAGMA query_only`
         // guards, which CASS's full-rebuild preflight requires on Windows
-        // without weakening its corruption gate.
+        // without weakening its corruption gate. 0.3.13 adds the
+        // autoindex-vanish corruption-writer fixes (the cass#434 writer
+        // class).
         expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
-        expected_rev: "027f62f22c3a70a05338e47af2a76c622df3ca57",
-        expected_version: "0.3.11",
+        expected_rev: "2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4",
+        expected_version: "0.3.13",
         // `async-api` exposes frankensqlite::AsyncConnection, which
         // src/search/query.rs uses (as SearchSqliteConnection) for the
         // no-hit alternate-agent suggestions without a full storage open.
@@ -80,8 +82,8 @@ const CONTRACTS: &[DependencyContract] = &[
         manifest_package_field: Some("fsqlite-types"),
         // Keep shared types on the identical source revision as the facade.
         expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
-        expected_rev: "027f62f22c3a70a05338e47af2a76c622df3ca57",
-        expected_version: "0.3.11",
+        expected_rev: "2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4",
+        expected_version: "0.3.13",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -98,8 +100,8 @@ const CONTRACTS: &[DependencyContract] = &[
         manifest_package_field: Some("fsqlite-types"),
         // Keep shared types on the identical source revision as the facade.
         expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
-        expected_rev: "027f62f22c3a70a05338e47af2a76c622df3ca57",
-        expected_version: "0.3.11",
+        expected_rev: "2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4",
+        expected_version: "0.3.13",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -432,9 +434,9 @@ fn validate_fsqlite_source_pin(manifest_dir: &Path, manifest: &Value, packaged_m
     // The fsqlite engine family must resolve exclusively from one immutable
     // upstream revision. The exact source is load-bearing for the read-only
     // FTS5 integrity preflight used by CASS on Windows.
-    const EXPECTED_VERSION: &str = "0.3.11";
+    const EXPECTED_VERSION: &str = "0.3.13";
     const EXPECTED_GIT: &str = "https://github.com/Dicklesworthstone/frankensqlite";
-    const EXPECTED_REV: &str = "027f62f22c3a70a05338e47af2a76c622df3ca57";
+    const EXPECTED_REV: &str = "2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4";
 
     // 1. franken-agent-detection names the crates.io facade. Require one
     //    narrowly scoped source replacement so that entry point resolves to
