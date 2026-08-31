@@ -116824,25 +116824,32 @@ fn run_models_backfill(
             decision.scheduled_batch_conversations
         });
 
-    let canonical_db_fingerprint =
-        crate::indexer::lexical_storage_fingerprint_for_db(&db_path).map_err(|e| CliError {
-            code: 5,
-            kind: CliErrorKind::StorageFingerprint.kind_str(),
-            message: format!(
-                "Failed to fingerprint cass database {}: {e:#}",
-                db_path.display()
-            ),
-            hint: Some(
-                "Run 'cass doctor check --json' if the archive is corrupt; index --force-rebuild only rebuilds derived assets from a healthy canonical archive."
-                    .into(),
-            ),
-            retryable: true,
-        })?;
     let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
         code: 5,
         kind: CliErrorKind::Storage.kind_str(),
         message: format!("Failed to open cass database {}: {e}", db_path.display()),
         hint: Some("Run 'cass health --json' to inspect the archive database".into()),
+        retryable: true,
+    })?;
+    // povuc / PR#384 "fingerprint reuse": this bounded backfill owns an open
+    // handle for its whole run, so fingerprint through it (GH#404 helper)
+    // instead of paying a second FrankenSQLite open + archive scan solely to
+    // stamp the checkpoint. The fingerprint is content-derived (ids/counts),
+    // so computing it after the writer open is equivalent.
+    let canonical_db_fingerprint = crate::indexer::lexical_storage_fingerprint_for_storage(
+        &storage,
+    )
+    .map_err(|e| CliError {
+        code: 5,
+        kind: CliErrorKind::StorageFingerprint.kind_str(),
+        message: format!(
+            "Failed to fingerprint cass database {}: {e:#}",
+            db_path.display()
+        ),
+        hint: Some(
+            "Run 'cass doctor check --json' if the archive is corrupt; index --force-rebuild only rebuilds derived assets from a healthy canonical archive."
+                .into(),
+        ),
         retryable: true,
     })?;
     let mut manifest = SemanticManifest::load_or_default(&data_dir).map_err(|e| CliError {
