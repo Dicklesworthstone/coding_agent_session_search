@@ -100568,6 +100568,7 @@ fn index_finalize_abort_threshold(abort_threshold: Option<Duration>) -> Option<D
 /// unreadable). Page-cache-hot userspace spins — the #301 wedge class that
 /// disqualified a CPU-liveness signal — do not advance these counters, so
 /// block-IO growth is a safe liveness hint for the pre-index window.
+#[cfg_attr(test, allow(dead_code))]
 fn process_block_io_bytes() -> Option<u64> {
     let text = std::fs::read_to_string("/proc/self/io").ok()?;
     let mut total: u64 = 0;
@@ -100582,6 +100583,23 @@ fn process_block_io_bytes() -> Option<u64> {
         }
     }
     seen.then_some(total)
+}
+
+/// Default watchdog block-IO sampler: the real `/proc` probe in production,
+/// pinned to `None` under `cfg(test)` so the timing-sensitive watchdog unit
+/// tests stay deterministic (the host process's own block IO must not grant
+/// the pre-index grace mid-test). Tests that exercise the grace inject their
+/// own sampler; integration/E2E suites run the real binary and keep the live
+/// probe.
+fn default_watchdog_io_probe() -> fn() -> Option<u64> {
+    #[cfg(test)]
+    {
+        || None
+    }
+    #[cfg(not(test))]
+    {
+        process_block_io_bytes
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100696,7 +100714,7 @@ impl IndexStallWatchdog {
             last_progress_advance: std::time::Instant::now(),
             stall_reported_for_phase: None,
             stall_abort_reported_for_phase: None,
-            io_probe: process_block_io_bytes,
+            io_probe: default_watchdog_io_probe(),
             last_io_bytes: None,
             last_io_advance: std::time::Instant::now(),
         }
@@ -101327,8 +101345,12 @@ mod stall_diagnostics_tests {
         );
 
         // Freeze IO and age the advance stamp past the detect window: the
-        // grace lapses and the base abort fires (bounded, per #422).
+        // grace lapses and the base abort fires (bounded, per #422). The
+        // growing probe's fetch_add left the counter ahead of the last
+        // sample, so align the baseline first — a frozen read must not
+        // register as one more advance.
         watchdog.io_probe = frozen_io;
+        watchdog.last_io_bytes = Some(IO_COUNTER.load(Ordering::Relaxed));
         watchdog.last_io_advance = std::time::Instant::now() - Duration::from_secs(90);
         let abort = watchdog
             .observe(&progress, 300)
