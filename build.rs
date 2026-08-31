@@ -432,53 +432,28 @@ fn validate_path_dependency_contracts(
 }
 
 fn validate_fsqlite_source_pin(manifest_dir: &Path, manifest: &Value, packaged_manifest: bool) {
-    // The fsqlite engine family must resolve exclusively from one immutable
-    // upstream revision. The exact source is load-bearing for the read-only
-    // FTS5 integrity preflight used by CASS on Windows.
+    // The fsqlite engine family must resolve exclusively from crates.io at
+    // one exact version. The single-source identity is load-bearing for the
+    // read-only FTS5 integrity preflight used by CASS on Windows.
     const EXPECTED_VERSION: &str = "0.3.13";
-    const EXPECTED_GIT: &str = "https://github.com/Dicklesworthstone/frankensqlite";
-    const EXPECTED_REV: &str = "2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4";
+    const EXPECTED_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
-    // 1. franken-agent-detection names the crates.io facade. Require one
-    //    narrowly scoped source replacement so that entry point resolves to
-    //    the same reviewed git universe as CASS's direct dependencies.
-    if !packaged_manifest {
-        let patch_tables = table(manifest, "patch", "manifest root");
-        let crates_io = table_value(Some(patch_tables), "crates-io", "[patch]");
-        let Some(crates_io) = crates_io.as_table() else {
-            fatal("dependency source contract: [patch.crates-io] must be a TOML table");
-        };
+    // 1. With the family on crates.io (e926644f), a `[patch]` table is no
+    //    longer required — but if one exists, it must not silently redirect
+    //    any fsqlite family member back to a shadow source.
+    if !packaged_manifest
+        && let Some(patch_tables) = manifest.get("patch")
+        && let Some(crates_io) = patch_tables.get("crates-io").and_then(Value::as_table)
+    {
         for dependency in crates_io.keys() {
-            if dependency.starts_with("fsqlite-") {
+            if dependency == "fsqlite" || dependency.starts_with("fsqlite-") {
                 fatal(format!(
-                    "dependency source contract violation for {dependency}: only the \
-                     registry facade entry [patch.crates-io].fsqlite may redirect the \
-                     family to {EXPECTED_GIT}@{EXPECTED_REV}"
+                    "dependency source contract violation for {dependency}: the fsqlite \
+                     family resolves from crates.io at ={EXPECTED_VERSION}; a \
+                     [patch.crates-io] redirect would reintroduce an unreviewed shadow \
+                     source"
                 ));
             }
-        }
-        let patch_entry = inline_table(crates_io, "fsqlite", "[patch.crates-io]");
-        let actual_version = string_value(patch_entry, "version", "fsqlite");
-        let expected_version = format!("={EXPECTED_VERSION}");
-        if actual_version != expected_version {
-            fatal(format!(
-                "dependency source contract violation for [patch.crates-io].fsqlite: \
-                 version must be `{expected_version}`, found `{actual_version}`"
-            ));
-        }
-        let actual_git = string_value(patch_entry, "git", "fsqlite");
-        if actual_git != EXPECTED_GIT {
-            fatal(format!(
-                "dependency source contract violation for [patch.crates-io].fsqlite: \
-                 git must be `{EXPECTED_GIT}`, found `{actual_git}`"
-            ));
-        }
-        let actual_rev = string_value(patch_entry, "rev", "fsqlite");
-        if actual_rev != EXPECTED_REV {
-            fatal(format!(
-                "dependency source contract violation for [patch.crates-io].fsqlite: \
-                 rev must be `{EXPECTED_REV}`, found `{actual_rev}`"
-            ));
         }
     }
 
@@ -544,11 +519,10 @@ fn validate_fsqlite_source_pin(manifest_dir: &Path, manifest: &Value, packaged_m
             ));
         }
         let source = package.get("source").and_then(Value::as_str).unwrap_or("");
-        let expected_source_prefix = format!("git+{EXPECTED_GIT}?rev={EXPECTED_REV}#");
-        if !source.starts_with(&expected_source_prefix) || !source.ends_with(EXPECTED_REV) {
+        if source != EXPECTED_REGISTRY_SOURCE {
             violations.push(format!(
-                "`{name}` resolves from `{source}`, expected `{EXPECTED_GIT}` at \
-                 revision `{EXPECTED_REV}`"
+                "`{name}` resolves from `{source}`, expected the crates.io registry \
+                 (`{EXPECTED_REGISTRY_SOURCE}`)"
             ));
         }
     }
