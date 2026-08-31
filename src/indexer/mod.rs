@@ -10905,6 +10905,7 @@ fn published_lexical_index_validated_for_current_data(index_path: &Path, db_path
 }
 
 fn persist_completed_lexical_rebuild_checkpoint_from_observations(
+    storage: &FrankenStorage,
     index_path: &Path,
     db_state: LexicalRebuildDbState,
     total_messages: usize,
@@ -10921,12 +10922,27 @@ fn persist_completed_lexical_rebuild_checkpoint_from_observations(
             observed_tantivy_docs
         }
     };
-    if observed_tantivy_docs != total_messages {
+    // GH #435: the lexical sink intentionally drops hard-noise messages
+    // (empty content / tool-acks via `is_hard_message_noise`), so on such
+    // corpora a HEALTHY live index always has fewer docs than the raw
+    // `COUNT(*) FROM messages`. Gating this refresh on the raw count made the
+    // metadata-only checkpoint refresh (#353) skip forever, leaving the stale
+    // fingerprint that drives repeated `--force-rebuild` churn (also #433).
+    // Gate on the same noise-adjusted expectation the rebuild planner uses
+    // (#317). The per-conversation content scan is only paid when the cheap
+    // raw equality does not already prove coverage.
+    let expected_docs = if observed_tantivy_docs == total_messages {
+        total_messages
+    } else {
+        expected_live_lexical_doc_count(storage)?
+    };
+    if observed_tantivy_docs != expected_docs {
         tracing::debug!(
             path = %index_path.display(),
             observed_tantivy_docs,
+            expected_lexical_docs = expected_docs,
             canonical_messages = total_messages,
-            "skipping lexical checkpoint refresh because the live Tantivy index does not match the canonical message count"
+            "skipping lexical checkpoint refresh because the live Tantivy index does not match the noise-adjusted expected document count"
         );
         return Ok(());
     }
@@ -10966,7 +10982,7 @@ fn persist_completed_lexical_rebuild_checkpoint_from_observations(
         && state.committed_offset == target_committed_offset
         && state.committed_conversation_id == max_conversation_id
         && state.processed_conversations == total_conversations
-        && state.indexed_docs == total_messages
+        && state.indexed_docs == observed_tantivy_docs
         && state.committed_meta_fingerprint == committed_meta_fingerprint
         && state.pending.is_none()
         && state.completed
@@ -10987,7 +11003,11 @@ fn persist_completed_lexical_rebuild_checkpoint_from_observations(
     state.committed_offset = target_committed_offset;
     state.committed_conversation_id = max_conversation_id;
     state.processed_conversations = total_conversations;
-    state.indexed_docs = total_messages;
+    // GH #435: record the OBSERVED live doc count, not the raw canonical
+    // message count — on noisy corpora those legitimately differ, and readers
+    // like `should_skip_post_full_scan_authoritative_rebuild` compare the
+    // checkpoint's indexed_docs against live Tantivy observations.
+    state.indexed_docs = observed_tantivy_docs;
     state.pending = None;
     state.completed = true;
     state.committed_meta_fingerprint = committed_meta_fingerprint;
@@ -11011,6 +11031,7 @@ fn refresh_completed_lexical_rebuild_checkpoint(
         total_messages,
     )?;
     persist_completed_lexical_rebuild_checkpoint_from_observations(
+        storage,
         &index_path,
         db_state,
         total_messages,
@@ -11039,12 +11060,17 @@ fn refresh_completed_lexical_rebuild_checkpoint_for_final_state(
             total_messages,
         )?;
         let index_path = index_dir(data_dir)?;
+        // GH #435: pass no fabricated observation — read the live Tantivy doc
+        // count so the checkpoint records what the index actually holds (on
+        // noisy corpora that is legitimately below `total_messages`), and so
+        // the refresh stays fail-closed when the index is genuinely behind.
         return persist_completed_lexical_rebuild_checkpoint_from_observations(
+            storage,
             &index_path,
             db_state,
             total_messages,
             max_conversation_id,
-            Some(total_messages),
+            None,
         );
     }
 
@@ -11072,15 +11098,19 @@ fn refresh_completed_lexical_rebuild_checkpoint_for_final_state(
         total_conversations,
         total_messages,
     )?;
-    settled.close_best_effort_in_place();
     let index_path = index_dir(data_dir)?;
-    persist_completed_lexical_rebuild_checkpoint_from_observations(
+    // Keep `settled` open through the persist call: the doc-count gate may
+    // need it to compute the noise-adjusted expectation (GH #435).
+    let result = persist_completed_lexical_rebuild_checkpoint_from_observations(
+        &settled,
         &index_path,
         db_state,
         total_messages,
         max_conversation_id,
         None,
-    )
+    );
+    settled.close_best_effort_in_place();
+    result
 }
 
 fn persist_final_index_run_metadata(
@@ -15915,7 +15945,8 @@ pub fn run_index(
         // Break the loop with the CHEAP, doc-count-gated metadata-only refresh:
         // `refresh_completed_lexical_rebuild_checkpoint` rewrites the checkpoint
         // fingerprint ONLY when the live Tantivy index already matches the
-        // canonical message count (i.e. the drift was absorbed inline), and
+        // noise-adjusted expected document count (GH #435; i.e. the drift was
+        // absorbed inline), and
         // safely skips otherwise — so it never masks genuine staleness (which
         // would silently drop the newly-ingested sessions from search). When
         // Tantivy is really behind, the refresh no-ops and search keeps
@@ -18496,6 +18527,30 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
     data_dir: &Path,
     progress: Option<Arc<IndexingProgress>>,
 ) -> Result<SearchLexicalRepairOutcome> {
+    // GH #436: probe canonical DB openability BEFORE acquiring the index-run
+    // lock. When the DB is unopenable (e.g. a malformed sqlite image), the
+    // old order created `index-run.lock` (+ `.meta` sidecar) on this
+    // read-triggered path and then bailed — `IndexRunLockGuard`'s Drop
+    // truncates but never unlinks, so a plain `cass search` left a dead
+    // zero-byte lock behind for existence-gated tooling to trip on.
+    //
+    // Deliberately NOT fixed by unlinking in the guard's Drop: every
+    // acquisition site opens the path first and then `try_lock_exclusive`s
+    // the fd, so an unlink opens the classic lockfile race — a process
+    // holding an fd to the old (now unlinked) inode can acquire its lock
+    // while another process locks a freshly created file at the same path,
+    // yielding two concurrent exclusive "holders". Keeping the file
+    // immortal once created is what makes the flock sound; instead we avoid
+    // creating it when the repair cannot possibly proceed. Opening the DB
+    // read-only without the lock is already done by every observation path
+    // (search itself, `read_search_maintenance_snapshot`, status/health).
+    let storage = FrankenStorage::open_readonly(db_path).with_context(|| {
+        format!(
+            "opening database to repair lexical index for search: {}",
+            db_path.display()
+        )
+    })?;
+
     let index_run_lock = acquire_index_run_lock(data_dir, db_path, SearchMaintenanceMode::Index)?;
     let _index_run_lock_heartbeat = IndexRunLockHeartbeat::start(
         data_dir.to_path_buf(),
@@ -18507,12 +18562,6 @@ pub(crate) fn repair_lexical_index_from_canonical_db_for_search(
     // debris from previous crashed runs while we hold the exclusive lock.
     staging_reclaim::reclaim_orphaned_staging_dirs_for_data_dir(data_dir, SystemTime::now()).log();
 
-    let storage = FrankenStorage::open_readonly(db_path).with_context(|| {
-        format!(
-            "opening database to repair lexical index for search: {}",
-            db_path.display()
-        )
-    })?;
     let total_conversations = count_total_conversations_exact(&storage)?;
     if total_conversations == 0 {
         let index_path = index_dir(data_dir)?;
@@ -55936,6 +55985,123 @@ mod tests {
                 .storage_fingerprint,
             live_fingerprint,
             "GH #353: a stale checkpoint must be refreshed to the live fingerprint when Tantivy is equivalent, breaking the forever-defer loop"
+        );
+    }
+
+    /// GH #435: a corpus containing hard-noise messages (empty content /
+    /// tool-acks the lexical sink drops via `is_hard_message_noise`) has a
+    /// HEALTHY live index with fewer docs than `COUNT(*) FROM messages`.
+    /// The checkpoint refresh must gate on the noise-adjusted
+    /// `expected_live_lexical_doc_count` (#317) rather than the raw message
+    /// count — otherwise the #353 metadata-only refresh skips forever and the
+    /// stale fingerprint drives a full `--force-rebuild` on every cycle.
+    #[test]
+    #[serial]
+    fn gh435_refresh_advances_stale_fingerprint_despite_hard_noise_messages() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("agent_search.db");
+        let index_path = index_dir(&data_dir).unwrap();
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+
+        // Two searchable messages plus one hard-noise (empty-content) message
+        // the lexical sink intentionally drops.
+        let mut noise = norm_msg(2, 1_700_000_000_200);
+        noise.content = String::new();
+        let convs = vec![norm_conv(
+            Some("c1"),
+            vec![
+                norm_msg(0, 1_700_000_000_000),
+                norm_msg(1, 1_700_000_000_100),
+                noise,
+            ],
+        )];
+        let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+        ingest_batch(
+            &storage,
+            Some(&mut index),
+            &data_dir,
+            &convs,
+            &None,
+            LexicalPopulationStrategy::IncrementalInline,
+            false,
+        )
+        .unwrap();
+        index.commit().unwrap();
+        drop(index);
+
+        let total_messages = count_total_messages_exact(&storage).unwrap();
+        assert_eq!(total_messages, 3, "canonical DB must hold all 3 messages");
+        assert_eq!(
+            live_tantivy_doc_count(&index_path).unwrap(),
+            Some(2),
+            "the lexical sink must have dropped the hard-noise message"
+        );
+        assert_eq!(
+            expected_live_lexical_doc_count(&storage).unwrap(),
+            2,
+            "the noise-adjusted expectation must match the live index"
+        );
+
+        let live_fingerprint = lexical_rebuild_storage_fingerprint(&db_path).unwrap();
+
+        // Persist a completed checkpoint carrying a STALE fingerprint — the
+        // state the #435 reporter observed after every incremental_inline run.
+        let mut state = LexicalRebuildState::new(
+            lexical_rebuild_db_state(&storage, &db_path).unwrap(),
+            LEXICAL_REBUILD_PAGE_SIZE,
+        );
+        state.db.storage_fingerprint = "content-v1:0:0:0".to_string();
+        state.mark_completed(index_meta_fingerprint(&index_path).unwrap());
+        persist_lexical_rebuild_state(&index_path, &state).unwrap();
+
+        refresh_completed_lexical_rebuild_checkpoint(&storage, &db_path, &data_dir).unwrap();
+
+        let checkpoint = load_lexical_rebuild_checkpoint(&index_path)
+            .unwrap()
+            .expect("refreshed checkpoint");
+        assert_eq!(
+            checkpoint.storage_fingerprint, live_fingerprint,
+            "GH #435: the checkpoint must advance when the live index equals the noise-adjusted expected count"
+        );
+        assert_eq!(
+            checkpoint.indexed_docs, 2,
+            "GH #435: the checkpoint must record the OBSERVED live doc count, not the raw message count"
+        );
+    }
+
+    /// GH #436: a read-triggered lexical repair whose canonical DB cannot be
+    /// opened must not leave a dead zero-byte `index-run.lock` (or `.meta`
+    /// sidecar) behind. The fix probes DB openability before acquiring the
+    /// lock, so on this failure arm the lock artifacts are never created.
+    #[test]
+    #[serial]
+    fn gh436_failed_search_repair_leaves_no_index_run_lock_artifacts() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("agent_search.db");
+        fs::write(&db_path, b"definitely not a sqlite database image").unwrap();
+
+        let err = repair_lexical_index_from_canonical_db_for_search(&db_path, &data_dir, None)
+            .expect_err("repair must fail on a malformed canonical database");
+        assert!(
+            format!("{err:#}").contains("opening database to repair lexical index for search"),
+            "failure must come from the canonical DB open probe, got: {err:#}"
+        );
+
+        let lock_path = crate::search::asset_state::index_run_lock_path(&data_dir);
+        assert!(
+            !lock_path.exists(),
+            "GH #436: a failed read-path repair must not leave index-run.lock behind"
+        );
+        let sidecar_path =
+            crate::search::asset_state::index_run_lock_metadata_sidecar_path(&lock_path);
+        assert!(
+            !sidecar_path.exists(),
+            "GH #436: a failed read-path repair must not leave index-run.lock.meta behind"
         );
     }
 
