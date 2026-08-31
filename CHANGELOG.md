@@ -15,14 +15,11 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ---
 
-## [Unreleased]
+## [v0.7.1] -- 2026-08-31
 
-> crates.io `0.7.0` was published from commit `1f6cdcf9` on 2026-08-25.
-> Subsequent correctness and release-hardening changes on `main` target
-> `0.7.1`; do not tag a later commit as `v0.7.0`.
->
-> No `v0.7.1` git tag or GitHub Release exists yet. The entries below describe
-> the current release candidate on `main`, not already-published binaries.
+> crates.io `0.7.0` was published from commit `1f6cdcf9` on 2026-08-25;
+> `v0.7.1` is the first tagged GitHub Release of the 0.7 line (binaries for
+> that crates.io publish were never shipped, so `v0.7.1` supersedes it).
 
 ### Added
 
@@ -52,6 +49,11 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ### Changed
 
+- Advanced the FrankenSQLite engine pin to `0.3.13` (rev `2d8a68b9`), which
+  carries the autoindex-vanish corruption-writer fixes — the writer-side class
+  behind the FTS5-corrupt-archive refusals tracked in
+  [#434](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/434)
+  ([`39d85c9f`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/39d85c9f)).
 - Advanced the registry dependency line to FrankenSQLite `0.3.11` and
   Frankensearch `0.4.1`. This carries the Windows read-only reopen repair and
   native Quill `LockFileEx` writer admission, and the build contract now rejects
@@ -76,6 +78,54 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ### Fixed
 
+- Fixed the GH#413 index-wedge class: the lexical-rebuild sink now flushes on
+  starvation so retained byte reservations cannot deadlock the pipeline
+  ([`424765b3`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/424765b3)),
+  and the stall watchdog grants a bounded preparing-phase grace window while
+  process block IO still advances
+  ([`f2f0aaff`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/f2f0aaff),
+  [`cd419c6f`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/cd419c6f),
+  [#413](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/413)).
+- A successful `cass index` run now validates that searchable lexical
+  artifacts were actually published (exit 9 otherwise), closing the
+  silent-success half of the search-refresh liveness report; runs against a
+  provably empty canonical archive are exempt
+  ([`f6d1e0ab`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/f6d1e0ab),
+  [`9157effc`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/9157effc),
+  [`5dce0f61`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/5dce0f61),
+  [#422](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/422)).
+- Metadata refresh is now gated on a noise-adjusted document count and the
+  archive DB is probed before taking the index lock, so a refresh can no
+  longer thrash on noise deltas or hold the lock against an unopenable DB
+  ([`02a3165e`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/02a3165e),
+  [#435](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/435),
+  [#436](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/436)).
+- Fixed the unsafe watermark portions of the interrupted-incremental-index
+  report: streaming mode advances each connector watermark only after that
+  connector completes and its batches commit, batch mode no longer advances a
+  timed global watermark while other connectors' batches are pending, and an
+  active/skipped source withholds only its own connector watermark. The exact
+  per-file resume ledger remains open pending an upstream connector seam
+  ([#426](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/426)).
+- Fixed empty-query browse-by-date ordering at TUI startup and made
+  browse paging skip conversations with no messages, so an empty newest
+  conversation cannot steal a page slot
+  ([`ca088e9d`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ca088e9d),
+  [`c728035e`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/c728035e),
+  [#395](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/395)).
+- Doctor now scales the archive-DB probe budget with database and WAL bundle
+  size and bounds the raw-mirror manifest listing by default, so large
+  archives cannot time out or flood the report
+  ([`91ddd68d`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/91ddd68d),
+  [`5f288040`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/5f288040),
+  [`b6c245e8`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/b6c245e8),
+  [#374](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/374)).
+- `cass status` reports a legacy Tantivy generation as engine-incompatible
+  with the exact rebuild contract instead of ready, and the status lane uses a
+  strict read-only, hard-bounded archive probe
+  ([`b61af339`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/b61af339),
+  [`f6bad77f`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/f6bad77f),
+  [#382](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/382)).
 - Completed kind-first local/remote provenance across analytics, incident
   discovery, stats, timeline, semantic filtering, TUI local-file actions, and
   doctor/raw-mirror diagnostics, and storage ingestion. Named local-kind
