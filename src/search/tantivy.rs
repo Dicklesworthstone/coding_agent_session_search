@@ -1879,6 +1879,82 @@ impl TantivyIndex {
         }
     }
 
+    /// Total live documents in the published snapshot.
+    pub fn doc_count(&self) -> Result<u64> {
+        self.inner.doc_count()
+    }
+
+    /// Build every lexical document for one packet without writing anything.
+    ///
+    /// The projection and noise filter are identical to
+    /// [`Self::add_messages_from_packet`]; callers that need identity-stable
+    /// writes (qhiv2 targeted reconcile) feed the result to
+    /// [`Self::upsert_prebuilt_documents_slice`].
+    #[must_use]
+    pub fn build_packet_documents(
+        packet: &ConversationPacket,
+        conversation_id_override: Option<i64>,
+    ) -> Vec<FsCassDocument> {
+        let mut context = cass_doc_context_from_packet(packet);
+        if let Some(id) = conversation_id_override {
+            context.conversation_id = Some(id);
+        }
+        packet
+            .payload
+            .messages
+            .iter()
+            .filter_map(|msg| cass_document_for_packet_message(&context, msg))
+            .collect()
+    }
+
+    /// Upsert prebuilt documents in bounded batches under their stable
+    /// identities (see `QuillCassIndex::upsert_cass_documents`); a retry of
+    /// the same set converges to exactly one live document per identity
+    /// instead of appending duplicates.
+    pub fn upsert_prebuilt_documents_slice(
+        &mut self,
+        documents: &[FsCassDocument],
+    ) -> Result<usize> {
+        let max_messages = tantivy_prebuilt_add_batch_max_messages();
+        let max_chars = tantivy_add_batch_max_chars();
+        let mut upserted_docs = 0usize;
+        let mut batch_start = 0usize;
+        let mut pending_chars = 0usize;
+
+        for (idx, doc) in documents.iter().enumerate() {
+            pending_chars = pending_chars.saturating_add(doc.content.len());
+            let batch_len = idx + 1 - batch_start;
+            if batch_len >= max_messages || pending_chars >= max_chars {
+                let batch_end = idx + 1;
+                upserted_docs = upserted_docs.saturating_add(batch_end - batch_start);
+                let Some(batch) = documents.get(batch_start..batch_end) else {
+                    anyhow::bail!(
+                        "invalid Tantivy upsert document batch range {}..{} for {} documents",
+                        batch_start,
+                        batch_end,
+                        documents.len()
+                    );
+                };
+                self.inner.upsert_cass_documents(batch)?;
+                batch_start = batch_end;
+                pending_chars = 0;
+            }
+        }
+
+        if batch_start < documents.len() {
+            upserted_docs = upserted_docs.saturating_add(documents.len() - batch_start);
+            let Some(batch) = documents.get(batch_start..) else {
+                anyhow::bail!(
+                    "invalid Tantivy upsert document tail range {}.. for {} documents",
+                    batch_start,
+                    documents.len()
+                );
+            };
+            self.inner.upsert_cass_documents(batch)?;
+        }
+        Ok(upserted_docs)
+    }
+
     pub fn add_prebuilt_documents_slice(&mut self, documents: &[FsCassDocument]) -> Result<usize> {
         let max_messages = tantivy_prebuilt_add_batch_max_messages();
         let max_chars = tantivy_add_batch_max_chars();

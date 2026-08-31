@@ -406,6 +406,13 @@ pub enum Commands {
         /// Force lexical index rebuild even if schema matches
         #[arg(long, default_value_t = false, visible_alias = "force")]
         force_rebuild: bool,
+        /// Targeted, idempotent lexical reconcile for ONE canonical
+        /// conversation id (gh#382 partial-prefix recovery): upserts the
+        /// conversation's full capped message set under stable document
+        /// identities and publishes a successor generation. Retry-safe; no
+        /// corpus-wide replay; the canonical archive is opened read-only.
+        #[arg(long, value_name = "CONVERSATION_ID", conflicts_with_all = ["full", "watch", "semantic"])]
+        reconcile_conversation: Option<i64>,
 
         /// Watch for changes and reindex automatically
         #[arg(long)]
@@ -7100,6 +7107,7 @@ async fn execute_cli(
                 Commands::Index {
                     full,
                     force_rebuild,
+                    reconcile_conversation,
                     watch,
                     watch_once,
                     watch_interval,
@@ -7115,6 +7123,14 @@ async fn execute_cli(
                     background,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
+                    if let Some(conversation_id) = reconcile_conversation {
+                        return run_lexical_reconcile_cli(
+                            cli.db.clone(),
+                            data_dir,
+                            conversation_id,
+                            structured_format,
+                        );
+                    }
                     run_index_with_data(
                         cli.db.clone(),
                         full,
@@ -102172,6 +102188,77 @@ mod stall_diagnostics_tests {
         );
         Ok(())
     }
+}
+
+/// CLI wrapper for the qhiv2 / gh#382 targeted lexical reconcile: one
+/// canonical conversation, upserted under stable identities, retry-safe.
+fn run_lexical_reconcile_cli(
+    db_override: Option<PathBuf>,
+    data_dir_override: Option<PathBuf>,
+    conversation_id: i64,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    use colored::Colorize;
+
+    let data_dir = resolve_data_dir(&data_dir_override, db_override.as_ref());
+    let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
+    if !db_path.is_file() {
+        return Err(CliError {
+            code: 3,
+            kind: CliErrorKind::MissingDb.kind_str(),
+            message: format!("Database not found at {}.", db_path.display()),
+            hint: Some("Run 'cass index --full' first.".into()),
+            retryable: true,
+        });
+    }
+    let report = crate::indexer::lexical_reconcile::run_lexical_conversation_reconcile(
+        &data_dir,
+        &db_path,
+        conversation_id,
+    )
+    .map_err(|err| CliError {
+        code: 5,
+        kind: CliErrorKind::Storage.kind_str(),
+        message: format!(
+            "targeted lexical reconcile of conversation {conversation_id} failed: {err:#}"
+        ),
+        hint: Some(
+            "The durable checkpoint (when written) is retained, so rerunning the same \
+             command converges; if the canonical source changed, run 'cass index' first."
+                .into(),
+        ),
+        retryable: true,
+    })?;
+
+    let structured_format = output_format.or_else(robot_format_from_env);
+    if structured_format.is_some() {
+        let mut payload = serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}));
+        if let serde_json::Value::Object(ref mut map) = payload {
+            map.insert("success".into(), serde_json::json!(true));
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{} conversation {} reconciled ({} docs upserted, attempt {})",
+        "✓".green(),
+        report.conversation_id,
+        report.upserted_docs,
+        report.attempt
+    );
+    println!(
+        "  Live docs: {} -> {} (converged: {})",
+        report.doc_count_before, report.doc_count_after, report.converged
+    );
+    println!(
+        "  Canaries: early {:?}, late {:?}; checkpoint cleared: {}",
+        report.early_canary_ok, report.late_canary_ok, report.checkpoint_cleared
+    );
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

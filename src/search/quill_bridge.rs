@@ -485,6 +485,35 @@ impl QuillCassIndex {
         .map_err(|error| anyhow!("indexing CASS documents into Quill: {error}"))
     }
 
+    /// Upsert one batch of CASS documents under their stable identities
+    /// (source id + source path + canonical conversation id + message idx).
+    ///
+    /// Unlike [`Self::add_cass_documents`], a document whose identity is
+    /// already live REPLACES it instead of appending a duplicate — the
+    /// primitive the qhiv2 / gh#382 targeted partial-prefix reconcile needs:
+    /// retrying the same source set converges to exactly one live document
+    /// per identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when admission, identity resolution, or accumulation
+    /// refuses the batch.
+    pub fn upsert_cass_documents(&mut self, documents: &[QuillCassDocument]) -> Result<()> {
+        if documents.is_empty() {
+            return Ok(());
+        }
+        let projected: Vec<SchemaDocument> = documents
+            .iter()
+            .map(QuillCassDocument::to_schema_document)
+            .collect();
+        drive(|cx| {
+            let projected = &projected;
+            let index = &self.index;
+            async move { index.upsert_schema_documents(&cx, projected).await }
+        })
+        .map_err(|error| anyhow!("upserting CASS documents into Quill: {error}"))
+    }
+
     /// Publish everything staged since the last commit.
     ///
     /// # Errors
