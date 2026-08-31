@@ -40,8 +40,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    config::DiscoveredHost, configure_child_process_group, host_key_verification_error,
-    is_host_key_verification_failure, strict_ssh_cli_tokens, wait_for_child_output_with_timeout,
+    config::DiscoveredHost, configure_child_process_group, file_backed_child_stdin,
+    host_key_verification_error, is_host_key_verification_failure, strict_ssh_cli_tokens,
+    wait_for_child_output_with_timeout,
 };
 
 /// Default connection timeout in seconds.
@@ -393,18 +394,28 @@ pub fn probe_host(host: &DiscoveredHost, timeout_secs: u64) -> HostProbeResult {
     // Build SSH command with strict host key verification.
     // Security-first: do not auto-trust unknown hosts during probing.
     // Use the host alias directly (SSH config handles Port, User, IdentityFile, ProxyJump, etc.)
+    let probe_script = build_probe_script();
+    let child_stdin = match file_backed_child_stdin(probe_script.as_bytes()) {
+        Ok(stdin) => stdin,
+        Err(e) => {
+            return HostProbeResult::unreachable(
+                &host.name,
+                format!("Failed to prepare SSH probe input: {e}"),
+            );
+        }
+    };
     let mut cmd = Command::new("ssh");
     cmd.args(strict_ssh_cli_tokens(timeout_secs))
         .arg("--")
         .arg(&host.name)
         .arg("bash -s")
-        .stdin(Stdio::piped())
+        .stdin(child_stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_child_process_group(&mut cmd);
 
     // Spawn the process and write probe script to stdin
-    let mut child = match cmd.spawn() {
+    let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             return HostProbeResult::unreachable(
@@ -415,13 +426,6 @@ pub fn probe_host(host: &DiscoveredHost, timeout_secs: u64) -> HostProbeResult {
     };
 
     // Write probe script to stdin
-    let probe_script = build_probe_script();
-    let write_error = if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        stdin.write_all(probe_script.as_bytes()).err()
-    } else {
-        None
-    };
 
     // Wait for completion
     let output = match wait_for_child_output_with_timeout(child, command_timeout) {
@@ -458,13 +462,6 @@ pub fn probe_host(host: &DiscoveredHost, timeout_secs: u64) -> HostProbeResult {
 
         return HostProbeResult::unreachable(&host.name, error_msg);
     }
-    if let Some(e) = write_error {
-        return HostProbeResult::unreachable(
-            &host.name,
-            format!("Failed to write probe script: {}", e),
-        );
-    }
-
     // Parse successful output
     let stdout = String::from_utf8_lossy(&output.stdout);
     parse_probe_output(&host.name, &stdout, connection_time_ms)

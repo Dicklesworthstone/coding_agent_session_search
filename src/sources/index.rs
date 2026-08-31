@@ -25,7 +25,6 @@
 //! }
 //! ```
 
-use std::io::Write as IoWrite;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -33,7 +32,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::{
-    configure_child_process_group, host_key_verification_error, is_host_key_verification_failure,
+    configure_child_process_group, file_backed_child_stdin, host_key_verification_error,
+    is_host_key_verification_failure,
     probe::{CassStatus, HostProbeResult},
     strict_ssh_cli_tokens, wait_for_child_output_with_timeout,
 };
@@ -820,18 +820,12 @@ fi
             .arg("bash")
             .arg("-s");
 
-        cmd.stdin(Stdio::piped())
+        cmd.stdin(file_backed_child_stdin(script.as_bytes())?)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         configure_child_process_group(&mut cmd);
 
-        let mut child = cmd.spawn()?;
-
-        let write_error = if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(script.as_bytes()).err()
-        } else {
-            None
-        };
+        let child = cmd.spawn()?;
 
         let output = wait_for_command_output_with_timeout(child, command_timeout)?;
 
@@ -856,10 +850,6 @@ fi
                 stderr.trim()
             )));
         }
-        if let Some(err) = write_error {
-            return Err(IndexError::Io(err));
-        }
-
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 }

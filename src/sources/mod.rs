@@ -78,8 +78,8 @@ pub mod provenance;
 pub mod setup;
 pub mod sync;
 
-use std::io::Read as IoRead;
-use std::process::{Child, Command, Output};
+use std::io::{Read as IoRead, Seek, Write};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -140,6 +140,13 @@ fn shell_quote_ssh_arg(value: &str) -> String {
         return value.to_string();
     }
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+pub(crate) fn file_backed_child_stdin(contents: &[u8]) -> std::io::Result<Stdio> {
+    let mut file = tempfile::tempfile()?;
+    file.write_all(contents)?;
+    file.seek(std::io::SeekFrom::Start(0))?;
+    Ok(Stdio::from(file))
 }
 
 struct ChildPipeReader {
@@ -385,5 +392,34 @@ mod tests {
 
         assert!(!tokens.contains(&"-F".to_string()));
         assert!(!command.contains(" -F "));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_child_stdin_delivers_exact_bytes() -> anyhow::Result<()> {
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg("cat")
+            .stdin(file_backed_child_stdin(b"probe payload\n")?)
+            .stdout(std::process::Stdio::piped())
+            .output()?;
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"probe payload\n");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_child_stdin_survives_child_exit_without_reading() -> anyhow::Result<()> {
+        let payload = vec![b'x'; 1_048_576];
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg("exit 23")
+            .stdin(file_backed_child_stdin(&payload)?)
+            .status()?;
+
+        assert_eq!(status.code(), Some(23));
+        Ok(())
     }
 }
