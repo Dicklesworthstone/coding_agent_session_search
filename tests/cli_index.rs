@@ -108,6 +108,52 @@ fn index_creates_db_and_index() {
 }
 
 #[test]
+fn full_index_worker_overrides_the_linux_default_stack_for_franken_open()
+-> Result<(), Box<dyn std::error::Error>> {
+    let tmp = TempDir::new()?;
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(&data_dir)?;
+
+    // The ordinary integration harness uses a 16 MiB RUST_MIN_STACK. Pin the
+    // production Linux default here so this child reproduces the debug-build
+    // FrankenStorage::open overflow unless cass explicitly sizes its index
+    // worker thread.
+    let mut cmd = base_cmd(tmp.path());
+    cmd.env("RUST_MIN_STACK", (2 * 1024 * 1024).to_string())
+        .arg("index")
+        .arg("--full")
+        .arg("--json")
+        .arg("--no-progress-events")
+        .arg("--data-dir")
+        .arg(&data_dir);
+    let output = cmd.output()?;
+
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "full index should survive FrankenStorage::open on its explicitly sized worker: status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        ))
+        .into());
+    }
+
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    if payload.get("success").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(
+            std::io::Error::other(format!("full index did not report success: {payload}")).into(),
+        );
+    }
+    if !data_dir.join("agent_search.db").is_file() {
+        return Err(
+            std::io::Error::other("full index did not create the canonical archive").into(),
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 #[serial]
 fn index_watch_once_skips_advisory_locked_active_source_without_quarantine() {
     let tmp = TempDir::new().unwrap();

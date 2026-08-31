@@ -99867,14 +99867,16 @@ fn validate_successful_index_artifacts(
     Ok(())
 }
 
-#[cfg(windows)]
-const WINDOWS_INDEX_WORKER_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
+// FrankenSQLite's debug-mode async open futures can exceed the 2 MiB default
+// worker stack on Linux as well as the 1 MiB MSVC default. Keep the explicit
+// bound on every platform so `cass index` does not depend on RUST_MIN_STACK or
+// release-mode frame shrinking just to open the canonical archive.
+const INDEX_WORKER_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
 fn index_worker_thread_builder() -> std::thread::Builder {
-    let builder = std::thread::Builder::new().name("cass-index-worker".to_string());
-    #[cfg(windows)]
-    let builder = builder.stack_size(WINDOWS_INDEX_WORKER_STACK_SIZE_BYTES);
-    builder
+    std::thread::Builder::new()
+        .name("cass-index-worker".to_string())
+        .stack_size(INDEX_WORKER_STACK_SIZE_BYTES)
 }
 
 /// Run an incremental index pass before a TUI or Search invocation when the
