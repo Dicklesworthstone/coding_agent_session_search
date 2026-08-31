@@ -582,7 +582,7 @@ impl DoctorFixtureFactory {
                     .push_unique("derived-lexical-stale");
             }
             DoctorFixtureScenario::CoverageReducingCandidate => {
-                self.write_fast_incomplete_archive_with_stale_index();
+                self.apply_scenario(DoctorFixtureScenario::DbCorruptWithStaleIndex);
                 self.set_contract(
                     "archive-coverage-gate-risk",
                     "blocked",

@@ -49551,8 +49551,36 @@ fn build_doctor_source_authority_report(
 fn doctor_refuse_source_authority_when_collectors_deferred(
     mut report: DoctorSourceAuthorityReport,
     reason: &str,
+    preserve_verified_raw_mirror_candidate: bool,
 ) -> DoctorSourceAuthorityReport {
+    let mut preserved_authorities = Vec::new();
     for mut candidate in std::mem::take(&mut report.selected_authorities) {
+        if preserve_verified_raw_mirror_candidate
+            && matches!(
+                candidate.authority,
+                DoctorSourceAuthorityKind::VerifiedRawMirror
+            )
+            && matches!(
+                candidate.decision,
+                DoctorSourceAuthorityDecision::CandidateOnly
+            )
+            && matches!(
+                candidate.checksum_status,
+                DoctorArtifactChecksumStatus::Matched
+            )
+        {
+            candidate.reason = format!(
+                "checksum-verified raw mirror may seed an isolated candidate after affirmative canonical corruption; archive-wide coverage remains unchecked: {reason}"
+            );
+            candidate
+                .evidence
+                .push("affirmative-canonical-integrity-failure".to_string());
+            candidate
+                .evidence
+                .push("candidate-only-not-promotion-authority".to_string());
+            preserved_authorities.push(candidate);
+            continue;
+        }
         candidate.decision = DoctorSourceAuthorityDecision::Refused;
         candidate.reason = format!(
             "archive-wide authority evidence is unchecked; prior provisional selection refused: {reason}"
@@ -49562,13 +49590,27 @@ fn doctor_refuse_source_authority_when_collectors_deferred(
             .push("archive-wide-collectors-deferred".to_string());
         report.rejected_authorities.push(candidate);
     }
-    report.decision = DoctorSourceAuthorityDecision::Refused;
-    report.selected_authority = None;
+    report.selected_authorities = preserved_authorities;
+    report.selected_authority = report
+        .selected_authorities
+        .first()
+        .map(|candidate| candidate.authority);
+    report.decision = match report.selected_authorities.first() {
+        Some(candidate) => candidate.decision,
+        None => DoctorSourceAuthorityDecision::Refused,
+    };
     report.notes.push(reason.to_string());
-    report.notes.push(
-        "No zero-valued deferred coverage field may select or promote a repair authority."
-            .to_string(),
-    );
+    if report.selected_authorities.is_empty() {
+        report.notes.push(
+            "No zero-valued deferred coverage field may select or promote a repair authority."
+                .to_string(),
+        );
+    } else {
+        report.notes.push(
+            "Affirmative canonical corruption permits checksum-verified raw-mirror CandidateOnly authority for isolated reconstruction; deferred coverage fields still cannot authorize promotion."
+                .to_string(),
+        );
+    }
     report
 }
 
@@ -60552,6 +60594,7 @@ fn build_doctor_repair_plan_preview(
     canonical_archive_queryable_for_non_destructive_derived_rebuild: bool,
     canonical_candidate_replacement_authorized: bool,
     archive_wide_collectors_complete: bool,
+    candidate_repair_authority_complete: bool,
     db_messages: Option<usize>,
     raw_mirror_backfill: &DoctorRawMirrorBackfillReport,
     coverage_summary: &DoctorCoverageSummary,
@@ -60594,7 +60637,7 @@ fn build_doctor_repair_plan_preview(
             );
         }
         None
-    } else if !archive_wide_collectors_complete {
+    } else if !candidate_repair_authority_complete {
         if selected_completed_candidate.is_some() {
             doctor_repair_push_blocker(
                 &mut blocked_reasons,
@@ -60783,6 +60826,7 @@ fn build_doctor_repair_plan_preview(
         "canonical_archive_queryable_for_non_destructive_derived_rebuild": canonical_archive_queryable_for_non_destructive_derived_rebuild,
         "canonical_candidate_replacement_authorized": canonical_candidate_replacement_authorized,
         "archive_wide_collectors_complete": archive_wide_collectors_complete,
+        "candidate_repair_authority_complete": candidate_repair_authority_complete,
         "db_messages": db_messages,
         "live_inventory": live_inventory,
         "operation_lock_state": doctor_repair_lock_fingerprint_state(operation_state),
@@ -72683,6 +72727,7 @@ mod doctor_asset_taxonomy_tests {
             canonical_archive_queryable_for_non_destructive_derived_rebuild,
             canonical_candidate_replacement_authorized,
             archive_wide_collectors_complete,
+            archive_wide_collectors_complete,
             None,
             &DoctorRawMirrorBackfillReport::default(),
             &DoctorCoverageSummary::default(),
@@ -72998,10 +73043,83 @@ mod doctor_asset_taxonomy_tests {
         let authority = doctor_refuse_source_authority_when_collectors_deferred(
             doctor_test_source_authority_report(),
             &reason,
+            false,
         );
         assert_eq!(authority.decision, DoctorSourceAuthorityDecision::Refused);
         assert_eq!(authority.selected_authority, None);
         assert!(authority.selected_authorities.is_empty());
+    }
+
+    #[test]
+    fn doctor_affirmative_corruption_preserves_verified_mirror_candidate_only_authority()
+    -> Result<(), String> {
+        let reason =
+            doctor_archive_wide_collectors_deferred_reason(None, false, true, false, true, false)
+                .ok_or_else(|| {
+                "affirmative corrupt-open must defer archive-wide collectors".to_string()
+            })?;
+        let mut report = doctor_test_source_authority_report();
+        report
+            .selected_authorities
+            .push(doctor_source_authority_candidate(
+                DoctorSourceAuthorityKind::VerifiedRawMirror,
+                DoctorSourceAuthorityDecision::CandidateOnly,
+                "verified raw mirror fixture".to_string(),
+                1,
+                None,
+                DoctorArtifactChecksumStatus::Matched,
+                vec!["verified-blob-count=1".to_string()],
+            ));
+
+        let authority =
+            doctor_refuse_source_authority_when_collectors_deferred(report, &reason, true);
+
+        if !matches!(
+            authority.decision,
+            DoctorSourceAuthorityDecision::CandidateOnly
+        ) {
+            return Err(format!(
+                "unexpected aggregate authority decision: {:?}",
+                authority.decision
+            ));
+        }
+        if !authority.selected_authority.is_some_and(|selected| {
+            matches!(selected, DoctorSourceAuthorityKind::VerifiedRawMirror)
+        }) {
+            return Err(format!(
+                "unexpected selected authority: {:?}",
+                authority.selected_authority
+            ));
+        }
+        if !authority.selected_authorities.len().cmp(&1).is_eq() {
+            return Err(format!(
+                "expected one preserved authority, found {}",
+                authority.selected_authorities.len()
+            ));
+        }
+        let Some(selected) = authority.selected_authorities.first() else {
+            return Err("preserved authority disappeared after length check".to_string());
+        };
+        if !matches!(
+            selected.decision,
+            DoctorSourceAuthorityDecision::CandidateOnly
+        ) {
+            return Err(format!(
+                "unexpected preserved authority decision: {:?}",
+                selected.decision
+            ));
+        }
+        if !selected.evidence.iter().any(|evidence| {
+            evidence
+                .as_str()
+                .eq("candidate-only-not-promotion-authority")
+        }) {
+            return Err(format!(
+                "candidate-only boundary evidence is missing: {:?}",
+                selected.evidence
+            ));
+        }
+        Ok(())
     }
 
     #[test]
@@ -85853,6 +85971,22 @@ fn doctor_canonical_candidate_replacement_authorized(
     affirmative_integrity_failure || (!db_exists && !not_initialized)
 }
 
+/// Classify only deterministic corruption-class open failures as affirmative
+/// replacement evidence. Timeouts, locks, permissions, and generic engine
+/// failures remain unknown and must never authorize canonical replacement.
+fn doctor_db_open_error_is_affirmative_integrity_failure(error: &CliError) -> bool {
+    if !error.kind.eq(CliErrorKind::DbOpen.kind_str()) {
+        return false;
+    }
+    let message = error.message.to_ascii_lowercase();
+    message.contains("file is too small to contain a sqlite header")
+        || message.contains("file header is not sqlite format 3")
+        || message.contains("not a database")
+        || message.contains("database disk image is malformed")
+        || message.contains("databasecorrupt")
+        || message.contains("walcorrupt")
+}
+
 fn doctor_archive_wide_collectors_deferred_reason(
     deep_integrity_skip_reason: Option<&str>,
     probe_timed_out: bool,
@@ -85867,12 +86001,12 @@ fn doctor_archive_wide_collectors_deferred_reason(
         "bounded archive database probe timed out".to_string()
     } else if busy_or_locked {
         "archive database is busy or locked".to_string()
+    } else if integrity_failed {
+        "archive database has an affirmative integrity failure".to_string()
     } else if db_open_failed {
         "archive database open did not complete successfully".to_string()
     } else if integrity_unverified {
         "archive database health is unverified".to_string()
-    } else if integrity_failed {
-        "archive database has an affirmative integrity failure".to_string()
     } else {
         return None;
     };
@@ -85997,6 +86131,44 @@ fn doctor_deferred_integrity_never_implies_corruption_or_destructive_rebuild() {
             "an unverified probe is diagnostic uncertainty, not replacement authority: {unverified_message}"
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn doctor_open_failure_authority_accepts_only_affirmative_corruption_classes() -> Result<(), String>
+{
+    let db_open_error = |message: &str| CliError {
+        code: 9,
+        kind: CliErrorKind::DbOpen.kind_str(),
+        message: message.to_string(),
+        hint: None,
+        retryable: true,
+    };
+    for message in [
+        "file is too small to contain a SQLite header (possible corruption)",
+        "file header is not SQLite format 3 (possible corruption)",
+        "database disk image is malformed",
+        "file is not a database",
+    ] {
+        if !doctor_db_open_error_is_affirmative_integrity_failure(&db_open_error(message)) {
+            return Err(format!(
+                "deterministic corruption-class open failure must authorize candidate recovery: {message}"
+            ));
+        }
+    }
+    for message in [
+        "open timed out after 30s (possible corruption or lock contention)",
+        "database is busy",
+        "permission denied",
+        "generic database open failed",
+    ] {
+        if doctor_db_open_error_is_affirmative_integrity_failure(&db_open_error(message)) {
+            return Err(format!(
+                "unknown/transient open failure must remain fail-closed: {message}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// #287: the doctor's `SELECT COUNT(*)` row counts and
@@ -86769,6 +86941,11 @@ pub(crate) fn run_doctor_impl(
                 }
                 Err(e) => {
                     storage_db_open_failed = true;
+                    if doctor_db_open_error_is_affirmative_integrity_failure(&e) {
+                        storage_integrity_failed = true;
+                        storage_attestation_check_depth = Some("archive_open");
+                        storage_attestation_detail = Some(e.message.clone());
+                    }
                     add_check!(
                         "database",
                         "fail",
@@ -87529,11 +87706,32 @@ pub(crate) fn run_doctor_impl(
     let source_authority = {
         let report = build_doctor_source_authority_report(&db_path, &source_inventory, &raw_mirror);
         if let Some(reason) = recovery_evidence_deferred_reason.as_deref() {
-            doctor_refuse_source_authority_when_collectors_deferred(report, reason)
+            doctor_refuse_source_authority_when_collectors_deferred(
+                report,
+                reason,
+                storage_integrity_failed,
+            )
         } else {
             report
         }
     };
+    let candidate_repair_authority_complete = recovery_evidence_collectors_complete
+        || (storage_integrity_failed
+            && source_authority
+                .selected_authorities
+                .iter()
+                .any(|authority| {
+                    matches!(
+                        authority.authority,
+                        DoctorSourceAuthorityKind::VerifiedRawMirror
+                    ) && matches!(
+                        authority.decision,
+                        DoctorSourceAuthorityDecision::CandidateOnly
+                    ) && matches!(
+                        authority.checksum_status,
+                        DoctorArtifactChecksumStatus::Matched
+                    )
+                }));
     doctor_push_timing_span(
         &mut timing_spans,
         "source_authority",
@@ -87544,17 +87742,28 @@ pub(crate) fn run_doctor_impl(
         vec!["source-authority matrix selected or rejected repair authorities".to_string()],
     );
     if let Some(reason) = recovery_evidence_deferred_reason.as_deref() {
-        add_check!(
-            "source_authority",
-            "warn",
-            format!("No archive repair authority was selected; {reason}"),
-            false
-        );
+        if candidate_repair_authority_complete {
+            add_check!(
+                "source_authority",
+                "warn",
+                format!(
+                    "Archive-wide coverage authority is deferred, but checksum-verified raw mirror evidence may seed an isolated candidate after affirmative canonical corruption; promotion remains independently gated; {reason}"
+                ),
+                true
+            );
+        } else {
+            add_check!(
+                "source_authority",
+                "warn",
+                format!("No archive repair authority was selected; {reason}"),
+                false
+            );
+        }
     }
     let candidate_staging_started = Instant::now();
     let mut candidate_staging =
         collect_doctor_candidate_staging_report(&data_dir, &db_path, &index_path);
-    if recovery_evidence_collectors_complete
+    if candidate_repair_authority_complete
         && candidate_staging.total_candidate_count == 0
         && doctor_candidate_build_should_run(
             fix_can_mutate,
@@ -87645,7 +87854,7 @@ pub(crate) fn run_doctor_impl(
         status: candidate_check_status.to_string(),
         message: candidate_check_message,
         fix_available: candidate_staging.total_candidate_count == 0
-            && archive_wide_collectors_complete
+            && candidate_repair_authority_complete
             && doctor_candidate_build_should_run(
                 !fix && operation_state.mutating_doctor_allowed,
                 archive_queryable_for_non_destructive_derived_rebuild,
@@ -87757,6 +87966,7 @@ pub(crate) fn run_doctor_impl(
             archive_queryable_for_non_destructive_derived_rebuild,
             canonical_candidate_replacement_authorized,
             archive_wide_collectors_complete,
+            candidate_repair_authority_complete,
             db_messages,
             &raw_mirror_backfill,
             &coverage_summary,
@@ -87968,7 +88178,7 @@ pub(crate) fn run_doctor_impl(
             "canonical-archive-failure-unproven",
             "candidate promotion refused because no affirmative current integrity failure or absent canonical DB authorizes replacement",
         ))
-    } else if !archive_wide_collectors_complete {
+    } else if !candidate_repair_authority_complete {
         Some((
             "archive-authority-collectors-unchecked",
             "candidate promotion refused because archive-wide coverage and source-authority collectors are unchecked",
@@ -88254,7 +88464,7 @@ pub(crate) fn run_doctor_impl(
     let archive_rebuild_authority_refused = needs_rebuild
         && fix_can_mutate
         && !archive_queryable_for_non_destructive_derived_rebuild
-        && (!canonical_candidate_replacement_authorized || !archive_wide_collectors_complete);
+        && (!canonical_candidate_replacement_authorized || !candidate_repair_authority_complete);
     if archive_rebuild_authority_refused {
         let reason = if !canonical_candidate_replacement_authorized {
             "canonical archive replacement has no affirmative failure/absence evidence"
@@ -99756,6 +99966,112 @@ fn canonical_archive_has_no_messages(db_path: &Path) -> bool {
         .is_ok_and(|max_id| max_id.is_none())
 }
 
+/// Re-prove a completed full index against the final, closed DB/WAL bytes and
+/// cache that exact fingerprint for lightweight status/search projections.
+/// Large archives retain the existing bounded-doctor behavior: an intentionally
+/// deferred deep probe leaves storage state `unchecked` instead of inventing a
+/// pass. An affirmative failure is a failed index postcondition.
+fn persist_post_index_integrity_attestation(data_dir: &Path, db_path: &Path) -> CliResult<()> {
+    let bundle_bytes = doctor_archive_bundle_bytes(db_path);
+    let timeout = doctor_archive_db_probe_hard_timeout(bundle_bytes);
+    let conn = open_franken_cli_read_db_with_hard_timeout(
+        db_path.to_path_buf(),
+        "post-index integrity attestation",
+        Duration::from_secs(30),
+    )
+    .map_err(|error| CliError {
+        code: 9,
+        kind: CliErrorKind::Index.kind_str(),
+        message: format!(
+            "indexing returned success but the final archive could not be opened for post-close integrity attestation: {}",
+            error.message
+        ),
+        hint: Some(
+            "The canonical database was preserved. Inspect `cass doctor check --json` before retrying the full index."
+                .to_string(),
+        ),
+        retryable: error.retryable,
+    })?;
+
+    match run_bounded_doctor_archive_db_probe(conn, db_path, timeout) {
+        DoctorBoundedArchiveDbProbeOutcome::TimedOut { phase } => {
+            tracing::warn!(
+                phase,
+                timeout_secs = timeout.as_secs(),
+                "post-index integrity attestation timed out; storage readiness remains unchecked"
+            );
+            Ok(())
+        }
+        DoctorBoundedArchiveDbProbeOutcome::Completed(probe) => {
+            if let Some(reason) = probe.integrity_skipped_reason {
+                tracing::info!(
+                    reason = %reason,
+                    "post-index integrity attestation was deliberately deferred"
+                );
+                return Ok(());
+            }
+            match probe.integrity {
+                Some(Ok(integrity)) if integrity.is_ok() => {
+                    crate::search::storage_integrity::store_integrity_attestation(
+                        data_dir,
+                        db_path,
+                        crate::search::storage_integrity::IntegrityAttestationVerdict::Pass,
+                        "integrity_check",
+                        None,
+                    )
+                    .ok_or_else(|| CliError {
+                        code: 9,
+                        kind: CliErrorKind::Index.kind_str(),
+                        message: "indexing returned success but the final archive fingerprint could not be captured for its completed integrity attestation".to_string(),
+                        hint: Some(
+                            "The canonical database was preserved. Inspect `cass status --json`; storage readiness will remain unchecked until a matching attestation can be captured."
+                                .to_string(),
+                        ),
+                        retryable: true,
+                    })?;
+                    Ok(())
+                }
+                Some(Ok(integrity)) => Err(CliError {
+                    code: 9,
+                    kind: CliErrorKind::Index.kind_str(),
+                    message: format!(
+                        "indexing returned success but the final archive failed frankensqlite {}: {}",
+                        integrity.failed_pragma_name(),
+                        integrity.diagnostic_summary()
+                    ),
+                    hint: Some(
+                        "The canonical database was preserved. Run `cass doctor check --json` before any further indexing or repair."
+                            .to_string(),
+                    ),
+                    retryable: false,
+                }),
+                Some(Err(error)) => Err(CliError {
+                    code: 9,
+                    kind: CliErrorKind::Index.kind_str(),
+                    message: format!(
+                        "indexing returned success but the final archive integrity probe could not establish a verdict: {error}"
+                    ),
+                    hint: Some(
+                        "The canonical database was preserved. Run `cass doctor check --json` to inspect the archive."
+                            .to_string(),
+                    ),
+                    retryable: true,
+                }),
+                None => Err(CliError {
+                    code: 9,
+                    kind: CliErrorKind::Index.kind_str(),
+                    message: "indexing returned success but the final archive integrity probe returned no verdict".to_string(),
+                    hint: Some(
+                        "The canonical database was preserved. Run `cass doctor check --json` to inspect the archive."
+                            .to_string(),
+                    ),
+                    retryable: true,
+                }),
+            }
+        }
+    }
+}
+
 fn validate_successful_index_artifacts(
     data_dir: &Path,
     db_path: &Path,
@@ -99862,6 +100178,7 @@ fn validate_successful_index_artifacts(
                 retryable: true,
             });
         }
+        persist_post_index_integrity_attestation(data_dir, db_path)?;
     }
 
     Ok(())

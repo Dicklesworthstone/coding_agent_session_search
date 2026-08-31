@@ -2534,7 +2534,6 @@ fn assert_default_artifacts_do_not_leak_sensitive_values(
 }
 
 #[test]
-#[ignore = "bead no0uw: fsqlite 0.3.x detects the corrupt-fixture class at open (0.2.x false-negatived it), so archive-wide collectors defer and mirror-grounded candidate authority is never selected; candidate promotion needs the mirror-authority redesign before these scenarios can run"]
 fn doctor_e2e_runner_reconstructs_candidate_from_mirror_when_db_is_corrupt() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let runner = DoctorE2eRunner::new(temp.path().join("run")).expect("runner");
@@ -2628,7 +2627,6 @@ fn doctor_e2e_runner_reconstructs_candidate_from_mirror_when_db_is_corrupt() {
 }
 
 #[test]
-#[ignore = "bead no0uw: fsqlite 0.3.x detects the corrupt-fixture class at open (0.2.x false-negatived it), so archive-wide collectors defer and mirror-grounded candidate authority is never selected; candidate promotion needs the mirror-authority redesign before these scenarios can run"]
 fn doctor_e2e_runner_blocks_coverage_decreasing_candidate_promotion() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let runner = DoctorE2eRunner::new(temp.path().join("run")).expect("runner");
@@ -2744,7 +2742,6 @@ fn doctor_e2e_runner_blocks_coverage_decreasing_candidate_promotion() {
 }
 
 #[test]
-#[ignore = "bead no0uw: fsqlite 0.3.x detects the corrupt-fixture class at open (0.2.x false-negatived it), so archive-wide collectors defer and mirror-grounded candidate authority is never selected; candidate promotion needs the mirror-authority redesign before these scenarios can run"]
 fn doctor_e2e_runner_promotes_corrupt_db_candidate_and_records_derived_followup() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let runner = DoctorE2eRunner::new(temp.path().join("run")).expect("runner");
@@ -2977,7 +2974,6 @@ fn doctor_e2e_runner_promotes_corrupt_db_candidate_and_records_derived_followup(
 }
 
 #[test]
-#[ignore = "bead no0uw: fsqlite 0.3.x detects the corrupt-fixture class at open (0.2.x false-negatived it), so archive-wide collectors defer and mirror-grounded candidate authority is never selected; candidate promotion needs the mirror-authority redesign before these scenarios can run"]
 fn doctor_e2e_runner_records_cross_device_fallback_kind_for_candidate_promotion() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let runner = DoctorE2eRunner::new(temp.path().join("run")).expect("runner");
@@ -3219,7 +3215,6 @@ fn assert_candidate_promotion_rollback_failpoint(failpoint_phase: &str, scenario
 }
 
 #[test]
-#[ignore = "bead no0uw: fsqlite 0.3.x detects the corrupt-fixture class at open (0.2.x false-negatived it), so archive-wide collectors defer and mirror-grounded candidate authority is never selected; candidate promotion needs the mirror-authority redesign before these scenarios can run"]
 fn doctor_e2e_runner_rolls_back_candidate_promotion_after_component_replace_failpoint() {
     assert_candidate_promotion_rollback_failpoint(
         "after-component-replace",
@@ -3228,7 +3223,6 @@ fn doctor_e2e_runner_rolls_back_candidate_promotion_after_component_replace_fail
 }
 
 #[test]
-#[ignore = "bead no0uw: fsqlite 0.3.x detects the corrupt-fixture class at open (0.2.x false-negatived it), so archive-wide collectors defer and mirror-grounded candidate authority is never selected; candidate promotion needs the mirror-authority redesign before these scenarios can run"]
 fn doctor_e2e_runner_rolls_back_candidate_promotion_before_parent_sync_failpoint() {
     assert_candidate_promotion_rollback_failpoint(
         "before-parent-sync",
