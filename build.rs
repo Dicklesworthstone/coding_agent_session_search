@@ -60,8 +60,9 @@ const CONTRACTS: &[DependencyContract] = &[
         // without weakening its corruption gate. 0.3.13 adds the
         // autoindex-vanish corruption-writer fixes (the cass#434 writer
         // class).
-        expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
-        expected_rev: "2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4",
+        // fsqlite resolves from crates.io at the exact version below.
+        expected_git: "",
+        expected_rev: "",
         expected_version: "0.3.13",
         // `async-api` exposes frankensqlite::AsyncConnection, which
         // src/search/query.rs uses (as SearchSqliteConnection) for the
@@ -80,9 +81,9 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "fsqlite-types",
         crate_package_name: "fsqlite-types",
         manifest_package_field: Some("fsqlite-types"),
-        // Keep shared types on the identical source revision as the facade.
-        expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
-        expected_rev: "2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4",
+        // Keep shared types on the identical registry version as the facade.
+        expected_git: "",
+        expected_rev: "",
         expected_version: "0.3.13",
         expected_features: &[],
         expected_default_features: None,
@@ -98,9 +99,9 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "fsqlite-types",
         crate_package_name: "fsqlite-types",
         manifest_package_field: Some("fsqlite-types"),
-        // Keep shared types on the identical source revision as the facade.
-        expected_git: "https://github.com/Dicklesworthstone/frankensqlite",
-        expected_rev: "2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4",
+        // Keep shared types on the identical registry version as the facade.
+        expected_git: "",
+        expected_rev: "",
         expected_version: "0.3.13",
         expected_features: &[],
         expected_default_features: None,
