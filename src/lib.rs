@@ -100563,6 +100563,27 @@ fn index_finalize_abort_threshold(abort_threshold: Option<Duration>) -> Option<D
     Some(Duration::from_secs(finalize_secs).max(abort_threshold))
 }
 
+/// fr7wp / gh#413: cumulative block-IO bytes for this process (Linux
+/// `/proc/self/io` `read_bytes + write_bytes`; `None` elsewhere or when
+/// unreadable). Page-cache-hot userspace spins — the #301 wedge class that
+/// disqualified a CPU-liveness signal — do not advance these counters, so
+/// block-IO growth is a safe liveness hint for the pre-index window.
+fn process_block_io_bytes() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/self/io").ok()?;
+    let mut total: u64 = 0;
+    let mut seen = false;
+    for line in text.lines() {
+        if let Some(rest) = line
+            .strip_prefix("read_bytes:")
+            .or_else(|| line.strip_prefix("write_bytes:"))
+        {
+            total = total.saturating_add(rest.trim().parse::<u64>().ok()?);
+            seen = true;
+        }
+    }
+    seen.then_some(total)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IndexStallAbortPolicy {
     #[cfg(test)]
@@ -100600,6 +100621,14 @@ struct IndexStallWatchdog {
     last_progress_advance: std::time::Instant,
     stall_reported_for_phase: Option<usize>,
     stall_abort_reported_for_phase: Option<usize>,
+    /// fr7wp / gh#413: injectable process block-IO sampler (see
+    /// [`process_block_io_bytes`]); a fn pointer so tests can pin the signal.
+    io_probe: fn() -> Option<u64>,
+    /// Last sampled cumulative block-IO byte count (pre-index phases only).
+    last_io_bytes: Option<u64>,
+    /// When block IO last grew. Recency within the detect threshold marks the
+    /// slow canonical open/scan as live and grants the bounded grace.
+    last_io_advance: std::time::Instant,
 }
 
 impl IndexStallWatchdog {
@@ -100667,6 +100696,9 @@ impl IndexStallWatchdog {
             last_progress_advance: std::time::Instant::now(),
             stall_reported_for_phase: None,
             stall_abort_reported_for_phase: None,
+            io_probe: process_block_io_bytes,
+            last_io_bytes: None,
+            last_io_advance: std::time::Instant::now(),
         }
     }
 
@@ -100718,6 +100750,27 @@ impl IndexStallWatchdog {
 
         if self.semantic_build && phase_code == indexer::INDEX_PHASE_SEMANTIC_HNSW {
             return None;
+        }
+
+        // fr7wp / gh#413: the slow canonical-DB open (and fsqlite's WAL-replay
+        // work inside it) runs under "preparing" before any progress atomic
+        // can tick — the 2026-08-23 report needed CASS_INDEX_STALL_ABORT_SECS=0
+        // just to get past a healthy slow open on a 2.1GB archive. Sample
+        // cumulative block IO while the run is still pre-index; recency feeds
+        // a BOUNDED grace below (finalize-class threshold), never an
+        // unbounded deferral, so #422's pre-index-wedges-are-abortable
+        // guarantee holds and a #301-class page-cache-hot spin (no block IO)
+        // gets no grace at all.
+        if phase_code < indexer::INDEX_PHASE_LEXICAL_INDEXING
+            && let Some(io_bytes) = (self.io_probe)()
+        {
+            if self
+                .last_io_bytes
+                .is_some_and(|previous| io_bytes > previous)
+            {
+                self.last_io_advance = std::time::Instant::now();
+            }
+            self.last_io_bytes = Some(io_bytes);
         }
 
         let threshold = self.threshold?;
@@ -100869,6 +100922,14 @@ impl IndexStallWatchdog {
             && index_progress
                 .persist_in_progress
                 .load(std::sync::atomic::Ordering::Relaxed);
+        // fr7wp / gh#413: a pre-index stall whose process block IO advanced
+        // within the current detect window is a slow open/scan doing real
+        // work, not a wedge. It gets the finalize-class abort bound instead of
+        // the base one — a bounded delay, exactly like the finalize/persist
+        // graces above it.
+        let preparing_io_grace = pre_index_lexical_wedge
+            && self.last_io_bytes.is_some()
+            && self.last_io_advance.elapsed() < threshold;
         let effective_abort_threshold = if (finalize_wedge
             && (index_progress
                 .finalizing
@@ -100877,6 +100938,7 @@ impl IndexStallWatchdog {
                     .is_rebuilding
                     .load(std::sync::atomic::Ordering::Relaxed)))
             || persist_grace
+            || preparing_io_grace
         {
             // Finalize aborts disabled (CASS_INDEX_FINALIZE_ABORT_SECS=0):
             // treat the finalize window as report-only.
@@ -100960,6 +101022,16 @@ impl IndexStallWatchdog {
                 INDEX_STALL_HINT
             };
             m.insert("hint".into(), serde_json::json!(hint));
+            // fr7wp / gh#413: pre-index stall with recently-advancing block
+            // IO — the canonical open/scan is doing real work and the bounded
+            // grace applies; operators reading the event should wait, not
+            // kill the run.
+            if phase_code < indexer::INDEX_PHASE_LEXICAL_INDEXING
+                && self.last_io_bytes.is_some()
+                && self.last_io_advance.elapsed() < threshold
+            {
+                m.insert("pre_index_io_active".into(), serde_json::json!(true));
+            }
         }
         payload
     }
@@ -101192,6 +101264,119 @@ mod stall_diagnostics_tests {
         assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
         assert_eq!(abort["abort_process"], serde_json::json!(true));
         assert_eq!(abort["exit_code"], serde_json::json!(70));
+        Ok(())
+    }
+
+    /// fr7wp / gh#413: a pre-index (preparing) stall whose process block IO
+    /// keeps advancing is a slow canonical open doing real work. The stall
+    /// REPORT still fires (with the io-active marker), but the abort defers
+    /// to the finalize-class bound; once IO stops advancing past the detect
+    /// window, the base abort applies again — the grace is bounded.
+    #[test]
+    fn watchdog_grants_bounded_preparing_grace_while_block_io_advances() -> anyhow::Result<()> {
+        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
+        use crate::indexer::{INDEX_PHASE_PREPARING, IndexingProgress};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Duration;
+
+        static IO_COUNTER: AtomicU64 = AtomicU64::new(0);
+        fn growing_io() -> Option<u64> {
+            Some(IO_COUNTER.fetch_add(4096, Ordering::Relaxed))
+        }
+        fn frozen_io() -> Option<u64> {
+            Some(IO_COUNTER.load(Ordering::Relaxed))
+        }
+
+        let tmp = TempDir::new()?;
+        let mut watchdog = IndexStallWatchdog::with_abort_policy(
+            tmp.path().to_path_buf(),
+            Duration::from_millis(50),
+            IndexStallAbortPolicy::AbortLexicalPhases,
+        );
+        watchdog.threshold = Some(Duration::from_secs(60));
+        watchdog.abort_threshold = Some(Duration::from_secs(120));
+        watchdog.finalize_abort_threshold = Some(Duration::from_secs(3600));
+        watchdog.io_probe = growing_io;
+        watchdog.last_phase = INDEX_PHASE_PREPARING;
+        watchdog.last_current = 0;
+        watchdog.last_activity = 0;
+        // Base abort threshold (120s) already elapsed; the detect threshold
+        // long passed too.
+        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_secs(200);
+        // Seed a baseline below the counter's next sample (fetch_add returns
+        // the PREVIOUS value) so the first observation registers an IO
+        // advance.
+        IO_COUNTER.store(4096, Ordering::Relaxed);
+        watchdog.last_io_bytes = Some(0);
+        watchdog.last_io_advance = std::time::Instant::now() - Duration::from_secs(200);
+
+        let progress = Arc::new(IndexingProgress::default());
+        let report = watchdog
+            .observe(&progress, 100)
+            .ok_or_else(|| anyhow::anyhow!("preparing stall did not report"))?;
+        assert_eq!(report["event"], serde_json::json!("stall_detected"));
+        assert_eq!(report["pre_index_io_active"], serde_json::json!(true));
+
+        // IO advanced within the detect window -> the abort defers to the
+        // finalize-class bound (3600s) even though the base 120s elapsed.
+        let deferred = watchdog.observe(&progress, 200);
+        assert!(
+            deferred.is_none(),
+            "advancing block IO must defer the pre-index abort to the finalize-class bound",
+        );
+
+        // Freeze IO and age the advance stamp past the detect window: the
+        // grace lapses and the base abort fires (bounded, per #422).
+        watchdog.io_probe = frozen_io;
+        watchdog.last_io_advance = std::time::Instant::now() - Duration::from_secs(90);
+        let abort = watchdog
+            .observe(&progress, 300)
+            .ok_or_else(|| anyhow::anyhow!("stalled-io preparing wedge did not abort"))?;
+        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
+        assert_eq!(abort["abort_process"], serde_json::json!(true));
+        assert_eq!(abort["exit_code"], serde_json::json!(70));
+        Ok(())
+    }
+
+    /// Without a block-IO signal (non-Linux, unreadable /proc) the pre-index
+    /// abort keeps its base threshold — the grace never engages on absence of
+    /// evidence.
+    #[test]
+    fn watchdog_without_io_signal_keeps_base_preparing_abort() -> anyhow::Result<()> {
+        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
+        use crate::indexer::{INDEX_PHASE_PREPARING, IndexingProgress};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        fn no_io() -> Option<u64> {
+            None
+        }
+
+        let tmp = TempDir::new()?;
+        let mut watchdog = IndexStallWatchdog::with_abort_policy(
+            tmp.path().to_path_buf(),
+            Duration::from_millis(50),
+            IndexStallAbortPolicy::AbortLexicalPhases,
+        );
+        watchdog.threshold = Some(Duration::from_millis(1));
+        watchdog.abort_threshold = Some(Duration::from_millis(2));
+        watchdog.io_probe = no_io;
+        watchdog.last_phase = INDEX_PHASE_PREPARING;
+        watchdog.last_current = 0;
+        watchdog.last_activity = 0;
+        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
+
+        let progress = Arc::new(IndexingProgress::default());
+        let report = watchdog
+            .observe(&progress, 100)
+            .ok_or_else(|| anyhow::anyhow!("preparing wedge did not report"))?;
+        assert_eq!(report["event"], serde_json::json!("stall_detected"));
+        assert!(report.get("pre_index_io_active").is_none());
+        let abort = watchdog
+            .observe(&progress, 200)
+            .ok_or_else(|| anyhow::anyhow!("preparing wedge did not abort at the base bound"))?;
+        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
         Ok(())
     }
 
