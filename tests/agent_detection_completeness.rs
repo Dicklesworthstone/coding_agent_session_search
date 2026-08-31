@@ -125,7 +125,7 @@ fn connector_factories_all_instantiate_and_detect() {
     // Required base connectors always present
     for required in [
         "codex", "cline", "gemini", "claude", "clawdbot", "vibe", "amp", "aider", "pi_agent",
-        "factory", "omp", "openclaw", "copilot", "grok",
+        "factory", "omp", "openclaw", "copilot", "grok", "muse",
     ] {
         assert!(
             unique.contains(required),

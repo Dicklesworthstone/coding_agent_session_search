@@ -60,6 +60,7 @@ use crate::connectors::{
     factory::FactoryConnector, gemini::GeminiConnector, grok::GrokConnector, kimi::KimiConnector,
     omp::OmpConnector, openclaw::OpenClawConnector, opencode::OpenCodeConnector,
     pi_agent::PiAgentConnector, qwen::QwenConnector, vibe::VibeConnector,
+    muse::MuseConnector,
 };
 use crate::model::conversation_packet::{
     CONVERSATION_PACKET_VERSION, ConversationPacket, ConversationPacketHashes,
@@ -25536,6 +25537,7 @@ impl ConnectorKind {
             "copilot_cli" => Some(Self::CopilotCli),
             "qwen" => Some(Self::Qwen),
             "grok" => Some(Self::Grok),
+            "muse" => Some(Self::Muse),
             _ => None,
         }
     }
@@ -25563,6 +25565,7 @@ impl ConnectorKind {
             Self::CopilotCli => "copilot_cli",
             Self::Qwen => "qwen",
             Self::Grok => "grok",
+            Self::Muse => "muse",
         }
     }
 
@@ -25591,6 +25594,7 @@ impl ConnectorKind {
             Self::CopilotCli => Box::new(CopilotCliConnector::new()),
             Self::Qwen => Box::new(QwenConnector::new()),
             Self::Grok => Box::new(GrokConnector::new()),
+            Self::Muse => Box::new(MuseConnector::new()),
         }
     }
 }
@@ -26679,6 +26683,8 @@ enum ConnectorKind {
     Qwen,
     #[serde(rename = "gk", alias = "Grok")]
     Grok,
+    #[serde(rename = "mu", alias = "Muse")]
+    Muse,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]

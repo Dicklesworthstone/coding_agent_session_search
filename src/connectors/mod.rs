@@ -249,6 +249,7 @@ pub mod goose;
 pub mod grok;
 pub mod hermes;
 pub mod kimi;
+pub mod muse;
 pub mod omp;
 pub mod openclaw;
 pub mod opencode;
