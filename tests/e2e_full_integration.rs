@@ -17,7 +17,6 @@ use std::process::Command;
 
 #[macro_use]
 mod util;
-use util::EnvGuard;
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -113,8 +112,8 @@ fn e2e_multi_agent_index_and_search() {
     fs::create_dir_all(&xdg_data).unwrap();
     fs::create_dir_all(&xdg_config).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — every cass subprocess below
+    // passes its HOME/XDG/CODEX_HOME explicitly via Command::env.
 
     // ---- Phase 1: Create fixtures ----
     // Codex session with unique searchable keyword
@@ -295,8 +294,8 @@ fn e2e_robot_mode_json_structure() {
     fs::create_dir_all(&xdg_data).unwrap();
     fs::create_dir_all(&xdg_config).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — every cass subprocess below
+    // passes its HOME/XDG/CODEX_HOME explicitly via Command::env.
 
     create_codex_session(
         &codex_home,
@@ -374,8 +373,8 @@ fn e2e_database_integrity() {
     fs::create_dir_all(&xdg_data).unwrap();
     fs::create_dir_all(&xdg_config).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — every cass subprocess below
+    // passes its HOME/XDG/CODEX_HOME explicitly via Command::env.
 
     // Create sessions for two different agents
     create_codex_session(
@@ -499,8 +498,8 @@ fn e2e_stats_after_index() {
     fs::create_dir_all(&xdg_data).unwrap();
     fs::create_dir_all(&xdg_config).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — every cass subprocess below
+    // passes its HOME/XDG/CODEX_HOME explicitly via Command::env.
 
     create_codex_session(
         &codex_home,
@@ -567,8 +566,8 @@ fn e2e_diag_after_index() {
     fs::create_dir_all(&xdg_data).unwrap();
     fs::create_dir_all(&xdg_config).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — every cass subprocess below
+    // passes its HOME/XDG/CODEX_HOME explicitly via Command::env.
 
     create_codex_session(
         &codex_home,
