@@ -432,6 +432,7 @@ fn capabilities_are_self_describing_for_agents() {
         "PI_SESSIONS_DIR",
         "CASS_STATUS_BUDGET_MS",
         "CASS_DOCTOR_BUDGET_MS",
+        "CASS_FTS_DRYRUN_CAP",
         "CASS_VIEW_BUDGET_MS",
         "CASS_SEARCH_BUDGET_MS",
         "CASS_TRIAGE_BUDGET_MS",
@@ -447,6 +448,7 @@ fn capabilities_are_self_describing_for_agents() {
     for (name, expected_default) in [
         ("CASS_STATUS_BUDGET_MS", "8000"),
         ("CASS_DOCTOR_BUDGET_MS", "8000"),
+        ("CASS_FTS_DRYRUN_CAP", "4096"),
         ("CASS_VIEW_BUDGET_MS", "10000"),
         ("CASS_SEARCH_BUDGET_MS", "120000"),
         ("CASS_TRIAGE_BUDGET_MS", "8000"),
@@ -2321,6 +2323,7 @@ fn robot_docs_env_lists_key_vars_and_no_ansi() {
         "TUI_HEADLESS",
         "CASS_STATUS_BUDGET_MS",
         "CASS_DOCTOR_BUDGET_MS",
+        "CASS_FTS_DRYRUN_CAP",
         "CASS_VIEW_BUDGET_MS",
         "CASS_SEARCH_BUDGET_MS",
         "CASS_TRIAGE_BUDGET_MS",
