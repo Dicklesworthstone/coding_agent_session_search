@@ -12,6 +12,7 @@
 //! Each test category catches a CLASS of bugs, not just specific instances.
 
 use assert_cmd::cargo::cargo_bin_cmd;
+use serial_test::serial;
 use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
@@ -29,7 +30,11 @@ use util::EnvGuard;
 ///
 /// This test would have caught the Aider detect() bug where it was doing
 /// a recursive WalkDir scan on every call, making it O(files) instead of O(1).
+// qu81y documented exception: in-process detect() has no root-injection
+// seam, so this test genuinely depends on a HOME override and must be
+// serialized against the other env-dependent detect test below.
 #[test]
+#[serial]
 fn detect_must_complete_within_100ms_all_connectors() {
     use coding_agent_search::connectors::Connector;
     use coding_agent_search::connectors::aider::AiderConnector;
@@ -94,7 +99,9 @@ fn detect_must_complete_within_100ms_all_connectors() {
 }
 
 /// Stress test: detect() must stay fast even with many nested directories.
+// qu81y documented exception: see detect_must_complete_within_100ms_all_connectors.
 #[test]
+#[serial]
 fn aider_detect_must_not_scan_recursively() {
     use coding_agent_search::connectors::Connector;
     use coding_agent_search::connectors::aider::AiderConnector;
@@ -151,8 +158,8 @@ fn incremental_reindex_preserves_all_messages() {
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — every cass subprocess below
+    // passes its HOME/CODEX_HOME explicitly via Command::env.
 
     let sessions = codex_home.join("sessions/2024/11/20");
     fs::create_dir_all(&sessions).unwrap();
@@ -289,8 +296,8 @@ fn repeated_reindex_maintains_message_integrity() {
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — every cass subprocess below
+    // passes its HOME/CODEX_HOME explicitly via Command::env.
 
     let sessions = codex_home.join("sessions/2024/11/20");
     fs::create_dir_all(&sessions).unwrap();
@@ -502,8 +509,8 @@ fn fresh_index_returns_expected_results() {
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — every cass subprocess below
+    // passes its HOME/CODEX_HOME explicitly via Command::env.
 
     let sessions = codex_home.join("sessions/2024/11/20");
     fs::create_dir_all(&sessions).unwrap();
