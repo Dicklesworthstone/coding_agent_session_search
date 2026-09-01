@@ -48190,10 +48190,23 @@ mod tests {
             assert!(rebuild.exact_checkpoint_persisted);
         });
 
+        // bet45: startup->steady promotion has two legitimate triggers that
+        // race on tiny budgets. The startup flow budget IS the initial
+        // commit-bytes interval (startup_commit_interval_message_bytes feeds
+        // the startup pipeline budget's batch-fetch bytes and in-flight cap),
+        // and the prep worker's working-set reservation is budget-limit
+        // derived, so a page-prep budget wait before the first durable commit
+        // is inherent here — when the controller samples that waiter first it
+        // promotes with a `startup_*_promoted_steady_budget_before_first_
+        // durable_commit` reason and the later commit-side
+        // record_first_durable_commit correctly becomes a no-op. Both paths
+        // prove the invariant under test: the startup budget was promoted to
+        // the steady budget exactly once, with the budget-update log emitted.
         assert!(
             logs.contains("updated lexical rebuild pipeline budgets")
-                && logs.contains("controller_reason=first_durable_commit_promoted_steady_budget"),
-            "expected budget-promotion log, got:
+                && (logs.contains("controller_reason=first_durable_commit_promoted_steady_budget")
+                    || logs.contains("promoted_steady_budget_before_first_durable_commit")),
+            "expected a startup->steady budget-promotion log, got:
 {logs}"
         );
         assert!(
