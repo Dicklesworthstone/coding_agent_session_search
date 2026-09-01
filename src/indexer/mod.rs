@@ -12584,8 +12584,8 @@ fn spawn_connector_producer(
     thread::spawn(move || {
         let scan_start = std::time::Instant::now();
         let conn = factory();
-        let detect = conn.detect();
-        let was_detected = detect.detected;
+        let detect = detect_for_local_scan(&config.local_connector_roots, || conn.detect());
+        let was_detected = detect.as_ref().is_some_and(|result| result.detected);
         let mut is_discovered = false;
         let mut scan_succeeded = true;
         let mut active_source_skipped = false;
@@ -12618,7 +12618,7 @@ fn spawn_connector_producer(
             });
         let scan_local = match &override_roots {
             Some(roots) => !roots.is_empty(),
-            None => detect.detected,
+            None => detect.as_ref().is_some_and(|result| result.detected),
         };
         if scan_local {
             // Update discovered agents count immediately when detected
@@ -12650,7 +12650,17 @@ fn spawn_connector_producer(
                 StreamingBatchSender::new(&tx, config.flow_limiter.clone(), name, is_discovered);
             let fallback_roots: Vec<ScanRoot> = match &override_roots {
                 Some(roots) => roots.clone(),
-                None => detect.root_paths.iter().cloned().map(ScanRoot::local).collect(),
+                None => detect
+                    .as_ref()
+                    .map(|result| {
+                        result
+                            .root_paths
+                            .iter()
+                            .cloned()
+                            .map(ScanRoot::local)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             };
             let (mut ingest_diagnostics, preparse_active_source_skipped) =
                 capture_connector_sources_before_parse(
@@ -13584,7 +13594,6 @@ fn run_streaming_index_with_connector_factories(
 /// all conversations into memory before ingesting. This is the fallback when
 /// streaming is disabled via CASS_STREAMING_INDEX=0.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn run_batch_index(
     storage: &FrankenStorage,
     t_index: Option<&mut TantivyIndex>,
@@ -13677,8 +13686,8 @@ fn run_batch_index_with_connector_factories(
             .into_par_iter()
             .filter_map(|(name, factory)| {
                 let conn = factory();
-                let detect = conn.detect();
-                let was_detected = detect.detected;
+                let detect = detect_for_local_scan(&local_connector_roots, || conn.detect());
+                let was_detected = detect.as_ref().is_some_and(|result| result.detected);
                 let mut convs = Vec::new();
                 let mut is_discovered = false;
                 let mut scan_succeeded = true;
@@ -13702,7 +13711,7 @@ fn run_batch_index_with_connector_factories(
                     });
                 let scan_local = match &override_roots {
                     Some(roots) => !roots.is_empty(),
-                    None => detect.detected,
+                    None => detect.as_ref().is_some_and(|result| result.detected),
                 };
                 if scan_local {
                     // Update discovered agents count immediately when detected
@@ -13731,11 +13740,16 @@ fn run_batch_index_with_connector_factories(
                     let fallback_roots: Vec<ScanRoot> = match &override_roots {
                         Some(roots) => roots.clone(),
                         None => detect
-                            .root_paths
-                            .iter()
-                            .cloned()
-                            .map(ScanRoot::local)
-                            .collect(),
+                            .as_ref()
+                            .map(|result| {
+                                result
+                                    .root_paths
+                                    .iter()
+                                    .cloned()
+                                    .map(ScanRoot::local)
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                     };
                     let (mut ingest_diagnostics, preparse_active_source_skipped) =
                         capture_connector_sources_before_parse(
@@ -14143,6 +14157,13 @@ pub fn run_index_with_local_connector_roots(
 /// closed world — scan exactly `map[connector]` per connector, skip
 /// connectors without an entry, and never run env-based default detection.
 type LocalConnectorRootsOverride = Option<Arc<HashMap<String, Vec<PathBuf>>>>;
+
+fn detect_for_local_scan(
+    local_connector_roots: &LocalConnectorRootsOverride,
+    detect: impl FnOnce() -> crate::connectors::DetectionResult,
+) -> Option<crate::connectors::DetectionResult> {
+    local_connector_roots.is_none().then(detect)
+}
 
 fn run_index_inner(
     opts: IndexOptions,
@@ -33448,6 +33469,18 @@ mod tests {
     use fsqlite_types::value::SqliteValue;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    #[test]
+    fn closed_world_connector_roots_skip_default_detection() {
+        let closed_world = Some(Arc::new(HashMap::new()));
+        let result = detect_for_local_scan(&closed_world, || {
+            panic!("closed-world indexing must not run default detection")
+        });
+        assert!(result.is_none());
+
+        let result = detect_for_local_scan(&None, DetectionResult::not_found);
+        assert!(result.is_some_and(|detection| !detection.detected));
+    }
 
     /// #366: waiting↔waiting park flaps are scheduler churn a livelocked
     /// pipeline can sustain forever; they must not reset the stall clock.

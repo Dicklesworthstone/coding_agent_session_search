@@ -1,6 +1,6 @@
 use coding_agent_search::connectors::{Connector, ScanContext, amp::AmpConnector};
 use coding_agent_search::connectors::{NormalizedConversation, NormalizedMessage};
-use coding_agent_search::indexer::{IndexOptions, persist::persist_conversation, run_index};
+use coding_agent_search::indexer::{IndexOptions, persist::persist_conversation};
 use coding_agent_search::search::query::{FieldMask, SearchClient, SearchFilters};
 use coding_agent_search::search::tantivy::{TantivyIndex, index_dir};
 use coding_agent_search::storage::sqlite::SqliteStorage;
