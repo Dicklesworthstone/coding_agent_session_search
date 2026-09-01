@@ -20320,7 +20320,11 @@ pub(crate) fn stored_path_identity_matches(saved: &str, current: &Path) -> bool 
 fn read_index_run_lock_snapshot(
     data_dir: &Path,
 ) -> crate::search::asset_state::SearchMaintenanceSnapshot {
-    crate::search::asset_state::read_search_maintenance_snapshot(data_dir)
+    // Observation surfaces (status/health/triage/doctor/TUI) use the reaping
+    // probe: stale metadata from a dead owner is truncated in place so later
+    // readers see a clean lock (#176 / bd-k9jb9). Search-side callers reach
+    // the pure-read variant directly (gh#422).
+    crate::search::asset_state::read_search_maintenance_snapshot_reaping(data_dir)
 }
 
 fn probe_index_run_lock(
@@ -20918,6 +20922,14 @@ fn state_meta_json_inner(
     // counts_skipped=false alongside message_count=0 would be a lie.
     let db_snapshot = if passive_db_probe && db_exists && db_is_regular_file {
         StateDbSnapshot {
+            // Per the gi4oy contract above: opened=true (ASSUMED-good) +
+            // open_skipped=true. Leaving `opened` at its false default made
+            // the zero-touch doctor lane claim `database_unavailable` for
+            // semantic assets on perfectly healthy archives (the semantic
+            // inspection keys `db_available` off this field), regressing
+            // doctor's model guidance to a dead end. Callers that need the
+            // truth branch on `open_skipped`, exactly as documented.
+            opened: true,
             counts_skipped: true,
             open_skipped: true,
             ..StateDbSnapshot::default()
@@ -84600,8 +84612,13 @@ mod cli_read_db_tests {
 
     #[test]
     fn gh422_state_meta_ignores_stale_lock_metadata_without_rewriting_it() {
-        // Preserve issue #176's clean observer state without making a status
-        // or search probe mutate the stale lock artifact.
+        // gh#422 keeps SEARCH probes pure-read (pinned on
+        // read_search_maintenance_snapshot in asset_state), while the
+        // status/health observation surface exercised here follows the
+        // #176 / bd-k9jb9 contract (pinned end-to-end in e2e_health):
+        // stale metadata from a dead owner is hidden from the caller AND
+        // reaped in place — truncated, never deleted — so later readers
+        // observe a clean lock without re-doing the staleness dance.
         let (temp, db_path) = seed_cli_db();
         let index_path = crate::search::tantivy::index_dir(temp.path()).expect("index dir");
         std::fs::create_dir_all(&index_path).expect("create index dir");
@@ -84633,7 +84650,6 @@ mod cli_read_db_tests {
             ),
         )
         .expect("write orphaned lock metadata");
-        let lock_bytes_before = std::fs::read(&lock_path).expect("read lock bytes before probe");
 
         let state = state_meta_json(temp.path(), &db_path, 60, true);
         assert_eq!(state["pending"]["orphaned"].as_bool(), Some(false));
@@ -84642,9 +84658,15 @@ mod cli_read_db_tests {
         assert_eq!(state["rebuild"]["job_kind"].as_str(), None);
         assert_eq!(state["rebuild"]["phase"].as_str(), None);
         assert_eq!(
-            std::fs::read(&lock_path).expect("read lock bytes after probe"),
-            lock_bytes_before,
-            "state metadata observation must preserve the stale lock bytes"
+            std::fs::metadata(&lock_path)
+                .expect("stat lock after observation")
+                .len(),
+            0,
+            "observation surfaces must reap stale lock metadata in place (#176 / bd-k9jb9)"
+        );
+        assert!(
+            lock_path.exists(),
+            "the lock file must be truncated, never deleted"
         );
     }
 

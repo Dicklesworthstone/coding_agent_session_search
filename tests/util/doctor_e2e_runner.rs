@@ -1819,6 +1819,16 @@ impl DoctorE2eFileTreeSnapshot {
                         .map_err(|err| format!("strip root {}: {err}", root.display()))?
                         .to_string_lossy()
                         .replace('\\', "/");
+                    // SQLite `-shm` files are shared-memory scratch, not
+                    // database state: since fsqlite 0.3.12 (GH#399) even a
+                    // READ-ONLY connection registers itself in the WAL-index
+                    // there — exactly like stock SQLite readers — so hashing
+                    // shm content would make every read-only doctor run a
+                    // false "mutation". The db and -wal stay fully hashed;
+                    // they are the actual no-mutation contract.
+                    if relative_path.ends_with("-shm") {
+                        continue;
+                    }
                     let entry_kind = if metadata.file_type().is_symlink() {
                         "symlink"
                     } else if metadata.is_dir() {

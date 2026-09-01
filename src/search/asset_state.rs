@@ -206,7 +206,27 @@ pub(crate) fn windows_lock_conflict(_err: &std::io::Error) -> bool {
     false
 }
 
+/// Pure-read maintenance probe (gh#422): search-triggered refresh decisions
+/// must never write, so this variant is byte-for-byte read-only even for
+/// stale metadata (which it still hides from the caller).
 pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMaintenanceSnapshot {
+    read_search_maintenance_snapshot_inner(data_dir, false)
+}
+
+/// Observation-surface maintenance probe (#176 / bd-k9jb9): status, health,
+/// and TUI polls additionally REAP stale metadata in place (flock-guarded,
+/// best-effort) so subsequent readers observe a clean lock file without
+/// re-doing the staleness dance. Search paths must use the pure variant.
+pub(crate) fn read_search_maintenance_snapshot_reaping(
+    data_dir: &Path,
+) -> SearchMaintenanceSnapshot {
+    read_search_maintenance_snapshot_inner(data_dir, true)
+}
+
+fn read_search_maintenance_snapshot_inner(
+    data_dir: &Path,
+    reap_stale: bool,
+) -> SearchMaintenanceSnapshot {
     // Real index-run.lock files written by `acquire_index_run_lock`
     // have a fixed key=value shape under ~1 KiB. Cap the read at 64 KiB
     // so a corrupted or maliciously-large lock file cannot force us to
@@ -263,19 +283,27 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
         match file.try_lock_shared() {
             Ok(()) => {
                 // A shared lock succeeds only when no writer holds the
-                // exclusive index-run lock. Treat any metadata as stale, but
-                // do not rewrite it here: this function is used by search,
-                // status, health, and TUI observation paths and therefore
-                // must be byte-for-byte read-only.
+                // exclusive index-run lock: the metadata is stale.
                 //
-                // Historically this produced a permanent `orphaned: true`
-                // state that callers (notably the TUI) interpreted as
-                // "rebuild in progress, keep polling" — yielding a tight
-                // CPU-bound loop that only cleared when the user manually
-                // deleted the lock file (see issue #176).
+                // Historically stale metadata produced a permanent
+                // `orphaned: true` state that callers (notably the TUI)
+                // interpreted as "rebuild in progress, keep polling" —
+                // yielding a tight CPU-bound loop that only cleared when the
+                // user manually deleted the lock file (see issue #176).
                 //
+                // On observation surfaces (#176, pinned by bd-k9jb9's e2e
+                // contract) the stale metadata is also reaped IN PLACE —
+                // guarded by the exclusive flock, best-effort — so every
+                // subsequent reader observes a clean file without re-doing
+                // this dance. Pure-read callers (gh#422 search paths) skip
+                // the reap and stay byte-for-byte read-only. On a read-only
+                // filesystem (or a lost lock race) the truncate is skipped;
+                // either way the caller gets the clean default snapshot.
                 let _ = file.unlock();
                 if metadata_present {
+                    if reap_stale {
+                        reap_stale_index_run_lock_metadata(&lock_path, &sidecar_path);
+                    }
                     return SearchMaintenanceSnapshot::default();
                 }
                 false
@@ -287,6 +315,47 @@ pub(crate) fn read_search_maintenance_snapshot(data_dir: &Path) -> SearchMainten
     };
     snapshot.orphaned = metadata_present && !snapshot.active;
     snapshot
+}
+
+/// #176 / bd-k9jb9: truncate stale `index-run.lock` metadata in place so a
+/// subsequent reader (next `cass status`, next TUI poll) observes a clean
+/// state without re-doing the reaping dance. The truncate happens only while
+/// holding the exclusive flock (concurrent readers/writers cannot race the
+/// reap) and is best-effort: a read-only filesystem or a lost lock race
+/// leaves the bytes untouched — the caller already reports the clean default
+/// snapshot either way. The file itself is truncated, never deleted, to
+/// preserve permissions and avoid create/recreate races with writers. The
+/// metadata sidecar is cleared alongside it, since an empty lock file falls
+/// back to the sidecar on the next read.
+fn reap_stale_index_run_lock_metadata(lock_path: &Path, sidecar_path: &Path) {
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(lock_path) else {
+        return;
+    };
+    if file.try_lock().is_err() {
+        // A writer appeared between our shared probe and now; its metadata
+        // is live again — do not touch it.
+        return;
+    }
+    match file.set_len(0) {
+        Ok(()) => {
+            let _ = file.sync_all();
+            tracing::info!(
+                path = %lock_path.display(),
+                "reaped stale index-run.lock metadata left by a dead owner (#176)"
+            );
+            if sidecar_path.exists() {
+                let _ = std::fs::write(sidecar_path, b"");
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %lock_path.display(),
+                error = %err,
+                "failed to reap stale index-run.lock metadata; leaving bytes in place"
+            );
+        }
+    }
+    let _ = file.unlock();
 }
 
 fn parse_search_maintenance_snapshot(
@@ -2359,7 +2428,7 @@ mod tests {
         assert_eq!(
             std::fs::read(&lock_path).expect("read unchanged lock metadata"),
             stale_metadata.as_bytes(),
-            "an observational lock probe must preserve every byte"
+            "the PURE probe (gh#422 search paths) must preserve every byte"
         );
 
         // Second read also returns a clean default snapshot.
@@ -2369,8 +2438,30 @@ mod tests {
         assert_eq!(
             std::fs::read(&lock_path).expect("read lock metadata after second probe"),
             stale_metadata.as_bytes(),
-            "repeated observation must remain byte-for-byte read-only"
+            "repeated pure observation must remain byte-for-byte read-only"
         );
+
+        // #176 / bd-k9jb9 contract: the REAPING probe (status/health/TUI
+        // observation surfaces) truncates the stale metadata in place —
+        // never deleting the file — so subsequent readers observe a clean
+        // lock without re-doing the staleness dance.
+        let reaped = read_search_maintenance_snapshot_reaping(temp.path());
+        assert!(!reaped.active);
+        assert!(!reaped.orphaned);
+        assert_eq!(
+            std::fs::metadata(&lock_path)
+                .expect("stat lock after reaping probe")
+                .len(),
+            0,
+            "stale lock metadata must be truncated in place by the reaping probe"
+        );
+        assert!(
+            lock_path.exists(),
+            "the lock file must be truncated, never deleted"
+        );
+        let after_reap = read_search_maintenance_snapshot_reaping(temp.path());
+        assert!(!after_reap.active);
+        assert!(!after_reap.orphaned);
     }
 
     #[test]
