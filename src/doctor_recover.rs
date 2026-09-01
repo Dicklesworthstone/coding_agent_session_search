@@ -36,7 +36,22 @@ use crate::{CliError, CliResult, RobotFormat, default_data_dir};
 const RECOVER_CONVERSATION_PAGE: i64 = 256;
 /// Maximum canonical and FTS row IDs inspected by a read-only dry-run. The
 /// mutating path still performs exact parity validation before changing data.
+/// #345 plan of record: when the divergence scan hits this cap the dry-run
+/// stops and reports ">= N divergent" instead of paying for an exact count on
+/// a multi-million-row archive. Override with `CASS_FTS_DRYRUN_CAP`.
 const FTS_DRY_RUN_ROWID_COMPARISON_CAP: usize = 4_096;
+
+/// #345: the effective dry-run cap — `CASS_FTS_DRYRUN_CAP` (positive integer)
+/// or the default. Pure parse half kept separate for unit testing.
+fn parse_fts_dry_run_cap(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|cap| *cap > 0)
+        .unwrap_or(FTS_DRY_RUN_ROWID_COMPARISON_CAP)
+}
+
+fn fts_dry_run_rowid_comparison_cap() -> usize {
+    parse_fts_dry_run_cap(dotenvy::var("CASS_FTS_DRYRUN_CAP").ok().as_deref())
+}
 
 fn now_unix_ms() -> i64 {
     SystemTime::now()
@@ -107,6 +122,25 @@ fn is_fts5_oversized_leaf_error(err: &anyhow::Error) -> bool {
 fn is_fts5_shadow_open_corruption_error(err: &anyhow::Error) -> bool {
     let rendered = format!("{err:#}");
     rendered.contains("corrupt %_data record") && !is_fts5_oversized_leaf_error(err)
+}
+
+/// #434 defect 2: schema-level open refusals that name a derived FTS5 shadow
+/// object — the reported shape is `database disk image is malformed:
+/// sqlite_master is missing implicit autoindex slot 1 for table
+/// \`fts_messages_config\``, which fails during the schema reload BEFORE the
+/// ordinary FTS5 deferral applies, so `--rebuild-canonical-fts` used to refuse
+/// to open the very archive it exists to repair. Every `fts_messages*` object
+/// is fully derived from canonical rows, so the right repair is the same
+/// deferred-open drop+recreate the corrupt-`%_data` class uses — attempted
+/// below; when even the deferred open cannot get past the schema reload,
+/// doctor now says so explicitly and routes to the raw-mirror recovery path
+/// instead of repeating the refusal.
+fn is_fts_shadow_schema_level_open_failure(err: &anyhow::Error) -> bool {
+    let rendered = format!("{err:#}");
+    rendered.contains("fts_messages")
+        && (rendered.contains("missing implicit autoindex slot")
+            || (rendered.contains("database disk image is malformed")
+                && rendered.contains("sqlite_master")))
 }
 
 /// The distinct, non-alarming diagnostic for the GH #369 oversized-leaf case:
@@ -447,6 +481,7 @@ fn fts_dry_run_parity_json(parity: &FtsDryRunParity) -> serde_json::Value {
         "indexed_ids_examined": parity.indexed_ids_examined,
         "observed_missing_canonical_rowids_at_least": parity.observed_missing_canonical_rowids_at_least,
         "observed_excess_fts_rowids_at_least": parity.observed_excess_fts_rowids_at_least,
+        "divergent_rowids_at_least": parity.divergent_rowids_at_least(),
         "detail": parity.detail,
     })
 }
@@ -519,12 +554,16 @@ pub fn run_doctor_rebuild_canonical_fts(
     };
     let storage = match storage_open {
         Ok(storage) => storage,
-        // #368 defect 3: the FTS5 shadow structure is corrupt enough that the
-        // archive cannot be opened normally (the schema reload decodes the
-        // corrupt %_data). Open with FTS5 hydration DEFERRED and rebuild the
-        // shadow by dropping + recreating it from canonical rows — the shadow is
-        // fully derived and canonical rows are never touched.
-        Err(open_err) if is_fts5_shadow_open_corruption_error(&open_err) => {
+        // #368 defect 3 / #434 defect 2: the FTS5 shadow is corrupt enough that
+        // the archive cannot be opened normally (the schema reload decodes the
+        // corrupt %_data, or refuses a shadow object's sqlite_master state).
+        // Open with FTS5 hydration DEFERRED and rebuild the shadow by dropping
+        // + recreating it from canonical rows — the shadow is fully derived
+        // and canonical rows are never touched.
+        Err(open_err)
+            if is_fts5_shadow_open_corruption_error(&open_err)
+                || is_fts_shadow_schema_level_open_failure(&open_err) =>
+        {
             if dry_run {
                 // A dry-run must stay read-only and non-locking: report the
                 // planned repair straight from the open error, WITHOUT opening
@@ -546,12 +585,17 @@ pub fn run_doctor_rebuild_canonical_fts(
                 return Ok(());
             }
             let deferred = FrankenStorage::open_deferred_fts5_for_repair(&db_path).map_err(|e| {
+                // #434 defect 2: BOTH structured opens failed. Say so
+                // explicitly instead of repeating the refusal, and route to
+                // the checksum-verified raw-mirror recovery path.
                 storage_error(
                     format!(
-                        "opening canonical archive {} with deferred FTS5 validation for corrupt-shadow repair: {e:#}",
+                        "no structured open of {} is possible: the ordinary open failed ({open_err:#}) and the deferred-FTS5 repair open also failed ({e:#})",
                         db_path.display()
                     ),
-                    Some("Preserve the archive bundle and run 'cass doctor check --json'."),
+                    Some(
+                        "The archive's schema state is damaged beyond what the deferred-FTS5 repair open tolerates, so doctor cannot repair the derived shadow in place. Preserve the complete archive bundle (db + -wal + -shm + sidecars) and recover instead: 'cass doctor check --json' ranks the recovery authorities, 'cass doctor --fix --json' verifies the checksum-verified raw mirror and stages an isolated reconstruct candidate, and 'cass doctor --recover-from-archive <DIR>' rebuilds the source tree from the archive's preserved events when the archive is still readable read-only.",
+                    ),
                 )
             })?;
             let inserted = deferred
@@ -586,15 +630,22 @@ pub fn run_doctor_rebuild_canonical_fts(
                     db_path.display()
                 ),
                 Some(
-                    "If the archive cannot be opened at all, the canonical rows are unreadable — use \
-                     'cass doctor --recover-from-archive <DIR>' to rebuild the source tree instead.",
+                    // #434 defect 1: an open failure proves a schema-level open
+                    // failure, NOT that canonical rows are unreadable (stock
+                    // readers served every canonical row of the #434 archive).
+                    "The archive failed to open at the schema level; that does not by itself mean \
+                     the canonical rows are unreadable. Run 'cass doctor check --json' to see what \
+                     is actually readable and which recovery authority doctor ranks first. If \
+                     doctor confirms the canonical rows are unreadable, 'cass doctor \
+                     --recover-from-archive <DIR>' rebuilds the source tree from the archive's \
+                     preserved events.",
                 ),
             ));
         }
     };
     if dry_run {
         let before = storage
-            .inspect_search_fallback_fts_parity_dry_run(FTS_DRY_RUN_ROWID_COMPARISON_CAP)
+            .inspect_search_fallback_fts_parity_dry_run(fts_dry_run_rowid_comparison_cap())
             .map_err(|e| {
                 storage_error(
                     format!("performing bounded canonical/FTS5 row-parity inspection: {e:#}"),
@@ -608,13 +659,19 @@ pub fn run_doctor_rebuild_canonical_fts(
             print_json(&envelope)?;
         } else {
             println!(
-                "Canonical FTS5 dry-run: status={}, inspection_complete={}, canonical={}, indexable={}, indexed={:?}, rowid_cap={}",
+                "Canonical FTS5 dry-run: status={}, inspection_complete={}, canonical={}, indexable={}, indexed={:?}, rowid_cap={}, divergent>={}{}",
                 before.status_as_str(),
                 before.inspection_complete,
                 before.canonical_messages,
                 before.indexable_messages,
                 before.indexed_messages,
                 before.comparison_cap,
+                before.divergent_rowids_at_least(),
+                if before.inspection_complete {
+                    ""
+                } else {
+                    " (capped; a divergence floor, not an exact count — raise CASS_FTS_DRYRUN_CAP or run --yes for exact parity)"
+                },
             );
         }
         return Ok(());
@@ -1434,6 +1491,50 @@ mod tests {
             matches, 1,
             "rebuilt FTS shadow must be queryable for 'needle'"
         );
+    }
+
+    /// GH #434 defect 2: the schema-level open refusal reported against real
+    /// archives (both the 0.6.26 read-path refusal and the doctor
+    /// `--rebuild-canonical-fts` inspection refusal carried the identical
+    /// engine string) must route into the deferred-FTS5 drop+recreate repair
+    /// branch instead of the generic "cannot open" wall, while failures naming
+    /// canonical (non-shadow) objects keep the generic routing.
+    #[test]
+    fn gh434_schema_level_shadow_open_failures_route_to_deferred_repair() {
+        // Verbatim shapes from the #434 report (index refusal + doctor refusal).
+        let index_refusal = anyhow::anyhow!(
+            "opening raw frankensqlite db readonly at /home/claude/.local/share/coding-agent-search/agent_search.db: \
+             database disk image is malformed: sqlite_master is missing implicit autoindex slot 1 for table `fts_messages_config`"
+        );
+        assert!(is_fts_shadow_schema_level_open_failure(&index_refusal));
+
+        let doctor_refusal = anyhow::anyhow!(
+            "opening frankensqlite db readonly at /tmp/cass-check/agent_search.db: \
+             database disk image is malformed: sqlite_master is missing implicit autoindex slot 1 for table `fts_messages_config`"
+        );
+        assert!(is_fts_shadow_schema_level_open_failure(&doctor_refusal));
+
+        // The same autoindex failure on a CANONICAL table is not repairable by
+        // recreating the derived shadow — it must keep the generic routing.
+        let canonical_refusal = anyhow::anyhow!(
+            "database disk image is malformed: sqlite_master is missing implicit autoindex slot 1 for table `conversations`"
+        );
+        assert!(!is_fts_shadow_schema_level_open_failure(&canonical_refusal));
+
+        // The %_data structure class keeps its own predicate; neither predicate
+        // swallows the other.
+        let data_corruption = anyhow::anyhow!(
+            "fts5: corrupt %_data record: structure segment count exceeds FTS5 maximum"
+        );
+        assert!(!is_fts_shadow_schema_level_open_failure(&data_corruption));
+        assert!(is_fts5_shadow_open_corruption_error(&data_corruption));
+
+        // The gh#369 oversized-leaf shape is a write-time engine limitation,
+        // not an open-blocking schema failure.
+        let oversized = anyhow::anyhow!(
+            "fts5: corrupt %_data record: segment leaf term offset exceeds u16"
+        );
+        assert!(!is_fts_shadow_schema_level_open_failure(&oversized));
     }
 
     /// GH #369: the cumulative oversized-leaf failure (many in-cap terms in one

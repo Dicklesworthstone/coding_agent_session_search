@@ -433,7 +433,10 @@ pub enum Commands {
         /// manifest publish, and finalization as distinct phases. Set
         /// CASS_INDEX_STALL_DETECT_SECS=0 to disable stall diagnostics, or
         /// CASS_INDEX_STALL_ABORT_SECS=0 to keep abort-eligible lexical stalls
-        /// report-only while still reporting semantic phase progress.
+        /// report-only while still reporting semantic phase progress. Set
+        /// CASS_INDEX_STALL_ABORT_ALL_PHASES=1 to promote the stall detector
+        /// to a hard abort (exit 70) in every phase it reports on, including
+        /// the otherwise report-only semantic/scribe lanes (issue #437).
         #[arg(long)]
         semantic: bool,
 
@@ -90977,7 +90980,12 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
         env_var_capability(
             "CASS_INDEX_STALL_ABORT_SECS",
             Some("300"),
-            "Seconds without progress before an abort-eligible lexical stall exits 70; 0 keeps stalls report-only. Semantic phases are report-only.",
+            "Seconds without progress before an abort-eligible lexical stall exits 70; 0 keeps stalls report-only. Semantic phases are report-only unless CASS_INDEX_STALL_ABORT_ALL_PHASES=1.",
+        ),
+        env_var_capability(
+            "CASS_INDEX_STALL_ABORT_ALL_PHASES",
+            Some("0"),
+            "Opt-in (#437): promote the stall watchdog's report-only warnings to a hard abort (exit 70) in ANY phase — including scribe/accumulate and semantic report-only lanes — once CASS_INDEX_STALL_ABORT_SECS elapses without progress. The finalize/persist grace thresholds still apply; phases whose detection is suppressed (opaque HNSW, quiescent watch idle) never warn and therefore never abort.",
         ),
         env_var_capability(
             "CASS_SEMANTIC_EMBEDDER",
@@ -100487,7 +100495,9 @@ const INDEX_STALL_HINT: &str = concat!(
     "heartbeat keeps refreshing while one thread spins). Semantic replay, embedding, vector publish, manifest, ",
     "and finalize phases expose their own counters and are report-only; native HNSW construction is explicitly ",
     "labelled but opaque. Set CASS_INDEX_STALL_DETECT_SECS=0 to disable detection; set ",
-    "CASS_INDEX_STALL_ABORT_SECS=0 to keep abort-eligible lexical stalls report-only. ",
+    "CASS_INDEX_STALL_ABORT_SECS=0 to keep abort-eligible lexical stalls report-only; set ",
+    "CASS_INDEX_STALL_ABORT_ALL_PHASES=1 to promote these report-only warnings to a hard abort ",
+    "in every phase, report-only lanes included (#437). ",
     "If `finalizing` is true in the diagnostics the indexer is inside the final WAL checkpoint of a large ",
     "deferred bulk-ingest WAL (slow on macOS); CASS_INDEX_FINALIZE_ABORT_SECS (default 1800) bounds that window, ",
     "and CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES=1000 caps WAL growth so the final checkpoint stays small."
@@ -100525,6 +100535,31 @@ fn index_stall_threshold(progress_interval: Duration) -> Option<Duration> {
         let min = progress_interval.saturating_add(Duration::from_secs(1));
         Some(Duration::from_secs(stall_threshold_secs).max(min))
     }
+}
+
+/// #437: does `CASS_INDEX_STALL_ABORT_ALL_PHASES` request promoting the stall
+/// watchdog's report-only warnings to hard aborts in every phase? Pure parse
+/// half so the truthiness contract is unit-testable without touching the
+/// process environment.
+fn stall_abort_all_phases_flag(raw: Option<&str>) -> bool {
+    raw.map(str::trim).is_some_and(|v| {
+        v == "1"
+            || v.eq_ignore_ascii_case("true")
+            || v.eq_ignore_ascii_case("yes")
+            || v.eq_ignore_ascii_case("on")
+    })
+}
+
+/// #437: opt-in env that extends the existing stall-abort containment
+/// (`CASS_INDEX_STALL_ABORT_SECS`) to EVERY phase the stall detector reports
+/// on — including the scribe/accumulate and semantic lanes that are
+/// report-only by default. Default off preserves current behavior exactly.
+fn index_stall_abort_all_phases_enabled() -> bool {
+    stall_abort_all_phases_flag(
+        dotenvy::var("CASS_INDEX_STALL_ABORT_ALL_PHASES")
+            .ok()
+            .as_deref(),
+    )
 }
 
 fn index_stall_abort_threshold(
@@ -100644,6 +100679,14 @@ struct IndexStallWatchdog {
     /// report-only and suppresses false stall reports during the one opaque
     /// native HNSW call. A preceding phase-2 lexical wedge remains abortable.
     semantic_build: bool,
+    /// #437: opt-in (`CASS_INDEX_STALL_ABORT_ALL_PHASES=1`) promotion of the
+    /// existing stall detection to a hard abort in ANY phase that reaches the
+    /// abort gate — including the scribe/accumulate and semantic report-only
+    /// lanes whose #258-signature wedges otherwise hold the index lock
+    /// unbounded. States whose detection is suppressed entirely (opaque HNSW,
+    /// quiescent watch idle, quiescent semantic finalize) never warn and are
+    /// therefore never promoted. Default off.
+    abort_all_phases: bool,
     last_phase: usize,
     last_current: usize,
     /// #332: last observed `IndexingProgress::activity` tick. Producers bump
@@ -100724,6 +100767,7 @@ impl IndexStallWatchdog {
             abort_policy,
             is_watch: false,
             semantic_build: false,
+            abort_all_phases: index_stall_abort_all_phases_enabled(),
             last_phase: usize::MAX,
             last_current: 0,
             last_activity: 0,
@@ -100900,7 +100944,17 @@ impl IndexStallWatchdog {
         // phases retain their measured/report-only treatment below.
         let pre_index_lexical_wedge = phase_code < indexer::INDEX_PHASE_LEXICAL_INDEXING
             && index_progress.rebuild_pipeline_is_quiescent();
-        let abort_eligible = phase_code == indexer::INDEX_PHASE_LEXICAL_INDEXING
+        // #437: CASS_INDEX_STALL_ABORT_ALL_PHASES=1 promotes the stall
+        // detection above to a hard abort in EVERY phase that reaches this
+        // gate — including the scribe/accumulate lane (phase 0/2 with a
+        // non-quiescent-but-frozen rebuild pipeline) and the semantic
+        // report-only phases. The abort path is identical to the lexical
+        // aborts (`abort_after_index_stall_if_requested`: best-effort WAL
+        // checkpoint, then exit 70), so locks are released and checkpoint
+        // state stays consistent exactly as before. The finalize/persist/
+        // pre-index-IO graces below still lengthen the bound where they apply.
+        let abort_eligible = self.abort_all_phases
+            || phase_code == indexer::INDEX_PHASE_LEXICAL_INDEXING
             || pre_index_lexical_wedge
             || finalize_wedge;
         // #319/#321: while the indexer signals `finalizing`, the phase-0 /
@@ -101934,6 +101988,128 @@ mod stall_diagnostics_tests {
             "semantic phases must remain report-only past the abort threshold"
         );
         Ok(())
+    }
+
+    /// #437: `CASS_INDEX_STALL_ABORT_ALL_PHASES=1` must promote the existing
+    /// report-only stall detection to a hard abort in a report-only phase.
+    /// The exact same setup as
+    /// `issue_342_watchdog_reports_semantic_embedding_stall_without_aborting`
+    /// — a frozen semantic-embedding phase past both thresholds — but with the
+    /// all-phases opt-in armed: the second observation must now carry the
+    /// `stall_aborting` / `abort_process` / exit-70 contract that the lexical
+    /// aborts use (and therefore the same finalize path:
+    /// `abort_after_index_stall_if_requested` checkpoints the WAL best-effort
+    /// before exiting, identical to lexical-phase aborts).
+    #[test]
+    fn gh437_all_phases_optin_promotes_report_only_stall_to_abort() -> anyhow::Result<()> {
+        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
+        use crate::indexer::{INDEX_PHASE_SEMANTIC_EMBEDDING, IndexingProgress};
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let tmp = TempDir::new()?;
+        let mut watchdog = IndexStallWatchdog::with_abort_policy(
+            tmp.path().to_path_buf(),
+            Duration::from_millis(50),
+            IndexStallAbortPolicy::AbortLexicalPhases,
+        )
+        .semantic_aware(true);
+        // The opt-in under test (env-armed in production via
+        // CASS_INDEX_STALL_ABORT_ALL_PHASES; set directly here so parallel
+        // tests never race on process-global env state).
+        watchdog.abort_all_phases = true;
+        watchdog.threshold = Some(Duration::from_millis(1));
+        watchdog.abort_threshold = Some(Duration::from_millis(2));
+        watchdog.last_phase = INDEX_PHASE_SEMANTIC_EMBEDDING;
+        watchdog.last_current = 7;
+        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
+
+        let progress = Arc::new(IndexingProgress::default());
+        progress
+            .phase
+            .store(INDEX_PHASE_SEMANTIC_EMBEDDING, Ordering::Relaxed);
+        progress.current.store(7, Ordering::Relaxed);
+        progress.total.store(100, Ordering::Relaxed);
+
+        let report = watchdog
+            .observe(&progress, 100)
+            .ok_or_else(|| anyhow::anyhow!("semantic embedding stall did not report"))?;
+        assert_eq!(report["event"], serde_json::json!("stall_detected"));
+        assert_ne!(report["abort_process"], serde_json::json!(true));
+
+        let abort = watchdog
+            .observe(&progress, 200)
+            .ok_or_else(|| anyhow::anyhow!("all-phases opt-in did not promote the stall"))?;
+        assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
+        assert_eq!(abort["abort_process"], serde_json::json!(true));
+        assert_eq!(abort["exit_code"], serde_json::json!(70));
+        Ok(())
+    }
+
+    /// #437 default-off contract: with the opt-in NOT set, the identical
+    /// report-only stall must keep today's behavior (warn, never abort). This
+    /// pins that `with_abort_policy` leaves `abort_all_phases` disarmed when
+    /// the env is absent.
+    #[test]
+    fn gh437_without_optin_report_only_stall_is_not_promoted() -> anyhow::Result<()> {
+        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
+        use crate::indexer::{INDEX_PHASE_SEMANTIC_EMBEDDING, IndexingProgress};
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let tmp = TempDir::new()?;
+        let mut watchdog = IndexStallWatchdog::with_abort_policy(
+            tmp.path().to_path_buf(),
+            Duration::from_millis(50),
+            IndexStallAbortPolicy::AbortLexicalPhases,
+        )
+        .semantic_aware(true);
+        assert!(
+            !watchdog.abort_all_phases,
+            "abort_all_phases must default off when CASS_INDEX_STALL_ABORT_ALL_PHASES is unset"
+        );
+        watchdog.threshold = Some(Duration::from_millis(1));
+        watchdog.abort_threshold = Some(Duration::from_millis(2));
+        watchdog.last_phase = INDEX_PHASE_SEMANTIC_EMBEDDING;
+        watchdog.last_current = 7;
+        watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
+
+        let progress = Arc::new(IndexingProgress::default());
+        progress
+            .phase
+            .store(INDEX_PHASE_SEMANTIC_EMBEDDING, Ordering::Relaxed);
+        progress.current.store(7, Ordering::Relaxed);
+        progress.total.store(100, Ordering::Relaxed);
+
+        let report = watchdog
+            .observe(&progress, 100)
+            .ok_or_else(|| anyhow::anyhow!("semantic embedding stall did not report"))?;
+        assert_eq!(report["event"], serde_json::json!("stall_detected"));
+        assert!(
+            watchdog.observe(&progress, 200).is_none(),
+            "without the opt-in, report-only phases must never abort"
+        );
+        Ok(())
+    }
+
+    /// #437: truthiness contract for CASS_INDEX_STALL_ABORT_ALL_PHASES.
+    #[test]
+    fn gh437_all_phases_flag_parses_expected_truthy_values() {
+        use super::stall_abort_all_phases_flag;
+        for truthy in ["1", "true", "TRUE", "yes", "on", " 1 "] {
+            assert!(
+                stall_abort_all_phases_flag(Some(truthy)),
+                "{truthy:?} must arm the all-phases abort"
+            );
+        }
+        for falsy in [None, Some(""), Some("0"), Some("false"), Some("off"), Some("2")] {
+            assert!(
+                !stall_abort_all_phases_flag(falsy),
+                "{falsy:?} must leave the all-phases abort disarmed"
+            );
+        }
     }
 
     #[test]

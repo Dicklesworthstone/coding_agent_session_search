@@ -9790,6 +9790,97 @@ fn repair_fallback_fts_after_full_index_run(
     Ok(Some(outcome))
 }
 
+/// #434 defect 3: consecutive `cass index` runs whose optional derived FTS
+/// repair failed IDENTICALLY before escalation. Below the threshold the
+/// failure stays a warning (canonical rows and the Tantivy index are good, so
+/// exit 0 is honest for the run's own work); at the threshold a non-watch
+/// `cass index` exits non-zero so cron/automation notices the persistent
+/// shadow corruption instead of logging the same warning forever — the #434
+/// report ate a month of identical daily warnings before a version bump turned
+/// the latent damage into a hard refusal.
+const FTS_REPAIR_FAILURE_ESCALATION_RUNS: u64 = 5;
+
+/// Cap on the failure detail persisted in the streak state file (identity
+/// comparison and the escalation message both use the bounded form).
+const FTS_REPAIR_FAILURE_STREAK_DETAIL_MAX_CHARS: usize = 2048;
+
+/// Persisted consecutive-identical-failure counter for the optional derived
+/// FTS repair (#434 defect 3). Lives as a dotfile in the index state dir like
+/// `.lexical-rebuild-state.json`; the DB is deliberately NOT used because one
+/// failure class is "cannot open a fresh connection at all".
+fn fts_repair_failure_streak_path(index_path: &Path) -> PathBuf {
+    index_path.join(".fts-repair-failure-streak.json")
+}
+
+fn read_fts_repair_failure_streak(index_path: &Path) -> Option<(u64, String)> {
+    let raw = std::fs::read_to_string(fts_repair_failure_streak_path(index_path)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let streak = value.get("consecutive_identical_failures")?.as_u64()?;
+    if streak == 0 {
+        return None;
+    }
+    let detail = value.get("detail")?.as_str()?.to_string();
+    Some((streak, detail))
+}
+
+/// Record one more derived-FTS repair failure and return the new streak
+/// length: incremented when `detail` matches the persisted failure exactly
+/// (bounded form), reset to 1 when the failure changed. Best-effort — a state
+/// write failure never fails a run whose canonical + Tantivy work succeeded.
+fn record_fts_repair_failure_streak(index_path: &Path, detail: &str) -> u64 {
+    let bounded: String = detail
+        .chars()
+        .take(FTS_REPAIR_FAILURE_STREAK_DETAIL_MAX_CHARS)
+        .collect();
+    let streak = match read_fts_repair_failure_streak(index_path) {
+        Some((prior, prior_detail)) if prior_detail == bounded => prior.saturating_add(1),
+        _ => 1,
+    };
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "consecutive_identical_failures": streak,
+        "escalation_threshold_runs": FTS_REPAIR_FAILURE_ESCALATION_RUNS,
+        "detail": bounded,
+        "updated_at_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    });
+    let _ = std::fs::create_dir_all(index_path);
+    if let Err(err) = std::fs::write(
+        fts_repair_failure_streak_path(index_path),
+        serde_json::to_vec_pretty(&payload).unwrap_or_default(),
+    ) {
+        tracing::debug!(
+            error = %err,
+            "persisting derived-FTS repair failure streak failed (non-fatal)"
+        );
+    }
+    streak
+}
+
+/// Reset the streak after any repair attempt that did not hit the corruption
+/// class (repaired, already healthy, known-healthy fingerprint, or a different
+/// nonfatal class — a changed failure breaks the "identical" chain anyway).
+/// Writes a zeroed record rather than deleting: cass never deletes.
+fn clear_fts_repair_failure_streak(index_path: &Path) {
+    let path = fts_repair_failure_streak_path(index_path);
+    if !path.exists() {
+        return;
+    }
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "consecutive_identical_failures": 0,
+        "escalation_threshold_runs": FTS_REPAIR_FAILURE_ESCALATION_RUNS,
+        "detail": serde_json::Value::Null,
+        "updated_at_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    });
+    let _ = std::fs::write(&path, serde_json::to_vec_pretty(&payload).unwrap_or_default());
+}
+
 /// The failure detail to persist as the "shadow may be half-rebuilt" marker for
 /// an outcome — `Some` for the skipped/failed cases, `None` (clear) when the
 /// shadow is repaired or known-healthy (zn1xn).
@@ -9849,6 +9940,68 @@ mod fallback_fts_repair_pending_tests {
             )),
             None
         );
+    }
+}
+
+/// #434 defect 3: the persisted consecutive-identical-failure counter behind
+/// the warn-forever → non-zero-exit escalation of `cass index`.
+#[cfg(test)]
+mod fts_repair_failure_streak_tests {
+    use super::{
+        FTS_REPAIR_FAILURE_ESCALATION_RUNS, clear_fts_repair_failure_streak,
+        fts_repair_failure_streak_path, read_fts_repair_failure_streak,
+        record_fts_repair_failure_streak,
+    };
+
+    #[test]
+    fn identical_failures_increment_and_changed_failures_reset() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index_path = tmp.path().join("index");
+
+        assert_eq!(read_fts_repair_failure_streak(&index_path), None);
+        assert_eq!(record_fts_repair_failure_streak(&index_path, "boom"), 1);
+        assert_eq!(record_fts_repair_failure_streak(&index_path, "boom"), 2);
+        // A different failure breaks the "identical" chain.
+        assert_eq!(record_fts_repair_failure_streak(&index_path, "other"), 1);
+        for expected in 2..=FTS_REPAIR_FAILURE_ESCALATION_RUNS {
+            assert_eq!(
+                record_fts_repair_failure_streak(&index_path, "other"),
+                expected
+            );
+        }
+        let (streak, detail) =
+            read_fts_repair_failure_streak(&index_path).expect("streak persisted");
+        assert_eq!(streak, FTS_REPAIR_FAILURE_ESCALATION_RUNS);
+        assert_eq!(detail, "other");
+    }
+
+    #[test]
+    fn clearing_zeroes_the_counter_without_deleting_the_state_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index_path = tmp.path().join("index");
+        assert_eq!(record_fts_repair_failure_streak(&index_path, "boom"), 1);
+
+        clear_fts_repair_failure_streak(&index_path);
+        assert_eq!(
+            read_fts_repair_failure_streak(&index_path),
+            None,
+            "a cleared streak must read back as no streak"
+        );
+        assert!(
+            fts_repair_failure_streak_path(&index_path).exists(),
+            "clearing zeroes the record in place — cass never deletes"
+        );
+        // The next failure restarts from 1.
+        assert_eq!(record_fts_repair_failure_streak(&index_path, "boom"), 1);
+    }
+
+    #[test]
+    fn clearing_a_never_written_streak_is_a_no_op() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index_path = tmp.path().join("index");
+        clear_fts_repair_failure_streak(&index_path);
+        assert!(!fts_repair_failure_streak_path(&index_path).exists());
+        assert_eq!(read_fts_repair_failure_streak(&index_path), None);
     }
 }
 
@@ -16023,6 +16176,11 @@ pub fn run_index(
             opts.db_path.display()
         )
     })? {
+        // #434 defect 3: track consecutive IDENTICAL derived-FTS corruption
+        // failures across runs. `Some(detail)` marks this run's repair attempt
+        // as the corruption class; any other attempted outcome resets the
+        // chain below.
+        let mut fts_repair_corruption_failure: Option<String> = None;
         match repair {
             FallbackFtsRepairOutcome::SkippedKnownHealthyForFingerprint {
                 archive_fingerprint,
@@ -16046,6 +16204,7 @@ pub fn run_index(
                     error = %detail,
                     "derived fallback FTS remains corrupt after its best-effort repair; preserving the successful canonical SQLite and Tantivy build. Run 'cass doctor check --json' before an explicit fallback-FTS rebuild"
                 );
+                fts_repair_corruption_failure = Some(detail);
             }
             FallbackFtsRepairOutcome::SkippedRepairFailed { detail } => {
                 tracing::warn!(
@@ -16053,6 +16212,7 @@ pub fn run_index(
                     error = %detail,
                     "optional derived fallback FTS repair failed; preserving the successful canonical SQLite and Tantivy build (#329). Lexical search is served by Tantivy; run 'cass doctor check --json' to inspect the shadow, and 'cass doctor --rebuild-canonical-fts --yes' for an explicit repair"
                 );
+                fts_repair_corruption_failure = Some(detail);
             }
             FallbackFtsRepairOutcome::Repaired(FtsConsistencyRepair::AlreadyHealthy { rows }) => {
                 tracing::info!(
@@ -16079,6 +16239,46 @@ pub fn run_index(
                     "rebuilt fallback FTS after full index run"
                 );
             }
+        }
+        // #434 defect 3: a derived FTS repair that fails IDENTICALLY on run
+        // after run must not stay warn-and-exit-0 forever. Persist the streak
+        // in the index state dir; once it reaches
+        // FTS_REPAIR_FAILURE_ESCALATION_RUNS, a non-watch run exits non-zero
+        // (the canonical + Tantivy work is already published and durable — the
+        // exit code is the escalation signal for cron/automation). A watch
+        // daemon logs the escalation instead of crash-looping.
+        match fts_repair_corruption_failure {
+            Some(detail) => {
+                let streak = record_fts_repair_failure_streak(&index_path, &detail);
+                let watch_mode = opts.watch || opts.watch_once_paths.is_some();
+                if streak >= FTS_REPAIR_FAILURE_ESCALATION_RUNS {
+                    if watch_mode {
+                        tracing::warn!(
+                            db_path = %opts.db_path.display(),
+                            consecutive_identical_failures = streak,
+                            escalation_threshold_runs = FTS_REPAIR_FAILURE_ESCALATION_RUNS,
+                            "the optional derived fallback FTS repair keeps failing identically; a non-watch 'cass index' would now exit non-zero (#434). Run 'cass doctor --rebuild-canonical-fts --yes --json' for an explicit repair"
+                        );
+                    } else {
+                        reset_progress_to_idle(opts.progress.as_ref());
+                        anyhow::bail!(
+                            "the optional derived fallback FTS repair has failed identically on {streak} consecutive index runs (escalation threshold: {FTS_REPAIR_FAILURE_ESCALATION_RUNS}; #434). \
+                             This run's canonical rows and Tantivy lexical index completed and search still works — the non-zero exit exists so automation notices the persistent shadow-FTS corruption instead of an identical warning every run. \
+                             Run 'cass doctor check --json' to inspect the shadow and 'cass doctor --rebuild-canonical-fts --yes --json' for an explicit repair; any run whose repair succeeds (or fails differently) resets the counter in {}. \
+                             Last failure: {detail}",
+                            fts_repair_failure_streak_path(&index_path).display()
+                        );
+                    }
+                } else if streak > 1 {
+                    tracing::warn!(
+                        db_path = %opts.db_path.display(),
+                        consecutive_identical_failures = streak,
+                        escalation_threshold_runs = FTS_REPAIR_FAILURE_ESCALATION_RUNS,
+                        "the optional derived fallback FTS repair has now failed identically on consecutive runs; 'cass index' escalates to a non-zero exit at the threshold (#434)"
+                    );
+                }
+            }
+            None => clear_fts_repair_failure_streak(&index_path),
         }
     } else if opts.full {
         tracing::info!(

@@ -2361,6 +2361,15 @@ impl FtsDryRunParity {
             None => "indeterminate",
         }
     }
+
+    /// #345: the divergence FLOOR observed within the comparison cap — missing
+    /// canonical rowids plus excess FTS rowids. On a capped (indeterminate)
+    /// inspection this is a ">= N divergent" lower bound, never an exact
+    /// count; on a complete inspection it is exact.
+    pub(crate) const fn divergent_rowids_at_least(&self) -> usize {
+        self.observed_missing_canonical_rowids_at_least
+            .saturating_add(self.observed_excess_fts_rowids_at_least)
+    }
 }
 
 fn classify_fts_shadow_parity(
@@ -13204,10 +13213,18 @@ impl FrankenStorage {
             );
             (Some(status), detail)
         } else {
+            // #345: a capped inspection reports a divergence FLOOR (">= N
+            // divergent"), never an exact count — the exact intersection is
+            // deferred to the --yes apply path so a read-only dry-run on a
+            // multi-million-row archive stays bounded.
+            let observed_divergent = observed_missing.saturating_add(observed_excess);
             (
                 None,
                 Some(format!(
-                    "bounded dry-run stopped after at most {comparison_cap} row IDs per domain; exact parity is deferred to --yes before any mutation"
+                    "bounded dry-run stopped after at most {comparison_cap} row IDs per domain \
+                     (>= {observed_divergent} divergent row ID(s) observed within the cap: \
+                     missing >= {observed_missing}, excess >= {observed_excess}); exact parity \
+                     is deferred to --yes before any mutation"
                 )),
             )
         };
@@ -21527,6 +21544,74 @@ mod tests {
         );
         assert_eq!(completed.observed_missing_canonical_rowids_at_least, 1);
         assert_eq!(completed.observed_excess_fts_rowids_at_least, 1);
+    }
+
+    /// #345 plan of record: on a fixture whose row-ID domains EXCEED the cap,
+    /// a capped dry-run must stop at the cap and report the divergence it saw
+    /// as a ">= N divergent" floor — never an exact count, never "healthy".
+    #[test]
+    fn gh345_capped_dry_run_reports_divergence_floor_on_fixture_exceeding_cap() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("fts-divergence-floor.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        seed_atomic_fts_rebuild_fixture(&storage);
+
+        let conversation_id: i64 = storage
+            .raw()
+            .query_row_map("SELECT id FROM conversations LIMIT 1", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        for idx in 1_i64..7 {
+            storage
+                .raw()
+                .execute_compat(
+                    "INSERT INTO messages(conversation_id, idx, role, content)
+                     VALUES(?1, ?2, 'assistant', ?3)",
+                    fparams![conversation_id, idx, format!("early divergence row {idx}")],
+                )
+                .unwrap();
+        }
+        storage.rebuild_fts().unwrap();
+        // Plant divergence EARLY (the smallest rowid) so a capped scan
+        // observes it before stopping.
+        let first_message_id: i64 = storage
+            .raw()
+            .query_row_map("SELECT MIN(id) FROM messages", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        storage
+            .raw()
+            .execute_compat(
+                "DELETE FROM fts_messages_docsize WHERE id = ?1",
+                fparams![first_message_id],
+            )
+            .unwrap();
+
+        // 7 indexable messages / 6 indexed rows, cap 3: both domains exceed
+        // the cap, so the inspection is indeterminate — but the missing first
+        // rowid was inside the inspected window and must surface as a floor.
+        let capped = storage
+            .inspect_search_fallback_fts_parity_dry_run(3)
+            .expect("capped dry-run on a fixture exceeding the cap");
+        assert!(!capped.inspection_complete);
+        assert_eq!(capped.exact_status, None);
+        assert_eq!(capped.status_as_str(), "indeterminate");
+        assert_eq!(capped.canonical_ids_examined, 3);
+        assert_eq!(capped.indexed_ids_examined, 3);
+        assert_eq!(capped.observed_missing_canonical_rowids_at_least, 1);
+        assert_eq!(capped.observed_excess_fts_rowids_at_least, 0);
+        assert_eq!(capped.divergent_rowids_at_least(), 1);
+        let detail = capped.detail.as_deref().expect("capped dry-run detail");
+        assert!(
+            detail.contains(">= 1 divergent row ID(s)"),
+            "capped detail must report the divergence floor, got: {detail}"
+        );
+        assert!(
+            detail.contains("deferred to --yes"),
+            "capped detail must defer exact parity to the apply path, got: {detail}"
+        );
     }
 
     #[test]
