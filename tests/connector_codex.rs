@@ -4,14 +4,12 @@ use tempfile::TempDir;
 
 use coding_agent_search::connectors::{Connector, ScanContext, ScanRoot, codex::CodexConnector};
 use serde_json::Value;
-use serial_test::serial;
 
 fn codex_real_fixture_home() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex_real")
 }
 
 #[test]
-#[serial]
 fn codex_connector_reads_modern_envelope_jsonl() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/11/21");
@@ -25,18 +23,14 @@ fn codex_connector_reads_modern_envelope_jsonl() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    // Safe in test scope: we control process env.
-    unsafe {
-        std::env::set_var("CODEX_HOME", dir.path());
-    }
-
     let connector = CodexConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir codex home is passed as an EXPLICIT scan root
+    // instead of mutating process-global CODEX_HOME.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
     let c = &convs[0];
@@ -67,7 +61,6 @@ fn codex_connector_reads_modern_envelope_jsonl() {
 }
 
 #[test]
-#[serial]
 fn codex_connector_includes_agent_reasoning() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/11/22");
@@ -82,17 +75,14 @@ fn codex_connector_includes_agent_reasoning() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("CODEX_HOME", dir.path());
-    }
-
     let connector = CodexConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir codex home is passed as an EXPLICIT scan root
+    // instead of mutating process-global CODEX_HOME.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
     let c = &convs[0];
@@ -136,22 +126,18 @@ fn codex_connector_includes_agent_reasoning() {
 }
 
 #[test]
-#[serial]
 fn codex_connector_parses_real_tool_call_fixture() {
     let fixture_home = codex_real_fixture_home();
     let expected_path = fixture_home.join("sessions/2025/11/26/rollout-tool-call.jsonl");
 
-    unsafe {
-        std::env::set_var("CODEX_HOME", &fixture_home);
-    }
 
     let connector = CodexConnector::new();
-    let ctx = ScanContext {
-        data_dir: fixture_home.clone(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: committed fixture home passed as an explicit scan root.
+    let ctx = ScanContext::with_roots(
+        fixture_home.clone(),
+        vec![ScanRoot::local(fixture_home.clone())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     let conv = convs
         .into_iter()
@@ -219,7 +205,6 @@ fn codex_connector_parses_real_tool_call_fixture() {
 }
 
 #[test]
-#[serial]
 fn codex_connector_indexes_modern_response_items() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2026/05/08");
@@ -235,17 +220,14 @@ fn codex_connector_indexes_modern_response_items() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("CODEX_HOME", dir.path());
-    }
-
     let connector = CodexConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir codex home is passed as an EXPLICIT scan root
+    // instead of mutating process-global CODEX_HOME.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -303,7 +285,6 @@ fn codex_connector_indexes_modern_response_items() {
 }
 
 #[test]
-#[serial]
 fn codex_connector_scans_explicit_rollout_file_root() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join(".codex/sessions/2026/05/08");
@@ -338,7 +319,6 @@ fn codex_connector_scans_explicit_rollout_file_root() {
 }
 
 #[test]
-#[serial]
 fn codex_connector_ignores_unmatched_token_count() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/11/23");
@@ -353,17 +333,14 @@ fn codex_connector_ignores_unmatched_token_count() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("CODEX_HOME", dir.path());
-    }
-
     let connector = CodexConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir codex home is passed as an EXPLICIT scan root
+    // instead of mutating process-global CODEX_HOME.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
     let c = &convs[0];
@@ -394,7 +371,6 @@ fn codex_connector_ignores_unmatched_token_count() {
 /// The since_ts is ONLY used to decide whether to process the file at all
 /// (based on file mtime vs since_ts).
 #[test]
-#[serial]
 fn codex_connector_respects_since_ts_at_file_level_only() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/11/24");
@@ -408,18 +384,13 @@ fn codex_connector_respects_since_ts_at_file_level_only() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("CODEX_HOME", dir.path());
-    }
-
     let connector = CodexConnector::new();
     // since_ts does NOT filter individual messages anymore - only whole files
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: Some(1_700_000_000_000),
-        progress_tick: None,
-    };
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        Some(1_700_000_000_000),
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
     let c = &convs[0];
@@ -439,7 +410,6 @@ fn codex_connector_respects_since_ts_at_file_level_only() {
 
 /// Test legacy .json format parsing
 #[test]
-#[serial]
 fn codex_connector_reads_legacy_json_format() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/11/25");
@@ -467,17 +437,14 @@ fn codex_connector_reads_legacy_json_format() {
     }"#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("CODEX_HOME", dir.path());
-    }
-
     let connector = CodexConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir codex home is passed as an EXPLICIT scan root
+    // instead of mutating process-global CODEX_HOME.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -500,41 +467,53 @@ fn codex_connector_reads_legacy_json_format() {
 
 /// Test detection with existing sessions directory
 #[test]
-#[serial]
 fn codex_detect_with_sessions_dir() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions");
     fs::create_dir_all(&sessions).unwrap();
 
-    unsafe {
-        std::env::set_var("CODEX_HOME", dir.path());
-    }
-
-    let connector = CodexConnector::new();
-    let result = connector.detect();
-    assert!(result.detected);
-    assert!(!result.evidence.is_empty());
+    // qu81y: detection is exercised through FAD's explicit root-override
+    // input (the same root CODEX_HOME=<dir> used to resolve to, i.e.
+    // <dir>/sessions) instead of mutating process-global env.
+    let report = franken_agent_detection::detect_installed_agents(
+        &franken_agent_detection::AgentDetectOptions {
+            only_connectors: Some(vec!["codex".to_string()]),
+            include_undetected: true,
+            root_overrides: vec![franken_agent_detection::AgentDetectRootOverride {
+                slug: "codex".to_string(),
+                root: sessions,
+            }],
+        },
+    )
+    .expect("codex detection report");
+    let entry = &report.installed_agents[0];
+    assert!(entry.detected);
+    assert!(!entry.evidence.is_empty());
 }
 
 /// Test detection without sessions directory
 #[test]
-#[serial]
 fn codex_detect_without_sessions_dir() {
     let dir = TempDir::new().unwrap();
-    // Don't create sessions directory
-
-    unsafe {
-        std::env::set_var("CODEX_HOME", dir.path());
-    }
-
-    let connector = CodexConnector::new();
-    let result = connector.detect();
-    assert!(!result.detected);
+    // Don't create the sessions directory: the overridden probe root does
+    // not exist, so detection must report not-found.
+    let report = franken_agent_detection::detect_installed_agents(
+        &franken_agent_detection::AgentDetectOptions {
+            only_connectors: Some(vec!["codex".to_string()]),
+            include_undetected: true,
+            root_overrides: vec![franken_agent_detection::AgentDetectRootOverride {
+                slug: "codex".to_string(),
+                root: dir.path().join("sessions"),
+            }],
+        },
+    )
+    .expect("codex detection report");
+    let entry = &report.installed_agents[0];
+    assert!(!entry.detected);
 }
 
 /// Test `user_message` event type
 #[test]
-#[serial]
 fn codex_connector_handles_user_message_event() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/11/26");
@@ -547,17 +526,14 @@ fn codex_connector_handles_user_message_event() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("CODEX_HOME", dir.path());
-    }
-
     let connector = CodexConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir codex home is passed as an EXPLICIT scan root
+    // instead of mutating process-global CODEX_HOME.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -571,7 +547,6 @@ fn codex_connector_handles_user_message_event() {
 
 /// Test malformed JSONL lines are skipped gracefully
 #[test]
-#[serial]
 fn codex_connector_skips_malformed_lines() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/11/27");
@@ -586,17 +561,14 @@ also not valid
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("CODEX_HOME", dir.path());
-    }
-
     let connector = CodexConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir codex home is passed as an EXPLICIT scan root
+    // instead of mutating process-global CODEX_HOME.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -607,7 +579,6 @@ also not valid
 
 /// Test multiple sessions in separate files
 #[test]
-#[serial]
 fn codex_connector_handles_multiple_sessions() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/11/28");
@@ -623,28 +594,24 @@ fn codex_connector_handles_multiple_sessions() {
         fs::write(&file, sample).unwrap();
     }
 
-    unsafe {
-        std::env::set_var("CODEX_HOME", dir.path());
-    }
-
     let connector = CodexConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir codex home is passed as an EXPLICIT scan root
+    // instead of mutating process-global CODEX_HOME.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 3);
 }
 
 /// Test empty content messages are filtered
 ///
-/// set CODEX_HOME env var without proper serialization, causing parallel
-/// tests to interfere with each other. Works locally but fails on CI.
-/// Consider adding serial_test or refactoring to avoid env var mutation.
+/// (qu81y: this suite no longer mutates CODEX_HOME — every test passes its
+/// tempdir as an explicit ScanContext scan root, so parallel scheduling is
+/// safe without serial_test.)
 #[test]
-#[serial]
 fn codex_connector_filters_empty_content() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/11/29");
@@ -658,17 +625,14 @@ fn codex_connector_filters_empty_content() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("CODEX_HOME", dir.path());
-    }
-
     let connector = CodexConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir codex home is passed as an EXPLICIT scan root
+    // instead of mutating process-global CODEX_HOME.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -681,7 +645,6 @@ fn codex_connector_filters_empty_content() {
 /// Test title extraction from first user message
 ///
 #[test]
-#[serial]
 fn codex_connector_extracts_title() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/11/30");
@@ -694,17 +657,14 @@ fn codex_connector_extracts_title() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("CODEX_HOME", dir.path());
-    }
-
     let connector = CodexConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir codex home is passed as an EXPLICIT scan root
+    // instead of mutating process-global CODEX_HOME.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -715,7 +675,6 @@ fn codex_connector_extracts_title() {
 
 /// Test sequential index assignment
 #[test]
-#[serial]
 fn codex_connector_assigns_sequential_indices() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/12/01");
@@ -729,17 +688,14 @@ fn codex_connector_assigns_sequential_indices() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("CODEX_HOME", dir.path());
-    }
-
     let connector = CodexConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir codex home is passed as an EXPLICIT scan root
+    // instead of mutating process-global CODEX_HOME.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -752,7 +708,6 @@ fn codex_connector_assigns_sequential_indices() {
 
 /// Test `external_id` comes from filename
 #[test]
-#[serial]
 fn codex_connector_sets_external_id_from_filename() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/12/02");
@@ -764,17 +719,14 @@ fn codex_connector_sets_external_id_from_filename() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("CODEX_HOME", dir.path());
-    }
-
     let connector = CodexConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir codex home is passed as an EXPLICIT scan root
+    // instead of mutating process-global CODEX_HOME.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -788,31 +740,26 @@ fn codex_connector_sets_external_id_from_filename() {
 
 /// Test empty sessions directory returns no conversations
 #[test]
-#[serial]
 fn codex_connector_handles_empty_sessions() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions");
     fs::create_dir_all(&sessions).unwrap();
     // No files in sessions
 
-    unsafe {
-        std::env::set_var("CODEX_HOME", dir.path());
-    }
-
     let connector = CodexConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir codex home is passed as an EXPLICIT scan root
+    // instead of mutating process-global CODEX_HOME.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert!(convs.is_empty());
 }
 
 /// Test integer (milliseconds) timestamp format
 #[test]
-#[serial]
 fn codex_connector_parses_millis_timestamp() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/12/03");
@@ -826,17 +773,14 @@ fn codex_connector_parses_millis_timestamp() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("CODEX_HOME", dir.path());
-    }
-
     let connector = CodexConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir codex home is passed as an EXPLICIT scan root
+    // instead of mutating process-global CODEX_HOME.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -851,7 +795,6 @@ fn codex_connector_parses_millis_timestamp() {
 
 /// Test `tool_use` blocks in content are flattened properly
 #[test]
-#[serial]
 fn codex_connector_flattens_tool_use_blocks() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/12/04");
@@ -864,17 +807,14 @@ fn codex_connector_flattens_tool_use_blocks() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("CODEX_HOME", dir.path());
-    }
-
     let connector = CodexConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir codex home is passed as an EXPLICIT scan root
+    // instead of mutating process-global CODEX_HOME.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -890,7 +830,6 @@ fn codex_connector_flattens_tool_use_blocks() {
 
 /// Test missing cwd in `session_meta` results in None workspace
 #[test]
-#[serial]
 fn codex_connector_handles_missing_cwd() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/12/05");
@@ -903,17 +842,14 @@ fn codex_connector_handles_missing_cwd() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("CODEX_HOME", dir.path());
-    }
-
     let connector = CodexConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir codex home is passed as an EXPLICIT scan root
+    // instead of mutating process-global CODEX_HOME.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -926,7 +862,6 @@ fn codex_connector_handles_missing_cwd() {
 
 /// Test files without rollout- prefix are ignored
 #[test]
-#[serial]
 fn codex_connector_ignores_non_rollout_files() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/12/06");
@@ -947,17 +882,14 @@ fn codex_connector_ignores_non_rollout_files() {
     fs::write(&other2, sample).unwrap();
     fs::write(&other3, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("CODEX_HOME", dir.path());
-    }
-
     let connector = CodexConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir codex home is passed as an EXPLICIT scan root
+    // instead of mutating process-global CODEX_HOME.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     // Only the rollout- prefixed file should be processed
     assert_eq!(convs.len(), 1);
@@ -970,7 +902,6 @@ fn codex_connector_ignores_non_rollout_files() {
 
 /// Test legacy JSON with missing optional fields
 #[test]
-#[serial]
 fn codex_connector_handles_legacy_json_missing_session() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/12/07");
@@ -988,17 +919,14 @@ fn codex_connector_handles_legacy_json_missing_session() {
     }"#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("CODEX_HOME", dir.path());
-    }
-
     let connector = CodexConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir codex home is passed as an EXPLICIT scan root
+    // instead of mutating process-global CODEX_HOME.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -1010,7 +938,6 @@ fn codex_connector_handles_legacy_json_missing_session() {
 
 /// Test title fallback to first message when no user message exists
 #[test]
-#[serial]
 fn codex_connector_title_fallback_to_first_message() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/12/08");
@@ -1023,17 +950,14 @@ fn codex_connector_title_fallback_to_first_message() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("CODEX_HOME", dir.path());
-    }
-
     let connector = CodexConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir codex home is passed as an EXPLICIT scan root
+    // instead of mutating process-global CODEX_HOME.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -1044,7 +968,6 @@ fn codex_connector_title_fallback_to_first_message() {
 
 /// Test deeply nested directory structure
 #[test]
-#[serial]
 fn codex_connector_handles_nested_directories() {
     let dir = TempDir::new().unwrap();
     let deep_sessions = dir.path().join("sessions/2025/12/09/sub1/sub2");
@@ -1056,17 +979,14 @@ fn codex_connector_handles_nested_directories() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("CODEX_HOME", dir.path());
-    }
-
     let connector = CodexConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir codex home is passed as an EXPLICIT scan root
+    // instead of mutating process-global CODEX_HOME.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
     assert!(convs[0].source_path.to_string_lossy().contains("sub2"));
@@ -1074,7 +994,6 @@ fn codex_connector_handles_nested_directories() {
 
 /// Test `turn_aborted` event is filtered out
 #[test]
-#[serial]
 fn codex_connector_filters_turn_aborted() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/12/10");
@@ -1088,17 +1007,14 @@ fn codex_connector_filters_turn_aborted() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("CODEX_HOME", dir.path());
-    }
-
     let connector = CodexConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir codex home is passed as an EXPLICIT scan root
+    // instead of mutating process-global CODEX_HOME.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -1112,7 +1028,6 @@ fn codex_connector_filters_turn_aborted() {
 
 /// Test long title is truncated to 100 chars
 #[test]
-#[serial]
 fn codex_connector_truncates_long_title() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/12/11");
@@ -1127,17 +1042,14 @@ fn codex_connector_truncates_long_title() {
     );
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("CODEX_HOME", dir.path());
-    }
-
     let connector = CodexConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir codex home is passed as an EXPLICIT scan root
+    // instead of mutating process-global CODEX_HOME.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -1162,7 +1074,6 @@ fn codex_connector_truncates_long_title() {
 
 /// Test `source_path` matches actual file path
 #[test]
-#[serial]
 fn codex_connector_sets_source_path() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/12/12");
@@ -1174,17 +1085,14 @@ fn codex_connector_sets_source_path() {
 "#;
     fs::write(&file, sample).unwrap();
 
-    unsafe {
-        std::env::set_var("CODEX_HOME", dir.path());
-    }
-
     let connector = CodexConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir codex home is passed as an EXPLICIT scan root
+    // instead of mutating process-global CODEX_HOME.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
@@ -1194,7 +1102,6 @@ fn codex_connector_sets_source_path() {
 
 /// Test metadata indicates correct source format
 #[test]
-#[serial]
 fn codex_connector_metadata_indicates_format() {
     let dir = TempDir::new().unwrap();
     let sessions = dir.path().join("sessions/2025/12/13");
@@ -1212,17 +1119,14 @@ fn codex_connector_metadata_indicates_format() {
     let json_sample = r#"{"session":{"id":"json","cwd":"/test"},"items":[{"role":"user","content":"json format"}]}"#;
     fs::write(&json_file, json_sample).unwrap();
 
-    unsafe {
-        std::env::set_var("CODEX_HOME", dir.path());
-    }
-
     let connector = CodexConnector::new();
-    let ctx = ScanContext {
-        data_dir: dir.path().to_path_buf(),
-        scan_roots: Vec::new(),
-        since_ts: None,
-        progress_tick: None,
-    };
+    // qu81y: the tempdir codex home is passed as an EXPLICIT scan root
+    // instead of mutating process-global CODEX_HOME.
+    let ctx = ScanContext::with_roots(
+        dir.path().to_path_buf(),
+        vec![ScanRoot::local(dir.path().to_path_buf())],
+        None,
+    );
     let convs = connector.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 2);
 
