@@ -829,6 +829,7 @@ fn e2e_subprocess_sources_cannot_mutate_the_parent_environment() -> SchemaTestRe
     let sources = [
         "tests/connector_codex.rs",
         "tests/connector_pi_agent.rs",
+        "tests/cli_index.rs",
         "tests/e2e_cli_flows.rs",
         "tests/e2e_deploy.rs",
         "tests/e2e_filters.rs",
