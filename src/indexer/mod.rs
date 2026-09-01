@@ -12561,6 +12561,8 @@ struct StreamingProducerConfig {
     flow_limiter: Arc<StreamingByteLimiter>,
     data_dir: PathBuf,
     additional_scan_roots: Vec<ScanRoot>,
+    /// qu81y closed-world override; see [`LocalConnectorRootsOverride`].
+    local_connector_roots: LocalConnectorRootsOverride,
     since_ts: Option<i64>,
     local_since_ts_by_connector: Arc<HashMap<&'static str, Option<i64>>>,
     progress: Option<Arc<IndexingProgress>>,
@@ -12603,7 +12605,22 @@ fn spawn_connector_producer(
             None => ctx,
         };
 
-        if detect.detected {
+        // qu81y closed-world override: when a per-connector roots map is
+        // supplied, scan exactly those roots and never consult env-based
+        // default detection; connectors absent from the map are skipped.
+        let override_roots: Option<Vec<ScanRoot>> = config
+            .local_connector_roots
+            .as_ref()
+            .map(|map| {
+                map.get(name)
+                    .map(|roots| roots.iter().cloned().map(ScanRoot::local).collect())
+                    .unwrap_or_default()
+            });
+        let scan_local = match &override_roots {
+            Some(roots) => !roots.is_empty(),
+            None => detect.detected,
+        };
+        if scan_local {
             // Update discovered agents count immediately when detected
             if let Some(p) = &config.progress {
                 p.discovered_agents.fetch_add(1, Ordering::Relaxed);
@@ -12617,19 +12634,24 @@ fn spawn_connector_producer(
                 .unwrap_or(config.since_ts);
 
             // Scan local sources
-            let ctx = with_scan_tick(crate::connectors::ScanContext::local_default(
-                config.data_dir.clone(),
-                local_since_ts,
-            ));
+            let ctx = with_scan_tick(match &override_roots {
+                Some(roots) => crate::connectors::ScanContext::with_roots(
+                    config.data_dir.clone(),
+                    roots.clone(),
+                    local_since_ts,
+                ),
+                None => crate::connectors::ScanContext::local_default(
+                    config.data_dir.clone(),
+                    local_since_ts,
+                ),
+            });
             let local_origin = Origin::local();
             let mut batch_sender =
                 StreamingBatchSender::new(&tx, config.flow_limiter.clone(), name, is_discovered);
-            let fallback_roots: Vec<ScanRoot> = detect
-                .root_paths
-                .iter()
-                .cloned()
-                .map(ScanRoot::local)
-                .collect();
+            let fallback_roots: Vec<ScanRoot> = match &override_roots {
+                Some(roots) => roots.clone(),
+                None => detect.root_paths.iter().cloned().map(ScanRoot::local).collect(),
+            };
             let (mut ingest_diagnostics, preparse_active_source_skipped) =
                 capture_connector_sources_before_parse(
                     conn.as_ref(),
@@ -13342,6 +13364,7 @@ fn run_streaming_index(
     since_ts: Option<i64>,
     lexical_strategy: LexicalPopulationStrategy,
     additional_scan_roots: Vec<ScanRoot>,
+    local_connector_roots: LocalConnectorRootsOverride,
     scan_start_ts: i64,
     progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
@@ -13352,6 +13375,7 @@ fn run_streaming_index(
         since_ts,
         lexical_strategy,
         additional_scan_roots,
+        local_connector_roots,
         configured_connector_factories(),
         scan_start_ts,
         progress_bump,
@@ -13409,6 +13433,7 @@ fn run_streaming_index_with_connector_factories(
     since_ts: Option<i64>,
     lexical_strategy: LexicalPopulationStrategy,
     additional_scan_roots: Vec<ScanRoot>,
+    local_connector_roots: LocalConnectorRootsOverride,
     connector_factories: Vec<(&'static str, ConnectorFactory)>,
     scan_start_ts: i64,
     progress_bump: Option<&Arc<AtomicI64>>,
@@ -13462,6 +13487,7 @@ fn run_streaming_index_with_connector_factories(
         flow_limiter: Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
         data_dir: opts.data_dir.clone(),
         additional_scan_roots: additional_scan_roots.clone(),
+        local_connector_roots: local_connector_roots.clone(),
         since_ts,
         local_since_ts_by_connector: Arc::new(connector_local_scan_since_ts_map(
             storage,
@@ -13558,6 +13584,7 @@ fn run_streaming_index_with_connector_factories(
 /// all conversations into memory before ingesting. This is the fallback when
 /// streaming is disabled via CASS_STREAMING_INDEX=0.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn run_batch_index(
     storage: &FrankenStorage,
     t_index: Option<&mut TantivyIndex>,
@@ -13565,6 +13592,7 @@ fn run_batch_index(
     since_ts: Option<i64>,
     lexical_strategy: LexicalPopulationStrategy,
     additional_scan_roots: Vec<ScanRoot>,
+    local_connector_roots: LocalConnectorRootsOverride,
     scan_start_ts: i64,
     progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
@@ -13575,6 +13603,7 @@ fn run_batch_index(
         since_ts,
         lexical_strategy,
         additional_scan_roots,
+        local_connector_roots,
         configured_connector_factories(),
         scan_start_ts,
         progress_bump,
@@ -13589,6 +13618,7 @@ fn run_batch_index_with_connector_factories(
     since_ts: Option<i64>,
     lexical_strategy: LexicalPopulationStrategy,
     additional_scan_roots: Vec<ScanRoot>,
+    local_connector_roots: LocalConnectorRootsOverride,
     connector_factories: Vec<(&'static str, ConnectorFactory)>,
     scan_start_ts: i64,
     progress_bump: Option<&Arc<AtomicI64>>,
@@ -13661,7 +13691,20 @@ fn run_batch_index_with_connector_factories(
                     }
                 };
 
-                if detect.detected {
+                // qu81y closed-world override: see the streaming lane — same
+                // semantics for the batch path.
+                let override_roots: Option<Vec<ScanRoot>> = local_connector_roots
+                    .as_ref()
+                    .map(|map| {
+                        map.get(name)
+                            .map(|roots| roots.iter().cloned().map(ScanRoot::local).collect())
+                            .unwrap_or_default()
+                    });
+                let scan_local = match &override_roots {
+                    Some(roots) => !roots.is_empty(),
+                    None => detect.detected,
+                };
+                if scan_local {
                     // Update discovered agents count immediately when detected
                     // This gives fast UI feedback during the discovery phase
                     // Note: AtomicUsize has no contention, only the mutex was problematic
@@ -13674,16 +13717,26 @@ fn run_batch_index_with_connector_factories(
                         .get(name)
                         .copied()
                         .unwrap_or(since_ts);
-                    let ctx = with_scan_tick(crate::connectors::ScanContext::local_default(
-                        data_dir.clone(),
-                        local_since_ts,
-                    ));
-                    let fallback_roots: Vec<ScanRoot> = detect
-                        .root_paths
-                        .iter()
-                        .cloned()
-                        .map(ScanRoot::local)
-                        .collect();
+                    let ctx = with_scan_tick(match &override_roots {
+                        Some(roots) => crate::connectors::ScanContext::with_roots(
+                            data_dir.clone(),
+                            roots.clone(),
+                            local_since_ts,
+                        ),
+                        None => crate::connectors::ScanContext::local_default(
+                            data_dir.clone(),
+                            local_since_ts,
+                        ),
+                    });
+                    let fallback_roots: Vec<ScanRoot> = match &override_roots {
+                        Some(roots) => roots.clone(),
+                        None => detect
+                            .root_paths
+                            .iter()
+                            .cloned()
+                            .map(ScanRoot::local)
+                            .collect(),
+                    };
                     let (mut ingest_diagnostics, preparse_active_source_skipped) =
                         capture_connector_sources_before_parse(
                         conn.as_ref(),
@@ -14066,6 +14119,35 @@ fn explicit_scan_root_since_ts(
 pub fn run_index(
     opts: IndexOptions,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
+) -> Result<()> {
+    run_index_inner(opts, event_channel, None)
+}
+
+/// qu81y class-B injection seam: run one index pass with the connectors'
+/// LOCAL default-detection lane replaced by an explicit CLOSED-WORLD set of
+/// per-connector scan roots. Connectors absent from the map are skipped
+/// entirely — detection never consults process-global environment (HOME,
+/// CODEX_HOME, ...), so in-process tests can drive `run_index` against
+/// fixture roots without mutating env vars shared across libtest threads.
+/// Explicitly configured `sources.toml` roots and the watch path are
+/// unaffected; production callers keep using [`run_index`].
+pub fn run_index_with_local_connector_roots(
+    opts: IndexOptions,
+    local_connector_roots: HashMap<String, Vec<PathBuf>>,
+    event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
+) -> Result<()> {
+    run_index_inner(opts, event_channel, Some(Arc::new(local_connector_roots)))
+}
+
+/// Per-connector local scan roots override (qu81y): `Some(map)` means a
+/// closed world — scan exactly `map[connector]` per connector, skip
+/// connectors without an entry, and never run env-based default detection.
+type LocalConnectorRootsOverride = Option<Arc<HashMap<String, Vec<PathBuf>>>>;
+
+fn run_index_inner(
+    opts: IndexOptions,
+    event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
+    local_connector_roots: LocalConnectorRootsOverride,
 ) -> Result<()> {
     ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(false, Ordering::Relaxed);
     let _progress_reset = RunIndexProgressReset::new(opts.progress.clone());
@@ -15367,8 +15449,14 @@ pub fn run_index(
                     tracing::info!("full_scan: no last_scan_ts or rebuild requested");
                 }
 
-                let additional_scan_roots =
-                    additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir);
+                // qu81y closed-world override: sources.toml resolution is
+                // HOME/XDG-scoped, so an env-free run must not consult it —
+                // the override map is the complete scan universe.
+                let additional_scan_roots = if local_connector_roots.is_some() {
+                    Vec::new()
+                } else {
+                    additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir)
+                };
                 // #372: drop remote mirror roots whose on-disk fingerprint is
                 // unchanged since the last error-free scan (they would otherwise
                 // be fully re-scanned every run), and capture fingerprints to
@@ -15398,6 +15486,7 @@ pub fn run_index(
                         since_ts,
                         lexical_strategy,
                         additional_scan_roots.clone(),
+                        local_connector_roots.clone(),
                         scan_start_ts,
                         Some(&progress_bump),
                     )?;
@@ -15424,6 +15513,7 @@ pub fn run_index(
                         since_ts,
                         lexical_strategy,
                         additional_scan_roots.clone(),
+                        local_connector_roots.clone(),
                         scan_start_ts,
                         Some(&progress_bump),
                     )?;
@@ -34373,6 +34463,7 @@ mod tests {
             None,
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
             Vec::new(),
+            None,
             vec![("codex", failing_explicit_file_root_connector_factory)],
             FrankenStorage::now_millis(),
             None,
@@ -44723,6 +44814,7 @@ mod tests {
                     Origin::remote("fixture-host"),
                     Some(crate::sources::config::Platform::Linux),
                 )],
+                local_connector_roots: None,
                 since_ts: None,
                 local_since_ts_by_connector: Arc::new(HashMap::new()),
                 progress: Some(progress.clone()),
@@ -44808,6 +44900,7 @@ mod tests {
                 Origin::remote("fixture-host"),
                 Some(Platform::Linux),
             )],
+            None,
             vec![("claude", watermark_sensitive_remote_connector_factory)],
             FrankenStorage::now_millis(),
             None,
@@ -44889,6 +44982,7 @@ mod tests {
             Some(i64::MAX),
             LexicalPopulationStrategy::IncrementalInline,
             vec![configured_local_scan_root(local_root_path)],
+            None,
             vec![("claude", watermark_sensitive_remote_connector_factory)],
             FrankenStorage::now_millis(),
             None,
@@ -44935,6 +45029,7 @@ mod tests {
             None,
             LexicalPopulationStrategy::IncrementalInline,
             Vec::new(),
+            None,
             vec![("claude", panic_connector_factory)],
             FrankenStorage::now_millis(),
             None,
@@ -45001,6 +45096,7 @@ mod tests {
                 Origin::remote("fixture-host"),
                 Some(Platform::Linux),
             )],
+            None,
             vec![("claude", watermark_sensitive_remote_connector_factory)],
             FrankenStorage::now_millis(),
             None,
@@ -45080,6 +45176,7 @@ mod tests {
             Some(i64::MAX),
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
             vec![configured_local_scan_root(local_root_path)],
+            None,
             vec![("claude", watermark_sensitive_remote_connector_factory)],
             FrankenStorage::now_millis(),
             None,
@@ -45132,6 +45229,7 @@ mod tests {
                 None,
                 LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
                 Vec::new(),
+                None,
                 vec![("codex", failing_explicit_file_root_connector_factory)],
                 FrankenStorage::now_millis(),
                 None,
@@ -45214,6 +45312,7 @@ mod tests {
             None,
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
             Vec::new(),
+            None,
             vec![
                 ("claude", active_batch_watermark_connector_factory),
                 ("codex", safe_batch_watermark_connector_factory),
@@ -45267,6 +45366,7 @@ mod tests {
             None,
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
             Vec::new(),
+            None,
             vec![("codex", deferred_batch_connector_factory)],
             FrankenStorage::now_millis(),
             None,
@@ -45328,6 +45428,7 @@ mod tests {
                     Origin::remote("fixture-host"),
                     Some(crate::sources::config::Platform::Linux),
                 )],
+                local_connector_roots: None,
                 since_ts: None,
                 local_since_ts_by_connector: Arc::new(HashMap::new()),
                 progress: None,
@@ -57282,6 +57383,7 @@ mod tests {
             None,
             LexicalPopulationStrategy::IncrementalInline,
             Vec::new(),
+            None,
             vec![("codex", factory)],
             FrankenStorage::now_millis(),
             None,

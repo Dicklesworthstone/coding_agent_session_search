@@ -273,11 +273,10 @@ fn test_corrupted_index_triggers_rebuild() {
     fs::create_dir_all(&xdg_config).expect("create temp xdg config");
     let codex_home = data_dir.join(".codex");
     fs::create_dir_all(&codex_home).expect("create temp codex home");
-    let _guard_home = EnvGuard::set("HOME", home_dir.to_string_lossy());
-    let _guard_xdg_data = EnvGuard::set("XDG_DATA_HOME", xdg_data.to_string_lossy());
-    let _guard_xdg_config = EnvGuard::set("XDG_CONFIG_HOME", xdg_config.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
-    let _guard_ignore_sources = EnvGuard::set("CASS_IGNORE_SOURCES_CONFIG", "1");
+    // qu81y: env-free — the closed-world roots override passed to
+    // run_index_with_local_connector_roots below replaces HOME/XDG/CODEX
+    // redirection and CASS_IGNORE_SOURCES_CONFIG entirely.
+    let _ = (&home_dir, &xdg_data, &xdg_config);
 
     // Phase 1: Create database and fixture tree inside the isolated sandbox.
     let start = tracker.start(
@@ -307,7 +306,9 @@ fn test_corrupted_index_triggers_rebuild() {
         progress: None,
         watch_interval_secs: 30,
     };
-    let result = indexer::run_index(opts, None);
+    let mut local_roots = std::collections::HashMap::new();
+    local_roots.insert("codex".to_string(), vec![codex_home.clone()]);
+    let result = indexer::run_index_with_local_connector_roots(opts, local_roots, None);
     // Index creation may fail if connectors aren't configured, which is fine
     // We're testing the recovery path, not the full indexing
     let _ = result;
@@ -338,7 +339,10 @@ fn test_corrupted_index_triggers_rebuild() {
             watch_interval_secs: 30,
         };
         // force_rebuild should handle corrupted index gracefully
-        let _ = indexer::run_index(rebuild_opts, None);
+        let mut rebuild_roots = std::collections::HashMap::new();
+        rebuild_roots.insert("codex".to_string(), vec![codex_home.clone()]);
+        let _ =
+            indexer::run_index_with_local_connector_roots(rebuild_opts, rebuild_roots, None);
         tracker.end(
             "rebuild_index",
             Some("Rebuild index with force flag"),

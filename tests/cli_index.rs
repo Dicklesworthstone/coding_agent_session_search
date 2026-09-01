@@ -10,7 +10,6 @@ use std::fs::OpenOptions;
 use tempfile::TempDir;
 
 mod util;
-use util::EnvGuard;
 
 fn run_on_large_stack<T, F>(f: F) -> T
 where
@@ -470,8 +469,8 @@ fn index_robot_trace_ingest_emits_batch_ndjson_with_lookup_counters()
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir)?;
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — base_cmd(home) passes
+    // HOME/XDG/CODEX_HOME (= home/.codex) explicitly to every cass child.
 
     make_codex_session(
         &codex_home,
@@ -755,7 +754,7 @@ fn watch_once_indexes_real_aider_session_with_deferred_tantivy_open() {
     let home = tmp.path();
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    // qu81y: redundant HOME guard removed — spawns pass env explicitly.
     let history_file = home.join(".aider.chat.history.md");
     fs::write(
         &history_file,
@@ -832,8 +831,8 @@ fn index_json_reports_full_refresh_lexical_strategy() {
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — base_cmd(home) passes
+    // HOME/XDG/CODEX_HOME (= home/.codex) explicitly to every cass child.
 
     make_codex_session(
         &codex_home,
@@ -890,8 +889,8 @@ fn index_json_reports_repeat_full_refresh_strategy_on_populated_canonical_db() {
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — base_cmd(home) passes
+    // HOME/XDG/CODEX_HOME (= home/.codex) explicitly to every cass child.
 
     make_codex_session(
         &codex_home,
@@ -954,8 +953,8 @@ fn repeat_full_json_preserves_exact_totals_when_noop_scan_underreports() {
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — base_cmd(home) passes
+    // HOME/XDG/CODEX_HOME (= home/.codex) explicitly to every cass child.
 
     make_codex_session(
         &codex_home,
@@ -1067,8 +1066,8 @@ fn index_full_persists_lexical_rebuild_equivalence_ledger() {
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — base_cmd(home) passes
+    // HOME/XDG/CODEX_HOME (= home/.codex) explicitly to every cass child.
 
     // Seed a small mixed corpus so the rebuild touches multiple distinct
     // conversations and exercises the streaming accumulator beyond a trivial
@@ -1201,8 +1200,8 @@ fn index_json_reports_incremental_lexical_strategy() {
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — base_cmd(home) passes
+    // HOME/XDG/CODEX_HOME (= home/.codex) explicitly to every cass child.
 
     make_codex_session(
         &codex_home,
@@ -1268,8 +1267,8 @@ fn index_json_reports_watch_once_incremental_lexical_strategy() {
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — base_cmd(home) passes
+    // HOME/XDG/CODEX_HOME (= home/.codex) explicitly to every cass child.
 
     make_codex_session(
         &codex_home,
@@ -1339,8 +1338,8 @@ fn plain_index_recreates_missing_lexical_checkpoint_from_live_assets() {
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — base_cmd(home) passes
+    // HOME/XDG/CODEX_HOME (= home/.codex) explicitly to every cass child.
 
     make_codex_session(
         &codex_home,
@@ -1589,8 +1588,8 @@ fn plain_index_self_heals_when_entire_lexical_index_directory_is_missing() {
     let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — base_cmd(home) passes
+    // HOME/XDG/CODEX_HOME (= home/.codex) explicitly to every cass child.
 
     // Seed three distinct sessions with a stable single-word keyword
     // each (avoid underscores — Tantivy's default tokenizer splits on

@@ -4,7 +4,6 @@ use coding_agent_search::indexer::{IndexOptions, persist::persist_conversation, 
 use coding_agent_search::search::query::{FieldMask, SearchClient, SearchFilters};
 use coding_agent_search::search::tantivy::{TantivyIndex, index_dir};
 use coding_agent_search::storage::sqlite::SqliteStorage;
-use serial_test::serial;
 use tempfile::TempDir;
 
 fn norm_msg(idx: i64) -> NormalizedMessage {
@@ -146,32 +145,7 @@ fn persist_conversation_logs_counts() {
     assert!(out.contains("messages=2"));
 }
 
-struct EnvVarGuard {
-    key: &'static str,
-    previous: Option<String>,
-}
-
-impl EnvVarGuard {
-    fn set(key: &'static str, value: &std::path::Path) -> Self {
-        let previous = std::env::var(key).ok();
-        unsafe {
-            std::env::set_var(key, value);
-        }
-        Self { key, previous }
-    }
-}
-
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        match &self.previous {
-            Some(value) => unsafe { std::env::set_var(self.key, value) },
-            None => unsafe { std::env::remove_var(self.key) },
-        }
-    }
-}
-
 #[test]
-#[serial]
 fn run_index_does_not_drop_storage_without_explicit_close() {
     let trace = TestTracing::new();
     let _guard = trace.install();
@@ -197,12 +171,10 @@ fn run_index_does_not_drop_storage_without_explicit_close() {
     )
     .unwrap();
 
-    let _home_guard = EnvVarGuard::set("HOME", &home_dir);
-    let _xdg_guard = EnvVarGuard::set("XDG_DATA_HOME", &xdg_dir);
-    let prev_ignore_sources = std::env::var("CASS_IGNORE_SOURCES_CONFIG").ok();
-    unsafe {
-        std::env::set_var("CASS_IGNORE_SOURCES_CONFIG", "1");
-    }
+    // qu81y: env-free — the closed-world roots override below replaces
+    // HOME/XDG redirection and CASS_IGNORE_SOURCES_CONFIG entirely (the
+    // override suppresses both default detection and sources.toml loading).
+    let _ = (&home_dir, &xdg_dir);
 
     let opts = IndexOptions {
         full: false,
@@ -218,12 +190,10 @@ fn run_index_does_not_drop_storage_without_explicit_close() {
         watch_interval_secs: 30,
     };
 
-    let result = run_index(opts, None);
-    match prev_ignore_sources {
-        Some(value) => unsafe { std::env::set_var("CASS_IGNORE_SOURCES_CONFIG", value) },
-        None => unsafe { std::env::remove_var("CASS_IGNORE_SOURCES_CONFIG") },
-    }
-    result.unwrap();
+    let mut local_roots = std::collections::HashMap::new();
+    local_roots.insert("amp".to_string(), vec![amp_dir.clone()]);
+    coding_agent_search::indexer::run_index_with_local_connector_roots(opts, local_roots, None)
+        .unwrap();
 
     let out = trace.output();
     assert!(
