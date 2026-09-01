@@ -9847,9 +9847,9 @@ fn record_fts_repair_failure_streak(index_path: &Path, detail: &str) -> u64 {
             .unwrap_or(0),
     });
     let _ = std::fs::create_dir_all(index_path);
-    if let Err(err) = std::fs::write(
-        fts_repair_failure_streak_path(index_path),
-        serde_json::to_vec_pretty(&payload).unwrap_or_default(),
+    if let Err(err) = write_json_pretty_atomically(
+        &fts_repair_failure_streak_path(index_path),
+        &payload,
     ) {
         tracing::debug!(
             error = %err,
@@ -9878,7 +9878,12 @@ fn clear_fts_repair_failure_streak(index_path: &Path) {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0),
     });
-    let _ = std::fs::write(&path, serde_json::to_vec_pretty(&payload).unwrap_or_default());
+    if let Err(err) = write_json_pretty_atomically(&path, &payload) {
+        tracing::debug!(
+            error = %err,
+            "clearing derived-FTS repair failure streak failed (non-fatal)"
+        );
+    }
 }
 
 /// The failure detail to persist as the "shadow may be half-rebuilt" marker for
