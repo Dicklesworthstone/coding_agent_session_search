@@ -40332,7 +40332,22 @@ mod tests {
             4,
             None,
             Arc::new(LexicalRebuildPipelineBudgetController::new(
-                lexical_rebuild_runtime_pipeline_budget_snapshot(3, 32, 1024, 4, 3, 32, 1024),
+                // bet45/f273ccc4: the content-bounded page limit divides the
+                // byte budget by the 8 MiB per-conversation content cap, so a
+                // byte budget below 3 * 8 MiB collapses this fixture into
+                // one-conversation pages. That starves later page-prep
+                // reservations behind the consumer-held first batch and parks
+                // the pipeline forever. Budget three full conversations so the
+                // fixture stays a single three-packet page.
+                lexical_rebuild_runtime_pipeline_budget_snapshot(
+                    3,
+                    32,
+                    3 * 8 * 1024 * 1024,
+                    4,
+                    3,
+                    32,
+                    3 * 8 * 1024 * 1024,
+                ),
             )),
             tx,
             flow_limiter.clone(),
@@ -40875,14 +40890,18 @@ mod tests {
             2,
             None,
             Arc::new(LexicalRebuildPipelineBudgetController::new(
+                // bet45/f273ccc4: keep the byte budget at 3 * 8 MiB (three
+                // per-conversation content caps) so the content-bounded page
+                // limit stays at three conversations per page and each page
+                // still closes exactly one planned shard.
                 lexical_rebuild_runtime_pipeline_budget_snapshot(
                     64,
                     256,
-                    256 * 1024,
+                    3 * 8 * 1024 * 1024,
                     2,
                     64,
                     256,
-                    256 * 1024,
+                    3 * 8 * 1024 * 1024,
                 ),
             )),
             tx,
