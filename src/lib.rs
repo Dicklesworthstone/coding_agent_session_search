@@ -90864,6 +90864,11 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
             "Structured doctor reporting budget in milliseconds. Reports whose elapsed time exceeds it set budget.timed_out.",
         ),
         env_var_capability(
+            "CASS_FTS_DRYRUN_CAP",
+            Some("4096"),
+            "Row-ID comparison cap for the read-only 'doctor --rebuild-canonical-fts --dry-run' divergence scan (#345). At the cap the dry-run stops and reports a '>= N divergent' floor instead of an exact count; exact parity is deferred to the --yes apply path. Positive integer; invalid values fall back to the default.",
+        ),
+        env_var_capability(
             "CASS_VIEW_BUDGET_MS",
             Some("10000"),
             "Structured view read-only worker deadline in milliseconds. On expiry, view returns a partial budget envelope with an exact retry probe.",

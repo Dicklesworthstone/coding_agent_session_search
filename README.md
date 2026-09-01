@@ -3092,6 +3092,7 @@ Update check state is stored in the data directory:
 | `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY` | unset | Set to `1` to hash every raw-mirror descriptor/chunk during a read-only doctor run, overriding the default bounded verification limits |
 | `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_MANIFEST_LIMIT` | `256` | Defer full raw-mirror hashing above this manifest count while retaining metadata-only amplification diagnostics |
 | `CASS_DOCTOR_RAW_MIRROR_FULL_VERIFY_BYTE_LIMIT` | `536870912` | Defer full raw-mirror hashing when either physical storage or estimated logical verification work exceeds this byte count; metadata-only amplification diagnostics remain available |
+| `CASS_FTS_DRYRUN_CAP` | `4096` | Row-ID comparison cap for the read-only `doctor --rebuild-canonical-fts --dry-run` divergence scan ([#345](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/345)). At the cap the dry-run stops and reports a `>= N divergent` floor instead of an exact count; exact parity is deferred to the `--yes` apply path |
 | **Background Indexing** | | |
 | `CASS_AUTO_REFRESH` | `1` | Stale-on-read catch-up for a stale/partial/behind index seen by `search`, `pack`, or TUI launch. Set `0` to disable globally; `search --no-maintenance` always remains read-only. |
 | `CASS_AUTO_REFRESH_COOLDOWN_SECS` | `300` | Minimum spacing between auto-spawned catch-up runs per data dir |

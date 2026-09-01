@@ -1275,6 +1275,63 @@ mod tests {
         assert_eq!(envelope["apply_command"], serde_json::Value::Null);
     }
 
+    /// #345: `CASS_FTS_DRYRUN_CAP` truthiness/validity contract (pure parse
+    /// half — the env wrapper only feeds it the raw string).
+    #[test]
+    fn gh345_dry_run_cap_env_parsing() {
+        assert_eq!(
+            parse_fts_dry_run_cap(None),
+            FTS_DRY_RUN_ROWID_COMPARISON_CAP
+        );
+        assert_eq!(parse_fts_dry_run_cap(Some("512")), 512);
+        assert_eq!(parse_fts_dry_run_cap(Some(" 8 ")), 8);
+        // Zero and garbage fall back to the default (a zero cap would make
+        // every dry-run indeterminate and trip the storage-layer ensure).
+        assert_eq!(
+            parse_fts_dry_run_cap(Some("0")),
+            FTS_DRY_RUN_ROWID_COMPARISON_CAP
+        );
+        assert_eq!(
+            parse_fts_dry_run_cap(Some("not-a-number")),
+            FTS_DRY_RUN_ROWID_COMPARISON_CAP
+        );
+        assert_eq!(
+            parse_fts_dry_run_cap(Some("")),
+            FTS_DRY_RUN_ROWID_COMPARISON_CAP
+        );
+    }
+
+    /// #345: a capped dry-run envelope must carry the ">= N divergent" floor
+    /// while staying indeterminate and deferring exact parity to the apply.
+    #[test]
+    fn gh345_capped_dry_run_envelope_reports_divergence_floor() {
+        let parity = FtsDryRunParity {
+            exact_status: None,
+            canonical_messages: 2_000_000,
+            indexable_messages: 2_000_000,
+            indexed_messages: Some(1_395_000),
+            inspection_complete: false,
+            comparison_cap: 4_096,
+            canonical_ids_examined: 4_096,
+            indexed_ids_examined: 4_096,
+            observed_missing_canonical_rowids_at_least: 7,
+            observed_excess_fts_rowids_at_least: 2,
+            detail: Some(
+                "bounded dry-run stopped after at most 4096 row IDs per domain (>= 9 divergent row ID(s) observed within the cap: missing >= 7, excess >= 2); exact parity is deferred to --yes before any mutation".to_string(),
+            ),
+        };
+        assert_eq!(parity.divergent_rowids_at_least(), 9);
+        let envelope = fts_rebuild_dry_run_envelope(Path::new("/tmp/large.db"), &parity);
+        assert_eq!(envelope["parity"]["status"], "indeterminate");
+        assert_eq!(envelope["parity"]["inspection_complete"], false);
+        assert_eq!(envelope["parity"]["divergent_rowids_at_least"], 9);
+        assert_eq!(
+            envelope["planned_action"],
+            "exact_parity_inspection_deferred_to_apply"
+        );
+        assert_eq!(envelope["would_mutate"], serde_json::Value::Null);
+    }
+
     #[test]
     fn gh345_indeterminate_fts_dry_run_defers_exact_parity_without_claiming_mutation() {
         let parity = FtsDryRunParity {
