@@ -27,8 +27,8 @@ use tempfile::TempDir;
 #[path = "util/mod.rs"]
 mod util;
 
+use util::ConversationFixtureBuilder;
 use util::e2e_log::PhaseTracker;
-use util::{ConversationFixtureBuilder, EnvGuard};
 
 // =============================================================================
 // E2E Logger Support
