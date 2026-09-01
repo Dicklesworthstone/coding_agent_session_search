@@ -187,6 +187,7 @@ struct BundlePublishJournal {
     candidate_sha256: String,
 }
 
+#[derive(Debug)]
 struct BundlePublishGuard {
     final_dir: PathBuf,
     lock_path: PathBuf,
@@ -333,8 +334,24 @@ impl BundleBuilder {
         // Heal an interrupted fallback publish before doing potentially long
         // archive validation/copying work, so a parked prior generation is
         // returned to the live handle as soon as the next build starts.
-        recover_interrupted_bundle_publish(output_dir)?;
-        ensure_replaceable_bundle_output_dir(output_dir)?;
+        // 70o8f: recovery renames/removes entries at the output pathname, so
+        // it must hold the same per-output publish lock the final
+        // replace_dir_from_temp takes — otherwise two concurrent builders
+        // could both run recovery against one output. The guard is taken
+        // only when there is recovery EVIDENCE (a live output, a publish
+        // journal, or a parked backup): acquiring it unconditionally would
+        // leave the lock file behind on rejected builds that never touch a
+        // pristine output location. A publisher racing in between is safe —
+        // replace_dir_from_temp re-runs recovery under its own guard.
+        let recovery_evidence = bundle_path_entry_exists(output_dir)?
+            || bundle_path_entry_exists(&bundle_publish_recovery_journal_path(output_dir))?
+            || first_unowned_bundle_publish_backup(output_dir, None)?.is_some();
+        if recovery_evidence {
+            let early_guard = acquire_bundle_publish_guard(output_dir)?;
+            require_bundle_publish_guard(output_dir, &early_guard)?;
+            recover_interrupted_bundle_publish(output_dir)?;
+            ensure_replaceable_bundle_output_dir(output_dir)?;
+        }
 
         // Validate encrypted_dir has required files
         let config_path = encrypted_dir.join("config.json");
@@ -2098,6 +2115,17 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
         .with_context(|| format!("failed syncing parent directory {}", parent.display()))
 }
 
+/// 70o8f durability contract, Windows: NTFS exposes no supported way to
+/// fsync a DIRECTORY handle's entry table from stable Rust (directory
+/// handles need FILE_FLAG_BACKUP_SEMANTICS and FlushFileBuffers on them is
+/// not documented to durably order sibling renames), so this is an explicit
+/// no-op. The crash-recovery model therefore does NOT rely on rename
+/// ordering being durable on Windows: every rename-pair phase is journaled
+/// first (BundlePublishJournal, written and fsynced as a FILE), and
+/// `recover_interrupted_bundle_publish` re-derives the phase from the
+/// journal plus on-disk evidence after restart — the strongest contract
+/// available without platform-specific unsafe. On Unix the parent directory
+/// is fsynced for real (above).
 #[cfg(windows)]
 fn sync_parent_directory(_path: &Path) -> Result<()> {
     Ok(())
@@ -4087,6 +4115,83 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "completed publication should not leave a recovery backup"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_publisher_is_refused_while_lock_is_held() {
+        // 70o8f: per-output single-publisher arbitration — while one
+        // publisher holds the advisory lock, a second publication attempt
+        // for the SAME output fails fast with the contention error instead
+        // of racing the rename pair.
+        let temp = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let staged_dir = temp.path().join("bundle.staged");
+        fs::create_dir_all(staged_dir.join("site")).unwrap();
+        fs::write(staged_dir.join("site/new.txt"), "new").unwrap();
+
+        let held = acquire_bundle_publish_guard(&final_dir).unwrap();
+        let mut retain_temp_on_error = false;
+        let error = replace_dir_from_temp(&staged_dir, &final_dir, &mut retain_temp_on_error)
+            .expect_err("second publisher must be refused while the lock is held");
+        assert!(
+            error.to_string().contains("already active"),
+            "expected lock-contention arbitration error, got: {error:#}"
+        );
+        assert!(
+            staged_dir.join("site/new.txt").exists(),
+            "refused publisher must leave its staged bundle untouched"
+        );
+        assert!(
+            !final_dir.exists(),
+            "refused publisher must not create the output"
+        );
+        drop(held);
+
+        // Once the first publisher releases, the same publication succeeds.
+        let mut retain_temp_on_error = false;
+        replace_dir_from_temp(&staged_dir, &final_dir, &mut retain_temp_on_error).unwrap();
+        assert!(final_dir.join("site/new.txt").exists());
+    }
+
+    #[test]
+    fn test_swapped_lock_entry_is_refused_by_guard_revalidation() {
+        // 70o8f: an attacker (or a confused cleaner) replacing the lock
+        // pathname after acquisition must be detected — the guard re-checks
+        // the pathname's file identity before authorizing mutation.
+        let temp = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let guard = acquire_bundle_publish_guard(&final_dir).unwrap();
+        let lock_path = bundle_publish_lock_path(&final_dir);
+
+        // Swap the lock entry: remove and recreate at the same pathname.
+        fs::remove_file(&lock_path).unwrap();
+        fs::write(&lock_path, b"impostor").unwrap();
+
+        let error = require_bundle_publish_guard(&final_dir, &guard)
+            .expect_err("guard revalidation must refuse a swapped lock entry");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("identity"),
+            "expected an identity-mismatch refusal, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_non_regular_lock_entry_is_refused_fail_closed() {
+        // 70o8f: a pre-existing non-regular-file entry at the lock pathname
+        // (e.g. a directory planted by an attacker) must fail closed rather
+        // than being followed or replaced.
+        let temp = TempDir::new().unwrap();
+        let final_dir = temp.path().join("bundle");
+        let lock_path = bundle_publish_lock_path(&final_dir);
+        fs::create_dir_all(&lock_path).unwrap();
+
+        let error = acquire_bundle_publish_guard(&final_dir)
+            .expect_err("a directory at the lock pathname must be refused");
+        assert!(
+            error.to_string().contains("not a regular file"),
+            "expected fail-closed non-regular-file refusal, got: {error:#}"
         );
     }
 
