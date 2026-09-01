@@ -14,7 +14,6 @@ use std::fs;
 use std::path::PathBuf;
 
 mod util;
-use util::EnvGuard;
 
 /// Helper to create Codex session with modern envelope format.
 fn make_codex_session(
@@ -290,8 +289,8 @@ fn test_mode_flag_lexical() {
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — every cass subprocess below
+    // passes its HOME/CODEX_HOME explicitly via Command::env.
 
     // Create fixture
     make_codex_session(
@@ -347,8 +346,8 @@ fn test_mode_flag_semantic() {
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — every cass subprocess below
+    // passes its HOME/CODEX_HOME explicitly via Command::env.
 
     // Create fixture
     make_codex_session(
@@ -406,8 +405,8 @@ fn test_mode_flag_hybrid() {
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — every cass subprocess below
+    // passes its HOME/CODEX_HOME explicitly via Command::env.
 
     // Create fixture
     make_codex_session(
@@ -469,8 +468,8 @@ fn test_same_query_same_results() {
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — every cass subprocess below
+    // passes its HOME/CODEX_HOME explicitly via Command::env.
 
     // Create multiple fixtures with deterministic content
     for i in 1..=3 {
@@ -544,8 +543,8 @@ fn test_result_ordering_deterministic() {
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — every cass subprocess below
+    // passes its HOME/CODEX_HOME explicitly via Command::env.
 
     // Create fixtures with shared term
     for i in 1..=5 {
@@ -616,8 +615,8 @@ fn test_robot_output_schema() {
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — every cass subprocess below
+    // passes its HOME/CODEX_HOME explicitly via Command::env.
 
     // Create fixture
     make_codex_session(
@@ -719,8 +718,8 @@ fn test_incremental_index_skips_unchanged() {
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — every cass subprocess below
+    // passes its HOME/CODEX_HOME explicitly via Command::env.
 
     // Create initial fixture
     make_codex_session(
@@ -772,8 +771,8 @@ fn test_incremental_index_picks_up_new_files() {
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — every cass subprocess below
+    // passes its HOME/CODEX_HOME explicitly via Command::env.
 
     // Create initial fixture
     make_codex_session(
@@ -849,8 +848,8 @@ fn test_filter_parity_agent_filter() {
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — every cass subprocess below
+    // passes its HOME/CODEX_HOME explicitly via Command::env.
 
     // Create fixture
     make_codex_session(
@@ -967,8 +966,8 @@ fn test_search_mode_flag_consistency() {
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — every cass subprocess below
+    // passes its HOME/CODEX_HOME explicitly via Command::env.
 
     // Create fixture
     make_codex_session(
@@ -1170,8 +1169,8 @@ fn test_approximate_flag_semantic_mode() {
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — every cass subprocess below
+    // passes its HOME/CODEX_HOME explicitly via Command::env.
 
     // Create fixture
     make_codex_session(
@@ -1234,8 +1233,8 @@ fn test_approximate_flag_lexical_mode_warning() {
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — every cass subprocess below
+    // passes its HOME/CODEX_HOME explicitly via Command::env.
 
     // Create fixture
     make_codex_session(
@@ -1297,8 +1296,8 @@ fn test_approximate_flag_hybrid_mode() {
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — every cass subprocess below
+    // passes its HOME/CODEX_HOME explicitly via Command::env.
 
     // Create fixture
     make_codex_session(
@@ -1359,8 +1358,8 @@ fn test_index_build_hnsw_flag() {
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+    // qu81y: no process-global env mutation — every cass subprocess below
+    // passes its HOME/CODEX_HOME explicitly via Command::env.
 
     // Create fixture
     make_codex_session(
