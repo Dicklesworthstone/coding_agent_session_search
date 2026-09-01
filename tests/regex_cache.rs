@@ -74,13 +74,10 @@ fn test_regex_cache_equivalence_suffix_pattern() {
         .search("*handler", filters.clone(), 10, 0, FieldMask::FULL)
         .unwrap();
 
-    // Search with cache disabled via env var
-    // Note: Due to static initialization, we use a fresh unique pattern
-    // to ensure we're testing the cache bypass path
-    let _guard = util::EnvGuard::set("CASS_REGEX_CACHE", "0");
-
-    // Use a different client to potentially pick up the env var change
-    // (though the static is already initialized, the bypass check happens per-call)
+    // qu81y: no production code reads CASS_REGEX_CACHE anymore — the former
+    // per-call bypass gate was removed — so the old EnvGuard here mutated a
+    // variable with no consumer. The test keeps its real assertion: a second
+    // independently-opened client produces identical results.
     let client_uncached = SearchClient::open(dir.path(), None)
         .unwrap()
         .expect("client");
@@ -128,8 +125,8 @@ fn test_regex_cache_equivalence_substring_pattern() {
         .search("*config*", filters.clone(), 10, 0, FieldMask::FULL)
         .unwrap();
 
-    // Search with cache disabled
-    let _guard = util::EnvGuard::set("CASS_REGEX_CACHE", "0");
+    // qu81y: CASS_REGEX_CACHE has no consumer anymore; repeat the query and
+    // pin result stability instead of mutating a dead env var.
     let results_uncached = client
         .search("*config*", filters.clone(), 10, 0, FieldMask::FULL)
         .unwrap();
@@ -420,12 +417,11 @@ fn test_regex_cache_concurrent_read_write() {
 
 #[test]
 fn test_regex_cache_disabled_via_env() {
-    // When CASS_REGEX_CACHE=0, regex queries should still work correctly
+    // qu81y: CASS_REGEX_CACHE has no consumer in production code anymore
+    // (the per-call bypass gate was removed), so this test no longer sets
+    // it. It still pins that regex queries work on a fresh client.
     let dir = TempDir::new().unwrap();
     let _index = create_test_index_with_patterns(&dir);
-
-    // Set env var to disable cache
-    let _guard = util::EnvGuard::set("CASS_REGEX_CACHE", "0");
 
     let client = SearchClient::open(dir.path(), None)
         .unwrap()
@@ -457,11 +453,10 @@ fn test_regex_cache_disabled_via_env() {
 
 #[test]
 fn test_regex_cache_disabled_false_string() {
-    // CASS_REGEX_CACHE=false should also disable cache
+    // qu81y: see test_regex_cache_disabled_via_env — the env gate is gone;
+    // this variant keeps its correctness assertions on a fresh client.
     let dir = TempDir::new().unwrap();
     let _index = create_test_index_with_patterns(&dir);
-
-    let _guard = util::EnvGuard::set("CASS_REGEX_CACHE", "false");
 
     let client = SearchClient::open(dir.path(), None)
         .unwrap()

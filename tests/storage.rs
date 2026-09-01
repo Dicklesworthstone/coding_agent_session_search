@@ -2985,38 +2985,38 @@ fn cache_multiple_unique_entries() {
     assert_eq!(hits, 20, "20 agent re-lookups = 20 hits");
 }
 
-/// Test CASS_SQLITE_CACHE environment variable control.
+/// Test the CASS_SQLITE_CACHE truthiness contract.
+///
+/// qu81y: exercised through the pure injected-value half
+/// (`is_enabled_from`) instead of mutating process-global environment —
+/// the env wrapper is a one-liner over this exact function.
 #[test]
 fn cache_env_var_control() {
-    // Default: cache enabled
+    // Default (unset): cache enabled
     assert!(
-        IndexingCache::is_enabled(),
+        IndexingCache::is_enabled_from(None),
         "cache should be enabled by default"
     );
-
-    // With CASS_SQLITE_CACHE=0, cache is disabled
-    unsafe { std::env::set_var("CASS_SQLITE_CACHE", "0") };
     assert!(
-        !IndexingCache::is_enabled(),
+        !IndexingCache::is_enabled_from(Some("0")),
         "cache should be disabled with CASS_SQLITE_CACHE=0"
     );
-
-    // With CASS_SQLITE_CACHE=false, cache is disabled
-    unsafe { std::env::set_var("CASS_SQLITE_CACHE", "false") };
     assert!(
-        !IndexingCache::is_enabled(),
+        !IndexingCache::is_enabled_from(Some("false")),
         "cache should be disabled with CASS_SQLITE_CACHE=false"
     );
-
-    // With CASS_SQLITE_CACHE=1, cache is enabled
-    unsafe { std::env::set_var("CASS_SQLITE_CACHE", "1") };
     assert!(
-        IndexingCache::is_enabled(),
+        !IndexingCache::is_enabled_from(Some("FALSE")),
+        "truthiness check is case-insensitive"
+    );
+    assert!(
+        IndexingCache::is_enabled_from(Some("1")),
         "cache should be enabled with CASS_SQLITE_CACHE=1"
     );
-
-    // Cleanup
-    unsafe { std::env::remove_var("CASS_SQLITE_CACHE") };
+    assert!(
+        IndexingCache::is_enabled_from(Some("")),
+        "an empty value is not one of the documented disable spellings"
+    );
 }
 
 /// Stress test: large corpus with many unique agents/workspaces.

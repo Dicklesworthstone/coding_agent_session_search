@@ -18937,8 +18937,14 @@ impl IndexingCache {
     /// Check if caching is enabled via environment variable.
     /// Returns true unless CASS_SQLITE_CACHE is set to "0" or "false".
     pub fn is_enabled() -> bool {
-        dotenvy::var("CASS_SQLITE_CACHE")
-            .map(|v| v != "0" && v.to_lowercase() != "false")
+        Self::is_enabled_from(dotenvy::var("CASS_SQLITE_CACHE").ok().as_deref())
+    }
+
+    /// Pure half of [`Self::is_enabled`] over an injected raw value, so the
+    /// truthiness contract is testable without mutating process-global
+    /// environment (qu81y).
+    pub fn is_enabled_from(raw: Option<&str>) -> bool {
+        raw.map(|v| v != "0" && v.to_lowercase() != "false")
             .unwrap_or(true)
     }
 
