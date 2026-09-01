@@ -18235,6 +18235,21 @@ fn full_rebuild_existing_storage_integrity_problem(
 }
 
 fn full_rebuild_existing_archive_integrity_preflight(db_path: &Path) -> Result<Option<String>> {
+    full_rebuild_existing_archive_integrity_preflight_with_max_bytes(
+        db_path,
+        index_integrity_preflight_max_bytes(),
+    )
+}
+
+/// Injected-cap half of the read-only full-rebuild preflight (bet45/qu81y):
+/// tests exercise the size gate through this parameter instead of mutating
+/// process-global CASS_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES, which under
+/// parallel scheduling leaked into sibling preflight tests and made their
+/// detection silently skip.
+fn full_rebuild_existing_archive_integrity_preflight_with_max_bytes(
+    db_path: &Path,
+    max_bytes: u64,
+) -> Result<Option<String>> {
     let archive_bytes = match fs::metadata(db_path) {
         Ok(metadata) => metadata.len(),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -18255,7 +18270,6 @@ fn full_rebuild_existing_archive_integrity_preflight(db_path: &Path) -> Result<O
     // syntactically tiny sqlite_master or COUNT query can hydrate gigabytes in
     // the current engine, so an after-open/after-query cap is not a bound.
     let bundle_bytes = database_bundle_size_bytes(db_path);
-    let max_bytes = index_integrity_preflight_max_bytes();
     if !should_run_engine_backed_archive_integrity_preflight(Some(bundle_bytes), max_bytes) {
         tracing::warn!(
             db_path = %db_path.display(),
@@ -45759,9 +45773,10 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn full_rebuild_integrity_preflight_large_archive_stops_before_fsqlite_open() {
-        let _max_bytes = set_env("CASS_INDEX_INTEGRITY_PREFLIGHT_MAX_BYTES", "4096");
+        // bet45/qu81y: the 4096-byte cap is INJECTED instead of set via
+        // process-global env — the env guard leaked into parallel sibling
+        // preflight tests and made their engine-backed detection skip.
         let tmp = TempDir::new().unwrap();
         let seed_path = tmp.path().join("seed.db");
         let seed = FrankenStorage::open(&seed_path).unwrap();
@@ -45775,7 +45790,8 @@ mod tests {
         drop(large);
 
         assert_eq!(
-            full_rebuild_existing_archive_integrity_preflight(&db_path).unwrap(),
+            full_rebuild_existing_archive_integrity_preflight_with_max_bytes(&db_path, 4096)
+                .unwrap(),
             None,
             "a large archive must defer engine-backed integrity work instead of opening fsqlite"
         );
