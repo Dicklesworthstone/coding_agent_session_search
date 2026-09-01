@@ -15,11 +15,12 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 mod util;
-use util::EnvGuard;
 
-/// These tests mutate process-level env vars (XDG_*, HOME, CODEX_HOME) and spawn `cass`.
-/// Running them in parallel makes them flaky and can accidentally index the developer's real
-/// archives, causing multi-minute hangs.
+/// qu81y: these tests no longer mutate process-level env — every `cass`
+/// child gets its isolated HOME/XDG_DATA_HOME/agent-home via `Command::env`
+/// (see `cass_cmd`). The mutex is retained to serialize the heavyweight
+/// index+TUI child processes themselves (parallel full-index spawns thrash
+/// the host and historically caused multi-minute hangs).
 static TUI_SMOKE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const CODEX_SMOKE_QUERY: &str = "codexsentinel";
 
@@ -74,6 +75,18 @@ fn make_multi_agent_fixtures(_data_dir: &Path, codex_home: &Path, claude_home: &
     make_claude_fixture(claude_home, "testproject");
 }
 
+/// qu81y: build a `cass` command carrying the test's isolated environment
+/// EXPLICITLY (HOME, XDG_DATA_HOME, plus per-test agent homes such as
+/// CODEX_HOME/CLAUDE_HOME) instead of mutating process-global env vars.
+fn cass_cmd(home: &Path, xdg: &Path, extra: &[(&str, &Path)]) -> assert_cmd::Command {
+    let mut cmd = cargo_bin_cmd!("cass");
+    cmd.env("HOME", home).env("XDG_DATA_HOME", xdg);
+    for (key, value) in extra {
+        cmd.env(key, value);
+    }
+    cmd
+}
+
 fn assert_robot_search_hit(stdout: &[u8], query: &str, expected_agent: &str) {
     let json: serde_json::Value =
         serde_json::from_slice(stdout).expect("robot search should emit valid JSON");
@@ -110,20 +123,18 @@ fn assert_robot_search_hit(stdout: &[u8], query: &str, expected_agent: &str) {
 fn tui_headless_launches_with_valid_index() {
     let _guard_lock = tui_smoke_guard();
     let tmp = tempfile::TempDir::new().unwrap();
-    let _guard_home = EnvGuard::set("HOME", tmp.path().to_string_lossy());
     let xdg = tmp.path().join("xdg");
     fs::create_dir_all(&xdg).unwrap();
-    let _guard_xdg = EnvGuard::set("XDG_DATA_HOME", xdg.to_string_lossy());
 
     let data_dir = tmp.path().join("data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    // Set up Codex fixture
-    let _guard_codex = EnvGuard::set("CODEX_HOME", data_dir.to_string_lossy());
+    // Set up Codex fixture (agent home passed per-child via cass_cmd)
     make_codex_fixture(&data_dir);
+    let envs = [("CODEX_HOME", data_dir.as_path())];
 
     // Build index first
-    cargo_bin_cmd!("cass")
+    cass_cmd(tmp.path(), &xdg, &envs)
         .arg("index")
         .arg("--full")
         .arg("--data-dir")
@@ -132,7 +143,7 @@ fn tui_headless_launches_with_valid_index() {
         .success();
 
     // Run TUI in headless mode
-    cargo_bin_cmd!("cass")
+    cass_cmd(tmp.path(), &xdg, &envs)
         .arg("tui")
         .arg("--data-dir")
         .arg(&data_dir)
@@ -153,25 +164,24 @@ fn tui_headless_launches_with_valid_index() {
 fn tui_headless_exits_cleanly_on_empty_dataset() {
     let _guard_lock = tui_smoke_guard();
     let tmp = tempfile::TempDir::new().unwrap();
-    let _guard_home = EnvGuard::set("HOME", tmp.path().to_string_lossy());
     let xdg = tmp.path().join("xdg");
     fs::create_dir_all(&xdg).unwrap();
-    let _guard_xdg = EnvGuard::set("XDG_DATA_HOME", xdg.to_string_lossy());
 
     let data_dir = tmp.path().join("data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    // Point agent envs to non-existent directories (no fixtures)
+    // Point agent homes at empty directories (no fixtures)
     let empty_codex = tmp.path().join("empty_codex");
     let empty_claude = tmp.path().join("empty_claude");
     fs::create_dir_all(&empty_codex).unwrap();
     fs::create_dir_all(&empty_claude).unwrap();
-
-    let _guard_codex = EnvGuard::set("CODEX_HOME", empty_codex.to_string_lossy());
-    let _guard_claude = EnvGuard::set("CLAUDE_HOME", empty_claude.to_string_lossy());
+    let envs = [
+        ("CODEX_HOME", empty_codex.as_path()),
+        ("CLAUDE_HOME", empty_claude.as_path()),
+    ];
 
     // Build empty index
-    cargo_bin_cmd!("cass")
+    cass_cmd(tmp.path(), &xdg, &envs)
         .arg("index")
         .arg("--full")
         .arg("--data-dir")
@@ -180,7 +190,7 @@ fn tui_headless_exits_cleanly_on_empty_dataset() {
         .success();
 
     // TUI should exit cleanly (exit 0) even with no data
-    cargo_bin_cmd!("cass")
+    cass_cmd(tmp.path(), &xdg, &envs)
         .arg("tui")
         .arg("--data-dir")
         .arg(&data_dir)
@@ -196,17 +206,15 @@ fn tui_headless_exits_cleanly_on_empty_dataset() {
 fn tui_headless_no_panic_without_index() {
     let _guard_lock = tui_smoke_guard();
     let tmp = tempfile::TempDir::new().unwrap();
-    let _guard_home = EnvGuard::set("HOME", tmp.path().to_string_lossy());
     let xdg = tmp.path().join("xdg");
     fs::create_dir_all(&xdg).unwrap();
-    let _guard_xdg = EnvGuard::set("XDG_DATA_HOME", xdg.to_string_lossy());
 
     let data_dir = tmp.path().join("data");
     fs::create_dir_all(&data_dir).unwrap();
 
     // Don't create index, just try to run TUI
     // Should fail gracefully (not panic) with exit code indicating index missing
-    let result = cargo_bin_cmd!("cass")
+    let result = cass_cmd(tmp.path(), &xdg, &[])
         .arg("tui")
         .arg("--data-dir")
         .arg(&data_dir)
@@ -234,10 +242,8 @@ fn tui_headless_no_panic_without_index() {
 fn tui_headless_search_executes_successfully() {
     let _guard_lock = tui_smoke_guard();
     let tmp = tempfile::TempDir::new().unwrap();
-    let _guard_home = EnvGuard::set("HOME", tmp.path().to_string_lossy());
     let xdg = tmp.path().join("xdg");
     fs::create_dir_all(&xdg).unwrap();
-    let _guard_xdg = EnvGuard::set("XDG_DATA_HOME", xdg.to_string_lossy());
 
     let data_dir = tmp.path().join("data");
     let codex_home = tmp.path().join("codex_home");
@@ -245,11 +251,11 @@ fn tui_headless_search_executes_successfully() {
     fs::create_dir_all(&codex_home).unwrap();
 
     // Set up fixtures
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
     make_codex_fixture(&codex_home);
+    let envs = [("CODEX_HOME", codex_home.as_path())];
 
     // Build index
-    cargo_bin_cmd!("cass")
+    cass_cmd(tmp.path(), &xdg, &envs)
         .arg("index")
         .arg("--full")
         .arg("--data-dir")
@@ -258,7 +264,7 @@ fn tui_headless_search_executes_successfully() {
         .success();
 
     // Run a search via CLI (robot mode) to verify search works
-    let output = cargo_bin_cmd!("cass")
+    let output = cass_cmd(tmp.path(), &xdg, &envs)
         .arg("search")
         .arg(CODEX_SMOKE_QUERY)
         .arg("--robot")
@@ -270,7 +276,7 @@ fn tui_headless_search_executes_successfully() {
     assert_robot_search_hit(&output.get_output().stdout, CODEX_SMOKE_QUERY, "codex");
 
     // Also run TUI headless to ensure search client initializes
-    cargo_bin_cmd!("cass")
+    cass_cmd(tmp.path(), &xdg, &envs)
         .arg("tui")
         .arg("--data-dir")
         .arg(&data_dir)
@@ -286,10 +292,8 @@ fn tui_headless_search_executes_successfully() {
 fn tui_headless_multi_agent_index_and_search() {
     let _guard_lock = tui_smoke_guard();
     let tmp = tempfile::TempDir::new().unwrap();
-    let _guard_home = EnvGuard::set("HOME", tmp.path().to_string_lossy());
     let xdg = tmp.path().join("xdg");
     fs::create_dir_all(&xdg).unwrap();
-    let _guard_xdg = EnvGuard::set("XDG_DATA_HOME", xdg.to_string_lossy());
 
     let data_dir = tmp.path().join("data");
     let codex_home = tmp.path().join("codex_home");
@@ -300,12 +304,14 @@ fn tui_headless_multi_agent_index_and_search() {
     fs::create_dir_all(&claude_home).unwrap();
 
     // Set up multi-agent fixtures
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
-    let _guard_claude = EnvGuard::set("CLAUDE_HOME", claude_home.to_string_lossy());
     make_multi_agent_fixtures(&data_dir, &codex_home, &claude_home);
+    let envs = [
+        ("CODEX_HOME", codex_home.as_path()),
+        ("CLAUDE_HOME", claude_home.as_path()),
+    ];
 
     // Build index (should pick up both agents)
-    cargo_bin_cmd!("cass")
+    cass_cmd(tmp.path(), &xdg, &envs)
         .arg("index")
         .arg("--full")
         .arg("--data-dir")
@@ -314,7 +320,7 @@ fn tui_headless_multi_agent_index_and_search() {
         .success();
 
     // Search for Codex content
-    let codex_search = cargo_bin_cmd!("cass")
+    let codex_search = cass_cmd(tmp.path(), &xdg, &envs)
         .arg("search")
         .arg(CODEX_SMOKE_QUERY)
         .arg("--robot")
@@ -330,7 +336,7 @@ fn tui_headless_multi_agent_index_and_search() {
     );
 
     // Search for Claude content
-    let claude_search = cargo_bin_cmd!("cass")
+    let claude_search = cass_cmd(tmp.path(), &xdg, &envs)
         .arg("search")
         .arg("authentication")
         .arg("--robot")
@@ -346,7 +352,7 @@ fn tui_headless_multi_agent_index_and_search() {
     );
 
     // TUI should work with multi-agent data
-    cargo_bin_cmd!("cass")
+    cass_cmd(tmp.path(), &xdg, &envs)
         .arg("tui")
         .arg("--data-dir")
         .arg(&data_dir)
@@ -366,19 +372,17 @@ fn tui_headless_multi_agent_index_and_search() {
 fn tui_headless_reset_state_clears_persisted_state() {
     let _guard_lock = tui_smoke_guard();
     let tmp = tempfile::TempDir::new().unwrap();
-    let _guard_home = EnvGuard::set("HOME", tmp.path().to_string_lossy());
     let xdg = tmp.path().join("xdg");
     fs::create_dir_all(&xdg).unwrap();
-    let _guard_xdg = EnvGuard::set("XDG_DATA_HOME", xdg.to_string_lossy());
 
     let data_dir = tmp.path().join("data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_codex = EnvGuard::set("CODEX_HOME", data_dir.to_string_lossy());
     make_codex_fixture(&data_dir);
+    let envs = [("CODEX_HOME", data_dir.as_path())];
 
     // Build index
-    cargo_bin_cmd!("cass")
+    cass_cmd(tmp.path(), &xdg, &envs)
         .arg("index")
         .arg("--full")
         .arg("--data-dir")
@@ -396,7 +400,7 @@ fn tui_headless_reset_state_clears_persisted_state() {
     assert!(state_file.exists(), "State file should exist before reset");
 
     // Run TUI with --reset-state
-    cargo_bin_cmd!("cass")
+    cass_cmd(tmp.path(), &xdg, &envs)
         .arg("tui")
         .arg("--data-dir")
         .arg(&data_dir)
@@ -433,19 +437,17 @@ fn tui_headless_reset_state_clears_persisted_state() {
 fn tui_headless_exit_code_success_with_data() {
     let _guard_lock = tui_smoke_guard();
     let tmp = tempfile::TempDir::new().unwrap();
-    let _guard_home = EnvGuard::set("HOME", tmp.path().to_string_lossy());
     let xdg = tmp.path().join("xdg");
     fs::create_dir_all(&xdg).unwrap();
-    let _guard_xdg = EnvGuard::set("XDG_DATA_HOME", xdg.to_string_lossy());
 
     let data_dir = tmp.path().join("data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_codex = EnvGuard::set("CODEX_HOME", data_dir.to_string_lossy());
     make_codex_fixture(&data_dir);
+    let envs = [("CODEX_HOME", data_dir.as_path())];
 
     // Build index
-    cargo_bin_cmd!("cass")
+    cass_cmd(tmp.path(), &xdg, &envs)
         .arg("index")
         .arg("--full")
         .arg("--data-dir")
@@ -454,7 +456,7 @@ fn tui_headless_exit_code_success_with_data() {
         .success();
 
     // TUI should exit with code 0
-    let result = cargo_bin_cmd!("cass")
+    let result = cass_cmd(tmp.path(), &xdg, &envs)
         .arg("tui")
         .arg("--data-dir")
         .arg(&data_dir)
@@ -476,19 +478,17 @@ fn tui_headless_exit_code_success_with_data() {
 fn health_check_before_tui_launch() {
     let _guard_lock = tui_smoke_guard();
     let tmp = tempfile::TempDir::new().unwrap();
-    let _guard_home = EnvGuard::set("HOME", tmp.path().to_string_lossy());
     let xdg = tmp.path().join("xdg");
     fs::create_dir_all(&xdg).unwrap();
-    let _guard_xdg = EnvGuard::set("XDG_DATA_HOME", xdg.to_string_lossy());
 
     let data_dir = tmp.path().join("data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_codex = EnvGuard::set("CODEX_HOME", data_dir.to_string_lossy());
     make_codex_fixture(&data_dir);
+    let envs = [("CODEX_HOME", data_dir.as_path())];
 
     // Build index
-    cargo_bin_cmd!("cass")
+    cass_cmd(tmp.path(), &xdg, &envs)
         .arg("index")
         .arg("--full")
         .arg("--data-dir")
@@ -497,7 +497,7 @@ fn health_check_before_tui_launch() {
         .success();
 
     // Health check should pass (exit 0)
-    cargo_bin_cmd!("cass")
+    cass_cmd(tmp.path(), &xdg, &envs)
         .arg("health")
         .arg("--data-dir")
         .arg(&data_dir)
@@ -505,7 +505,7 @@ fn health_check_before_tui_launch() {
         .success();
 
     // After health check passes, TUI should work
-    cargo_bin_cmd!("cass")
+    cass_cmd(tmp.path(), &xdg, &envs)
         .arg("tui")
         .arg("--data-dir")
         .arg(&data_dir)
@@ -537,19 +537,17 @@ fn tui_help_flag_shows_usage() {
 fn tui_accepts_data_dir_flag() {
     let _guard_lock = tui_smoke_guard();
     let tmp = tempfile::TempDir::new().unwrap();
-    let _guard_home = EnvGuard::set("HOME", tmp.path().to_string_lossy());
     let xdg = tmp.path().join("xdg");
     fs::create_dir_all(&xdg).unwrap();
-    let _guard_xdg = EnvGuard::set("XDG_DATA_HOME", xdg.to_string_lossy());
 
     let data_dir = tmp.path().join("custom_data_dir");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_codex = EnvGuard::set("CODEX_HOME", data_dir.to_string_lossy());
+    let envs = [("CODEX_HOME", data_dir.as_path())];
     make_codex_fixture(&data_dir);
 
     // Build index in custom dir
-    cargo_bin_cmd!("cass")
+    cass_cmd(tmp.path(), &xdg, &envs)
         .arg("index")
         .arg("--full")
         .arg("--data-dir")
@@ -558,7 +556,7 @@ fn tui_accepts_data_dir_flag() {
         .success();
 
     // TUI should accept --data-dir
-    cargo_bin_cmd!("cass")
+    cass_cmd(tmp.path(), &xdg, &envs)
         .arg("tui")
         .arg("--data-dir")
         .arg(&data_dir)
@@ -581,19 +579,17 @@ fn tui_accepts_data_dir_flag() {
 fn diag_command_provides_useful_info() {
     let _guard_lock = tui_smoke_guard();
     let tmp = tempfile::TempDir::new().unwrap();
-    let _guard_home = EnvGuard::set("HOME", tmp.path().to_string_lossy());
     let xdg = tmp.path().join("xdg");
     fs::create_dir_all(&xdg).unwrap();
-    let _guard_xdg = EnvGuard::set("XDG_DATA_HOME", xdg.to_string_lossy());
 
     let data_dir = tmp.path().join("data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_codex = EnvGuard::set("CODEX_HOME", data_dir.to_string_lossy());
     make_codex_fixture(&data_dir);
+    let envs = [("CODEX_HOME", data_dir.as_path())];
 
     // Build index
-    cargo_bin_cmd!("cass")
+    cass_cmd(tmp.path(), &xdg, &envs)
         .arg("index")
         .arg("--full")
         .arg("--data-dir")
@@ -602,7 +598,7 @@ fn diag_command_provides_useful_info() {
         .success();
 
     // Diag should provide useful information
-    let output = cargo_bin_cmd!("cass")
+    let output = cass_cmd(tmp.path(), &xdg, &envs)
         .arg("diag")
         .arg("--json")
         .arg("--data-dir")
@@ -624,19 +620,17 @@ fn diag_command_provides_useful_info() {
 fn status_command_shows_health() {
     let _guard_lock = tui_smoke_guard();
     let tmp = tempfile::TempDir::new().unwrap();
-    let _guard_home = EnvGuard::set("HOME", tmp.path().to_string_lossy());
     let xdg = tmp.path().join("xdg");
     fs::create_dir_all(&xdg).unwrap();
-    let _guard_xdg = EnvGuard::set("XDG_DATA_HOME", xdg.to_string_lossy());
 
     let data_dir = tmp.path().join("data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_codex = EnvGuard::set("CODEX_HOME", data_dir.to_string_lossy());
     make_codex_fixture(&data_dir);
+    let envs = [("CODEX_HOME", data_dir.as_path())];
 
     // Build index
-    cargo_bin_cmd!("cass")
+    cass_cmd(tmp.path(), &xdg, &envs)
         .arg("index")
         .arg("--full")
         .arg("--data-dir")
@@ -645,7 +639,7 @@ fn status_command_shows_health() {
         .success();
 
     // Status should work
-    cargo_bin_cmd!("cass")
+    cass_cmd(tmp.path(), &xdg, &envs)
         .arg("status")
         .arg("--json")
         .arg("--data-dir")
@@ -664,10 +658,8 @@ fn status_command_shows_health() {
 fn tui_handles_unicode_content() {
     let _guard_lock = tui_smoke_guard();
     let tmp = tempfile::TempDir::new().unwrap();
-    let _guard_home = EnvGuard::set("HOME", tmp.path().to_string_lossy());
     let xdg = tmp.path().join("xdg");
     fs::create_dir_all(&xdg).unwrap();
-    let _guard_xdg = EnvGuard::set("XDG_DATA_HOME", xdg.to_string_lossy());
 
     let data_dir = tmp.path().join("data");
     fs::create_dir_all(&data_dir).unwrap();
@@ -681,10 +673,10 @@ fn tui_handles_unicode_content() {
 "#;
     fs::write(file, sample).unwrap();
 
-    let _guard_codex = EnvGuard::set("CODEX_HOME", data_dir.to_string_lossy());
+    let envs = [("CODEX_HOME", data_dir.as_path())];
 
     // Build index
-    cargo_bin_cmd!("cass")
+    cass_cmd(tmp.path(), &xdg, &envs)
         .arg("index")
         .arg("--full")
         .arg("--data-dir")
@@ -693,7 +685,7 @@ fn tui_handles_unicode_content() {
         .success();
 
     // TUI should handle Unicode without panicking
-    cargo_bin_cmd!("cass")
+    cass_cmd(tmp.path(), &xdg, &envs)
         .arg("tui")
         .arg("--data-dir")
         .arg(&data_dir)
@@ -703,7 +695,7 @@ fn tui_handles_unicode_content() {
         .success();
 
     // Search for Unicode content
-    cargo_bin_cmd!("cass")
+    cass_cmd(tmp.path(), &xdg, &envs)
         .arg("search")
         .arg("日本語")
         .arg("--robot")
@@ -719,10 +711,8 @@ fn tui_handles_unicode_content() {
 fn tui_handles_large_message_content() {
     let _guard_lock = tui_smoke_guard();
     let tmp = tempfile::TempDir::new().unwrap();
-    let _guard_home = EnvGuard::set("HOME", tmp.path().to_string_lossy());
     let xdg = tmp.path().join("xdg");
     fs::create_dir_all(&xdg).unwrap();
-    let _guard_xdg = EnvGuard::set("XDG_DATA_HOME", xdg.to_string_lossy());
 
     let data_dir = tmp.path().join("data");
     fs::create_dir_all(&data_dir).unwrap();
@@ -742,10 +732,10 @@ fn tui_handles_large_message_content() {
     );
     fs::write(file, sample).unwrap();
 
-    let _guard_codex = EnvGuard::set("CODEX_HOME", data_dir.to_string_lossy());
+    let envs = [("CODEX_HOME", data_dir.as_path())];
 
     // Build index
-    cargo_bin_cmd!("cass")
+    cass_cmd(tmp.path(), &xdg, &envs)
         .arg("index")
         .arg("--full")
         .arg("--data-dir")
@@ -754,7 +744,7 @@ fn tui_handles_large_message_content() {
         .success();
 
     // TUI should handle large content without panicking
-    cargo_bin_cmd!("cass")
+    cass_cmd(tmp.path(), &xdg, &envs)
         .arg("tui")
         .arg("--data-dir")
         .arg(&data_dir)

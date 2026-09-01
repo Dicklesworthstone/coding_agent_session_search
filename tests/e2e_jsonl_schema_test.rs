@@ -827,9 +827,12 @@ fn e2e_subprocess_sources_cannot_mutate_the_parent_environment() -> SchemaTestRe
     let tracker = tracker_for("e2e_subprocess_sources_cannot_mutate_the_parent_environment");
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let sources = [
+        "tests/connector_codex.rs",
+        "tests/connector_pi_agent.rs",
         "tests/e2e_cli_flows.rs",
         "tests/e2e_deploy.rs",
         "tests/e2e_filters.rs",
+        "tests/e2e_full_integration.rs",
         "tests/e2e_index_tui.rs",
         "tests/e2e_install_easy.rs",
         "tests/e2e_jsonl_schema_test.rs",
@@ -841,7 +844,12 @@ fn e2e_subprocess_sources_cannot_mutate_the_parent_environment() -> SchemaTestRe
         "tests/e2e_sources.rs",
         "tests/e2e_ssh_sources.rs",
         "tests/e2e_tui_smoke_flows.rs",
+        "tests/metamorphic_stats.rs",
         "tests/pages_preview_integration.rs",
+        "tests/regex_cache.rs",
+        "tests/semantic_integration.rs",
+        "tests/storage.rs",
+        "tests/tui_smoke.rs",
         "tests/util/e2e_log.rs",
     ];
     let forbidden = [

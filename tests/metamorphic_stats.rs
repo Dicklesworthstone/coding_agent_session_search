@@ -22,7 +22,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 mod util;
-use util::EnvGuard;
 
 struct StatsFixture {
     _tmp: tempfile::TempDir,
@@ -45,13 +44,6 @@ impl StatsFixture {
             codex_home,
             data_dir,
         }
-    }
-
-    fn env_guards(&self) -> (EnvGuard, EnvGuard) {
-        (
-            EnvGuard::set("HOME", self.home.to_string_lossy().as_ref()),
-            EnvGuard::set("CODEX_HOME", self.codex_home.to_string_lossy().as_ref()),
-        )
     }
 
     fn index_full(&self) {
@@ -131,7 +123,8 @@ fn write_codex_session(
 #[test]
 fn mr_stats_total_equals_sum_of_by_source() {
     let fixture = StatsFixture::new();
-    let _guards = fixture.env_guards();
+    // qu81y: no process-global env mutation — every cass subprocess passes
+    // its HOME/CODEX_HOME explicitly via Command::env.
 
     // Seed three distinct Codex sessions across different dates so
     // the row count is unambiguously > 1. Each session contributes 2
@@ -215,7 +208,8 @@ fn mr_stats_empty_data_dir_produces_zero_counters_or_structured_error() {
     let fixture = StatsFixture::new();
     fs::create_dir_all(&fixture.codex_home).unwrap();
 
-    let _guards = fixture.env_guards();
+    // qu81y: no process-global env mutation — every cass subprocess passes
+    // its HOME/CODEX_HOME explicitly via Command::env.
 
     let output = cargo_bin_cmd!("cass")
         .args(["stats", "--json", "--data-dir"])
@@ -275,7 +269,8 @@ fn mr_stats_empty_data_dir_produces_zero_counters_or_structured_error() {
 #[test]
 fn mr_stats_date_range_oldest_lte_newest() {
     let fixture = StatsFixture::new();
-    let _guards = fixture.env_guards();
+    // qu81y: no process-global env mutation — every cass subprocess passes
+    // its HOME/CODEX_HOME explicitly via Command::env.
 
     fixture.seed("20", "1", "first", 1_732_118_400_000);
     fixture.seed("22", "2", "second", 1_732_291_200_000);
