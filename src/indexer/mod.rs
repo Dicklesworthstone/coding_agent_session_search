@@ -45830,11 +45830,13 @@ mod tests {
             storage
                 .raw()
                 .execute(
+                    // bet45: the contentless fts_messages shadow no longer
+                    // carries a message_id column; the rowid IS the message id.
                     "INSERT INTO fts_messages(
-                         rowid, content, title, agent, workspace, source_path, created_at, message_id
+                         rowid, content, title, agent, workspace, source_path, created_at
                      ) VALUES(
                          1, 'segment corruption sentinel', 'title', 'codex', '/workspace',
-                         '/tmp/session.jsonl', 1, 1
+                         '/tmp/session.jsonl', 1
                      )",
                 )
                 .expect("persist one FTS segment");
@@ -45845,10 +45847,13 @@ mod tests {
                 db_path.to_string_lossy().into_owned(),
             )
             .unwrap();
+            // bet45: target the newest structure record instead of the old
+            // magic id=10 — the contentless shadow's row layout changed and
+            // the fixture's single segment no longer lands on that id.
             conn.execute(
                 "UPDATE fts_messages_data
                  SET block = X'FFFFFFFFFFFFFFFFFFFFFFFF'
-                 WHERE id = 10",
+                 WHERE id = (SELECT MAX(id) FROM fts_messages_data)",
             )
             .expect("corrupt the persisted FTS structure record");
         }

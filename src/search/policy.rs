@@ -1195,7 +1195,8 @@ mod tests {
     #[test]
     fn budget_decisions() {
         let p = SemanticPolicy::compiled_defaults();
-        // defaults: budget=500, min_free=200, max_model=300
+        // defaults: budget=500, min_free=200, max_model=500 (raised from 300
+        // for the larger multilingual quality-tier models)
 
         let cases: &[(u64, u64, u64, BudgetDecision)] = &[
             // (write_mb, current_usage_mb, free_disk_mb, expected)
@@ -1222,14 +1223,14 @@ mod tests {
                     min_required_mb: 200,
                 },
             ),
-            // Model too large: 350 MB > max_model 300 → deny
+            // Model too large: 550 MB > max_model 500 → deny
             (
-                350,
+                550,
                 0,
                 1000,
                 BudgetDecision::ModelTooLarge {
-                    model_mb: 350,
-                    max_mb: 300,
+                    model_mb: 550,
+                    max_mb: 500,
                 },
             ),
             // Edge: exact budget limit (90+410=500) → allowed

@@ -32708,6 +32708,10 @@ mod tests {
             },
             "the v2 classifier must run even when the narrower v1 migration was complete"
         );
+        // bet45: since the analytics split (d29f8825), reclassification
+        // defers message_metrics to the analytics rebuild it flags via
+        // analytics_rebuild_required — run it before asserting metrics rows.
+        storage.rebuild_analytics()?;
 
         let omp_agent_id: i64 = storage.conn.query_row_map(
             "SELECT id FROM agents WHERE slug = 'omp'",

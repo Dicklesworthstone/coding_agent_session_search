@@ -3412,8 +3412,10 @@ mod tests {
             Err(err) => err,
         };
 
+        let rendered = err.to_string();
         anyhow::ensure!(
-            err.to_string().contains("Invalid password"),
+            rendered.contains("Invalid password")
+                || rendered.contains("The password you entered is incorrect"),
             "unexpected error: {err:#}"
         );
         let viewer_metadata = std::fs::symlink_metadata(site_dir.join("viewer.js"))?;
