@@ -1,9 +1,8 @@
 //! First-class Oh My Pi v18 integration gates.
 
-mod util;
-
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::Context as _;
 use coding_agent_search::connectors::{
@@ -12,8 +11,10 @@ use coding_agent_search::connectors::{
 };
 use coding_agent_search::sources::sync::path_to_safe_dirname;
 use serde_json::json;
-use serial_test::serial;
-use util::EnvGuard;
+
+const OMP_LIVE_OVERRIDE_CHILD_ENV: &str = "CASS_TEST_OMP_LIVE_OVERRIDE_CHILD";
+const OMP_LIVE_OVERRIDE_STATE_DIR_ENV: &str = "CASS_TEST_OMP_LIVE_OVERRIDE_STATE_DIR";
+const OMP_LIVE_OVERRIDE_CHILD_RECEIPT: &str = "cass-omp-live-override-child-ok";
 
 fn write_omp_session(agent_root: &Path, id: &str, title: &str) -> PathBuf {
     let session_dir = agent_root.join("sessions/-projects-cass");
@@ -363,7 +364,6 @@ fn sanitized_remote_omp_profile_root_preserves_profile_subagents_and_provenance(
 }
 
 #[test]
-#[serial]
 fn cass_omp_data_root_is_an_omp_only_live_override() {
     let temp = tempfile::tempdir().expect("tempdir");
     let omp_root = temp.path().join("custom-omp-store");
@@ -371,14 +371,58 @@ fn cass_omp_data_root_is_an_omp_only_live_override() {
     write_omp_session(&omp_root, "omp-only-live-root", "OMP-only override");
     write_omp_session(&shared_pi_root, "shared-pi-root", "Shared Pi override");
 
-    let _omp_root = EnvGuard::set("CASS_OMP_DATA_ROOT", omp_root.to_string_lossy());
-    let _shared_root = EnvGuard::set("PI_CODING_AGENT_DIR", shared_pi_root.to_string_lossy());
-    let _pi_sessions = EnvGuard::set("PI_SESSIONS_DIR", "");
-    let _omp_sessions = EnvGuard::set("PI_CODING_AGENT_SESSION_DIR", "");
-    let _config_dir = EnvGuard::set("PI_CONFIG_DIR", "");
-    let _profile = EnvGuard::set("OMP_PROFILE", "");
-    let _legacy_profile = EnvGuard::set("PI_PROFILE", "");
-    let _xdg_data_home = EnvGuard::set("XDG_DATA_HOME", "");
+    let output = Command::new(std::env::current_exe().expect("current connector_omp test binary"))
+        .arg("--exact")
+        .arg("cass_omp_data_root_is_an_omp_only_live_override_child")
+        .arg("--nocapture")
+        .env_clear()
+        .env(OMP_LIVE_OVERRIDE_CHILD_ENV, "1")
+        .env(OMP_LIVE_OVERRIDE_STATE_DIR_ENV, temp.path())
+        .env("CASS_OMP_DATA_ROOT", &omp_root)
+        .env("PI_CODING_AGENT_DIR", &shared_pi_root)
+        .env("RUST_MIN_STACK", "16777216")
+        .output()
+        .expect("spawn isolated OMP live-override test child");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "isolated OMP live-override child failed\nstatus={:?}\n{combined}",
+        output.status
+    );
+    assert!(
+        combined.len() <= 1024 * 1024,
+        "isolated OMP live-override child exceeded the 1 MiB diagnostic cap"
+    );
+    assert!(
+        combined.contains(OMP_LIVE_OVERRIDE_CHILD_RECEIPT),
+        "isolated OMP live-override child omitted its success receipt: {combined}"
+    );
+}
+
+#[test]
+fn cass_omp_data_root_is_an_omp_only_live_override_child() {
+    let Some(child_marker) = std::env::var_os(OMP_LIVE_OVERRIDE_CHILD_ENV) else {
+        return;
+    };
+    if child_marker.to_str() != Some("1") {
+        return;
+    }
+
+    let state_dir = PathBuf::from(
+        std::env::var_os(OMP_LIVE_OVERRIDE_STATE_DIR_ENV)
+            .expect("OMP live-override child state directory"),
+    );
+    let omp_root = PathBuf::from(
+        std::env::var_os("CASS_OMP_DATA_ROOT").expect("OMP live-override child OMP root"),
+    );
+    let shared_pi_root = PathBuf::from(
+        std::env::var_os("PI_CODING_AGENT_DIR")
+            .expect("OMP live-override child shared Pi root"),
+    );
 
     let detection = runtime_connector("omp").detect();
     assert!(
@@ -387,7 +431,7 @@ fn cass_omp_data_root_is_an_omp_only_live_override() {
     );
 
     let ctx = ScanContext::with_roots(
-        temp.path().join("cass-state"),
+        state_dir.join("cass-state"),
         vec![
             ScanRoot::local(omp_root.clone()),
             ScanRoot::local(shared_pi_root.clone()),
@@ -429,6 +473,7 @@ fn cass_omp_data_root_is_an_omp_only_live_override() {
             conversation.external_id.as_deref() == Some("omp-only-live-root")
         })
     );
+    eprintln!("{OMP_LIVE_OVERRIDE_CHILD_RECEIPT}");
 }
 
 #[test]
