@@ -2241,7 +2241,6 @@ impl SemanticGenerationManifestV1 {
                     || ann.vector_slot_count != base.vector_slot_count
                     || ann.live_vector_count != base.live_vector_count
                     || ann.tombstone_vector_count != base.tombstone_vector_count
-                    || ann.wal_entry_count != base.wal_entry_count
                     || ann.generation_corpus_sha256 != base.generation_corpus_sha256
                     || ann.covered_live_docset_sha256 != base.covered_live_docset_sha256
                     || ann.covered_content_sha256 != base.covered_content_sha256
@@ -5107,7 +5106,6 @@ mod tests {
         ann.vector_slot_count = base.vector_slot_count;
         ann.live_vector_count = base.live_vector_count;
         ann.tombstone_vector_count = base.tombstone_vector_count;
-        ann.wal_entry_count = base.wal_entry_count;
         ann.generation_corpus_sha256 = base.generation_corpus_sha256.clone();
         ann.covered_live_docset_sha256 = base.covered_live_docset_sha256.clone();
         ann.covered_content_sha256 = base.covered_content_sha256.clone();
@@ -5116,7 +5114,6 @@ mod tests {
         ann.validation.vector_slot_count = ann.vector_slot_count;
         ann.validation.live_vector_count = ann.live_vector_count;
         ann.validation.tombstone_vector_count = ann.tombstone_vector_count;
-        ann.validation.wal_entry_count = ann.wal_entry_count;
         ann.validation.generation_corpus_sha256 = ann.generation_corpus_sha256.clone();
         ann.validation.covered_live_docset_sha256 = ann.covered_live_docset_sha256.clone();
         ann.validation.covered_content_sha256 = ann.covered_content_sha256.clone();
@@ -7480,15 +7477,20 @@ mod tests {
             b"base-vector",
             &corpus,
         );
-        let ann = bind_ann_to_base(
-            complete_generation_artifact(
-                SemanticArtifactRole::FastAnn,
-                "fast/search.hnsw",
-                b"ann-index",
-                &corpus,
-            ),
-            &base,
+        let ann_template = complete_generation_artifact(
+            SemanticArtifactRole::FastAnn,
+            "fast/search.hnsw",
+            b"ann-index",
+            &corpus,
         );
+        let mut base_with_wal = base.clone();
+        base_with_wal.wal_entry_count = 7;
+        base_with_wal.validation.wal_entry_count = 7;
+        let ann_from_live_base = bind_ann_to_base(ann_template.clone(), &base_with_wal);
+        assert_eq!(ann_from_live_base.wal_entry_count, 0);
+        assert_eq!(ann_from_live_base.validation.wal_entry_count, 0);
+
+        let ann = bind_ann_to_base(ann_template, &base);
         let manifest = test_generation_manifest(
             SemanticGenerationTopology::FastOnly,
             vec![base.clone(), ann],
