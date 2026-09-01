@@ -414,7 +414,8 @@ pub fn probe_host(host: &DiscoveredHost, timeout_secs: u64) -> HostProbeResult {
         .stderr(Stdio::piped());
     configure_child_process_group(&mut cmd);
 
-    // Spawn the process and write probe script to stdin
+    // Spawn the process; the probe script reaches bash through the
+    // file-backed stdin above (no pipe write from cass — ztlan/gh#358).
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -424,8 +425,6 @@ pub fn probe_host(host: &DiscoveredHost, timeout_secs: u64) -> HostProbeResult {
             );
         }
     };
-
-    // Write probe script to stdin
 
     // Wait for completion
     let output = match wait_for_child_output_with_timeout(child, command_timeout) {
