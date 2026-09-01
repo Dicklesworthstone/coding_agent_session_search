@@ -123,7 +123,7 @@ impl Embedder for HashEmbedder {
 
         let tokens = Self::tokenize(text);
 
-        // Preserve cass legacy behavior for low-signal inputs.
+        // Preserve cass legacy behavior for tokenless low-signal inputs.
         if tokens.is_empty() {
             return Ok(self.uniform_fallback());
         }
@@ -141,6 +141,12 @@ impl Embedder for HashEmbedder {
                     embedding.len()
                 ))),
             });
+        }
+        // Feature hashing can exactly cancel nonempty token contributions.
+        // Preserve the same deterministic, nonzero fallback used for tokenless
+        // input so downstream search never receives a zero-norm vector.
+        if embedding.iter().all(|value| *value == 0.0) {
+            return Ok(self.uniform_fallback());
         }
         Ok(embedding)
     }
@@ -252,6 +258,30 @@ mod tests {
             (norm - 1.0).abs() < 1e-5,
             "L2 norm should be ~1.0, got {norm}"
         );
+    }
+
+    #[test]
+    fn test_hash_embedder_cancellation_uses_finite_unit_fallback() {
+        let embedder = HashEmbedder::new(1);
+        let cancellation_input = "token0 token100";
+        let raw = embedder.delegate.embed_sync(cancellation_input);
+        assert_eq!(
+            raw,
+            vec![0.0],
+            "fixture must exactly cancel two nonempty hash features"
+        );
+
+        let embedding = embedder.embed_sync(cancellation_input).unwrap();
+        let norm = embedding
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+
+        assert!(embedding.iter().all(|value| value.is_finite()));
+        assert!(embedding.iter().any(|value| *value != 0.0));
+        assert!((norm - 1.0).abs() < 1e-6, "fallback norm={norm}");
+        assert_eq!(embedding, embedder.uniform_fallback());
     }
 
     #[test]
