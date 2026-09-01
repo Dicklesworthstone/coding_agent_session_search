@@ -13,11 +13,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use fs2::FileExt;
 use frankensearch::{
     AttestedDaemonEmbeddingResponseV1, DaemonChallengeV1, DaemonConnectionIdentityV1,
     DaemonEmbeddingAttestationV1, PinnedDaemonVerifierV1,
 };
+use fs2::FileExt;
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
@@ -27,9 +27,9 @@ use super::protocol::{
 };
 use super::worker::EmbeddingJobConfig;
 use super::{
-    DAEMON_ATTESTATION_PROTOCOL_REVISION, DaemonRunLockMetadata,
-    daemon_run_lock_path, daemon_socket_endpoint_fingerprint, daemon_spawn_guard_lock_path,
-    daemon_socket_path_for_data_dir, load_daemon_attestation_key, published_lexical_generation,
+    DAEMON_ATTESTATION_PROTOCOL_REVISION, DaemonRunLockMetadata, daemon_run_lock_path,
+    daemon_socket_endpoint_fingerprint, daemon_socket_path_for_data_dir,
+    daemon_spawn_guard_lock_path, load_daemon_attestation_key, published_lexical_generation,
 };
 use crate::search::daemon_client::{DaemonClient, DaemonError};
 
@@ -287,7 +287,10 @@ impl UdsDaemonClient {
         // authenticated channel, so it must be forwarded to the resident
         // process rather than silently serving the platform default.
         let mut command = Command::new(&binary);
-        command.arg("daemon").arg("--socket").arg(&self.config.socket_path);
+        command
+            .arg("daemon")
+            .arg("--socket")
+            .arg(&self.config.socket_path);
         if let Some(data_dir) = &self.config.data_dir {
             command.arg("--data-dir").arg(data_dir);
         }
@@ -1083,9 +1086,8 @@ mod tests {
     use super::*;
     use frankensearch::{
         DAEMON_CONNECTION_IDENTITY_SCHEMA_V1, DaemonChallengeV1, DaemonConnectionIdentityV1,
-        DaemonEmbeddingAttestationV1, DaemonFallbackEmbedder, DaemonOperationV1,
-        DaemonRetryConfig, Embedder as _, HashAlgorithm, HashEmbedder, ModelCategory,
-        SyncEmbed as _,
+        DaemonEmbeddingAttestationV1, DaemonFallbackEmbedder, DaemonOperationV1, DaemonRetryConfig,
+        Embedder as _, HashAlgorithm, HashEmbedder, ModelCategory, SyncEmbed as _,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -1115,94 +1117,96 @@ mod tests {
 
         let (client_stream, mut server_stream) = UnixStream::pair()?;
         let server_connection = connection.clone();
-        let server = std::thread::spawn(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            for step in 0..4 {
-                let mut len = [0_u8; 4];
-                server_stream.read_exact(&mut len)?;
-                let mut payload = vec![0_u8; u32::from_be_bytes(len) as usize];
-                server_stream.read_exact(&mut payload)?;
-                let request = decode_message::<Request>(&payload)?;
-                let response = match (step, request.payload) {
-                    (0, Request::ConnectionIdentity) => {
-                        Response::ConnectionIdentity(server_connection.clone())
-                    }
-                    (1, Request::HandshakeAttested { challenge }) => {
-                        let expected = DaemonChallengeV1::for_inputs(
-                            challenge.request_nonce.clone(),
-                            DaemonOperationV1::Handshake,
-                            &[],
-                            &server_connection,
-                        )?;
-                        if expected != challenge {
-                            return Err(std::io::Error::other(
-                                "handshake challenge mismatch",
-                            )
-                            .into());
+        let server = std::thread::spawn(
+            move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                for step in 0..4 {
+                    let mut len = [0_u8; 4];
+                    server_stream.read_exact(&mut len)?;
+                    let mut payload = vec![0_u8; u32::from_be_bytes(len) as usize];
+                    server_stream.read_exact(&mut payload)?;
+                    let request = decode_message::<Request>(&payload)?;
+                    let response = match (step, request.payload) {
+                        (0, Request::ConnectionIdentity) => {
+                            Response::ConnectionIdentity(server_connection.clone())
                         }
-                        let mut attestation = DaemonEmbeddingAttestationV1::unsigned(
-                            challenge,
-                            server_connection.clone(),
-                            &[],
-                        )?;
-                        attestation.sign_hmac_sha256(authority.secret())?;
-                        Response::Attestation(attestation)
-                    }
-                    (2, Request::HealthAttested { challenge }) => {
-                        let expected = DaemonChallengeV1::for_inputs(
-                            challenge.request_nonce.clone(),
-                            DaemonOperationV1::Health,
-                            &[],
-                            &server_connection,
-                        )?;
-                        if expected != challenge {
-                            return Err(
-                                std::io::Error::other("health challenge mismatch").into()
-                            );
+                        (1, Request::HandshakeAttested { challenge }) => {
+                            let expected = DaemonChallengeV1::for_inputs(
+                                challenge.request_nonce.clone(),
+                                DaemonOperationV1::Handshake,
+                                &[],
+                                &server_connection,
+                            )?;
+                            if expected != challenge {
+                                return Err(
+                                    std::io::Error::other("handshake challenge mismatch").into()
+                                );
+                            }
+                            let mut attestation = DaemonEmbeddingAttestationV1::unsigned(
+                                challenge,
+                                server_connection.clone(),
+                                &[],
+                            )?;
+                            attestation.sign_hmac_sha256(authority.secret())?;
+                            Response::Attestation(attestation)
                         }
-                        let mut attestation = DaemonEmbeddingAttestationV1::unsigned(
-                            challenge,
-                            server_connection.clone(),
-                            &[],
-                        )?;
-                        attestation.sign_hmac_sha256(authority.secret())?;
-                        Response::Attestation(attestation)
-                    }
-                    (
-                        3,
-                        Request::EmbedAttested {
-                            texts, challenge, ..
-                        },
-                    ) => {
-                        let input_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-                        let expected = DaemonChallengeV1::for_inputs(
-                            challenge.request_nonce.clone(),
-                            DaemonOperationV1::Embed,
-                            &input_refs,
-                            &server_connection,
-                        )?;
-                        if expected != challenge {
-                            return Err(std::io::Error::other("embed challenge mismatch").into());
+                        (2, Request::HealthAttested { challenge }) => {
+                            let expected = DaemonChallengeV1::for_inputs(
+                                challenge.request_nonce.clone(),
+                                DaemonOperationV1::Health,
+                                &[],
+                                &server_connection,
+                            )?;
+                            if expected != challenge {
+                                return Err(
+                                    std::io::Error::other("health challenge mismatch").into()
+                                );
+                            }
+                            let mut attestation = DaemonEmbeddingAttestationV1::unsigned(
+                                challenge,
+                                server_connection.clone(),
+                                &[],
+                            )?;
+                            attestation.sign_hmac_sha256(authority.secret())?;
+                            Response::Attestation(attestation)
                         }
-                        Response::AttestedEmbedding(
-                            AttestedDaemonEmbeddingResponseV1::signed(
+                        (
+                            3,
+                            Request::EmbedAttested {
+                                texts, challenge, ..
+                            },
+                        ) => {
+                            let input_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+                            let expected = DaemonChallengeV1::for_inputs(
+                                challenge.request_nonce.clone(),
+                                DaemonOperationV1::Embed,
+                                &input_refs,
+                                &server_connection,
+                            )?;
+                            if expected != challenge {
+                                return Err(
+                                    std::io::Error::other("embed challenge mismatch").into()
+                                );
+                            }
+                            Response::AttestedEmbedding(AttestedDaemonEmbeddingResponseV1::signed(
                                 challenge,
                                 server_connection.clone(),
                                 vec![vec![0.25, 0.5, 0.75]],
                                 authority.secret(),
-                            )?,
-                        )
-                    }
-                    _ => {
-                        return Err(
-                            std::io::Error::other("unexpected attested request sequence").into()
-                        );
-                    }
-                };
-                let framed = FramedMessage::new(request.request_id, response);
-                server_stream.write_all(&encode_message(&framed)?)?;
-            }
-            Ok(())
-        });
+                            )?)
+                        }
+                        _ => {
+                            return Err(std::io::Error::other(
+                                "unexpected attested request sequence",
+                            )
+                            .into());
+                        }
+                    };
+                    let framed = FramedMessage::new(request.request_id, response);
+                    server_stream.write_all(&encode_message(&framed)?)?;
+                }
+                Ok(())
+            },
+        );
 
         let client = Arc::new(UdsDaemonClient::new(DaemonClientConfig {
             socket_path,

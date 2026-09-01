@@ -54,8 +54,7 @@ use serde::{Deserialize, Serialize};
 /// request/response semantics requires a new label as well as a wire protocol
 /// version bump.
 #[cfg(unix)]
-pub(crate) const DAEMON_ATTESTATION_PROTOCOL_REVISION: &str =
-    "cass-semantic-msgpack-attested-v1";
+pub(crate) const DAEMON_ATTESTATION_PROTOCOL_REVISION: &str = "cass-semantic-msgpack-attested-v1";
 
 #[cfg(unix)]
 const DAEMON_ATTESTATION_KEY_BYTES: usize = 32;

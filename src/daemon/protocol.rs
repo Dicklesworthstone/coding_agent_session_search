@@ -337,9 +337,9 @@ mod tests {
     use std::fmt::Debug;
 
     use frankensearch::{
-        AttestedDaemonEmbeddingResponseV1, DAEMON_CONNECTION_IDENTITY_SCHEMA_V1,
-        DaemonChallengeV1, DaemonConnectionIdentityV1, DaemonOperationV1, HashAlgorithm,
-        Embedder as _, HashEmbedder, ModelCategory,
+        AttestedDaemonEmbeddingResponseV1, DAEMON_CONNECTION_IDENTITY_SCHEMA_V1, DaemonChallengeV1,
+        DaemonConnectionIdentityV1, DaemonOperationV1, Embedder as _, HashAlgorithm, HashEmbedder,
+        ModelCategory,
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -487,10 +487,7 @@ mod tests {
             vec![vec![0.25, 0.5, 0.75]],
             &key,
         )?;
-        let response = FramedMessage::new(
-            "attested-response",
-            Response::AttestedEmbedding(signed),
-        );
+        let response = FramedMessage::new("attested-response", Response::AttestedEmbedding(signed));
         let decoded: FramedMessage<Response> = decode_framed(&encode_message(&response)?)?;
         let Response::AttestedEmbedding(decoded) = decoded.payload else {
             return Err(test_error("expected attested embed response"));

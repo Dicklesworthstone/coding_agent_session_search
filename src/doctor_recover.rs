@@ -1588,9 +1588,8 @@ mod tests {
 
         // The gh#369 oversized-leaf shape is a write-time engine limitation,
         // not an open-blocking schema failure.
-        let oversized = anyhow::anyhow!(
-            "fts5: corrupt %_data record: segment leaf term offset exceeds u16"
-        );
+        let oversized =
+            anyhow::anyhow!("fts5: corrupt %_data record: segment leaf term offset exceeds u16");
         assert!(!is_fts_shadow_schema_level_open_failure(&oversized));
     }
 

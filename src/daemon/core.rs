@@ -6,20 +6,18 @@
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{
-    DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt,
-};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use fs2::FileExt;
 use frankensearch::{
     AttestedDaemonEmbeddingResponseV1, DAEMON_CONNECTION_IDENTITY_SCHEMA_V1, DaemonChallengeV1,
     DaemonConnectionIdentityV1, DaemonEmbeddingAttestationV1, DaemonError, DaemonOperationV1,
 };
+use fs2::FileExt;
 use parking_lot::RwLock;
 use tracing::{debug, error, info, warn};
 
@@ -31,12 +29,12 @@ use super::protocol::{
 };
 use super::resource::ResourceMonitor;
 use super::worker::{EmbeddingJobConfig, EmbeddingWorker, EmbeddingWorkerHandle};
-use super::{DaemonRunLockMetadata, daemon_run_lock_path};
 use super::{
     DAEMON_ATTESTATION_PROTOCOL_REVISION, DaemonAttestationKeyV1,
     current_daemon_executable_fingerprint, daemon_socket_endpoint_fingerprint,
     daemon_socket_path_for_data_dir, initialize_daemon_attestation_authority,
 };
+use super::{DaemonRunLockMetadata, daemon_run_lock_path};
 
 struct BoundDaemonSocket {
     listener: UnixListener,
@@ -1034,11 +1032,7 @@ impl ModelDaemon {
                     return attestation_unavailable_response();
                 };
                 if state
-                    .validate_challenge_for_inputs(
-                        &challenge,
-                        DaemonOperationV1::Rerank,
-                        &inputs,
-                    )
+                    .validate_challenge_for_inputs(&challenge, DaemonOperationV1::Rerank, &inputs)
                     .is_err()
                 {
                     return rejected_attestation_response();
@@ -1051,12 +1045,7 @@ impl ModelDaemon {
                 );
                 match self.models.rerank(&query, &documents) {
                     Ok(scores) => state
-                        .sign_vectors(
-                            &challenge,
-                            DaemonOperationV1::Rerank,
-                            &inputs,
-                            vec![scores],
-                        )
+                        .sign_vectors(&challenge, DaemonOperationV1::Rerank, &inputs, vec![scores])
                         .map(Response::AttestedEmbedding)
                         .unwrap_or_else(|_| rejected_attestation_response()),
                     Err(error) => Response::Error(ErrorResponse {
