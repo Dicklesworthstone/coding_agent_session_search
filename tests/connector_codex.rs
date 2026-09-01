@@ -130,7 +130,6 @@ fn codex_connector_parses_real_tool_call_fixture() {
     let fixture_home = codex_real_fixture_home();
     let expected_path = fixture_home.join("sessions/2025/11/26/rollout-tool-call.jsonl");
 
-
     let connector = CodexConnector::new();
     // qu81y: committed fixture home passed as an explicit scan root.
     let ctx = ScanContext::with_roots(

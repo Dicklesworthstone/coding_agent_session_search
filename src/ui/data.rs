@@ -400,11 +400,8 @@ pub(crate) fn load_conversation_uncached(
 ) -> Result<Option<ConversationView>> {
     let normalized_source_sql =
         normalized_ui_source_identity_sql_expr("c.source_id", "c.origin_host");
-    let normalized_origin_kind_sql = normalized_ui_source_origin_kind_sql_expr(
-        "c.source_id",
-        "s.kind",
-        "c.origin_host",
-    );
+    let normalized_origin_kind_sql =
+        normalized_ui_source_origin_kind_sql_expr("c.source_id", "s.kind", "c.origin_host");
     // LEFT JOIN + COALESCE on agents for the same NULL-agent_id safety as
     // load_conversation_by_id_uncached.
     let (sql, params) = if let Some(source_id) = source_id {
@@ -478,11 +475,8 @@ fn cached_conversation_matches_lookup_head(
 
     let normalized_source_sql =
         normalized_ui_source_identity_sql_expr("c.source_id", "c.origin_host");
-    let normalized_origin_kind_sql = normalized_ui_source_origin_kind_sql_expr(
-        "c.source_id",
-        "s.kind",
-        "c.origin_host",
-    );
+    let normalized_origin_kind_sql =
+        normalized_ui_source_origin_kind_sql_expr("c.source_id", "s.kind", "c.origin_host");
     let (sql, params) = if let Some(source_id) = source_id {
         (
             format!(

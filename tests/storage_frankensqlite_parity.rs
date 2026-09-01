@@ -8,10 +8,10 @@
 //! transaction behavior, edge cases (Unicode, NULL, empty DB, large content),
 //! and cross-format file reads (rusqlite ↔ frankensqlite interop).
 
+use coding_agent_search::franken_sync::compat::{ConnectionExt as _, ParamValue, RowExt as _};
 use coding_agent_search::model::types::{
     Agent, AgentKind, Conversation, Message, MessageRole, Snippet,
 };
-use coding_agent_search::franken_sync::compat::{ConnectionExt as _, ParamValue, RowExt as _};
 use coding_agent_search::sources::provenance::{Source, SourceKind};
 use coding_agent_search::storage::sqlite::{CURRENT_SCHEMA_VERSION, FrankenStorage, SqliteStorage};
 use serde_json::json;

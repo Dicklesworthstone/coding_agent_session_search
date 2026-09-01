@@ -2,7 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
-use coding_agent_search::connectors::{Connector, ScanContext, ScanRoot, pi_agent::PiAgentConnector};
+use coding_agent_search::connectors::{
+    Connector, ScanContext, ScanRoot, pi_agent::PiAgentConnector,
+};
 
 #[test]
 fn pi_agent_connector_reads_session_jsonl() {

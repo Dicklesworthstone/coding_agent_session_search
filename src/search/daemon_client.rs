@@ -53,7 +53,10 @@ impl IdentityCheckedLocalEmbedder {
     }
 
     fn validate_loaded_inner(&self) -> SearchResult<()> {
-        let actual = self.inner.identity().map_err(|_| Self::identity_mismatch())?;
+        let actual = self
+            .inner
+            .identity()
+            .map_err(|_| Self::identity_mismatch())?;
         actual.validate().map_err(|_| Self::identity_mismatch())?;
         if actual != &self.expected {
             return Err(Self::identity_mismatch());

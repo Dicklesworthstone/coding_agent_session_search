@@ -803,7 +803,6 @@ pub enum Commands {
         /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
-
     },
     /// Collapse pre-existing duplicate conversation rows (projects/<rel> vs <rel> external_id twins) created before the dedup fix
     Dedup {
@@ -18065,7 +18064,11 @@ mod franken_query_retry_callback_tests {
                 Err(FrankenError::Busy)
             });
         assert!(result.is_err());
-        assert!(calls.get().cmp(&1).is_eq(), "callback invoked {} times", calls.get());
+        assert!(
+            calls.get().cmp(&1).is_eq(),
+            "callback invoked {} times",
+            calls.get()
+        );
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
@@ -18080,7 +18083,11 @@ mod franken_query_retry_callback_tests {
                 Err(FrankenError::Busy)
             });
         assert!(result.is_err());
-        assert!(calls.get().cmp(&1).is_eq(), "callback invoked {} times", calls.get());
+        assert!(
+            calls.get().cmp(&1).is_eq(),
+            "callback invoked {} times",
+            calls.get()
+        );
     }
 }
 
@@ -26144,14 +26151,11 @@ fn issue_347_semantic_daemon_policy_discovers_existing_by_default_and_respects_o
 #[test]
 fn unverifiable_daemon_composition_preserves_the_verified_local_embedding_space() {
     use crate::search::daemon_client::{
-        DaemonConnectionIdentityV1, DaemonRetryConfig, NoopDaemonClient,
-        PinnedDaemonVerifierV1,
+        DaemonConnectionIdentityV1, DaemonRetryConfig, NoopDaemonClient, PinnedDaemonVerifierV1,
     };
     use crate::search::embedder::Embedder;
     use crate::search::hash_embedder::HashEmbedder;
-    use frankensearch::{
-        DAEMON_CONNECTION_IDENTITY_SCHEMA_V1, Embedder as _, ModelCategory,
-    };
+    use frankensearch::{DAEMON_CONNECTION_IDENTITY_SCHEMA_V1, Embedder as _, ModelCategory};
 
     let local: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(32));
     let expected = local
@@ -26173,8 +26177,8 @@ fn unverifiable_daemon_composition_preserves_the_verified_local_embedding_space(
         model_category: ModelCategory::HashEmbedder,
     };
     let daemon = Arc::new(NoopDaemonClient::new("unverified-test-daemon"));
-    let verifier = PinnedDaemonVerifierV1::new("test-key-v1", vec![7_u8; 32])
-        .expect("test verifier");
+    let verifier =
+        PinnedDaemonVerifierV1::new("test-key-v1", vec![7_u8; 32]).expect("test verifier");
     let composed = compose_verified_daemon_embedder_or_local(
         daemon,
         local,
@@ -34319,7 +34323,11 @@ fn run_stats(
     } else {
         ""
     };
-    let origin_kind_sql = if source_join.is_empty() { "NULL" } else { "s.kind" };
+    let origin_kind_sql = if source_join.is_empty() {
+        "NULL"
+    } else {
+        "s.kind"
+    };
 
     // Build WHERE clause for source filtering
     let (source_where, source_param): (String, Option<String>) =
@@ -34547,7 +34555,10 @@ fn run_stats(
         println!("  Unique blobs: {}", raw_mirror_summary.unique_blob_count);
         println!("  Blob bytes: {}", raw_mirror_summary.total_blob_bytes);
         println!("  Orphan blobs: {}", raw_mirror_summary.orphan_blob_count);
-        println!("  Orphan blob bytes: {}", raw_mirror_summary.orphan_blob_bytes);
+        println!(
+            "  Orphan blob bytes: {}",
+            raw_mirror_summary.orphan_blob_bytes
+        );
         println!(
             "  Largest blob bytes: {}",
             raw_mirror_summary.largest_blob_bytes
@@ -45415,9 +45426,8 @@ fn doctor_verify_raw_mirror_manifest(
     if manifest.content_storage.is_none()
         && manifest.source_size_bytes != Some(manifest.blob_size_bytes)
     {
-        invalid_reason = Some(
-            "whole-blob source_size_bytes does not match blob_size_bytes".to_string(),
-        );
+        invalid_reason =
+            Some("whole-blob source_size_bytes does not match blob_size_bytes".to_string());
         status = "invalid_manifest".to_string();
     }
 
@@ -45710,8 +45720,7 @@ fn doctor_raw_mirror_amplification_version_from_manifest_path(
     }
     let mut stored_blobs = vec![(manifest.blob_blake3.clone(), manifest.blob_size_bytes)];
     let expected_content_blake3 = if let Some(storage) = manifest.content_storage.as_ref() {
-        if storage.get("kind").and_then(serde_json::Value::as_str)
-            != Some("fixed_chunks_v1")
+        if storage.get("kind").and_then(serde_json::Value::as_str) != Some("fixed_chunks_v1")
             || storage
                 .get("content_hash_algorithm")
                 .and_then(serde_json::Value::as_str)
@@ -45761,17 +45770,16 @@ fn doctor_raw_mirror_amplification_version_from_manifest_path(
             }
             reconstructed_size_bytes =
                 reconstructed_size_bytes.checked_add(chunk_blob_size_bytes)?;
-            if doctor_raw_mirror_blob_relative_path(chunk_blake3)?.as_str()
-                != chunk_relative_path
-            {
+            if doctor_raw_mirror_blob_relative_path(chunk_blake3)?.as_str() != chunk_relative_path {
                 return None;
             }
             let relative_chunk =
                 doctor_raw_mirror_validate_relative_path(chunk_relative_path).ok()?;
             let chunk_path = root.join(relative_chunk);
-            if chunk_path.parent().is_none_or(|parent| {
-                existing_path_has_symlink_below_root(parent, root)
-            }) {
+            if chunk_path
+                .parent()
+                .is_none_or(|parent| existing_path_has_symlink_below_root(parent, root))
+            {
                 return None;
             }
             let chunk_metadata = std::fs::symlink_metadata(&chunk_path).ok()?;
@@ -45874,8 +45882,7 @@ fn doctor_raw_mirror_bounded_amplification_reports_with_limits(
             truncated = true;
             break;
         };
-        if scanned_manifest_count >= limits.manifest_count
-            || next_scanned_bytes > limits.byte_count
+        if scanned_manifest_count >= limits.manifest_count || next_scanned_bytes > limits.byte_count
         {
             truncated = true;
             break;
@@ -45969,9 +45976,7 @@ fn doctor_raw_mirror_full_verify_byte_limit() -> u64 {
         .unwrap_or(DOCTOR_RAW_MIRROR_DEFAULT_FULL_VERIFY_BYTE_LIMIT)
 }
 
-fn doctor_raw_mirror_estimated_verification_bytes(
-    manifest_entries: &[(PathBuf, bool)],
-) -> u64 {
+fn doctor_raw_mirror_estimated_verification_bytes(manifest_entries: &[(PathBuf, bool)]) -> u64 {
     let mut estimated_bytes = 0_u64;
     for (path, is_symlink) in manifest_entries {
         if *is_symlink {
@@ -46145,9 +46150,8 @@ fn collect_doctor_raw_mirror_report_with_thresholds_and_mode(
     let mut manifest_entries: Vec<(PathBuf, bool)> = Vec::new();
     let mut manifest_entry_count = 0usize;
     let mut full_verification_deferred = false;
-    let bounded_inventory_entry_limit = bounded_manifest_limit.map(|limit| {
-        limit.max(DOCTOR_RAW_MIRROR_BOUNDED_AMPLIFICATION_MANIFEST_LIMIT)
-    });
+    let bounded_inventory_entry_limit = bounded_manifest_limit
+        .map(|limit| limit.max(DOCTOR_RAW_MIRROR_BOUNDED_AMPLIFICATION_MANIFEST_LIMIT));
     if manifest_root.exists() {
         for entry in walkdir::WalkDir::new(&manifest_root)
             .follow_links(false)
@@ -46166,10 +46170,7 @@ fn collect_doctor_raw_mirror_report_with_thresholds_and_mode(
                     if bounded_inventory_entry_limit
                         .is_none_or(|limit| manifest_entries.len() < limit)
                     {
-                        manifest_entries.push((
-                            path.to_path_buf(),
-                            entry.file_type().is_symlink(),
-                        ));
+                        manifest_entries.push((path.to_path_buf(), entry.file_type().is_symlink()));
                     }
                 }
                 Ok(_) => {}
@@ -46185,16 +46186,15 @@ fn collect_doctor_raw_mirror_report_with_thresholds_and_mode(
         .unwrap_or(0);
     let physical_limit_exceeded =
         bounded_byte_limit.is_some_and(|limit| physical_storage_bytes > limit);
-    let verification_work_computed = bounded_byte_limit.is_some()
-        && !physical_limit_exceeded
-        && !full_verification_deferred;
+    let verification_work_computed =
+        bounded_byte_limit.is_some() && !physical_limit_exceeded && !full_verification_deferred;
     let estimated_verification_bytes = if verification_work_computed {
         doctor_raw_mirror_estimated_verification_bytes(&manifest_entries)
     } else {
         0
     };
-    let verification_work_limit_exceeded = bounded_byte_limit
-        .is_some_and(|limit| estimated_verification_bytes > limit);
+    let verification_work_limit_exceeded =
+        bounded_byte_limit.is_some_and(|limit| estimated_verification_bytes > limit);
     if physical_limit_exceeded || verification_work_limit_exceeded {
         full_verification_deferred = true;
     }
@@ -47809,19 +47809,15 @@ fn doctor_raw_mirror_backfill_source_stat(
                 "other"
             }
             .to_string();
-            let (content_blake3, stat_error) = if metadata.is_file()
-                && !metadata.file_type().is_symlink()
-            {
-                match doctor_file_blake3(path) {
-                    Ok(hash) => (Some(hash), None),
-                    Err(err) => (
-                        None,
-                        Some(format!("failed to hash source contents: {err}")),
-                    ),
-                }
-            } else {
-                (None, None)
-            };
+            let (content_blake3, stat_error) =
+                if metadata.is_file() && !metadata.file_type().is_symlink() {
+                    match doctor_file_blake3(path) {
+                        Ok(hash) => (Some(hash), None),
+                        Err(err) => (None, Some(format!("failed to hash source contents: {err}"))),
+                    }
+                } else {
+                    (None, None)
+                };
             DoctorRawMirrorBackfillSourceStatSnapshot {
                 exists: true,
                 file_type,
@@ -47980,8 +47976,7 @@ fn doctor_raw_mirror_backfill_mark_existing_evidence(
     receipt.raw_mirror_manifest_relative_path = Some(evidence.manifest_relative_path.clone());
     receipt.raw_mirror_blob_blake3 = Some(evidence.blob_blake3.clone());
     receipt.raw_mirror_blob_size_bytes = Some(evidence.blob_size_bytes);
-    receipt.raw_mirror_source_content_blake3 =
-        Some(evidence.source_content_blake3.clone());
+    receipt.raw_mirror_source_content_blake3 = Some(evidence.source_content_blake3.clone());
     receipt.raw_mirror_source_size_bytes = evidence.source_size_bytes;
     receipt.raw_mirror_storage_kind = Some(evidence.storage_kind.clone());
     receipt.raw_mirror_chunk_count = Some(evidence.chunk_count);
@@ -48354,10 +48349,8 @@ fn collect_doctor_raw_mirror_backfill_report(
     };
 
     let (by_conversation_id, by_source_key) = doctor_raw_mirror_existing_evidence_maps(raw_mirror);
-    let mut source_stat_cache: HashMap<
-        PathBuf,
-        DoctorRawMirrorBackfillSourceStatSnapshot,
-    > = HashMap::new();
+    let mut source_stat_cache: HashMap<PathBuf, DoctorRawMirrorBackfillSourceStatSnapshot> =
+        HashMap::new();
     if apply {
         let dry_run_receipts = candidates
             .iter()
@@ -50548,10 +50541,7 @@ fn doctor_candidate_copy_raw_mirror_evidence_to_staging(
         }
         receipts.push(doctor_candidate_copy_to_staging(
             context,
-            &format!(
-                "copy-raw-mirror-blob-{}-to-candidate",
-                &blob_blake3[..12]
-            ),
+            &format!("copy-raw-mirror-blob-{}-to-candidate", &blob_blake3[..12]),
             &source_path,
             &target_path,
             DoctorAssetClass::RawMirrorBlob,
@@ -72437,8 +72427,8 @@ mod doctor_asset_taxonomy_tests {
             "the skipped record must identify the older capture: {skipped_log}"
         );
 
-        let newest_blob_path = doctor_raw_mirror_root(&data_dir)
-            .join(&manifest_b.blob_relative_path);
+        let newest_blob_path =
+            doctor_raw_mirror_root(&data_dir).join(&manifest_b.blob_relative_path);
         std::fs::write(&newest_blob_path, vec![b'X'; bytes_b.len()])
             .expect("plant same-size post-verification corruption in newest blob");
         let fallback_build = build_doctor_reconstruct_candidate(
@@ -72465,12 +72455,15 @@ mod doctor_asset_taxonomy_tests {
                 .all(|source| !source.contains(&manifest_b.manifest_id)),
             "post-verification corruption must not become recovery authority: {fallback_build:#?}"
         );
-        let fallback_candidate_dir =
-            PathBuf::from(fallback_build.path.as_deref().expect("fallback candidate path"));
-        let fallback_skipped_log = std::fs::read_to_string(
-            fallback_candidate_dir.join("logs/skipped-records.jsonl"),
-        )
-        .expect("read fallback skipped log");
+        let fallback_candidate_dir = PathBuf::from(
+            fallback_build
+                .path
+                .as_deref()
+                .expect("fallback candidate path"),
+        );
+        let fallback_skipped_log =
+            std::fs::read_to_string(fallback_candidate_dir.join("logs/skipped-records.jsonl"))
+                .expect("read fallback skipped log");
         assert!(fallback_skipped_log.contains(&manifest_b.manifest_id));
         assert!(fallback_skipped_log.contains("source verification changed"));
     }
@@ -73062,11 +73055,8 @@ mod doctor_asset_taxonomy_tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("archive_wide_collectors_deferred"))
         );
-        let backfill = doctor_raw_mirror_backfill_deferred(
-            false,
-            &reason,
-            "archive_wide_collectors_deferred",
-        );
+        let backfill =
+            doctor_raw_mirror_backfill_deferred(false, &reason, "archive_wide_collectors_deferred");
         assert_eq!(backfill.status, "deferred");
         assert_eq!(backfill.total_candidate_count, 0);
         let coverage = doctor_coverage_summary_deferred(Some(17), Some(101), 3, &reason);
@@ -76383,8 +76373,7 @@ paths = ["~/.claude/projects"]
         .expect("capture second chunked source version");
 
         let report = collect_doctor_raw_mirror_report_with_threshold(&data_dir, u64::MAX);
-        let (by_conversation_id, by_source_key) =
-            doctor_raw_mirror_existing_evidence_maps(&report);
+        let (by_conversation_id, by_source_key) = doctor_raw_mirror_existing_evidence_maps(&report);
         let expected_source_blake3 = blake3::hash(&second_bytes).to_hex().to_string();
         let linked = by_conversation_id
             .get(&7)
@@ -76428,8 +76417,7 @@ paths = ["~/.claude/projects"]
         );
         assert_eq!(reclassified_receipt.provider, "omp");
         assert_eq!(
-            reclassified_receipt.action,
-            "existing_raw_manifest_needs_db_link",
+            reclassified_receipt.action, "existing_raw_manifest_needs_db_link",
             "provider reclassification must reuse the verified physical-source evidence"
         );
         assert!(reclassified_receipt.raw_source_captured);
@@ -76439,7 +76427,9 @@ paths = ["~/.claude/projects"]
             Some(linked.manifest_id.clone())
         );
         assert_eq!(
-            reclassified_receipt.raw_mirror_source_content_blake3.as_deref(),
+            reclassified_receipt
+                .raw_mirror_source_content_blake3
+                .as_deref(),
             Some(expected_source_blake3.as_str())
         );
         assert_eq!(
@@ -76619,12 +76609,8 @@ paths = ["~/.claude/projects"]
         std::fs::write(&db_path, b"not a sqlite database").expect("write malformed archive");
         let raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
 
-        let report = collect_doctor_raw_mirror_backfill_report(
-            &data_dir,
-            &db_path,
-            &raw_mirror,
-            false,
-        );
+        let report =
+            collect_doctor_raw_mirror_backfill_report(&data_dir, &db_path, &raw_mirror, false);
 
         assert!(!report.db_available);
         assert_eq!(report.status, "warn");
@@ -76954,8 +76940,9 @@ paths = ["~/.claude/projects"]
         assert_eq!(byte_limited.summary.manifest_count, 4);
         assert!(byte_limited.manifests.is_empty());
         assert!(byte_limited.warnings.iter().any(|warning| {
-            warning.contains("physical bytes across blobs, manifests, logs, and interrupted temp artifacts")
-                && warning.contains("1 physical bytes")
+            warning.contains(
+                "physical bytes across blobs, manifests, logs, and interrupted temp artifacts",
+            ) && warning.contains("1 physical bytes")
         }));
 
         let poisoned_db_path = data_dir.join("agent_search.db");
@@ -78879,7 +78866,9 @@ mod cleanup_target_safety_tests {
         std::fs::write(&source_path, source_bytes).expect("write source");
         let expected_source_blake3 = blake3::hash(source_bytes).to_hex().to_string();
 
-        let staging_root = data_dir.join("doctor-staging").join("matching-target-symlink");
+        let staging_root = data_dir
+            .join("doctor-staging")
+            .join("matching-target-symlink");
         std::fs::create_dir_all(&staging_root).expect("create staging root");
         let outside_target = temp.path().join("outside-matching-target.raw");
         std::fs::write(&outside_target, source_bytes).expect("write matching outside target");
@@ -83482,7 +83471,10 @@ mod cli_read_db_tests {
         let before = std::fs::read(&db_path).expect("read db before probe");
         let snapshot = probe_state_db(&db_path, "status", STATE_DB_OPEN_TIMEOUT, true);
 
-        assert!(snapshot.opened, "strict probe should open the seeded archive");
+        assert!(
+            snapshot.opened,
+            "strict probe should open the seeded archive"
+        );
         assert!(!snapshot.open_skipped);
         assert!(!snapshot.counts_skipped, "counts were requested");
         // The seeded archive carries watermarks only; the counts are read
@@ -89831,17 +89823,14 @@ fn run_sessions(
                     origin_kind.as_deref(),
                     origin_host.as_deref(),
                 );
-                let normalized_origin_kind = normalized_provenance_origin_kind(
-                    source_id.as_str(),
-                    origin_kind.as_deref(),
-                );
-                let metadata = if normalized_origin_kind
-                    == crate::sources::provenance::LOCAL_SOURCE_ID
-                {
-                    std::fs::metadata(&source_path_buf).ok()
-                } else {
-                    None
-                };
+                let normalized_origin_kind =
+                    normalized_provenance_origin_kind(source_id.as_str(), origin_kind.as_deref());
+                let metadata =
+                    if normalized_origin_kind == crate::sources::provenance::LOCAL_SOURCE_ID {
+                        std::fs::metadata(&source_path_buf).ok()
+                    } else {
+                        None
+                    };
                 let modified_at = metadata
                     .as_ref()
                     .and_then(|m| m.modified().ok())
@@ -100288,15 +100277,14 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
     // progress counters and emit plain-text status lines while it runs. We
     // move the whole opts struct (it contains the shared progress handle).
     let watchdog_data_dir = opts.data_dir.clone();
-    let index_handle = match index_worker_thread_builder()
-        .spawn(move || indexer::run_index(opts, None))
-    {
-        Ok(handle) => handle,
-        Err(error) => {
-            eprintln!("Warning: failed to start the refresh index worker: {error}");
-            return;
-        }
-    };
+    let index_handle =
+        match index_worker_thread_builder().spawn(move || indexer::run_index(opts, None)) {
+            Ok(handle) => handle,
+            Err(error) => {
+                eprintln!("Warning: failed to start the refresh index worker: {error}");
+                return;
+            }
+        };
 
     // Sentinels are `usize::MAX` so the first observed atomic values always
     // differ and trigger the first print. Using `0` for `last_total` would
@@ -102132,7 +102120,14 @@ mod stall_diagnostics_tests {
                 "{truthy:?} must arm the all-phases abort"
             );
         }
-        for falsy in [None, Some(""), Some("0"), Some("false"), Some("off"), Some("2")] {
+        for falsy in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("2"),
+        ] {
             assert!(
                 !stall_abort_all_phases_flag(falsy),
                 "{falsy:?} must leave the all-phases abort disarmed"
@@ -111898,8 +111893,7 @@ fn run_timeline(
             normalized_source_id.as_str(),
             origin_kind.as_deref(),
         );
-        let source_badge = if normalized_origin_kind
-            != crate::sources::provenance::LOCAL_SOURCE_ID
+        let source_badge = if normalized_origin_kind != crate::sources::provenance::LOCAL_SOURCE_ID
         {
             let label = origin_host
                 .as_deref()
@@ -118347,8 +118341,7 @@ fn run_daemon(
     use crate::daemon::{ModelDaemon, ModelManager};
 
     let data_dir = data_dir.unwrap_or_else(default_data_dir);
-    let socket_was_explicit =
-        socket.is_some() || dotenvy::var("CASS_DAEMON_SOCKET").is_ok();
+    let socket_was_explicit = socket.is_some() || dotenvy::var("CASS_DAEMON_SOCKET").is_ok();
     let mut config = resolved_daemon_config(socket, idle_timeout, max_connections);
     if !socket_was_explicit {
         config.socket_path = crate::daemon::daemon_socket_path_for_data_dir(&data_dir);

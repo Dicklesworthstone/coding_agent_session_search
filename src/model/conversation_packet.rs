@@ -1054,8 +1054,7 @@ mod tests {
         let conversation = canonical_conversation();
         let first_content_ptr = conversation.messages[0].content.as_ptr();
         let provenance = ConversationPacketProvenance::local();
-        let borrowed =
-            ConversationPacket::from_canonical_replay(&conversation, provenance.clone());
+        let borrowed = ConversationPacket::from_canonical_replay(&conversation, provenance.clone());
         let owned = ConversationPacket::from_canonical_replay_owned(conversation, provenance);
 
         assert_eq!(owned, borrowed);

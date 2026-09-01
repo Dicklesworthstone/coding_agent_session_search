@@ -10521,8 +10521,7 @@ impl FrankenStorage {
         let (messages, original_bytes) = self
             .stream_capped_lexical_rebuild_messages(conversation_id, cap, &hinted_sql)
             .or_else(|err| {
-                if format!("{err:#}").contains("no such index: sqlite_autoindex_messages_1")
-                {
+                if format!("{err:#}").contains("no such index: sqlite_autoindex_messages_1") {
                     return self.stream_capped_lexical_rebuild_messages(
                         conversation_id,
                         cap,
@@ -10571,8 +10570,8 @@ impl FrankenStorage {
             .query_with_params_for_each(sql, &params, |row| {
                 let role: String = row.get_typed(2)?;
                 let mut content: String = row.get_typed(5)?;
-                let content_bytes = usize::try_from(row.get_typed::<i64>(6)?.max(0))
-                    .unwrap_or(usize::MAX);
+                let content_bytes =
+                    usize::try_from(row.get_typed::<i64>(6)?.max(0)).unwrap_or(usize::MAX);
                 original_bytes = original_bytes.saturating_add(content_bytes);
                 let boundary = lexical_content_truncation_boundary(&content, remaining_bytes);
                 content.truncate(boundary);
@@ -15016,10 +15015,8 @@ fn normalized_storage_source_parts(
         origin_kind,
         host_label.as_deref(),
     );
-    let normalized_kind = crate::search::tantivy::normalized_index_origin_kind(
-        source_id.as_str(),
-        origin_kind,
-    );
+    let normalized_kind =
+        crate::search::tantivy::normalized_index_origin_kind(source_id.as_str(), origin_kind);
     if normalized_kind == LOCAL_SOURCE_ID {
         (source_id, SourceKind::Local, None)
     } else {
@@ -15095,9 +15092,9 @@ impl FrankenStorage {
             // authoritative registry classification. This matters for legacy
             // archive imports whose `sources` rows carry kind but whose older
             // conversation metadata does not.
-            self.mark_conversation_source_ensured(
-                EnsuredConversationSourceKey::from_source(&existing),
-            );
+            self.mark_conversation_source_ensured(EnsuredConversationSourceKey::from_source(
+                &existing,
+            ));
             return Ok(());
         }
         self.upsert_source(&source)?;
@@ -18142,9 +18139,8 @@ impl FrankenStorage {
                         // otherwise delete an already-counted row while leaving
                         // `processed <= total_messages`; blindly resuming would
                         // preserve the deleted row in additive usage rollups.
-                        let (prefix_count, prefix_last_id): (i64, Option<i64>) = self
-                            .conn
-                            .query_row_map(
+                        let (prefix_count, prefix_last_id): (i64, Option<i64>) =
+                            self.conn.query_row_map(
                                 "SELECT COUNT(*), MAX(id) FROM messages WHERE id <= ?1",
                                 fparams![last_id],
                                 |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
@@ -18701,14 +18697,7 @@ impl FrankenStorage {
                         let content_len: i64 = row.get_typed(1)?;
                         next_message_idx = message_idx;
                         page_rows = page_rows.saturating_add(1);
-                        aggregate.record_delta(
-                            &agent_slug,
-                            &source_id,
-                            day_id,
-                            0,
-                            1,
-                            content_len,
-                        );
+                        aggregate.record_delta(&agent_slug, &source_id, day_id, 0, 1, content_len);
                         Ok(())
                     };
                     let scan_result = if first_message_page {
@@ -34453,11 +34442,9 @@ mod tests {
         assert!(!was_fresh);
 
         // A failing step must be attributed to its exact version and name.
-        let err = run_attributed_migration_steps(
-            &conn,
-            &[(99, "bogus_step", "THIS IS NOT VALID SQL")],
-        )
-        .unwrap_err();
+        let err =
+            run_attributed_migration_steps(&conn, &[(99, "bogus_step", "THIS IS NOT VALID SQL")])
+                .unwrap_err();
         let rendered = format!("{err:#}");
         assert!(
             rendered.contains("running schema migration v99 (bogus_step)"),
@@ -35811,9 +35798,7 @@ mod tests {
             .rebuild_token_daily_stats_with_progress(Some(&heartbeat))
             .expect_err("a changed ledger must reject publication");
         assert!(
-            error
-                .to_string()
-                .contains("phase=pre_publish_consistency"),
+            error.to_string().contains("phase=pre_publish_consistency"),
             "the error must identify the exact rejected publication phase: {error:#}"
         );
         let live_total: i64 = raw
