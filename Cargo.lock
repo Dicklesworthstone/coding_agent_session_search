@@ -2210,7 +2210,8 @@ dependencies = [
 [[package]]
 name = "fsqlite"
 version = "0.3.13"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4#2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ade57cf0c1cae46f8dbbfe8a954cca72c0ece45b30c35e21ce6d4b2ee494c8f7"
 dependencies = [
  "asupersync",
  "fsqlite-core",
@@ -2230,7 +2231,8 @@ dependencies = [
 [[package]]
 name = "fsqlite-ast"
 version = "0.3.13"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4#2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0235428aa4f744cd0f01af258fdfc82739f2d4bf5f237b4d6c6a0e9b3960b7eb"
 dependencies = [
  "fsqlite-types",
  "smallvec",
@@ -2239,7 +2241,8 @@ dependencies = [
 [[package]]
 name = "fsqlite-btree"
 version = "0.3.13"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4#2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0a1625665ee2f8754a69a68b2121fb946804da9dd1acd200e0283fc433e13f8"
 dependencies = [
  "foldhash 0.2.0",
  "fsqlite-error",
@@ -2256,7 +2259,8 @@ dependencies = [
 [[package]]
 name = "fsqlite-core"
 version = "0.3.13"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4#2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc7631eb6167273a13262b0e5ae972c5f69f58aa091a3e542ea6718108b7de72"
 dependencies = [
  "asupersync",
  "blake3",
@@ -2294,7 +2298,8 @@ dependencies = [
 [[package]]
 name = "fsqlite-error"
 version = "0.3.13"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4#2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97be32692faa7ffb9989fe188dc07805b6a009a98f6565a5adaef2335b572ac6"
 dependencies = [
  "thiserror 2.0.20",
 ]
@@ -2302,7 +2307,8 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-fts5"
 version = "0.3.13"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4#2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd3437fdad0fa70c10d050098e9855b7adb1b8578db5c0e258c476f26eb7771d"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2314,7 +2320,8 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-icu"
 version = "0.3.13"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4#2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2dee9c31bc7ad1546fc62a9e96719952c5d5253fa00219e430fc23ba7db5dc3"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2325,7 +2332,8 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-json"
 version = "0.3.13"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4#2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b2d62b3244d407ee6f52d15b3eea9d39cb2c7206a95b1477e715d6f75e71bb0"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2337,7 +2345,8 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-misc"
 version = "0.3.13"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4#2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d17adbad9dd6ae44f9cfa6e4b9460697e7a94379186b8d33414118473098e38"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2350,7 +2359,8 @@ dependencies = [
 [[package]]
 name = "fsqlite-ext-rtree"
 version = "0.3.13"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4#2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35fffbfe09822203946ad894d350361559af0828874e221276c6a8c7b35766a1"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -2360,7 +2370,8 @@ dependencies = [
 [[package]]
 name = "fsqlite-func"
 version = "0.3.13"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4#2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d24d10877ac6ea15906a4988d56a010a4782e8b107a9dc87dd6f22eda783ed2"
 dependencies = [
  "chrono",
  "fsqlite-error",
@@ -2371,7 +2382,8 @@ dependencies = [
 [[package]]
 name = "fsqlite-mvcc"
 version = "0.3.13"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4#2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca0e68bdbfcb49d8a2b2f0b114cdd10cc27bb7e8f59e0a0637389acf17d29bb1"
 dependencies = [
  "asupersync",
  "blake3",
@@ -2396,7 +2408,8 @@ dependencies = [
 [[package]]
 name = "fsqlite-observability"
 version = "0.3.13"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4#2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2edc2f5e88ff39de11a91904252443dff368889941878a7eefd49f79c2db9c66"
 dependencies = [
  "fsqlite-types",
  "parking_lot",
@@ -2407,7 +2420,8 @@ dependencies = [
 [[package]]
 name = "fsqlite-pager"
 version = "0.3.13"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4#2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b61c9eda201309037e627a2c463386e51151b8b6592b4f80f7ba502d2b1a184"
 dependencies = [
  "argon2",
  "asupersync",
@@ -2432,7 +2446,8 @@ dependencies = [
 [[package]]
 name = "fsqlite-parser"
 version = "0.3.13"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4#2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cdb9c8c41af3c67cf2ac6e8d80214edec20dfc1de892c9947180cbbf0876ea3c"
 dependencies = [
  "fsqlite-ast",
  "fsqlite-error",
@@ -2445,7 +2460,8 @@ dependencies = [
 [[package]]
 name = "fsqlite-planner"
 version = "0.3.13"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4#2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c067dffa534b28f09806a74948437d5baace3750795f5d72622ebd7c888468b"
 dependencies = [
  "blake3",
  "fsqlite-ast",
@@ -2462,7 +2478,8 @@ dependencies = [
 [[package]]
 name = "fsqlite-types"
 version = "0.3.13"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4#2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18d09ddf0c3dae97597287c1aba0c026eb83c6af2bdecc7be53e81ca0443fd95"
 dependencies = [
  "asupersync",
  "bitflags 2.13.1",
@@ -2481,7 +2498,8 @@ dependencies = [
 [[package]]
 name = "fsqlite-vdbe"
 version = "0.3.13"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4#2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2a7ec35c763f464be18df19aec49ad61be670e97fac61ae9ad0079b6584b72a"
 dependencies = [
  "asupersync",
  "crossbeam-deque",
@@ -2503,7 +2521,8 @@ dependencies = [
 [[package]]
 name = "fsqlite-vfs"
 version = "0.3.13"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4#2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4665bfd11f05a1ebe1685908b88ea8f7c14ba040038bb5b77e09cfa0e57ec501"
 dependencies = [
  "advisory-lock",
  "asupersync",
@@ -2521,7 +2540,8 @@ dependencies = [
 [[package]]
 name = "fsqlite-wal"
 version = "0.3.13"
-source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4#2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dcff95fa0eff52db0799c19b9f47b2e02fe5f5785ae547be8cfd16a749438054"
 dependencies = [
  "asupersync",
  "blake3",
