@@ -36362,6 +36362,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn cleanup_orphan_fk_rows_preflight_is_opt_in() {
         {
             let _guard = unset_env_var("CASS_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS");
@@ -58349,6 +58350,13 @@ mod tests {
         assert_eq!(names, vec!["codex"]);
     }
 
+    /// The cass registry mirrors the upstream one entry for entry: the three
+    /// cass adapters (codex, omp, pi_agent) replace the upstream factory, and
+    /// every other entry behaves like the upstream connector. The pass-through
+    /// half is asserted behaviorally — same detection result and streaming
+    /// capability from both factories — because function-pointer identity
+    /// (`fn_addr_eq`) is not guaranteed across codegen units and failed on two
+    /// otherwise-green fleet runs (bead zgzva).
     #[test]
     fn cass_connector_registry_installs_every_cass_adapter() {
         let upstream = franken_agent_detection::get_connector_factories();
@@ -58360,9 +58368,30 @@ mod tests {
         {
             assert_eq!(configured_name, upstream_name);
             if matches!(configured_name, "codex" | "omp" | "pi_agent") {
-                assert!(!std::ptr::fn_addr_eq(configured_factory, upstream_factory));
+                assert!(
+                    !std::ptr::fn_addr_eq(configured_factory, upstream_factory),
+                    "{configured_name}: cass must install its own adapter, not the upstream one"
+                );
             } else {
-                assert!(std::ptr::fn_addr_eq(configured_factory, upstream_factory));
+                let configured_connector = configured_factory();
+                let upstream_connector = upstream_factory();
+                let configured_detection = configured_connector.detect();
+                let upstream_detection = upstream_connector.detect();
+                assert_eq!(
+                    (
+                        configured_detection.detected,
+                        &configured_detection.evidence,
+                        &configured_detection.root_paths,
+                        configured_connector.supports_streaming_scan(),
+                    ),
+                    (
+                        upstream_detection.detected,
+                        &upstream_detection.evidence,
+                        &upstream_detection.root_paths,
+                        upstream_connector.supports_streaming_scan(),
+                    ),
+                    "{configured_name}: the pass-through entry must behave like the upstream connector"
+                );
             }
         }
     }
