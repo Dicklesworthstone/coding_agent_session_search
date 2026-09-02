@@ -17192,7 +17192,60 @@ fn close_storage_after_index(storage: FrankenStorage, db_path: &Path, context: &
     // the historically-lenient contract of this normal-close path (Ok even if the
     // checkpoint could not fully truncate) — the abort path (#321) is the one that
     // must branch on the outcome.
-    run_final_wal_checkpoint(db_path, context).map(|_outcome| ())
+    //
+    // GH #382 / g3zyo: bounded. On an archive whose frankensqlite writable path
+    // loops (the disowned-page reclaim sweep rescans the WAL per ledger page)
+    // this checkpoint never returned, so every index run hung *after* a
+    // successful publish and every stale-on-read refresh died here. The publish
+    // is durable before this point and an un-truncated WAL costs the next
+    // opener a replay, never data — so a checkpoint that outlives its budget is
+    // reported and skipped rather than waited on forever.
+    let timeout = final_wal_checkpoint_timeout();
+    let worker_context = context.to_string();
+    match run_bounded_abort_wal_checkpoint(db_path.to_path_buf(), timeout, move |path| {
+        run_final_wal_checkpoint(path, &worker_context)
+    }) {
+        AbortWalCheckpointAttempt::Finished(Ok(_outcome)) => Ok(()),
+        AbortWalCheckpointAttempt::Finished(Err(error)) => Err(anyhow::anyhow!(
+            "final WAL checkpoint after {context} failed: {error}"
+        )),
+        AbortWalCheckpointAttempt::TimedOut => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                context,
+                timeout_secs = timeout.as_secs(),
+                "final WAL checkpoint exceeded its budget and was left for the next opener; \
+                 if this repeats on a large archive the writable open is looping on the WAL \
+                 (GH #382): back up the archive and its sidecars, then checkpoint it with \
+                 stock sqlite3 (`PRAGMA wal_checkpoint(TRUNCATE)`)"
+            );
+            Ok(())
+        }
+        AbortWalCheckpointAttempt::WorkerUnavailable(error) => {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                context,
+                %error,
+                "final WAL checkpoint worker was unavailable; the WAL is left for the next opener"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Wall-clock budget for the index run's final `wal_checkpoint(TRUNCATE)`
+/// (GH #382 / g3zyo). `CASS_INDEX_FINAL_WAL_CHECKPOINT_TIMEOUT_SECS` overrides
+/// the 900 s default, which stays below the finalize stall abort (1800 s) so
+/// a looping checkpoint is skipped truthfully instead of turning into an
+/// exit-70 abort; `0` falls back to the default rather than disabling the bound.
+fn final_wal_checkpoint_timeout() -> Duration {
+    const DEFAULT_SECS: u64 = 900;
+    let secs = dotenvy::var("CASS_INDEX_FINAL_WAL_CHECKPOINT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(DEFAULT_SECS);
+    Duration::from_secs(secs)
 }
 
 fn prepare_storage_for_final_checkpoint(storage: &FrankenStorage, db_path: &Path, context: &str) {
@@ -17386,63 +17439,55 @@ pub fn best_effort_abort_wal_checkpoint(data_dir: &Path) {
 /// concurrent reader/writer pinned it (`Ok(false)`). For repair surfaces
 /// (`doctor --fix`, WS-B.5) that must tell the operator the truth about an
 /// oversized sidecar rather than claim a checkpoint that did not happen.
-pub(crate) fn checkpoint_wal_truncate(db_path: &Path, context: &str) -> Result<bool> {
-    Ok(matches!(
-        run_final_wal_checkpoint(db_path, context)?,
-        FinalWalCheckpointOutcome::Completed
-    ))
-}
-
-/// Test hook: park the WAL checkpoint for this many milliseconds before it
-/// opens the archive, so a deadline can be exercised without an archive whose
-/// writable open really loops (GH #382 needs a multi-GB archive for that).
+/// Test hook: park every `wal_checkpoint(TRUNCATE)` issued through
+/// [`run_final_wal_checkpoint`] for this many milliseconds before it opens the
+/// archive, so the deadlines around it (doctor `--fix`, the index run's final
+/// close) can be exercised without an archive whose writable open really
+/// loops (GH #382 needs a multi-GB archive for that).
 pub(crate) const CASS_TEST_WAL_CHECKPOINT_PARK_MS_ENV: &str = "CASS_TEST_WAL_CHECKPOINT_PARK_MS";
 
 /// [`checkpoint_wal_truncate`] with a wall-clock deadline (GH #382, bead
 /// g3zyo). On the owner-scale archive with a 200 MB WAL, frankensqlite's
 /// writable open never returns, which turned `cass doctor --fix` into an
-/// infinite hang. The checkpoint runs on a helper thread; if it has not
-/// finished by `deadline`, the caller gets an error that names the shape and
-/// the out-of-band remedy instead of waiting forever. The helper thread is
-/// left to finish or die with the process — it cannot be cancelled, and the
-/// callers are short-lived CLI commands.
+/// infinite hang. The checkpoint runs on the same disposable worker as the
+/// stall-abort checkpoint; if it has not finished by `deadline`, the caller
+/// gets an error that names the shape and the out-of-band remedy instead of
+/// waiting forever. The worker is left to finish or die with the process — it
+/// cannot be cancelled, and the callers are short-lived CLI commands.
 pub(crate) fn checkpoint_wal_truncate_with_deadline(
     db_path: &Path,
     context: &str,
-    deadline: std::time::Duration,
+    deadline: Duration,
 ) -> Result<bool> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let worker_db_path = db_path.to_path_buf();
     let worker_context = context.to_string();
-    std::thread::Builder::new()
-        .name("cass-wal-checkpoint".into())
-        .spawn(move || {
-            if let Some(park_ms) = std::env::var(CASS_TEST_WAL_CHECKPOINT_PARK_MS_ENV)
-                .ok()
-                .and_then(|value| value.trim().parse::<u64>().ok())
-                .filter(|ms| *ms > 0)
-            {
-                std::thread::sleep(std::time::Duration::from_millis(park_ms));
-            }
-            let _ = tx.send(checkpoint_wal_truncate(&worker_db_path, &worker_context));
-        })
-        .with_context(|| format!("spawning the WAL checkpoint thread for {context}"))?;
-    match rx.recv_timeout(deadline) {
-        Ok(result) => result,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(anyhow::anyhow!(
+    match run_bounded_abort_wal_checkpoint(db_path.to_path_buf(), deadline, move |path| {
+        run_final_wal_checkpoint(path, &worker_context)
+    }) {
+        AbortWalCheckpointAttempt::Finished(Ok(outcome)) => {
+            Ok(matches!(outcome, FinalWalCheckpointOutcome::Completed))
+        }
+        AbortWalCheckpointAttempt::Finished(Err(error)) => Err(anyhow::anyhow!("{error}")),
+        AbortWalCheckpointAttempt::TimedOut => Err(anyhow::anyhow!(
             "WAL checkpoint did not complete within {} s; on a large archive this means the \
              writable open is looping on the WAL (GH #382): back up {} and its -wal/-shm \
              sidecars, then checkpoint with stock sqlite3 (`PRAGMA wal_checkpoint(TRUNCATE)`)",
             deadline.as_secs(),
             db_path.display()
         )),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
-            "WAL checkpoint thread exited without a result after {context}"
+        AbortWalCheckpointAttempt::WorkerUnavailable(error) => Err(anyhow::anyhow!(
+            "WAL checkpoint worker was unavailable after {context}: {error}"
         )),
     }
 }
 
 fn run_final_wal_checkpoint(db_path: &Path, context: &str) -> Result<FinalWalCheckpointOutcome> {
+    if let Some(park_ms) = dotenvy::var(CASS_TEST_WAL_CHECKPOINT_PARK_MS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+    {
+        std::thread::sleep(Duration::from_millis(park_ms));
+    }
     // Run this after closing the indexing storage handle: frankensqlite flushes
     // retained autocommit writes during close, and TRUNCATE avoids leaving the
     // completed bulk-ingest WAL for the next opener to replay.

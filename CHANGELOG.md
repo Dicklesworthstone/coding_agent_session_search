@@ -62,6 +62,12 @@ Everything below is on `main`; nothing is in a released binary yet.
   40-segment generation is folded by a plain `cass index`).
 
 ### Changed
+- The index run's final `wal_checkpoint(TRUNCATE)` runs under a wall-clock
+  budget (900 s, `CASS_INDEX_FINAL_WAL_CHECKPOINT_TIMEOUT_SECS`): on an archive
+  whose frankensqlite writable path loops (GH #382) the run no longer hangs
+  after a successful publish; the WAL is left for the next opener and a
+  warning names the remedy. The loop itself is fixed upstream in frankensqlite
+  `8d012706a` and cass consumes it with the release that carries it.
 - The TUI analytics dashboard's load task is one production function with the
   detached-rebuild spawn injected (`load_chart_data_with_auto_rebuild`); the
   test-only stub that returned canned data is gone, and unit tests prove that

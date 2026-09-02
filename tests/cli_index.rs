@@ -1967,8 +1967,17 @@ fn gh439_slow_post_publish_fts_repair_is_not_aborted_while_it_heartbeats() {
     seed_fts_liveness_sessions(home);
 
     let started = std::time::Instant::now();
+    // Discrimination: four pages at 12 s each = 48 s of repair work under a
+    // 40 s abort window. With the per-page heartbeat every silent stretch is
+    // 12 s (< 40 s) and the run survives; without it the 48 s stretch would
+    // exceed the window and abort. The window is deliberately wider than the
+    // parked variant's 20 s so a slow `preparing` phase on a loaded fleet
+    // worker (debug build) cannot trip the abort before the repair starts.
     let output = fts_repair_liveness_index_cmd(home, &data_dir)
-        .env("CASS_TEST_FTS_REPAIR_PAGE_SLEEP_MS", "4000")
+        .env("CASS_TEST_FTS_REPAIR_PAGE_SLEEP_MS", "12000")
+        .env("CASS_INDEX_STALL_DETECT_SECS", "10")
+        .env("CASS_INDEX_STALL_ABORT_SECS", "40")
+        .env("CASS_INDEX_FINALIZE_ABORT_SECS", "40")
         .output()
         .expect("run cass index --full with a slow FTS repair");
     let elapsed = started.elapsed();
@@ -1981,9 +1990,9 @@ fn gh439_slow_post_publish_fts_repair_is_not_aborted_while_it_heartbeats() {
         output.status
     );
     assert!(
-        elapsed >= std::time::Duration::from_secs(16),
+        elapsed >= std::time::Duration::from_secs(48),
         "the repair must actually have paged with the injected sleep (four messages, one \
-         per page, 2 s each); elapsed={elapsed:?}\nstderr={stderr}"
+         per page, 12 s each); elapsed={elapsed:?}\nstderr={stderr}"
     );
     // `index --json` interleaves single-line liveness events with the run's
     // pretty-printed summary, so the summary is the last JSON *document* on
@@ -2001,6 +2010,98 @@ fn gh439_slow_post_publish_fts_repair_is_not_aborted_while_it_heartbeats() {
     assert!(
         payload["messages"].as_i64().unwrap_or_default() >= 4,
         "both seeded sessions must be ingested: {payload}"
+    );
+}
+
+/// GH #382 / g3zyo: the index run's final `wal_checkpoint(TRUNCATE)` is bounded.
+/// On an archive whose frankensqlite writable path loops, that checkpoint never
+/// returned and every run hung after a successful publish. Positive observable:
+/// with the checkpoint parked past a 1 s budget the run still exits 0 within
+/// seconds and leaves the WAL sidecar in place (non-empty) for the next opener;
+/// a plain `cass index` afterwards, unparked, truncates it. Planted negative:
+/// the unparked run truncating the sidecar is what proves the parked run really
+/// skipped the checkpoint rather than never issuing one. No-claim: this proves
+/// the bound, not that the engine no longer loops (that is frankensqlite
+/// 8d012706a, consumed with its release).
+#[test]
+fn gh382_final_wal_checkpoint_is_bounded_and_leaves_the_wal_for_the_next_run() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+    seed_fts_liveness_sessions(home);
+    let wal_path = data_dir.join("agent_search.db-wal");
+
+    let started = std::time::Instant::now();
+    let output = base_cmd(home)
+        .current_dir(home)
+        .args([
+            "index",
+            "--full",
+            "--json",
+            "--no-progress-events",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        // Discrimination by wall clock: a full run of this fixture takes up
+        // to ~30 s on a loaded debug-build fleet worker, so the park is 60 s
+        // against a 1 s budget — a run that waited for the parked checkpoint
+        // cannot finish under 60 s; a bounded one finishes in the base time
+        // plus one second.
+        .env("CASS_TEST_WAL_CHECKPOINT_PARK_MS", "60000")
+        .env("CASS_INDEX_FINAL_WAL_CHECKPOINT_TIMEOUT_SECS", "1")
+        .output()
+        .expect("run cass index --full with a parked final checkpoint");
+    let elapsed = started.elapsed();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "a final checkpoint that outlives its budget must not fail the run (GH #382); \
+         status={:?}\nstdout={stdout}\nstderr={stderr}",
+        output.status
+    );
+    let parked_elapsed = elapsed;
+    // A WAL that still carries frames is larger than its 32-byte header; a
+    // truncated one (frankensqlite keeps the header on TRUNCATE) is exactly 32.
+    const WAL_HEADER_BYTES: u64 = 32;
+    let wal_bytes_after_parked_run = fs::metadata(&wal_path).map(|meta| meta.len()).unwrap_or(0);
+    assert!(
+        wal_bytes_after_parked_run > WAL_HEADER_BYTES,
+        "the skipped checkpoint must leave the WAL frames for the next opener; \
+         wal_bytes={wal_bytes_after_parked_run}\nstderr={stderr}"
+    );
+
+    let started = std::time::Instant::now();
+    let output = base_cmd(home)
+        .current_dir(home)
+        .args(["index", "--json", "--no-progress-events", "--data-dir"])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .output()
+        .expect("run a plain cass index without the park");
+    let plain_elapsed = started.elapsed();
+    assert!(
+        output.status.success(),
+        "the next plain run must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The bound, measured against the same worker's load: a run that waited
+    // for the 60 s park would take at least the plain run plus 60 s; a
+    // bounded one takes the plain run plus about a second (the budget).
+    assert!(
+        parked_elapsed < plain_elapsed + std::time::Duration::from_secs(30),
+        "the parked run must return once the 1 s checkpoint budget passes, not wait for \
+         the 60 s park; parked={parked_elapsed:?} plain={plain_elapsed:?}\nstderr={stderr}"
+    );
+    let wal_bytes_after_plain_run = fs::metadata(&wal_path).map(|meta| meta.len()).unwrap_or(0);
+    assert!(
+        wal_bytes_after_plain_run <= WAL_HEADER_BYTES
+            && wal_bytes_after_plain_run < wal_bytes_after_parked_run,
+        "the next unparked run must truncate the WAL the bounded run left behind \
+         (header only, at most {WAL_HEADER_BYTES} bytes); before={wal_bytes_after_parked_run} \
+         after={wal_bytes_after_plain_run}"
     );
 }
 
