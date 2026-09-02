@@ -3660,6 +3660,22 @@ fn watch_startup_step_idx(sub_phase: &str) -> Option<u8> {
         .and_then(|i| u8::try_from(i).ok())
 }
 
+/// Should `run_index` write `sub_phase` to the lock file's `phase=` line
+/// under `mode`?
+///
+/// Always. The preflight steps run in the same order in every index mode,
+/// and a breadcrumb that is written for one step and then never advanced is
+/// a lie: GH #443 reported a plain incremental run "stalled in
+/// `classify_nonresumable_checkpoint`" (a sidecar-only read that returns in
+/// milliseconds) when the process was actually wedged in the writable
+/// frankensqlite open that follows it. `cass status`, the `stall_detected`
+/// diagnostics and the operator all key on this string, so it must name the
+/// step that is running now. The per-step abort watchdog is a separate
+/// decision (`timeout_enforced` in the macro) and stays watch-startup-only.
+const fn preflight_breadcrumb_visible(_mode: SearchMaintenanceMode, _sub_phase: &str) -> bool {
+    true
+}
+
 /// True if the operator has set `CASS_SKIP_PREFLIGHT_<NAME>=1` for the
 /// given sub-phase. Logs at WARN when it returns true so the bypass
 /// is auditable in production. Thin wrapper over
@@ -14431,17 +14447,23 @@ fn run_index_inner(
     // breadcrumb so operators investigating a watch-startup wedge can see
     // WHICH step stalled instead of an opaque top-level phase for the entire
     // pre-pipeline block. The historical `watch_startup:` namespace remains a
-    // compatibility contract. Plain incremental indexing additionally exposes
-    // the cheap restart-from-zero checkpoint classification it can enter;
-    // other index modes retain their existing telemetry. The hard watchdog
-    // remains scoped to watch startup; plain restart no longer performs an
-    // exact startup count and therefore needs no preflight abort path.
-    // Each visible `set_phase`
+    // compatibility contract.
+    //
+    // GH #443: the breadcrumb is written in EVERY index mode, not only watch
+    // startup. Plain incremental runs used to expose just the (sidecar-only,
+    // millisecond) `classify_nonresumable_checkpoint` step and then go dark:
+    // the lock file kept naming that step while the process was actually
+    // inside the writable frankensqlite open (`open_storage`) or a later
+    // preflight, so a wedge there was reported — by `cass status`, the stall
+    // event and the reporter — against a function that had already returned.
+    // A stale breadcrumb is worse than none; see
+    // `preflight_breadcrumb_visible`. The hard per-step abort watchdog
+    // remains scoped to watch startup.
+    // Each `set_phase`
     // call bumps `last_progress_at_ms` (in both the atomic and the on-disk
     // field) and emits a new `phase=` string that `IndexStallWatchdog` treats
     // as a phase transition (resets its `last_progress_advance` timer). The
-    // macro keeps the call sites compact while leaving unrelated full/plain
-    // preflight telemetry unchanged.
+    // macro keeps the call sites compact.
     //
     // v0.6.7 extension: the macro also notifies the
     // `WatchStartupPreflightState` so the watchdog thread can detect
@@ -14466,8 +14488,7 @@ fn run_index_inner(
     });
     macro_rules! preflight_phase {
         ($phase:expr) => {{
-            let phase_visible = initial_lock_mode == SearchMaintenanceMode::WatchStartup
-                || $phase == "watch_startup:classify_nonresumable_checkpoint";
+            let phase_visible = preflight_breadcrumb_visible(initial_lock_mode, $phase);
             let timeout_enforced = initial_lock_mode == SearchMaintenanceMode::WatchStartup;
             if timeout_enforced {
                 // Notify the watchdog of the new active step BEFORE writing
@@ -35595,6 +35616,71 @@ mod tests {
                 "the atomic mirror used by the heartbeat thread must match the on-disk last_progress_at_ms after set_phase"
             );
             prev_progress = progress;
+        }
+
+        drop(guard);
+        Ok(())
+    }
+
+    /// Regression for GH #443.
+    ///
+    /// A plain incremental run (`mode=index`) used to write only the
+    /// `classify_nonresumable_checkpoint` breadcrumb and then leave it in
+    /// place for every later preflight step, so a wedge inside the writable
+    /// storage open was reported against a sidecar read that had already
+    /// returned. Every taxonomy step must now be visible in every mode.
+    #[test]
+    fn preflight_breadcrumbs_are_visible_in_every_index_mode() {
+        for mode in [
+            SearchMaintenanceMode::Index,
+            SearchMaintenanceMode::WatchStartup,
+            SearchMaintenanceMode::Watch,
+            SearchMaintenanceMode::WatchOnce,
+        ] {
+            for sub_phase in super::WATCH_STARTUP_SUB_PHASE_TAXONOMY {
+                assert!(
+                    super::preflight_breadcrumb_visible(mode, sub_phase),
+                    "{sub_phase} must be written to the lock file under mode {:?}; a breadcrumb \
+                     that stops advancing after classify_nonresumable_checkpoint misattributes \
+                     an open_storage wedge (GH #443)",
+                    mode.as_lock_value()
+                );
+            }
+        }
+    }
+
+    /// GH #443 companion: under `mode=index` the lock file carries the
+    /// sub-phase string while `mode=` stays `index`, so `cass status` shows
+    /// the running preflight step for a plain incremental run and does not
+    /// mistake it for a watch-startup job.
+    #[test]
+    fn set_phase_under_plain_index_mode_keeps_mode_index_and_advances_breadcrumb() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"placeholder")?;
+        let mut guard = acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::Index)?;
+        let lock_path = tmp.path().join("index-run.lock");
+
+        for sub_phase in [
+            "watch_startup:classify_nonresumable_checkpoint",
+            "watch_startup:open_storage",
+            "watch_startup:writable_preflight",
+            "watch_startup:count_total_conversations",
+        ] {
+            guard.set_phase(SearchMaintenanceMode::Index, sub_phase)?;
+            let raw = read_index_run_lock_metadata_for_test(&lock_path)?;
+            let phase_line = raw.lines().find_map(|line| line.strip_prefix("phase="));
+            assert_eq!(
+                phase_line,
+                Some(sub_phase),
+                "plain index mode must advance the on-disk phase= breadcrumb; got {raw:?}"
+            );
+            let mode_line = raw.lines().find_map(|line| line.strip_prefix("mode="));
+            assert_eq!(
+                mode_line,
+                Some("index"),
+                "sub-phase breadcrumbs must not rewrite mode= for a plain index run; got {raw:?}"
+            );
         }
 
         drop(guard);
