@@ -408,8 +408,34 @@ esac
 # MIN_GLIBC fails at load time with a linker error after a successful-looking
 # install. Detect it here and take the source route instead. An explicit
 # --artifact-url is honored as written (the operator asked for that file).
+last_major_minor_in_line() {
+  # Print the LAST `<digits>.<digits>` token of the first line of $1, or
+  # nothing. Builtins only: no pipeline, so nothing can close early.
+  local first="${1%%$'\n'*}" rest version=""
+  rest="$first"
+  while [[ "$rest" =~ ([0-9]+\.[0-9]+)(.*) ]]; do
+    version="${BASH_REMATCH[1]}"
+    rest="${BASH_REMATCH[2]}"
+  done
+  printf '%s' "$version"
+}
 host_glibc_version() {
-  ldd --version 2>/dev/null | head -n 1 | grep -o -E '[0-9]+\.[0-9]+' | tail -n 1
+  # GH #444: `ldd --version` is a shell script on glibc that prints its banner
+  # with several separate writes. The old `ldd | head -n 1 | grep | tail`
+  # pipeline let `head` close its end after the first line, `ldd` then took
+  # SIGPIPE (exit 141), and `set -o pipefail` turned that race into an
+  # installer failure roughly half the time. Capture the whole banner once
+  # (no early-closing reader), then parse it in-process; fall back to
+  # `getconf GNU_LIBC_VERSION` when ldd is absent or prints nothing usable
+  # (e.g. musl's ldd, which prints usage to stderr and exits non-zero).
+  local banner="" version=""
+  banner=$(LC_ALL=C ldd --version 2>/dev/null) || banner=""
+  version=$(last_major_minor_in_line "$banner")
+  if [ -z "$version" ]; then
+    banner=$(LC_ALL=C getconf GNU_LIBC_VERSION 2>/dev/null) || banner=""
+    version=$(last_major_minor_in_line "$banner")
+  fi
+  printf '%s' "$version"
 }
 glibc_at_least() {
   # $1 = required, $2 = host; true when host >= required (numeric major.minor)

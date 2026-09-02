@@ -147,6 +147,116 @@ fn install_sh_has_no_baseline_artifact_selection() -> Result<(), String> {
     Ok(())
 }
 
+/// The installer's glibc probe functions, extracted verbatim so they run under
+/// the same `set -euo pipefail` the installer uses.
+#[cfg(unix)]
+fn install_sh_glibc_probe_functions() -> String {
+    let script = fs::read_to_string("install.sh").expect("read install.sh");
+    let mut out = String::new();
+    for name in ["last_major_minor_in_line", "host_glibc_version"] {
+        let header = format!("{name}() {{\n");
+        let start = script
+            .find(&header)
+            .unwrap_or_else(|| panic!("install.sh must define {name}()"));
+        let end = script[start..]
+            .find("\n}\n")
+            .map(|offset| start + offset + "\n}\n".len())
+            .expect("function body must end with a bare closing brace");
+        out.push_str(&script[start..end]);
+    }
+    out
+}
+
+/// Run `host_glibc_version` under `set -euo pipefail` with `dir` first on PATH,
+/// returning `(exit_code, stdout)`.
+#[cfg(unix)]
+fn run_host_glibc_version(dir: &std::path::Path, iterations: usize) -> (i32, String) {
+    let functions = install_sh_glibc_probe_functions();
+    let path = format!(
+        "{}:{}",
+        dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let script = format!(
+        "set -euo pipefail\n{functions}\nfor _ in $(seq 1 {iterations}); do\n  HOST=$(host_glibc_version)\n  printf '%s\\n' \"$HOST\"\ndone\n"
+    );
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(script)
+        .env("PATH", path)
+        .output()
+        .expect("run host_glibc_version");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+    )
+}
+
+#[test]
+#[cfg(unix)]
+fn install_sh_glibc_probe_is_deterministic_under_pipefail() {
+    // GH #444: glibc's `ldd --version` prints its banner with several separate
+    // writes. The old `ldd | head -n 1 | ...` pipeline let `head` exit after
+    // the first line, `ldd` then died of SIGPIPE (141), and `set -o pipefail`
+    // turned that race into an installer failure. This fake ldd makes the race
+    // deterministic by pausing between writes; 40 runs must all succeed.
+    let bin = tempfile::TempDir::new().expect("fake bin dir");
+    make_executable_script(
+        &bin.path().join("ldd"),
+        "#!/usr/bin/env bash\n\
+         for line in 'ldd (Ubuntu GLIBC 2.39-0ubuntu8.4) 2.39' 'Copyright (C) 2024 Free Software Foundation, Inc.' 'This is free software; see the source for copying conditions.  There is NO' 'warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.' 'Written by Roland McGrath and Ulrich Drepper.'; do\n  printf '%s\\n' \"$line\" || exit 141\n  sleep 0.01\ndone\n",
+    );
+    let (code, stdout) = run_host_glibc_version(bin.path(), 40);
+    assert_eq!(
+        code, 0,
+        "glibc probe must never fail under pipefail: {stdout}"
+    );
+    let versions: Vec<&str> = stdout.lines().collect();
+    assert_eq!(versions.len(), 40, "one version per run: {stdout}");
+    assert!(
+        versions.iter().all(|version| *version == "2.39"),
+        "every run must parse the banner's trailing major.minor: {stdout}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn install_sh_glibc_probe_yields_nothing_on_musl_and_falls_back_to_getconf() {
+    // musl's ldd prints usage to stderr and exits non-zero: the probe must
+    // print nothing and NOT fail the installer (the caller then skips the
+    // glibc floor check). When ldd is unusable but getconf knows the glibc
+    // version, that answer is used instead.
+    let musl = tempfile::TempDir::new().expect("fake musl bin dir");
+    make_executable_script(
+        &musl.path().join("ldd"),
+        "#!/usr/bin/env bash\nprintf 'musl libc (x86_64)\\nVersion 1.2.5\\nUsage: ldd [options] [--] pathname\\n' >&2\nexit 1\n",
+    );
+    // Shadow any real getconf so the musl case cannot borrow the host's glibc.
+    make_executable_script(
+        &musl.path().join("getconf"),
+        "#!/usr/bin/env bash\nexit 1\n",
+    );
+    let (code, stdout) = run_host_glibc_version(musl.path(), 3);
+    assert_eq!(code, 0, "musl-style ldd must not fail the probe: {stdout}");
+    assert_eq!(
+        stdout, "\n\n\n",
+        "musl-style ldd must yield an empty version"
+    );
+
+    let getconf = tempfile::TempDir::new().expect("fake getconf bin dir");
+    make_executable_script(
+        &getconf.path().join("ldd"),
+        "#!/usr/bin/env bash\necho 'ldd: unrecognized option' >&2\nexit 1\n",
+    );
+    make_executable_script(
+        &getconf.path().join("getconf"),
+        "#!/usr/bin/env bash\n[ \"$1\" = GNU_LIBC_VERSION ] && { echo 'glibc 2.31'; exit 0; }\nexit 1\n",
+    );
+    let (code, stdout) = run_host_glibc_version(getconf.path(), 2);
+    assert_eq!(code, 0, "getconf fallback must succeed: {stdout}");
+    assert_eq!(stdout, "2.31\n2.31\n");
+}
+
 #[test]
 fn source_installer_uses_the_checkout_pinned_toolchain() {
     let script = fs::read_to_string("install.sh").expect("read install.sh");
