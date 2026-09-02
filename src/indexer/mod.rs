@@ -47128,6 +47128,29 @@ mod tests {
         );
     }
 
+    /// #440: the resume fence owes the upsert path exactly the documents the
+    /// published authority holds beyond the checkpoint (plus slack), nothing
+    /// for a from-zero build, and everything for a resume into the live index.
+    #[test]
+    fn resume_reconcile_upsert_budget_matches_the_authority_gap() {
+        // From zero: never upsert, whatever the index holds.
+        assert_eq!(resume_reconcile_upsert_budget(false, false, 0, 0), 0);
+        assert_eq!(resume_reconcile_upsert_budget(false, false, 0, 500), 0);
+        // Resume into staging: authority at or behind the checkpoint owes nothing.
+        assert_eq!(resume_reconcile_upsert_budget(false, true, 300, 300), 0);
+        assert_eq!(resume_reconcile_upsert_budget(false, true, 300, 120), 0);
+        // Resume into staging with the authority ahead: gap plus slack.
+        assert_eq!(
+            resume_reconcile_upsert_budget(false, true, 316_934, 320_000),
+            3_066 + RESUME_RECONCILE_SLACK_DOCS
+        );
+        // Resume into the live index: every replayed document is upserted.
+        assert_eq!(
+            resume_reconcile_upsert_budget(true, true, 300, 300),
+            usize::MAX
+        );
+    }
+
     #[test]
     fn fallback_fts_repair_is_skipped_for_canonical_only_full_rebuild() {
         assert!(!should_repair_fallback_fts_after_full_index_run(true, true));
