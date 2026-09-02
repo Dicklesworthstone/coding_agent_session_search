@@ -62,11 +62,6 @@ Everything below is on `main`; nothing is in a released binary yet.
   40-segment generation is folded by a plain `cass index`).
 
 ### Changed
-- frankensqlite pinned at `=0.3.15` (from 0.3.14): on a 10 GB archive with a
-  200 MB WAL, 0.3.14's writable open never returned; 0.3.15's open and
-  `BEGIN IMMEDIATE` complete. Its `PRAGMA wal_checkpoint` on such an archive
-  still loops (`reclaim_disowned_in_range` rescans the WAL per ledger page);
-  fixed upstream in frankensqlite `8d012706a`, consumed with the next release.
 - The TUI analytics dashboard's load task is one production function with the
   detached-rebuild spawn injected (`load_chart_data_with_auto_rebuild`); the
   test-only stub that returned canned data is gone, and unit tests prove that
