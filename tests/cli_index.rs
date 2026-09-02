@@ -1785,8 +1785,16 @@ fn gh413_full_rebuild_drains_when_one_conversation_exceeds_the_inflight_budget()
         fs::write(codex_root.join(name), sample).unwrap();
     };
     write_session("rollout-huge.jsonl", &huge_text, "gh413-huge");
-    write_session("rollout-small-a.jsonl", "gh413 small marker alpha", "gh413-a");
-    write_session("rollout-small-b.jsonl", "gh413 small marker beta", "gh413-b");
+    write_session(
+        "rollout-small-a.jsonl",
+        "gh413 small marker alpha",
+        "gh413-a",
+    );
+    write_session(
+        "rollout-small-b.jsonl",
+        "gh413 small marker beta",
+        "gh413-b",
+    );
 
     let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
     cmd.args([

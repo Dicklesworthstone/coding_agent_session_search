@@ -420,8 +420,7 @@ fn cass_omp_data_root_is_an_omp_only_live_override_child() {
         std::env::var_os("CASS_OMP_DATA_ROOT").expect("OMP live-override child OMP root"),
     );
     let shared_pi_root = PathBuf::from(
-        std::env::var_os("PI_CODING_AGENT_DIR")
-            .expect("OMP live-override child shared Pi root"),
+        std::env::var_os("PI_CODING_AGENT_DIR").expect("OMP live-override child shared Pi root"),
     );
 
     let detection = runtime_connector("omp").detect();

@@ -341,8 +341,7 @@ fn test_corrupted_index_triggers_rebuild() {
         // force_rebuild should handle corrupted index gracefully
         let mut rebuild_roots = std::collections::HashMap::new();
         rebuild_roots.insert("codex".to_string(), vec![codex_home.clone()]);
-        let _ =
-            indexer::run_index_with_local_connector_roots(rebuild_opts, rebuild_roots, None);
+        let _ = indexer::run_index_with_local_connector_roots(rebuild_opts, rebuild_roots, None);
         tracker.end(
             "rebuild_index",
             Some("Rebuild index with force flag"),

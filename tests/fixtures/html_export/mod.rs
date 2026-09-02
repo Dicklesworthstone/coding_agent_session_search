@@ -88,10 +88,7 @@ mod tests {
     #[test]
     fn validate_real_session_fixtures() {
         let fixtures = fixtures_in_category("real_sessions");
-        assert!(
-            !fixtures.is_empty(),
-            "No real session fixtures found"
-        );
+        assert!(!fixtures.is_empty(), "No real session fixtures found");
 
         for path in fixtures {
             let content = std::fs::read_to_string(&path)
@@ -136,11 +133,7 @@ mod tests {
 
         for name in expected {
             let path = fixture_path("edge_cases", name);
-            assert!(
-                path.exists(),
-                "Missing edge case fixture: {}",
-                name
-            );
+            assert!(path.exists(), "Missing edge case fixture: {}", name);
 
             let content = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("Failed to read {}: {}", name, e));
@@ -164,18 +157,14 @@ mod tests {
     #[test]
     fn validate_malformed_fixtures() {
         let malformed = fixtures_in_category("malformed");
-        assert!(
-            !malformed.is_empty(),
-            "No malformed fixtures found"
-        );
+        assert!(!malformed.is_empty(), "No malformed fixtures found");
 
         for path in malformed {
             let content = std::fs::read_to_string(&path).unwrap();
 
             // Malformed fixtures should have at least one invalid line
             let has_invalid = content.lines().any(|line| {
-                !line.trim().is_empty()
-                    && serde_json::from_str::<serde_json::Value>(line).is_err()
+                !line.trim().is_empty() && serde_json::from_str::<serde_json::Value>(line).is_err()
             });
 
             assert!(
@@ -211,7 +200,10 @@ mod tests {
         assert!(content.contains("中文"), "Should contain Chinese");
         assert!(content.contains("🎉"), "Should contain emoji");
         assert!(content.contains("مرحبا"), "Should contain Arabic");
-        assert!(content.contains("∫∑∏"), "Should contain mathematical symbols");
+        assert!(
+            content.contains("∫∑∏"),
+            "Should contain mathematical symbols"
+        );
     }
 
     /// Validate all message types are represented.
