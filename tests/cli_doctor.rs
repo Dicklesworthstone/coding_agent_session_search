@@ -7450,3 +7450,81 @@ fn doctor_reports_oversized_wal_sidecar_without_touching_it() {
         "a read-only doctor must not checkpoint or truncate the sidecar"
     );
 }
+
+/// GH #382 / g3zyo: `doctor --fix` must not hang forever on an archive whose
+/// writable open loops (the owner's 10 GB archive with a 200 MB WAL did
+/// exactly that). Positive observable: with the checkpoint parked past a
+/// 1 s deadline the `archive_wal` check comes back `fail` naming the deadline,
+/// GH #382 and the stock-sqlite remedy, `fix_applied` stays false, the
+/// sidecar is untouched, and the whole command returns in seconds. Planted
+/// negative: the same fixture with the park removed is covered by the
+/// read-only test above (a sparse WAL is not valid content, so the real
+/// checkpoint path is not exercised here). No-claim: this proves the bound,
+/// not that frankensqlite's open no longer loops.
+#[test]
+fn doctor_fix_wal_checkpoint_fails_truthfully_when_it_exceeds_its_deadline() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    seed_healthy_empty_index(test_home, &data_dir);
+
+    let wal_path = data_dir.join("agent_search.db-wal");
+    let oversized: u64 = 65 * 1024 * 1024;
+    let wal = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&wal_path)
+        .expect("open wal sidecar");
+    wal.set_len(oversized).expect("grow wal sidecar");
+    drop(wal);
+
+    let started = std::time::Instant::now();
+    let out = cass_cmd(test_home)
+        .env("CASS_TEST_WAL_CHECKPOINT_PARK_MS", "20000")
+        .env("CASS_DOCTOR_WAL_CHECKPOINT_TIMEOUT_SECS", "1")
+        .args([
+            "doctor",
+            "--fix",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor --fix --json");
+    let elapsed = started.elapsed();
+    let payload: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|err| {
+        panic!(
+            "doctor json: {err}\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    let check = payload["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|check| check["name"].as_str() == Some("archive_wal"))
+        .cloned()
+        .expect("archive_wal check present");
+
+    assert_eq!(check["status"].as_str(), Some("fail"), "{check}");
+    assert_eq!(check["fix_applied"].as_bool(), Some(false), "{check}");
+    let message = check["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("did not complete within 1 s")
+            && message.contains("GH #382")
+            && message.contains("wal_checkpoint(TRUNCATE)"),
+        "the failure must name the deadline, the issue and the remedy: {message}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "doctor --fix must return once the deadline passes, not wait for the parked \
+         checkpoint; elapsed={elapsed:?}"
+    );
+    assert_eq!(
+        fs::metadata(&wal_path).expect("wal metadata").len(),
+        oversized,
+        "a timed-out checkpoint must leave the sidecar as it found it"
+    );
+}

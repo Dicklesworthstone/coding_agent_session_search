@@ -86444,6 +86444,19 @@ const DOCTOR_FRANKEN_DEEP_INTEGRITY_MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// doctor thread.
 const CASS_DOCTOR_FULL_PAGE_INTEGRITY_PROBE: &str = "CASS_DOCTOR_FULL_PAGE_INTEGRITY_PROBE";
 
+/// Wall-clock budget for the `archive_wal` `--fix` checkpoint (GH #382 /
+/// g3zyo). `CASS_DOCTOR_WAL_CHECKPOINT_TIMEOUT_SECS` overrides the 120 s
+/// default; `0` falls back to the default rather than disabling the bound.
+fn doctor_wal_checkpoint_deadline() -> std::time::Duration {
+    const DEFAULT_SECS: u64 = 120;
+    let secs = dotenvy::var("CASS_DOCTOR_WAL_CHECKPOINT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(DEFAULT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
 fn doctor_full_page_integrity_probe_requested() -> bool {
     dotenvy::var(CASS_DOCTOR_FULL_PAGE_INTEGRITY_PROBE)
         .ok()
@@ -87620,7 +87633,14 @@ pub(crate) fn run_doctor_impl(
                 false
             );
         } else if fix_can_mutate {
-            match crate::indexer::checkpoint_wal_truncate(&db_path, "doctor --fix") {
+            // GH #382 / g3zyo: bounded, so an archive whose writable open
+            // loops turns into a truthful `fail` with the remedy instead of a
+            // doctor that never returns.
+            match crate::indexer::checkpoint_wal_truncate_with_deadline(
+                &db_path,
+                "doctor --fix",
+                doctor_wal_checkpoint_deadline(),
+            ) {
                 Ok(true) => {
                     let after = std::fs::metadata(&wal_path).map_or(0, |meta| meta.len());
                     checks.push(Check {
@@ -87665,7 +87685,10 @@ pub(crate) fn run_doctor_impl(
                 "warn",
                 format!(
                     "WAL sidecar is {wal_bytes} bytes (> {DOCTOR_WAL_OVERSIZED_BYTES}); every \
-                     opener replays it. Run `cass doctor --fix` or `cass index` to checkpoint it"
+                     opener replays it. Run `cass doctor --fix` or `cass index` to checkpoint it. \
+                     If either sits in `preparing` with no progress, the writable open is \
+                     looping on this WAL (GH #382): back up the archive and its sidecars, then \
+                     checkpoint it with stock sqlite3 (`PRAGMA wal_checkpoint(TRUNCATE)`)"
                 ),
                 true
             );

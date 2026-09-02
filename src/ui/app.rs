@@ -20376,88 +20376,39 @@ impl super::ftui_adapter::Model for CassApp {
                 let data_dir = self.data_dir.clone();
                 let filters = self.analytics_filters.clone();
                 let group_by = self.explorer_group_by;
-                #[cfg(test)]
-                {
-                    let _ = (db_path, data_dir, filters, group_by);
-                    ftui::Cmd::task(|| CassMsg::AnalyticsChartDataLoaded(Box::default()))
-                }
-                #[cfg(not(test))]
-                {
-                    ftui::Cmd::task(move || {
-                        match crate::storage::sqlite::FrankenStorage::open_readonly(&db_path) {
-                            Ok(db) => {
-                                let mut data = super::analytics_charts::load_chart_data(
-                                    &db, &filters, group_by,
-                                );
-
-                                let should_auto_rebuild = if data.is_empty() {
-                                    // Data is empty — check whether messages exist
-                                    // and analytics tables need rebuilding.
-                                    match crate::analytics::query::query_status(
-                                        db.raw(),
-                                        &crate::analytics::AnalyticsFilter::default(),
-                                    ) {
-                                        Ok(status) => {
-                                            let has_messages = status.coverage.total_messages > 0;
-                                            let needs_rebuild =
-                                                status.recommended_action.starts_with("rebuild")
-                                                    || status.drift.signals.iter().any(|signal| {
-                                                        matches!(
-                                                            signal.signal.as_str(),
-                                                            "missing_rollups" | "no_analytics_data"
-                                                        )
-                                                    });
-                                            tracing::debug!(
-                                                has_messages,
-                                                needs_rebuild,
-                                                action = %status.recommended_action,
-                                                "analytics auto-rebuild check"
-                                            );
-                                            has_messages && needs_rebuild
-                                        }
-                                        Err(e) => {
-                                            // query_status failed (likely frankensqlite compat) —
-                                            // try rebuild anyway since we have no data to show.
-                                            tracing::warn!(
-                                                error = %e,
-                                                "analytics query_status failed, attempting rebuild"
-                                            );
-                                            true
-                                        }
-                                    }
-                                } else {
-                                    false
-                                };
-
-                                if should_auto_rebuild {
-                                    // GH #395: never rebuild rollups inside the TUI
-                                    // process. On a multi-million-message archive
-                                    // `rebuild_analytics` is a multi-GB, multi-minute
-                                    // allocation storm on the effects thread, which
-                                    // froze the whole UI. Hand it to a detached
-                                    // `cass analytics rebuild` child and let the
-                                    // dashboard reload on its next visit.
-                                    tracing::info!(
-                                        "analytics rollups missing; spawning detached rebuild"
-                                    );
-                                    match crate::indexer::background_refresh::spawn_detached_analytics_rebuild(
-                                        &data_dir, &db_path,
-                                    ) {
-                                        Ok(pid) => data.auto_rebuild_spawned_pid = Some(pid),
-                                        Err(err) => {
-                                            data.auto_rebuild_error = Some(format!(
-                                                "could not start background analytics rebuild: {err}"
-                                            ));
-                                        }
-                                    }
-                                }
-
-                                CassMsg::AnalyticsChartDataLoaded(Box::new(data))
-                            }
-                            Err(e) => CassMsg::AnalyticsChartDataFailed(e.to_string()),
+                ftui::Cmd::task(move || {
+                    // GH #395: the load runs read-only and never rebuilds
+                    // rollups in-process (analytics_charts::
+                    // load_chart_data_with_auto_rebuild); an archive whose
+                    // rollups are missing gets a detached `cass analytics
+                    // rebuild` child instead. Under `cfg(test)` the current
+                    // executable is the test binary, so the spawner refuses
+                    // rather than launching it; the load logic itself stays
+                    // the production path.
+                    let spawn_rebuild = || {
+                        #[cfg(test)]
+                        {
+                            let _ = (&data_dir, &db_path);
+                            Err("detached analytics rebuild is disabled under cfg(test)"
+                                .to_string())
                         }
-                    })
-                }
+                        #[cfg(not(test))]
+                        {
+                            crate::indexer::background_refresh::spawn_detached_analytics_rebuild(
+                                &data_dir, &db_path,
+                            )
+                        }
+                    };
+                    match super::analytics_charts::load_chart_data_with_auto_rebuild(
+                        &db_path,
+                        &filters,
+                        group_by,
+                        spawn_rebuild,
+                    ) {
+                        Ok(data) => CassMsg::AnalyticsChartDataLoaded(Box::new(data)),
+                        Err(error) => CassMsg::AnalyticsChartDataFailed(error),
+                    }
+                })
             }
             CassMsg::AnalyticsChartDataLoaded(data) => {
                 if data.auto_rebuilt {

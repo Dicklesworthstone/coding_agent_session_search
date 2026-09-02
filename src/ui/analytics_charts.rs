@@ -506,6 +506,80 @@ pub fn load_chart_data(
     data
 }
 
+/// GH #395: the analytics surface's load task, with its one side effect —
+/// spawning the detached `cass analytics rebuild` child — injected.
+///
+/// The dashboard must never rebuild rollups inside the TUI process: on a
+/// multi-million-message archive `rebuild_analytics` is a multi-GB,
+/// multi-minute allocation storm on the effects thread, which froze the whole
+/// UI. This function opens the archive read-only, and when the archive has
+/// messages but no usable rollups it calls `spawn_rebuild` exactly once and
+/// reports the pid (or the spawn error) in the returned data. The caller in
+/// `app.rs` passes the real detached spawner; tests pass a fake one and prove
+/// the invariant against a seeded archive.
+pub fn load_chart_data_with_auto_rebuild(
+    db_path: &std::path::Path,
+    filters: &super::app::AnalyticsFilterState,
+    group_by: crate::analytics::GroupBy,
+    spawn_rebuild: impl FnOnce() -> Result<u32, String>,
+) -> Result<AnalyticsChartData, String> {
+    let db = crate::storage::sqlite::FrankenStorage::open_readonly(db_path)
+        .map_err(|error| error.to_string())?;
+    let mut data = load_chart_data(&db, filters, group_by);
+
+    let should_auto_rebuild = if data.is_empty() {
+        // Data is empty — check whether messages exist and the analytics
+        // tables need rebuilding.
+        match crate::analytics::query::query_status(
+            db.raw(),
+            &crate::analytics::AnalyticsFilter::default(),
+        ) {
+            Ok(status) => {
+                let has_messages = status.coverage.total_messages > 0;
+                let needs_rebuild = status.recommended_action.starts_with("rebuild")
+                    || status.drift.signals.iter().any(|signal| {
+                        matches!(
+                            signal.signal.as_str(),
+                            "missing_rollups" | "no_analytics_data"
+                        )
+                    });
+                tracing::debug!(
+                    has_messages,
+                    needs_rebuild,
+                    action = %status.recommended_action,
+                    "analytics auto-rebuild check"
+                );
+                has_messages && needs_rebuild
+            }
+            Err(error) => {
+                // query_status failed (likely frankensqlite compat) — try the
+                // rebuild anyway since there is no data to show.
+                tracing::warn!(
+                    error = %error,
+                    "analytics query_status failed, attempting rebuild"
+                );
+                true
+            }
+        }
+    } else {
+        false
+    };
+
+    if should_auto_rebuild {
+        tracing::info!("analytics rollups missing; spawning detached rebuild");
+        match spawn_rebuild() {
+            Ok(pid) => data.auto_rebuild_spawned_pid = Some(pid),
+            Err(error) => {
+                data.auto_rebuild_error = Some(format!(
+                    "could not start background analytics rebuild: {error}"
+                ));
+            }
+        }
+    }
+
+    Ok(data)
+}
+
 fn percent_outcome(numerator: f64, denominator: f64) -> crate::metric_integrity::MetricOutcome {
     match crate::metric_integrity::safe_ratio(numerator, denominator) {
         crate::metric_integrity::MetricOutcome::Value(value) => {
@@ -3294,6 +3368,192 @@ mod tests {
     use super::*;
     use crate::franken_sync::compat::ConnectionExt;
     use crate::franken_sync::params;
+
+    /// A frankensqlite archive with `messages` messages in one conversation and
+    /// NO analytics rollups (inserted with analytics updates deferred, the shape
+    /// of an archive whose rollups were never built). `messages == 0` yields an
+    /// initialized but empty archive. `query_status` only reports
+    /// `no_analytics_data` above 100 messages, so the rebuild-shaped fixtures
+    /// seed more than that.
+    fn archive_without_rollups(messages: i64) -> (tempfile::TempDir, std::path::PathBuf) {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("agent_search.db");
+        let storage =
+            crate::storage::sqlite::FrankenStorage::open(&db_path).expect("open frankensqlite");
+        if messages > 0 {
+            let agent_id = storage
+                .ensure_agent(&Agent {
+                    id: None,
+                    slug: "codex".into(),
+                    name: "Codex".into(),
+                    version: None,
+                    kind: AgentKind::Cli,
+                })
+                .expect("ensure agent");
+            let conversation = Conversation {
+                id: None,
+                agent_slug: "codex".into(),
+                workspace: None,
+                external_id: Some("gh395-rollups-missing".into()),
+                title: Some("GH #395 fixture".into()),
+                source_path: tmp.path().join("rollout-gh395.jsonl"),
+                started_at: Some(1_700_000_000_000),
+                ended_at: None,
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: (0..messages)
+                    .map(|idx| Message {
+                        id: None,
+                        idx,
+                        role: if idx % 2 == 0 {
+                            MessageRole::User
+                        } else {
+                            MessageRole::Agent
+                        },
+                        author: None,
+                        created_at: Some(1_700_000_000_000 + idx * 1_000),
+                        content: format!("message {idx} about borrow checker lifetimes"),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    })
+                    .collect(),
+                source_id: crate::sources::provenance::LOCAL_SOURCE_ID.into(),
+                origin_host: None,
+            };
+            storage
+                .insert_conversation_tree_with_analytics(agent_id, None, &conversation, true)
+                .expect("insert conversation with analytics deferred");
+        }
+        drop(storage);
+        (tmp, db_path)
+    }
+
+    /// True when the archive's analytics status still asks for a rebuild, i.e.
+    /// nothing has built the rollups in the meantime.
+    fn rollups_still_missing(db_path: &std::path::Path) -> bool {
+        let db = crate::storage::sqlite::FrankenStorage::open_readonly(db_path)
+            .expect("reopen archive read-only");
+        let status = crate::analytics::query::query_status(
+            db.raw(),
+            &crate::analytics::AnalyticsFilter::default(),
+        )
+        .expect("analytics status");
+        status.recommended_action.starts_with("rebuild")
+            || status.drift.signals.iter().any(|signal| {
+                matches!(
+                    signal.signal.as_str(),
+                    "missing_rollups" | "no_analytics_data"
+                )
+            })
+    }
+
+    /// GH #395: an archive with messages but no rollups makes the dashboard
+    /// spawn the detached rebuild exactly once and report its pid — and the
+    /// rollups are still missing afterwards, which is the proof that nothing
+    /// rebuilt them inside the calling process.
+    #[test]
+    fn missing_rollups_spawn_one_detached_rebuild_and_never_rebuild_in_process() {
+        let (_tmp, db_path) = archive_without_rollups(120);
+        assert!(
+            rollups_still_missing(&db_path),
+            "fixture must start without analytics rollups"
+        );
+
+        let spawns = std::cell::Cell::new(0_u32);
+        let data = load_chart_data_with_auto_rebuild(
+            &db_path,
+            &super::super::app::AnalyticsFilterState::default(),
+            crate::analytics::GroupBy::default(),
+            || {
+                spawns.set(spawns.get() + 1);
+                Ok(4242)
+            },
+        )
+        .expect("load must succeed on a readable archive");
+
+        assert_eq!(spawns.get(), 1, "exactly one detached rebuild is spawned");
+        assert_eq!(data.auto_rebuild_spawned_pid, Some(4242));
+        assert!(
+            data.auto_rebuild_error.is_none(),
+            "{:?}",
+            data.auto_rebuild_error
+        );
+        assert!(
+            !data.auto_rebuilt,
+            "the TUI process must never rebuild rollups itself"
+        );
+        assert!(data.is_empty(), "no rollups means no chart data yet");
+        assert!(
+            rollups_still_missing(&db_path),
+            "the load must not have rebuilt the rollups in-process"
+        );
+    }
+
+    /// A spawn failure is reported on the data, and the load still refuses to
+    /// fall back to an in-process rebuild.
+    #[test]
+    fn failed_spawn_is_reported_and_does_not_fall_back_to_an_in_process_rebuild() {
+        let (_tmp, db_path) = archive_without_rollups(150);
+
+        let data = load_chart_data_with_auto_rebuild(
+            &db_path,
+            &super::super::app::AnalyticsFilterState::default(),
+            crate::analytics::GroupBy::default(),
+            || Err("fork refused".to_string()),
+        )
+        .expect("load must succeed even when the spawn fails");
+
+        assert_eq!(data.auto_rebuild_spawned_pid, None);
+        let error = data.auto_rebuild_error.as_deref().unwrap_or_default();
+        assert!(error.contains("fork refused"), "{error}");
+        assert!(
+            rollups_still_missing(&db_path),
+            "a failed spawn must not trigger an in-process rebuild"
+        );
+    }
+
+    /// An initialized archive with no messages has nothing to rebuild: the
+    /// spawner is never called and no error is reported.
+    #[test]
+    fn empty_archive_does_not_spawn_a_rebuild() {
+        let (_tmp, db_path) = archive_without_rollups(0);
+
+        let spawns = std::cell::Cell::new(0_u32);
+        let data = load_chart_data_with_auto_rebuild(
+            &db_path,
+            &super::super::app::AnalyticsFilterState::default(),
+            crate::analytics::GroupBy::default(),
+            || {
+                spawns.set(spawns.get() + 1);
+                Ok(1)
+            },
+        )
+        .expect("load must succeed on an empty archive");
+
+        assert_eq!(spawns.get(), 0, "nothing to rebuild on an empty archive");
+        assert_eq!(data.auto_rebuild_spawned_pid, None);
+        assert!(
+            data.auto_rebuild_error.is_none(),
+            "{:?}",
+            data.auto_rebuild_error
+        );
+    }
+
+    /// A path that is not an archive fails the load instead of pretending.
+    #[test]
+    fn unreadable_archive_fails_the_load() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let missing = tmp.path().join("does-not-exist").join("agent_search.db");
+        let result = load_chart_data_with_auto_rebuild(
+            &missing,
+            &super::super::app::AnalyticsFilterState::default(),
+            crate::analytics::GroupBy::default(),
+            || panic!("must not spawn when the archive cannot be opened"),
+        );
+        assert!(result.is_err(), "{result:?}");
+    }
 
     #[test]
     fn resolve_workspace_filter_ids_supports_paths_and_numeric_ids() {

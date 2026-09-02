@@ -17251,6 +17251,55 @@ pub(crate) fn checkpoint_wal_truncate(db_path: &Path, context: &str) -> Result<b
     ))
 }
 
+/// Test hook: park the WAL checkpoint for this many milliseconds before it
+/// opens the archive, so a deadline can be exercised without an archive whose
+/// writable open really loops (GH #382 needs a multi-GB archive for that).
+pub(crate) const CASS_TEST_WAL_CHECKPOINT_PARK_MS_ENV: &str = "CASS_TEST_WAL_CHECKPOINT_PARK_MS";
+
+/// [`checkpoint_wal_truncate`] with a wall-clock deadline (GH #382, bead
+/// g3zyo). On the owner-scale archive with a 200 MB WAL, frankensqlite's
+/// writable open never returns, which turned `cass doctor --fix` into an
+/// infinite hang. The checkpoint runs on a helper thread; if it has not
+/// finished by `deadline`, the caller gets an error that names the shape and
+/// the out-of-band remedy instead of waiting forever. The helper thread is
+/// left to finish or die with the process — it cannot be cancelled, and the
+/// callers are short-lived CLI commands.
+pub(crate) fn checkpoint_wal_truncate_with_deadline(
+    db_path: &Path,
+    context: &str,
+    deadline: std::time::Duration,
+) -> Result<bool> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker_db_path = db_path.to_path_buf();
+    let worker_context = context.to_string();
+    std::thread::Builder::new()
+        .name("cass-wal-checkpoint".into())
+        .spawn(move || {
+            if let Some(park_ms) = std::env::var(CASS_TEST_WAL_CHECKPOINT_PARK_MS_ENV)
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .filter(|ms| *ms > 0)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(park_ms));
+            }
+            let _ = tx.send(checkpoint_wal_truncate(&worker_db_path, &worker_context));
+        })
+        .with_context(|| format!("spawning the WAL checkpoint thread for {context}"))?;
+    match rx.recv_timeout(deadline) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(anyhow::anyhow!(
+            "WAL checkpoint did not complete within {} s; on a large archive this means the \
+             writable open is looping on the WAL (GH #382): back up {} and its -wal/-shm \
+             sidecars, then checkpoint with stock sqlite3 (`PRAGMA wal_checkpoint(TRUNCATE)`)",
+            deadline.as_secs(),
+            db_path.display()
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
+            "WAL checkpoint thread exited without a result after {context}"
+        )),
+    }
+}
+
 fn run_final_wal_checkpoint(db_path: &Path, context: &str) -> Result<FinalWalCheckpointOutcome> {
     // Run this after closing the indexing storage handle: frankensqlite flushes
     // retained autocommit writes during close, and TRUNCATE avoids leaving the
