@@ -54,6 +54,11 @@ pub(crate) enum SemanticFallbackReason {
     PackEnrichmentUnavailable,
     /// Semantic was simply not applied (generic / no specific cause).
     SemanticNotApplied,
+    /// The inverse fail-open (#441): the LEXICAL leg of a hybrid query was
+    /// refused (Quill query fuel exhausted) and the query realized as
+    /// semantic-only. Semantic refinement contributed in full; lexical
+    /// evidence is what is missing.
+    LexicalLegSkipped,
 }
 
 impl SemanticFallbackReason {
@@ -69,6 +74,7 @@ impl SemanticFallbackReason {
             Self::HybridExecutionError => "hybrid_execution_error",
             Self::PackEnrichmentUnavailable => "pack_enrichment_unavailable",
             Self::SemanticNotApplied => "semantic_not_applied",
+            Self::LexicalLegSkipped => "lexical_leg_skipped",
         }
     }
 }
@@ -80,7 +86,9 @@ impl SemanticFallbackReason {
 pub(crate) fn classify_fallback_reason(reason: &str) -> SemanticFallbackReason {
     let r = reason.to_ascii_lowercase();
     // Most specific phrases first.
-    if r.contains("policy") || r.contains("disabled") || r.contains("lexical-only") {
+    if r.contains("lexical leg skipped") {
+        SemanticFallbackReason::LexicalLegSkipped
+    } else if r.contains("policy") || r.contains("disabled") || r.contains("lexical-only") {
         SemanticFallbackReason::SemanticPolicyDisabled
     } else if r.contains("checksum") || r.contains("verification failed") {
         SemanticFallbackReason::SemanticChecksumMismatch
@@ -228,6 +236,21 @@ pub(crate) fn project(signals: SearchModeSignals<'_>) -> SearchModeReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #441: the semantic-only fail-open records its reason as a lexical-leg
+    /// skip, and that phrase must classify ahead of the generic buckets.
+    #[test]
+    fn lexical_leg_skipped_classifies_before_generic_reasons() {
+        let reason = "lexical leg skipped: executing a Quill lexical query: scalar Quill query fuel exhausted after 10000000/10000000 units";
+        assert_eq!(
+            classify_fallback_reason(reason),
+            SemanticFallbackReason::LexicalLegSkipped
+        );
+        assert_eq!(
+            SemanticFallbackReason::LexicalLegSkipped.code(),
+            "lexical_leg_skipped"
+        );
+    }
 
     fn base() -> SearchModeSignals<'static> {
         SearchModeSignals {

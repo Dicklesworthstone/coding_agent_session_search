@@ -9675,6 +9675,7 @@ fn repair_fallback_fts_after_full_index_run(
     full_rebuild: bool,
     canonical_only_full_rebuild: bool,
     known_archive_fingerprint: Option<&str>,
+    heartbeat: Option<Box<dyn Fn() + Send + Sync>>,
 ) -> Result<Option<FallbackFtsRepairOutcome>> {
     if !should_repair_fallback_fts_after_full_index_run(full_rebuild, canonical_only_full_rebuild) {
         return Ok(None);
@@ -9720,6 +9721,8 @@ fn repair_fallback_fts_after_full_index_run(
             }));
         }
     };
+    // #439: stream-page liveness for the stall watchdog (see the call site).
+    fresh_storage.set_fts_maintenance_heartbeat(heartbeat);
 
     let outcome: FallbackFtsRepairOutcome = 'compute: {
         if let Some(archive_fingerprint) = known_archive_fingerprint {
@@ -15598,10 +15601,42 @@ fn run_index_inner(
                         t_index = Some(TantivyIndex::open_or_create(&index_path)?);
                     }
                 } else if scan_requires_tantivy {
-                    t_index
+                    let t_index = t_index
                         .as_mut()
-                        .expect("tantivy index must remain open for lexical commit")
-                        .commit()?;
+                        .expect("tantivy index must remain open for lexical commit");
+                    t_index.commit()?;
+                    // #441: an append-only archive never trips Quill's
+                    // tombstone-driven compaction, and its width-tiered merge
+                    // cannot fold the sparse per-session docid leases, so
+                    // every incremental run used to add segments that only a
+                    // full rebuild removed. Apply the bounded size-tiered
+                    // policy here (threshold + cooldown gated), the same hook
+                    // the watch loop already runs. The merge is post-publish
+                    // work with parked counters, so it runs under the
+                    // finalize-class grace like the WAL checkpoint does.
+                    if scan_canonical_mutations.inserted_messages > 0
+                        || scan_canonical_mutations.inserted_conversations > 0
+                    {
+                        if let Some(progress) = opts.progress.as_ref() {
+                            progress.finalizing.store(true, Ordering::Relaxed);
+                            progress.tick_activity();
+                        }
+                        match t_index.optimize_if_idle() {
+                            Ok(true) => tracing::info!(
+                                segments = t_index.segment_count(),
+                                "folded lexical segments after incremental index run (#441)"
+                            ),
+                            Ok(false) => {}
+                            Err(err) => tracing::warn!(
+                                error = %format!("{err:#}"),
+                                "segment merge after incremental index run failed; continuing with the unmerged generation"
+                            ),
+                        }
+                        if let Some(progress) = opts.progress.as_ref() {
+                            progress.tick_activity();
+                            progress.finalizing.store(false, Ordering::Relaxed);
+                        }
+                    }
                 }
 
                 if !scan_lexical_update_deferred
@@ -16279,14 +16314,53 @@ fn run_index_inner(
                 .as_deref(),
         )
         .flatten();
-    if let Some(repair) = repair_fallback_fts_after_full_index_run(
+    // #439: the fallback-FTS shadow maintenance below is the last heavy step
+    // of a `--full` run and it runs AFTER the lexical generation is published
+    // with every progress counter parked at phase 0 / `current == total`. To
+    // the stall watchdog that is the #297 finalize-wedge shape, and on a
+    // large corpus (the report: 640k messages) the shadow rebuild alone runs
+    // past the base 300 s abort — killing a run whose index is already
+    // complete and healthy. Two signals cover it: the per-page heartbeat
+    // ticks `activity` while rows stream (so an active rebuild never even
+    // reports), and `finalizing` grants the bounded finalize-class grace for
+    // the parity probes that cannot tick (a COUNT over the FTS shadow).
+    if should_repair_fallback_fts_after_full_index_run(opts.full, canonical_only_full_rebuild) {
+        if let Some(progress) = opts.progress.as_ref() {
+            progress.finalizing.store(true, Ordering::Relaxed);
+            progress.tick_activity();
+        }
+        if let Err(err) = index_run_lock.set_phase(initial_lock_mode, "fts:fallback_repair") {
+            tracing::debug!(
+                error = %err,
+                "fallback FTS repair phase breadcrumb write failed (continuing)"
+            );
+        }
+    }
+    let fallback_fts_heartbeat: Option<Box<dyn Fn() + Send + Sync>> = {
+        let progress = opts.progress.clone();
+        let progress_bump = Arc::clone(&progress_bump);
+        Some(Box::new(move || {
+            if let Some(progress) = progress.as_ref() {
+                progress.tick_activity();
+            }
+            bump_index_run_lock_progress_atomic(&progress_bump);
+        }))
+    };
+    let fallback_fts_repair = repair_fallback_fts_after_full_index_run(
         &storage,
         &opts.db_path,
         opts.full,
         canonical_only_full_rebuild,
         fallback_fts_archive_fingerprint,
-    )
-    .with_context(|| {
+        fallback_fts_heartbeat,
+    );
+    if let Some(progress) = opts.progress.as_ref() {
+        progress.tick_activity();
+        // The final WAL checkpoint below re-arms `finalizing` for its own
+        // window; keep the flag scoped to the work it describes.
+        progress.finalizing.store(false, Ordering::Relaxed);
+    }
+    if let Some(repair) = fallback_fts_repair.with_context(|| {
         format!(
             "repairing frankensqlite-owned fallback FTS after full index run for {}",
             opts.db_path.display()
@@ -20236,6 +20310,39 @@ fn maybe_pause_lexical_publish_for_kill_relaunch(
 /// the next from-zero rebuild clears it before reuse while an interrupted run
 /// resumes into it. Worst case is one stale scratch directory, never a growing
 /// set.
+/// Extra documents routed through the upsert path beyond the measured
+/// authority/checkpoint gap (#440). Upserting a document whose identity is
+/// absent is an ordinary insert, so the margin only costs an identity probe
+/// per document and buys tolerance for any off-by-a-batch drift between the
+/// checkpoint's document accounting and the engine's live count.
+const RESUME_RECONCILE_SLACK_DOCS: usize = 4_096;
+
+/// How many leading replayed documents a resumed rebuild must upsert (#440).
+///
+/// * A from-zero build (`resuming == false`) owes nothing: its target is empty.
+/// * A resume into the LIVE index (`builds_in_live_index`) may be replaying
+///   over a complete prior generation, so every document is upserted.
+/// * A resume into a staged scratch owes the documents the authority holds
+///   beyond the checkpoint, plus [`RESUME_RECONCILE_SLACK_DOCS`]; nothing when
+///   the authority is at or behind the checkpoint.
+fn resume_reconcile_upsert_budget(
+    builds_in_live_index: bool,
+    resuming: bool,
+    checkpoint_indexed_docs: usize,
+    published_docs: usize,
+) -> usize {
+    if !resuming {
+        return 0;
+    }
+    if builds_in_live_index {
+        return usize::MAX;
+    }
+    match published_docs.checked_sub(checkpoint_indexed_docs) {
+        Some(gap) if gap > 0 => gap.saturating_add(RESUME_RECONCILE_SLACK_DOCS),
+        _ => 0,
+    }
+}
+
 fn staged_lexical_rebuild_scratch_path(index_path: &Path) -> PathBuf {
     let name = index_path
         .file_name()
@@ -22655,6 +22762,34 @@ fn rebuild_tantivy_from_db_with_options(
         }
     };
 
+    // #440: fence the resume cursor against the published authority. The
+    // checkpoint says how many documents the last durable commit covered;
+    // the index says how many are actually live. Anything live beyond the
+    // checkpoint was published without a matching checkpoint advance (a
+    // pre-fix engine visibility publish, or an upsert-triggered commit inside
+    // an earlier reconcile window) and replaying it with plain adds is
+    // refused as a duplicate identity. Route that many leading documents —
+    // plus a small margin — through the identity-idempotent upsert path so
+    // the replay converges instead of failing. A resume that builds in the
+    // LIVE directory (no staged scratch) may be sitting on a complete prior
+    // generation whose identities are anywhere in the replay, so it upserts
+    // everything.
+    let resume_reconcile_docs = resume_reconcile_upsert_budget(
+        staged_build_path.is_none(),
+        rebuild_state.processed_conversations > 0 || rebuild_state.pending.is_some(),
+        rebuild_state.indexed_docs,
+        usize::try_from(t_index.doc_count().unwrap_or(0)).unwrap_or(usize::MAX),
+    );
+    if resume_reconcile_docs > 0 {
+        tracing::warn!(
+            checkpoint_indexed_docs = rebuild_state.indexed_docs,
+            build_path = %build_path.display(),
+            reconcile_docs = resume_reconcile_docs,
+            "published lexical authority is ahead of the rebuild checkpoint; resuming through identity-idempotent upserts (#440)"
+        );
+        t_index.arm_resume_reconcile(resume_reconcile_docs);
+    }
+
     if let Some(p) = &progress {
         p.phase.store(2, Ordering::Relaxed);
         p.is_rebuilding.store(true, Ordering::Relaxed);
@@ -23223,28 +23358,54 @@ fn rebuild_tantivy_from_db_with_options(
         ),
     );
 
-    if conversations_since_commit > 0
-        || messages_since_commit > 0
-        || message_bytes_since_commit > 0
-        || rebuild_state.pending.is_some()
-    {
-        // The terminal successful commit persists the pending checkpoint before
-        // commit, then lets completion fold commit-finalization into the final
-        // completed-state write. If the process dies after commit but before
-        // completion, restart reconciliation still lands the pending commit.
-        commit_lexical_rebuild_progress(
-            &index_path,
-            &build_path,
-            &mut rebuild_state,
-            last_processed_conversation_id,
-            processed_conversations,
-            indexed_docs,
-            &latest_pipeline_runtime,
-            &mut t_index,
-            false,
-            perf_profile.as_mut(),
-        )?;
+    // #441: publish everything staged, then fold the freshly built generation
+    // into one segment BEFORE the terminal checkpoint records the manifest
+    // fingerprint. A from-scratch build seals one segment per ingest shard
+    // per accumulation budget, and Quill's query planner probes every sealed
+    // dictionary for every lowered segment, so segment count is the dominant
+    // query cost on a large archive; a published generation should start at
+    // one. The merge is a Q1-preserving concat behind an atomic MANIFEST
+    // publish, so a failure leaves the (valid, merely unmerged) generation in
+    // place and is logged rather than failing a completed rebuild.
+    t_index.commit()?;
+    if let Some(p) = &progress {
+        p.tick_activity();
     }
+    let merge_started = Instant::now();
+    match t_index.force_merge() {
+        Ok(()) => tracing::info!(
+            merge_ms = merge_started.elapsed().as_millis() as u64,
+            segments = t_index.segment_count(),
+            "folded the rebuilt lexical generation before publish (#441)"
+        ),
+        Err(err) => tracing::warn!(
+            error = %format!("{err:#}"),
+            "segment merge after lexical rebuild failed; publishing the unmerged generation"
+        ),
+    }
+    if let Some(p) = &progress {
+        p.tick_activity();
+    }
+    // The terminal commit persists the pending checkpoint before commit, then
+    // lets completion fold commit-finalization into the final completed-state
+    // write. If the process dies after commit but before completion, restart
+    // reconciliation still lands the pending commit. It runs unconditionally:
+    // the merge above changed the manifest, and the fingerprint the completed
+    // checkpoint carries must describe the generation that is actually
+    // published — a stale fingerprint reads as "index changed underneath the
+    // checkpoint" and forces the next run into another full rebuild.
+    commit_lexical_rebuild_progress(
+        &index_path,
+        &build_path,
+        &mut rebuild_state,
+        last_processed_conversation_id,
+        processed_conversations,
+        indexed_docs,
+        &latest_pipeline_runtime,
+        &mut t_index,
+        false,
+        perf_profile.as_mut(),
+    )?;
 
     drop(t_index);
     // Swap the freshly built index into the live path. Until this call the live
@@ -47008,7 +47169,7 @@ mod tests {
         seed_lexical_rebuild_fixture(&storage);
 
         let repair =
-            repair_fallback_fts_after_full_index_run(&storage, &db_path, true, false, None)
+            repair_fallback_fts_after_full_index_run(&storage, &db_path, true, false, None, None)
                 .unwrap();
         assert_eq!(
             repair,
@@ -47026,7 +47187,7 @@ mod tests {
         seed_lexical_rebuild_fixture(&storage);
 
         let repair =
-            repair_fallback_fts_after_full_index_run(&storage, &db_path, true, false, None)
+            repair_fallback_fts_after_full_index_run(&storage, &db_path, true, false, None, None)
                 .unwrap();
         assert_eq!(
             repair,
@@ -47056,6 +47217,7 @@ mod tests {
             true,
             false,
             Some(&archive_fingerprint),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -47065,6 +47227,42 @@ mod tests {
                     archive_fingerprint
                 }
             )
+        );
+    }
+
+    /// #439: the fallback-FTS shadow maintenance must report liveness per
+    /// streamed page, otherwise the post-publish `--full` tail looks like a
+    /// finalize wedge to the stall watchdog.
+    #[test]
+    fn fallback_fts_repair_after_full_run_ticks_its_heartbeat_per_page() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("fts-heartbeat.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        // No shadow at all, so the repair has to stream every canonical row.
+        seed_lexical_rebuild_fixture(&storage);
+
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let heartbeat_ticks = Arc::clone(&ticks);
+        let repair = repair_fallback_fts_after_full_index_run(
+            &storage,
+            &db_path,
+            true,
+            false,
+            None,
+            Some(Box::new(move || {
+                heartbeat_ticks.fetch_add(1, Ordering::Relaxed);
+            })),
+        )
+        .unwrap();
+        assert_eq!(
+            repair,
+            Some(FallbackFtsRepairOutcome::Repaired(
+                FtsConsistencyRepair::Rebuilt { inserted_rows: 4 }
+            ))
+        );
+        assert!(
+            ticks.load(Ordering::Relaxed) >= 1,
+            "streaming the shadow rows must tick the liveness heartbeat"
         );
     }
 

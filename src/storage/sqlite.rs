@@ -4656,6 +4656,13 @@ pub struct FrankenStorage {
     ensured_conversation_sources: Arc<parking_lot::Mutex<HashSet<EnsuredConversationSourceKey>>>,
     ensured_daily_stats_keys: Arc<parking_lot::Mutex<HashSet<EnsuredDailyStatsKey>>>,
     fts_messages_present_cache: AtomicI8,
+    /// #439: liveness callback invoked once per streamed page during the
+    /// fallback-FTS shadow maintenance (`stream_fts_rows_via_frankensqlite`).
+    /// The post-publish `index --full` tail runs that maintenance with every
+    /// progress counter parked at `current == total`, so without a tick the
+    /// stall watchdog reads a healthy multi-minute shadow rebuild as a wedge
+    /// and exits 70 after the base abort threshold.
+    fts_maintenance_heartbeat: parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 /// Keep ordinary storage commits from tripping over frequent auto-checkpoints
@@ -4861,6 +4868,7 @@ impl FrankenStorage {
             ensured_conversation_sources,
             ensured_daily_stats_keys,
             fts_messages_present_cache: AtomicI8::new(FTS_MESSAGES_PRESENT_UNKNOWN),
+            fts_maintenance_heartbeat: parking_lot::Mutex::new(None),
         }
     }
 
@@ -12638,6 +12646,22 @@ impl FrankenStorage {
         self.ensure_fts_consistency_via_frankensqlite()
     }
 
+    /// #439: install (or, with `None`, clear) the liveness callback that
+    /// fallback-FTS shadow maintenance invokes once per streamed page. See
+    /// the `fts_maintenance_heartbeat` field.
+    pub(crate) fn set_fts_maintenance_heartbeat(
+        &self,
+        heartbeat: Option<Box<dyn Fn() + Send + Sync>>,
+    ) {
+        *self.fts_maintenance_heartbeat.lock() = heartbeat;
+    }
+
+    fn tick_fts_maintenance_heartbeat(&self) {
+        if let Some(heartbeat) = self.fts_maintenance_heartbeat.lock().as_ref() {
+            heartbeat();
+        }
+    }
+
     pub(crate) fn validate_fts_messages_integrity(&self) -> Result<()> {
         validate_fts_messages_integrity_for_connection(&self.conn)
     }
@@ -13624,6 +13648,9 @@ impl FrankenStorage {
 
         loop {
             let page = self.fetch_fts_rebuild_message_page(last_rowid, batch_limit)?;
+            // #439: every fetched page is forward progress the stall watchdog
+            // cannot otherwise see.
+            self.tick_fts_maintenance_heartbeat();
             let fetched_count = page.rows.len();
             if fetched_count == 0 && page.exhausted {
                 break;

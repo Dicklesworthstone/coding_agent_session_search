@@ -36,6 +36,60 @@ use frankensearch::quill::{QuillConfig, QuillIndex, QuillSearchIndex, SchemaDocu
 /// authority, so its presence is what makes a directory readable.
 pub const QUILL_INDEX_MARKER: &str = "MANIFEST";
 
+/// Operator override for Quill's deterministic per-query work budget
+/// (`QuillConfig::query_fuel_budget`, default 10,000,000 units). The budget is
+/// what turns a pathological query into a fast typed refusal instead of an
+/// unbounded scan, so raising it is a diagnostic/escape hatch, not a tuning
+/// knob; the durable fix for fuel exhaustion is a compacted index (#441).
+pub const QUILL_QUERY_FUEL_BUDGET_ENV: &str = "CASS_QUILL_QUERY_FUEL_BUDGET";
+
+/// Engine configuration every CASS reader and writer opens with.
+///
+/// Two deliberate departures from `QuillConfig::default()`:
+///
+/// * `max_visibility_lag_ms` is effectively infinite. Quill's default (1 s)
+///   is a cross-process visibility contract: once unpublished changes are a
+///   second old, the *next ingest call* seals every shard and publishes a new
+///   MANIFEST on its own. CASS never relies on that — every reader opens the
+///   snapshot CASS itself publishes through an explicit `commit()`, and the
+///   rebuild checkpoint (`.lexical-rebuild-state.json`) is written around that
+///   same commit. Letting the engine publish underneath the checkpoint is
+///   exactly what #440 reported: an interrupted `--force-rebuild` left a
+///   staging MANIFEST several conversations ahead of the durable cursor, so
+///   the resumed run re-inserted already-live identities and Quill refused
+///   the duplicate. It is also why #441's archives grew hundreds of tiny
+///   segments: a seal per shard per second, each in its own sparse docid
+///   lease, which the hole-ratio-gated tier merge can never fold. With
+///   explicit publication only, a segment is sealed on the accumulation
+///   budget or at commit, and the MANIFEST moves only when CASS says so.
+/// * `query_fuel_budget` honours [`QUILL_QUERY_FUEL_BUDGET_ENV`].
+///
+/// Everything else keeps the engine default so the on-disk format and the
+/// admission/merge semantics stay exactly what the pinned engine documents.
+#[must_use]
+pub fn cass_quill_config() -> QuillConfig {
+    let mut config = QuillConfig {
+        max_visibility_lag_ms: u64::MAX,
+        ..QuillConfig::default()
+    };
+    if let Some(budget) = query_fuel_budget_override(
+        dotenvy::var(QUILL_QUERY_FUEL_BUDGET_ENV)
+            .ok()
+            .as_deref(),
+    ) {
+        config.query_fuel_budget = budget;
+    }
+    config
+}
+
+/// Parse the fuel-budget override. Zero, garbage, and absent all mean "keep
+/// the engine default" — a zero budget would refuse every query, which is
+/// never what an operator setting this variable wants.
+fn query_fuel_budget_override(raw: Option<&str>) -> Option<u64> {
+    raw.and_then(|value| value.trim().replace('_', "").parse::<u64>().ok())
+        .filter(|budget| *budget > 0)
+}
+
 thread_local! {
     static DRIVER: RefCell<Option<Runtime>> = const { RefCell::new(None) };
 }
@@ -317,7 +371,7 @@ pub fn open_cass_reader(path: &Path) -> Result<QuillSearchIndex> {
                 &cx,
                 path,
                 CASS_SEMANTIC_SCHEMA,
-                QuillConfig::default(),
+                cass_quill_config(),
             )
             .await
         }
@@ -426,7 +480,7 @@ impl QuillCassIndex {
                         &cx,
                         directory,
                         CASS_SEMANTIC_SCHEMA,
-                        QuillConfig::default(),
+                        cass_quill_config(),
                     )
                     .await
                 } else {
@@ -434,7 +488,7 @@ impl QuillCassIndex {
                         &cx,
                         directory,
                         CASS_SEMANTIC_SCHEMA,
-                        QuillConfig::default(),
+                        cass_quill_config(),
                     )
                     .await
                 }
@@ -554,7 +608,7 @@ impl QuillCassIndex {
                     &cx,
                     directory,
                     CASS_SEMANTIC_SCHEMA,
-                    QuillConfig::default(),
+                    cass_quill_config(),
                 )
                 .await
             }
@@ -636,6 +690,40 @@ impl QuillCassIndex {
         self.add_cass_documents(&owned)
     }
 
+    /// Upsert one batch of borrowed CASS documents under their stable
+    /// identities (see [`Self::upsert_cass_documents`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when admission, identity resolution, or accumulation
+    /// refuses the batch.
+    pub fn upsert_cass_document_refs(
+        &mut self,
+        documents: &[frankensearch::quill::cass::CassDocumentRef<'_>],
+    ) -> Result<()> {
+        if documents.is_empty() {
+            return Ok(());
+        }
+        let owned: Vec<QuillCassDocument> = documents
+            .iter()
+            .map(|document| QuillCassDocument {
+                agent: document.agent.to_owned(),
+                workspace: document.workspace.map(str::to_owned),
+                workspace_original: document.workspace_original.map(str::to_owned),
+                source_path: document.source_path.to_owned(),
+                msg_idx: document.msg_idx,
+                created_at: document.created_at,
+                title: document.title.map(str::to_owned),
+                content: document.content.to_owned(),
+                source_id: document.source_id.to_owned(),
+                origin_kind: document.origin_kind.to_owned(),
+                origin_host: document.origin_host.map(str::to_owned),
+                conversation_id: document.conversation_id,
+            })
+            .collect();
+        self.upsert_cass_documents(&owned)
+    }
+
     /// Live segment count in the published snapshot.
     ///
     /// Returns 0 when nothing is published yet, which is what the caller's
@@ -650,27 +738,118 @@ impl QuillCassIndex {
 
     /// Compact when the segment count and cooldown say it is worth doing.
     ///
-    /// Returns whether a compaction actually ran.
+    /// Runs the bounded policy in [`plan_bounded_segment_merge`]: every run of
+    /// two or more adjacent *small* segments is folded into one, so an
+    /// append-only archive converges to a handful of large segments plus one
+    /// growing tail instead of accumulating a segment per session (#441).
+    /// Tombstone-density compaction runs afterwards so replaced/deleted rows
+    /// are reclaimed on the same cadence.
+    ///
+    /// Returns whether any merge or compaction actually ran.
     ///
     /// # Errors
     ///
-    /// Returns an error when compaction itself fails.
+    /// Returns an error when a merge or compaction itself fails.
     pub fn optimize_if_idle(&mut self, now_ms: i64) -> Result<bool> {
         let segments = self.segment_count();
         if !self.merge_status(segments, now_ms).should_merge() {
             return Ok(false);
         }
-        self.force_merge()?;
-        self.note_merged(now_ms);
-        Ok(true)
+        let merged = self.merge_small_segment_runs()?;
+        let compacted = self.compact_tombstones()?;
+        if merged || compacted {
+            self.note_merged(now_ms);
+        }
+        Ok(merged || compacted)
     }
 
-    /// Compact now, regardless of policy.
+    /// Fold every published segment into one, regardless of policy, then
+    /// reclaim tombstones.
+    ///
+    /// This is the end-of-rebuild step: a from-scratch build seals one segment
+    /// per ingest shard per accumulation budget, and the query planner's
+    /// per-segment dictionary probes make segment count the dominant query
+    /// cost (#441), so a freshly published generation should start at one.
     ///
     /// # Errors
     ///
-    /// Returns an error when compaction fails.
+    /// Returns an error when the merge or compaction fails. Requires a fully
+    /// committed index (call [`Self::commit`] first).
     pub fn force_merge(&mut self) -> Result<()> {
+        let segments = self.published_segment_profile()?;
+        if segments.len() >= 2 {
+            let source_ids: Vec<u64> = segments.iter().map(|segment| segment.0).collect();
+            self.concat_merge_run(&source_ids)?;
+        }
+        self.compact_tombstones()?;
+        Ok(())
+    }
+
+    /// `(segment_id, live_doc_count)` for every published segment, in manifest
+    /// (docid) order — the order [`QuillIndex::concat_merge`] requires a source
+    /// run to be consecutive in.
+    fn published_segment_profile(&self) -> Result<Vec<(u64, u64)>> {
+        let snapshot = self
+            .index
+            .snapshot()
+            .map_err(|error| anyhow!("reading the Quill CASS manifest: {error}"))?;
+        Ok(snapshot
+            .segments()
+            .iter()
+            .map(|segment| {
+                (
+                    segment.manifest().segment_id,
+                    u64::from(segment.manifest().live_doc_count()),
+                )
+            })
+            .collect())
+    }
+
+    /// Apply [`plan_bounded_segment_merge`] until it has nothing left to fold.
+    /// Returns whether at least one merge ran.
+    fn merge_small_segment_runs(&mut self) -> Result<bool> {
+        let mut merged_any = false;
+        // Each iteration strictly reduces the segment count, so this loop is
+        // bounded by the initial count; the cap is a belt-and-braces guard.
+        for _ in 0..MAX_BOUNDED_MERGE_PASSES {
+            let profile = self.published_segment_profile()?;
+            let Some(run) = plan_bounded_segment_merge(&profile) else {
+                break;
+            };
+            self.concat_merge_run(&run)?;
+            merged_any = true;
+        }
+        Ok(merged_any)
+    }
+
+    /// Q1-preserving concat merge of one consecutive manifest run into a
+    /// fresh segment. The output id is random and collision-checked against
+    /// the live manifest, matching the engine's own id discipline.
+    fn concat_merge_run(&mut self, source_segment_ids: &[u64]) -> Result<()> {
+        let output_segment_id = fresh_segment_id(&self.published_segment_profile()?);
+        let created_unix_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        drive(|cx| {
+            let index = &self.index;
+            async move {
+                index
+                    .concat_merge(&cx, source_segment_ids, output_segment_id, created_unix_s)
+                    .await
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| {
+            anyhow!(
+                "concat-merging {} Quill CASS segments: {error}",
+                source_segment_ids.len()
+            )
+        })
+    }
+
+    /// Density-driven tombstone compaction; a no-op on an append-only index.
+    fn compact_tombstones(&mut self) -> Result<bool> {
         drive(|cx| {
             let index = &self.index;
             async move {
@@ -679,7 +858,7 @@ impl QuillCassIndex {
                     .await
             }
         })
-        .map(|_| ())
+        .map(|report| report.changed())
         .map_err(|error| anyhow!("compacting the Quill CASS index: {error}"))
     }
 
@@ -693,9 +872,172 @@ impl QuillCassIndex {
     pub const fn configure_bulk_load_merge_policy(&self) {}
 }
 
+/// Upper bound on bounded-merge passes per `optimize_if_idle` call. Each pass
+/// removes at least one segment, so this can only bind on a manifest with
+/// thousands of segments — and then it merely defers the remainder to the next
+/// maintenance window instead of holding the writer for the whole backlog.
+const MAX_BOUNDED_MERGE_PASSES: usize = 256;
+
+/// Indexes at or below this many live documents are simply merged into one
+/// segment: the rewrite is cheap and the tiering below would only add
+/// bookkeeping. One Q1 lease (65,536 docids) is the natural boundary.
+const BOUNDED_MERGE_SMALL_INDEX_DOCS: u64 = 1 << 16;
+
+/// A segment holding at least `total / BOUNDED_MERGE_BIG_DIVISOR` live docs is
+/// "big" and never rewritten by the bounded policy; only runs of small
+/// segments are folded. Eight bounds the big-segment count at eight (each is
+/// at least an eighth of the corpus) plus at most one small run between any
+/// two, and keeps every incremental merge to at most an eighth of the index.
+const BOUNDED_MERGE_BIG_DIVISOR: u64 = 8;
+
+/// Pick the next run of adjacent segments to concat-merge, or `None` when the
+/// manifest is already converged.
+///
+/// `profile` is `(segment_id, live_doc_count)` in manifest order. The policy
+/// is size-tiered by *document count*, deliberately not by docid width: the
+/// engine's own tier merge classifies by docid-range width and refuses runs
+/// whose hull is more than half holes, and a CASS archive built session by
+/// session is nothing but holes (every writer session leases fresh 65,536-wide
+/// docid blocks per shard and burns the unused tail). A Q1 concat merge
+/// preserves ids and tolerates those gaps, so counting live rows is the
+/// measure that actually predicts merge cost and query cost here.
+///
+/// Returns the longest run of two or more adjacent small segments. Ties go to
+/// the earliest run so the result is deterministic for a given manifest.
+fn plan_bounded_segment_merge(profile: &[(u64, u64)]) -> Option<Vec<u64>> {
+    if profile.len() < 2 {
+        return None;
+    }
+    let total: u64 = profile
+        .iter()
+        .map(|(_, live)| *live)
+        .fold(0, u64::saturating_add);
+    if total <= BOUNDED_MERGE_SMALL_INDEX_DOCS {
+        return Some(profile.iter().map(|(id, _)| *id).collect());
+    }
+    let big_threshold = (total / BOUNDED_MERGE_BIG_DIVISOR).max(1);
+    let mut best: Option<(usize, usize)> = None;
+    let mut run_start: Option<usize> = None;
+    for (index, (_, live)) in profile.iter().enumerate() {
+        let small = *live < big_threshold;
+        match (small, run_start) {
+            (true, None) => run_start = Some(index),
+            (false, Some(start)) => {
+                let len = index - start;
+                if len >= 2 && best.is_none_or(|(_, best_len)| len > best_len) {
+                    best = Some((start, len));
+                }
+                run_start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(start) = run_start {
+        let len = profile.len() - start;
+        if len >= 2 && best.is_none_or(|(_, best_len)| len > best_len) {
+            best = Some((start, len));
+        }
+    }
+    best.map(|(start, len)| {
+        profile[start..start + len]
+            .iter()
+            .map(|(id, _)| *id)
+            .collect()
+    })
+}
+
+/// A random, nonzero segment id absent from `profile`.
+fn fresh_segment_id(profile: &[(u64, u64)]) -> u64 {
+    loop {
+        let candidate: u64 = rand::random();
+        if candidate != 0 && profile.iter().all(|(id, _)| *id != candidate) {
+            return candidate;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Files under the index directory, so a merge can be observed on disk
+    /// (a live segment is one `.fslx`-family file; a merged generation must
+    /// not keep every source alive forever).
+    fn published_segment_count(index: &QuillCassIndex) -> usize {
+        index.segment_count()
+    }
+
+    #[test]
+    fn fuel_budget_override_parses_positive_integers_only() {
+        assert_eq!(query_fuel_budget_override(None), None);
+        assert_eq!(query_fuel_budget_override(Some("")), None);
+        assert_eq!(query_fuel_budget_override(Some("0")), None);
+        assert_eq!(query_fuel_budget_override(Some("lots")), None);
+        assert_eq!(query_fuel_budget_override(Some(" 25000000 ")), Some(25_000_000));
+        assert_eq!(query_fuel_budget_override(Some("25_000_000")), Some(25_000_000));
+    }
+
+    #[test]
+    fn cass_config_publishes_only_on_explicit_commit() {
+        let config = cass_quill_config();
+        assert_eq!(
+            config.max_visibility_lag_ms,
+            u64::MAX,
+            "#440/#441: the engine must never publish a MANIFEST underneath the rebuild checkpoint"
+        );
+        assert!(config.validate().is_ok(), "the CASS config must pass engine validation");
+        let default = QuillConfig::default();
+        assert_eq!(config.tier_fanout, default.tier_fanout);
+        assert_eq!(config.scribe_shard_budget_bytes, default.scribe_shard_budget_bytes);
+        assert_eq!(config.query_fuel_budget, default.query_fuel_budget);
+    }
+
+    #[test]
+    fn bounded_merge_plan_folds_small_runs_and_leaves_big_segments_alone() {
+        // Tiny index: everything merges.
+        assert_eq!(
+            plan_bounded_segment_merge(&[(1, 10), (2, 20), (3, 30)]),
+            Some(vec![1, 2, 3])
+        );
+        // Nothing to do with fewer than two segments.
+        assert_eq!(plan_bounded_segment_merge(&[(1, 10)]), None);
+        assert_eq!(plan_bounded_segment_merge(&[]), None);
+
+        // Large index (total 800k, big threshold 100k): one big head, then a
+        // run of small tail segments -> the tail run is the plan and the big
+        // segment is untouched.
+        let profile = [(7, 700_000), (8, 40_000), (9, 30_000), (10, 30_000)];
+        assert_eq!(plan_bounded_segment_merge(&profile), Some(vec![8, 9, 10]));
+
+        // Two runs: the longest wins; ties go to the earliest.
+        let profile = [
+            (1, 500_000),
+            (2, 10),
+            (3, 10),
+            (4, 500_000),
+            (5, 10),
+            (6, 10),
+            (7, 10),
+        ];
+        assert_eq!(plan_bounded_segment_merge(&profile), Some(vec![5, 6, 7]));
+        let profile = [(1, 500_000), (2, 10), (3, 10), (4, 500_000), (5, 10), (6, 10)];
+        assert_eq!(plan_bounded_segment_merge(&profile), Some(vec![2, 3]));
+
+        // Converged: only big segments, or isolated smalls between bigs.
+        let profile = [(1, 300_000), (2, 300_000), (3, 300_000)];
+        assert_eq!(plan_bounded_segment_merge(&profile), None);
+        let profile = [(1, 300_000), (2, 5), (3, 300_000), (4, 5)];
+        assert_eq!(plan_bounded_segment_merge(&profile), None);
+    }
+
+    #[test]
+    fn fresh_segment_id_avoids_live_ids_and_zero() {
+        let profile = [(1, 1), (2, 1)];
+        for _ in 0..64 {
+            let id = fresh_segment_id(&profile);
+            assert!(id != 0 && id != 1 && id != 2);
+        }
+    }
 
     fn sample(source_id: &str, msg_idx: u64, content: &str) -> QuillCassDocument {
         QuillCassDocument {
@@ -747,5 +1089,120 @@ mod tests {
             index.doc_count()
         });
         assert_eq!(nested.expect("nested doc count"), 0);
+    }
+
+    /// #440: the engine must not publish a MANIFEST on its own visibility
+    /// cadence. With the engine default (1 s) a second ingest call after a
+    /// one-second pause seals and publishes everything staged so far, which
+    /// is precisely how a staging index ran ahead of the rebuild checkpoint.
+    #[test]
+    fn engine_publishes_only_on_explicit_commit() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open or create");
+        index
+            .add_cass_documents(&[sample("alpha", 0, "first staged batch")])
+            .expect("stage first batch");
+        std::thread::sleep(std::time::Duration::from_millis(1_200));
+        index
+            .add_cass_documents(&[sample("alpha", 1, "second staged batch")])
+            .expect("stage second batch");
+        assert_eq!(
+            index.doc_count().expect("published doc count"),
+            0,
+            "nothing may be published before CASS commits"
+        );
+        index.commit().expect("commit");
+        assert_eq!(index.doc_count().expect("published doc count"), 2);
+    }
+
+    /// #440: a resumed rebuild re-adds documents the published authority may
+    /// already hold. The upsert path must converge to one live document per
+    /// identity where a plain add is (correctly) refused as a duplicate.
+    #[test]
+    fn upsert_refs_converge_where_add_refuses_duplicates() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open or create");
+        let published = [
+            sample("alpha", 0, "published before the interruption"),
+            sample("alpha", 1, "also published before the interruption"),
+        ];
+        index
+            .add_cass_documents(&published)
+            .expect("index published documents");
+        index.commit().expect("publish");
+
+        let duplicate = index.add_cass_documents(&published[..1]);
+        assert!(
+            duplicate
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("duplicate live document id")),
+            "a plain re-add of a live identity must be refused: {duplicate:?}"
+        );
+
+        let replay = [
+            published[0].clone(),
+            published[1].clone(),
+            sample("alpha", 2, "new after the interruption"),
+        ];
+        let refs: Vec<_> = replay.iter().map(QuillCassDocument::as_ref).collect();
+        index
+            .upsert_cass_document_refs(&refs)
+            .expect("upsert converges on the published identities");
+        index.commit().expect("publish replay");
+        assert_eq!(index.doc_count().expect("doc count"), 3);
+    }
+
+    /// #441: one writer session per open leases fresh docid blocks, so every
+    /// session leaves at least one segment the engine's width-tiered merge
+    /// will never fold. The bounded policy must fold them and keep the corpus
+    /// searchable.
+    #[test]
+    fn bounded_merge_folds_session_segments_into_one() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        let sessions = 5_u64;
+        for session in 0..sessions {
+            let mut index =
+                QuillCassIndex::open_or_create(directory.path()).expect("open session");
+            index
+                .add_cass_documents(&[
+                    sample(&format!("s{session}"), 0, "session zero message alpha"),
+                    sample(&format!("s{session}"), 1, "session one message beta"),
+                ])
+                .expect("index session documents");
+            index.commit().expect("commit session");
+        }
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("reopen");
+        let before = published_segment_count(&index);
+        assert!(
+            before >= usize::try_from(sessions).expect("small count"),
+            "each session must have left at least one segment, got {before}"
+        );
+        assert_eq!(index.doc_count().expect("doc count"), sessions * 2);
+
+        // Cooldown never elapsed and nothing merged yet -> policy fires.
+        let merged = index.optimize_if_idle(1_700_000_000_000).expect("optimize");
+        assert!(merged, "five session segments exceed the merge threshold");
+        assert_eq!(published_segment_count(&index), 1);
+        assert_eq!(index.doc_count().expect("doc count"), sessions * 2);
+
+        // A reader opened on the merged generation still finds every session.
+        let reader = index.reader().expect("reader");
+        let hits = reader
+            .search_results(&Cx::for_request(), "alpha", 100)
+            .expect("search merged generation");
+        assert_eq!(hits.len(), usize::try_from(sessions).expect("small count"));
+
+        // Converged: another pass inside the cooldown is a no-op.
+        assert!(!index.optimize_if_idle(1_700_000_000_001).expect("optimize"));
+
+        // A further session appends a segment; force_merge folds it back.
+        index
+            .add_cass_documents(&[sample("late", 0, "late session alpha")])
+            .expect("index late session");
+        index.commit().expect("commit late session");
+        assert!(published_segment_count(&index) >= 2);
+        index.force_merge().expect("force merge");
+        assert_eq!(published_segment_count(&index), 1);
+        assert_eq!(index.doc_count().expect("doc count"), sessions * 2 + 1);
     }
 }

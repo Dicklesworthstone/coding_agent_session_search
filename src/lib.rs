@@ -28486,7 +28486,42 @@ fn execute_search_operation(
             Ok(result) => result,
             Err(error) => {
                 let message = error.to_string();
-                if hybrid_fail_open
+                if hybrid_fail_open && lexical_query_fuel_exhausted(&message) {
+                    // #441: the lexical leg was refused by Quill's query fuel
+                    // budget (a many-segment index makes dictionary probing
+                    // scale with segments x terms); the semantic leg answers
+                    // the same query, so serve it and say so in the metadata
+                    // rather than failing the whole request.
+                    mode_meta.fall_back_to_semantic_only(format!("lexical leg skipped: {error}"));
+                    let (hits, ann_stats) = client
+                        .search_semantic_with_tier(
+                            &query,
+                            filters.clone(),
+                            search_limit,
+                            search_offset,
+                            field_mask,
+                            approximate,
+                            semantic_execution_tier,
+                        )
+                        .map_err(|semantic_error| CliError {
+                            code: 9,
+                            kind: CliErrorKind::Search.kind_str(),
+                            message: format!(
+                                "hybrid search failed ({error}); semantic fallback failed: {semantic_error}"
+                            ),
+                            hint: Some(LEXICAL_FUEL_EXHAUSTED_HINT.to_string()),
+                            retryable: true,
+                        })?;
+                    crate::search::query::SearchResult {
+                        hits,
+                        wildcard_fallback: false,
+                        cache_stats: crate::search::query::CacheStats::default(),
+                        suggestions: Vec::new(),
+                        ann_stats,
+                        ann_unavailable_reason: None,
+                        total_count: None,
+                    }
+                } else if hybrid_fail_open
                     && (message.contains("unavailable") || message.contains("no embedder"))
                 {
                     mode_meta
@@ -29614,7 +29649,39 @@ fn run_cli_search(
                 Ok(result) => result,
                 Err(e) => {
                     let err_str = e.to_string();
-                    if hybrid_fail_open
+                    if hybrid_fail_open && lexical_query_fuel_exhausted(&err_str) {
+                        // #441: see the one-shot search path — serve the
+                        // semantic leg when the lexical leg is fuel-refused.
+                        mode_meta.fall_back_to_semantic_only(format!("lexical leg skipped: {e}"));
+                        let (hits, ann_stats) = client
+                            .search_semantic_with_tier(
+                                query,
+                                filters.clone(),
+                                search_limit,
+                                search_offset,
+                                field_mask,
+                                approximate,
+                                semantic_execution_tier,
+                            )
+                            .map_err(|semantic_error| CliError {
+                                code: 9,
+                                kind: CliErrorKind::Search.kind_str(),
+                                message: format!(
+                                    "hybrid search failed ({e}); semantic fallback failed: {semantic_error}"
+                                ),
+                                hint: Some(LEXICAL_FUEL_EXHAUSTED_HINT.to_string()),
+                                retryable: true,
+                            })?;
+                        crate::search::query::SearchResult {
+                            hits,
+                            wildcard_fallback: false,
+                            cache_stats: crate::search::query::CacheStats::default(),
+                            suggestions: Vec::new(),
+                            ann_stats,
+                            ann_unavailable_reason: None,
+                            total_count: None,
+                        }
+                    } else if hybrid_fail_open
                         && (err_str.contains("unavailable") || err_str.contains("no embedder"))
                     {
                         mode_meta
@@ -31018,7 +31085,7 @@ fn run_cli_pack(
             } else {
                 PackLexicalReadiness::Ready
             },
-            semantic_readiness: if mode_meta.fallback_tier.is_some() {
+            semantic_readiness: if mode_meta.fell_back_to_lexical() {
                 PackSemanticReadiness::FallbackLexical
             } else {
                 PackSemanticReadiness::Disabled
@@ -32422,6 +32489,20 @@ fn robot_format_from_env() -> Option<RobotFormat> {
         })
 }
 
+/// #441: Quill refuses a query whose deterministic work exceeds its fuel
+/// budget with this phrase (`frankensearch::quill::QuillIndexError`). On a
+/// hybrid request the semantic leg can still answer, so this is the signature
+/// the fail-open below keys on.
+fn lexical_query_fuel_exhausted(message: &str) -> bool {
+    message.contains("query fuel exhausted")
+}
+
+const LEXICAL_FUEL_EXHAUSTED_HINT: &str = concat!(
+    "The lexical index has accumulated more segments than this query's Quill fuel budget can probe. ",
+    "Run `cass index` (it folds segments after every run) or `cass index --full` to compact it; ",
+    "CASS_QUILL_QUERY_FUEL_BUDGET raises the per-query budget as a stopgap."
+);
+
 #[derive(Debug, Clone)]
 struct SearchModeMeta {
     requested: crate::search::query::SearchMode,
@@ -32453,7 +32534,7 @@ impl SearchModeMeta {
                 crate::search::query::SearchMode::Semantic
                     | crate::search::query::SearchMode::Hybrid
             )
-            && self.fallback_tier.is_none()
+            && !self.fell_back_to_lexical()
     }
 
     fn fail_open_on_semantic_unavailable(&self) -> bool {
@@ -32466,12 +32547,27 @@ impl SearchModeMeta {
         self.fallback_reason = Some(reason.into());
     }
 
+    /// #441: a hybrid query whose LEXICAL leg was refused (Quill query fuel
+    /// exhausted on a many-segment index) degrades to its semantic leg
+    /// instead of failing outright. Semantic refinement still contributed in
+    /// full; what is missing is the lexical evidence, and `fallback_tier`
+    /// / `fallback_reason` say so.
+    fn fall_back_to_semantic_only(&mut self, reason: impl Into<String>) {
+        self.realized = crate::search::query::SearchMode::Semantic;
+        self.fallback_tier = Some("semantic");
+        self.fallback_reason = Some(reason.into());
+    }
+
+    fn fell_back_to_lexical(&self) -> bool {
+        self.fallback_tier == Some("lexical")
+    }
+
     /// The realized refinement level for `--robot-meta` (bead .5.4): a precise
     /// `lexical_only` / `fully_hybrid_refined` instead of a bare bool. A
     /// one-shot CLI search runs to completion, so the quality tier contributes
     /// whenever semantic/hybrid did not fail open to lexical.
     fn realized_refinement(&self) -> crate::search::readiness::SearchRefinementLevel {
-        if self.fallback_tier.is_some() {
+        if self.fell_back_to_lexical() {
             crate::search::readiness::SearchRefinementLevel::LexicalOnly
         } else {
             crate::search::search_mode_metadata::refinement_level(
@@ -100514,9 +100610,13 @@ const INDEX_STALL_HINT: &str = concat!(
     "CASS_INDEX_STALL_ABORT_SECS=0 to keep abort-eligible lexical stalls report-only; set ",
     "CASS_INDEX_STALL_ABORT_ALL_PHASES=1 to promote these report-only warnings to a hard abort ",
     "in every phase, report-only lanes included (#437). ",
-    "If `finalizing` is true in the diagnostics the indexer is inside the final WAL checkpoint of a large ",
-    "deferred bulk-ingest WAL (slow on macOS); CASS_INDEX_FINALIZE_ABORT_SECS (default 1800) bounds that window, ",
-    "and CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES=1000 caps WAL growth so the final checkpoint stays small."
+    "If `finalizing` is true in the diagnostics the indexer is inside post-publish finalize work that cannot ",
+    "report per-row progress: the final WAL checkpoint of a large deferred bulk-ingest WAL (slow on macOS), ",
+    "the fallback-FTS shadow parity probe/rebuild that follows a `--full` publish (#439), or a post-run ",
+    "segment fold; CASS_INDEX_FINALIZE_ABORT_SECS (default 1800) bounds that window, ",
+    "and CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES=1000 caps WAL growth so the final checkpoint stays small. ",
+    "A `preparing` stall with `pre_index_io_active` true is a slow canonical open/scan doing real disk IO ",
+    "(for example replaying a multi-GiB WAL, #382); it gets the same bounded grace."
 );
 
 /// gh373/oeu5a: phase-2 hint for a stall observed while `persist_in_progress`
@@ -100637,19 +100737,66 @@ fn index_finalize_abort_threshold(abort_threshold: Option<Duration>) -> Option<D
 /// block-IO growth is a safe liveness hint for the pre-index window.
 #[cfg_attr(test, allow(dead_code))]
 fn process_block_io_bytes() -> Option<u64> {
-    let text = std::fs::read_to_string("/proc/self/io").ok()?;
-    let mut total: u64 = 0;
-    let mut seen = false;
-    for line in text.lines() {
-        if let Some(rest) = line
-            .strip_prefix("read_bytes:")
-            .or_else(|| line.strip_prefix("write_bytes:"))
-        {
-            total = total.saturating_add(rest.trim().parse::<u64>().ok()?);
-            seen = true;
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/self/io").ok()?;
+        let mut total: u64 = 0;
+        let mut seen = false;
+        for line in text.lines() {
+            if let Some(rest) = line
+                .strip_prefix("read_bytes:")
+                .or_else(|| line.strip_prefix("write_bytes:"))
+            {
+                total = total.saturating_add(rest.trim().parse::<u64>().ok()?);
+                seen = true;
+            }
         }
+        seen.then_some(total)
     }
-    seen.then_some(total)
+    #[cfg(target_os = "macos")]
+    {
+        macos_process_disk_io_bytes()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// #382: the macOS counterpart of `/proc/self/io` — `proc_pid_rusage`'s
+/// `ri_diskio_bytesread + ri_diskio_byteswritten`. The 2026-08-31 retest of
+/// the large-archive `preparing` wedge was on Apple Silicon: the canonical
+/// open sat in `pread` over a ~37 GiB WAL for the whole 300 s abort window,
+/// and because this probe was Linux-only the watchdog had no liveness signal
+/// and killed six healthy-but-slow opens in a row. This is the one FFI call
+/// with no safe wrapper in `std`; the buffer is the exact `rusage_info_v2`
+/// layout the `RUSAGE_INFO_V2` flavour fills, and a nonzero return leaves it
+/// unread.
+#[cfg(target_os = "macos")]
+fn macos_process_disk_io_bytes() -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v2>::zeroed();
+    // SAFETY: `proc_pid_rusage` writes at most `size_of::<rusage_info_v2>()`
+    // bytes for the `RUSAGE_INFO_V2` flavour into a caller-provided buffer of
+    // exactly that type; the buffer outlives the call and is only read after
+    // the kernel reports success (return value 0). The libc binding spells
+    // the C `rusage_info_t buffer` (a `void *`) as `*mut rusage_info_t`, so
+    // the pointer to our struct is cast to that (ABI-identical) pointer type.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            libc::getpid(),
+            libc::RUSAGE_INFO_V2,
+            info.as_mut_ptr().cast::<libc::rusage_info_t>(),
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: the kernel filled the v2 layout on success (checked above).
+    let info = unsafe { info.assume_init() };
+    Some(
+        info.ri_diskio_bytesread
+            .saturating_add(info.ri_diskio_byteswritten),
+    )
 }
 
 /// Default watchdog block-IO sampler: the real `/proc` probe in production,
