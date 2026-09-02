@@ -18754,7 +18754,7 @@ fn ensure_index_storage_headroom(
     Ok(())
 }
 
-fn index_disk_headroom_check_disabled() -> bool {
+pub(crate) fn index_disk_headroom_check_disabled() -> bool {
     dotenvy::var("CASS_INDEX_SKIP_DISK_HEADROOM_CHECK")
         .map(|value| env_value_truthy(&value))
         .unwrap_or(false)
@@ -18767,7 +18767,11 @@ fn env_value_truthy(value: &str) -> bool {
     )
 }
 
-fn existing_headroom_probe_paths(data_dir: &Path, db_path: &Path) -> Vec<PathBuf> {
+/// The filesystem locations whose free space gates an index run: the data
+/// dir and the database's directory (deduplicated; nearest existing
+/// ancestor when the path does not exist yet). Shared with `doctor` so its
+/// full-rebuild readiness answer probes exactly what `index --full` probes.
+pub(crate) fn existing_headroom_probe_paths(data_dir: &Path, db_path: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::with_capacity(2);
     for candidate in [data_dir, db_path.parent().unwrap_or(db_path)] {
         if let Some(existing) = nearest_existing_path(candidate) {
@@ -18827,23 +18831,57 @@ fn required_index_headroom_bytes(
     match requirement {
         IndexStorageHeadroomRequirement::IncrementalStartup => INDEX_MIN_FREE_SPACE_BYTES,
         IndexStorageHeadroomRequirement::AuthoritativeLexicalRebuild => {
-            // An authoritative rebuild writes a *second* full lexical index (plus
-            // staged shard/merge scratch) while the existing one is still on
-            // disk, so the db bundle alone badly under-projects the requirement.
-            //
-            // Sizing this as `db_bundle * 2` (the pre-2026-07 formula) let a real
-            // rebuild run a filesystem to 0 bytes: on a host with a 25 GB db and a
-            // 57 GB lexical index the check required 50 GB, passed against 113 GB
-            // free, then consumed ~115 GB and died on `disk I/O error (10)`.
-            // Counting the lexical index makes that case fail the preflight
-            // instead of failing mid-commit.
-            let db_bundle_bytes = database_bundle_size_bytes(db_path);
-            let lexical_bytes = lexical_index_size_bytes(data_dir);
-            let projected = db_bundle_bytes
-                .saturating_mul(2)
-                .saturating_add(lexical_bytes.saturating_mul(2));
-            INDEX_MIN_FREE_SPACE_BYTES.max(projected)
+            full_rebuild_headroom_projection(data_dir, db_path).required_bytes
         }
+    }
+}
+
+/// Human-readable statement of the full-rebuild headroom rule, reported by
+/// `doctor` next to the numbers so an agent can see *why* a rebuild is
+/// blocked. Keep in sync with [`full_rebuild_headroom_projection`].
+pub(crate) const FULL_REBUILD_HEADROOM_FORMULA: &str =
+    "max(512 MiB, db_bundle_bytes * 2 + lexical_index_bytes * 2)";
+
+/// The inputs and result of the full-rebuild headroom rule, so `doctor` can
+/// report the same requirement `index --full` / `--force-rebuild` enforces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FullRebuildHeadroomProjection {
+    /// Bytes that must be free at every probe path for the rebuild to start.
+    pub(crate) required_bytes: u64,
+    /// The absolute floor (`INDEX_MIN_FREE_SPACE_BYTES`).
+    pub(crate) floor_bytes: u64,
+    /// `agent_search.db` plus its `-wal`/`-shm` sidecars.
+    pub(crate) db_bundle_bytes: u64,
+    /// On-disk size of the lexical (Tantivy) index tree.
+    pub(crate) lexical_index_bytes: u64,
+}
+
+/// Single source of truth for the authoritative (full) rebuild headroom rule.
+///
+/// An authoritative rebuild writes a *second* full lexical index (plus staged
+/// shard/merge scratch) while the existing one is still on disk, so the db
+/// bundle alone badly under-projects the requirement.
+///
+/// Sizing this as `db_bundle * 2` (the pre-2026-07 formula) let a real
+/// rebuild run a filesystem to 0 bytes: on a host with a 25 GB db and a
+/// 57 GB lexical index the check required 50 GB, passed against 113 GB
+/// free, then consumed ~115 GB and died on `disk I/O error (10)`.
+/// Counting the lexical index makes that case fail the preflight
+/// instead of failing mid-commit.
+pub(crate) fn full_rebuild_headroom_projection(
+    data_dir: &Path,
+    db_path: &Path,
+) -> FullRebuildHeadroomProjection {
+    let db_bundle_bytes = database_bundle_size_bytes(db_path);
+    let lexical_index_bytes = lexical_index_size_bytes(data_dir);
+    let projected = db_bundle_bytes
+        .saturating_mul(2)
+        .saturating_add(lexical_index_bytes.saturating_mul(2));
+    FullRebuildHeadroomProjection {
+        required_bytes: INDEX_MIN_FREE_SPACE_BYTES.max(projected),
+        floor_bytes: INDEX_MIN_FREE_SPACE_BYTES,
+        db_bundle_bytes,
+        lexical_index_bytes,
     }
 }
 

@@ -1770,6 +1770,10 @@ fn doctor_check_json_reports_read_only_truth_surface_without_writes() {
         "/semantic",
         "/derived_semantic_assets",
         "/storage_pressure",
+        "/storage_pressure/full_rebuild_readiness/status",
+        "/storage_pressure/full_rebuild_readiness/required_bytes",
+        "/storage_pressure/full_rebuild_readiness/available_bytes",
+        "/storage_pressure/full_rebuild_readiness/formula",
         "/check_scope/skipped_expensive_collectors",
         "/checks",
     ] {
@@ -1778,6 +1782,34 @@ fn doctor_check_json_reports_read_only_truth_surface_without_writes() {
             "doctor check JSON missing {pointer}: {payload:#}"
         );
     }
+    // GH#442: doctor answers the predicate `index --full` refuses on, with
+    // the same numbers the indexer's preflight names, in JSON and as a
+    // check line.
+    let readiness = &payload["storage_pressure"]["full_rebuild_readiness"];
+    assert!(
+        matches!(
+            readiness["status"].as_str(),
+            Some("ready" | "blocked" | "unknown")
+        ),
+        "unexpected full_rebuild_readiness status: {readiness:#}"
+    );
+    assert!(
+        readiness["required_bytes"]
+            .as_u64()
+            .is_some_and(|required| required >= 512 * 1024 * 1024),
+        "full rebuild requirement must honour the 512 MiB floor: {readiness:#}"
+    );
+    assert!(
+        payload["checks"]
+            .as_array()
+            .is_some_and(|checks| checks.iter().any(|check| {
+                check["name"].as_str() == Some("full_rebuild_readiness")
+                    && check["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("Full rebuild"))
+            })),
+        "doctor check must report full-rebuild readiness as a check line: {payload:#}"
+    );
     assert!(
         payload["check_scope"]["skipped_expensive_collectors"]
             .as_array()

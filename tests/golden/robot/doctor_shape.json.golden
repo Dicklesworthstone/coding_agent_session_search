@@ -1392,6 +1392,53 @@
         "low_disk_risk": {
           "type": "string"
         },
+        "full_rebuild_readiness": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string"
+            },
+            "enforced": {
+              "type": "boolean"
+            },
+            "formula": {
+              "type": "string"
+            },
+            "required_bytes": {
+              "type": "integer"
+            },
+            "floor_bytes": {
+              "type": "integer"
+            },
+            "db_bundle_bytes": {
+              "type": "integer"
+            },
+            "lexical_index_bytes": {
+              "type": "integer"
+            },
+            "available_bytes": {
+              "type": "integer"
+            },
+            "shortfall_bytes": {
+              "type": "integer"
+            },
+            "probe_path": {
+              "type": "string"
+            },
+            "probe_paths": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "notes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
         "total_accounted_bytes": {
           "type": "integer"
         },

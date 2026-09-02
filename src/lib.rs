@@ -35801,6 +35801,11 @@ enum DoctorAnomaly {
     InterruptedRepair,
     LockContention,
     StoragePressure,
+    /// GH#442: an authoritative rebuild (`index --full` / `--force-rebuild`)
+    /// would be refused by the indexer's disk-headroom preflight. Nothing is
+    /// degraded or at risk; the host cannot currently host a second lexical
+    /// index next to the archive.
+    FullRebuildHeadroom,
     ConfigExclusionRisk,
     BackupUnverified,
     BackupStale,
@@ -36186,6 +36191,21 @@ const DOCTOR_ANOMALY_POLICY_TABLE: &[DoctorAnomalyPolicy] = &[
         recommended_action: "free-space-without-deleting-archive-evidence",
     },
     DoctorAnomalyPolicy {
+        // A blocked full rebuild is a capacity fact, not a health defect:
+        // incremental indexing and search keep working, nothing is lost, and
+        // the indexer already refuses before writing. Health stays `healthy`
+        // (risk `low` via the warn), and the numbers live in
+        // `storage_pressure.full_rebuild_readiness`.
+        anomaly_class: DoctorAnomaly::FullRebuildHeadroom,
+        health_class: DoctorHealth::Healthy,
+        severity: DoctorSeverity::Warn,
+        affected_asset_class: DoctorAssetClass::DerivedLexicalIndex,
+        data_loss_risk: DoctorDataLossRisk::None,
+        default_outcome_kind: DoctorRepairOutcomeKind::Blocked,
+        safe_for_auto_repair: false,
+        recommended_action: "free-disk-headroom-before-full-rebuild",
+    },
+    DoctorAnomalyPolicy {
         anomaly_class: DoctorAnomaly::ConfigExclusionRisk,
         health_class: DoctorHealth::SourceAuthorityUnsafe,
         severity: DoctorSeverity::Warn,
@@ -36439,6 +36459,7 @@ fn doctor_anomaly_for_check(name: &str, status: &str, message: &str) -> DoctorAn
     match name {
         "data_directory" => DoctorAnomaly::StoragePressure,
         "storage_pressure" => DoctorAnomaly::StoragePressure,
+        "full_rebuild_readiness" => DoctorAnomaly::FullRebuildHeadroom,
         "lock_file" => DoctorAnomaly::LockContention,
         "operation_state" => {
             if message.contains("interrupted") {
@@ -36588,7 +36609,7 @@ fn doctor_safe_auto_manual_next_command(check: &DoctorCheckReport) -> &'static s
             "cass doctor archive-scan --json"
         }
         "candidate_staging" | "coverage_comparison_gate" => "cass doctor repair --dry-run --json",
-        "storage_pressure" => "cass doctor cleanup --json",
+        "storage_pressure" | "full_rebuild_readiness" => "cass doctor cleanup --json",
         _ => "cass doctor check --json",
     }
 }
@@ -36925,7 +36946,7 @@ fn doctor_incident_kind_for_check(
         }
         DoctorAnomaly::LockContention => DoctorIncidentRootCauseKind::ActiveLockBlockingRepair,
         DoctorAnomaly::InterruptedRepair => DoctorIncidentRootCauseKind::InterruptedRepairState,
-        DoctorAnomaly::StoragePressure => {
+        DoctorAnomaly::StoragePressure | DoctorAnomaly::FullRebuildHeadroom => {
             DoctorIncidentRootCauseKind::StoragePressureDerivedCleanupAvailable
         }
         DoctorAnomaly::ConfigExclusionRisk => DoctorIncidentRootCauseKind::BackupExclusionRisk,
@@ -41611,6 +41632,10 @@ struct DoctorStoragePressureReport {
     available_bytes: Option<u64>,
     min_recommended_free_bytes: u64,
     low_disk_risk: String,
+    /// GH#442: whether an authoritative rebuild (`cass index --full` /
+    /// `--force-rebuild`) would pass the indexer's disk-headroom preflight,
+    /// computed by the indexer's own rule against the same probe paths.
+    full_rebuild_readiness: DoctorFullRebuildReadinessReport,
     total_accounted_bytes: u64,
     reclaimable_derived_bytes: u64,
     precious_evidence_bytes: u64,
@@ -41923,6 +41948,7 @@ fn build_doctor_storage_pressure_report(
     probe_path: PathBuf,
     available_space: io::Result<u64>,
     used_test_override: bool,
+    full_rebuild_readiness: DoctorFullRebuildReadinessReport,
 ) -> DoctorStoragePressureReport {
     let (bytes_by_class, classification_warnings) = doctor_collect_storage_bytes_by_class(data_dir);
     let mut total_accounted_bytes = 0_u64;
@@ -42014,6 +42040,9 @@ fn build_doctor_storage_pressure_report(
                 .to_string(),
         );
     }
+    if let Some(note) = full_rebuild_readiness.notes.first() {
+        notes.push(note.clone());
+    }
 
     let recommended_action = doctor_storage_pressure_action(
         &low_disk_risk,
@@ -42022,13 +42051,14 @@ fn build_doctor_storage_pressure_report(
     );
 
     DoctorStoragePressureReport {
-        schema_version: 2,
+        schema_version: 3,
         status,
         data_dir_exists: data_dir.exists(),
         probe_path: probe_path.display().to_string(),
         available_bytes,
         min_recommended_free_bytes: DOCTOR_STORAGE_MIN_FREE_BYTES,
         low_disk_risk,
+        full_rebuild_readiness,
         total_accounted_bytes,
         reclaimable_derived_bytes,
         precious_evidence_bytes,
@@ -42046,11 +42076,182 @@ fn build_doctor_storage_pressure_report(
     }
 }
 
-fn collect_doctor_storage_pressure(data_dir: &Path) -> DoctorStoragePressureReport {
+fn collect_doctor_storage_pressure(data_dir: &Path, db_path: &Path) -> DoctorStoragePressureReport {
     let probe_path = doctor_storage_probe_path(data_dir);
     let used_test_override = dotenvy::var(CASS_TEST_DOCTOR_STORAGE_AVAILABLE_BYTES).is_ok();
     let available_space = doctor_available_space(&probe_path);
-    build_doctor_storage_pressure_report(data_dir, probe_path, available_space, used_test_override)
+    let full_rebuild_readiness = collect_doctor_full_rebuild_readiness(data_dir, db_path);
+    build_doctor_storage_pressure_report(
+        data_dir,
+        probe_path,
+        available_space,
+        used_test_override,
+        full_rebuild_readiness,
+    )
+}
+
+/// GH#442: the answer to the predicate `cass index --full` refuses on.
+///
+/// `index --full` / `--force-rebuild` runs the indexer's authoritative-rebuild
+/// headroom preflight and, when it refuses, tells the user to run
+/// `cass doctor check --json`. Doctor's general `storage_pressure.status`
+/// only compares free space against a 1 GiB floor, so it could say `ok`
+/// seconds after the indexer refused with a 200 GB requirement. This block
+/// reports the requirement by the indexer's own rule
+/// ([`indexer::full_rebuild_headroom_projection`]) against the indexer's own
+/// probe paths ([`indexer::existing_headroom_probe_paths`]), so the two
+/// surfaces cannot disagree.
+#[derive(Debug, Clone, Serialize)]
+struct DoctorFullRebuildReadinessReport {
+    /// `ready` (every probe path has at least `required_bytes` free),
+    /// `blocked` (at least one does not), or `unknown` (a probe failed).
+    status: String,
+    /// `false` when `CASS_INDEX_SKIP_DISK_HEADROOM_CHECK` is set: the indexer
+    /// would skip this preflight, so a `blocked` verdict is advisory only.
+    enforced: bool,
+    /// The rule, stated for humans and agents reading the numbers.
+    formula: String,
+    required_bytes: u64,
+    floor_bytes: u64,
+    db_bundle_bytes: u64,
+    lexical_index_bytes: u64,
+    /// Free bytes at the most constrained probe path (`None` when unknown).
+    available_bytes: Option<u64>,
+    /// `required_bytes - available_bytes` when blocked, else 0.
+    shortfall_bytes: u64,
+    /// The probe path that decided the verdict (least free space, or the
+    /// first one that failed to probe).
+    probe_path: String,
+    /// Every path the indexer's preflight probes, in its order.
+    probe_paths: Vec<String>,
+    notes: Vec<String>,
+}
+
+fn collect_doctor_full_rebuild_readiness(
+    data_dir: &Path,
+    db_path: &Path,
+) -> DoctorFullRebuildReadinessReport {
+    let projection = crate::indexer::full_rebuild_headroom_projection(data_dir, db_path);
+    let probes: Vec<(PathBuf, io::Result<u64>)> =
+        crate::indexer::existing_headroom_probe_paths(data_dir, db_path)
+            .into_iter()
+            .map(|path| {
+                let available = doctor_available_space(&path);
+                (path, available)
+            })
+            .collect();
+    build_doctor_full_rebuild_readiness(
+        projection,
+        probes,
+        !crate::indexer::index_disk_headroom_check_disabled(),
+    )
+}
+
+fn build_doctor_full_rebuild_readiness(
+    projection: crate::indexer::FullRebuildHeadroomProjection,
+    probes: Vec<(PathBuf, io::Result<u64>)>,
+    enforced: bool,
+) -> DoctorFullRebuildReadinessReport {
+    let required_bytes = projection.required_bytes;
+    let probe_paths: Vec<String> = probes
+        .iter()
+        .map(|(path, _)| path.display().to_string())
+        .collect();
+
+    // Mirror the indexer: the first probe that fails is an error, otherwise
+    // the verdict is decided by the path with the least free space.
+    let mut failed: Option<(String, String)> = None;
+    let mut tightest: Option<(String, u64)> = None;
+    for (path, available) in probes {
+        match available {
+            Ok(bytes) => {
+                if tightest.as_ref().is_none_or(|(_, best)| bytes < *best) {
+                    tightest = Some((path.display().to_string(), bytes));
+                }
+            }
+            Err(err) => {
+                if failed.is_none() {
+                    failed = Some((path.display().to_string(), err.to_string()));
+                }
+                break;
+            }
+        }
+    }
+
+    let (status, available_bytes, shortfall_bytes, probe_path, mut notes) = match (failed, tightest)
+    {
+        (Some((path, err)), _) => (
+            "unknown",
+            None,
+            0,
+            path.clone(),
+            vec![format!(
+                "Full-rebuild readiness is unknown: free-space probing failed at {path}: {err}"
+            )],
+        ),
+        (None, Some((path, available))) => {
+            let shortfall = required_bytes.saturating_sub(available);
+            if shortfall == 0 {
+                (
+                    "ready",
+                    Some(available),
+                    0,
+                    path.clone(),
+                    // No live free-space figure here: this note is part of
+                    // the doctor robot goldens, and the number lives in
+                    // `available_bytes` (which the goldens scrub).
+                    vec![format!(
+                        "A full rebuild (cass index --full / --force-rebuild) needs {required_bytes} bytes free at {path}, and the free space there covers it, so the indexer's headroom preflight would pass."
+                    )],
+                )
+            } else {
+                (
+                    "blocked",
+                    Some(available),
+                    shortfall,
+                    path.clone(),
+                    vec![format!(
+                        "A full rebuild (cass index --full / --force-rebuild) needs {required_bytes} bytes free at {path}; {available} bytes are available ({shortfall} bytes short), so the indexer's headroom preflight would refuse. Incremental indexing is unaffected by this verdict."
+                    )],
+                )
+            }
+        }
+        (None, None) => (
+            "unknown",
+            None,
+            0,
+            String::new(),
+            vec!["Full-rebuild readiness is unknown: no probe path was available.".to_string()],
+        ),
+    };
+    notes.push(format!(
+        "Requirement is {}: db bundle {} bytes, lexical index {} bytes, floor {} bytes.",
+        crate::indexer::FULL_REBUILD_HEADROOM_FORMULA,
+        projection.db_bundle_bytes,
+        projection.lexical_index_bytes,
+        projection.floor_bytes
+    ));
+    if !enforced {
+        notes.push(
+            "CASS_INDEX_SKIP_DISK_HEADROOM_CHECK is set, so the indexer would skip this preflight; the verdict is advisory."
+                .to_string(),
+        );
+    }
+
+    DoctorFullRebuildReadinessReport {
+        status: status.to_string(),
+        enforced,
+        formula: crate::indexer::FULL_REBUILD_HEADROOM_FORMULA.to_string(),
+        required_bytes,
+        floor_bytes: projection.floor_bytes,
+        db_bundle_bytes: projection.db_bundle_bytes,
+        lexical_index_bytes: projection.lexical_index_bytes,
+        available_bytes,
+        shortfall_bytes,
+        probe_path,
+        probe_paths,
+        notes,
+    }
 }
 
 fn doctor_config_exclusion_targets(
@@ -54817,6 +55018,7 @@ fn run_doctor_emit_capabilities(structured_format: Option<RobotFormat>) -> CliRe
             {"name": "repair_failure_marker", "kind": "meta", "since_pass": 0, "auto_fixable": false},
             {"name": "data_directory", "kind": "filesystem", "since_pass": 0, "auto_fixable": true},
             {"name": "storage_pressure", "kind": "resource", "since_pass": 0, "auto_fixable": false},
+            {"name": "full_rebuild_readiness", "kind": "resource", "since_pass": 0, "auto_fixable": false},
             {"name": "stale_lock", "kind": "lock-state", "since_pass": 0, "auto_fixable": true},
             {"name": "database", "kind": "integrity", "since_pass": 0, "auto_fixable": true},
             {"name": "database_schema", "kind": "integrity", "since_pass": 0, "auto_fixable": true},
@@ -57253,7 +57455,7 @@ fn build_doctor_baseline_snapshot(
     let coverage_risk = doctor_coverage_risk_summary(&coverage_summary, sole_copy_warnings.len());
     let source_authority =
         build_doctor_source_authority_report(db_path, &source_inventory, &raw_mirror);
-    let storage_pressure = collect_doctor_storage_pressure(data_dir);
+    let storage_pressure = collect_doctor_storage_pressure(data_dir, db_path);
     let config_exclusion_risks =
         collect_doctor_config_exclusion_risks(data_dir, db_path, &config_path, &sources_path);
     let candidate_staging = collect_doctor_candidate_staging_report(data_dir, db_path, &index_path);
@@ -67369,6 +67571,7 @@ mod doctor_asset_taxonomy_tests {
         DoctorAnomaly::InterruptedRepair,
         DoctorAnomaly::LockContention,
         DoctorAnomaly::StoragePressure,
+        DoctorAnomaly::FullRebuildHeadroom,
         DoctorAnomaly::ConfigExclusionRisk,
         DoctorAnomaly::BackupUnverified,
         DoctorAnomaly::BackupStale,
@@ -86900,7 +87103,7 @@ pub(crate) fn run_doctor_impl(
     }
 
     let storage_pressure_started = Instant::now();
-    let storage_pressure = collect_doctor_storage_pressure(&data_dir);
+    let storage_pressure = collect_doctor_storage_pressure(&data_dir, &db_path);
     doctor_push_timing_span(
         &mut timing_spans,
         "storage_pressure",
@@ -86945,6 +87148,49 @@ pub(crate) fn run_doctor_impl(
                 false
             );
         }
+    }
+    // GH#442: answer the predicate `index --full` refuses on, as its own
+    // check line so the human output shows it next to the general
+    // storage-pressure verdict. A blocked rebuild is a warning, never a
+    // failure: incremental indexing and search keep working without it.
+    {
+        let readiness = &storage_pressure.full_rebuild_readiness;
+        let (status, message) = match readiness.status.as_str() {
+            // The pass message carries no live free-space figure (it feeds
+            // the event-log hash chain in the robot goldens); the number is
+            // in storage_pressure.full_rebuild_readiness.available_bytes.
+            "ready" => (
+                "pass",
+                format!(
+                    "Full rebuild ready: {} bytes required at {} and free space covers it",
+                    readiness.required_bytes, readiness.probe_path
+                ),
+            ),
+            "blocked" => (
+                "warn",
+                format!(
+                    "Full rebuild blocked by disk headroom: {} bytes required, {} bytes available at {} ({} bytes short){}",
+                    readiness.required_bytes,
+                    readiness.available_bytes.unwrap_or(0),
+                    readiness.probe_path,
+                    readiness.shortfall_bytes,
+                    if readiness.enforced {
+                        ""
+                    } else {
+                        "; CASS_INDEX_SKIP_DISK_HEADROOM_CHECK is set, so the indexer would not enforce this"
+                    }
+                ),
+            ),
+            _ => (
+                "warn",
+                readiness
+                    .notes
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "Full-rebuild readiness was not checked".to_string()),
+            ),
+        };
+        add_check!("full_rebuild_readiness", status, message, false);
     }
 
     // 2. Check for stale lock files
@@ -98907,9 +99153,25 @@ mod response_schema_tests {
         write_storage_fixture_file(root, "index/live/shard", 17);
         write_storage_fixture_file(root, "index/generation-quarantined/manifest.json", 19);
 
-        let report = build_doctor_storage_pressure_report(root, root.to_path_buf(), Ok(1024), true);
+        let report = build_doctor_storage_pressure_report(
+            root,
+            root.to_path_buf(),
+            Ok(1024),
+            true,
+            test_full_rebuild_readiness(root, 1024),
+        );
 
-        assert_eq!(report.schema_version, 2);
+        assert_eq!(report.schema_version, 3);
+        assert_eq!(report.full_rebuild_readiness.status, "blocked");
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note
+                    .contains("A full rebuild (cass index --full / --force-rebuild) needs")),
+            "storage notes should carry the full-rebuild readiness verdict: {:?}",
+            report.notes
+        );
         assert_eq!(report.status, "warn");
         assert_eq!(report.low_disk_risk, "low_free_space");
         assert_eq!(report.total_accounted_bytes, 77);
@@ -98966,6 +99228,7 @@ mod response_schema_tests {
             link_root.clone(),
             Ok(DOCTOR_STORAGE_MIN_FREE_BYTES),
             false,
+            test_full_rebuild_readiness(&link_root, DOCTOR_STORAGE_MIN_FREE_BYTES),
         );
 
         assert!(report.data_dir_exists);
@@ -98975,6 +99238,185 @@ mod response_schema_tests {
                 .reclaimable_bytes_by_class
                 .contains_key("bookmark_store"),
             "bookmarks are user state and must not become reclaimable through a symlinked root"
+        );
+    }
+
+    fn test_full_rebuild_readiness(
+        root: &Path,
+        available_bytes: u64,
+    ) -> DoctorFullRebuildReadinessReport {
+        let db_path = root.join("agent_search.db");
+        build_doctor_full_rebuild_readiness(
+            crate::indexer::full_rebuild_headroom_projection(root, &db_path),
+            vec![(root.to_path_buf(), Ok(available_bytes))],
+            true,
+        )
+    }
+
+    /// GH#442: doctor's full-rebuild readiness must be the indexer's own
+    /// rule and probe paths, not a parallel approximation.
+    #[test]
+    fn doctor_full_rebuild_readiness_uses_the_indexer_rule_and_probe_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        write_storage_fixture_file(root, "agent_search.db", 5);
+        write_storage_fixture_file(root, "agent_search.db-wal", 3);
+        write_storage_fixture_file(root, "index/live/shard", 17);
+        let db_path = root.join("agent_search.db");
+
+        let projection = crate::indexer::full_rebuild_headroom_projection(root, &db_path);
+        assert_eq!(projection.db_bundle_bytes, 8, "db + wal sidecar");
+        assert_eq!(projection.lexical_index_bytes, 17);
+        assert_eq!(projection.floor_bytes, 512 * 1024 * 1024);
+        assert_eq!(
+            projection.required_bytes, projection.floor_bytes,
+            "2*8 + 2*17 is below the floor, so the floor applies"
+        );
+        let probe_paths = crate::indexer::existing_headroom_probe_paths(root, &db_path);
+        assert_eq!(
+            probe_paths,
+            vec![root.to_path_buf()],
+            "data dir and db parent are the same path and must be probed once"
+        );
+
+        let required = projection.required_bytes;
+        let ready = build_doctor_full_rebuild_readiness(
+            projection,
+            vec![(root.to_path_buf(), Ok(required))],
+            true,
+        );
+        assert_eq!(ready.status, "ready");
+        assert!(ready.enforced);
+        assert_eq!(ready.required_bytes, required);
+        assert_eq!(ready.available_bytes, Some(required));
+        assert_eq!(ready.shortfall_bytes, 0);
+        assert_eq!(ready.probe_path, root.display().to_string());
+        assert_eq!(ready.probe_paths, vec![root.display().to_string()]);
+        assert_eq!(ready.formula, crate::indexer::FULL_REBUILD_HEADROOM_FORMULA);
+        assert!(
+            ready.notes[0].contains("would pass"),
+            "ready note should say the preflight passes: {:?}",
+            ready.notes
+        );
+
+        // The tightest probe path decides, exactly as the indexer's loop does.
+        let other = root.join("elsewhere");
+        let blocked = build_doctor_full_rebuild_readiness(
+            projection,
+            vec![
+                (root.to_path_buf(), Ok(required + 1)),
+                (other.clone(), Ok(required - 10)),
+            ],
+            true,
+        );
+        assert_eq!(blocked.status, "blocked");
+        assert_eq!(blocked.available_bytes, Some(required - 10));
+        assert_eq!(blocked.shortfall_bytes, 10);
+        assert_eq!(blocked.probe_path, other.display().to_string());
+        assert_eq!(blocked.probe_paths.len(), 2);
+        assert!(
+            blocked.notes[0].contains("10 bytes short")
+                && blocked.notes[0].contains("would refuse"),
+            "blocked note should name the shortfall: {:?}",
+            blocked.notes
+        );
+
+        let unknown = build_doctor_full_rebuild_readiness(
+            projection,
+            vec![(root.to_path_buf(), Err(io::Error::other("probe failed")))],
+            true,
+        );
+        assert_eq!(unknown.status, "unknown");
+        assert_eq!(unknown.available_bytes, None);
+        assert_eq!(unknown.shortfall_bytes, 0);
+        assert!(unknown.notes[0].contains("probe failed"));
+
+        let advisory = build_doctor_full_rebuild_readiness(
+            projection,
+            vec![(root.to_path_buf(), Ok(0))],
+            false,
+        );
+        assert_eq!(advisory.status, "blocked");
+        assert!(!advisory.enforced);
+        assert!(
+            advisory
+                .notes
+                .iter()
+                .any(|note| note.contains("CASS_INDEX_SKIP_DISK_HEADROOM_CHECK")),
+            "advisory verdict must say the indexer would not enforce it: {:?}",
+            advisory.notes
+        );
+
+        // The check line classifies as its own anomaly: a warning that keeps
+        // doctor healthy and carries no data-loss risk.
+        let check = doctor_check_report(
+            "full_rebuild_readiness",
+            "warn",
+            "Full rebuild blocked by disk headroom",
+            false,
+            false,
+        );
+        assert_eq!(check.anomaly_class, DoctorAnomaly::FullRebuildHeadroom);
+        assert_eq!(check.health_class, DoctorHealth::Healthy);
+        assert_eq!(check.data_loss_risk, DoctorDataLossRisk::None);
+        assert!(!check.safe_for_auto_repair);
+        assert_eq!(
+            doctor_check_report("full_rebuild_readiness", "pass", "ready", false, false)
+                .anomaly_class,
+            DoctorAnomaly::Healthy
+        );
+    }
+
+    /// GH#442 reproduction shape: a 100 GiB (sparse) archive projects a
+    /// 200 GiB requirement, and doctor reports it blocked against the free
+    /// space the indexer's refusal named, even though the 1 GiB general
+    /// pressure floor is satisfied.
+    #[test]
+    fn doctor_full_rebuild_readiness_reports_the_indexer_refusal_numbers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let db_path = root.join("agent_search.db");
+        let db = std::fs::File::create(&db_path).expect("create sparse db");
+        db.set_len(100 * 1024 * 1024 * 1024)
+            .expect("extend sparse db");
+        drop(db);
+
+        let projection = crate::indexer::full_rebuild_headroom_projection(root, &db_path);
+        assert_eq!(projection.required_bytes, 214_748_364_800);
+
+        let available = 45_252_415_488_u64;
+        let report = build_doctor_storage_pressure_report(
+            root,
+            root.to_path_buf(),
+            Ok(available),
+            true,
+            build_doctor_full_rebuild_readiness(
+                projection,
+                vec![(root.to_path_buf(), Ok(available))],
+                true,
+            ),
+        );
+        assert_eq!(report.status, "ok", "general pressure floor is satisfied");
+        assert_eq!(report.low_disk_risk, "none");
+        let readiness = &report.full_rebuild_readiness;
+        assert_eq!(readiness.status, "blocked");
+        assert_eq!(readiness.required_bytes, 214_748_364_800);
+        assert_eq!(readiness.available_bytes, Some(available));
+        assert_eq!(readiness.shortfall_bytes, 214_748_364_800 - available);
+
+        let json = serde_json::to_value(&report).expect("serialize storage pressure");
+        assert_eq!(json["schema_version"], 3);
+        assert_eq!(
+            json["full_rebuild_readiness"]["status"].as_str(),
+            Some("blocked")
+        );
+        assert_eq!(
+            json["full_rebuild_readiness"]["required_bytes"].as_u64(),
+            Some(214_748_364_800)
+        );
+        assert_eq!(
+            json["full_rebuild_readiness"]["formula"].as_str(),
+            Some(crate::indexer::FULL_REBUILD_HEADROOM_FORMULA)
         );
     }
 
