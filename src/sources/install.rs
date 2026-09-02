@@ -361,10 +361,14 @@ impl RemoteInstaller {
         Ok(())
     }
 
-    /// Choose the best installation method based on system info.
+    /// Every installation method this host can attempt, fastest first.
     ///
-    /// Returns `None` if no viable installation method is available.
-    pub fn choose_method(&self) -> Option<InstallMethod> {
+    /// [`Self::install`] walks this list and falls through on failure — the
+    /// chain the module documentation promised, which `choose_method` alone
+    /// never delivered (reality check 2026-09-01, WS-G.1: one failed
+    /// `cargo-binstall` used to end the whole install).
+    pub fn candidate_methods(&self) -> Vec<InstallMethod> {
+        let mut methods = Vec::new();
         // 1. Try cargo-binstall first when source fallback is safe and the
         // binary fast path is compatible with the remote. On known old glibc
         // Linux distros, binstall can fetch the same incompatible release
@@ -373,7 +377,7 @@ impl RemoteInstaller {
             && self.can_compile().is_ok()
             && self.prebuilt_binary_fast_path_is_safe()
         {
-            return Some(InstallMethod::CargoBinstall);
+            methods.push(InstallMethod::CargoBinstall);
         }
 
         // 2. Try pre-built binary if available, compatible, and backed by
@@ -382,24 +386,31 @@ impl RemoteInstaller {
         if let Some(url) = self.get_prebuilt_url() {
             let checksum = self.fetch_remote_prebuilt_checksum(&url);
             if let Some(method) = Self::verified_prebuilt_binary_method(url, checksum) {
-                return Some(method);
+                methods.push(method);
             }
         }
 
         // 3. Try cargo install if cargo is available and we have resources
         if self.system_info.has_cargo && self.can_compile().is_ok() {
-            return Some(InstallMethod::CargoInstall);
+            methods.push(InstallMethod::CargoInstall);
         }
 
         // 4. Full bootstrap installs rustup and then compiles from source, so
         // it needs the same compile resources as cargo install. Check before
         // mutating the remote with a new toolchain.
         if self.system_info.has_curl && self.can_compile().is_ok() {
-            return Some(InstallMethod::FullBootstrap);
+            methods.push(InstallMethod::FullBootstrap);
         }
 
-        // No viable method available
-        None
+        methods
+    }
+
+    /// Choose the best installation method based on system info: the first
+    /// entry of [`Self::candidate_methods`].
+    ///
+    /// Returns `None` if no viable installation method is available.
+    pub fn choose_method(&self) -> Option<InstallMethod> {
+        self.candidate_methods().into_iter().next()
     }
 
     fn prebuilt_binary_fast_path_is_safe(&self) -> bool {
@@ -631,55 +642,89 @@ impl RemoteInstaller {
 
         self.check_resources()?;
 
-        // Choose method
-        let method = self
-            .choose_method()
-            .ok_or(InstallError::NoMethodAvailable)?;
+        // Walk the documented chain: every viable method, fastest first, and
+        // fall through when one fails (WS-G.1). A failed cargo-binstall on a
+        // host that can compile is a slow install, not a failed setup.
+        let methods = self.candidate_methods();
+        if methods.is_empty() {
+            return Err(InstallError::NoMethodAvailable);
+        }
+        let total = methods.len();
+        let mut failures: Vec<String> = Vec::new();
+        let mut last_error: Option<InstallError> = None;
+        for (ordinal, method) in methods.into_iter().enumerate() {
+            on_progress(InstallProgress {
+                stage: InstallStage::Preparing,
+                message: if ordinal == 0 {
+                    format!("Selected installation method: {}", method)
+                } else {
+                    format!(
+                        "Falling back to installation method {} of {}: {}",
+                        ordinal + 1,
+                        total,
+                        method
+                    )
+                },
+                percent: Some(5),
+                elapsed: start.elapsed(),
+            });
 
-        on_progress(InstallProgress {
-            stage: InstallStage::Preparing,
-            message: format!("Selected installation method: {}", method),
-            percent: Some(5),
-            elapsed: start.elapsed(),
-        });
+            let result = match &method {
+                InstallMethod::CargoBinstall => self.install_via_binstall(&on_progress, start),
+                InstallMethod::PrebuiltBinary { url, checksum } => {
+                    self.install_via_binary(url, checksum.as_deref(), &on_progress, start)
+                }
+                InstallMethod::CargoInstall => self.install_via_cargo(&on_progress, start),
+                InstallMethod::FullBootstrap => self.install_with_bootstrap(&on_progress, start),
+            };
 
-        // Execute installation
-        let result = match &method {
-            InstallMethod::CargoBinstall => self.install_via_binstall(&on_progress, start),
-            InstallMethod::PrebuiltBinary { url, checksum } => {
-                self.install_via_binary(url, checksum.as_deref(), &on_progress, start)
-            }
-            InstallMethod::CargoInstall => self.install_via_cargo(&on_progress, start),
-            InstallMethod::FullBootstrap => self.install_with_bootstrap(&on_progress, start),
-        };
-
-        match result {
-            Ok(install_result) => {
-                on_progress(InstallProgress {
-                    stage: InstallStage::Complete,
-                    message: format!(
-                        "Installed cass {} via {} in {:.1}s",
-                        install_result.version,
-                        method,
-                        install_result.duration.as_secs_f64()
-                    ),
-                    percent: Some(100),
-                    elapsed: start.elapsed(),
-                });
-                Ok(install_result)
-            }
-            Err(e) => {
-                on_progress(InstallProgress {
-                    stage: InstallStage::Failed {
-                        error: e.to_string(),
-                    },
-                    message: format!("Installation failed: {}", e),
-                    percent: None,
-                    elapsed: start.elapsed(),
-                });
-                Err(e)
+            match result {
+                Ok(install_result) => {
+                    on_progress(InstallProgress {
+                        stage: InstallStage::Complete,
+                        message: format!(
+                            "Installed cass {} via {} in {:.1}s{}",
+                            install_result.version,
+                            method,
+                            install_result.duration.as_secs_f64(),
+                            if failures.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" (after {} failed attempt(s))", failures.len())
+                            }
+                        ),
+                        percent: Some(100),
+                        elapsed: start.elapsed(),
+                    });
+                    return Ok(install_result);
+                }
+                Err(e) => {
+                    failures.push(format!("{method}: {e}"));
+                    on_progress(InstallProgress {
+                        stage: InstallStage::Preparing,
+                        message: format!("Installation via {} failed: {}", method, e),
+                        percent: None,
+                        elapsed: start.elapsed(),
+                    });
+                    last_error = Some(e);
+                }
             }
         }
+
+        let error = last_error.unwrap_or(InstallError::NoMethodAvailable);
+        on_progress(InstallProgress {
+            stage: InstallStage::Failed {
+                error: error.to_string(),
+            },
+            message: format!(
+                "Installation failed after {} method(s): {}",
+                failures.len(),
+                failures.join("; ")
+            ),
+            percent: None,
+            elapsed: start.elapsed(),
+        });
+        Err(error)
     }
 
     /// Install via cargo-binstall.
@@ -1270,6 +1315,46 @@ mod tests {
         assert_eq!(
             installer.choose_method(),
             Some(InstallMethod::CargoBinstall)
+        );
+    }
+
+    /// WS-G.1: `install()` walks every viable method in order instead of
+    /// stopping at the first choice. Positive observable: a host with
+    /// binstall, cargo and curl yields the full chain, fastest first, and
+    /// `choose_method` is exactly its head. Planted negative: a host with no
+    /// viable method yields an empty chain, so `install()` reports
+    /// `NoMethodAvailable` without attempting anything. No-claim: the
+    /// fall-through on a real failed `cargo-binstall` is not executed here.
+    #[test]
+    fn candidate_methods_is_the_ordered_fallback_chain() {
+        // No curl/wget: the prebuilt branch (which would consult the release
+        // checksum over the network) and the bootstrap branch are excluded, so
+        // this stays a pure unit test.
+        let mut system = fixture_system_info();
+        system.has_cargo_binstall = true;
+        system.has_cargo = true;
+        system.has_curl = false;
+        system.has_wget = false;
+        let installer = RemoteInstaller::new("test", system, fixture_resources());
+        let chain = installer.candidate_methods();
+        assert_eq!(
+            chain,
+            vec![InstallMethod::CargoBinstall, InstallMethod::CargoInstall],
+            "fastest first, and cargo install stays available after a binstall failure"
+        );
+        assert_eq!(chain.first(), installer.choose_method().as_ref());
+
+        let mut bare = fixture_system_info();
+        bare.has_cargo_binstall = false;
+        bare.has_cargo = false;
+        bare.has_curl = false;
+        let installer = RemoteInstaller::new("test", bare, fixture_resources());
+        assert!(installer.candidate_methods().is_empty());
+        assert_eq!(installer.choose_method(), None);
+        let outcome = installer.install(|_| {});
+        assert!(
+            matches!(outcome, Err(InstallError::NoMethodAvailable)),
+            "an empty chain must not attempt an install: {outcome:?}"
         );
     }
 

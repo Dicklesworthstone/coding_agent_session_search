@@ -14,6 +14,9 @@ QUIET=0
 VERIFY=0
 QUICKSTART=0
 FROM_SOURCE=0
+# Linux prebuilt binaries are built on ubuntu-24.04 (frankensqlite needs the
+# newer kernel/libc surface); older glibc cannot load them. Probed below.
+MIN_GLIBC="2.38"
 CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
 ARTIFACT_URL="${ARTIFACT_URL:-}"
@@ -401,6 +404,33 @@ case "$TARGET" in
 esac
 
 # Prefer prebuilt artifact when we know the target or the caller supplied a direct URL.
+# glibc probe (WS-G.2): a prebuilt Linux binary on a host older than
+# MIN_GLIBC fails at load time with a linker error after a successful-looking
+# install. Detect it here and take the source route instead. An explicit
+# --artifact-url is honored as written (the operator asked for that file).
+host_glibc_version() {
+  ldd --version 2>/dev/null | head -n 1 | grep -o -E '[0-9]+\.[0-9]+' | tail -n 1
+}
+glibc_at_least() {
+  # $1 = required, $2 = host; true when host >= required (numeric major.minor)
+  req_major=${1%%.*}; req_minor=${1#*.}
+  host_major=${2%%.*}; host_minor=${2#*.}
+  [ "$host_major" -gt "$req_major" ] 2>/dev/null && return 0
+  [ "$host_major" -eq "$req_major" ] 2>/dev/null && [ "$host_minor" -ge "$req_minor" ] 2>/dev/null
+}
+if [ "$FROM_SOURCE" -eq 0 ] && [ -z "$ARTIFACT_URL" ]; then
+  case "$TARGET" in
+    linux-*musl*) : ;;
+    linux-*)
+      HOST_GLIBC=$(host_glibc_version)
+      if [ -n "$HOST_GLIBC" ] && ! glibc_at_least "$MIN_GLIBC" "$HOST_GLIBC"; then
+        warn "Host glibc ${HOST_GLIBC} is older than ${MIN_GLIBC}, which the prebuilt Linux binary requires; falling back to build-from-source (pass --artifact-url to force a prebuilt artifact)"
+        FROM_SOURCE=1
+      fi
+      ;;
+    *) : ;;
+  esac
+fi
 TAR=""
 URL=""
 if [ "$FROM_SOURCE" -eq 0 ]; then

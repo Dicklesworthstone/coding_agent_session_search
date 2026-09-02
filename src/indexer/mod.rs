@@ -6142,6 +6142,16 @@ fn commit_lexical_rebuild_progress(
         profile.commit_count = profile.commit_count.saturating_add(1);
         profile.commit_duration += started.elapsed();
     }
+    // GH #440 test hook: the engine commit above is the moment the published
+    // authority moves ahead of the durable checkpoint (written below). A
+    // process killed here leaves exactly the state #440 reported — a staging
+    // MANIFEST several conversations ahead of `.lexical-rebuild-state.json` —
+    // and the next plain `cass index` must resume through it, not exit 9.
+    maybe_pause_lexical_rebuild_after_commit_for_kill(
+        state_path,
+        rebuild_state.indexed_docs,
+        indexed_docs,
+    )?;
     let meta_fingerprint_started = perf_profile.as_ref().map(|_| Instant::now());
     let meta_fingerprint = index_meta_fingerprint(content_path)?;
     if let (Some(profile), Some(started)) = (perf_profile.as_mut(), meta_fingerprint_started) {
@@ -15769,8 +15779,9 @@ fn run_index_inner(
                     // the watch loop already runs. The merge is post-publish
                     // work with parked counters, so it runs under the
                     // finalize-class grace like the WAL checkpoint does.
-                    if scan_canonical_mutations.inserted_messages > 0
-                        || scan_canonical_mutations.inserted_conversations > 0
+                    if (scan_canonical_mutations.inserted_messages > 0
+                        || scan_canonical_mutations.inserted_conversations > 0)
+                        && !lexical_post_run_maintenance_skipped_for_test()
                     {
                         if let Some(progress) = opts.progress.as_ref() {
                             progress.finalizing.store(true, Ordering::Relaxed);
@@ -17205,6 +17216,18 @@ pub fn best_effort_abort_wal_checkpoint(data_dir: &Path) {
             );
         }
     }
+}
+
+/// Run one `wal_checkpoint(TRUNCATE)` on a fresh handle and report whether
+/// the WAL was actually truncated (`Ok(true)`) or left in place because a
+/// concurrent reader/writer pinned it (`Ok(false)`). For repair surfaces
+/// (`doctor --fix`, WS-B.5) that must tell the operator the truth about an
+/// oversized sidecar rather than claim a checkpoint that did not happen.
+pub(crate) fn checkpoint_wal_truncate(db_path: &Path, context: &str) -> Result<bool> {
+    Ok(matches!(
+        run_final_wal_checkpoint(db_path, context)?,
+        FinalWalCheckpointOutcome::Completed
+    ))
 }
 
 fn run_final_wal_checkpoint(db_path: &Path, context: &str) -> Result<FinalWalCheckpointOutcome> {
@@ -20424,6 +20447,66 @@ fn rename_lexical_publish_path(
     fs::rename(src, dst)
 }
 
+/// GH #441 test hook (tests/cli_index.rs): skip the post-run segment
+/// maintenance (`optimize_if_idle` after an incremental run, `force_merge`
+/// after a full rebuild) so a test can build a deliberately fragmented
+/// generation — the shape of a v0.7.1 archive — and then prove that an
+/// ordinary `cass index` consolidates it. Unset in production.
+fn lexical_post_run_maintenance_skipped_for_test() -> bool {
+    dotenvy::var("CASS_TEST_SKIP_POST_RUN_LEXICAL_MAINTENANCE")
+        .ok()
+        .is_some_and(|raw| matches!(raw.trim(), "1" | "true" | "yes"))
+}
+
+/// GH #440 test hook (tests/cli_index.rs): after the Nth staged engine commit
+/// (`CASS_TEST_LEXICAL_REBUILD_KILL_AFTER_COMMITS`, default 1), write a
+/// sentinel describing the authority/checkpoint gap the commit just opened
+/// and park so the test can SIGKILL the run inside that window. Unset in
+/// production: an absent sentinel path returns immediately.
+fn maybe_pause_lexical_rebuild_after_commit_for_kill(
+    state_path: &Path,
+    checkpoint_indexed_docs: usize,
+    committed_indexed_docs: usize,
+) -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    static COMMITS_SEEN: AtomicUsize = AtomicUsize::new(0);
+
+    let sentinel_path = match dotenvy::var("CASS_TEST_LEXICAL_REBUILD_KILL_AFTER_COMMIT_SENTINEL") {
+        Ok(raw) if !raw.trim().is_empty() => PathBuf::from(raw),
+        _ => return Ok(()),
+    };
+    let fire_on = dotenvy::var("CASS_TEST_LEXICAL_REBUILD_KILL_AFTER_COMMITS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1);
+    let seen = COMMITS_SEEN.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+    if seen != fire_on {
+        return Ok(());
+    }
+    let sleep_ms = dotenvy::var("CASS_TEST_LEXICAL_REBUILD_KILL_AFTER_COMMIT_SLEEP_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(30_000);
+    let payload = serde_json::json!({
+        "stage": "staged_commit_published_checkpoint_not_yet_written",
+        "pid": std::process::id(),
+        "commit_ordinal": seen,
+        "state_path": state_path.display().to_string(),
+        "checkpoint_indexed_docs": checkpoint_indexed_docs,
+        "committed_indexed_docs": committed_indexed_docs,
+    });
+    write_json_pretty_atomically(&sentinel_path, &payload).with_context(|| {
+        format!(
+            "writing lexical rebuild kill-after-commit sentinel {}",
+            sentinel_path.display()
+        )
+    })?;
+    thread::sleep(Duration::from_millis(sleep_ms));
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn maybe_pause_lexical_publish_for_kill_relaunch(
     index_path: &Path,
@@ -23538,16 +23621,23 @@ fn rebuild_tantivy_from_db_with_options(
         p.tick_activity();
     }
     let merge_started = Instant::now();
-    match t_index.force_merge() {
-        Ok(()) => tracing::info!(
-            merge_ms = merge_started.elapsed().as_millis() as u64,
+    if lexical_post_run_maintenance_skipped_for_test() {
+        tracing::warn!(
             segments = t_index.segment_count(),
-            "folded the rebuilt lexical generation before publish (#441)"
-        ),
-        Err(err) => tracing::warn!(
-            error = %format!("{err:#}"),
-            "segment merge after lexical rebuild failed; publishing the unmerged generation"
-        ),
+            "post-rebuild segment merge skipped by CASS_TEST_SKIP_POST_RUN_LEXICAL_MAINTENANCE (test hook)"
+        );
+    } else {
+        match t_index.force_merge() {
+            Ok(()) => tracing::info!(
+                merge_ms = merge_started.elapsed().as_millis() as u64,
+                segments = t_index.segment_count(),
+                "folded the rebuilt lexical generation before publish (#441)"
+            ),
+            Err(err) => tracing::warn!(
+                error = %format!("{err:#}"),
+                "segment merge after lexical rebuild failed; publishing the unmerged generation"
+            ),
+        }
     }
     if let Some(p) = &progress {
         p.tick_activity();

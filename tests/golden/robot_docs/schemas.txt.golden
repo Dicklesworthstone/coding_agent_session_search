@@ -405,6 +405,7 @@ schemas: (auto-generated from contract)
       - quarantined_conversations: integer
       - reason: ?
       - rebuilding: boolean
+      - segment_files: ?
       - stale: boolean
       - stale_threshold_seconds: integer
       - stalled: boolean
@@ -3001,6 +3002,7 @@ schemas: (auto-generated from contract)
         - quarantined_conversations: integer
         - reason: ?
         - rebuilding: boolean
+        - segment_files: ?
         - stale: boolean
         - stale_threshold_seconds: integer
         - stalled: boolean
@@ -3498,6 +3500,7 @@ schemas: (auto-generated from contract)
       - quarantined_conversations: integer
       - reason: ?
       - rebuilding: boolean
+      - segment_files: ?
       - stale: boolean
       - stale_threshold_seconds: integer
       - stalled: boolean
@@ -3887,6 +3890,7 @@ schemas: (auto-generated from contract)
       - quarantined_conversations: integer
       - reason: ?
       - rebuilding: boolean
+      - segment_files: ?
       - stale: boolean
       - stale_threshold_seconds: integer
       - stalled: boolean
@@ -4149,6 +4153,7 @@ schemas: (auto-generated from contract)
         - quarantined_conversations: integer
         - reason: ?
         - rebuilding: boolean
+        - segment_files: ?
         - stale: boolean
         - stale_threshold_seconds: integer
         - stalled: boolean

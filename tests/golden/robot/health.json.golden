@@ -378,6 +378,7 @@
       "engine_incompatible": false,
       "activity_at": null,
       "documents": null,
+      "segment_files": null,
       "empty_with_messages": false,
       "quarantined_conversations": 0,
       "fingerprint": {

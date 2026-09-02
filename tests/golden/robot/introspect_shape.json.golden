@@ -4241,6 +4241,17 @@
                             }
                           }
                         },
+                        "segment_files": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
                         "empty_with_messages": {
                           "type": "object",
                           "properties": {
@@ -54717,6 +54728,17 @@
                                     }
                                   }
                                 },
+                                "segment_files": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
                                 "empty_with_messages": {
                                   "type": "object",
                                   "properties": {
@@ -60486,6 +60508,17 @@
                                             }
                                           }
                                         },
+                                        "segment_files": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
                                         "empty_with_messages": {
                                           "type": "object",
                                           "properties": {
@@ -63088,6 +63121,17 @@
                           }
                         },
                         "documents": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        "segment_files": {
                           "type": "object",
                           "properties": {
                             "type": {
@@ -67568,6 +67612,17 @@
                             }
                           }
                         },
+                        "segment_files": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
                         "empty_with_messages": {
                           "type": "object",
                           "properties": {
@@ -71952,6 +72007,17 @@
                                   }
                                 },
                                 "documents": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "segment_files": {
                                   "type": "object",
                                   "properties": {
                                     "type": {

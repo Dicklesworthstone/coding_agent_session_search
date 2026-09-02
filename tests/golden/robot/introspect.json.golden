@@ -819,8 +819,23 @@
     {
       "name": "bookmarks",
       "description": "Save, list, search, remove, export, and import bookmarks (bookmarks.db)",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "robot-docs",
@@ -1057,7 +1072,7 @@
         },
         {
           "name": "highlight",
-          "description": "Highlight matching terms in output (uses **bold** markers in text, <mark> in HTML)",
+          "description": "Highlight matching terms in snippets with **bold** markers (text and JSON output)",
           "arg_type": "flag",
           "required": false,
           "enum_values": [
@@ -3415,8 +3430,23 @@
     {
       "name": "quarantine",
       "description": "Inspect and manage the conversation-ingest quarantine (list / clear)",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "forget",
@@ -3477,50 +3507,170 @@
     {
       "name": "mirror",
       "description": "Inspect and prune raw-mirror evidence under explicit operator control",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "sources",
       "description": "Manage remote sources (P5.x)",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "models",
       "description": "Manage semantic search models",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "fleet",
       "description": "Fleet-safe upgrade rehearsal and bounded post-upgrade verification",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "lessons",
       "description": "Mine and query durable lessons from local evidence (commits, beads, proofs)",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "swarm",
       "description": "Read-only swarm operations status, work packets, and coordination lint",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "import",
       "description": "Import data from external sources",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "analytics",
       "description": "Token usage, tool, and model analytics",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     },
     {
       "name": "release-verify",
@@ -3643,8 +3793,23 @@
     {
       "name": "schedule",
       "description": "Keep the index fresh automatically via the OS scheduler (launchd / systemd user timers)",
-      "arguments": [],
-      "has_json_output": false
+      "arguments": [
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
     }
   ],
   "response_schemas": {
@@ -5586,6 +5751,12 @@
               ]
             },
             "documents": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "segment_files": {
               "type": [
                 "integer",
                 "null"
@@ -29314,6 +29485,12 @@
                     "null"
                   ]
                 },
+                "segment_files": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
                 "empty_with_messages": {
                   "type": "boolean"
                 },
@@ -31823,6 +32000,12 @@
                         "null"
                       ]
                     },
+                    "segment_files": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
                     "empty_with_messages": {
                       "type": "boolean"
                     },
@@ -33024,6 +33207,12 @@
               ]
             },
             "documents": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "segment_files": {
               "type": [
                 "integer",
                 "null"
@@ -35100,6 +35289,12 @@
                 "null"
               ]
             },
+            "segment_files": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "empty_with_messages": {
               "type": "boolean"
             },
@@ -37145,6 +37340,12 @@
                   ]
                 },
                 "documents": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "segment_files": {
                   "type": [
                     "integer",
                     "null"

@@ -81,15 +81,19 @@ Recovery key slots use **HKDF-SHA256** for key derivation:
 
 ### Generating a Recovery Key
 
-Recovery keys are generated during archive creation or can be added later:
+A recovery key is generated when you ask for one in the interactive `cass pages`
+wizard (the "recovery key backup" step), or added later to an existing bundle:
 
 ```bash
-# During creation with wizard
-cass pages encrypt archive.db --with-recovery
+# During creation: run the wizard and accept the recovery-key step
+cass pages
 
-# Add to existing archive
-cass pages key add-recovery --archive ./archive
+# Add to an existing exported bundle (authenticates with the current password)
+cass pages key add-recovery --archive ./bundle
 ```
+
+`--archive` accepts the exported bundle root (the directory that contains `site/`)
+or the `site/` directory itself.
 
 ### Recovery Secret Format
 
@@ -101,45 +105,58 @@ Example: q7w8e9r0t1y2u3i4o5p6a7s8d9f0g1h2j3k4l5z6x7c8v9b0
 
 **Important:** Store this secret securely. Anyone with the recovery secret can decrypt the archive.
 
-### QR Code Generation
+### The Secret Is Shown Exactly Once
 
-Recovery secrets can be displayed as QR codes for offline backup:
-
-```bash
-cass pages key show-recovery --archive ./archive --qr
-```
-
-The QR code contains the base64url-encoded secret and can be scanned to restore access.
+The recovery secret is never written into the archive — only a wrapped copy of
+the data-encryption key that the secret can unwrap. cass therefore cannot show it
+again later: there is no "show recovery" command. The wizard prints it (and can
+render it as a QR code when the `qr` feature is built in) at creation, and
+`cass pages key add-recovery` prints it once on stdout. Save it before you close
+the terminal. If it is lost, add a new recovery slot with
+`cass pages key add-recovery` and revoke the old slot.
 
 ### Using a Recovery Key
 
-To unlock an archive with a recovery key:
+Recovery keys unlock the archive in the published viewer, not on the command line:
+open the archive page, choose "Use Recovery Key" on the unlock screen, and enter
+the secret exactly as saved. The bundle's generated `recovery.html` carries the
+same instructions for people who receive the link without this guide.
 
-```bash
-# Interactive
-cass pages decrypt ./archive
-
-# Programmatic (stdin)
-echo "base64url-secret-here" | cass pages decrypt ./archive --recovery-stdin
-```
+The `cass pages key …` commands authenticate with a *password*; a recovery
+secret cannot drive them. To regain command-line control of a bundle whose
+password is lost, see "Scenario: Forgotten Password" below.
 
 ---
 
 ## Multi-Key-Slot Operations
 
+All key commands take `--archive <bundle>`, `--json` (one JSON document on
+stdout, `success: true`, an `action` tag, and the engine's result fields), and
+`--password-stdin`. Passwords are never accepted on the command line. Without
+`--password-stdin`, a verb that needs a password prompts for it when stdin is a
+terminal and fails with exit 6 (`password-required`) otherwise.
+
+`--password-stdin` reads one password per line: the current password first, then
+the new password for `add-password` and `rotate`.
+
+Exit codes: 0 success · 1 the engine refused (wrong password, last slot, unsupported
+bundle) · 2 usage · 3 the path is not a pages bundle · 6 no password available.
+
 ### Listing Key Slots
 
+`list` never needs a password.
+
 ```bash
-cass pages key list --archive ./archive
+cass pages key list --archive ./bundle
+cass pages key list --archive ./bundle --json | jq '.active_slots'
 ```
 
 Output:
 ```
-Key Slots:
-  Slot 0: password (Argon2id)
-  Slot 1: recovery (HKDF-SHA256)
-
-Active slots: 2
+Key slots for /path/to/bundle/site
+  export id: …   active slots: 2   dek created: 2026-09-01T20:14:02Z
+  slot   0  password   kdf: argon2id
+  slot   1  recovery   kdf: hkdf-sha256
 ```
 
 ### Adding a Password Slot
@@ -147,47 +164,52 @@ Active slots: 2
 Add an additional password to an existing archive:
 
 ```bash
-cass pages key add-password --archive ./archive
-```
+# interactive: prompts for the current password, the new password, and a confirmation
+cass pages key add-password --archive ./bundle
 
-You'll be prompted for:
-1. Current password (to authenticate)
-2. New password (to add)
+# non-interactive
+printf '%s\n%s\n' "$CURRENT" "$NEW" | cass pages key add-password --archive ./bundle --password-stdin --json
+```
 
 ### Adding a Recovery Slot
 
 Add a recovery key to an existing archive:
 
 ```bash
-cass pages key add-recovery --archive ./archive
+cass pages key add-recovery --archive ./bundle
+printf '%s\n' "$CURRENT" | cass pages key add-recovery --archive ./bundle --password-stdin --json
 ```
 
-**Save the displayed recovery secret immediately.**
+**Save the displayed recovery secret immediately** (`recovery_secret` in the JSON
+document). It is shown once and is not stored.
 
 ### Revoking a Key Slot
 
 Remove a key slot:
 
 ```bash
-cass pages key revoke --archive ./archive --slot 1
+cass pages key revoke --archive ./bundle --slot 1
 ```
 
-**Constraints:**
-- Cannot revoke the last remaining slot
-- Cannot revoke the slot you're authenticating with
+**Constraints (enforced by the engine):**
+- Cannot revoke the last remaining slot — add another slot first
+- Cannot revoke the slot whose password you are authenticating with
+- Unknown slot ids are refused
 - Revoked slot IDs are never reused
 
 ### Key Rotation
 
-Full key rotation regenerates the DEK and re-encrypts all data:
+Full key rotation regenerates the DEK and re-encrypts all data under a new
+password; every previous slot is discarded:
 
 ```bash
-cass pages key rotate --archive ./archive
+cass pages key rotate --archive ./bundle
+printf '%s\n%s\n' "$CURRENT" "$NEW" | cass pages key rotate --archive ./bundle --password-stdin --keep-recovery --json
 ```
 
 Options:
-- `--keep-recovery`: Generate new recovery key after rotation
-- Default: Creates single password slot
+- `--keep-recovery`: also mint a new recovery secret for the rotated key (printed once)
+- Default: the rotated archive has a single password slot
 
 **When to rotate:**
 - Suspected key compromise
@@ -200,18 +222,21 @@ Options:
 
 ### Scenario: Forgotten Password
 
-If you have a recovery key:
+If you have a recovery key, the archive is still readable: open the published
+viewer, choose "Use Recovery Key", and enter the secret. Readers never need the
+password.
 
-```bash
-cass pages decrypt ./archive --recovery
-# Enter recovery secret when prompted
-```
+Command-line key management (`cass pages key …`) authenticates with a password
+only, so with the password lost you cannot add or revoke slots on that bundle.
+To get back to a bundle you control:
 
-Then add a new password:
+1. Export the archive again with `cass pages` and choose a new password (and a
+   new recovery key) in the wizard.
+2. Publish the new bundle in place of the old one.
+3. Keep the old bundle only as long as its recovery secret is safely stored.
 
-```bash
-cass pages key add-password --archive ./archive
-```
+If you have neither the password nor a recovery key, the data in that bundle is
+unrecoverable by design; re-export from your local cass archive instead.
 
 ### Scenario: Corrupted config.json
 
@@ -236,7 +261,8 @@ Symptoms:
 Verification:
 
 ```bash
-cass pages verify --archive ./archive
+cass pages --verify ./bundle
+cass pages --verify ./bundle --json
 ```
 
 If specific chunks are corrupted:
@@ -245,10 +271,10 @@ If specific chunks are corrupted:
 
 ### Scenario: Missing Files
 
-Use integrity verification:
+The same verifier checks file presence and hashes:
 
 ```bash
-cass pages verify --archive ./archive --check-integrity
+cass pages --verify ./bundle
 ```
 
 This validates:

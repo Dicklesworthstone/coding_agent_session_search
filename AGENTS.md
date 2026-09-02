@@ -71,6 +71,11 @@ because of that day:
 - **After any commit by another agent touches a file you changed,** `git grep` every
   symbol you landed there. Presence is not enough: check that the function still does
   what yours did (an in-process memo is not an on-disk cache).
+- **A GitHub issue gets a bead within 24 hours** (`gh<issue>-<topic>` in the title, the
+  reporter's numbers in the description) and the first triage comment on the issue
+  cites that bead. On 2026-09-01 the five worst open issues (#439, #440, #441, #395,
+  #391) had no bead while 2,000 beads were closed around them; the tracker must track
+  what users report, not only what agents choose.
 
 ---
 
@@ -269,7 +274,7 @@ If you see errors, **carefully understand and resolve each issue**. Read suffici
 
 ### UBS Pre-Merge Gate
 
-Per `coding_agent_session_search-dpfvr`, every PR is meant to run `ubs --ci --fail-on-warning` against the changed files in CI (`.github/workflows/ci.yml::ubs-changed-files`). The gate is **blocking** — warnings stop merges. **Current state:** every workflow defined in `.github/workflows/` is disabled (`gh workflow list --all` shows `disabled_manually` for all of them, including `CI`; only GitHub's own Copilot workflows are active), so until CI is re-enabled this gate — like fmt/clippy/tests — is agent-run through `rch` before pushing.
+Per `coding_agent_session_search-dpfvr`, every PR is meant to run `ubs --ci --fail-on-warning` against the changed files in CI (`.github/workflows/ci.yml::ubs-changed-files`). The gate is **blocking** — warnings stop merges. **Current state:** every workflow defined in `.github/workflows/` is disabled (`gh workflow list --all` shows `disabled_manually` for all of them, including `CI`; only GitHub's own Copilot workflows are active), so until CI is re-enabled this gate — like fmt/clippy/tests — is agent-run through `rch` before pushing. Run it as ONE fleet admission with `scripts/gate.sh` (fmt, clippy `-D warnings`, lib tests, targeted integration tests, goldens; `--lib-filter`, `--integration name:filter,...`, `--regen-goldens`; `GATE_RETRIES=40` retries fleet refusals) and cite its `STAGE=<name> EXIT=<code>` receipt lines in the bead closure and the commit message — never spend an admission on a bare `cargo check`.
 
 **Local pre-flight before pushing:**
 
@@ -778,7 +783,7 @@ cass sources setup --json --hosts css  # JSON output for parsing
 cass search "database migration"
 
 # Sync latest data
-cass sources sync --all
+cass sources sync            # all configured remote sources; --source <name> narrows it
 
 # List configured sources
 cass sources list

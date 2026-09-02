@@ -859,6 +859,9 @@
         "documents": {
           "type": "null"
         },
+        "segment_files": {
+          "type": "null"
+        },
         "empty_with_messages": {
           "type": "boolean"
         },

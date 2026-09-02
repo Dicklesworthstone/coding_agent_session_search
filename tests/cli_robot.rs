@@ -22,6 +22,15 @@ use util::cass_bin;
 fn base_cmd() -> Command {
     let mut cmd = Command::new(cass_bin());
     cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
+    // WS-A.6 (2w1sc): 52 tests in this binary read the committed fixture
+    // archive IN PLACE (`tests/fixtures/search_demo_data`). Stale-on-read
+    // auto-refresh only stays quiet for data dirs under the OS temp dir, and
+    // the fixture is under the checkout, so on a fleet worker a `search` here
+    // spawned a detached `cass index --background` INTO the fixture, which
+    // ingested that worker's real sessions; every golden test that later
+    // copied the fixture absorbed them. These tests observe a fixture; they
+    // never want a live refresh.
+    cmd.env("CASS_AUTO_REFRESH", "0");
     cmd
 }
 

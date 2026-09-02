@@ -15,6 +15,80 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ---
 
+## [Unreleased]
+
+Reality-check bridge work (see `docs/planning/REALITY_CHECK_AND_BRIDGE_PLAN_2026-09-01.md`).
+Everything below is on `main`; nothing is in a released binary yet.
+
+### Added
+- `cass bookmarks add|list|search|remove|export|import` — the bookmarks module the
+  README advertised is now reachable from the CLI (exit codes 13 not-found, 14 io).
+- `cass search --robot` reports `_meta.lexical_degrade_reason` (`query_fuel_exhausted`)
+  when a hybrid query drops its lexical leg instead of failing (GH #441).
+- `cass status --json` / `cass health --json` expose `database.db_bytes`,
+  `database.wal_bytes`, and `database.shm_present`, read from file metadata only,
+  so an untruncated WAL is visible without a shell.
+- The exit-70 stall abort now writes the standard error envelope
+  (`kind: "index-stalled"`, `code: 70`, `phase`, `stall_elapsed_ms`, hint) on stderr
+  before exiting (GH #439).
+- `cass analytics rebuild --json` reports `wal_checkpoint` and closes its handle
+  through the same checkpointing path as `cass index`.
+- Robot/JSON mode prints every argument auto-correction as
+  `note: auto-corrected: …` on stderr (stdout stays data-only).
+- `scripts/gate.sh`: the blocking quality gate batched into one rch admission with
+  per-stage receipts, until the GitHub workflows are re-enabled.
+- `cass pages key list|add-password|add-recovery|revoke|rotate --archive <bundle>`:
+  key-slot management for exported encrypted bundles over the previously uncalled
+  key-management engine; passwords via prompt or `--password-stdin`, never argv;
+  `docs/RECOVERY.md` rewritten to the real surface.
+- `cass doctor` checks `archive_wal` (an untruncated WAL sidecar above 64 MiB is
+  reported with its size; `--fix` checkpoints it and reports pass, blocked, or
+  failed truthfully) and `index_segments` (a lexical generation fragmented past
+  8× the merge threshold is reported with the `cass index --full` remedy).
+- `cass status --json` / `cass health --json` report `index.segment_files`, a
+  metadata-only upper bound on the published lexical segment count.
+- `install.sh` probes the host's glibc before downloading a Linux prebuilt
+  binary and falls back to build-from-source below 2.38 (proven on Ubuntu 22.04
+  and 24.04 containers).
+
+### Changed
+- Quill is opened everywhere with one cass configuration: engine visibility-lag
+  publication is disabled (snapshots publish only on cass commits), the query fuel
+  budget stays at the engine default with `CASS_QUILL_QUERY_FUEL_BUDGET` as an
+  escape hatch, incremental runs fold published runs when they exceed the merge
+  threshold, and `cass index --full` consolidates the generation (GH #440, #441).
+- `cass health` uses the same strict, mutation-free, 30 s-bounded owner-thread
+  archive probe as `cass status`; it never checkpoints a dirty WAL.
+- The default `cass search` no longer re-reads the archive WAL on every call: the
+  lexical self-heal fingerprint is memoized on the archive's physical identity in
+  `<index>/.archive-fingerprint-cache.json`.
+- The TUI loads the semantic context lazily before the first frame and spawns
+  analytics rollup rebuilds as a detached `cass analytics rebuild` child (GH #395).
+- The post-publish FTS shadow rebuild ticks the stall watchdog per page (GH #439).
+- `#![deny(unsafe_code)]` outside tests with scoped, commented allows on the
+  audited FFI/env sites.
+- README and AGENTS.md corrected against the code (schema v20, key bindings, dedup
+  keys, `--timeout` semantics, swarm fixture-only status, export flags, installer and
+  self-update reality, hidden subcommands documented).
+
+### Fixed
+- `main` compiled again after a stale renamed constant left by concurrent edits
+  (`CASS_QUILL_QUERY_FUEL_BUDGET_ENV`).
+- Golden tests no longer absorb a host's real Pi Agent sessions. The writer was
+  the robot-CLI test binary, whose tests use the committed fixture archive in
+  place: stale-on-read auto-refresh indexed the host's sessions into it. Those
+  tests now run with `CASS_AUTO_REFRESH=0`; the golden harness also pins
+  `PI_SESSIONS_DIR`, `PI_CODING_AGENT_DIR`, and `PI_CODING_AGENT_SESSION_DIR`.
+- `forget --apply`, `dedup --apply`, and `analytics validate --fix` close their
+  archive handle through the same checkpointing path as `cass index`, so the
+  next opener does not replay their rewrites from the WAL.
+- `cass introspect`/`capabilities` report `has_json_output: true` for commands
+  whose JSON flag lives on a subcommand (bookmarks, pages key, sources, …).
+- The `--highlight` flag doc and README no longer claim `<mark>` wrapping for an
+  HTML output that search does not have; only `**bold**` markers exist.
+- The unreachable `Alt+W => swarm cockpit` key arm (shadowed by the documented
+  workspace-filter palette) was removed.
+
 ## [v0.7.1] -- 2026-08-31
 
 > crates.io `0.7.0` was published from commit `1f6cdcf9` on 2026-08-25;

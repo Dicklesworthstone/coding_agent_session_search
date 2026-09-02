@@ -587,7 +587,7 @@ pub enum Commands {
         /// Timeout in milliseconds. Returns partial results and error if exceeded.
         #[arg(long)]
         timeout: Option<u64>,
-        /// Highlight matching terms in output (uses **bold** markers in text, <mark> in HTML)
+        /// Highlight matching terms in snippets with **bold** markers (text and JSON output)
         #[arg(long)]
         highlight: bool,
         /// Filter by source: 'local', 'remote', 'all', or a specific source hostname
@@ -1479,6 +1479,11 @@ pub enum Commands {
     },
     /// Export encrypted searchable archive for static hosting (P4.x)
     Pages {
+        /// Key-slot management for an exported bundle (`cass pages key …`);
+        /// without a subcommand the export flags below apply.
+        #[command(subcommand)]
+        subcommand: Option<PagesSubcommand>,
+
         /// Export only (skip wizard and encryption) to specified directory
         #[arg(long)]
         export_only: Option<PathBuf>,
@@ -2269,6 +2274,12 @@ pub enum SourcesCommand {
         /// Sync only specific source(s)
         #[arg(long, short)]
         source: Option<Vec<String>>,
+        /// Sync every configured remote source. This is already the default
+        /// when --source is absent; the explicit spelling is what doctor,
+        /// robot-docs and the fleet rehearsal recommend, and it used to be a
+        /// usage error (reality check 2026-09-01, docs validator).
+        #[arg(long, conflicts_with = "source")]
+        all: bool,
         /// Don't re-index after sync
         #[arg(long)]
         no_index: bool,
@@ -3076,6 +3087,16 @@ pub enum TimelineGrouping {
     Day,
     /// No grouping (flat list)
     None,
+}
+
+/// Subcommands of `cass pages` that operate on an already exported bundle.
+/// The export/wizard surface stays flag-driven on `cass pages` itself; this
+/// enum only carries verbs that need their own argument set.
+#[derive(Debug, Clone, Subcommand)]
+pub enum PagesSubcommand {
+    /// Manage the key slots of an exported encrypted bundle
+    /// (`list`, `add-password`, `add-recovery`, `revoke`, `rotate`).
+    Key(crate::pages::key_cli::PagesKeyArgs),
 }
 
 /// Deployment target for pages export.
@@ -6268,6 +6289,10 @@ const CANONICAL_TOP_LEVEL_COMMANDS: &[&str] = &[
     "export",
     "export-html",
     "pages",
+    // Landed 2026-09-01 (bookmarks CLI); without this entry robot mode
+    // rewrote `cass bookmarks … --robot` into `search bookmarks …` (GH #367
+    // class), which the full lib suite caught on 2026-09-02.
+    "bookmarks",
     "import",
     "daemon",
     "schedule",
@@ -7493,6 +7518,7 @@ async fn execute_cli(
                     )?;
                 }
                 Commands::Pages {
+                    subcommand,
                     export_only,
                     verify,
                     agents,
@@ -7521,6 +7547,11 @@ async fn execute_cli(
                     example_config,
                     json,
                 } => {
+                    // `cass pages key …` operates on an exported bundle and
+                    // never touches the export/wizard flags (WS-G.4).
+                    if let Some(PagesSubcommand::Key(args)) = subcommand {
+                        return crate::pages::key_cli::run_pages_key_command(&args);
+                    }
                     let structured_format = resolve_subcommand_structured_format(cli, json);
                     let robot_mode_here = structured_format.is_some() || robot_mode;
                     // Handle --example-config (show example config and exit)
@@ -9319,6 +9350,22 @@ fn run_forget_command(
         if let Err(e) = storage.rebuild_daily_stats() {
             tracing::warn!(error = %e, "forget: failed to rebuild daily stats after deletion");
         }
+    }
+
+    // WS-B.5 (z2uon): an applied forget deletes rows and rewrites FTS,
+    // analytics and daily-stats tables; close through the checkpointing path
+    // so the next opener does not replay all of that from the WAL. A dry run
+    // wrote nothing and must not checkpoint anything.
+    if apply
+        && let Err(err) =
+            crate::indexer::close_storage_with_wal_checkpoint(storage, &db_path, "forget")
+    {
+        tracing::warn!(
+            error = %format!("{err:#}"),
+            db_path = %db_path.display(),
+            "forget: final WAL checkpoint did not complete"
+        );
+        eprintln!("Warning: final WAL checkpoint after forget did not complete: {err:#}");
     }
 
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
@@ -18961,6 +19008,19 @@ fn run_analytics_validate(
                             ),
                             retryable: true,
                         })?;
+                        // WS-B.5 (z2uon): the repair rewrote whole analytics
+                        // tables; do not leave them in the WAL for the next
+                        // opener. A blocked checkpoint is logged, never fatal.
+                        if let Err(err) = crate::indexer::close_storage_with_wal_checkpoint(
+                            storage,
+                            &db_path,
+                            "analytics validate --fix (track A)",
+                        ) {
+                            tracing::warn!(
+                                error = %format!("{err:#}"),
+                                "analytics repair: final WAL checkpoint did not complete"
+                            );
+                        }
                         applied_repairs.push(serde_json::json!({
                             "kind": "rebuild_track_a",
                             "check_ids": decision.check_ids,
@@ -19021,6 +19081,18 @@ fn run_analytics_validate(
                                 ),
                             }));
                         }
+                    }
+                    // WS-B.5 (z2uon): same contract as Track A — the rollup
+                    // rewrite must not outlive this command in the WAL.
+                    if let Err(err) = crate::indexer::close_storage_with_wal_checkpoint(
+                        storage,
+                        &db_path,
+                        "analytics validate --fix (track B)",
+                    ) {
+                        tracing::warn!(
+                            error = %format!("{err:#}"),
+                            "analytics repair: final WAL checkpoint did not complete"
+                        );
                     }
                 }
                 analytics::validate::RepairKind::TrackAllRebuildUnavailable => {
@@ -21425,6 +21497,15 @@ fn state_meta_json_inner(
     } else {
         None
     };
+    // #441 / WS-B.1a: how fragmented the published lexical generation is, from
+    // directory metadata only (an upper bound on the live segment count; see
+    // `quill_bridge::segment_file_count`). `null` when no Quill index exists.
+    let lexical_segment_files: Option<u64> = if lexical.exists {
+        crate::search::quill_bridge::segment_file_count(&index_path)
+            .map(|count| u64::try_from(count).unwrap_or(u64::MAX))
+    } else {
+        None
+    };
     let index_empty_with_messages = index_doc_count
         .map(|docs| docs == 0 && message_count > 0)
         .unwrap_or(false);
@@ -21496,6 +21577,8 @@ fn state_meta_json_inner(
                     .to_rfc3339()
             }),
             "documents": index_doc_count,
+            // #441: upper bound on published Quill segments, metadata only.
+            "segment_files": lexical_segment_files,
             "empty_with_messages": index_empty_with_messages,
             "quarantined_conversations": quarantined_conversations,
             "fingerprint": {
@@ -24978,7 +25061,14 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
         Commands::Guide { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
-        Commands::Pages { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
+        Commands::Pages {
+            subcommand, json, ..
+        } => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+                || subcommand.as_ref().is_some_and(|sub| match sub {
+                    PagesSubcommand::Key(args) => args.command.json(),
+                })
+        }
         Commands::Sessions { json, .. } => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
@@ -35155,6 +35245,23 @@ fn run_dedup(
                 );
             }
         }
+    }
+
+    // WS-B.5 (z2uon): an applied dedup deletes rows and rewrites the FTS
+    // shadow; close through the checkpointing path so the next opener does
+    // not replay that work from the WAL. Dry runs and no-op applies wrote
+    // nothing and must not checkpoint anything.
+    if apply
+        && result.conversations_affected > 0
+        && let Err(err) =
+            crate::indexer::close_storage_with_wal_checkpoint(storage, &db_path, "dedup")
+    {
+        tracing::warn!(
+            error = %format!("{err:#}"),
+            db_path = %db_path.display(),
+            "dedup: final WAL checkpoint did not complete"
+        );
+        eprintln!("Warning: final WAL checkpoint after dedup did not complete: {err:#}");
     }
 
     let recommended_action = if result.conversations_affected == 0 {
@@ -81431,6 +81538,10 @@ fn run_status(
                 "conversations": state.get("database").and_then(|d| d.get("conversations")).cloned().unwrap_or(serde_json::Value::Null),
                 "messages": state.get("database").and_then(|d| d.get("messages")).cloned().unwrap_or(serde_json::Value::Null),
                 "path": db_path.display().to_string(),
+                // WS-B.4a: physical footprint from metadata (see state meta).
+                "db_bytes": state.get("database").and_then(|d| d.get("db_bytes")).cloned().unwrap_or(serde_json::json!(0)),
+                "wal_bytes": state.get("database").and_then(|d| d.get("wal_bytes")).cloned().unwrap_or(serde_json::json!(0)),
+                "shm_present": state.get("database").and_then(|d| d.get("shm_present")).cloned().unwrap_or(serde_json::json!(false)),
                 "open_error": db_open_error,
                 "open_retryable": db_open_retryable,
                 "counts_skipped": counts_skipped,
@@ -87232,6 +87343,88 @@ pub(crate) fn run_doctor_impl(
         DOCTOR_SLOW_OPERATION_DEFAULT_THRESHOLD_MS,
         vec!["archive DB open, row counts, and integrity-style checks completed or were skipped by state".to_string()],
     );
+
+    // WS-B.5 (z2uon): an untruncated WAL is a tax every opener pays (the
+    // owner's archive carried 200 MB for 18 days; every default search
+    // replayed it). Observe from metadata only; repair only under --fix, never
+    // while an index run owns the archive, and never claim a checkpoint that
+    // the engine reported as blocked.
+    {
+        const DOCTOR_WAL_OVERSIZED_BYTES: u64 = 64 * 1024 * 1024;
+        let wal_path = crate::storage::sqlite::database_sidecar_path(&db_path, "-wal");
+        let wal_bytes = std::fs::metadata(&wal_path)
+            .ok()
+            .filter(|meta| meta.is_file())
+            .map_or(0, |meta| meta.len());
+        if wal_bytes <= DOCTOR_WAL_OVERSIZED_BYTES {
+            add_check!(
+                "archive_wal",
+                "pass",
+                format!("WAL sidecar is {wal_bytes} bytes (bounded)"),
+                false
+            );
+        } else if rebuild_active {
+            add_check!(
+                "archive_wal",
+                "warn",
+                format!(
+                    "WAL sidecar is {wal_bytes} bytes while an index run owns the archive; \
+                     the run truncates it at finalize"
+                ),
+                false
+            );
+        } else if fix_can_mutate {
+            match crate::indexer::checkpoint_wal_truncate(&db_path, "doctor --fix") {
+                Ok(true) => {
+                    let after = std::fs::metadata(&wal_path).map_or(0, |meta| meta.len());
+                    checks.push(Check {
+                        name: "archive_wal".to_string(),
+                        status: "pass".to_string(),
+                        message: format!(
+                            "WAL sidecar checkpointed and truncated: {wal_bytes} -> {after} bytes"
+                        ),
+                        fix_available: true,
+                        fix_applied: true,
+                    });
+                    auto_fix_actions.push(format!(
+                        "Checkpointed the archive WAL ({wal_bytes} -> {after} bytes)"
+                    ));
+                    auto_fix_applied = true;
+                }
+                Ok(false) => {
+                    add_check!(
+                        "archive_wal",
+                        "warn",
+                        format!(
+                            "WAL sidecar is {wal_bytes} bytes and the checkpoint was blocked by \
+                             a concurrent reader; retry when no other cass process is open"
+                        ),
+                        true
+                    );
+                }
+                Err(err) => {
+                    add_check!(
+                        "archive_wal",
+                        "fail",
+                        format!(
+                            "WAL sidecar is {wal_bytes} bytes and the checkpoint failed: {err:#}"
+                        ),
+                        true
+                    );
+                }
+            }
+        } else {
+            add_check!(
+                "archive_wal",
+                "warn",
+                format!(
+                    "WAL sidecar is {wal_bytes} bytes (> {DOCTOR_WAL_OVERSIZED_BYTES}); every \
+                     opener replays it. Run `cass doctor --fix` or `cass index` to checkpoint it"
+                ),
+                true
+            );
+        }
+    }
     // This predicate means only that canonical rows may be consumed without
     // modifying the archive.  It deliberately includes a large archive whose
     // bounded counts succeeded while deep PRAGMAs were deferred, but excludes
@@ -87280,6 +87473,42 @@ pub(crate) fn run_doctor_impl(
                     format!("Search index OK ({} documents)", num_docs),
                     false
                 );
+
+                // #441 / WS-B.1a: a generation that fragmented into hundreds
+                // of segments makes every query pay `segments × terms`
+                // dictionary walks and exhausts the engine's per-query fuel
+                // on ordinary stopword-heavy queries. Doctor may spend an
+                // engine open, so it reports the LIVE segment count (what a
+                // query pays for); folded inputs linger on disk after a merge,
+                // so the file count would keep warning after a successful
+                // consolidation. Files are the fallback when the reader fails.
+                let live_segments = crate::search::quill_bridge::live_segment_count(&index_path);
+                let counted = live_segments.map(|n| (n, "segments")).or_else(|| {
+                    crate::search::quill_bridge::segment_file_count(&index_path)
+                        .map(|n| (n, "segment files"))
+                });
+                if let Some((segments, unit)) = counted {
+                    let pressure = crate::search::quill_bridge::CASS_SEGMENT_PRESSURE_FILES;
+                    if segments > pressure {
+                        add_check!(
+                            "index_segments",
+                            "warn",
+                            format!(
+                                "Search index has {segments} {unit} (> {pressure}); queries pay \
+                                 per segment and long queries can exhaust the engine's fuel \
+                                 budget. Run `cass index --full` to consolidate"
+                            ),
+                            true
+                        );
+                    } else {
+                        add_check!(
+                            "index_segments",
+                            "pass",
+                            format!("Search index has {segments} {unit} (bounded)"),
+                            false
+                        );
+                    }
+                }
 
                 // Check if index is empty but database has data. #287: reuse the
                 // message count from the bounded archive-DB probe above instead
@@ -92700,9 +92929,11 @@ fn command_schema_from_clap(cmd: &Command, global_robot_format: Option<&Arg>) ->
         .filter(|arg| !should_skip_arg(arg))
         .map(argument_schema_from_clap)
         .collect();
-    let has_json_output = cmd
-        .get_arguments()
-        .any(|arg| arg.get_id().as_str() == "json");
+    // WS-F.4: a command whose JSON flag lives on its subcommands
+    // (`bookmarks list --json`, `pages key list --json`, `sources list --json`)
+    // does emit JSON; reporting `false` here told agents to avoid a surface
+    // they could use. Look through the subcommand tree, not only the top level.
+    let has_json_output = command_tree_has_json_flag(cmd);
     if has_json_output
         && let Some(robot_format) = global_robot_format
         && !arguments.iter().any(|arg| arg.name == "robot-format")
@@ -92720,6 +92951,13 @@ fn command_schema_from_clap(cmd: &Command, global_robot_format: Option<&Arg>) ->
         arguments,
         has_json_output,
     }
+}
+
+/// Whether `cmd` or any subcommand beneath it accepts a `--json` flag.
+fn command_tree_has_json_flag(cmd: &Command) -> bool {
+    cmd.get_arguments()
+        .any(|arg| arg.get_id().as_str() == "json")
+        || cmd.get_subcommands().any(command_tree_has_json_flag)
 }
 
 fn argument_schema_from_clap(arg: &Arg) -> ArgumentSchema {
@@ -92860,6 +93098,7 @@ fn response_schema_index_state() -> serde_json::Value {
             "stalled": { "type": "boolean" },
             "activity_at": { "type": ["string", "null"] },
             "documents": { "type": ["integer", "null"] },
+            "segment_files": { "type": ["integer", "null"] },
             "empty_with_messages": { "type": "boolean" },
             "quarantined_conversations": { "type": "integer" },
             "fingerprint": {
@@ -112332,6 +112571,9 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
         }
         SourcesCommand::Sync {
             source,
+            // `--all` only makes the default explicit; clap already refuses it
+            // together with `--source`.
+            all: _,
             no_index,
             verbose,
             dry_run,
@@ -115225,6 +115467,9 @@ fn run_sources_setup(opts: sources::setup::SetupOptions) -> CliResult<()> {
     match run_setup(&opts) {
         Ok(result) => {
             if opts.json {
+                // One JSON document per command: the sync prints its own
+                // report, so robot mode defers it and says so truthfully
+                // instead of interleaving two documents on stdout.
                 println!(
                     "{}",
                     serde_json::json!({
@@ -115234,8 +115479,46 @@ fn run_sources_setup(opts: sources::setup::SetupOptions) -> CliResult<()> {
                         "hosts_installed": result.hosts_installed,
                         "hosts_indexed": result.hosts_indexed,
                         "total_sessions": result.total_sessions,
+                        "sync": if result.sync_pending {
+                            serde_json::json!({
+                                "status": "pending",
+                                "command": "cass sources sync --json",
+                            })
+                        } else {
+                            serde_json::json!({ "status": "skipped" })
+                        },
                     })
                 );
+                return Ok(());
+            }
+            if result.sync_pending {
+                // WS-G.1: setup used to print "Phase 7: Syncing" and mark the
+                // sync complete without running it. Run it, and record it
+                // only once it has actually happened.
+                run_sources_sync(None, false, opts.verbose, false, None).map_err(|err| {
+                    CliError {
+                        code: err.code,
+                        kind: err.kind,
+                        message: format!("Setup finished, but the final sync failed: {}", err.message),
+                        hint: Some(
+                            "Setup state is saved; re-run 'cass sources sync' (or 'cass sources setup --resume') once the remotes are reachable"
+                                .into(),
+                        ),
+                        retryable: true,
+                    }
+                })?;
+                match sources::setup::SetupState::load() {
+                    Ok(Some(mut state)) => {
+                        state.sync_complete = true;
+                        if let Err(err) = state.save() {
+                            tracing::warn!(error = %err, "setup: could not record the completed sync in the setup state");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::warn!(error = %err, "setup: could not reload the setup state after the sync");
+                    }
+                }
             }
             Ok(())
         }

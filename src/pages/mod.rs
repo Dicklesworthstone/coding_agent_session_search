@@ -21,6 +21,7 @@ pub mod encrypt;
 pub mod errors;
 pub mod export;
 pub mod fts;
+pub mod key_cli;
 pub mod key_management;
 pub mod password;
 pub mod patterns;

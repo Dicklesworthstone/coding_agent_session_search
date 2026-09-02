@@ -22,6 +22,7 @@
     "engine_incompatible": false,
     "activity_at": null,
     "documents": null,
+    "segment_files": null,
     "empty_with_messages": false,
     "quarantined_conversations": 0,
     "fingerprint": {
@@ -44,6 +45,9 @@
     "conversations": 0,
     "messages": 0,
     "path": "[TEST_HOME]/cass-data/agent_search.db",
+    "db_bytes": "[LIVE_BYTES]",
+    "wal_bytes": "[LIVE_BYTES]",
+    "shm_present": false,
     "open_error": null,
     "open_retryable": false,
     "counts_skipped": false,

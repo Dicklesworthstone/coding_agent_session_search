@@ -383,10 +383,40 @@ pub(crate) fn daemon_socket_path_for_data_dir(data_dir: &Path) -> PathBuf {
     hasher.update((path_bytes.len() as u64).to_be_bytes());
     hasher.update(path_bytes);
     let digest = hasher.finalize();
-    std::env::temp_dir().join(format!(
-        "cass-semantic-daemon-{}.sock",
-        hex::encode(&digest[..12])
-    ))
+    let file_name = format!("cass-semantic-daemon-{}.sock", hex::encode(&digest[..12]));
+    let mut candidates = vec![std::env::temp_dir()];
+    if let Ok(runtime_dir) = dotenvy::var("XDG_RUNTIME_DIR")
+        && !runtime_dir.trim().is_empty()
+    {
+        candidates.push(PathBuf::from(runtime_dir));
+    }
+    candidates.push(PathBuf::from("/tmp"));
+    choose_daemon_socket_dir(&candidates, file_name.len()).join(file_name)
+}
+
+/// Upper bound for the daemon socket path, leaving headroom under the
+/// 108-byte `sun_path` limit that every supported Unix enforces.
+#[cfg(unix)]
+const DAEMON_SOCKET_PATH_MAX_BYTES: usize = 100;
+
+/// Pick the first candidate directory whose joined socket path stays under
+/// [`DAEMON_SOCKET_PATH_MAX_BYTES`]; when none does, the shortest candidate.
+///
+/// `$TMPDIR` is first so hosts with a short temp dir keep exactly the path
+/// they had. A long `$TMPDIR` (rch workers keep tempdirs under the checkout;
+/// some CI images and macOS do similar) used to yield a path the daemon
+/// could not bind and clients could not reach — caught by the full lib suite
+/// on 2026-09-02 (bead ie339).
+#[cfg(unix)]
+fn choose_daemon_socket_dir(candidates: &[PathBuf], file_name_len: usize) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt as _;
+    let joined_len = |dir: &PathBuf| dir.as_os_str().as_bytes().len() + 1 + file_name_len;
+    candidates
+        .iter()
+        .find(|dir| joined_len(dir) < DAEMON_SOCKET_PATH_MAX_BYTES)
+        .or_else(|| candidates.iter().min_by_key(|dir| joined_len(dir)))
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
 /// Hash the current executable into a bounded deployment identity, then bind
@@ -544,6 +574,38 @@ mod tests {
         assert!(
             first.as_os_str().len() < 100,
             "default UDS path should leave headroom under platform limits"
+        );
+    }
+
+    /// Bead ie339: a long `$TMPDIR` must not push the socket path over the
+    /// `sun_path` limit. Positive observable: a short first candidate is kept
+    /// byte-for-byte (existing hosts see no change); a long first candidate
+    /// is skipped for the first short one. Planted negative: when every
+    /// candidate is long, the shortest is chosen rather than the first, so
+    /// the outcome is still the best available. No-claim: no socket is bound.
+    #[cfg(unix)]
+    #[test]
+    fn socket_dir_selection_stays_under_the_sun_path_bound() {
+        let name_len = "cass-semantic-daemon-0123456789abcdef01234567.sock".len();
+        let short = PathBuf::from("/tmp");
+        let long = PathBuf::from(format!("/{}", "x".repeat(90)));
+        let longer = PathBuf::from(format!("/{}", "y".repeat(120)));
+
+        assert_eq!(
+            choose_daemon_socket_dir(&[short.clone(), long.clone()], name_len),
+            short,
+            "a short first candidate keeps today's path"
+        );
+        assert_eq!(
+            choose_daemon_socket_dir(&[long.clone(), short.clone()], name_len),
+            short,
+            "a long TMPDIR falls through to the short candidate"
+        );
+        let chosen = choose_daemon_socket_dir(&[longer.clone(), long.clone()], name_len);
+        assert_eq!(chosen, long, "with no short candidate the shortest wins");
+        assert!(
+            short.join("x").as_os_str().len() + name_len < DAEMON_SOCKET_PATH_MAX_BYTES,
+            "the /tmp last resort must itself fit under the bound"
         );
     }
 

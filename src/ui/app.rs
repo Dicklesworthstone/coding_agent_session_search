@@ -15817,8 +15817,11 @@ impl From<super::ftui_adapter::Event> for CassMsg {
                     KeyCode::Char('i') | KeyCode::Char('I') if alt => CassMsg::UpdateSkipped,
 
                     // -- Swarm operations -----------------------------------------
-                    KeyCode::Char('w') if alt => CassMsg::SwarmEntered,
-                    KeyCode::Char('W') if alt => CassMsg::SwarmEntered,
+                    // No direct key: `Alt+W` is the documented workspace-filter
+                    // palette (matched above), so an `Alt+W => SwarmEntered` arm
+                    // here was unreachable dead code (reality check 2026-09-01,
+                    // WS-D.4). The swarm cockpit is entered through the surface
+                    // switch (`AppSurface::Swarm`).
 
                     // -- Sources management -----------------------------------------
                     KeyCode::Char('s') if ctrl && shift => CassMsg::SourcesEntered,

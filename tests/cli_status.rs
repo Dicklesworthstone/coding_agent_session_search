@@ -1189,3 +1189,140 @@ fn status_json_surfaces_lexical_generation_lifecycle_inventory() {
         Some(1)
     );
 }
+
+/// WS-B.4a (q2vn9): `status --json` and `health --json` must expose the
+/// archive's physical footprint from metadata alone, so an untruncated WAL is
+/// visible without a shell. Positive observable: `database.wal_bytes` equals
+/// the sidecar's actual length, including after the sidecar is grown (sparse,
+/// so the test costs no disk). Planted negative: a data dir with no archive
+/// reports `db_bytes` 0, `wal_bytes` 0 and `shm_present` false instead of
+/// omitting the keys. No-claim: nothing here proves the values are cheap to
+/// compute on a large archive; the observation surfaces read metadata only
+/// by construction.
+#[test]
+fn status_and_health_report_archive_footprint_from_metadata() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+
+    let index_out = isolated_cass_cmd(test_home.path())
+        .args([
+            "index",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+            "--json",
+            "--no-progress-events",
+        ])
+        .output()
+        .expect("run cass index --json");
+    assert!(
+        index_out.status.success(),
+        "cass index --json failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&index_out.stdout),
+        String::from_utf8_lossy(&index_out.stderr)
+    );
+
+    let db_path = data_dir.join("agent_search.db");
+    let wal_path = data_dir.join("agent_search.db-wal");
+    let footprint = |surface: &str| -> serde_json::Value {
+        let out = isolated_cass_cmd(test_home.path())
+            .args([
+                surface,
+                "--data-dir",
+                data_dir.to_str().expect("utf8"),
+                "--json",
+            ])
+            .output()
+            .unwrap_or_else(|err| panic!("run cass {surface} --json: {err}"));
+        let payload: serde_json::Value =
+            serde_json::from_slice(&out.stdout).unwrap_or_else(|err| {
+                panic!(
+                    "{surface} json: {err}\nstdout={}\nstderr={}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            });
+        // `status` carries the database block at the top level; `health`
+        // nests the same state meta under `state`.
+        if surface == "health" {
+            payload["state"]["database"].clone()
+        } else {
+            payload["database"].clone()
+        }
+    };
+
+    let db_len = fs::metadata(&db_path).expect("db metadata").len();
+    let wal_len = fs::metadata(&wal_path).map_or(0, |meta| meta.len());
+    for surface in ["status", "health"] {
+        let database = footprint(surface);
+        assert_eq!(
+            database["db_bytes"].as_u64(),
+            Some(db_len),
+            "{surface}: {database}"
+        );
+        assert_eq!(
+            database["wal_bytes"].as_u64(),
+            Some(wal_len),
+            "{surface}: {database}"
+        );
+        assert!(
+            database["shm_present"].is_boolean(),
+            "{surface}: {database}"
+        );
+    }
+
+    // Grow the sidecar past anything the engine would leave behind; a sparse
+    // tail of zeros is invalid WAL content the engine ignores, but it is the
+    // size an operator would see with `ls -l`.
+    let grown: u64 = 48 * 1024 * 1024;
+    let wal = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&wal_path)
+        .expect("open wal sidecar");
+    wal.set_len(grown).expect("grow wal sidecar");
+    drop(wal);
+    let database = footprint("status");
+    assert_eq!(database["wal_bytes"].as_u64(), Some(grown), "{database}");
+    assert_eq!(
+        fs::metadata(&wal_path).expect("wal metadata").len(),
+        grown,
+        "status must not checkpoint or truncate the sidecar"
+    );
+
+    // Planted negative: no archive at all still reports the keys, as zeros.
+    let empty_dir = test_home.path().join("empty-data");
+    fs::create_dir_all(&empty_dir).expect("create empty data dir");
+    let out = isolated_cass_cmd(test_home.path())
+        .args([
+            "status",
+            "--data-dir",
+            empty_dir.to_str().expect("utf8"),
+            "--json",
+        ])
+        .output()
+        .expect("run cass status --json on an empty data dir");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("status json on empty data dir");
+    assert_eq!(
+        payload["database"]["exists"].as_bool(),
+        Some(false),
+        "{payload}"
+    );
+    assert_eq!(
+        payload["database"]["db_bytes"].as_u64(),
+        Some(0),
+        "{payload}"
+    );
+    assert_eq!(
+        payload["database"]["wal_bytes"].as_u64(),
+        Some(0),
+        "{payload}"
+    );
+    assert_eq!(
+        payload["database"]["shm_present"].as_bool(),
+        Some(false),
+        "{payload}"
+    );
+}

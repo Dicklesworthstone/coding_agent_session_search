@@ -7329,3 +7329,92 @@ fn doctor_archive_export_verify_reports_checksum_missing_and_extra_drift() {
         "extra target file should be reported: {payload:#}"
     );
 }
+
+/// WS-B.5 (z2uon): `doctor` must make an untruncated WAL visible. Positive
+/// observable: on a freshly seeded archive the `archive_wal` check passes and
+/// names the sidecar size. Planted negative: a WAL sidecar grown past the
+/// 64 MiB bound (sparse, so the test costs no disk) turns the check into a
+/// `warn` with `fix_available`, and the read-only doctor leaves the sidecar
+/// exactly as it found it. No-claim: the `--fix` checkpoint of a real
+/// oversized WAL is not exercised here (the sparse tail is not valid WAL
+/// content), only the observation and the read-only contract.
+#[test]
+fn doctor_reports_oversized_wal_sidecar_without_touching_it() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    seed_healthy_empty_index(test_home, &data_dir);
+
+    let run_doctor = || -> Value {
+        let out = cass_cmd(test_home)
+            .args([
+                "doctor",
+                "--json",
+                "--data-dir",
+                data_dir.to_str().expect("utf8"),
+            ])
+            .output()
+            .expect("run cass doctor --json");
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|err| {
+            panic!(
+                "doctor json: {err}\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })
+    };
+    let archive_wal_check = |payload: &Value| -> Value {
+        payload["checks"]
+            .as_array()
+            .expect("checks")
+            .iter()
+            .find(|check| check["name"].as_str() == Some("archive_wal"))
+            .cloned()
+            .expect("archive_wal check present")
+    };
+
+    let baseline = archive_wal_check(&run_doctor());
+    assert_eq!(baseline["status"].as_str(), Some("pass"), "{baseline}");
+    assert!(
+        baseline["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("bytes")),
+        "{baseline}"
+    );
+
+    // Grow the sidecar past the bound without writing 65 MiB: a sparse tail
+    // of zeros is ignored by the engine (invalid frame checksums) but counts
+    // in the metadata the check reads.
+    let wal_path = data_dir.join("agent_search.db-wal");
+    let oversized: u64 = 65 * 1024 * 1024;
+    let wal = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&wal_path)
+        .expect("open wal sidecar");
+    wal.set_len(oversized).expect("grow wal sidecar");
+    drop(wal);
+    let before = fs::metadata(&wal_path).expect("wal metadata").len();
+    assert_eq!(before, oversized);
+
+    let oversized_check = archive_wal_check(&run_doctor());
+    assert_eq!(
+        oversized_check["status"].as_str(),
+        Some("warn"),
+        "{oversized_check}"
+    );
+    assert_eq!(oversized_check["fix_available"].as_bool(), Some(true));
+    assert_eq!(oversized_check["fix_applied"].as_bool(), Some(false));
+    assert!(
+        oversized_check["message"]
+            .as_str()
+            .is_some_and(|message| message.contains(&oversized.to_string())),
+        "the warning must name the observed size: {oversized_check}"
+    );
+    assert_eq!(
+        fs::metadata(&wal_path).expect("wal metadata").len(),
+        oversized,
+        "a read-only doctor must not checkpoint or truncate the sidecar"
+    );
+}

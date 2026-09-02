@@ -320,7 +320,7 @@ cass search "auth error handling" --mode hybrid --robot
 - **Auto-Fuzzy Fallback**: When exact searches return sparse results, automatically retries with `*term*` wildcards to broaden matches. Visual indicator shows when fallback is active.
 - **Query History Deduplication**: Recent searches deduplicated to show unique queries; navigate with `Up`/`Down` arrows.
 - **Match Quality Ranking**: New ranking mode (cycle with `F12`) that prioritizes exact matches over wildcard/fuzzy results.
-- **Match Highlighting**: Use `--highlight` in robot mode to wrap matching terms with markers (`**bold**` for text, `<mark>` for HTML output).
+- **Match Highlighting**: Use `--highlight` in robot mode to wrap matching terms in snippets with `**bold**` markers (text and JSON output alike; search has no HTML output).
 
 ### 🖥️ Rich Terminal UI (TUI)
 
@@ -462,7 +462,7 @@ cass sources setup
 | `--non-interactive` | Use auto-detected defaults for scripting |
 | `--skip-install` | Don't install cass on remotes |
 | `--skip-index` | Don't run indexing on remotes |
-| `--skip-sync` | Skip the final sync phase (which only prints the `cass sources sync` reminder) |
+| `--skip-sync` | Skip the final `cass sources sync`. Interactive setup runs that sync after the hosts are configured and records it as complete only once it has actually finished; `--json` setup always defers it and reports `sync.status = "pending"` with the command to run |
 | `--resume` | Resume an interrupted setup |
 | `--json` | Output progress as JSON (for automation) |
 
@@ -585,7 +585,7 @@ cass archive DB and cass-owned local mirror may be the only remaining evidence
 for those conversations. Treat gap names such as `remote_source_unavailable`,
 `remote_source_pruned`, `local_archive_ahead_of_remote`, and
 `remote_copy_ahead_verified` as preservation signals first: keep the archive and
-mirror intact, then run the recommended `cass sources sync --all --json` or
+mirror intact, then run the recommended `cass sources sync --json` (all configured remote sources; `--source <name>` narrows it) or
 source-specific sync command after reviewing the reported evidence.
 
 Raw-mirror retention is explicit and audited. Use `cass mirror prune
@@ -772,7 +772,7 @@ Each conversation tracks its origin:
 These fields appear in JSON/robot output and enable filtering:
 ```bash
 cass search "auth error" --source laptop --json
-cass timeline --days 7 --source remote
+cass timeline --since 7d --source remote
 cass stats --by-source
 ```
 
@@ -1242,8 +1242,8 @@ The `--highlight` flag wraps matching terms for visual/programmatic identificati
 
 ```bash
 cass search "authentication error" --robot --highlight
-# In text output: **authentication** and **error** are bold-wrapped
-# In HTML export: <mark>authentication</mark> and <mark>error</mark>
+# Snippets come back with **authentication** and **error** bold-wrapped,
+# in text and in JSON output alike (search has no HTML output format).
 ```
 
 Highlighting is query-aware: quoted phrases like `"auth error"` highlight as a unit; individual terms highlight separately.
@@ -2685,7 +2685,7 @@ cass completions powershell >> $PROFILE
 
 - **CPU**: any x86_64 or ARM64 processor. Semantic search runs on a pure-Rust inference backend (frankensearch/native) with runtime-dispatched SIMD — NEON on Apple Silicon, AVX2/FMA when present on x86, SSE2/scalar fallback otherwise — so there is no AVX requirement and no `SIGILL` hazard (the historical ONNX Runtime dependency was removed in cass#308).
 - **OS**: Linux, macOS, or Windows
-- **Linux glibc**: Pre-built binaries require **glibc 2.38+** (Ubuntu 24.04+, Fedora 39+, Debian 13+). Ubuntu 20.04 (glibc 2.31) and 22.04 (glibc 2.35) are **not supported** with pre-built binaries. Users on older distributions should build from source with `cargo install --git https://github.com/Dicklesworthstone/coding_agent_session_search`. This requirement exists because CI builds target ubuntu-24.04 to access newer kernel features used by the frankensqlite storage engine. The install script does not probe glibc, so on an older distribution pass `--from-source` explicitly (`install.sh --from-source`) or use the `cargo install` route.
+- **Linux glibc**: Pre-built binaries require **glibc 2.38+** (Ubuntu 24.04+, Fedora 39+, Debian 13+). Ubuntu 20.04 (glibc 2.31) and 22.04 (glibc 2.35) are **not supported** with pre-built binaries. Users on older distributions should build from source with `cargo install --git https://github.com/Dicklesworthstone/coding_agent_session_search`. This requirement exists because CI builds target ubuntu-24.04 to access newer kernel features used by the frankensqlite storage engine. The install script probes the host's glibc (`ldd --version`) before downloading a Linux prebuilt binary and falls back to build-from-source with a warning when it is older than 2.38; `--from-source` forces that route, and `--artifact-url` bypasses the probe for an explicitly chosen artifact.
 - **Disk**: Sufficient space for the search index (varies with session history size)
 
 ---
@@ -2868,6 +2868,7 @@ Other subcommands (all present in the `Commands` enum in `src/lib.rs`):
 | Command | Purpose |
 |---------|---------|
 | `pages` | Export an encrypted, searchable static-site archive with GitHub Pages / Cloudflare Pages deploy; runs the interactive wizard by default, with `--export-only DIR`, `--verify BUNDLE`, `--preview BUNDLE`, and `--scan-secrets` as non-wizard modes |
+| `pages key list\|add-password\|add-recovery\|revoke\|rotate --archive BUNDLE` | Manage the key slots of an exported encrypted bundle (LUKS-style: several independently wrapped copies of one data key). Passwords come from an interactive prompt or `--password-stdin` (current password on line 1, new password on line 2), never from argv; `--json` for automation; recovery secrets are printed once and never stored. See `docs/RECOVERY.md` |
 | `upgrade` | Check for a newer release and optionally run the same checksum-verified installer the TUI uses (`--check`, `--yes`, `--force`) |
 | `man` | Generate the man page to stdout |
 | `storage` | On-disk storage footprint by component (DB, WAL, lexical index, raw mirror, semantic, quarantine) |
@@ -3230,7 +3231,6 @@ Update check state is stored in the data directory:
 | **TUI** | | |
 | `TUI_HEADLESS` | unset | Disable interactive features |
 | `CASS_ALLOW_DUMB_TERM` | unset | Allow TUI startup even when `TERM=dumb` |
-| `CASS_UI_METRICS` | unset | Enable UI interaction tracing |
 | `CASS_DISABLE_ANIMATIONS` | unset | Disable UI animations |
 | `EDITOR` | `$VISUAL` or `vi` | External editor command |
 | `EDITOR_LINE_FLAG` | `+` | Line number flag (e.g., `+42`) |

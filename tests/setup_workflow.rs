@@ -350,6 +350,7 @@ fn setup_result_structure() {
         hosts_indexed: 2,
         total_sessions: 150,
         dry_run: false,
+        sync_pending: false,
     };
 
     assert_eq!(result.sources_added, 3);
@@ -368,6 +369,7 @@ fn setup_result_dry_run() {
         hosts_indexed: 3,
         total_sessions: 0,
         dry_run: true,
+        sync_pending: false,
     };
 
     assert!(result.dry_run);

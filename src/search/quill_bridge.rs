@@ -385,6 +385,62 @@ pub fn open_cass_reader(path: &Path) -> Result<QuillSearchIndex> {
     .map_err(|error| anyhow!("opening Quill CASS reader at {}: {error}", path.display()))
 }
 
+/// File name pattern of one published Quill segment inside an index directory.
+const QUILL_SEGMENT_FILE_PREFIX: &str = "seg-";
+const QUILL_SEGMENT_FILE_SUFFIX: &str = ".fslx";
+
+/// Live segment count of a published Quill index, from the engine's own
+/// reader — the number a query actually pays for. Costs an engine open, so
+/// it belongs on surfaces that may spend (`doctor`, tests), not on
+/// `status`/`health`, which report [`segment_file_count`] instead. Folded
+/// inputs stay on disk for a while after a merge, so the two can differ.
+#[must_use]
+pub fn live_segment_count(path: &Path) -> Option<usize> {
+    if !path.join(QUILL_INDEX_MARKER).is_file() {
+        return None;
+    }
+    open_cass_reader(path)
+        .ok()
+        .and_then(|reader| reader.segment_count().ok())
+}
+
+/// Segment-file count above which `doctor` reports segment pressure (#441).
+/// Eight times the bounded-merge threshold: the post-run maintenance pass
+/// folds runs above the threshold, so a generation this far past it either
+/// predates the maintenance pass (a v0.7.1 archive) or is not being folded,
+/// and one `cass index --full` consolidates it.
+pub const CASS_SEGMENT_PRESSURE_FILES: usize = 8 * CASS_MERGE_SEGMENT_THRESHOLD;
+
+/// Number of segment files in a Quill index directory, from directory
+/// metadata alone — no engine open, no manifest parse.
+///
+/// This is the observation-surface cousin of [`QuillCassIndex::segment_count`]
+/// (#441, WS-B.1a): `status`/`health` must never open the engine, but an
+/// operator still needs to see an archive that has fragmented into hundreds
+/// of segments. Files on disk can briefly exceed the manifest's live segment
+/// count (a merge publishes before the folded inputs are removed), so this is
+/// a truthful upper bound labeled as such, not the live count. Returns `None`
+/// when the directory is not a Quill index.
+#[must_use]
+pub fn segment_file_count(path: &Path) -> Option<usize> {
+    if !path.join(QUILL_INDEX_MARKER).is_file() {
+        return None;
+    }
+    let entries = std::fs::read_dir(path).ok()?;
+    Some(
+        entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .filter(|entry| {
+                entry.file_name().to_str().is_some_and(|name| {
+                    name.starts_with(QUILL_SEGMENT_FILE_PREFIX)
+                        && name.ends_with(QUILL_SEGMENT_FILE_SUFFIX)
+                })
+            })
+            .count(),
+    )
+}
+
 /// Field handles for the compiled CASS schema.
 ///
 /// The Tantivy incumbent resolved these from a runtime schema read, because a
@@ -1296,5 +1352,50 @@ mod tests {
             "maintenance left {after} segments (threshold {CASS_MERGE_SEGMENT_THRESHOLD})"
         );
         assert_eq!(index.doc_count().expect("doc count"), commits * 8);
+    }
+
+    /// WS-B.1a: the metadata-only segment-file count that `status`/`doctor`
+    /// report must track the live segment count as an upper bound, without
+    /// opening the engine. Positive observable: after a run of append-only
+    /// commits the file count is at least the reader's live count and grows
+    /// with it; after a merge it is still at least the (now small) live
+    /// count. Planted negative: a directory without a MANIFEST is `None`,
+    /// never a fake zero. No-claim: this does not pin when the engine removes
+    /// folded segment files, only that the bound holds.
+    #[test]
+    fn segment_file_count_bounds_the_live_segment_count_without_opening_the_engine() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        assert_eq!(
+            segment_file_count(directory.path()),
+            None,
+            "a directory without a MANIFEST is not a Quill index"
+        );
+
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open or create");
+        for commit in 0..6_u64 {
+            index
+                .add_cass_documents(&[sample(
+                    &format!("session-{commit}"),
+                    0,
+                    "segment file count fixture",
+                )])
+                .expect("index batch");
+            index.commit().expect("commit batch");
+        }
+        let live = published_segment_count(&index);
+        let files = segment_file_count(directory.path()).expect("published index");
+        assert!(
+            files >= live && live >= 2,
+            "segment files ({files}) must bound the live segment count ({live})"
+        );
+
+        index.force_merge().expect("force merge");
+        let live_after = published_segment_count(&index);
+        let files_after = segment_file_count(directory.path()).expect("published index");
+        assert_eq!(live_after, 1);
+        assert!(
+            files_after >= live_after,
+            "segment files ({files_after}) must still bound the live count ({live_after})"
+        );
     }
 }

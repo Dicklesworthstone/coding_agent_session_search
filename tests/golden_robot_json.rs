@@ -73,13 +73,13 @@ fn cass_cmd(test_home: &std::path::Path) -> Command {
         )
         .env_remove("PI_CONFIG_DIR")
         .env_remove("PI_PROFILE")
-        // WS-A.6: stale-on-read auto-refresh is suppressed for data dirs under
-        // the OS temp dir, but rch workers place `tempfile` dirs beneath the
-        // checkout, so on the fleet a golden `search`/`stats` spawned a
-        // detached `cass index --background` into the fixture copy; that
-        // child ingested the worker's real sessions (raw mirror initialized,
-        // 10 Pi Agent conversations) and the goldens absorbed them on
-        // regeneration. Goldens observe a fixture, never a live refresh.
+        // WS-A.6: stale-on-read auto-refresh is suppressed only for data dirs
+        // under the OS temp dir, and rch workers place `tempfile` dirs beneath
+        // the checkout, so a golden `search`/`stats` could spawn a detached
+        // `cass index --background` into the fixture copy. (The 2026-09-01
+        // leak itself came from `tests/cli_robot.rs` refreshing the committed
+        // fixture in place before these tests copied it; both writers are now
+        // off.) Goldens observe a fixture, never a live refresh.
         .env("CASS_AUTO_REFRESH", "0")
         // Never probe or connect to a daemon owned by the host running the
         // golden suite. The default socket is user-global, while each golden
