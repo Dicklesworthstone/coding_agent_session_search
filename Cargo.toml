@@ -124,7 +124,7 @@ bytemuck = "1.25.0"
 # embedding space to the Windows Quill publication line introduced in 0.4.1;
 # registry 0.3.2 was a stale same-version twin and must never be resolved.
 frankensearch = { version = "=0.4.2", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
-franken-agent-detection = { version = "=0.2.1", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes"] }
+franken-agent-detection = { version = "=0.2.2", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache

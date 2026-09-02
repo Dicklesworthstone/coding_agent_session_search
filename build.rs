@@ -117,12 +117,15 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "franken-agent-detection",
         crate_package_name: "franken-agent-detection",
         manifest_package_field: None,
-        // GH#416: registry pin. crates.io 0.2.1's src/ is byte-identical to
-        // the previously pinned git rev 82424dc8 (verified by tree diff, not
-        // the version field), and crates.io refuses git dependencies.
+        // GH#416: registry pin. crates.io 0.2.2 is the upstream release tag
+        // f19e7e0 (2026-09: cursor/antigravity/grok scan-root scoping plus the
+        // aider/copilot-cli/amp/opencode/clawdbot/muse session-loss fixes).
+        // The Shelley connector, FAD#22 source-boundary seam, and the
+        // chatgpt/omp injection seams live past this tag and wait on the next
+        // publish. crates.io refuses git dependencies, hence version-only.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.2.1",
+        expected_version: "0.2.2",
         expected_features: &[
             "chatgpt",
             "connectors",
