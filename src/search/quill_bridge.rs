@@ -72,11 +72,9 @@ pub fn cass_quill_config() -> QuillConfig {
         max_visibility_lag_ms: u64::MAX,
         ..QuillConfig::default()
     };
-    if let Some(budget) = query_fuel_budget_override(
-        dotenvy::var(QUILL_QUERY_FUEL_BUDGET_ENV)
-            .ok()
-            .as_deref(),
-    ) {
+    if let Some(budget) =
+        query_fuel_budget_override(dotenvy::var(QUILL_QUERY_FUEL_BUDGET_ENV).ok().as_deref())
+    {
         config.query_fuel_budget = budget;
     }
     config
@@ -367,13 +365,8 @@ pub fn open_cass_reader(path: &Path) -> Result<QuillSearchIndex> {
     drive(|cx| {
         let path = path.to_path_buf();
         async move {
-            QuillSearchIndex::open_with_schema(
-                &cx,
-                path,
-                CASS_SEMANTIC_SCHEMA,
-                cass_quill_config(),
-            )
-            .await
+            QuillSearchIndex::open_with_schema(&cx, path, CASS_SEMANTIC_SCHEMA, cass_quill_config())
+                .await
         }
     })
     .map_err(|error| anyhow!("opening Quill CASS reader at {}: {error}", path.display()))
@@ -960,9 +953,8 @@ fn fresh_segment_id(profile: &[(u64, u64)]) -> u64 {
 mod tests {
     use super::*;
 
-    /// Files under the index directory, so a merge can be observed on disk
-    /// (a live segment is one `.fslx`-family file; a merged generation must
-    /// not keep every source alive forever).
+    /// Segments referenced by the published MANIFEST, read through the same
+    /// reader the merge policy consults.
     fn published_segment_count(index: &QuillCassIndex) -> usize {
         index.segment_count()
     }
@@ -973,8 +965,14 @@ mod tests {
         assert_eq!(query_fuel_budget_override(Some("")), None);
         assert_eq!(query_fuel_budget_override(Some("0")), None);
         assert_eq!(query_fuel_budget_override(Some("lots")), None);
-        assert_eq!(query_fuel_budget_override(Some(" 25000000 ")), Some(25_000_000));
-        assert_eq!(query_fuel_budget_override(Some("25_000_000")), Some(25_000_000));
+        assert_eq!(
+            query_fuel_budget_override(Some(" 25000000 ")),
+            Some(25_000_000)
+        );
+        assert_eq!(
+            query_fuel_budget_override(Some("25_000_000")),
+            Some(25_000_000)
+        );
     }
 
     #[test]
@@ -985,10 +983,16 @@ mod tests {
             u64::MAX,
             "#440/#441: the engine must never publish a MANIFEST underneath the rebuild checkpoint"
         );
-        assert!(config.validate().is_ok(), "the CASS config must pass engine validation");
+        assert!(
+            config.validate().is_ok(),
+            "the CASS config must pass engine validation"
+        );
         let default = QuillConfig::default();
         assert_eq!(config.tier_fanout, default.tier_fanout);
-        assert_eq!(config.scribe_shard_budget_bytes, default.scribe_shard_budget_bytes);
+        assert_eq!(
+            config.scribe_shard_budget_bytes,
+            default.scribe_shard_budget_bytes
+        );
         assert_eq!(config.query_fuel_budget, default.query_fuel_budget);
     }
 
@@ -1020,7 +1024,14 @@ mod tests {
             (7, 10),
         ];
         assert_eq!(plan_bounded_segment_merge(&profile), Some(vec![5, 6, 7]));
-        let profile = [(1, 500_000), (2, 10), (3, 10), (4, 500_000), (5, 10), (6, 10)];
+        let profile = [
+            (1, 500_000),
+            (2, 10),
+            (3, 10),
+            (4, 500_000),
+            (5, 10),
+            (6, 10),
+        ];
         assert_eq!(plan_bounded_segment_merge(&profile), Some(vec![2, 3]));
 
         // Converged: only big segments, or isolated smalls between bigs.
@@ -1161,8 +1172,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("bridge index directory");
         let sessions = 5_u64;
         for session in 0..sessions {
-            let mut index =
-                QuillCassIndex::open_or_create(directory.path()).expect("open session");
+            let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open session");
             index
                 .add_cass_documents(&[
                     sample(&format!("s{session}"), 0, "session zero message alpha"),

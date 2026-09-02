@@ -1,9 +1,9 @@
 pub mod background_refresh;
 pub(crate) mod lexical_generation;
+pub mod lexical_reconcile;
 pub(crate) mod memoization;
 pub(crate) mod parallel_wal_shadow;
 pub mod quarantine;
-pub mod lexical_reconcile;
 pub mod quarantine_retry;
 pub mod redact_secrets;
 pub mod refresh_ledger;
@@ -52,17 +52,17 @@ use tempfile::Builder as TempDirBuilder;
 use crate::connector_ingest_diagnostics::{
     ConnectorIngestDiagnostic, ConnectorIngestReport, ConnectorIngestRun, ProviderIngestSummary,
 };
-use crate::connectors::{NormalizedConversation, NormalizedMessage, NormalizedSnippet};
 use crate::connectors::{
     Connector, ScanRoot, aider::AiderConnector, amp::AmpConnector,
     antigravity::AntigravityConnector, chatgpt::ChatGptConnector, claude_code::ClaudeCodeConnector,
     clawdbot::ClawdbotConnector, cline::ClineConnector, codex::CodexConnector,
     copilot::CopilotConnector, copilot_cli::CopilotCliConnector, cursor::CursorConnector,
     factory::FactoryConnector, gemini::GeminiConnector, grok::GrokConnector, kimi::KimiConnector,
-    omp::OmpConnector, openclaw::OpenClawConnector, opencode::OpenCodeConnector,
-    pi_agent::PiAgentConnector, qwen::QwenConnector, vibe::VibeConnector,
-    muse::MuseConnector,
+    muse::MuseConnector, omp::OmpConnector, openclaw::OpenClawConnector,
+    opencode::OpenCodeConnector, pi_agent::PiAgentConnector, qwen::QwenConnector,
+    vibe::VibeConnector,
 };
+use crate::connectors::{NormalizedConversation, NormalizedMessage, NormalizedSnippet};
 use crate::model::conversation_packet::{
     CONVERSATION_PACKET_VERSION, ConversationPacket, ConversationPacketHashes,
     ConversationPacketProvenance, ConversationPacketSinkProjections,
@@ -2610,7 +2610,8 @@ fn nonresumable_pending_lexical_rebuild_status_without_fingerprint(
     db_path: &Path,
     total_conversations: usize,
 ) -> Result<Option<MatchingLexicalRebuildStateStatus>> {
-    let Some(state) = nonresumable_pending_lexical_rebuild_state_for_db(index_path, db_path)? else {
+    let Some(state) = nonresumable_pending_lexical_rebuild_state_for_db(index_path, db_path)?
+    else {
         return Ok(None);
     };
     if state.db.total_conversations != total_conversations {
@@ -2659,7 +2660,8 @@ fn nonresumable_pending_lexical_rebuild_status_from_readonly_db(
     index_path: &Path,
     db_path: &Path,
 ) -> Result<Option<(MatchingLexicalRebuildStateStatus, usize)>> {
-    let Some(state) = nonresumable_pending_lexical_rebuild_state_for_db(index_path, db_path)? else {
+    let Some(state) = nonresumable_pending_lexical_rebuild_state_for_db(index_path, db_path)?
+    else {
         return Ok(None);
     };
     confirm_nonresumable_pending_lexical_rebuild_state_from_readonly_db(&state, db_path)
@@ -9850,10 +9852,9 @@ fn record_fts_repair_failure_streak(index_path: &Path, detail: &str) -> u64 {
             .unwrap_or(0),
     });
     let _ = std::fs::create_dir_all(index_path);
-    if let Err(err) = write_json_pretty_atomically(
-        &fts_repair_failure_streak_path(index_path),
-        &payload,
-    ) {
+    if let Err(err) =
+        write_json_pretty_atomically(&fts_repair_failure_streak_path(index_path), &payload)
+    {
         tracing::debug!(
             error = %err,
             "persisting derived-FTS repair failure streak failed (non-fatal)"
@@ -12194,9 +12195,7 @@ struct StreamingConversationFootprint {
 /// pair that must exist for each node and all recursively owned allocations.
 fn json_heap_bytes(value: &serde_json::Value) -> usize {
     match value {
-        serde_json::Value::Null
-        | serde_json::Value::Bool(_)
-        | serde_json::Value::Number(_) => 0,
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => 0,
         serde_json::Value::String(text) => text.capacity(),
         serde_json::Value::Array(values) => values
             .capacity()
@@ -12261,44 +12260,35 @@ fn conversation_batch_footprint(conv: &NormalizedConversation) -> StreamingConve
         );
 
     for message in &conv.messages {
-        retained_bytes = retained_bytes
-            .saturating_add(message.role.capacity())
-            .saturating_add(optional_string_heap_bytes(message.author.as_ref()))
-            .saturating_add(message.content.capacity())
-            .saturating_add(json_heap_bytes(&message.extra))
-            .saturating_add(
-                message
-                    .snippets
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<NormalizedSnippet>()),
-            )
-            .saturating_add(
-                message
-                    .snippets
-                    .iter()
-                    .map(normalized_snippet_heap_bytes)
-                    .fold(0usize, usize::saturating_add),
-            )
-            .saturating_add(
-                message
-                    .invocations
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<
-                        franken_agent_detection::NormalizedInvocation,
-                    >()),
-            );
+        retained_bytes =
+            retained_bytes
+                .saturating_add(message.role.capacity())
+                .saturating_add(optional_string_heap_bytes(message.author.as_ref()))
+                .saturating_add(message.content.capacity())
+                .saturating_add(json_heap_bytes(&message.extra))
+                .saturating_add(
+                    message
+                        .snippets
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<NormalizedSnippet>()),
+                )
+                .saturating_add(
+                    message
+                        .snippets
+                        .iter()
+                        .map(normalized_snippet_heap_bytes)
+                        .fold(0usize, usize::saturating_add),
+                )
+                .saturating_add(message.invocations.capacity().saturating_mul(
+                    std::mem::size_of::<franken_agent_detection::NormalizedInvocation>(),
+                ));
         for invocation in &message.invocations {
             retained_bytes = retained_bytes
                 .saturating_add(invocation.kind.capacity())
                 .saturating_add(invocation.name.capacity())
                 .saturating_add(optional_string_heap_bytes(invocation.raw_name.as_ref()))
                 .saturating_add(optional_string_heap_bytes(invocation.call_id.as_ref()))
-                .saturating_add(
-                    invocation
-                        .arguments
-                        .as_ref()
-                        .map_or(0, json_heap_bytes),
-                );
+                .saturating_add(invocation.arguments.as_ref().map_or(0, json_heap_bytes));
         }
     }
 
@@ -12396,11 +12386,14 @@ impl<'a> StreamingBatchSender<'a> {
             self.flush()?;
         }
 
-        let byte_reservation = self.flow_limiter.acquire(footprint.retained_bytes).map_err(|_| {
-            anyhow::Error::new(StreamingConsumerDisconnected {
-                connector_name: self.connector_name,
-            })
-        })?;
+        let byte_reservation = self
+            .flow_limiter
+            .acquire(footprint.retained_bytes)
+            .map_err(|_| {
+                anyhow::Error::new(StreamingConsumerDisconnected {
+                    connector_name: self.connector_name,
+                })
+            })?;
         self.message_count = self.message_count.saturating_add(footprint.message_count);
         self.content_bytes = self.content_bytes.saturating_add(footprint.content_bytes);
         self.retained_bytes = self.retained_bytes.saturating_add(footprint.retained_bytes);
@@ -12611,10 +12604,8 @@ fn spawn_connector_producer(
         // qu81y closed-world override: when a per-connector roots map is
         // supplied, scan exactly those roots and never consult env-based
         // default detection; connectors absent from the map are skipped.
-        let override_roots: Option<Vec<ScanRoot>> = config
-            .local_connector_roots
-            .as_ref()
-            .map(|map| {
+        let override_roots: Option<Vec<ScanRoot>> =
+            config.local_connector_roots.as_ref().map(|map| {
                 map.get(name)
                     .map(|roots| roots.iter().cloned().map(ScanRoot::local).collect())
                     .unwrap_or_default()
@@ -14352,16 +14343,15 @@ fn run_index_inner(
         // ingest work. The persisted count is only a progress hint: it may be
         // stale after an interrupted run and must never authorize an early
         // return or become the completed generation's fingerprint.
-        let pending_state =
-            if preflight_skip("watch_startup:classify_nonresumable_checkpoint") {
-                Ok(None)
-            } else {
-                preflight_phase!("watch_startup:classify_nonresumable_checkpoint");
-                let result =
-                    nonresumable_pending_lexical_rebuild_state_for_db(&index_path, &opts.db_path);
-                complete_preflight_phase!();
-                result
-            };
+        let pending_state = if preflight_skip("watch_startup:classify_nonresumable_checkpoint") {
+            Ok(None)
+        } else {
+            preflight_phase!("watch_startup:classify_nonresumable_checkpoint");
+            let result =
+                nonresumable_pending_lexical_rebuild_state_for_db(&index_path, &opts.db_path);
+            complete_preflight_phase!();
+            result
+        };
         match pending_state {
             Ok(Some(state)) => {
                 let total_conversations_hint = state.db.total_conversations;
@@ -18218,9 +18208,7 @@ fn incompatible_legacy_fts_shadow_problem(storage: &FrankenStorage) -> Result<Op
 /// b-trees, but it does not understand the payload stored inside `%_data`, so
 /// it can report `ok` for the exact corrupt-segment shape seen in GH #374.
 /// The special command is read-only despite its INSERT syntax.
-fn canonical_fts_segment_integrity_problem(
-    storage: &FrankenStorage,
-) -> Result<Option<String>> {
+fn canonical_fts_segment_integrity_problem(storage: &FrankenStorage) -> Result<Option<String>> {
     let fts_exists = storage
         .raw()
         .query_row_map(
@@ -18239,14 +18227,10 @@ fn canonical_fts_segment_integrity_problem(
         .execute("INSERT INTO fts_messages(fts_messages) VALUES('integrity-check')")
     {
         Ok(_) => Ok(None),
-        Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => {
-            Err(anyhow::anyhow!(
-                "full rebuild FTS segment integrity preflight hit transient storage contention: {err}"
-            ))
-        }
-        Err(err) => Ok(Some(format!(
-            "FTS5 segment integrity-check failed: {err}"
-        ))),
+        Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => Err(anyhow::anyhow!(
+            "full rebuild FTS segment integrity preflight hit transient storage contention: {err}"
+        )),
+        Err(err) => Ok(Some(format!("FTS5 segment integrity-check failed: {err}"))),
     }
 }
 
@@ -18273,9 +18257,7 @@ fn full_rebuild_existing_storage_integrity_problem(
             ));
         }
         Err(err) => {
-            return Ok(Some(format!(
-                "FTS shadow-schema preflight failed: {err:#}"
-            )));
+            return Ok(Some(format!("FTS shadow-schema preflight failed: {err:#}")));
         }
     }
 
@@ -19325,8 +19307,8 @@ fn prepare_lexical_rebuild_page_work(
                         "preparing lexical rebuild packet for conversation {conversation_id} after page guardrail overflow"
                     )
                 })?;
-                packet_prepare_duration = packet_prepare_duration
-                    .saturating_add(fallback_prepare_started.elapsed());
+                packet_prepare_duration =
+                    packet_prepare_duration.saturating_add(fallback_prepare_started.elapsed());
                 prepared_packets.extend(conversation_packets);
             }
             prepared_packets
@@ -19770,11 +19752,10 @@ fn spawn_lexical_rebuild_packet_producer(
                                 pipeline_budget.page_conversation_limit,
                                 pipeline_budget.batch_fetch_message_bytes_limit,
                             );
-                        let conversation_page_limit = i64::try_from(
-                            content_bounded_page_conversation_limit,
-                        )
-                        .unwrap_or(i64::MAX)
-                        .min(page_size.max(1));
+                        let conversation_page_limit =
+                            i64::try_from(content_bounded_page_conversation_limit)
+                                .unwrap_or(i64::MAX)
+                                .min(page_size.max(1));
                         let current_planned_shard = planned_shard_cursor
                             .as_ref()
                             .and_then(LexicalRebuildPlannedShardCursor::current)
@@ -22236,8 +22217,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
     rebuild_state.db.storage_fingerprint = final_storage_fingerprint;
     rebuild_state.db.total_conversations = final_total_conversations;
     rebuild_state.db.total_messages = final_observed_messages;
-    rebuild_state.committed_offset =
-        i64::try_from(final_total_conversations).unwrap_or(i64::MAX);
+    rebuild_state.committed_offset = i64::try_from(final_total_conversations).unwrap_or(i64::MAX);
     rebuild_state.committed_conversation_id = last_processed_conversation_id;
     rebuild_state.processed_conversations = processed_conversations;
     rebuild_state.indexed_docs = indexed_docs;
@@ -22247,8 +22227,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
     if let Some(p) = &progress {
         p.current
             .store(final_total_conversations, Ordering::Relaxed);
-        p.total
-            .store(final_total_conversations, Ordering::Relaxed);
+        p.total.store(final_total_conversations, Ordering::Relaxed);
         p.total_is_final.store(true, Ordering::Relaxed);
         p.phase.store(0, Ordering::Relaxed);
         p.is_rebuilding.store(false, Ordering::Relaxed);
@@ -23456,8 +23435,7 @@ fn rebuild_tantivy_from_db_with_options(
     rebuild_state.db.total_conversations = final_total_conversations;
     let final_observed_messages = observed_messages.max(indexed_docs);
     rebuild_state.db.total_messages = final_observed_messages;
-    rebuild_state.committed_offset =
-        i64::try_from(final_total_conversations).unwrap_or(i64::MAX);
+    rebuild_state.committed_offset = i64::try_from(final_total_conversations).unwrap_or(i64::MAX);
     rebuild_state.committed_conversation_id = last_processed_conversation_id;
     rebuild_state.processed_conversations = processed_conversations;
     rebuild_state.indexed_docs = indexed_docs;
@@ -23470,8 +23448,7 @@ fn rebuild_tantivy_from_db_with_options(
     if let Some(p) = &progress {
         p.current
             .store(final_total_conversations, Ordering::Relaxed);
-        p.total
-            .store(final_total_conversations, Ordering::Relaxed);
+        p.total.store(final_total_conversations, Ordering::Relaxed);
         p.total_is_final.store(true, Ordering::Relaxed);
         p.phase.store(0, Ordering::Relaxed);
         p.is_rebuilding.store(false, Ordering::Relaxed);
@@ -28857,10 +28834,8 @@ pub mod persist {
             Item = (&'a NormalizedConversation, &'a InsertOutcome),
         >,
     ) {
-        let mut links_by_manifest: BTreeMap<
-            String,
-            Vec<crate::raw_mirror::RawMirrorDbLink>,
-        > = BTreeMap::new();
+        let mut links_by_manifest: BTreeMap<String, Vec<crate::raw_mirror::RawMirrorDbLink>> =
+            BTreeMap::new();
         for (conv, outcome) in conversations_and_outcomes {
             let Some(manifest_relative_path) = raw_mirror_manifest_relative_path(conv) else {
                 continue;
@@ -28895,10 +28870,7 @@ pub mod persist {
         let Some(data_dir) = data_dir else {
             return;
         };
-        record_persisted_raw_mirror_db_link_groups(
-            data_dir,
-            convs.iter().zip(outcomes.iter()),
-        );
+        record_persisted_raw_mirror_db_link_groups(data_dir, convs.iter().zip(outcomes.iter()));
     }
 
     fn begin_concurrent_writes_enabled() -> bool {
@@ -29821,9 +29793,9 @@ pub mod persist {
         if let Some(data_dir) = raw_mirror_data_dir {
             record_persisted_raw_mirror_db_link_groups(
                 data_dir,
-                ordered.iter().filter_map(|(idx, outcome)| {
-                    convs.get(*idx).map(|conv| (conv, outcome))
-                }),
+                ordered
+                    .iter()
+                    .filter_map(|(idx, outcome)| convs.get(*idx).map(|conv| (conv, outcome))),
             );
         }
 
@@ -34850,11 +34822,7 @@ mod tests {
             &source_path
         ));
         assert!(
-            !should_skip_active_session_source(
-                &active_filter,
-                SourceKind::Ssh,
-                &source_path
-            ),
+            !should_skip_active_session_source(&active_filter, SourceKind::Ssh, &source_path),
             "remote mirrors are immutable local copies, not live provider writers"
         );
     }
@@ -41868,8 +41836,7 @@ mod tests {
                 assert_eq!(conversations[0].external_id.as_deref(), Some("huge"));
                 assert_eq!(message_count, 1);
                 assert_eq!(
-                    byte_reservation,
-                    expected_reservation,
+                    byte_reservation, expected_reservation,
                     "the limiter must charge the full retained object graph, not content alone"
                 );
             }
@@ -46072,10 +46039,9 @@ mod tests {
         }
 
         {
-            let conn = crate::franken_sync::Connection::open(
-                db_path.to_string_lossy().into_owned(),
-            )
-            .unwrap();
+            let conn =
+                crate::franken_sync::Connection::open(db_path.to_string_lossy().into_owned())
+                    .unwrap();
             // bet45: target the newest structure record instead of the old
             // magic id=10 — the contentless shadow's row layout changed and
             // the fixture's single segment no longer lands on that id.
@@ -46132,10 +46098,8 @@ mod tests {
 
     #[test]
     fn full_rebuild_integrity_preflight_recognizes_legacy_fts_shadow_ddl() {
-        let legacy_config =
-            "CREATE TABLE fts_messages_config(k TEXT PRIMARY KEY, v)";
-        let legacy_idx =
-            "CREATE TABLE fts_messages_idx(segid INTEGER, term BLOB, pgno INTEGER)";
+        let legacy_config = "CREATE TABLE fts_messages_config(k TEXT PRIMARY KEY, v)";
+        let legacy_idx = "CREATE TABLE fts_messages_idx(segid INTEGER, term BLOB, pgno INTEGER)";
         for (table, ddl) in [
             ("fts_messages_config", legacy_config),
             ("fts_messages_idx", legacy_idx),
@@ -48528,24 +48492,17 @@ mod tests {
             "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
             "2",
         );
-        let _steady_commit_conversations = set_env(
-            "CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS",
-            "4096",
-        );
+        let _steady_commit_conversations =
+            set_env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS", "4096");
         let _startup_commit_conversations = set_env(
             "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_CONVERSATIONS",
             "4096",
         );
-        let _steady_commit_messages =
-            set_env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGES", "4096");
-        let _startup_commit_messages = set_env(
-            "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGES",
-            "4096",
-        );
-        let _steady_commit_bytes = set_env(
-            "CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES",
-            "4096",
-        );
+        let _steady_commit_messages = set_env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGES", "4096");
+        let _startup_commit_messages =
+            set_env("CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGES", "4096");
+        let _steady_commit_bytes =
+            set_env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES", "4096");
         let _startup_commit_bytes = set_env(
             "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGE_BYTES",
             "4096",
@@ -48558,16 +48515,7 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).unwrap();
         ensure_fts_schema(&storage);
         let conversations = (0..12)
-            .map(|idx| {
-                large_startup_conv(
-                    "codex",
-                    "gh382-reduced",
-                    idx,
-                    2,
-                    128,
-                    1_700_500_000_000,
-                )
-            })
+            .map(|idx| large_startup_conv("codex", "gh382-reduced", idx, 2, 128, 1_700_500_000_000))
             .collect::<Vec<_>>();
         ingest_batch(
             &storage,
@@ -57224,8 +57172,7 @@ mod tests {
             total_messages: 0,
             storage_fingerprint: lexical_rebuild_deferred_content_fingerprint(0),
         };
-        let mut state =
-            LexicalRebuildState::new(checkpoint_db_state, LEXICAL_REBUILD_PAGE_SIZE);
+        let mut state = LexicalRebuildState::new(checkpoint_db_state, LEXICAL_REBUILD_PAGE_SIZE);
         state.execution_mode = None;
         persist_lexical_rebuild_state(&index_path, &state).unwrap();
 

@@ -36439,6 +36439,24 @@ fn doctor_anomaly_for_check(name: &str, status: &str, message: &str) -> DoctorAn
     }
 }
 
+/// #438: the healthy `fts_table` verdict, spelled out so an operator running a
+/// stock-sqlite integrity monitor against a frankensqlite-written archive
+/// knows which validator to trust for which layer. Stock `PRAGMA
+/// integrity_check` / fts5 `integrity-check` can report frankensqlite-written
+/// fts5 segments as corrupt while every read path (frankensqlite, stock
+/// `MATCH`, `VACUUM INTO`) is healthy; that is an engine-dialect divergence
+/// tracked upstream (frankensqlite#404), not data loss. The FTS shadow is
+/// fully derived from canonical rows and `cass doctor --rebuild-canonical-fts
+/// --yes` regenerates it.
+const DOCTOR_FTS_TABLE_QUERYABLE_MESSAGE: &str = concat!(
+    "FTS search table (fts_messages) is queryable via frankensqlite. ",
+    "Treat this check as authoritative for the fts5 shadow's contents: stock SQLite's ",
+    "PRAGMA integrity_check / fts5 integrity-check may flag frankensqlite-written fts5 segments ",
+    "as corrupt while every read path is healthy (cass#438, frankensqlite#404); stock ",
+    "integrity_check stays authoritative for the page/b-tree level. The shadow is derived from ",
+    "canonical rows and `cass doctor --rebuild-canonical-fts --yes` regenerates it."
+);
+
 fn doctor_check_report(
     name: &str,
     status: &str,
@@ -87079,10 +87097,14 @@ pub(crate) fn run_doctor_impl(
                                                 Some(
                                                     DoctorFtsTableState::QueryableViaFrankensqlite,
                                                 ) => {
+                                                    // #438: name the known engine-dialect
+                                                    // divergence so a stock-sqlite integrity
+                                                    // monitor can special-case it instead of
+                                                    // paging on a healthy archive.
                                                     add_check!(
                                                         "fts_table",
                                                         "pass",
-                                                        "FTS search table (fts_messages) is queryable via frankensqlite",
+                                                        DOCTOR_FTS_TABLE_QUERYABLE_MESSAGE,
                                                         false
                                                     );
                                                 }

@@ -538,7 +538,9 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
             selected_manifests.insert(manifest.manifest_id.clone());
             manifest_reasons
                 .entry(manifest.manifest_id.clone())
-                .or_insert_with(|| "max-size over budget; retiring oldest unpinned capture".to_string());
+                .or_insert_with(|| {
+                    "max-size over budget; retiring oldest unpinned capture".to_string()
+                });
 
             let mut seen_manifest_blobs = HashSet::new();
             for blob_reference in &manifest.blob_references {
@@ -648,9 +650,7 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
             for reference in raw_mirror_manifest_blob_references(&manifest)? {
                 if verified_blob_paths.insert(reference.blob_relative_path.clone()) {
                     verify_existing_blob_reference(&root, &reference).with_context(|| {
-                        format!(
-                            "preflight content checksum for selected manifest {manifest_id}"
-                        )
+                        format!("preflight content checksum for selected manifest {manifest_id}")
                     })?;
                 }
             }
@@ -660,7 +660,10 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
                 continue;
             }
             let physical = physical_blob_by_relative.get(&entry.path).ok_or_else(|| {
-                anyhow!("preflight selected raw mirror blob disappeared: {}", entry.path)
+                anyhow!(
+                    "preflight selected raw mirror blob disappeared: {}",
+                    entry.path
+                )
             })?;
             verify_existing_blob_reference(
                 &root,
@@ -674,9 +677,8 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         }
         for entry in &report.entries {
             let path = root.join(&entry.path);
-            validate_prune_target_file(&root, &path).with_context(|| {
-                format!("preflight raw mirror prune target {}", path.display())
-            })?;
+            validate_prune_target_file(&root, &path)
+                .with_context(|| format!("preflight raw mirror prune target {}", path.display()))?;
         }
 
         // Record and fsync the exact authority-bearing plan before removing
@@ -761,16 +763,14 @@ fn collect_prune_manifests(root: &Path) -> Result<Vec<RawMirrorPruneManifest>> {
                 expected_path.display()
             );
         }
-        let blob_references = validate_raw_mirror_manifest_contents(
-            &parsed_manifest,
-            &parsed_manifest.manifest_id,
-        )
-        .with_context(|| {
-            format!(
-                "refusing to prune raw mirror manifest without valid identity and checksum {}",
-                path.display()
-            )
-        })?;
+        let blob_references =
+            validate_raw_mirror_manifest_contents(&parsed_manifest, &parsed_manifest.manifest_id)
+                .with_context(|| {
+                format!(
+                    "refusing to prune raw mirror manifest without valid identity and checksum {}",
+                    path.display()
+                )
+            })?;
         let manifest_blake3 = parsed_manifest.manifest_blake3.clone().ok_or_else(|| {
             anyhow!(
                 "validated raw mirror manifest {} is missing its descriptor checksum",
@@ -935,8 +935,9 @@ fn collect_raw_mirror_physical_blobs(root: &Path) -> Result<Vec<RawMirrorPhysica
         {
             let entry = entry?;
             let path = entry.path();
-            let metadata = fs::symlink_metadata(&path)
-                .with_context(|| format!("stat raw mirror blob inventory path {}", path.display()))?;
+            let metadata = fs::symlink_metadata(&path).with_context(|| {
+                format!("stat raw mirror blob inventory path {}", path.display())
+            })?;
             if metadata.file_type().is_symlink() {
                 return Err(anyhow!(
                     "refusing to inventory symlinked raw mirror blob path {}",
@@ -1066,17 +1067,13 @@ fn remove_prune_entry_file(root: &Path, entry: &RawMirrorPruneEntry) -> Result<b
                     path.display()
                 )
             })?;
-            let observed_manifest = validated_existing_manifest(
-                root,
-                &path,
-                expected_blob_blake3,
-            )
-            .with_context(|| {
-                format!(
-                    "revalidating raw mirror manifest immediately before deletion {}",
-                    path.display()
-                )
-            })?;
+            let observed_manifest = validated_existing_manifest(root, &path, expected_blob_blake3)
+                .with_context(|| {
+                    format!(
+                        "revalidating raw mirror manifest immediately before deletion {}",
+                        path.display()
+                    )
+                })?;
             if observed_manifest.manifest_blake3.as_deref() != Some(expected_manifest_blake3) {
                 return Err(anyhow!(
                     "raw mirror prune manifest checksum changed after preflight for {}: observed {:?}, expected {}",
@@ -1094,8 +1091,7 @@ fn remove_prune_entry_file(root: &Path, entry: &RawMirrorPruneEntry) -> Result<b
         }
     }
 
-    fs::remove_file(&path)
-        .with_context(|| format!("remove raw mirror file {}", path.display()))?;
+    fs::remove_file(&path).with_context(|| format!("remove raw mirror file {}", path.display()))?;
     sync_parent(&path)?;
     Ok(true)
 }
@@ -1110,9 +1106,12 @@ fn open_prune_audit_log(root: &Path) -> Result<(PathBuf, File)> {
     let file = options
         .open(&audit_path)
         .with_context(|| format!("open raw mirror prune audit {}", audit_path.display()))?;
-    let opened_metadata = file
-        .metadata()
-        .with_context(|| format!("stat opened raw mirror prune audit {}", audit_path.display()))?;
+    let opened_metadata = file.metadata().with_context(|| {
+        format!(
+            "stat opened raw mirror prune audit {}",
+            audit_path.display()
+        )
+    })?;
     let path_metadata = fs::symlink_metadata(&audit_path)
         .with_context(|| format!("restat raw mirror prune audit {}", audit_path.display()))?;
     if path_metadata.file_type().is_symlink()
@@ -1210,15 +1209,15 @@ fn acquire_raw_mirror_mutation_lock(root: &Path) -> Result<RawMirrorFileLockGuar
     // bet45: first use of a mirror may acquire the mutation lock before the
     // root has ever been created; the root was just verified symlink-free
     // (or nonexistent) above, so creating it here is safe.
-    fs::create_dir_all(root)
-        .with_context(|| format!("create raw mirror root for mutation lock {}", root.display()))?;
+    fs::create_dir_all(root).with_context(|| {
+        format!(
+            "create raw mirror root for mutation lock {}",
+            root.display()
+        )
+    })?;
 
     let mut options = OpenOptions::new();
-    options
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true);
+    options.create(true).truncate(false).read(true).write(true);
     configure_lock_open_options(&mut options);
     let file = options
         .open(&lock_path)
@@ -1226,9 +1225,12 @@ fn acquire_raw_mirror_mutation_lock(root: &Path) -> Result<RawMirrorFileLockGuar
     fs2::FileExt::lock_exclusive(&file)
         .with_context(|| format!("acquire raw mirror mutation lock {}", lock_path.display()))?;
 
-    let opened_metadata = file
-        .metadata()
-        .with_context(|| format!("stat opened raw mirror mutation lock {}", lock_path.display()))?;
+    let opened_metadata = file.metadata().with_context(|| {
+        format!(
+            "stat opened raw mirror mutation lock {}",
+            lock_path.display()
+        )
+    })?;
     let path_metadata = fs::symlink_metadata(&lock_path)
         .with_context(|| format!("restat raw mirror mutation lock {}", lock_path.display()))?;
     if path_metadata.file_type().is_symlink()
@@ -1258,15 +1260,12 @@ fn try_acquire_index_run_lock_for_prune(data_dir: &Path) -> Result<RawMirrorFile
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            return Err(error).with_context(|| format!("stat index-run lock {}", lock_path.display()));
+            return Err(error)
+                .with_context(|| format!("stat index-run lock {}", lock_path.display()));
         }
     }
     let mut options = OpenOptions::new();
-    options
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true);
+    options.create(true).truncate(false).read(true).write(true);
     configure_lock_open_options(&mut options);
     let file = options
         .open(&lock_path)
@@ -1907,10 +1906,7 @@ fn copy_source_to_private_chunks(
     })
 }
 
-fn content_addressed_blob_is_verified(
-    root: &Path,
-    reference: &RawMirrorChunkRef,
-) -> Result<bool> {
+fn content_addressed_blob_is_verified(root: &Path, reference: &RawMirrorChunkRef) -> Result<bool> {
     let path = root.join(&reference.blob_relative_path);
     if raw_mirror_path_has_symlink_below_root(root, &path) {
         return Err(anyhow!(
@@ -1924,7 +1920,9 @@ fn content_addressed_blob_is_verified(
             Ok(true)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error).with_context(|| format!("stat raw mirror blob {}", path.display())),
+        Err(error) => {
+            Err(error).with_context(|| format!("stat raw mirror blob {}", path.display()))
+        }
     }
 }
 
@@ -2020,10 +2018,7 @@ fn source_file_changed_during_capture(
     }
 }
 
-fn source_path_changed_identity_during_capture(
-    source_path: &Path,
-    initial: &fs::Metadata,
-) -> bool {
+fn source_path_changed_identity_during_capture(source_path: &Path, initial: &fs::Metadata) -> bool {
     match fs::symlink_metadata(source_path) {
         Ok(current) => current.file_type().is_symlink() || !same_source_identity(initial, &current),
         Err(_) => true,
@@ -2300,11 +2295,7 @@ fn verify_existing_file(path: &Path, expected_blake3: &str) -> Result<()> {
     }
 }
 
-fn verify_existing_manifest(
-    root: &Path,
-    path: &Path,
-    expected_blob_blake3: &str,
-) -> Result<()> {
+fn verify_existing_manifest(root: &Path, path: &Path, expected_blob_blake3: &str) -> Result<()> {
     validated_existing_manifest(root, path, expected_blob_blake3).map(|_| ())
 }
 
@@ -2640,8 +2631,7 @@ fn raw_mirror_manifest_blob_references(
         || storage.chunk_size_bytes == 0
         || storage.chunks.is_empty()
         || storage.content_size_bytes != manifest.source_size_bytes
-        || manifest.verification.content_blake3.as_deref()
-            != Some(storage.content_blake3.as_str())
+        || manifest.verification.content_blake3.as_deref() != Some(storage.content_blake3.as_str())
         || raw_mirror_blob_relative_path(&storage.content_blake3).is_none()
     {
         return Err(anyhow!(
@@ -2650,8 +2640,7 @@ fn raw_mirror_manifest_blob_references(
     }
     let descriptor_bytes = serde_json::to_vec(storage)?;
     if descriptor_bytes.len() as u64 != manifest.blob_size_bytes
-        || blake3::hash(&descriptor_bytes).to_hex().as_str()
-            != manifest.blob_blake3.as_str()
+        || blake3::hash(&descriptor_bytes).to_hex().as_str() != manifest.blob_blake3.as_str()
     {
         return Err(anyhow!(
             "raw mirror fixed-chunk descriptor does not match the manifest blob"
@@ -3520,7 +3509,9 @@ mod tests {
         let second_manifest = read_raw_mirror_manifest(&root.join(&second.manifest_relative_path))
             .expect("second manifest");
         let first_storage = first_manifest.content_storage.expect("first chunk storage");
-        let second_storage = second_manifest.content_storage.expect("second chunk storage");
+        let second_storage = second_manifest
+            .content_storage
+            .expect("second chunk storage");
         assert_eq!(
             first_storage.chunks,
             second_storage.chunks[..3],
@@ -3571,8 +3562,7 @@ mod tests {
         let mut old_first_manifest =
             read_raw_mirror_manifest(&first_manifest_path).expect("re-read first manifest");
         old_first_manifest.captured_at_ms = 0;
-        old_first_manifest.manifest_blake3 =
-            Some(raw_mirror_manifest_blake3(&old_first_manifest));
+        old_first_manifest.manifest_blake3 = Some(raw_mirror_manifest_blake3(&old_first_manifest));
         fs::write(
             &first_manifest_path,
             serde_json::to_vec_pretty(&old_first_manifest).expect("serialize old manifest"),
@@ -3593,9 +3583,7 @@ mod tests {
         let planned_manifest = prune_report
             .entries
             .iter()
-            .find(|entry| {
-                entry.kind == "manifest" && entry.path == first.manifest_relative_path
-            })
+            .find(|entry| entry.kind == "manifest" && entry.path == first.manifest_relative_path)
             .expect("retired chunked manifest prune entry");
         assert_eq!(
             planned_manifest.blob_blake3.as_deref(),
@@ -3608,9 +3596,10 @@ mod tests {
             "a manifest prune plan must pin the exact descriptor checksum"
         );
         assert!(
-            prune_report.entries.iter().any(|entry| {
-                entry.kind == "blob" && entry.path == first.blob_relative_path
-            }),
+            prune_report
+                .entries
+                .iter()
+                .any(|entry| { entry.kind == "blob" && entry.path == first.blob_relative_path }),
             "the retired snapshot descriptor should be reclaimable"
         );
         for shared_chunk in &first_storage.chunks {
@@ -3647,7 +3636,12 @@ mod tests {
 
         let shared_chunk_path = root.join(&first_storage.chunks[0].blob_relative_path);
         fs::write(&shared_chunk_path, b"tampered-16-byte").expect("plant same-size corruption");
-        assert_eq!(fs::metadata(&shared_chunk_path).expect("chunk metadata").len(), 16);
+        assert_eq!(
+            fs::metadata(&shared_chunk_path)
+                .expect("chunk metadata")
+                .len(),
+            16
+        );
         let error = verify_source_capture(&data_dir, &third.manifest_id)
             .expect_err("same-size chunk corruption must invalidate reconstruction authority");
         assert!(
@@ -3758,8 +3752,7 @@ mod tests {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
         let source_path = temp.path().join("chunked-prune.jsonl");
-        fs::write(&source_path, b"0123456789abcdefABCDEFGHIJKLMNOP")
-            .expect("write chunked source");
+        fs::write(&source_path, b"0123456789abcdefABCDEFGHIJKLMNOP").expect("write chunked source");
         let captured = capture_source_file_with_chunk_policy(
             RawMirrorCaptureInput {
                 data_dir: &data_dir,
@@ -4016,27 +4009,21 @@ mod tests {
         ensure_private_dir_descendant(&root, &temp_dir).expect("create preparation temp dir");
         let source_metadata = fs::symlink_metadata(&source_path).expect("source metadata");
 
-        let prepared = prepare_source_content(
-            &root,
-            &source_path,
-            &temp_dir,
-            &source_metadata,
-            1,
-            16,
-        )
-        .expect("prepare appended source");
+        let prepared =
+            prepare_source_content(&root, &source_path, &temp_dir, &source_metadata, 1, 16)
+                .expect("prepare appended source");
 
-        assert_eq!(prepared.record.source_size_bytes, appended_bytes.len() as u64);
+        assert_eq!(
+            prepared.record.source_size_bytes,
+            appended_bytes.len() as u64
+        );
         assert_eq!(prepared.files.len(), 2);
         assert!(
             prepared.files.iter().any(|file| file.bytes_copied == 5),
             "the appended tail must be the only new source-content temp"
         );
         assert!(
-            prepared
-                .files
-                .iter()
-                .all(|file| file.bytes_copied != 16),
+            prepared.files.iter().all(|file| file.bytes_copied != 16),
             "unchanged complete chunks must be verified and reused without temp rewrites"
         );
     }
@@ -4053,15 +4040,9 @@ mod tests {
         ensure_private_dir_descendant(&root, &temp_dir).expect("create preparation temp dir");
         let source_metadata = fs::symlink_metadata(&source_path).expect("source metadata");
 
-        let prepared = prepare_source_content(
-            &root,
-            &source_path,
-            &temp_dir,
-            &source_metadata,
-            1,
-            16,
-        )
-        .expect("prepare repeated chunks");
+        let prepared =
+            prepare_source_content(&root, &source_path, &temp_dir, &source_metadata, 1, 16)
+                .expect("prepare repeated chunks");
 
         assert_eq!(prepared.record.source_size_bytes, 32);
         assert_eq!(
@@ -4177,8 +4158,11 @@ mod tests {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
         let source_path = temp.path().join("source.jsonl");
-        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"bounded\"}\n")
-            .expect("write source");
+        fs::write(
+            &source_path,
+            b"{\"type\":\"message\",\"text\":\"bounded\"}\n",
+        )
+        .expect("write source");
         let captured = capture_source_file(RawMirrorCaptureInput {
             data_dir: &data_dir,
             provider: "codex",
@@ -4222,8 +4206,11 @@ mod tests {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
         let source_path = temp.path().join("source.jsonl");
-        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"integrity\"}\n")
-            .expect("write source");
+        fs::write(
+            &source_path,
+            b"{\"type\":\"message\",\"text\":\"integrity\"}\n",
+        )
+        .expect("write source");
         let captured = capture_source_file(RawMirrorCaptureInput {
             data_dir: &data_dir,
             provider: "codex",
@@ -4400,15 +4387,17 @@ mod tests {
         let blob_parent = blob_path.parent().expect("blob parent");
         let relocated_parent = temp.path().join("relocated-blob-prefix");
         fs::rename(blob_parent, &relocated_parent).expect("relocate blob prefix");
-        std::os::unix::fs::symlink(&relocated_parent, blob_parent)
-            .expect("symlink blob prefix");
+        std::os::unix::fs::symlink(&relocated_parent, blob_parent).expect("symlink blob prefix");
 
         let summary = storage_summary(&data_dir);
         assert_eq!(summary.manifest_count, 1);
         assert_eq!(summary.unique_blob_count, 0);
         assert_eq!(summary.total_blob_bytes, 0);
         assert_eq!(summary.missing_blob_count, 1);
-        assert_eq!(fs::read(&blob_path).expect("outside blob bytes"), source_bytes);
+        assert_eq!(
+            fs::read(&blob_path).expect("outside blob bytes"),
+            source_bytes
+        );
     }
 
     #[test]
@@ -4472,8 +4461,11 @@ mod tests {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
         let source_path = temp.path().join("source.jsonl");
-        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"bounded\"}\n")
-            .expect("write source");
+        fs::write(
+            &source_path,
+            b"{\"type\":\"message\",\"text\":\"bounded\"}\n",
+        )
+        .expect("write source");
         let captured = capture_source_file(RawMirrorCaptureInput {
             data_dir: &data_dir,
             provider: "codex",
@@ -4628,11 +4620,8 @@ mod tests {
         let orphan_relative =
             raw_mirror_blob_relative_path(&orphan_blake3).expect("orphan blob path");
         let orphan_path = root.join(&orphan_relative);
-        ensure_private_dir_descendant(
-            &root,
-            orphan_path.parent().expect("orphan parent"),
-        )
-        .expect("orphan parent directory");
+        ensure_private_dir_descendant(&root, orphan_path.parent().expect("orphan parent"))
+            .expect("orphan parent directory");
         fs::write(&orphan_path, orphan_bytes).expect("plant crash-orphaned blob");
 
         let summary = storage_summary(&data_dir);
@@ -4691,11 +4680,8 @@ mod tests {
         let orphan_relative =
             raw_mirror_blob_relative_path(&orphan_blake3).expect("orphan blob path");
         let orphan_path = root.join(&orphan_relative);
-        ensure_private_dir_descendant(
-            &root,
-            orphan_path.parent().expect("orphan parent"),
-        )
-        .expect("orphan parent directory");
+        ensure_private_dir_descendant(&root, orphan_path.parent().expect("orphan parent"))
+            .expect("orphan parent directory");
         fs::write(&orphan_path, orphan_bytes).expect("plant recent orphan");
 
         let report = prune(
@@ -4724,11 +4710,8 @@ mod tests {
         let orphan_relative =
             raw_mirror_blob_relative_path(&orphan_blake3).expect("orphan blob path");
         let orphan_path = root.join(&orphan_relative);
-        ensure_private_dir_descendant(
-            &root,
-            orphan_path.parent().expect("orphan parent"),
-        )
-        .expect("orphan parent directory");
+        ensure_private_dir_descendant(&root, orphan_path.parent().expect("orphan parent"))
+            .expect("orphan parent directory");
         fs::write(&orphan_path, b"corrupted orphan byte").expect("plant corrupt orphan");
         assert_eq!(
             fs::metadata(&orphan_path).expect("orphan metadata").len(),
@@ -4761,14 +4744,10 @@ mod tests {
         let root = ensure_raw_mirror_root(&data_dir).expect("raw mirror root");
         let expected_bytes = b"preflighted raw mirror evidence";
         let expected_blake3 = blake3::hash(expected_bytes).to_hex().to_string();
-        let relative_path =
-            raw_mirror_blob_relative_path(&expected_blake3).expect("blob path");
+        let relative_path = raw_mirror_blob_relative_path(&expected_blake3).expect("blob path");
         let blob_path = root.join(&relative_path);
-        ensure_private_dir_descendant(
-            &root,
-            blob_path.parent().expect("blob parent directory"),
-        )
-        .expect("create blob parent directory");
+        ensure_private_dir_descendant(&root, blob_path.parent().expect("blob parent directory"))
+            .expect("create blob parent directory");
         fs::write(&blob_path, expected_bytes).expect("plant preflighted blob");
         let entry = RawMirrorPruneEntry {
             kind: "blob".to_string(),
@@ -4944,7 +4923,10 @@ mod tests {
         )
         .expect_err("held index-run lock must block applied prune");
 
-        assert!(error.to_string().contains("index run acquired"), "{error:#}");
+        assert!(
+            error.to_string().contains("index run acquired"),
+            "{error:#}"
+        );
         assert!(root.join(captured.manifest_relative_path).exists());
         assert!(root.join(captured.blob_relative_path).exists());
         assert!(!root.join("pruned.jsonl").exists());
@@ -5105,10 +5087,15 @@ mod tests {
             detail.contains("symlink"),
             "unexpected prune preflight error: {detail}"
         );
-        assert!(manifest_path.exists(), "preflight failure removed the manifest");
+        assert!(
+            manifest_path.exists(),
+            "preflight failure removed the manifest"
+        );
         assert!(blob_path.exists(), "preflight failure removed the blob");
         assert!(
-            outside_bucket.join(blob_path.file_name().context("blob file name")?).exists(),
+            outside_bucket
+                .join(blob_path.file_name().context("blob file name")?)
+                .exists(),
             "preflight failure removed the external blob target"
         );
         assert!(!root.join("pruned.jsonl").exists());
@@ -5429,8 +5416,7 @@ mod tests {
             content_storage: None,
         };
         let root = ensure_raw_mirror_root(&first_key.data_dir).expect("create mirror root");
-        for (record, bytes) in [(&first_record, &b"a"[..]), (&second_record, &b"bb"[..])]
-        {
+        for (record, bytes) in [(&first_record, &b"a"[..]), (&second_record, &b"bb"[..])] {
             let relative = raw_mirror_blob_relative_path(&record.blob_blake3)
                 .expect("fixture blob relative path");
             let path = root.join(relative);
@@ -5482,10 +5468,7 @@ mod tests {
         // vacuously (nothing was cached at all).
         if let Some(cache) = BLOB_CAPTURE_CACHE.get() {
             assert!(
-                !cache
-                    .lock()
-                    .expect("cache lock")
-                    .contains_key(&source_key),
+                !cache.lock().expect("cache lock").contains_key(&source_key),
                 "a weak non-Unix-style metadata key must never authorize cache reuse"
             );
         }
@@ -5631,11 +5614,8 @@ mod tests {
         fs::create_dir_all(&root).expect("raw mirror root");
         fs::write(&source_path, source_bytes).expect("source bytes");
         fs::write(&protected_target, b"protected\n").expect("protected target");
-        std::os::unix::fs::symlink(
-            &protected_target,
-            root.join(RAW_MIRROR_MUTATION_LOCK_FILE),
-        )
-        .expect("symlink mutation lock");
+        std::os::unix::fs::symlink(&protected_target, root.join(RAW_MIRROR_MUTATION_LOCK_FILE))
+            .expect("symlink mutation lock");
 
         let error = capture_source_file(RawMirrorCaptureInput {
             data_dir: &data_dir,
@@ -5648,7 +5628,10 @@ mod tests {
         })
         .expect_err("symlinked mutation lock must be rejected");
 
-        assert!(error.to_string().contains("mutation lock path"), "{error:#}");
+        assert!(
+            error.to_string().contains("mutation lock path"),
+            "{error:#}"
+        );
         assert_eq!(
             fs::read(&protected_target).expect("protected bytes"),
             b"protected\n"

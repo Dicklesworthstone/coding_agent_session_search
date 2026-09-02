@@ -2520,8 +2520,11 @@ mod tests {
         };
         // The "published before the interruption" prefix.
         let published = [doc(0, "alpha published"), doc(1, "beta published")];
-        let refs: Vec<FsCassDocumentRef<'_>> = published.iter().map(FsCassDocument::as_ref).collect();
-        index.add_prebuilt_document_refs_slice(&refs).expect("publish prefix");
+        let refs: Vec<FsCassDocumentRef<'_>> =
+            published.iter().map(FsCassDocument::as_ref).collect();
+        index
+            .add_prebuilt_document_refs_slice(&refs)
+            .expect("publish prefix");
         index.commit().expect("commit prefix");
         assert_eq!(index.doc_count().expect("doc count"), 2);
 
