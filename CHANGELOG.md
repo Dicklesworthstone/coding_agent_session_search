@@ -50,8 +50,28 @@ Everything below is on `main`; nothing is in a released binary yet.
 - `install.sh` probes the host's glibc before downloading a Linux prebuilt
   binary and falls back to build-from-source below 2.38 (proven on Ubuntu 22.04
   and 24.04 containers).
+- `cass doctor --fix`'s WAL checkpoint runs under a wall-clock deadline (120 s,
+  `CASS_DOCTOR_WAL_CHECKPOINT_TIMEOUT_SECS`); on an archive whose frankensqlite
+  writable open loops (GH #382) the `archive_wal` check fails truthfully, names
+  the issue and the stock-sqlite remedy, and doctor returns instead of hanging.
+  The read-only warning names the same loop shape.
+- End-to-end proofs for GH #439 (a slow-but-heartbeating post-publish FTS repair
+  survives the stall window; a parked one exits 70 with the envelope), GH #440
+  (a force rebuild killed between the staged commit and the checkpoint write
+  resumes with a plain `cass index`, no duplicate identities), and GH #441 (a
+  40-segment generation is folded by a plain `cass index`).
 
 ### Changed
+- frankensqlite pinned at `=0.3.15` (from 0.3.14): on a 10 GB archive with a
+  200 MB WAL, 0.3.14's writable open never returned; 0.3.15's open and
+  `BEGIN IMMEDIATE` complete. Its `PRAGMA wal_checkpoint` on such an archive
+  still loops (`reclaim_disowned_in_range` rescans the WAL per ledger page);
+  fixed upstream in frankensqlite `8d012706a`, consumed with the next release.
+- The TUI analytics dashboard's load task is one production function with the
+  detached-rebuild spawn injected (`load_chart_data_with_auto_rebuild`); the
+  test-only stub that returned canned data is gone, and unit tests prove that
+  missing rollups spawn exactly one detached `cass analytics rebuild` and never
+  rebuild in-process (GH #395).
 - Quill is opened everywhere with one cass configuration: engine visibility-lag
   publication is disabled (snapshots publish only on cass commits), the query fuel
   budget stays at the engine default with `CASS_QUILL_QUERY_FUEL_BUDGET` as an
