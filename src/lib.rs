@@ -28616,42 +28616,7 @@ fn execute_search_operation(
             Ok(result) => result,
             Err(error) => {
                 let message = error.to_string();
-                if hybrid_fail_open && lexical_query_fuel_exhausted(&message) {
-                    // #441: the lexical leg was refused by Quill's query fuel
-                    // budget (a many-segment index makes dictionary probing
-                    // scale with segments x terms); the semantic leg answers
-                    // the same query, so serve it and say so in the metadata
-                    // rather than failing the whole request.
-                    mode_meta.fall_back_to_semantic_only(format!("lexical leg skipped: {error}"));
-                    let (hits, ann_stats) = client
-                        .search_semantic_with_tier(
-                            &query,
-                            filters.clone(),
-                            search_limit,
-                            search_offset,
-                            field_mask,
-                            approximate,
-                            semantic_execution_tier,
-                        )
-                        .map_err(|semantic_error| CliError {
-                            code: 9,
-                            kind: CliErrorKind::Search.kind_str(),
-                            message: format!(
-                                "hybrid search failed ({error}); semantic fallback failed: {semantic_error}"
-                            ),
-                            hint: Some(LEXICAL_FUEL_EXHAUSTED_HINT.to_string()),
-                            retryable: true,
-                        })?;
-                    crate::search::query::SearchResult {
-                        hits,
-                        wildcard_fallback: false,
-                        cache_stats: crate::search::query::CacheStats::default(),
-                        suggestions: Vec::new(),
-                        ann_stats,
-                        ann_unavailable_reason: None,
-                        total_count: None,
-                    }
-                } else if hybrid_fail_open
+                if hybrid_fail_open
                     && (message.contains("unavailable") || message.contains("no embedder"))
                 {
                     mode_meta
@@ -29780,39 +29745,7 @@ fn run_cli_search(
                 Ok(result) => result,
                 Err(e) => {
                     let err_str = e.to_string();
-                    if hybrid_fail_open && lexical_query_fuel_exhausted(&err_str) {
-                        // #441: see the one-shot search path — serve the
-                        // semantic leg when the lexical leg is fuel-refused.
-                        mode_meta.fall_back_to_semantic_only(format!("lexical leg skipped: {e}"));
-                        let (hits, ann_stats) = client
-                            .search_semantic_with_tier(
-                                query,
-                                filters.clone(),
-                                search_limit,
-                                search_offset,
-                                field_mask,
-                                approximate,
-                                semantic_execution_tier,
-                            )
-                            .map_err(|semantic_error| CliError {
-                                code: 9,
-                                kind: CliErrorKind::Search.kind_str(),
-                                message: format!(
-                                    "hybrid search failed ({e}); semantic fallback failed: {semantic_error}"
-                                ),
-                                hint: Some(LEXICAL_FUEL_EXHAUSTED_HINT.to_string()),
-                                retryable: true,
-                            })?;
-                        crate::search::query::SearchResult {
-                            hits,
-                            wildcard_fallback: false,
-                            cache_stats: crate::search::query::CacheStats::default(),
-                            suggestions: Vec::new(),
-                            ann_stats,
-                            ann_unavailable_reason: None,
-                            total_count: None,
-                        }
-                    } else if hybrid_fail_open
+                    if hybrid_fail_open
                         && (err_str.contains("unavailable") || err_str.contains("no embedder"))
                     {
                         mode_meta
@@ -32620,20 +32553,6 @@ fn robot_format_from_env() -> Option<RobotFormat> {
         })
 }
 
-/// #441: Quill refuses a query whose deterministic work exceeds its fuel
-/// budget with this phrase (`frankensearch::quill::QuillIndexError`). On a
-/// hybrid request the semantic leg can still answer, so this is the signature
-/// the fail-open below keys on.
-fn lexical_query_fuel_exhausted(message: &str) -> bool {
-    message.contains("query fuel exhausted")
-}
-
-const LEXICAL_FUEL_EXHAUSTED_HINT: &str = concat!(
-    "The lexical index has accumulated more segments than this query's Quill fuel budget can probe. ",
-    "Run `cass index` (it folds segments after every run) or `cass index --full` to compact it; ",
-    "CASS_QUILL_QUERY_FUEL_BUDGET raises the per-query budget as a stopgap."
-);
-
 #[derive(Debug, Clone)]
 struct SearchModeMeta {
     requested: crate::search::query::SearchMode,
@@ -32679,17 +32598,6 @@ impl SearchModeMeta {
     fn fall_back_to_lexical(&mut self, reason: impl Into<String>) {
         self.realized = crate::search::query::SearchMode::Lexical;
         self.fallback_tier = Some("lexical");
-        self.fallback_reason = Some(reason.into());
-    }
-
-    /// #441: a hybrid query whose LEXICAL leg was refused (Quill query fuel
-    /// exhausted on a many-segment index) degrades to its semantic leg
-    /// instead of failing outright. Semantic refinement still contributed in
-    /// full; what is missing is the lexical evidence, and `fallback_tier`
-    /// / `fallback_reason` say so.
-    fn fall_back_to_semantic_only(&mut self, reason: impl Into<String>) {
-        self.realized = crate::search::query::SearchMode::Semantic;
-        self.fallback_tier = Some("semantic");
         self.fallback_reason = Some(reason.into());
     }
 

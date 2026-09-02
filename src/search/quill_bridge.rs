@@ -41,7 +41,18 @@ pub const QUILL_INDEX_MARKER: &str = "MANIFEST";
 /// what turns a pathological query into a fast typed refusal instead of an
 /// unbounded scan, so raising it is a diagnostic/escape hatch, not a tuning
 /// knob; the durable fix for fuel exhaustion is a compacted index (#441).
-pub const QUILL_QUERY_FUEL_BUDGET_ENV: &str = "CASS_QUILL_QUERY_FUEL_BUDGET";
+pub const CASS_QUILL_QUERY_FUEL_BUDGET_ENV: &str = "CASS_QUILL_QUERY_FUEL_BUDGET";
+
+/// Whether `error` is Quill's typed query-fuel refusal (#441), anywhere in
+/// its context chain. The engine reports it as `... query fuel exhausted after
+/// N/M units ...`; callers use this to tell "the lexical engine refused the
+/// work" apart from an index fault.
+#[must_use]
+pub fn is_query_fuel_exhausted(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("query fuel exhausted"))
+}
 
 /// Engine configuration every CASS reader and writer opens with.
 ///
@@ -62,7 +73,7 @@ pub const QUILL_QUERY_FUEL_BUDGET_ENV: &str = "CASS_QUILL_QUERY_FUEL_BUDGET";
 ///   lease, which the hole-ratio-gated tier merge can never fold. With
 ///   explicit publication only, a segment is sealed on the accumulation
 ///   budget or at commit, and the MANIFEST moves only when CASS says so.
-/// * `query_fuel_budget` honours [`QUILL_QUERY_FUEL_BUDGET_ENV`].
+/// * `query_fuel_budget` honours [`CASS_QUILL_QUERY_FUEL_BUDGET_ENV`].
 ///
 /// Everything else keeps the engine default so the on-disk format and the
 /// admission/merge semantics stay exactly what the pinned engine documents.
@@ -72,9 +83,11 @@ pub fn cass_quill_config() -> QuillConfig {
         max_visibility_lag_ms: u64::MAX,
         ..QuillConfig::default()
     };
-    if let Some(budget) =
-        query_fuel_budget_override(dotenvy::var(QUILL_QUERY_FUEL_BUDGET_ENV).ok().as_deref())
-    {
+    if let Some(budget) = query_fuel_budget_override(
+        dotenvy::var(CASS_QUILL_QUERY_FUEL_BUDGET_ENV)
+            .ok()
+            .as_deref(),
+    ) {
         config.query_fuel_budget = budget;
     }
     config
