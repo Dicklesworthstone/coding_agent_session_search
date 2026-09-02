@@ -11025,57 +11025,159 @@ pub(crate) fn lexical_storage_fingerprint_for_db_strict(db_path: &Path) -> Resul
     Ok(fingerprint)
 }
 
+/// Sidecar (inside the lexical index directory, next to the rebuild
+/// checkpoint) that memoizes the canonical archive fingerprint against the
+/// archive's physical identity. It exists for the one-shot CLI: every
+/// `cass search --robot` is a fresh process, so an in-process memo alone
+/// never hits on the path that matters most.
+pub(crate) const ARCHIVE_FINGERPRINT_CACHE_FILE: &str = ".archive-fingerprint-cache.json";
+
+const ARCHIVE_FINGERPRINT_CACHE_SCHEMA_VERSION: u32 = 1;
+
 /// Physical identity of a canonical archive for fingerprint memoization: the
 /// size and mtime of the main database file and of its WAL sidecar. Any
-/// committed write touches at least one of them, so an unchanged key means
-/// the strict fingerprint computed last time is still the current one.
-fn lexical_storage_physical_identity(db_path: &Path) -> Option<(u64, u128, u64, u128)> {
-    fn stamp(path: &Path) -> Option<(u64, u128)> {
+/// committed write touches at least one of them (a WAL append changes the WAL
+/// length and mtime; a checkpoint changes the main file), so an unchanged key
+/// means the strict fingerprint computed last time is still the current one.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+struct ArchivePhysicalIdentity {
+    db_len: u64,
+    db_mtime_secs: u64,
+    db_mtime_nanos: u32,
+    wal_len: u64,
+    wal_mtime_secs: u64,
+    wal_mtime_nanos: u32,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ArchiveFingerprintCache {
+    schema_version: u32,
+    identity: ArchivePhysicalIdentity,
+    fingerprint: String,
+    computed_at_ms: i64,
+}
+
+fn lexical_storage_physical_identity(db_path: &Path) -> Option<ArchivePhysicalIdentity> {
+    fn stamp(path: &Path) -> Option<(u64, u64, u32)> {
         match fs::metadata(path) {
             Ok(meta) => {
                 let modified = meta
                     .modified()
                     .ok()
-                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|elapsed| elapsed.as_nanos())?;
-                Some((meta.len(), modified))
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())?;
+                Some((meta.len(), modified.as_secs(), modified.subsec_nanos()))
             }
             // An absent WAL sidecar is a legitimate, stable state.
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some((0, 0)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some((0, 0, 0)),
             Err(_) => None,
         }
     }
-    let (db_len, db_modified) = stamp(db_path)?;
+    let (db_len, db_mtime_secs, db_mtime_nanos) = stamp(db_path)?;
+    if db_len == 0 {
+        // No archive (or an empty placeholder): nothing worth memoizing.
+        return None;
+    }
     let wal_path = crate::storage::sqlite::database_sidecar_path(db_path, "-wal");
-    let (wal_len, wal_modified) = stamp(&wal_path)?;
-    Some((db_len, db_modified, wal_len, wal_modified))
+    let (wal_len, wal_mtime_secs, wal_mtime_nanos) = stamp(&wal_path)?;
+    Some(ArchivePhysicalIdentity {
+        db_len,
+        db_mtime_secs,
+        db_mtime_nanos,
+        wal_len,
+        wal_mtime_secs,
+        wal_mtime_nanos,
+    })
 }
 
-/// [`lexical_storage_fingerprint_for_db_strict`], memoized per process on the
-/// archive's physical identity (`lexical_storage_physical_identity`) and the
-/// lexical index it is being validated against.
+/// The on-disk layer of [`lexical_storage_fingerprint_for_db_cached`]: serve
+/// the sidecar's fingerprint when it was computed for exactly this physical
+/// identity, otherwise compute the strict fingerprint and rewrite the sidecar
+/// (best effort, tmp + rename, never fatal). The sidecar is never consulted
+/// by the indexer's own checkpoint logic, which always recomputes.
+fn lexical_storage_fingerprint_for_db_disk_cached(
+    db_path: &Path,
+    identity: &ArchivePhysicalIdentity,
+    cache_dir: &Path,
+) -> Result<String> {
+    let cache_path = cache_dir.join(ARCHIVE_FINGERPRINT_CACHE_FILE);
+    if let Ok(raw) = fs::read(&cache_path)
+        && let Ok(cached) = serde_json::from_slice::<ArchiveFingerprintCache>(&raw)
+        && cached.schema_version == ARCHIVE_FINGERPRINT_CACHE_SCHEMA_VERSION
+        && &cached.identity == identity
+        && cached.fingerprint.starts_with("content-v1:")
+    {
+        tracing::debug!(
+            archive_fingerprint_cache = "hit",
+            cache = %cache_path.display(),
+            "archive fingerprint served from the identity sidecar"
+        );
+        return Ok(cached.fingerprint);
+    }
+    tracing::debug!(
+        archive_fingerprint_cache = "miss",
+        cache = %cache_path.display(),
+        "archive fingerprint recomputed from the canonical database"
+    );
+    let fingerprint = lexical_storage_fingerprint_for_db_strict(db_path)?;
+    let payload = ArchiveFingerprintCache {
+        schema_version: ARCHIVE_FINGERPRINT_CACHE_SCHEMA_VERSION,
+        identity: identity.clone(),
+        fingerprint: fingerprint.clone(),
+        computed_at_ms: semantic_indexing_now_ms(),
+    };
+    // Per-process temp name: concurrent one-shot searches may all miss at once.
+    let tmp_path = cache_dir.join(format!(
+        "{ARCHIVE_FINGERPRINT_CACHE_FILE}.{}.tmp",
+        std::process::id()
+    ));
+    let written = serde_json::to_vec(&payload)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| fs::write(&tmp_path, bytes))
+        .and_then(|()| fs::rename(&tmp_path, &cache_path));
+    if let Err(err) = written {
+        tracing::debug!(
+            error = %err,
+            cache = %cache_path.display(),
+            "archive fingerprint cache write skipped"
+        );
+        let _ = fs::remove_file(&tmp_path);
+    }
+    Ok(fingerprint)
+}
+
+/// [`lexical_storage_fingerprint_for_db_strict`], memoized on the archive's
+/// physical identity (`lexical_storage_physical_identity`) and the lexical
+/// index it is being validated against — first in this process, then in the
+/// on-disk sidecar inside `index_path`.
 ///
 /// The strict variant opens a synchronous read-only handle and replays the
 /// WAL; on a large archive that cost every default `cass search` seconds
-/// before the engine query even ran. A search-time freshness check only needs
-/// the answer to change when the archive does, and any committed write moves
-/// the database or WAL size/mtime, so the memo is invalidated exactly when it
-/// must be. When the identity cannot be read the strict path runs uncached.
+/// (measured: 201 MB of WAL read in 97k calls, 3.5–4 s) before the engine
+/// query even ran, and a one-shot CLI process cannot amortize it in memory.
+/// A search-time freshness check only needs the answer to change when the
+/// archive does, and any committed write moves the database or WAL
+/// size/mtime, so both layers are invalidated exactly when they must be. When
+/// the identity cannot be read the strict path runs uncached.
 pub(crate) fn lexical_storage_fingerprint_for_db_cached(
     db_path: &Path,
     index_path: &Path,
 ) -> Result<String> {
-    type MemoKey = (PathBuf, PathBuf, (u64, u128, u64, u128));
+    type MemoKey = (PathBuf, PathBuf, ArchivePhysicalIdentity);
     static MEMO: std::sync::OnceLock<Mutex<HashMap<MemoKey, String>>> = std::sync::OnceLock::new();
     let Some(identity) = lexical_storage_physical_identity(db_path) else {
         return lexical_storage_fingerprint_for_db_strict(db_path);
     };
-    let key: MemoKey = (db_path.to_path_buf(), index_path.to_path_buf(), identity);
+    let key: MemoKey = (
+        db_path.to_path_buf(),
+        index_path.to_path_buf(),
+        identity.clone(),
+    );
     let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(fingerprint) = memo.lock().ok().and_then(|guard| guard.get(&key).cloned()) {
         return Ok(fingerprint);
     }
-    let fingerprint = lexical_storage_fingerprint_for_db_strict(db_path)?;
+    let fingerprint =
+        lexical_storage_fingerprint_for_db_disk_cached(db_path, &identity, index_path)?;
     if let Ok(mut guard) = memo.lock() {
         // One entry per archive/index pair: a changed identity replaces the
         // stale one rather than accumulating history.
@@ -16881,6 +16983,25 @@ fn run_index_inner(
         progress.finalizing.store(true, Ordering::Relaxed);
     }
     close_storage_after_index(storage, &opts.db_path, "index run")
+}
+
+/// Close a write handle the way `cass index` closes its own: restore the
+/// checkpoint policy, close, then `wal_checkpoint(TRUNCATE)` on a fresh
+/// handle so the sidecar does not outlive the command that filled it.
+///
+/// WS-B.5 (z2uon): every mutating command that is not an index run —
+/// analytics rebuilds, doctor repairs, quarantine retries — used to drop its
+/// handle and leave the WAL for the next opener to replay. The owner's archive
+/// carried a 200 MB WAL for 18 days that way, and every default search paid
+/// for it. A blocked checkpoint (a concurrent reader pinning the WAL) is not
+/// an error here; it is logged by `query_final_wal_checkpoint` and the caller
+/// reports it truthfully.
+pub(crate) fn close_storage_with_wal_checkpoint(
+    storage: FrankenStorage,
+    db_path: &Path,
+    context: &str,
+) -> Result<()> {
+    close_storage_after_index(storage, db_path, context)
 }
 
 fn close_storage_after_index(storage: FrankenStorage, db_path: &Path, context: &str) -> Result<()> {
@@ -58593,5 +58714,127 @@ mod tests {
         assert_eq!(state.committed_conversation_id, Some(999));
         assert_eq!(state.processed_conversations, 5);
         assert_eq!(state.committed_offset, 5);
+    }
+
+    fn seed_archive_conversation(storage: &FrankenStorage, external_id: &str) {
+        let agent = crate::model::types::Agent {
+            id: None,
+            slug: "tester".into(),
+            name: "Tester".into(),
+            version: None,
+            kind: crate::model::types::AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conversation = crate::model::types::Conversation {
+            id: None,
+            agent_slug: "tester".into(),
+            workspace: Some(std::path::PathBuf::from("/tmp/workspace")),
+            external_id: Some(external_id.into()),
+            title: Some(external_id.into()),
+            source_path: std::path::PathBuf::from(format!("/tmp/{external_id}.jsonl")),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![crate::model::types::Message {
+                id: None,
+                idx: 0,
+                role: crate::model::types::MessageRole::User,
+                author: Some("user".into()),
+                created_at: Some(1_700_000_000_050),
+                content: format!("fingerprint cache seed {external_id}"),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: crate::sources::provenance::LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversations_batched(&[(agent_id, None, &conversation)])
+            .unwrap();
+    }
+
+    /// The on-disk archive fingerprint sidecar is served while the archive's
+    /// physical identity is unchanged, and recomputed once the archive
+    /// changes. Positive observable: a planted sentinel fingerprint in the
+    /// sidecar is returned verbatim (proving the DB was not consulted).
+    /// Planted negative: after a write, the sentinel is discarded and the
+    /// real fingerprint comes back — through the disk layer and through the
+    /// in-process memo wrapper alike. No-claim: this does not measure the
+    /// WAL-replay cost the sidecar exists to avoid.
+    #[test]
+    fn cached_archive_fingerprint_hits_on_unchanged_identity_and_misses_after_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("db.sqlite");
+        let cache_dir = tmp.path().join("index");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        storage.run_migrations().unwrap();
+        seed_archive_conversation(&storage, "first");
+        storage.close_without_checkpoint().unwrap();
+
+        let authoritative = lexical_storage_fingerprint_for_db_strict(&db_path).unwrap();
+        assert!(authoritative.starts_with("content-v1:"));
+        let identity = lexical_storage_physical_identity(&db_path).expect("archive identity");
+        let first = lexical_storage_fingerprint_for_db_disk_cached(&db_path, &identity, &cache_dir)
+            .unwrap();
+        assert_eq!(first, authoritative);
+        let cache_path = cache_dir.join(ARCHIVE_FINGERPRINT_CACHE_FILE);
+        assert!(cache_path.is_file(), "miss must populate the sidecar");
+        assert_eq!(
+            lexical_storage_fingerprint_for_db_cached(&db_path, &cache_dir).unwrap(),
+            authoritative,
+            "the memo wrapper must agree with the disk layer"
+        );
+
+        // Plant a sentinel under the SAME identity: the disk layer must
+        // return it without touching the database.
+        let mut cached: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
+        cached["fingerprint"] = serde_json::Value::String("content-v1:sentinel".into());
+        std::fs::write(&cache_path, cached.to_string()).unwrap();
+        let hit = lexical_storage_fingerprint_for_db_disk_cached(&db_path, &identity, &cache_dir)
+            .unwrap();
+        assert_eq!(
+            hit, "content-v1:sentinel",
+            "unchanged identity must be served from the sidecar"
+        );
+
+        // A sidecar from a different schema version is ignored, not trusted.
+        cached["schema_version"] = serde_json::Value::from(999);
+        std::fs::write(&cache_path, cached.to_string()).unwrap();
+        assert_eq!(
+            lexical_storage_fingerprint_for_db_disk_cached(&db_path, &identity, &cache_dir)
+                .unwrap(),
+            authoritative,
+            "an unknown sidecar schema must fall back to the strict computation"
+        );
+
+        // Change the archive: the identity moves and the sentinel is discarded
+        // by both layers.
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        seed_archive_conversation(&storage, "second");
+        storage.close_without_checkpoint().unwrap();
+        let changed = lexical_storage_physical_identity(&db_path).expect("archive identity");
+        assert_ne!(
+            changed, identity,
+            "a committed write must move the identity"
+        );
+        let recomputed =
+            lexical_storage_fingerprint_for_db_disk_cached(&db_path, &changed, &cache_dir).unwrap();
+        assert_ne!(recomputed, "content-v1:sentinel");
+        assert_eq!(
+            recomputed,
+            lexical_storage_fingerprint_for_db_strict(&db_path).unwrap()
+        );
+        assert_ne!(
+            recomputed, authoritative,
+            "a second conversation changes the fingerprint"
+        );
+        assert_eq!(
+            lexical_storage_fingerprint_for_db_cached(&db_path, &cache_dir).unwrap(),
+            recomputed,
+            "the memo wrapper must not serve the pre-write fingerprint"
+        );
     }
 }

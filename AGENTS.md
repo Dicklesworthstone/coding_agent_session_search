@@ -45,6 +45,35 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ---
 
+## Swarm Commits: Stage Only What You Changed
+
+Several agents edit this working tree at once. On 2026-09-01 two agents committed
+another session's uncommitted files under their own messages, rewrote three shared
+files from older copies (dropping helper functions whose callers had just been
+committed), and left `main` unable to compile for most of an hour. These rules exist
+because of that day:
+
+- **Never `git add -A`, `git add .`, or `git commit -a`.** Stage the exact paths you
+  edited (`git add src/foo.rs tests/bar.rs`). If `git status` shows files you did not
+  touch, they belong to another agent — leave them alone (AGENTS.md rule: never stash,
+  revert, or overwrite concurrent work).
+- **Reserve the shared monoliths before editing them** — `src/lib.rs`,
+  `src/indexer/mod.rs`, `src/storage/sqlite.rs`, `src/search/quill_bridge.rs`,
+  `src/ui/app.rs` — with an Agent Mail file reservation
+  (`file_reservation_paths(project_key, agent, ["src/lib.rs"], ttl_seconds=3600, exclusive=true)`),
+  and install the Agent Mail pre-commit guard (`install_precommit_guard`) so a commit
+  that includes a path reserved by another agent is refused instead of merged blind.
+- **Never restore a file from an older copy** to "fix" a compile error. Fix the
+  error in place; a symbol your rewrite removes may already have committed callers.
+- **Commit small and early.** A long-lived uncommitted tree is the surface that gets
+  swept. Verify with the batched gate (`scripts/gate.sh`) before pushing; a commit
+  titled "restore a compiling main" that does not compile is worse than no commit.
+- **After any commit by another agent touches a file you changed,** `git grep` every
+  symbol you landed there. Presence is not enough: check that the function still does
+  what yours did (an in-process memo is not an on-disk cache).
+
+---
+
 ## RULE NUMBER 2: ABSOLUTELY NO RUSQLITE IN NEW CODE — FRANKENSQLITE ONLY
 
 **THIS IS A HARD, NON-NEGOTIABLE RULE. IT HAS BEEN VIOLATED OVER 10 TIMES AND THE OWNER IS DONE TOLERATING IT.**

@@ -1238,4 +1238,63 @@ mod tests {
         assert_eq!(published_segment_count(&index), 1);
         assert_eq!(index.doc_count().expect("doc count"), sessions * 2 + 1);
     }
+
+    /// Fuel exhaustion is recognised by the engine's own error text, anywhere
+    /// in the cause chain, and only that text (GH #441 degrade path).
+    #[test]
+    fn query_fuel_exhaustion_is_recognised_through_the_cause_chain() {
+        let inner = anyhow!("scalar Quill query fuel exhausted after 10000000/10000000 units");
+        let wrapped = inner.context("executing a Quill lexical query");
+        assert!(is_query_fuel_exhausted(&wrapped));
+        assert!(!is_query_fuel_exhausted(&anyhow!(
+            "opening the Quill CASS reader: manifest missing"
+        )));
+    }
+
+    /// GH #441: an archive only ever appends, so tombstone-driven compaction
+    /// never fires and every commit seals a segment the engine's own tier
+    /// policy does not fold (measured here: 40 commits → 40 segments with the
+    /// production configuration alone). What bounds growth in production is
+    /// the post-run maintenance step `cass index` calls after every
+    /// incremental run (`optimize_if_idle`) — so that is the invariant this
+    /// pins: after forty append-only commits, one maintenance pass folds the
+    /// generation well below the merge threshold and keeps every document.
+    /// No-claim: this proves consolidation happens, not its cost.
+    #[test]
+    fn post_run_maintenance_bounds_segment_growth_on_append_only_commits() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open or create");
+        let commits = 40_u64;
+        for commit in 0..commits {
+            let batch: Vec<QuillCassDocument> = (0..8)
+                .map(|slot| {
+                    let source = format!("session-{commit}");
+                    sample(
+                        &source,
+                        slot,
+                        &format!("commit {commit} message {slot} about borrow checker lifetimes"),
+                    )
+                })
+                .collect();
+            index.add_cass_documents(&batch).expect("index batch");
+            index.commit().expect("commit batch");
+        }
+        let before = published_segment_count(&index);
+        assert!(
+            before >= CASS_MERGE_SEGMENT_THRESHOLD,
+            "precondition: append-only commits must leave unfolded segments (got {before})"
+        );
+
+        let merged = index.optimize_if_idle(1_700_000_000_000).expect("optimize");
+        assert!(
+            merged,
+            "the post-run maintenance pass must fold {before} segments"
+        );
+        let after = published_segment_count(&index);
+        assert!(
+            after < CASS_MERGE_SEGMENT_THRESHOLD,
+            "maintenance left {after} segments (threshold {CASS_MERGE_SEGMENT_THRESHOLD})"
+        );
+        assert_eq!(index.doc_count().expect("doc count"), commits * 8);
+    }
 }

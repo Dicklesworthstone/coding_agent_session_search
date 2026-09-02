@@ -99,6 +99,8 @@ analytics:
   data.track_a: { message_metrics_rows, usage_hourly_rows, usage_daily_rows,
                   usage_models_daily_rows, elapsed_ms, rows_per_sec }
   data.overall_elapsed_ms: u64
+  data.wal_checkpoint: string ('completed' | 'failed') — the rebuild closes with a
+                  WAL checkpoint so the next opener replays nothing
   --force: rebuild even when rollups appear fresh
 
 ### analytics validate

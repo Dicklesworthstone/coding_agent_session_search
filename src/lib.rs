@@ -18525,6 +18525,32 @@ fn run_analytics_rebuild(
         );
     }
 
+    // WS-B.5 (z2uon): a rebuild rewrites whole analytics tables, so dropping
+    // the handle here used to leave every one of those pages in the WAL for
+    // the next opener to replay — on the owner's archive that was a 200 MB
+    // sidecar every `cass search` paid for. Close through the same
+    // checkpointing path `cass index` uses. The rows are already committed, so
+    // a blocked checkpoint (another reader pinning the WAL) is reported, not
+    // treated as a failed rebuild.
+    let wal_checkpoint = match crate::indexer::close_storage_with_wal_checkpoint(
+        storage,
+        &db_path,
+        "analytics rebuild",
+    ) {
+        Ok(()) => "completed",
+        Err(err) => {
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                db_path = %db_path.display(),
+                "analytics rebuild: final WAL checkpoint did not complete"
+            );
+            eprintln!(
+                "Warning: final WAL checkpoint after analytics rebuild did not complete: {err:#}"
+            );
+            "failed"
+        }
+    };
+    payload.insert("wal_checkpoint".into(), serde_json::json!(wal_checkpoint));
     payload.insert(
         "track".into(),
         serde_json::json!(match track {
@@ -18729,6 +18755,25 @@ mod analytics_filter_validation_tests {
         assert!(payload.get("since_ms").is_none(), "{payload}");
         assert!(payload.get("since_day_id").is_none(), "{payload}");
         assert_eq!(payload["tracks_rebuilt"], serde_json::json!(["a", "b"]));
+
+        // WS-B.5 (z2uon): the rebuild closes through the checkpointing path,
+        // so the command reports the checkpoint and leaves no WAL frames for
+        // the next opener to replay. Positive observable: `wal_checkpoint` is
+        // "completed" and the sidecar is header-only or gone. No-claim: a
+        // checkpoint blocked by a concurrent reader is not exercised here.
+        assert_eq!(
+            payload["wal_checkpoint"],
+            serde_json::json!("completed"),
+            "{payload}"
+        );
+        let wal_len = std::fs::metadata(crate::storage::sqlite::database_sidecar_path(
+            &db_path, "-wal",
+        ))
+        .map_or(0, |meta| meta.len());
+        assert!(
+            wal_len <= 32,
+            "analytics rebuild must not leave WAL frames behind (wal_len={wal_len})"
+        );
     }
 }
 
@@ -20969,6 +21014,21 @@ fn state_meta_json_inner(
 
     let db_metadata = fs::metadata(db_path).ok();
     let db_size_bytes = db_metadata.as_ref().map(|m| m.len());
+    // WS-B.4a: the WAL sidecar is the archive's hidden cost — every opener
+    // replays it, and an untruncated multi-hundred-MB WAL was invisible from
+    // every observation surface until now. Read it from metadata only; the
+    // observation surfaces never open or checkpoint anything here.
+    let db_wal_bytes = fs::metadata(crate::storage::sqlite::database_sidecar_path(
+        db_path, "-wal",
+    ))
+    .ok()
+    .filter(|m| m.is_file())
+    .map_or(0, |m| m.len());
+    let db_shm_present = fs::metadata(crate::storage::sqlite::database_sidecar_path(
+        db_path, "-shm",
+    ))
+    .ok()
+    .is_some_and(|m| m.is_file());
     // [session-review-gi4oy] Capture is_file ALONGSIDE size from the
     // single metadata call — the gi4oy skip-open path cannot trust
     // db_path.exists() alone because exists() returns true for both
@@ -21454,6 +21514,10 @@ fn state_meta_json_inner(
         },
         "database": {
             "exists": db_exists,
+            // WS-B.4a: physical footprint from metadata only (never an open).
+            "db_bytes": db_size_bytes.unwrap_or(0),
+            "wal_bytes": db_wal_bytes,
+            "shm_present": db_shm_present,
             "opened": db_opened,
             "conversations": state_db_count_json(conversation_count, counts_skipped),
             "messages": state_db_count_json(message_count, counts_skipped),
@@ -25921,6 +25985,8 @@ fn render_analytics_docs() -> Vec<String> {
         "  data.track_a: { message_metrics_rows, usage_hourly_rows, usage_daily_rows,".into(),
         "                  usage_models_daily_rows, elapsed_ms, rows_per_sec }".into(),
         "  data.overall_elapsed_ms: u64".into(),
+        "  data.wal_checkpoint: string ('completed' | 'failed') — the rebuild closes with a".into(),
+        "                  WAL checkpoint so the next opener replays nothing".into(),
         "  --force: rebuild even when rollups appear fresh".into(),
         String::new(),
         "### analytics validate".into(),
@@ -28505,7 +28571,7 @@ fn execute_search_operation(
                          stopword-heavy query on an archive with many index segments); retry \
                          with fewer or rarer terms, raise {} above {}, or run 'cass index --full' \
                          to consolidate segments",
-                        crate::search::quill_bridge::QUILL_QUERY_FUEL_BUDGET_ENV,
+                        crate::search::quill_bridge::CASS_QUILL_QUERY_FUEL_BUDGET_ENV,
                         crate::search::quill_bridge::cass_quill_config().query_fuel_budget
                     ))
                 } else {
@@ -92842,6 +92908,9 @@ fn response_schema_state_database() -> serde_json::Value {
         "type": "object",
         "properties": {
             "exists": { "type": "boolean" },
+            "db_bytes": { "type": "integer" },
+            "wal_bytes": { "type": "integer" },
+            "shm_present": { "type": "boolean" },
             "opened": { "type": "boolean" },
             "conversations": { "type": ["integer", "null"] },
             "messages": { "type": ["integer", "null"] },
@@ -101373,15 +101442,60 @@ fn index_stall_warning_lines(payload: &serde_json::Value) -> (String, String) {
     (summary, diagnostics)
 }
 
-fn abort_after_index_stall_if_requested(payload: &serde_json::Value, data_dir: &Path) {
-    if payload
+/// The robot error envelope for a stall abort (WS-F.2, #439): the same shape
+/// `cli_error_json_payload` gives every other failure (`success`, `error`,
+/// `code`, `kind`, `retryable`, `hint`), plus the stall fields agents branch
+/// on. Returns `None` for a payload that does not request an abort, so the
+/// warn-only stall path never emits an error envelope.
+fn index_stall_abort_envelope(payload: &serde_json::Value) -> Option<serde_json::Value> {
+    if !payload
         .get("abort_process")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
     {
+        return None;
+    }
+    let phase = payload
+        .get("phase")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let stall_elapsed_ms = payload
+        .get("stall_elapsed_ms")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let abort_threshold_secs = payload
+        .get("abort_threshold_secs")
+        .and_then(serde_json::Value::as_u64);
+    let hint = payload
+        .get("hint")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| INDEX_STALL_HINT.to_string(), |hint| hint.to_string());
+    Some(serde_json::json!({
+        "success": false,
+        "error": format!(
+            "cass index made no {phase} progress for {}s past the abort threshold",
+            stall_elapsed_ms / 1000
+        ),
+        "code": 70,
+        "kind": "index-stalled",
+        "retryable": true,
+        "phase": phase,
+        "stall_elapsed_ms": stall_elapsed_ms,
+        "abort_threshold_secs": abort_threshold_secs,
+        "hint": hint,
+        "recommended_action": "Inspect `cass status --json` (rebuild.phase, rebuild.last_progress_age_ms) and the stall diagnostics above; re-run `cass index` — the lock is reaped on the next start. Raise CASS_INDEX_STALL_ABORT_SECS only if the diagnostics show real forward progress.",
+    }))
+}
+
+fn abort_after_index_stall_if_requested(payload: &serde_json::Value, data_dir: &Path) {
+    if let Some(envelope) = index_stall_abort_envelope(payload) {
         eprintln!(
             "cass index made no indexing progress past the abort threshold; exiting with code 70."
         );
+        // WS-F.2: one machine-readable line on stderr (stdout stays data-only)
+        // so agents get the documented error envelope for exit 70 instead of
+        // only a prose warning.
+        eprintln!("{envelope}");
         // #296: before the bounded exit (which skips destructors), best-effort
         // checkpoint the canonical WAL so the killed run leaves a recoverable
         // DB instead of a multi-GB orphaned WAL. Stale locks are reaped by the
@@ -101396,6 +101510,54 @@ mod stall_diagnostics_tests {
     use super::collect_stall_diagnostics;
     use clap::CommandFactory;
     use tempfile::TempDir;
+
+    /// WS-F.2 / #439: the exit-70 path must hand agents the documented error
+    /// envelope. Positive observable: an abort payload yields the envelope
+    /// with `kind:"index-stalled"`, `code:70`, `retryable:true`, the phase and
+    /// stall duration, and the phase-aware hint carried through. Planted
+    /// negative: a warn-only stall payload (`abort_process` absent or false)
+    /// yields no envelope at all. No-claim: this does not exercise the process
+    /// exit or the watchdog timing.
+    #[test]
+    fn stall_abort_emits_index_stalled_error_envelope_only_when_aborting() {
+        let abort = serde_json::json!({
+            "event": "stall_detected",
+            "phase": "preparing",
+            "stall_elapsed_ms": 305_000_u64,
+            "abort_threshold_secs": 300_u64,
+            "abort_process": true,
+            "exit_code": 70,
+            "hint": "phase hint",
+        });
+        let envelope = super::index_stall_abort_envelope(&abort).expect("abort envelope");
+        assert_eq!(envelope["success"], serde_json::json!(false));
+        assert_eq!(envelope["code"], serde_json::json!(70));
+        assert_eq!(envelope["kind"], serde_json::json!("index-stalled"));
+        assert_eq!(envelope["retryable"], serde_json::json!(true));
+        assert_eq!(envelope["phase"], serde_json::json!("preparing"));
+        assert_eq!(envelope["stall_elapsed_ms"], serde_json::json!(305_000_u64));
+        assert_eq!(envelope["abort_threshold_secs"], serde_json::json!(300_u64));
+        assert_eq!(envelope["hint"], serde_json::json!("phase hint"));
+        assert!(
+            envelope["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("preparing") && message.contains("305s")),
+            "error message must name the phase and the stall duration: {envelope}"
+        );
+        // The line agents read is the compact JSON of that same envelope.
+        let line = envelope.to_string();
+        let reparsed: serde_json::Value = serde_json::from_str(&line).expect("envelope parses");
+        assert_eq!(reparsed, envelope);
+
+        let warn_only = serde_json::json!({
+            "event": "stall_detected",
+            "phase": "preparing",
+            "stall_elapsed_ms": 125_000_u64,
+        });
+        assert!(super::index_stall_abort_envelope(&warn_only).is_none());
+        let explicit_false = serde_json::json!({ "abort_process": false, "phase": "indexing" });
+        assert!(super::index_stall_abort_envelope(&explicit_false).is_none());
+    }
 
     #[test]
     fn issue_342_index_help_documents_semantic_stall_controls() {

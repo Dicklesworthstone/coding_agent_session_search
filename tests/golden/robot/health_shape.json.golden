@@ -990,6 +990,15 @@
             "exists": {
               "type": "boolean"
             },
+            "db_bytes": {
+              "type": "string"
+            },
+            "wal_bytes": {
+              "type": "string"
+            },
+            "shm_present": {
+              "type": "boolean"
+            },
             "opened": {
               "type": "boolean"
             },

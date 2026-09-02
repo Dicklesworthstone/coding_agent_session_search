@@ -59,6 +59,28 @@ fn cass_cmd(test_home: &std::path::Path) -> Command {
         .env("GEMINI_HOME", gemini_home)
         .env("OPENCODE_STORAGE_ROOT", opencode_root)
         .env("CASS_AIDER_DATA_ROOT", aider_root)
+        // WS-A.6: the Pi family connectors honor these overrides ahead of
+        // the synthetic HOME. On 2026-09-01 a fleet worker's real
+        // `~/.pi/agent/sessions` leaked into `search_robot` and
+        // `stats_full_payload` through exactly this gap. Pin every override
+        // to a path inside the test HOME so the goldens observe only the
+        // fixture, whatever the host's environment says.
+        .env("PI_SESSIONS_DIR", test_home.join(".pi-sessions-missing"))
+        .env("PI_CODING_AGENT_DIR", test_home.join(".pi-agent-missing"))
+        .env(
+            "PI_CODING_AGENT_SESSION_DIR",
+            test_home.join(".pi-coding-agent-sessions-missing"),
+        )
+        .env_remove("PI_CONFIG_DIR")
+        .env_remove("PI_PROFILE")
+        // WS-A.6: stale-on-read auto-refresh is suppressed for data dirs under
+        // the OS temp dir, but rch workers place `tempfile` dirs beneath the
+        // checkout, so on the fleet a golden `search`/`stats` spawned a
+        // detached `cass index --background` into the fixture copy; that
+        // child ingested the worker's real sessions (raw mirror initialized,
+        // 10 Pi Agent conversations) and the goldens absorbed them on
+        // regeneration. Goldens observe a fixture, never a live refresh.
+        .env("CASS_AUTO_REFRESH", "0")
         // Never probe or connect to a daemon owned by the host running the
         // golden suite. The default socket is user-global, while each golden
         // must observe only its synthetic HOME.
@@ -1046,6 +1068,11 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
         "available_bytes",
         "max_inflight_bytes",
         "pipeline_max_message_bytes_in_flight",
+        // WS-B.4a: the archive footprint depends on the engine's page layout
+        // and on whether a WAL sidecar happens to exist; keep the keys, scrub
+        // the values.
+        "db_bytes",
+        "wal_bytes",
     ] {
         let re = regex::Regex::new(&format!(r#""{key}"\s*:\s*("?\d+"?)"#)).unwrap();
         out = re

@@ -29389,6 +29389,15 @@
                 "exists": {
                   "type": "boolean"
                 },
+                "db_bytes": {
+                  "type": "integer"
+                },
+                "wal_bytes": {
+                  "type": "integer"
+                },
+                "shm_present": {
+                  "type": "boolean"
+                },
                 "opened": {
                   "type": "boolean"
                 },
@@ -31889,6 +31898,15 @@
                     "exists": {
                       "type": "boolean"
                     },
+                    "db_bytes": {
+                      "type": "integer"
+                    },
+                    "wal_bytes": {
+                      "type": "integer"
+                    },
+                    "shm_present": {
+                      "type": "boolean"
+                    },
                     "opened": {
                       "type": "boolean"
                     },
@@ -33084,6 +33102,15 @@
           "type": "object",
           "properties": {
             "exists": {
+              "type": "boolean"
+            },
+            "db_bytes": {
+              "type": "integer"
+            },
+            "wal_bytes": {
+              "type": "integer"
+            },
+            "shm_present": {
               "type": "boolean"
             },
             "opened": {
@@ -35148,6 +35175,15 @@
             "exists": {
               "type": "boolean"
             },
+            "db_bytes": {
+              "type": "integer"
+            },
+            "wal_bytes": {
+              "type": "integer"
+            },
+            "shm_present": {
+              "type": "boolean"
+            },
             "opened": {
               "type": "boolean"
             },
@@ -37187,6 +37223,15 @@
               "type": "object",
               "properties": {
                 "exists": {
+                  "type": "boolean"
+                },
+                "db_bytes": {
+                  "type": "integer"
+                },
+                "wal_bytes": {
+                  "type": "integer"
+                },
+                "shm_present": {
                   "type": "boolean"
                 },
                 "opened": {

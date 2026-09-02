@@ -2973,6 +2973,7 @@ schemas: (auto-generated from contract)
       - database: object
         - conversations: ?
         - counts_skipped: boolean
+        - db_bytes: integer
         - exists: boolean
         - integrity: string
         - integrity_detail: ?
@@ -2982,6 +2983,8 @@ schemas: (auto-generated from contract)
         - open_retryable: boolean
         - open_skipped: boolean
         - opened: boolean
+        - shm_present: boolean
+        - wal_bytes: integer
       - index: object
         - activity_at: ?
         - age_seconds: ?
@@ -3369,6 +3372,7 @@ schemas: (auto-generated from contract)
     - database: object
       - conversations: ?
       - counts_skipped: boolean
+      - db_bytes: integer
       - exists: boolean
       - integrity: string
       - integrity_detail: ?
@@ -3379,6 +3383,8 @@ schemas: (auto-generated from contract)
       - open_skipped: boolean
       - opened: boolean
       - path: string
+      - shm_present: boolean
+      - wal_bytes: integer
     - doctor_summary: object
       - active_repair: object
         - active: boolean
@@ -3755,6 +3761,7 @@ schemas: (auto-generated from contract)
     - database: object
       - conversations: ?
       - counts_skipped: boolean
+      - db_bytes: integer
       - exists: boolean
       - integrity: string
       - integrity_detail: ?
@@ -3765,6 +3772,8 @@ schemas: (auto-generated from contract)
       - open_skipped: boolean
       - opened: boolean
       - path: string
+      - shm_present: boolean
+      - wal_bytes: integer
     - doctor_summary: object
       - active_repair: object
         - active: boolean
@@ -4112,6 +4121,7 @@ schemas: (auto-generated from contract)
       - database: object
         - conversations: ?
         - counts_skipped: boolean
+        - db_bytes: integer
         - exists: boolean
         - integrity: string
         - integrity_detail: ?
@@ -4121,6 +4131,8 @@ schemas: (auto-generated from contract)
         - open_retryable: boolean
         - open_skipped: boolean
         - opened: boolean
+        - shm_present: boolean
+        - wal_bytes: integer
       - index: object
         - activity_at: ?
         - age_seconds: ?

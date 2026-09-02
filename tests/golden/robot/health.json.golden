@@ -396,6 +396,9 @@
     },
     "database": {
       "exists": false,
+      "db_bytes": "[LIVE_BYTES]",
+      "wal_bytes": "[LIVE_BYTES]",
+      "shm_present": false,
       "opened": false,
       "conversations": 0,
       "messages": 0,
