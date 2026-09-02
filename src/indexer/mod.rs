@@ -468,6 +468,9 @@ mod linux_publish_swap {
     /// underlying filesystem doesn't support `RENAME_EXCHANGE`).
     pub const EINVAL: i32 = 22;
 
+    // SAFETY: a raw libc symbol declaration; the only caller is
+    // `atomic_exchange_paths`, which documents its argument invariants.
+    #[allow(unsafe_code)]
     unsafe extern "C" {
         pub fn renameat2(
             olddirfd: c_int,
@@ -11022,6 +11025,66 @@ pub(crate) fn lexical_storage_fingerprint_for_db_strict(db_path: &Path) -> Resul
     Ok(fingerprint)
 }
 
+/// Physical identity of a canonical archive for fingerprint memoization: the
+/// size and mtime of the main database file and of its WAL sidecar. Any
+/// committed write touches at least one of them, so an unchanged key means
+/// the strict fingerprint computed last time is still the current one.
+fn lexical_storage_physical_identity(db_path: &Path) -> Option<(u64, u128, u64, u128)> {
+    fn stamp(path: &Path) -> Option<(u64, u128)> {
+        match fs::metadata(path) {
+            Ok(meta) => {
+                let modified = meta
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|elapsed| elapsed.as_nanos())?;
+                Some((meta.len(), modified))
+            }
+            // An absent WAL sidecar is a legitimate, stable state.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some((0, 0)),
+            Err(_) => None,
+        }
+    }
+    let (db_len, db_modified) = stamp(db_path)?;
+    let wal_path = crate::storage::sqlite::database_sidecar_path(db_path, "-wal");
+    let (wal_len, wal_modified) = stamp(&wal_path)?;
+    Some((db_len, db_modified, wal_len, wal_modified))
+}
+
+/// [`lexical_storage_fingerprint_for_db_strict`], memoized per process on the
+/// archive's physical identity (`lexical_storage_physical_identity`) and the
+/// lexical index it is being validated against.
+///
+/// The strict variant opens a synchronous read-only handle and replays the
+/// WAL; on a large archive that cost every default `cass search` seconds
+/// before the engine query even ran. A search-time freshness check only needs
+/// the answer to change when the archive does, and any committed write moves
+/// the database or WAL size/mtime, so the memo is invalidated exactly when it
+/// must be. When the identity cannot be read the strict path runs uncached.
+pub(crate) fn lexical_storage_fingerprint_for_db_cached(
+    db_path: &Path,
+    index_path: &Path,
+) -> Result<String> {
+    type MemoKey = (PathBuf, PathBuf, (u64, u128, u64, u128));
+    static MEMO: std::sync::OnceLock<Mutex<HashMap<MemoKey, String>>> = std::sync::OnceLock::new();
+    let Some(identity) = lexical_storage_physical_identity(db_path) else {
+        return lexical_storage_fingerprint_for_db_strict(db_path);
+    };
+    let key: MemoKey = (db_path.to_path_buf(), index_path.to_path_buf(), identity);
+    let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(fingerprint) = memo.lock().ok().and_then(|guard| guard.get(&key).cloned()) {
+        return Ok(fingerprint);
+    }
+    let fingerprint = lexical_storage_fingerprint_for_db_strict(db_path)?;
+    if let Ok(mut guard) = memo.lock() {
+        // One entry per archive/index pair: a changed identity replaces the
+        // stale one rather than accumulating history.
+        guard.retain(|(db, index, _), _| !(db == &key.0 && index == &key.1));
+        guard.insert(key, fingerprint.clone());
+    }
+    Ok(fingerprint)
+}
+
 /// Same fingerprint as [`lexical_storage_fingerprint_for_db`], computed on an
 /// already-open read-only handle so callers that have paid the archive open
 /// cost (semantic context loading, which opens the DB for filter maps anyway)
@@ -20813,9 +20876,12 @@ fn path_to_cstring(path: &Path) -> Result<CString> {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
 pub(crate) fn atomic_exchange_paths(left: &Path, right: &Path) -> Result<()> {
     let left_c = path_to_cstring(left)?;
     let right_c = path_to_cstring(right)?;
+    // SAFETY: both paths are valid NUL-terminated C strings that outlive the
+    // call, AT_FDCWD is a valid dirfd, and renameat2 reads nothing else.
     let result = unsafe {
         linux_publish_swap::renameat2(
             linux_publish_swap::AT_FDCWD,

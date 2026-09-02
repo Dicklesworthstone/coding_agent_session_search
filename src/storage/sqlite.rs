@@ -1987,7 +1987,7 @@ impl DatabaseBundleMoveResult {
     }
 }
 
-fn database_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn database_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(format!("{}{}", path.to_string_lossy(), suffix))
 }
 
@@ -4592,7 +4592,7 @@ fn franken_close_error_is_transiently_busy(err: &crate::franken_sync::FrankenErr
 /// callers can retry; every attempt after a failed one re-runs the same
 /// commit/rollback/teardown steps, and a successful close is terminal, so a
 /// bounded backoff loop is safe. Non-busy errors are returned immediately.
-fn close_franken_in_place_with_busy_retry(
+pub(crate) fn close_franken_in_place_with_busy_retry(
     conn: &mut FrankenConnection,
     checkpoint_on_close: bool,
 ) -> std::result::Result<(), crate::franken_sync::FrankenError> {

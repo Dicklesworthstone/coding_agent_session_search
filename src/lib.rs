@@ -100848,6 +100848,7 @@ fn process_block_io_bytes() -> Option<u64> {
 /// layout the `RUSAGE_INFO_V2` flavour fills, and a nonzero return leaves it
 /// unread.
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
 fn macos_process_disk_io_bytes() -> Option<u64> {
     let mut info = std::mem::MaybeUninit::<libc::rusage_info_v2>::zeroed();
     // SAFETY: `proc_pid_rusage` writes at most `size_of::<rusage_info_v2>()`
