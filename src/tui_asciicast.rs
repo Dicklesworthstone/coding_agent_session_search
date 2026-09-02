@@ -40,6 +40,8 @@ mod posix {
     )))]
     pub const O_NONBLOCK: c_int = 0o4000;
 
+    // SAFETY: declaration matches the POSIX prototype of fcntl(2) (variadic third argument).
+    #[allow(unsafe_code)]
     unsafe extern "C" {
         pub fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     }
@@ -444,6 +446,7 @@ struct StdinNonBlockingGuard {
 
 #[cfg(unix)]
 impl StdinNonBlockingGuard {
+    #[allow(unsafe_code)]
     fn new(fd: RawFd) -> io::Result<Self> {
         // SAFETY: fcntl does not outlive `fd` and is called with valid command
         // constants; errors are surfaced via last_os_error.
@@ -464,6 +467,7 @@ impl StdinNonBlockingGuard {
 
 #[cfg(unix)]
 impl Drop for StdinNonBlockingGuard {
+    #[allow(unsafe_code)]
     fn drop(&mut self) {
         // SAFETY: best-effort restoration of original descriptor flags.
         unsafe {

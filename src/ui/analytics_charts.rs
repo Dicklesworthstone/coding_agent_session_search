@@ -181,6 +181,10 @@ pub struct AnalyticsChartData {
     pub auto_rebuilt: bool,
     /// Captures auto-rebuild errors; data may still be partially available.
     pub auto_rebuild_error: Option<String>,
+    /// GH #395: pid of the detached `cass analytics rebuild` the dashboard
+    /// spawned because the rollups were missing. The rebuild runs outside the
+    /// TUI process; the dashboard reloads on its next visit.
+    pub auto_rebuild_spawned_pid: Option<u32>,
 }
 
 impl AnalyticsChartData {

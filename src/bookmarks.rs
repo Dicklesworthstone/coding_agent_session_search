@@ -7,7 +7,9 @@ use crate::franken_sync::Connection;
 use crate::franken_sync::compat::{ConnectionExt, OptionalExtension, RowExt, TransactionExt};
 use crate::franken_sync::params;
 use anyhow::{Context, Result};
+use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -361,9 +363,625 @@ fn row_to_bookmark(
     })
 }
 
+/// File name of the bookmarks database inside the data directory.
+pub const BOOKMARKS_DB_FILE: &str = "bookmarks.db";
+
+/// Location of the bookmarks database inside a specific data directory.
+pub fn bookmarks_path_in(data_dir: &Path) -> PathBuf {
+    data_dir.join(BOOKMARKS_DB_FILE)
+}
+
 /// Get the default bookmarks database path
 pub fn default_bookmarks_path() -> PathBuf {
-    crate::default_data_dir().join("bookmarks.db")
+    bookmarks_path_in(&crate::default_data_dir())
+}
+
+// ---------------------------------------------------------------------------
+// CLI surface: `cass bookmarks <add|list|search|remove|export|import>`
+// ---------------------------------------------------------------------------
+
+/// Exit code for a bookmark command that completed successfully.
+pub const BOOKMARKS_EXIT_OK: i32 = 0;
+/// Exit code for usage errors (bad arguments, unparsable import file).
+pub const BOOKMARKS_EXIT_USAGE: i32 = 2;
+/// Exit code when the requested bookmark id does not exist. Uses the crate's
+/// documented "mapping / not-found" class (13); 3 is reserved for a missing
+/// index/archive and would misroute agents to `cass index --full`.
+pub const BOOKMARKS_EXIT_NOT_FOUND: i32 = 13;
+/// Exit code for filesystem or database failures: the crate's documented
+/// I/O class (14); 4 is reserved for network errors.
+pub const BOOKMARKS_EXIT_IO: i32 = 14;
+
+/// Agent name recorded when `add` is invoked without `--agent`.
+const DEFAULT_BOOKMARK_AGENT: &str = "unknown";
+
+/// Arguments for the `cass bookmarks` command family.
+///
+/// The dispatcher only needs to hand this struct to
+/// [`run_bookmarks_command`]; every subcommand resolves its own data
+/// directory and output mode.
+#[derive(Debug, Clone, Args)]
+pub struct BookmarksArgs {
+    /// Bookmark operation to run.
+    #[command(subcommand)]
+    pub command: BookmarksCommand,
+}
+
+/// Operations available under `cass bookmarks`.
+///
+/// Every variant accepts `--json` (alias `--robot`) for a single machine
+/// readable document on stdout, and `--data-dir` to override where
+/// `bookmarks.db` lives (default: the crate's data directory).
+#[derive(Debug, Clone, Subcommand)]
+pub enum BookmarksCommand {
+    /// Save a bookmark pointing at a source file (optionally a specific line).
+    Add {
+        /// Path of the session/file being bookmarked (stored verbatim).
+        source_path: PathBuf,
+        /// Line number inside the source, as shown by `cass search`.
+        #[arg(long, short = 'n')]
+        line: Option<u64>,
+        /// Human title; defaults to the source file name.
+        #[arg(long)]
+        title: Option<String>,
+        /// Free-form note or annotation.
+        #[arg(long)]
+        note: Option<String>,
+        /// Comma-separated tags (e.g. `rust,important`).
+        #[arg(long)]
+        tags: Option<String>,
+        /// Agent that produced the bookmarked content.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Workspace/project path the content belongs to.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Original search snippet kept for context.
+        #[arg(long)]
+        snippet: Option<String>,
+        /// Emit a single JSON document instead of human-readable lines.
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+        /// Override the data directory holding `bookmarks.db`.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+    /// List saved bookmarks, newest first.
+    List {
+        /// Maximum number of bookmarks to print.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Only show bookmarks carrying this tag (case-insensitive).
+        #[arg(long)]
+        tag: Option<String>,
+        /// Emit a single JSON document instead of human-readable lines.
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+        /// Override the data directory holding `bookmarks.db`.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+    /// Search bookmark titles, notes, and snippets (case-insensitive substring).
+    Search {
+        /// Text to look for.
+        query: String,
+        /// Maximum number of matches to print.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Emit a single JSON document instead of human-readable lines.
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+        /// Override the data directory holding `bookmarks.db`.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+    /// Delete a bookmark by id.
+    Remove {
+        /// Bookmark id as shown by `list`.
+        id: i64,
+        /// Emit a single JSON document instead of human-readable lines.
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+        /// Override the data directory holding `bookmarks.db`.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+    /// Export all bookmarks as JSON (to a file, or stdout when no `--output`).
+    Export {
+        /// Destination file; parent directories are created as needed.
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+        /// Emit a single JSON document instead of human-readable lines.
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+        /// Override the data directory holding `bookmarks.db`.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+    /// Import bookmarks from a JSON file produced by `export` (duplicates skipped).
+    Import {
+        /// JSON file: either an array of bookmarks or `{"bookmarks": [...]}`.
+        input: PathBuf,
+        /// Emit a single JSON document instead of human-readable lines.
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+        /// Override the data directory holding `bookmarks.db`.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+}
+
+impl BookmarksCommand {
+    /// Whether the subcommand was invoked with `--json`/`--robot`.
+    pub fn json(&self) -> bool {
+        match self {
+            Self::Add { json, .. }
+            | Self::List { json, .. }
+            | Self::Search { json, .. }
+            | Self::Remove { json, .. }
+            | Self::Export { json, .. }
+            | Self::Import { json, .. } => *json,
+        }
+    }
+
+    /// Explicit `--data-dir` override, if any.
+    pub fn data_dir(&self) -> Option<&Path> {
+        match self {
+            Self::Add { data_dir, .. }
+            | Self::List { data_dir, .. }
+            | Self::Search { data_dir, .. }
+            | Self::Remove { data_dir, .. }
+            | Self::Export { data_dir, .. }
+            | Self::Import { data_dir, .. } => data_dir.as_deref(),
+        }
+    }
+
+    /// Data directory this invocation operates on (override or crate default).
+    pub fn resolved_data_dir(&self) -> PathBuf {
+        self.data_dir()
+            .map_or_else(crate::default_data_dir, Path::to_path_buf)
+    }
+}
+
+/// Failure raised by a bookmark CLI command.
+///
+/// Carries the process exit code plus the machine-readable `kind` that the
+/// `--json` error envelope exposes (`usage`, `bookmark-not-found`, `io`).
+#[derive(Debug, Clone)]
+struct BookmarkCliError {
+    code: i32,
+    kind: &'static str,
+    message: String,
+    hint: Option<String>,
+}
+
+impl BookmarkCliError {
+    fn usage(message: impl Into<String>, hint: Option<&str>) -> Self {
+        Self {
+            code: BOOKMARKS_EXIT_USAGE,
+            kind: "usage",
+            message: message.into(),
+            hint: hint.map(str::to_string),
+        }
+    }
+
+    fn not_found(id: i64) -> Self {
+        Self {
+            code: BOOKMARKS_EXIT_NOT_FOUND,
+            kind: "bookmark-not-found",
+            message: format!("bookmark {id} not found"),
+            hint: Some("Run `cass bookmarks list` to see the ids that exist.".to_string()),
+        }
+    }
+
+    fn io(context: &str, detail: impl std::fmt::Display) -> Self {
+        Self {
+            code: BOOKMARKS_EXIT_IO,
+            kind: "io",
+            message: format!("{context}: {detail}"),
+            hint: None,
+        }
+    }
+
+    /// Print the failure to stderr, as a JSON envelope when `json` is set.
+    ///
+    /// The envelope mirrors the crate's structured CLI error shape:
+    /// `{"success": false, "error": {code, kind, message, hint, retryable}}`.
+    fn report(&self, json: bool) {
+        if json {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "success": false,
+                    "error": {
+                        "code": self.code,
+                        "kind": self.kind,
+                        "message": self.message,
+                        "hint": self.hint,
+                        "retryable": false
+                    }
+                })
+            );
+        } else {
+            eprintln!("error: {}", self.message);
+            if let Some(hint) = &self.hint {
+                eprintln!("hint: {hint}");
+            }
+        }
+    }
+}
+
+type BookmarkCliResult<T> = std::result::Result<T, BookmarkCliError>;
+
+/// Run a `cass bookmarks` subcommand, writing its output to stdout.
+///
+/// Returns the process exit code: `0` on success, `2` for usage errors,
+/// `13` (the crate's not-found class) when a bookmark id does not exist,
+/// `14` (the crate's I/O class) for filesystem/database failures. Command-level failures are reported on stderr (as a JSON
+/// envelope under `--json`) and surfaced through the exit code rather than
+/// as `Err`, so callers can dispatch this uniformly with the other command
+/// entry points.
+pub fn run_bookmarks_command(args: BookmarksArgs) -> Result<i32> {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    run_bookmarks_command_to(args, &mut out)
+}
+
+/// Run a `cass bookmarks` subcommand, writing its stdout payload to `out`.
+///
+/// Same contract as [`run_bookmarks_command`]; diagnostics still go to the
+/// real stderr. Exposed so tests and embedders can capture the output.
+pub fn run_bookmarks_command_to(args: BookmarksArgs, out: &mut dyn Write) -> Result<i32> {
+    let json = args.command.json();
+    match execute(&args.command, out) {
+        Ok(code) => Ok(code),
+        Err(err) => {
+            err.report(json);
+            Ok(err.code)
+        }
+    }
+}
+
+fn execute(command: &BookmarksCommand, out: &mut dyn Write) -> BookmarkCliResult<i32> {
+    let json = command.json();
+    let db_path = bookmarks_path_in(&command.resolved_data_dir());
+
+    match command {
+        BookmarksCommand::Add {
+            source_path,
+            line,
+            title,
+            note,
+            tags,
+            agent,
+            workspace,
+            snippet,
+            ..
+        } => {
+            let source = source_path.to_string_lossy().into_owned();
+            if source.trim().is_empty() {
+                return Err(BookmarkCliError::usage(
+                    "source path must not be empty",
+                    None,
+                ));
+            }
+            let line = line
+                .map(|n| {
+                    usize::try_from(n).map_err(|_| {
+                        BookmarkCliError::usage(
+                            format!("line number {n} is too large for this platform"),
+                            None,
+                        )
+                    })
+                })
+                .transpose()?;
+            let title = title
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map_or_else(|| default_title(source_path), str::to_string);
+
+            let mut bookmark = Bookmark::new(
+                title,
+                source,
+                agent.as_deref().unwrap_or(DEFAULT_BOOKMARK_AGENT),
+                workspace.as_deref().unwrap_or_default(),
+            );
+            if let Some(line) = line {
+                bookmark = bookmark.with_line(line);
+            }
+            if let Some(note) = note {
+                bookmark = bookmark.with_note(note.as_str());
+            }
+            if let Some(tags) = tags {
+                bookmark = bookmark.with_tags(tags.as_str());
+            }
+            if let Some(snippet) = snippet {
+                bookmark = bookmark.with_snippet(snippet.as_str());
+            }
+
+            let store = open_store(&db_path)?;
+            let id = store
+                .add(&bookmark)
+                .map_err(|e| BookmarkCliError::io("adding bookmark", format!("{e:#}")))?;
+            let saved = store
+                .get(id)
+                .map_err(|e| BookmarkCliError::io("reading back bookmark", format!("{e:#}")))?
+                .ok_or_else(|| {
+                    BookmarkCliError::io(
+                        "reading back bookmark",
+                        format!("id {id} is missing right after insert"),
+                    )
+                })?;
+
+            if json {
+                write_json_line(
+                    out,
+                    &serde_json::json!({ "success": true, "bookmark": saved }),
+                )?;
+            } else {
+                write_line(
+                    out,
+                    &format!(
+                        "Saved bookmark #{id}: {} ({})",
+                        saved.title,
+                        describe_location(&saved)
+                    ),
+                )?;
+            }
+            Ok(BOOKMARKS_EXIT_OK)
+        }
+
+        BookmarksCommand::List { limit, tag, .. } => {
+            let store = open_store(&db_path)?;
+            let mut bookmarks = store
+                .list(tag.as_deref())
+                .map_err(|e| BookmarkCliError::io("listing bookmarks", format!("{e:#}")))?;
+            if let Some(limit) = limit {
+                bookmarks.truncate(*limit);
+            }
+            emit_bookmarks(out, json, &bookmarks)?;
+            Ok(BOOKMARKS_EXIT_OK)
+        }
+
+        BookmarksCommand::Search { query, limit, .. } => {
+            let query = query.trim();
+            if query.is_empty() {
+                return Err(BookmarkCliError::usage(
+                    "search query must not be empty",
+                    Some("Pass the text to look for, e.g. `cass bookmarks search auth`."),
+                ));
+            }
+            let store = open_store(&db_path)?;
+            let mut bookmarks = store
+                .search(query)
+                .map_err(|e| BookmarkCliError::io("searching bookmarks", format!("{e:#}")))?;
+            if let Some(limit) = limit {
+                bookmarks.truncate(*limit);
+            }
+            emit_bookmarks(out, json, &bookmarks)?;
+            Ok(BOOKMARKS_EXIT_OK)
+        }
+
+        BookmarksCommand::Remove { id, .. } => {
+            let store = open_store(&db_path)?;
+            let removed = store
+                .remove(*id)
+                .map_err(|e| BookmarkCliError::io("removing bookmark", format!("{e:#}")))?;
+            if !removed {
+                return Err(BookmarkCliError::not_found(*id));
+            }
+            if json {
+                write_json_line(out, &serde_json::json!({ "success": true, "removed": id }))?;
+            } else {
+                write_line(out, &format!("Removed bookmark #{id}"))?;
+            }
+            Ok(BOOKMARKS_EXIT_OK)
+        }
+
+        BookmarksCommand::Export { output, .. } => {
+            let store = open_store(&db_path)?;
+            let bookmarks = store
+                .list(None)
+                .map_err(|e| BookmarkCliError::io("listing bookmarks", format!("{e:#}")))?;
+            let count = bookmarks.len();
+
+            match output {
+                Some(path) => {
+                    let payload = serde_json::to_string_pretty(&bookmarks).map_err(|e| {
+                        BookmarkCliError::io("serializing bookmarks", e.to_string())
+                    })?;
+                    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                        std::fs::create_dir_all(parent).map_err(|e| {
+                            BookmarkCliError::io(
+                                &format!("creating export directory {}", parent.display()),
+                                e,
+                            )
+                        })?;
+                    }
+                    std::fs::write(path, payload).map_err(|e| {
+                        BookmarkCliError::io(&format!("writing {}", path.display()), e)
+                    })?;
+                    let shown = path.display().to_string();
+                    if json {
+                        write_json_line(
+                            out,
+                            &serde_json::json!({
+                                "success": true,
+                                "exported": shown,
+                                "count": count
+                            }),
+                        )?;
+                    } else {
+                        write_line(out, &format!("Exported {count} bookmark(s) to {shown}"))?;
+                    }
+                }
+                None => {
+                    if json {
+                        // One document only: the envelope carries the payload.
+                        write_json_line(
+                            out,
+                            &serde_json::json!({
+                                "success": true,
+                                "exported": "stdout",
+                                "count": count,
+                                "bookmarks": bookmarks
+                            }),
+                        )?;
+                    } else {
+                        // Raw export payload, directly re-importable.
+                        let payload = serde_json::to_string_pretty(&bookmarks).map_err(|e| {
+                            BookmarkCliError::io("serializing bookmarks", e.to_string())
+                        })?;
+                        write_line(out, &payload)?;
+                    }
+                }
+            }
+            Ok(BOOKMARKS_EXIT_OK)
+        }
+
+        BookmarksCommand::Import { input, .. } => {
+            let raw = std::fs::read_to_string(input)
+                .map_err(|e| BookmarkCliError::io(&format!("reading {}", input.display()), e))?;
+            let bookmarks = parse_import_payload(&raw)?;
+            let total = bookmarks.len();
+            let payload = serde_json::to_string(&bookmarks)
+                .map_err(|e| BookmarkCliError::io("serializing import payload", e.to_string()))?;
+
+            let store = open_store(&db_path)?;
+            let imported = store
+                .import_json(&payload)
+                .map_err(|e| BookmarkCliError::io("importing bookmarks", format!("{e:#}")))?;
+            let skipped = total.saturating_sub(imported);
+
+            if json {
+                write_json_line(
+                    out,
+                    &serde_json::json!({
+                        "success": true,
+                        "imported": imported,
+                        "skipped": skipped
+                    }),
+                )?;
+            } else {
+                write_line(
+                    out,
+                    &format!(
+                        "Imported {imported} bookmark(s) from {} ({skipped} duplicate(s) skipped)",
+                        input.display()
+                    ),
+                )?;
+            }
+            Ok(BOOKMARKS_EXIT_OK)
+        }
+    }
+}
+
+fn open_store(db_path: &Path) -> BookmarkCliResult<BookmarkStore> {
+    BookmarkStore::open(db_path)
+        .map_err(|e| BookmarkCliError::io("opening bookmarks database", format!("{e:#}")))
+}
+
+/// Title used by `add` when none is supplied: the source file name.
+fn default_title(source_path: &Path) -> String {
+    source_path.file_name().map_or_else(
+        || source_path.to_string_lossy().into_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+/// `path` or `path:line` for human-readable output.
+fn describe_location(bookmark: &Bookmark) -> String {
+    match bookmark.line_number {
+        Some(line) => format!("{}:{line}", bookmark.source_path),
+        None => bookmark.source_path.clone(),
+    }
+}
+
+/// Accept either a bare bookmark array or the `{"bookmarks": [...]}` envelope
+/// that `export --json` prints, and validate every entry before touching the DB.
+fn parse_import_payload(raw: &str) -> BookmarkCliResult<Vec<Bookmark>> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
+        BookmarkCliError::usage(format!("import file is not valid JSON: {e}"), None)
+    })?;
+    let entries = match value {
+        serde_json::Value::Array(entries) => entries,
+        serde_json::Value::Object(mut map) => match map.remove("bookmarks") {
+            Some(serde_json::Value::Array(entries)) => entries,
+            _ => {
+                return Err(BookmarkCliError::usage(
+                    "import file must be a JSON array of bookmarks or an object with a \"bookmarks\" array",
+                    Some("Use the output of `cass bookmarks export`."),
+                ));
+            }
+        },
+        _ => {
+            return Err(BookmarkCliError::usage(
+                "import file must be a JSON array of bookmarks or an object with a \"bookmarks\" array",
+                Some("Use the output of `cass bookmarks export`."),
+            ));
+        }
+    };
+    serde_json::from_value(serde_json::Value::Array(entries)).map_err(|e| {
+        BookmarkCliError::usage(
+            format!("import file contains an invalid bookmark: {e}"),
+            None,
+        )
+    })
+}
+
+/// Print a bookmark collection: a JSON envelope, or one block per bookmark.
+fn emit_bookmarks(
+    out: &mut dyn Write,
+    json: bool,
+    bookmarks: &[Bookmark],
+) -> BookmarkCliResult<()> {
+    if json {
+        return write_json_line(
+            out,
+            &serde_json::json!({
+                "success": true,
+                "count": bookmarks.len(),
+                "bookmarks": bookmarks
+            }),
+        );
+    }
+    if bookmarks.is_empty() {
+        eprintln!("No bookmarks found.");
+        return Ok(());
+    }
+    for bookmark in bookmarks {
+        write_line(
+            out,
+            &format!(
+                "#{}\t{}\t{}",
+                bookmark.id,
+                describe_location(bookmark),
+                bookmark.title
+            ),
+        )?;
+        let tags = bookmark.tags.trim();
+        if !tags.is_empty() {
+            write_line(out, &format!("\ttags: {tags}"))?;
+        }
+        let note = bookmark.note.trim();
+        if !note.is_empty() {
+            write_line(out, &format!("\tnote: {note}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn write_json_line(out: &mut dyn Write, value: &serde_json::Value) -> BookmarkCliResult<()> {
+    let text = serde_json::to_string(value)
+        .map_err(|e| BookmarkCliError::io("serializing output", e.to_string()))?;
+    write_line(out, &text)
+}
+
+fn write_line(out: &mut dyn Write, text: &str) -> BookmarkCliResult<()> {
+    writeln!(out, "{text}").map_err(|e| BookmarkCliError::io("writing output", e))?;
+    out.flush()
+        .map_err(|e| BookmarkCliError::io("flushing output", e))
 }
 
 /// SQL schema for bookmarks database

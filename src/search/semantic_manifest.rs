@@ -4364,6 +4364,7 @@ fn portable_file_identity(
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)]
 fn portable_file_identity(
     file: &fs::File,
     _metadata: &fs::Metadata,
@@ -4388,6 +4389,8 @@ fn portable_file_identity(
         file_index_low: u32,
     }
 
+    // SAFETY: declaration matches the documented kernel32 prototype.
+    #[allow(unsafe_code)]
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetFileInformationByHandle(
@@ -4703,6 +4706,7 @@ fn persist_named_temp(
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)]
 fn windows_move_file_write_through(
     source: &Path,
     destination: &Path,
@@ -4714,6 +4718,8 @@ fn windows_move_file_write_through(
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
     const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
 
+    // SAFETY: declarations match the documented kernel32 prototypes.
+    #[allow(unsafe_code)]
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn MoveFileExW(

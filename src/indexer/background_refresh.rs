@@ -222,16 +222,83 @@ pub fn background_index_args(data_dir: &Path, db_path: &Path, full: bool) -> Vec
 /// in its own process group so closing the terminal that ran the original
 /// `cass search` does not HUP it.
 fn build_command(binary: &Path, data_dir: &Path, db_path: &Path, full: bool) -> Command {
+    let mut cmd = build_detached_command(
+        binary,
+        &background_index_args(data_dir, db_path, full),
+        &log_path(data_dir),
+    );
+    cmd.env("CASS_INDEX_NO_PROGRESS_EVENTS", "1");
+    cmd
+}
+
+/// Log file for the detached analytics rollup rebuild the TUI spawns (GH #395).
+pub fn analytics_rebuild_log_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("analytics-rebuild.log")
+}
+
+/// The exact argv (after the binary) for a detached analytics rollup rebuild.
+///
+/// Track A only: that is what the TUI dashboard reads, and Track B's token
+/// ledger has its own scheduled path. `--json` keeps the child's stdout a
+/// single parseable receipt in the log file.
+pub fn background_analytics_rebuild_args(data_dir: &Path, db_path: &Path) -> Vec<OsString> {
+    vec![
+        OsString::from("--db"),
+        db_path.as_os_str().to_os_string(),
+        OsString::from("--color=never"),
+        OsString::from("analytics"),
+        OsString::from("rebuild"),
+        OsString::from("--json"),
+        OsString::from("--data-dir"),
+        data_dir.as_os_str().to_os_string(),
+    ]
+}
+
+/// Spawn a detached `cass analytics rebuild` for `db_path` (GH #395).
+///
+/// The TUI used to run the full rollup rebuild in-process on its effects
+/// thread when the dashboard found no rollups; on a multi-million-message
+/// archive that is a multi-GB, multi-minute allocation storm that froze the
+/// UI. The child inherits the same detachment as the index catch-up (own
+/// process group, stdio to a log, no nested auto-refresh) and is fire-and-
+/// forget: the caller reports "rebuilding in the background" and reloads the
+/// dashboard later. Returns the child pid.
+///
+/// # Errors
+///
+/// Returns a message when the current executable cannot be resolved or the
+/// child cannot be spawned.
+pub fn spawn_detached_analytics_rebuild(data_dir: &Path, db_path: &Path) -> Result<u32, String> {
+    let binary = std::env::current_exe()
+        .map_err(|error| format!("cannot resolve the running cass binary: {error}"))?;
+    let mut cmd = build_detached_command(
+        &binary,
+        &background_analytics_rebuild_args(data_dir, db_path),
+        &analytics_rebuild_log_path(data_dir),
+    );
+    let mut child = cmd
+        .spawn()
+        .map_err(|error| format!("cannot spawn detached analytics rebuild: {error}"))?;
+    let pid = child.id();
+    info!(pid, db_path = %db_path.display(), "spawned detached analytics rollup rebuild");
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(pid)
+}
+
+/// Shared shape of every detached cass child: stdio to `log`, own process
+/// group, and `CASS_AUTO_REFRESH=0` so a child never spawns children.
+fn build_detached_command(binary: &Path, args: &[OsString], log: &Path) -> Command {
     // ubs:ignore — `binary` is always `std::env::current_exe()` (the running
     // cass), never user-supplied input; same pattern as daemon auto-spawn.
     let mut cmd = Command::new(binary);
-    cmd.args(background_index_args(data_dir, db_path, full));
-    cmd.env("CASS_INDEX_NO_PROGRESS_EVENTS", "1");
+    cmd.args(args);
     // The child never searches, but be explicit: a catch-up must not spawn
     // catch-ups.
     cmd.env("CASS_AUTO_REFRESH", "0");
     cmd.stdin(Stdio::null());
-    match File::create(log_path(data_dir)) {
+    match File::create(log) {
         Ok(log) => {
             match log.try_clone() {
                 Ok(err_log) => {

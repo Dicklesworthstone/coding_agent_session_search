@@ -559,6 +559,7 @@ fn read_loadavg() -> Option<f32> {
 /// stack samples of long test runs, so the subprocess is now only a fallback
 /// for the (practically unreachable) case where `getloadavg` reports nothing.
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
 fn read_loadavg() -> Option<f32> {
     let mut samples = [0f64; 3];
     // SAFETY: `getloadavg` writes at most `nelem` doubles into the buffer, and

@@ -5418,6 +5418,42 @@ fn subcommand_alias_find_to_search() {
     assert.code(predicate::in_iter(vec![0, 1, 2, 3]));
 }
 
+/// README contract: when cass auto-corrects a robot invocation it emits a
+/// teaching note on stderr so the agent learns the canonical syntax, while
+/// stdout stays data-only. Positive observable: the note names the
+/// correction. Planted negative: a canonical invocation prints no note.
+#[test]
+fn robot_mode_auto_correction_emits_teaching_note_on_stderr() -> Result<(), Box<dyn Error>> {
+    let fixture = isolated_search_demo_data()?;
+    let data_dir = fixture.path().to_str().ok_or("non-utf8 data dir")?;
+
+    let corrected = base_cmd()
+        .args(["find", "hello", "--json", "--data-dir", data_dir])
+        .output()?;
+    let stderr = String::from_utf8_lossy(&corrected.stderr);
+    assert!(
+        stderr.contains("note: auto-corrected:"),
+        "robot-mode correction must teach on stderr; got stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Tip: Run 'cass --help'"),
+        "robot-mode note must be the compact machine form, not the human tip block: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&corrected.stdout);
+    let _: Value = serde_json::from_str(stdout.trim())
+        .map_err(|e| format!("stdout must stay a single JSON document: {e}; stdout={stdout}"))?;
+
+    let canonical = base_cmd()
+        .args(["search", "hello", "--json", "--data-dir", data_dir])
+        .output()?;
+    let canonical_stderr = String::from_utf8_lossy(&canonical.stderr);
+    assert!(
+        !canonical_stderr.contains("auto-corrected"),
+        "a canonical invocation must not print a correction note: {canonical_stderr}"
+    );
+    Ok(())
+}
+
 /// Subcommand alias: query → search
 #[test]
 fn subcommand_alias_query_to_search() {

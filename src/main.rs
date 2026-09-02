@@ -1,3 +1,7 @@
+// `unsafe` is denied crate-wide outside tests; the only sanctioned sites carry
+// `#[allow(unsafe_code)]` + a SAFETY comment (startup env writes, unavoidable FFI per AGENTS.md).
+#![cfg_attr(not(test), deny(unsafe_code))]
+
 fn env_requests_robot_output() -> bool {
     let cass_output_format = dotenvy::var("CASS_OUTPUT_FORMAT")
         .ok()
@@ -171,6 +175,7 @@ fn handle_fatal_error(err: coding_agent_search::CliError) -> ! {
     std::process::exit(err.code);
 }
 
+#[allow(unsafe_code)]
 fn apply_default_tantivy_writer_thread_cap() {
     let configured = dotenvy::var("CASS_TANTIVY_MAX_WRITER_THREADS")
         .ok()
@@ -182,6 +187,7 @@ fn apply_default_tantivy_writer_thread_cap() {
         // any Tantivy writers.
         let default_cap =
             coding_agent_search::search::tantivy::default_tantivy_max_writer_threads();
+        // SAFETY: single-threaded startup before any runtime thread exists.
         unsafe {
             std::env::set_var("CASS_TANTIVY_MAX_WRITER_THREADS", default_cap.to_string());
         }
@@ -204,6 +210,7 @@ fn apply_default_tantivy_writer_thread_cap() {
 ///
 /// Operators who need full per-cursor provenance can override by exporting
 /// `FSQLITE_READ_WITNESS_CAP=0` (or any value) before launching cass.
+#[allow(unsafe_code)]
 fn apply_default_fsqlite_read_witness_cap() {
     // The env var is parsed once by frankensqlite at first cursor construction
     // and cached in a process-wide OnceLock, so a later `set_var` after a

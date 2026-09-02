@@ -3025,7 +3025,16 @@ pub struct SearchClient {
     /// can truthfully report lower-bound count precision without blocking the
     /// top-N result path.
     last_tantivy_total_count: Mutex<Option<usize>>,
+    /// GH #441: why the most recent hybrid search dropped its lexical leg
+    /// (`None` when lexical ran normally). Robot metadata surfaces it as
+    /// `_meta.lexical_degrade_reason` so an agent can tell "no lexical hits"
+    /// from "lexical was skipped because the engine ran out of query fuel".
+    last_lexical_degrade_reason: Mutex<Option<&'static str>>,
 }
+
+/// `_meta.lexical_degrade_reason` value when Quill's query-fuel ceiling was
+/// hit on the lexical leg of a hybrid search (GH #441).
+pub const LEXICAL_DEGRADE_QUERY_FUEL_EXHAUSTED: &str = "query_fuel_exhausted";
 
 #[derive(Debug, Clone, Copy)]
 pub struct SearchClientOptions {
@@ -4079,6 +4088,7 @@ impl SearchClient {
             cache_namespace,
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         }))
     }
 
@@ -6904,14 +6914,40 @@ impl SearchClient {
 
         let budget =
             hybrid_candidate_budget(semantic_query, requested_limit, limit, offset, total_docs);
-        let lexical = self.search_with_fallback(
+        self.record_lexical_degrade_reason(None);
+        let lexical = match self.search_with_fallback(
             lexical_query,
             filters.clone(),
             budget.lexical_candidates,
             0,
             sparse_threshold,
             field_mask,
-        )?;
+        ) {
+            Ok(lexical) => lexical,
+            // GH #441: Quill's per-query fuel ceiling is a work bound, not an
+            // index fault. A stopword-heavy natural-language query on a
+            // segment-heavy archive can hit it while the semantic leg is
+            // perfectly able to answer. Degrade to semantic-only and say so
+            // in the robot metadata instead of failing the whole search.
+            Err(err) if crate::search::quill_bridge::is_query_fuel_exhausted(&err) => {
+                tracing::warn!(
+                    error = %err,
+                    "lexical leg of hybrid search exhausted its Quill query fuel; \
+                     continuing with the semantic leg only (GH #441)"
+                );
+                self.record_lexical_degrade_reason(Some(LEXICAL_DEGRADE_QUERY_FUEL_EXHAUSTED));
+                SearchResult {
+                    hits: Vec::new(),
+                    wildcard_fallback: false,
+                    cache_stats: self.cache_stats(),
+                    suggestions: Vec::new(),
+                    ann_stats: None,
+                    ann_unavailable_reason: None,
+                    total_count: None,
+                }
+            }
+            Err(err) => return Err(err),
+        };
         let (semantic_hits, semantic_ann_stats) = self.search_semantic_with_tier(
             semantic_query,
             filters,
@@ -10084,6 +10120,22 @@ impl SearchClient {
         }
     }
 
+    fn record_lexical_degrade_reason(&self, reason: Option<&'static str>) {
+        if let Ok(mut slot) = self.last_lexical_degrade_reason.lock() {
+            *slot = reason;
+        }
+    }
+
+    /// Why the most recent hybrid search dropped its lexical leg, if it did.
+    /// See [`LEXICAL_DEGRADE_QUERY_FUEL_EXHAUSTED`] (GH #441).
+    #[must_use]
+    pub fn lexical_degrade_reason(&self) -> Option<&'static str> {
+        self.last_lexical_degrade_reason
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
+    }
+
     pub fn cache_stats(&self) -> CacheStats {
         let (hits, searcher_cache, shortfall, reloads, reload_ms_total) =
             self.metrics.snapshot_all();
@@ -10218,6 +10270,7 @@ mod tests {
             cache_namespace: "vtest|schema:cass-layer-b".into(),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         }
     }
 
@@ -11613,6 +11666,7 @@ mod tests {
             cache_namespace: format!("v{}|schema:{}", CACHE_KEY_VERSION, FS_CASS_SCHEMA_HASH),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
         let semantic_embedder: Arc<dyn Embedder> = fast_embedder;
         client.set_semantic_context(
@@ -12385,6 +12439,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         // Wildcard query should skip cache logic entirely (no miss recorded)
@@ -12436,6 +12491,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = vec![SearchHit {
@@ -12647,6 +12703,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
         let field_mask = FieldMask::new(false, true, true, true);
         let lexical_hit = SearchHit {
@@ -13188,6 +13245,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = client.search("*handler", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -13270,6 +13328,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = client.search("auth", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -13357,6 +13416,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = client.search("auth", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -13460,6 +13520,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let sqlite_hits = client.search_sqlite_fts5(
@@ -13565,6 +13626,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let guard = client
@@ -13684,6 +13746,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:cross-worker"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         });
         let worker_count = 4;
         let start = Arc::new(std::sync::Barrier::new(worker_count + 1));
@@ -13971,6 +14034,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let guard = client.sqlite_guard()?;
@@ -14138,6 +14202,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
         let direct_hits = client.search_sqlite_fts5(
             Path::new(":memory:"),
@@ -14275,6 +14340,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let fallback_key = (
@@ -14409,6 +14475,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = client.search("delta", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
@@ -14526,6 +14593,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let local_hits = client.browse_by_date(
@@ -14654,6 +14722,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let remote_hits = client.search(
@@ -14791,6 +14860,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = client.search(
@@ -15252,6 +15322,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:negated-or-fallback"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = client.search_sqlite_fts5(
@@ -15324,6 +15395,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:wildcard-scan-fallback"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
         let contents = |query: &str| -> Result<HashSet<String>> {
             Ok(client
@@ -15430,6 +15502,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = client.browse_by_date(
@@ -15525,6 +15598,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -15968,6 +16042,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -16041,6 +16116,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -16130,6 +16206,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let first_hit = SearchHit {
@@ -16247,6 +16324,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = client.hydrate_semantic_hits_with_ids(
@@ -16333,6 +16411,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let first_hit = SearchHit {
@@ -16426,6 +16505,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -16509,6 +16589,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -16592,6 +16673,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -16676,6 +16758,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -16798,6 +16881,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = client.browse_by_date(
@@ -16926,6 +17010,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -16988,6 +17073,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -17043,6 +17129,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         client.metrics.inc_cache_hits();
@@ -17084,6 +17171,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
         let mut filters = SearchFilters::default();
         filters.workspaces.insert("/tmp/cass-workspace".into());
@@ -17148,6 +17236,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
         let filters = SearchFilters::default();
 
@@ -17190,6 +17279,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hit = SearchHit {
@@ -17402,6 +17492,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         // Large content to exceed byte cap quickly
@@ -18769,6 +18860,7 @@ mod tests {
             cache_namespace: "vtest|schema:none".into(),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let result = client.search_with_fallback(
@@ -18862,6 +18954,7 @@ mod tests {
             cache_namespace: "vtest|schema:none".into(),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let result = client.search_with_fallback(
@@ -18907,6 +19000,7 @@ mod tests {
             cache_namespace: "vtest|schema:none".into(),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let mut filters = SearchFilters::default();
@@ -19982,6 +20076,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let filters_empty = SearchFilters::default();
@@ -20188,6 +20283,7 @@ mod tests {
             cache_namespace: "fts5-disabled".to_string(),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let hits = client.search_sqlite_fts5(
@@ -20329,6 +20425,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:k0e5p"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         // Hit-key tuple: (source_path, line_number) is the stable
@@ -21117,6 +21214,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         // Initial metrics should be zero
@@ -21156,6 +21254,7 @@ mod tests {
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
             semantic: Mutex::new(None),
             last_tantivy_total_count: Mutex::new(None),
+            last_lexical_degrade_reason: Mutex::new(None),
         };
 
         let filters1 = SearchFilters::default();

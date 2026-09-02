@@ -2,6 +2,9 @@
 // obscure the arithmetic without changing behaviour.
 #![allow(clippy::needless_range_loop)]
 #![recursion_limit = "512"]
+// `unsafe` is denied crate-wide outside tests; the only sanctioned sites carry
+// `#[allow(unsafe_code)]` + a SAFETY comment (startup env writes, unavoidable FFI per AGENTS.md).
+#![cfg_attr(not(test), deny(unsafe_code))]
 
 pub mod analytics;
 pub mod bakeoff;
@@ -494,6 +497,8 @@ pub enum Commands {
     },
     /// Generate man page to stdout
     Man,
+    /// Save, list, search, remove, export, and import bookmarks (bookmarks.db)
+    Bookmarks(bookmarks::BookmarksArgs),
     /// Machine-focused docs for automation agents
     RobotDocs {
         /// Topic to print
@@ -6726,14 +6731,13 @@ pub async fn run_with_parsed(parsed: ParsedCli) -> CliResult<()> {
         .flatten()
         .collect();
 
-    // Suppress correction chatter for robot/doc modes; still show for humans
-    if !all_notes.is_empty() && !is_doc_mode && !is_robot_mode {
-        // Human-readable correction notice
-        eprintln!("Note: Your command was auto-corrected:");
-        for note in &all_notes {
-            eprintln!("  • {note}");
-        }
-        eprintln!("Tip: Run 'cass --help' for proper syntax.");
+    // Teaching notes go to stderr for humans AND robots: README promises that
+    // agents learn the canonical syntax from a stderr note, and stdout stays
+    // data-only in robot mode so the note can never corrupt a JSON payload.
+    // Only the robot-docs/--robot-help surfaces stay quiet, because their
+    // stderr is part of the documented docs stream.
+    if !all_notes.is_empty() && !is_doc_mode {
+        emit_correction_notes(&all_notes, is_robot_mode);
     }
 
     let result = execute_cli(
@@ -6810,12 +6814,8 @@ pub fn try_run_with_parsed_fast(parsed: ParsedCli) -> Result<CliResult<()>, Box<
         .flatten()
         .collect();
 
-    if !all_notes.is_empty() && !is_robot_mode {
-        eprintln!("Note: Your command was auto-corrected:");
-        for note in &all_notes {
-            eprintln!("  • {note}");
-        }
-        eprintln!("Tip: Run 'cass --help' for proper syntax.");
+    if !all_notes.is_empty() {
+        emit_correction_notes(&all_notes, is_robot_mode);
     }
 
     let result = match command.expect("fast command was matched above") {
@@ -8132,6 +8132,21 @@ async fn execute_cli(
                     let man = clap_mangen::Man::new(cmd);
                     man.render(&mut std::io::stdout())
                         .map_err(|e| CliError::unknown(format!("failed to render man: {e}")))?;
+                }
+                Commands::Bookmarks(args) => {
+                    // The bookmarks module owns its output contract: exactly
+                    // one JSON document on stdout under --json, and on failure
+                    // one error envelope on stderr. It hands back the exit
+                    // code instead of a CliError so the top-level handler does
+                    // not print a second envelope.
+                    let code = bookmarks::run_bookmarks_command(args)
+                        .map_err(|e| CliError::unknown(format!("bookmarks command failed: {e}")))?;
+                    if code != 0 {
+                        use std::io::Write as _;
+                        let _ = std::io::stdout().flush();
+                        let _ = std::io::stderr().flush();
+                        std::process::exit(code);
+                    }
                 }
                 Commands::Capabilities { json } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
@@ -19849,6 +19864,25 @@ fn probe_state_db_strict_bounded(
     busy_timeout: Duration,
     include_counts: bool,
 ) -> StateDbSnapshot {
+    probe_state_db_strict_bounded_scoped(db_path, reason, busy_timeout, include_counts, false)
+}
+
+/// [`probe_state_db_strict_bounded`] with the health watermark scope.
+///
+/// `watermarks_only` reads just the single-row `meta` watermarks and skips
+/// the integrity probe and row counts. It exists so `cass health` (k2k20 ask
+/// #2) shares the strict, mutation-free, hard-deadline opener with `status`
+/// instead of the inline read opener, whose sanctioned recovery writes
+/// (duplicate-FTS schema repair, dirty-WAL `wal_checkpoint(TRUNCATE)`) made a
+/// documented <50 ms observation surface pay a multi-GB recovery bill on the
+/// archive it was only supposed to describe.
+fn probe_state_db_strict_bounded_scoped(
+    db_path: &Path,
+    reason: &str,
+    busy_timeout: Duration,
+    include_counts: bool,
+    watermarks_only: bool,
+) -> StateDbSnapshot {
     let display_path = db_path.display().to_string();
     // SQLite treats a zero-byte file as a valid, empty database; only a
     // non-empty file that cannot carry a header is a corruption signal.
@@ -19866,8 +19900,11 @@ fn probe_state_db_strict_bounded(
             ..StateDbSnapshot::default()
         };
     }
+    // The watermark scope never pays for the integrity probe or the row
+    // counts: health reads two meta rows and nothing else.
+    let include_counts = include_counts && !watermarks_only;
     let integrity_probe_allowed =
-        doctor_archive_bundle_bytes(db_path) <= STATUS_COUNT_SCAN_MAX_DB_BYTES;
+        !watermarks_only && doctor_archive_bundle_bytes(db_path) <= STATUS_COUNT_SCAN_MAX_DB_BYTES;
     let phase = std::sync::Arc::new(std::sync::Mutex::new("open"));
     let (tx, rx) = std::sync::mpsc::channel();
     let worker_phase = std::sync::Arc::clone(&phase);
@@ -19884,20 +19921,151 @@ fn probe_state_db_strict_bounded(
         );
         let _ = tx.send(snapshot);
     });
-    match rx.recv_timeout(STATE_DB_PROBE_HARD_TIMEOUT) {
-        Ok(snapshot) => snapshot,
+    let (snapshot, timed_out) = match rx.recv_timeout(STATE_DB_PROBE_HARD_TIMEOUT) {
+        Ok(snapshot) => (snapshot, false),
         Err(_) => {
             let last_phase = phase.lock().map(|current| *current).unwrap_or("unknown");
-            StateDbSnapshot {
-                counts_skipped: true,
-                open_error: Some(format!(
-                    "state probe of {reason} database at {display_path} exceeded {}s (last phase: {last_phase}); the archive is very large or busy and this read-only probe did not modify it — run 'cass doctor check --json' for a bounded diagnosis",
-                    STATE_DB_PROBE_HARD_TIMEOUT.as_secs()
-                )),
-                open_retryable: true,
-                ..StateDbSnapshot::default()
-            }
+            (
+                StateDbSnapshot {
+                    counts_skipped: true,
+                    open_error: Some(format!(
+                        "state probe of {reason} database at {display_path} exceeded {}s (last phase: {last_phase}); the archive is very large or busy and this read-only probe did not modify it — run 'cass doctor check --json' for a bounded diagnosis",
+                        STATE_DB_PROBE_HARD_TIMEOUT.as_secs()
+                    )),
+                    open_retryable: true,
+                    ..StateDbSnapshot::default()
+                },
+                true,
+            )
         }
+    };
+    if watermarks_only {
+        finalize_health_watermark_snapshot(snapshot, timed_out)
+    } else {
+        snapshot
+    }
+}
+
+/// Apply the `cass health` watermark-lane contract to a strict probe result.
+///
+/// The gi4oy/d0rmo health contract reports `open_skipped=true`,
+/// `counts_skipped=true` and null counts whatever happened underneath, and
+/// treats a lock-class (retryable) open failure as "a concurrent writer holds
+/// the archive", which is not a degraded-state signal: it is elided to an
+/// assumed-good open exactly as the pre-#301 fast lane did. Two things are
+/// deliberately NOT elided: a hard open failure (GH #396: masking CANTOPEN /
+/// corrupt-header made health say `db=available` while every search failed),
+/// and the probe's own hard deadline — a 30 s silent open IS the k2k20 defect
+/// class, so it surfaces as a retryable open error with the last phase named.
+fn finalize_health_watermark_snapshot(
+    mut snapshot: StateDbSnapshot,
+    timed_out: bool,
+) -> StateDbSnapshot {
+    snapshot.counts_skipped = true;
+    if !timed_out && snapshot.open_error.is_some() && snapshot.open_retryable {
+        snapshot.open_error = None;
+        snapshot.opened = true;
+    }
+    // An open we ATTEMPTED and watched fail hard (or time out) must surface
+    // as such on every surface; only the assumed-good/successful shapes keep
+    // the historical `open_skipped=true` marker.
+    snapshot.open_skipped = snapshot.open_error.is_none();
+    snapshot
+}
+
+#[cfg(test)]
+mod health_watermark_probe_tests {
+    use super::*;
+
+    /// Write real rows, then close WITHOUT the final checkpoint so the WAL
+    /// keeps unreplayed frames — the unclean-shutdown artifact the ordinary
+    /// read opener would "recover" with a `wal_checkpoint(TRUNCATE)`.
+    fn dirty_wal_db(dir: &Path) -> (PathBuf, u64) {
+        let db_path = dir.join("watermarks.db");
+        {
+            let mut conn =
+                crate::franken_sync::Connection::open(db_path.to_string_lossy().into_owned())
+                    .expect("open fixture db");
+            conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);")
+                .expect("create meta");
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('last_indexed_at', '1700000000000'), ('last_scan_ts', '1700000001000');",
+            )
+            .expect("seed watermarks");
+            crate::storage::sqlite::close_franken_in_place_with_busy_retry(&mut conn, false)
+                .expect("close without checkpoint");
+        }
+        let wal_path = crate::storage::sqlite::database_sidecar_path(&db_path, "-wal");
+        let wal_len = std::fs::symlink_metadata(&wal_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        assert!(
+            wal_len > 32,
+            "precondition: close-without-checkpoint must leave WAL frames (len={wal_len})"
+        );
+        (db_path, wal_len)
+    }
+
+    /// k2k20 (health half): the watermark lane reads its two meta rows
+    /// through the strict opener and leaves a dirty WAL exactly as it found
+    /// it. Positive observable: watermarks are read. Planted negative: the
+    /// WAL byte length is unchanged, i.e. no recovery checkpoint ran.
+    /// No-claim: this does not bound wall-clock on a multi-GB archive; the
+    /// 30 s hard deadline is exercised by the status-probe tests.
+    #[test]
+    fn health_watermark_probe_reads_meta_without_checkpointing_a_dirty_wal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (db_path, dirty_len) = dirty_wal_db(dir.path());
+
+        let snapshot = probe_state_db_modes(
+            &db_path,
+            "state-meta-watermarks",
+            Duration::from_secs(2),
+            false,
+            true,
+        );
+
+        assert!(
+            snapshot.opened,
+            "watermark probe must open the db: {snapshot:?}"
+        );
+        assert!(snapshot.open_skipped && snapshot.counts_skipped);
+        assert_eq!(snapshot.open_error, None);
+        assert_eq!(snapshot.last_indexed_at, Some(1_700_000_000_000));
+        assert_eq!(snapshot.last_scan_ts, Some(1_700_000_001_000));
+        let wal_path = crate::storage::sqlite::database_sidecar_path(&db_path, "-wal");
+        let after_len = std::fs::symlink_metadata(&wal_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        assert_eq!(
+            after_len, dirty_len,
+            "health must never checkpoint the archive it is describing (WAL {dirty_len} -> {after_len})"
+        );
+    }
+
+    /// A hard open failure (here: a non-SQLite file) must surface on the
+    /// health lane rather than being elided to assumed-good (GH #396).
+    #[test]
+    fn health_watermark_probe_surfaces_hard_open_failures() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("not-a-db.db");
+        std::fs::write(&db_path, b"this is definitely not a SQLite database header").unwrap();
+
+        let snapshot = probe_state_db_modes(
+            &db_path,
+            "state-meta-watermarks",
+            Duration::from_secs(2),
+            false,
+            true,
+        );
+
+        assert!(!snapshot.opened);
+        assert!(
+            !snapshot.open_skipped,
+            "an attempted-and-failed open is never 'skipped'"
+        );
+        assert!(!snapshot.open_retryable);
+        assert!(snapshot.open_error.is_some(), "{snapshot:?}");
     }
 }
 
@@ -20064,97 +20232,14 @@ fn probe_state_db_modes(
     // the count refresh) is a readiness READ. It opens strictly read-only on
     // a dedicated owner thread under one hard deadline; the health
     // watermark lane below keeps its own fast contract.
-    if !watermarks_only {
-        return probe_state_db_strict_bounded(db_path, reason, timeout, include_counts);
-    }
-
-    let mut snapshot = StateDbSnapshot {
-        counts_skipped: !include_counts || watermarks_only,
-        open_skipped: watermarks_only,
-        ..StateDbSnapshot::default()
-    };
-
-    let conn = match open_franken_cli_read_db(db_path.to_path_buf(), reason, timeout) {
-        Ok(conn) => conn,
-        Err(err) => {
-            if watermarks_only && err.retryable {
-                // Preserve the pre-#301 skip-open semantics on the fast
-                // readiness surface for RETRYABLE (busy/lock-class) open
-                // failures only: a concurrent writer holding the archive is
-                // not a degraded-state signal, so report the assumed-good
-                // elision (opened=true + open_skipped=true) and keep health
-                // under its latency budget.
-                //
-                // Hard (non-retryable) failures — CANTOPEN, corrupt header,
-                // permission — fall through: GH #396 showed that masking
-                // them made `cass health` print `db=available` / "Search
-                // usable now: yes" while every `cass search` failed on an
-                // unopenable archive. An open we ATTEMPTED and watched fail
-                // hard must surface as OpenFailed, on every surface.
-                snapshot.opened = true;
-                return snapshot;
-            }
-            snapshot.open_skipped = false;
-            snapshot.open_error = Some(err.message);
-            snapshot.open_retryable = err.retryable;
-            return snapshot;
-        }
-    };
-
-    use crate::franken_sync::compat::RowExt;
-    use crate::franken_sync::params;
-
-    snapshot.opened = true;
-    snapshot.last_indexed_at = franken_query_row_map_retry(
-        &conn,
-        "SELECT value FROM meta WHERE key = 'last_indexed_at'",
-        params![],
-        |r| r.get_typed::<String>(0),
-    )
-    .ok()
-    .and_then(|s| s.parse::<i64>().ok());
-    snapshot.last_scan_ts = franken_query_row_map_retry(
-        &conn,
-        "SELECT value FROM meta WHERE key = 'last_scan_ts'",
-        params![],
-        |r| r.get_typed::<String>(0),
-    )
-    .ok()
-    .and_then(|s| s.parse::<i64>().ok());
-    // zn1xn: cheap single-row read of the "canonical FTS shadow may be
-    // half-rebuilt" marker, alongside the other watermarks, so `index --json`
-    // and `status` surface it without a separate probe.
-    snapshot.fallback_repair_pending = franken_query_row_map_retry(
-        &conn,
-        "SELECT value FROM meta WHERE key = 'fts_fallback_repair_pending'",
-        params![],
-        |r| r.get_typed::<String>(0),
-    )
-    .ok()
-    .filter(|detail| !detail.is_empty());
-    // zn1xn F4: persistent lexical-repair deferral streak + reason.
-    snapshot.lexical_repair_deferred_runs = franken_query_row_map_retry(
-        &conn,
-        "SELECT value FROM meta WHERE key = 'lexical_repair_deferred_consecutive_runs'",
-        params![],
-        |r| r.get_typed::<String>(0),
-    )
-    .ok()
-    .and_then(|s| s.parse::<i64>().ok())
-    .filter(|runs| *runs > 0);
-    snapshot.lexical_repair_deferred_reason = franken_query_row_map_retry(
-        &conn,
-        "SELECT value FROM meta WHERE key = 'lexical_repair_deferred_reason'",
-        params![],
-        |r| r.get_typed::<String>(0),
-    )
-    .ok()
-    .filter(|reason| !reason.is_empty());
-    if let Err(err) = close_franken_cli_read_db(conn, db_path, reason) {
-        snapshot.open_error = Some(err.message);
-    }
-
-    snapshot
+    // k2k20 ask #2 (health half): the watermark lane used to be the ONE
+    // observation surface still on the inline read opener, whose sanctioned
+    // recovery writes (duplicate-FTS schema repair, dirty-WAL
+    // `wal_checkpoint(TRUNCATE)`) ran unbounded on the caller's thread — the
+    // 13-minute silent `cass health` on a 9.3 GB archive. It now shares the
+    // strict, mutation-free, hard-deadline owner-thread probe with `status`,
+    // scoped to the two single-row meta watermarks it always read.
+    probe_state_db_strict_bounded_scoped(db_path, reason, timeout, include_counts, watermarks_only)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22951,6 +23036,7 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::View { .. }) => "view".to_string(),
         Some(Commands::Completions { .. }) => "completions".to_string(),
         Some(Commands::Man) => "man".to_string(),
+        Some(Commands::Bookmarks(_)) => "bookmarks".to_string(),
         Some(Commands::Capabilities { .. }) => "capabilities".to_string(),
         Some(Commands::ApiVersion { .. }) => "api-version".to_string(),
         Some(Commands::ReleaseVerify { .. }) => "release-verify".to_string(),
@@ -24791,6 +24877,27 @@ mod log_hygiene_tests {
     }
 }
 
+/// Print the auto-correction teaching note on stderr.
+///
+/// Humans get the multi-line bulleted form. Robots get one `note:` line per
+/// correction so a JSON caller that captures stderr sees a stable, greppable
+/// prefix (`note: auto-corrected:`) and never a decorative bullet or the
+/// `cass --help` tip. stdout is untouched on both paths, so the data
+/// contract (`stdout = data only, stderr = diagnostics`) holds.
+fn emit_correction_notes(notes: &[&str], robot_mode: bool) {
+    if robot_mode {
+        for note in notes {
+            eprintln!("note: auto-corrected: {note}");
+        }
+        return;
+    }
+    eprintln!("Note: Your command was auto-corrected:");
+    for note in notes {
+        eprintln!("  • {note}");
+    }
+    eprintln!("Tip: Run 'cass --help' for proper syntax.");
+}
+
 /// Returns true if the command is using robot/JSON output mode.
 /// Used to auto-suppress INFO logs for clean machine-parseable output.
 fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
@@ -24845,6 +24952,7 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
         Commands::Doctor { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
+        Commands::Bookmarks(args) => args.command.json() || env_robot_mode,
         Commands::Timeline { json, .. } => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
@@ -26597,9 +26705,13 @@ fn search_lexical_self_heal_diagnosis(
             "lexical checkpoint does not carry a completed canonical storage fingerprint",
         )));
     }
-    let current_storage_fingerprint = match crate::indexer::lexical_storage_fingerprint_for_db(
-        db_path,
-    ) {
+    // Memoized on the archive's physical identity: the uncached variant opens
+    // a synchronous storage handle that replays the whole WAL on a large
+    // archive, which cost every default `cass search` ~4 s before the engine
+    // query even ran (see `lexical_storage_fingerprint_for_db_cached`).
+    let cached_fingerprint =
+        crate::indexer::lexical_storage_fingerprint_for_db_cached(db_path, index_path);
+    let current_storage_fingerprint = match cached_fingerprint {
         Ok(fingerprint) => fingerprint,
         Err(err) => {
             let dedicated = crate::search::storage_integrity::probe_dedicated_storage_state(
@@ -28391,12 +28503,30 @@ fn execute_search_operation(
                 search_sparse_threshold,
                 field_mask,
             )
-            .map_err(|error| CliError {
-                code: 9,
-                kind: CliErrorKind::Search.kind_str(),
-                message: format!("search failed: {error}"),
-                hint: None,
-                retryable: true,
+            .map_err(|error| {
+                // GH #441: a lexical-only search has no semantic leg to
+                // degrade to, so name the two real remedies instead of a bare
+                // engine error.
+                let fuel_exhausted = crate::search::quill_bridge::is_query_fuel_exhausted(&error);
+                let hint = if fuel_exhausted {
+                    Some(format!(
+                        "the lexical engine hit its per-query work ceiling (usually a long, \
+                         stopword-heavy query on an archive with many index segments); retry \
+                         with fewer or rarer terms, raise {} above {}, or run 'cass index --full' \
+                         to consolidate segments",
+                        crate::search::quill_bridge::CASS_QUILL_QUERY_FUEL_BUDGET_ENV,
+                        crate::search::quill_bridge::cass_quill_config().query_fuel_budget
+                    ))
+                } else {
+                    None
+                };
+                CliError {
+                    code: 9,
+                    kind: CliErrorKind::Search.kind_str(),
+                    message: format!("search failed: {error}"),
+                    hint,
+                    retryable: true,
+                }
             })?,
         SearchMode::Semantic => {
             let (hits, ann_stats) = client
@@ -28570,6 +28700,7 @@ fn execute_search_operation(
             }
         },
     };
+    mode_meta.lexical_degrade_reason = client.lexical_degrade_reason();
     Ok((result, mode_meta))
 }
 
@@ -32512,6 +32643,9 @@ struct SearchModeMeta {
     fallback_reason: Option<String>,
     quality_tier_refined: bool,
     semantic_work_completed: bool,
+    /// GH #441: set when a hybrid search dropped its lexical leg (for example
+    /// `query_fuel_exhausted`) and answered from the semantic leg alone.
+    lexical_degrade_reason: Option<&'static str>,
 }
 
 impl SearchModeMeta {
@@ -32524,6 +32658,7 @@ impl SearchModeMeta {
             fallback_reason: None,
             quality_tier_refined: true,
             semantic_work_completed: true,
+            lexical_degrade_reason: None,
         }
     }
 
@@ -33609,6 +33744,7 @@ fn output_robot_results(
                     "semantic_refinement": search_mode_meta.semantic_refinement(),
                     "refinement_level": search_mode_meta.realized_refinement(),
                     "semantic_fallback_reason": search_mode_meta.semantic_fallback_reason(),
+                    "lexical_degrade_reason": search_mode_meta.lexical_degrade_reason,
                     "wildcard_fallback": result.wildcard_fallback,
                     "cache_stats": {
                         "hits": result.cache_stats.cache_hits,
@@ -33760,6 +33896,7 @@ fn output_robot_results(
                         "semantic_refinement": search_mode_meta.semantic_refinement(),
                         "refinement_level": search_mode_meta.realized_refinement(),
                         "semantic_fallback_reason": search_mode_meta.semantic_fallback_reason(),
+                    "lexical_degrade_reason": search_mode_meta.lexical_degrade_reason,
                         "wildcard_fallback": result.wildcard_fallback,
                         "cache_stats": {
                             "hits": result.cache_stats.cache_hits,
@@ -33975,6 +34112,7 @@ fn output_robot_results(
                     "semantic_refinement": search_mode_meta.semantic_refinement(),
                     "refinement_level": search_mode_meta.realized_refinement(),
                     "semantic_fallback_reason": search_mode_meta.semantic_fallback_reason(),
+                    "lexical_degrade_reason": search_mode_meta.lexical_degrade_reason,
                     "wildcard_fallback": result.wildcard_fallback,
                     "tokens_estimated": tokens_estimated,
                     "max_tokens": max_tokens,
@@ -34146,6 +34284,7 @@ fn output_robot_results(
                     "semantic_refinement": search_mode_meta.semantic_refinement(),
                     "refinement_level": search_mode_meta.realized_refinement(),
                     "semantic_fallback_reason": search_mode_meta.semantic_fallback_reason(),
+                    "lexical_degrade_reason": search_mode_meta.lexical_degrade_reason,
                     "wildcard_fallback": result.wildcard_fallback,
                     "tokens_estimated": tokens_estimated,
                     "max_tokens": max_tokens,
@@ -95881,6 +96020,12 @@ fn response_schema_search_meta() -> serde_json::Value {
         (
             "semantic_fallback_reason",
             serde_json::json!({ "type": ["string", "null"] }),
+        ),
+        // GH #441: set when hybrid answered from the semantic leg alone
+        // because the lexical leg exhausted its Quill query fuel.
+        (
+            "lexical_degrade_reason",
+            serde_json::json!({ "type": ["string", "null"], "enum": ["query_fuel_exhausted", null] }),
         ),
         (
             "wildcard_fallback",

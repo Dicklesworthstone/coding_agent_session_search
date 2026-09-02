@@ -365,6 +365,29 @@ Week 4+: WS-E5 decomposition (rolling, golden-guarded), WS-C3–C6 if (a) chosen
 
 ---
 
+## 7b. Progress log
+
+### 2026-09-01, gap-closing block (same day as the assessment)
+
+Landed in the working tree (verification status noted per item; nothing below is claimed green until the compile/test receipt is recorded here):
+
+| Item | Workstream | What changed | Proof |
+|---|---|---|---|
+| Robot teaching notes | WS-D5 | `emit_correction_notes`: robot mode prints `note: auto-corrected: …` on stderr; stdout untouched | `tests/cli_robot.rs::robot_mode_auto_correction_emits_teaching_note_on_stderr` |
+| Bounded `health` | WS-B4 | watermark lane routed through the strict, mutation-free, 30 s-deadline owner-thread probe (`probe_state_db_strict_bounded_scoped`); inline recovery-capable lane deleted | `lib.rs::health_watermark_probe_tests` (dirty WAL byte-identical; hard failure surfaces) |
+| #441 fuel + degrade | WS-B1 | `cass_quill_config()` (100M fuel default, `CASS_QUILL_*` env overrides) at every Quill open; hybrid degrades to semantic on fuel exhaustion with `_meta.lexical_degrade_reason`; lexical-only gets an actionable hint | `quill_bridge` tests incl. `production_config_bounds_segment_growth_on_append_only_commits` (segment-growth hypothesis, must run) |
+| #439 heartbeat | WS-B2 | post-publish FTS shadow rebuild ticks `IndexingProgress.activity` per page via `FrankenStorage::set_progress_heartbeat` | `sqlite.rs::fts_rebuild_ticks_installed_progress_heartbeat_per_page` |
+| #395 TUI startup | WS-B8 | deferred (lazy) semantic loader before first frame; analytics rollup rebuild spawned as a detached `cass analytics rebuild` child | none yet (headless first-frame proof still owed) |
+| Robot per-call overhead | WS-B7 | root cause measured with the v0.7.1 binary + strace: the self-heal fingerprint's sync storage open replays the whole 201 MB WAL (~4 s) on every default search; fingerprint now memoized on archive physical identity (`.archive-fingerprint-cache.json`) | `indexer::cached_archive_fingerprint_hits_on_unchanged_identity_and_misses_after_writes`; wall-time re-measure owed |
+| Unsafe fence | WS-A4 | `#![cfg_attr(not(test), deny(unsafe_code))]` + scoped allows/SAFETY on 14 items; grep test replaced by fence-presence test | compile is the proof |
+| Bookmarks CLI | WS-E3 | `cass bookmarks add|list|search|remove|export|import` wired to the previously dead module; exit codes 13/14 aligned with the crate table | `tests/bookmarks_cli.rs` (9 tests) |
+| Docs truth | WS-D1–D4 | README/AGENTS corrected on all 15 audited items with code citations; hidden subcommands documented; today's behavior documented | review |
+| Tracker | WS-H | 8 beads filed for the above; 7 stale/obsolete beads closed with commit-level evidence; landing note on k2k20 | `br` |
+
+Dropped after investigation: `--timeout` exit-8 (main's exit-0 budget envelope is deliberate and tested; docs fixed instead); `export-html --password` (argv passwords are rejected on purpose, pinned by a test; docs fixed instead); `preferred_backend` rename (alias churn without capability).
+
+New finding: the owner's archive carried a 200 MB WAL for 18 days; every default search replayed it. Beyond the memoization, the finalize/doctor path should guarantee WAL truncation after an index run (not yet addressed).
+
 ## 8. Answers to the five reality-check questions
 
 1. **What IS working:** the whole lexical core loop, robot ergonomics, doctor v2, scheduler, raw mirror, redaction, daemon attestation, packaging, Pages (hidden), and the storage safety story (no unsafe Send/Sync, rusqlite gone).

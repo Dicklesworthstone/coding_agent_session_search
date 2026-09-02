@@ -26,6 +26,8 @@ mod posix {
     #[cfg(target_os = "linux")]
     pub const _SC_PAGESIZE: c_int = 30;
     pub const PRIO_PROCESS: c_int = 0;
+    // SAFETY: declarations match the POSIX prototypes of sysconf(3) and setpriority(2).
+    #[allow(unsafe_code)]
     unsafe extern "C" {
         #[cfg(target_os = "linux")]
         pub fn sysconf(name: c_int) -> c_long;
@@ -91,6 +93,7 @@ impl ResourceMonitor {
 
     /// Get system page size in bytes.
     #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)]
     fn page_size() -> u64 {
         // SAFETY: sysconf has no pointer arguments and is thread-safe for this key.
         let raw = unsafe { posix::sysconf(posix::_SC_PAGESIZE) };
@@ -101,6 +104,7 @@ impl ResourceMonitor {
     ///
     /// Nice values range from -20 (highest priority) to 19 (lowest priority).
     /// Returns true if successful.
+    #[allow(unsafe_code)]
     pub fn apply_nice(&self, nice_value: i32) -> bool {
         #[cfg(unix)]
         {

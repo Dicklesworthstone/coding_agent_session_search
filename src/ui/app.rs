@@ -20370,11 +20370,12 @@ impl super::ftui_adapter::Model for CassApp {
             }
             CassMsg::AnalyticsLoadRequested => {
                 let db_path = self.db_path.clone();
+                let data_dir = self.data_dir.clone();
                 let filters = self.analytics_filters.clone();
                 let group_by = self.explorer_group_by;
                 #[cfg(test)]
                 {
-                    let _ = (db_path, filters, group_by);
+                    let _ = (db_path, data_dir, filters, group_by);
                     ftui::Cmd::task(|| CassMsg::AnalyticsChartDataLoaded(Box::default()))
                 }
                 #[cfg(not(test))]
@@ -20426,36 +20427,24 @@ impl super::ftui_adapter::Model for CassApp {
                                 };
 
                                 if should_auto_rebuild {
-                                    tracing::info!("analytics auto-rebuild triggered");
-                                    match crate::storage::sqlite::FrankenStorage::open(&db_path) {
-                                        Ok(db_rw) => match db_rw.rebuild_analytics() {
-                                            Ok(_) => {
-                                                // Re-open with FrankenStorage to load refreshed data
-                                                match crate::storage::sqlite::FrankenStorage::open_readonly(&db_path) {
-                                                    Ok(db_refreshed) => {
-                                                        let mut refreshed =
-                                                            super::analytics_charts::load_chart_data(
-                                                                &db_refreshed, &filters, group_by,
-                                                            );
-                                                        refreshed.auto_rebuilt = true;
-                                                        data = refreshed;
-                                                    }
-                                                    Err(err) => {
-                                                        data.auto_rebuild_error = Some(format!(
-                                                            "failed re-opening analytics DB after rebuild: {err}"
-                                                        ));
-                                                    }
-                                                }
-                                            }
-                                            Err(err) => {
-                                                data.auto_rebuild_error = Some(format!(
-                                                    "analytics rebuild failed: {err}"
-                                                ));
-                                            }
-                                        },
+                                    // GH #395: never rebuild rollups inside the TUI
+                                    // process. On a multi-million-message archive
+                                    // `rebuild_analytics` is a multi-GB, multi-minute
+                                    // allocation storm on the effects thread, which
+                                    // froze the whole UI. Hand it to a detached
+                                    // `cass analytics rebuild` child and let the
+                                    // dashboard reload on its next visit.
+                                    tracing::info!(
+                                        "analytics rollups missing; spawning detached rebuild"
+                                    );
+                                    match crate::indexer::background_refresh::spawn_detached_analytics_rebuild(
+                                        &data_dir, &db_path,
+                                    ) {
+                                        Ok(pid) => data.auto_rebuild_spawned_pid = Some(pid),
                                         Err(err) => {
-                                            data.auto_rebuild_error =
-                                                Some(format!("failed opening analytics DB: {err}"));
+                                            data.auto_rebuild_error = Some(format!(
+                                                "could not start background analytics rebuild: {err}"
+                                            ));
                                         }
                                     }
                                 }
@@ -20470,6 +20459,10 @@ impl super::ftui_adapter::Model for CassApp {
             CassMsg::AnalyticsChartDataLoaded(data) => {
                 if data.auto_rebuilt {
                     self.status = "Analytics data rebuilt automatically.".to_string();
+                } else if let Some(pid) = data.auto_rebuild_spawned_pid {
+                    self.status = format!(
+                        "Analytics rollups are being rebuilt in the background (pid {pid}); reopen the dashboard in a few minutes."
+                    );
                 } else if let Some(err) = data.auto_rebuild_error.as_deref() {
                     self.status = format!("Automatic analytics rebuild failed: {err}");
                 }
@@ -23387,16 +23380,23 @@ pub fn run_tui_ftui(
             Ok(Some(client)) => {
                 use crate::search::embedder_registry::{EmbedderRegistry, HASH_EMBEDDER};
                 use crate::search::model_manager::{
-                    load_hash_semantic_context, load_semantic_context,
+                    load_hash_semantic_context, load_semantic_context_deferred,
                 };
 
                 let client = Arc::new(client);
                 let prefer_hash =
                     EmbedderRegistry::new(&data_dir).best_available().name == HASH_EMBEDDER;
+                // GH #395: this runs on the main thread BEFORE the first frame.
+                // The deferred loader resolves the model's identity and
+                // artifacts now but initializes the in-process MiniLM lazily
+                // on the first semantic query (which the TUI already runs on a
+                // background task), so a large model or slow disk can never
+                // hold the UI at a blank screen. The CLI's daemon-first path
+                // uses the same lazy embedder.
                 let setup = if prefer_hash {
                     load_hash_semantic_context(&data_dir, &model.db_path)
                 } else {
-                    load_semantic_context(&data_dir, &model.db_path)
+                    load_semantic_context_deferred(&data_dir, &model.db_path)
                 };
                 model.semantic_availability = setup.availability.clone();
 

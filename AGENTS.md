@@ -240,7 +240,7 @@ If you see errors, **carefully understand and resolve each issue**. Read suffici
 
 ### UBS Pre-Merge Gate
 
-Per `coding_agent_session_search-dpfvr`, every PR runs `ubs --ci --fail-on-warning` against the changed files in CI (`.github/workflows/ci.yml::ubs-changed-files`). The gate is **blocking** — warnings stop merges.
+Per `coding_agent_session_search-dpfvr`, every PR is meant to run `ubs --ci --fail-on-warning` against the changed files in CI (`.github/workflows/ci.yml::ubs-changed-files`). The gate is **blocking** — warnings stop merges. **Current state:** every workflow defined in `.github/workflows/` is disabled (`gh workflow list --all` shows `disabled_manually` for all of them, including `CI`; only GitHub's own Copilot workflows are active), so until CI is re-enabled this gate — like fmt/clippy/tests — is agent-run through `rch` before pushing.
 
 **Local pre-flight before pushing:**
 
@@ -256,7 +256,7 @@ ubs $(git diff --name-only --cached)
 
 If a known-acceptable warning needs to ship despite the gate, suppress at the UBS config level (`tests/policies/no_mock_allowlist.json` or per-file inline pragma) — never bypass by removing the gate.
 
-The pinned UBS version lives in `.github/workflows/ubs-version.txt`; the CI installer reads that file. Local installs should match.
+The pinned UBS version lives in `.github/workflows/ubs-version.txt`; the CI installer reads that file when the workflow is enabled. Local installs should match.
 
 ---
 
@@ -427,6 +427,7 @@ Provides unified full-text and semantic search across all local coding agent ses
 - **Semantic enrichment is opportunistic.** Lexical-only behavior is expected during first indexing, semantic backfill, disabled semantic policy, missing model files, or vector catch-up.
 - **Semantic model acquisition is opt-in.** `cass models install` downloads the MiniLM model (~90 MB) on explicit operator request. cass never auto-downloads. Air-gapped installs use `--from-file <dir>`. While the model is absent, `fallback_mode="lexical"` is reported in health/status and queries silently degrade to lexical-only.
 - **Truth surfaces:** `cass health --json`, `cass status --json`, and search `--robot-meta` expose readiness, active rebuilds, realized search mode, fallback tier, and recommended action. Follow those fields instead of hard-coded manual repair rituals.
+- **Lexical query fuel is bounded.** cass opens Quill with a 100,000,000-unit query-fuel budget (`CASS_QUILL_QUERY_FUEL_BUDGET`); if a hybrid search exhausts it, the lexical leg is dropped rather than failing the search and `_meta.lexical_degrade_reason` reports `query_fuel_exhausted`. `CASS_QUILL_TIER_FANOUT` and `CASS_QUILL_MERGE_MAX_HOLE_RATIO` override Quill's concat-merge fan-out and hole-ratio tolerance (`src/search/quill_bridge.rs::cass_quill_config`).
 
 ### Keeping the Index Fresh (do not hand-roll cron for this)
 
@@ -548,7 +549,7 @@ cass expand /path/to/session.jsonl -n 42 -C 3 --json
 
 # Export session as self-contained HTML
 cass export-html /path/to/session.jsonl --json
-cass export-html session.jsonl --encrypt --password "secret" --json
+printf '%s\n' "secret" | cass export-html session.jsonl --encrypt --password-stdin --json
 
 # Learn the full API
 cass capabilities --json      # Feature discovery
@@ -583,6 +584,8 @@ cass robot-docs guide         # LLM-optimized docs
 | OpenHands | `openhands.rs` | JSON event stream |
 | Antigravity | `antigravity.rs` | JSONL / SQLite |
 | Grok Build | `grok.rs` | ACP updates JSONL |
+| Goose | `goose.rs` | SQLite (`sessions.db`, v1.20+) / legacy per-session JSONL |
+| Muse Code | `muse.rs` | JSONL |
 
 ### HTML Export (Robot Mode)
 
@@ -592,11 +595,8 @@ Export conversations as self-contained HTML files with optional encryption:
 # Basic export (outputs to Downloads folder)
 cass export-html /path/to/session.jsonl --json
 
-# With encryption
-cass export-html session.jsonl --encrypt --password "secret" --json
-
-# Password from stdin (secure)
-echo "secret" | cass export-html session.jsonl --encrypt --password-stdin --json
+# With encryption (there is no --password argv flag; it is rejected on purpose)
+printf '%s\n' "secret" | cass export-html session.jsonl --encrypt --password-stdin --json
 
 # Custom output
 cass export-html session.jsonl --output-dir /tmp --filename "export" --json
@@ -606,10 +606,17 @@ cass export-html session.jsonl --output-dir /tmp --filename "export" --json
 ```json
 {
   "success": true,
-  "output_path": "/home/user/Downloads/claude_2026-01-25_session.html",
-  "file_size": 145623,
-  "encrypted": false,
-  "message_count": 42
+  "exported": {
+    "session_path": "/path/to/session.jsonl",
+    "output_path": "/home/user/Downloads/claude_2026-01-25_session.html",
+    "filename": "claude_2026-01-25_session.html",
+    "size_bytes": 145623,
+    "encrypted": false,
+    "messages_count": 42,
+    "agent": "claude_code",
+    "workspace": "/projects/myapp",
+    "title": "..."
+  }
 }
 ```
 
@@ -620,6 +627,7 @@ cass export-html session.jsonl --output-dir /tmp --filename "export" --json
 | 4 | output_not_writable | Cannot write to output directory |
 | 5 | encryption_error | Encryption failed |
 | 6 | password_required | --encrypt used without password |
+| 9 | opencode-parse / opencode-sqlite-parse / indexed-session-required / empty-session | Session could not be parsed, is not an indexed conversation or JSONL/OpenCode session, or has no messages |
 
 ### Key Flags
 
@@ -649,6 +657,8 @@ cass export-html session.jsonl --output-dir /tmp --filename "export" --json
 | `find "query"` | `search "query"` | `find` is an alias |
 | `--robot-docs` | `robot-docs` | It's a subcommand |
 
+Every applied correction is reported on stderr; in robot/JSON mode it is one `note: auto-corrected: <note>` line per correction, so stdout stays data-only.
+
 **Full alias list:**
 - **Search:** `find`, `query`, `q`, `lookup`, `grep` -> `search`
 - **Stats:** `ls`, `list`, `info`, `summary` -> `stats`
@@ -663,7 +673,7 @@ cass export-html session.jsonl --output-dir /tmp --filename "export" --json
 cass health --json
 ```
 
-Returns in <50ms:
+Returns in <50ms on a healthy archive (the archive probe is the same strict, mutation-free owner-thread probe as `status`, bounded by a 30 s hard deadline; it never checkpoints a dirty WAL):
 - **Exit 0:** Healthy — proceed with queries
 - **Exit 1:** Not ready — inspect `status`, `rebuild`, `semantic`, and `recommended_action`. Fresh installs usually need `cass index --full`; active rebuilds usually need bounded waiting; semantic-only gaps usually mean lexical fallback is expected.
 
@@ -679,7 +689,7 @@ Returns in <50ms:
 | 5 | Data corruption | Yes — inspect health/status, then rebuild derived assets if recommended |
 | 6 | Incompatible version | No — update cass |
 | 7 | Lock/busy | Yes — retry later |
-| 8 | Partial result | Yes — increase timeout |
+| 8 | Partial result (`sources sync` only: some sources had path failures) | Yes — inspect per-path errors, retry failed sources |
 | 9 | Unknown error | Maybe |
 | 10 | Config / timeout (domain-specific) | Depends on `err.kind` |
 | 11 | Config validation | No — fix config |
@@ -691,6 +701,8 @@ Returns in <50ms:
 | 22 | I/O during model handling | Maybe |
 | 23 | Download failure | Yes — retry or use `--from-file` |
 | 24 | I/O during model verify/install | Maybe |
+
+Search/pack timeouts are not exit 8: on expiry `search` and `pack` exit 0 with `{"hits": [], "budget": {"timed_out": true, "skipped_sections": [...], "retry": "<command>", ...}}`; `--robot-format sessions` instead fails with exit 10, kind `timeout`.
 
 **Codes ≥ 10 are domain-specific.** The numeric code alone is ambiguous (e.g. code 10 covers both `config` and `timeout` kinds). Agents should branch on `err.kind` from the JSON error envelope, not on the numeric code, when handling codes ≥ 10. Kind names are kebab-case (examples: `missing-index`, `missing-db`, `semantic-unavailable`, `embedder-unavailable`, `ambiguous-source`, `timeout`, `config`, `lock-busy`, `network`, `model`, `download`, `io`). The full set (~50 kinds) lives in `src/lib.rs`.
 
@@ -1030,7 +1042,7 @@ rch status                    # Overview of current state
 rch queue                     # See active/waiting builds
 ```
 
-If rch or its workers are unavailable, it fails open — builds run locally as normal.
+If rch or its workers are unavailable, it fails open — builds run locally as normal. For proof runs use `RCH_REQUIRE_REMOTE=1 rch exec -- ...`: it fails closed and refuses local fallback (refusal `RCH-I012`, non-zero exit) when the fleet is pressure-blocked or has no admissible worker — that is not a build failure, so retry once `rch status` shows an admissible worker.
 
 **Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
 
