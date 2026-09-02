@@ -1209,11 +1209,21 @@ mod tests {
         assert_eq!(index.doc_count().expect("doc count"), sessions * 2);
 
         // A reader opened on the merged generation still finds every session.
+        // The CASS-schema reader is preparsed-only, so go through the CASS
+        // parser exactly as the search layer does.
         let reader = index.reader().expect("reader");
-        let hits = reader
-            .search_results(&Cx::for_request(), "alpha", 100)
+        let parser = frankensearch::quill::query::CassQueryParser::new(CASS_SEMANTIC_SCHEMA)
+            .expect("CASS query parser");
+        let parsed = parser.parse(
+            "alpha",
+            &frankensearch::quill::query::CassQueryFilters::default(),
+        );
+        let page = search_paginated(&reader, &parsed.query, 100, 0, false)
             .expect("search merged generation");
-        assert_eq!(hits.len(), usize::try_from(sessions).expect("small count"));
+        assert_eq!(
+            page.hits.len(),
+            usize::try_from(sessions).expect("small count")
+        );
 
         // Converged: another pass inside the cooldown is a no-op.
         assert!(!index.optimize_if_idle(1_700_000_000_001).expect("optimize"));
