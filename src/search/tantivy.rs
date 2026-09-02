@@ -1531,6 +1531,16 @@ impl TantivyIndex {
         self.inner.commit()
     }
 
+    /// GH #446: route the stall watchdog's liveness signal into the Quill
+    /// sink so accumulate / commit / merge work ticks `activity` — see
+    /// `quill_bridge::EngineLivenessProbe`.
+    pub fn set_heartbeat(
+        &mut self,
+        heartbeat: Option<crate::search::quill_bridge::EngineHeartbeat>,
+    ) {
+        self.inner.set_heartbeat(heartbeat);
+    }
+
     pub fn configure_bulk_load_merge_policy(&mut self) {
         self.inner.configure_bulk_load_merge_policy();
     }

@@ -2213,6 +2213,36 @@ fn producer_state_transition_is_work(previous: &str, current: &str) -> bool {
 /// generation, and waiting↔waiting park flaps are deliberately excluded:
 /// they keep changing while the pipeline is genuinely wedged and must not
 /// defeat the stall watchdog.
+/// GH #446: the stall watchdog's liveness signal, shaped for the Quill sink
+/// (`quill_bridge::EngineLivenessProbe`). `None` when the run has no progress
+/// tracker, in which case the sink stays silent as before.
+fn lexical_index_heartbeat(
+    progress: Option<&Arc<IndexingProgress>>,
+) -> Option<crate::search::quill_bridge::EngineHeartbeat> {
+    progress.map(|progress| {
+        let progress = Arc::clone(progress);
+        Arc::new(move || progress.tick_activity()) as crate::search::quill_bridge::EngineHeartbeat
+    })
+}
+
+fn install_lexical_index_heartbeat(
+    t_index: &mut TantivyIndex,
+    progress: Option<&Arc<IndexingProgress>>,
+) {
+    t_index.set_heartbeat(lexical_index_heartbeat(progress));
+}
+
+/// Open the live lexical index with the stall watchdog's liveness signal
+/// already routed into its sink (GH #446).
+fn open_lexical_index_with_heartbeat(
+    index_path: &Path,
+    progress: Option<&Arc<IndexingProgress>>,
+) -> Result<TantivyIndex> {
+    let mut t_index = TantivyIndex::open_or_create(index_path)?;
+    install_lexical_index_heartbeat(&mut t_index, progress);
+    Ok(t_index)
+}
+
 fn lexical_rebuild_pipeline_work_advanced(
     previous: &LexicalRebuildPipelineRuntimeSnapshot,
     current: &LexicalRebuildPipelineRuntimeSnapshot,
@@ -4882,6 +4912,7 @@ fn build_lexical_rebuild_shard_index(
             batch,
             lexical_rebuild_worker_pool,
             None,
+            None,
         )?
         .docs,
     )
@@ -4892,6 +4923,7 @@ fn build_lexical_rebuild_shard_index_summary_with_writer_parallelism(
     batch: &[LexicalRebuildConversationPacket],
     lexical_rebuild_worker_pool: Option<&ThreadPool>,
     writer_parallelism: Option<usize>,
+    heartbeat: Option<crate::search::quill_bridge::EngineHeartbeat>,
 ) -> Result<SearchableIndexSummary> {
     let mut shard_index = if let Some(writer_parallelism) = writer_parallelism {
         TantivyIndex::open_or_create_with_writer_parallelism(shard_index_path, writer_parallelism)
@@ -4904,6 +4936,9 @@ fn build_lexical_rebuild_shard_index_summary_with_writer_parallelism(
             shard_index_path.display()
         )
     })?;
+    // GH #446: a single giant shard build is minutes of silent Quill work
+    // between the pipeline counter changes the watchdog can see.
+    shard_index.set_heartbeat(heartbeat);
     shard_index.configure_bulk_load_merge_policy();
     let prepared_docs =
         lexical_rebuild_prepare_prebuilt_doc_refs(batch, lexical_rebuild_worker_pool);
@@ -5074,6 +5109,7 @@ fn spawn_lexical_rebuild_shard_builder_workers(
     tx: Sender<LexicalRebuildShardBuildMessage>,
     flow_limiter: Arc<StreamingByteLimiter>,
     lexical_rebuild_worker_pool: Option<Arc<ThreadPool>>,
+    heartbeat: Option<crate::search::quill_bridge::EngineHeartbeat>,
 ) -> Vec<JoinHandle<()>> {
     let tracing_dispatch = tracing::dispatcher::get_default(|dispatch| dispatch.clone());
     (0..worker_count.max(1))
@@ -5082,6 +5118,7 @@ fn spawn_lexical_rebuild_shard_builder_workers(
             let tx = tx.clone();
             let flow_limiter = Arc::clone(&flow_limiter);
             let lexical_rebuild_worker_pool = lexical_rebuild_worker_pool.clone();
+            let heartbeat = heartbeat.clone();
             let tracing_dispatch = tracing_dispatch.clone();
             thread::spawn(move || {
                 tracing::dispatcher::with_default(&tracing_dispatch, || {
@@ -5111,6 +5148,7 @@ fn spawn_lexical_rebuild_shard_builder_workers(
                                     &work.packets,
                                     lexical_rebuild_worker_pool.as_deref(),
                                     Some(work.writer_parallelism),
+                                    heartbeat.clone(),
                                 )
                             },
                         )) {
@@ -7568,13 +7606,18 @@ struct LexicalRebuildResponsivenessController {
     reason: String,
     clear_samples: usize,
     last_transition_at: Instant,
+    /// GH #445: pressure demotions in this run. Each one doubles the restore
+    /// hold (capped) so a host with no load telemetry, where saturation alone
+    /// can demote, cannot flap between budgets every few seconds.
+    pressure_demotions: u32,
     last_observed_producer_budget_wait_count: usize,
     last_observed_producer_handoff_wait_count: usize,
 }
 
 impl LexicalRebuildResponsivenessController {
     const INFLIGHT_HIGH_WATERMARK_PERCENT: usize = 90;
-    const INFLIGHT_LOW_WATERMARK_PERCENT: usize = 50;
+    /// Upper bound on the restore-hold doubling (2^3 = 8x the base hold).
+    const MAX_RESTORE_HOLD_DOUBLINGS: u32 = 3;
 
     fn new(
         policy: LexicalRebuildResponsivenessPolicy,
@@ -7620,6 +7663,7 @@ impl LexicalRebuildResponsivenessController {
             reason,
             clear_samples: 0,
             last_transition_at: Instant::now(),
+            pressure_demotions: 0,
             last_observed_producer_budget_wait_count: 0,
             last_observed_producer_handoff_wait_count: 0,
         }
@@ -7703,6 +7747,7 @@ impl LexicalRebuildResponsivenessController {
                 let old_budget = self.current_budget();
                 self.state = LexicalRebuildResponsivenessState::PressureLimited;
                 self.last_transition_at = Instant::now();
+                self.pressure_demotions = self.pressure_demotions.saturating_add(1);
                 let new_budget = self.current_budget();
                 if old_budget != new_budget {
                     return Some(LexicalRebuildBudgetTransition {
@@ -7718,16 +7763,27 @@ impl LexicalRebuildResponsivenessController {
 
         if self.state == LexicalRebuildResponsivenessState::PressureLimited {
             let held_for = self.last_transition_at.elapsed();
-            if held_for < self.restore_hold {
+            let restore_hold = self.restore_hold_after_demotions();
+            if held_for < restore_hold {
                 self.reason = format!(
                     "holding_conservative_budget_after_pressure_demote_for_{}ms",
-                    self.restore_hold.as_millis()
+                    restore_hold.as_millis()
                 );
                 self.clear_samples = 0;
                 return None;
             }
 
-            if self.runtime_is_clear(runtime) {
+            // GH #445: restore judges host pressure, not pipeline emptiness.
+            // The previous gate demanded a fully drained pipeline (no queued
+            // pages, no pending batch, inflight <= 50% of cap) for three
+            // consecutive samples — unreachable while a producer exists to
+            // keep the pipeline full — so one transient demotion pinned the
+            // whole rebuild to the startup budget (66 min in steady mode vs.
+            // crawl/wedge under auto on a 2.4M-doc archive).
+            if let Some(reason) = self.host_pressure_not_clear_reason(runtime) {
+                self.clear_samples = 0;
+                self.reason = reason;
+            } else {
                 self.clear_samples = self.clear_samples.saturating_add(1);
                 if self.clear_samples >= self.restore_clear_samples {
                     let old_budget = self.current_budget();
@@ -7753,15 +7809,27 @@ impl LexicalRebuildResponsivenessController {
                         self.clear_samples, self.restore_clear_samples
                     );
                 }
-            } else {
-                self.clear_samples = 0;
-                self.reason = "pressure_signals_not_yet_clear".to_string();
             }
         } else {
             self.reason = "steady_budget_with_headroom".to_string();
         }
 
         None
+    }
+
+    /// GH #445: the restore hold doubles with every pressure demotion in this
+    /// run (capped at 2^[`Self::MAX_RESTORE_HOLD_DOUBLINGS`]). On hosts without
+    /// load telemetry a saturated pipeline alone can demote, and it saturates
+    /// again as soon as the steady budget returns; the growing hold bounds
+    /// that demote/restore churn without ever pinning the demoted budget.
+    fn restore_hold_after_demotions(&self) -> Duration {
+        let doublings = self
+            .pressure_demotions
+            .saturating_sub(1)
+            .min(Self::MAX_RESTORE_HOLD_DOUBLINGS);
+        self.restore_hold
+            .checked_mul(1u32 << doublings)
+            .unwrap_or(Duration::MAX)
     }
 
     fn observe_new_producer_budget_wait(&mut self, observed_count: usize) -> bool {
@@ -7805,7 +7873,28 @@ impl LexicalRebuildResponsivenessController {
         runtime: &LexicalRebuildPipelineRuntimeSnapshot,
         new_producer_handoff_wait: bool,
     ) -> Option<String> {
-        let current_budget = self.current_budget();
+        if let Some(reason) = self.detect_host_pressure(runtime) {
+            return Some(reason);
+        }
+        // GH #445: queue depth at capacity, inflight bytes near the cap, a
+        // full pending batch, an ordered-barrier backlog, or a producer
+        // handoff wait are the pipeline's bounded backpressure doing its job
+        // — the healthy steady run on the reporting archive sat at 93% of
+        // the inflight cap for an hour. They only mean the HOST is in trouble
+        // when host telemetry says so (or is unavailable, in which case the
+        // pipeline shape is the only signal we have and the old behaviour
+        // stands). Demoting on saturation alone starved the producer while
+        // Quill's accumulation kept growing RSS regardless.
+        if self.host_is_demonstrably_calm(runtime) {
+            return None;
+        }
+        self.detect_pipeline_saturation(runtime, new_producer_handoff_wait)
+    }
+
+    fn detect_host_pressure(
+        &self,
+        runtime: &LexicalRebuildPipelineRuntimeSnapshot,
+    ) -> Option<String> {
         if let (Some(loadavg_1m_milli), Some(high_watermark_1m_milli)) = (
             runtime.host_loadavg_1m_milli,
             self.loadavg_high_watermark_1m_milli,
@@ -7832,6 +7921,71 @@ impl LexicalRebuildResponsivenessController {
                 ));
             }
         }
+        None
+    }
+
+    /// True only when host telemetry positively shows a calm machine: a
+    /// loadavg reading at or below the low watermark AND (when known)
+    /// available memory above the reserve. Missing loadavg telemetry (no
+    /// reading, or no watermark on this platform) is NOT calm — it is
+    /// unknown, and pipeline saturation keeps its say.
+    fn host_is_demonstrably_calm(&self, runtime: &LexicalRebuildPipelineRuntimeSnapshot) -> bool {
+        let loadavg_calm = match (
+            runtime.host_loadavg_1m_milli,
+            self.loadavg_low_watermark_1m_milli,
+        ) {
+            (Some(loadavg_1m_milli), Some(low_watermark_1m_milli)) => {
+                loadavg_1m_milli <= low_watermark_1m_milli
+            }
+            _ => false,
+        };
+        loadavg_calm && self.memory_is_clear(runtime)
+    }
+
+    fn memory_is_clear(&self, runtime: &LexicalRebuildPipelineRuntimeSnapshot) -> bool {
+        runtime
+            .host_available_memory_bytes
+            .is_none_or(|available_memory_bytes| {
+                usize_from_u64_saturating(available_memory_bytes) > self.memory_reserve_bytes
+            })
+    }
+
+    /// Why a demoted budget cannot be restored yet, or `None` when the host
+    /// signals that can demote have cleared (loadavg at or below the low
+    /// watermark — hysteresis against the high-watermark demote — and memory
+    /// above the reserve). Pipeline occupancy is deliberately not consulted:
+    /// a rebuild with a live producer never drains mid-run.
+    fn host_pressure_not_clear_reason(
+        &self,
+        runtime: &LexicalRebuildPipelineRuntimeSnapshot,
+    ) -> Option<String> {
+        if let (Some(loadavg_1m_milli), Some(low_watermark_1m_milli)) = (
+            runtime.host_loadavg_1m_milli,
+            self.loadavg_low_watermark_1m_milli,
+        ) && loadavg_1m_milli > low_watermark_1m_milli
+        {
+            return Some(format!(
+                "host_loadavg_1m_{}_above_low_watermark_{}",
+                format_lexical_rebuild_loadavg_1m_milli(loadavg_1m_milli),
+                format_lexical_rebuild_loadavg_1m_milli(low_watermark_1m_milli)
+            ));
+        }
+        if !self.memory_is_clear(runtime) {
+            return Some(format!(
+                "host_available_memory_bytes_{}_at_or_below_reserve_{}",
+                runtime.host_available_memory_bytes.unwrap_or_default(),
+                self.memory_reserve_bytes
+            ));
+        }
+        None
+    }
+
+    fn detect_pipeline_saturation(
+        &self,
+        runtime: &LexicalRebuildPipelineRuntimeSnapshot,
+        new_producer_handoff_wait: bool,
+    ) -> Option<String> {
+        let current_budget = self.current_budget();
         if new_producer_handoff_wait {
             return Some(format!(
                 "producer_handoff_wait_count_{}_observed_consumer_backpressure",
@@ -7874,37 +8028,6 @@ impl LexicalRebuildResponsivenessController {
             ));
         }
         None
-    }
-
-    fn runtime_is_clear(&self, runtime: &LexicalRebuildPipelineRuntimeSnapshot) -> bool {
-        let current_budget = self.current_budget();
-        let loadavg_is_clear = match (
-            runtime.host_loadavg_1m_milli,
-            self.loadavg_low_watermark_1m_milli,
-        ) {
-            (_, None) => true,
-            (Some(loadavg_1m_milli), Some(low_watermark_1m_milli)) => {
-                loadavg_1m_milli <= low_watermark_1m_milli
-            }
-            (None, Some(_)) => true,
-        };
-        let memory_is_clear = runtime
-            .host_available_memory_bytes
-            .map(|available_memory_bytes| {
-                usize_from_u64_saturating(available_memory_bytes) > self.memory_reserve_bytes
-            })
-            .unwrap_or(true);
-        runtime.queue_depth == 0
-            && runtime.ordered_buffered_pages == 0
-            && runtime.pending_batch_conversations == 0
-            && runtime.pending_batch_message_bytes == 0
-            && current_budget.max_message_bytes_in_flight > 0
-            && runtime.inflight_message_bytes.saturating_mul(100)
-                <= current_budget
-                    .max_message_bytes_in_flight
-                    .saturating_mul(Self::INFLIGHT_LOW_WATERMARK_PERCENT)
-            && loadavg_is_clear
-            && memory_is_clear
     }
 }
 
@@ -15201,7 +15324,10 @@ fn run_index_inner(
             );
         }
         if keep_tantivy_open_after_rebuild {
-            Some(TantivyIndex::open_or_create(&index_path)?)
+            Some(open_lexical_index_with_heartbeat(
+                &index_path,
+                opts.progress.as_ref(),
+            )?)
         } else {
             None
         }
@@ -15491,7 +15617,10 @@ fn run_index_inner(
                 );
             }
             if keep_tantivy_open_after_rebuild {
-                t_index = Some(TantivyIndex::open_or_create(&index_path)?);
+                t_index = Some(open_lexical_index_with_heartbeat(
+                    &index_path,
+                    opts.progress.as_ref(),
+                )?);
             }
         } else {
             let followup_scan_after_authoritative_repair =
@@ -15542,7 +15671,10 @@ fn run_index_inner(
                         observed_messages,
                     );
                 }
-                t_index = Some(TantivyIndex::open_or_create(&index_path)?);
+                t_index = Some(open_lexical_index_with_heartbeat(
+                    &index_path,
+                    opts.progress.as_ref(),
+                )?);
                 needs_rebuild = false;
             }
 
@@ -15678,7 +15810,10 @@ fn run_index_inner(
 
                 // Choose between streaming indexing (Opt 8.2) and batch indexing
                 if scan_requires_tantivy && t_index.is_none() {
-                    t_index = Some(TantivyIndex::open_or_create(&index_path)?);
+                    t_index = Some(open_lexical_index_with_heartbeat(
+                        &index_path,
+                        opts.progress.as_ref(),
+                    )?);
                 } else if !scan_requires_tantivy {
                     tracing::info!(
                         strategy = lexical_strategy.as_str(),
@@ -15784,7 +15919,10 @@ fn run_index_inner(
                         );
                     }
                     if keep_tantivy_open_after_rebuild {
-                        t_index = Some(TantivyIndex::open_or_create(&index_path)?);
+                        t_index = Some(open_lexical_index_with_heartbeat(
+                            &index_path,
+                            opts.progress.as_ref(),
+                        )?);
                     }
                 } else if scan_requires_tantivy {
                     let t_index = t_index
@@ -15898,7 +16036,10 @@ fn run_index_inner(
                             );
                         }
                         if keep_tantivy_open_after_rebuild {
-                            t_index = Some(TantivyIndex::open_or_create(&index_path)?);
+                            t_index = Some(open_lexical_index_with_heartbeat(
+                                &index_path,
+                                opts.progress.as_ref(),
+                            )?);
                         }
                     }
                 }
@@ -16718,12 +16859,13 @@ fn run_index_inner(
         let t_index = Mutex::new(if should_preopen_tantivy_for_watch {
             Some(match t_index {
                 Some(t_index) => t_index,
-                None => TantivyIndex::open_or_create(&index_path).with_context(|| {
-                    format!(
-                        "opening Tantivy index before entering watch mode for {}",
-                        index_path.display()
-                    )
-                })?,
+                None => open_lexical_index_with_heartbeat(&index_path, opts.progress.as_ref())
+                    .with_context(|| {
+                        format!(
+                            "opening Tantivy index before entering watch mode for {}",
+                            index_path.display()
+                        )
+                    })?,
             })
         } else {
             t_index
@@ -21542,6 +21684,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
         shard_result_tx,
         Arc::clone(&lexical_rebuild_flow_limiter),
         lexical_rebuild_worker_pool.clone(),
+        lexical_index_heartbeat(progress.as_ref()),
     );
     let shard_work_dispatch_tx = shard_work_tx.clone();
     let (merge_work_tx, merge_work_rx) =
@@ -23089,6 +23232,10 @@ fn rebuild_tantivy_from_db_with_options(
         };
         log_prep_step("open_tantivy", &mut prep_step_started);
 
+        // GH #446: the sink side of the pipeline (accumulate / commit /
+        // merge) is where a large rebuild spends its longest silent
+        // stretches; let that work tick the watchdog's `activity` signal.
+        install_lexical_index_heartbeat(&mut t_index, progress.as_ref());
         t_index.configure_bulk_load_merge_policy();
 
         // Keep the persisted checkpoint aligned with the in-memory active-run
@@ -40436,6 +40583,237 @@ mod tests {
         assert_eq!(controller.current_budget(), steady_budget);
     }
 
+    /// GH #445 fixtures: a 24-core Linux host (high watermark 22.0, low 21.0)
+    /// with plenty of memory, in steady mode, hold/samples pinned directly so
+    /// no env var is touched.
+    fn gh445_controller() -> (
+        LexicalRebuildResponsivenessController,
+        LexicalRebuildPipelineBudgetSnapshot,
+        LexicalRebuildPipelineBudgetSnapshot,
+    ) {
+        let startup_budget =
+            LexicalRebuildPipelineBudgetSnapshot::new(32, 64, 1024, 640 << 20, 2_048, 128, 4_096);
+        let steady_budget = LexicalRebuildPipelineBudgetSnapshot::new(
+            256,
+            512,
+            4096,
+            2_357_809_664,
+            10_000,
+            8_192,
+            65_536,
+        );
+        let mut controller = LexicalRebuildResponsivenessController::new(
+            LexicalRebuildResponsivenessPolicy::Auto,
+            startup_budget,
+            steady_budget,
+            8,
+            false,
+            Some(22_000),
+            Some(21_000),
+        );
+        controller.restore_clear_samples = 3;
+        controller.restore_hold = Duration::from_millis(1);
+        controller.memory_reserve_bytes = 11 << 30;
+        controller.emergency_memory_reserve_bytes = 4 << 30;
+        (controller, startup_budget, steady_budget)
+    }
+
+    /// The reporter's mid-rebuild shape: pending batch, bytes in flight at
+    /// ~82% of the cap, a routine loadavg of 12.72 on 24 cores, 51 GB free.
+    fn gh445_busy_runtime(loadavg_1m_milli: u32) -> LexicalRebuildPipelineRuntimeSnapshot {
+        LexicalRebuildPipelineRuntimeSnapshot {
+            queue_depth: 0,
+            inflight_message_bytes: 524_666_240,
+            max_message_bytes_in_flight: 640 << 20,
+            pending_batch_conversations: 15,
+            pending_batch_message_bytes: 104_771_393,
+            producer_budget_wait_count: 355,
+            producer_budget_waiter_count: 1,
+            host_loadavg_1m_milli: Some(loadavg_1m_milli),
+            host_available_memory_bytes: Some(51_625_844_736),
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn gh445_controller_restores_mid_rebuild_with_in_flight_work_once_host_is_calm() {
+        let (mut controller, startup_budget, steady_budget) = gh445_controller();
+        assert_eq!(controller.mode(), "steady");
+
+        // A genuine host trigger demotes: loadavg over the high watermark.
+        let overloaded = LexicalRebuildPipelineRuntimeSnapshot {
+            host_loadavg_1m_milli: Some(25_000),
+            ..gh445_busy_runtime(25_000)
+        };
+        let transition = controller
+            .observe_runtime(&overloaded)
+            .expect("host loadavg over the high watermark must demote");
+        assert_eq!(transition.mode, "pressure_limited");
+        assert!(
+            transition
+                .reason
+                .starts_with("host_loadavg_1m_25.000_reached_high_watermark")
+        );
+        assert_eq!(controller.current_budget(), startup_budget);
+
+        // Load drops to routine levels while the pipeline is still full of
+        // work. The old gate needed an EMPTY pipeline (queue, pending batch,
+        // inflight <= 50%) for three samples — never true mid-rebuild — and
+        // pinned the run to the startup budget for good.
+        controller.last_transition_at = Instant::now() - Duration::from_secs(1);
+        let busy = gh445_busy_runtime(12_720);
+        assert!(controller.observe_runtime(&busy).is_none());
+        assert_eq!(controller.reason(), "awaiting_clear_pressure_window_1/3");
+        assert!(controller.observe_runtime(&busy).is_none());
+        assert_eq!(controller.reason(), "awaiting_clear_pressure_window_2/3");
+        let restore = controller
+            .observe_runtime(&busy)
+            .expect("three calm host samples must restore the steady budget mid-rebuild");
+        assert_eq!(restore.old_budget, startup_budget);
+        assert_eq!(restore.new_budget, steady_budget);
+        assert_eq!(restore.mode, "steady");
+        assert_eq!(
+            restore.reason,
+            "restored_steady_budget_after_3_clear_samples"
+        );
+        assert_eq!(controller.current_budget(), steady_budget);
+    }
+
+    #[test]
+    fn gh445_inflight_near_cap_is_backpressure_not_pressure_when_host_is_calm() {
+        let (mut controller, _, steady_budget) = gh445_controller();
+        // The healthy steady run on the reporting archive sat at 93% of the
+        // inflight cap with loadavg ~12 on 24 cores. That must not demote.
+        let saturated = LexicalRebuildPipelineRuntimeSnapshot {
+            inflight_message_bytes: 2_196_486_820,
+            max_message_bytes_in_flight: steady_budget.max_message_bytes_in_flight,
+            pending_batch_conversations: 63,
+            queue_depth: 8,
+            ordered_buffered_pages: 2,
+            producer_handoff_wait_count: 1,
+            ..gh445_busy_runtime(12_720)
+        };
+        assert!(controller.observe_runtime(&saturated).is_none());
+        assert_eq!(controller.mode(), "steady");
+        assert_eq!(controller.reason(), "steady_budget_with_headroom");
+        assert_eq!(controller.current_budget(), steady_budget);
+    }
+
+    #[test]
+    fn gh445_saturation_still_demotes_when_loadavg_is_above_the_low_watermark() {
+        let (mut controller, startup_budget, steady_budget) = gh445_controller();
+        // Between the low (21.0) and high (22.0) watermarks the host is not
+        // demonstrably calm, so a saturated pipeline keeps its say.
+        let saturated_under_load = LexicalRebuildPipelineRuntimeSnapshot {
+            inflight_message_bytes: 2_196_486_820,
+            max_message_bytes_in_flight: steady_budget.max_message_bytes_in_flight,
+            ..gh445_busy_runtime(21_500)
+        };
+        let transition = controller
+            .observe_runtime(&saturated_under_load)
+            .expect("inflight near the cap under load must demote");
+        assert!(
+            transition
+                .reason
+                .starts_with("inflight_message_bytes_2196486820_near_limit_")
+        );
+        assert_eq!(controller.current_budget(), startup_budget);
+
+        // Restore is blocked while loadavg stays above the low watermark —
+        // and the reason names the actual blocker, not a generic
+        // "pressure_signals_not_yet_clear".
+        controller.last_transition_at = Instant::now() - Duration::from_secs(1);
+        let busy_under_load = gh445_busy_runtime(21_500);
+        assert!(controller.observe_runtime(&busy_under_load).is_none());
+        assert_eq!(
+            controller.reason(),
+            "host_loadavg_1m_21.500_above_low_watermark_21.000"
+        );
+        assert_eq!(controller.mode(), "pressure_limited");
+
+        // Memory below the reserve blocks restore too (hysteresis on the
+        // memory demote), then a calm streak restores.
+        let low_memory = LexicalRebuildPipelineRuntimeSnapshot {
+            host_available_memory_bytes: Some(10 << 30),
+            ..gh445_busy_runtime(12_000)
+        };
+        assert!(controller.observe_runtime(&low_memory).is_none());
+        assert!(
+            controller
+                .reason()
+                .starts_with("host_available_memory_bytes_"),
+            "{}",
+            controller.reason()
+        );
+        let calm = gh445_busy_runtime(12_000);
+        assert!(controller.observe_runtime(&calm).is_none());
+        assert!(controller.observe_runtime(&calm).is_none());
+        let restore = controller
+            .observe_runtime(&calm)
+            .expect("calm host restores");
+        assert_eq!(restore.new_budget, steady_budget);
+    }
+
+    #[test]
+    fn gh445_saturation_demotes_without_host_telemetry_and_restore_hold_backs_off() {
+        // No loadavg reading (non-Linux, or no watermark): the pipeline shape
+        // is the only signal, so saturation demotes as before — and because
+        // the steady budget saturates again as soon as it returns, the hold
+        // doubles per demotion (capped at 8x) so the budgets cannot flap
+        // every few seconds.
+        let startup_budget =
+            LexicalRebuildPipelineBudgetSnapshot::new(32, 64, 1024, 2_048, 16, 128, 4_096);
+        let steady_budget =
+            LexicalRebuildPipelineBudgetSnapshot::new(256, 512, 4096, 8_192, 1_024, 8_192, 65_536);
+        let mut controller = LexicalRebuildResponsivenessController::new(
+            LexicalRebuildResponsivenessPolicy::Auto,
+            startup_budget,
+            steady_budget,
+            2,
+            false,
+            None,
+            None,
+        );
+        controller.restore_clear_samples = 1;
+        controller.restore_hold = Duration::from_millis(10);
+        assert_eq!(
+            controller.restore_hold_after_demotions(),
+            Duration::from_millis(10)
+        );
+
+        let saturated = LexicalRebuildPipelineRuntimeSnapshot {
+            queue_depth: 2,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
+        };
+        let calm = LexicalRebuildPipelineRuntimeSnapshot::default();
+        let expected_holds_ms = [10u64, 20, 40, 80, 80, 80];
+        for (demotion, expected_hold_ms) in expected_holds_ms.iter().enumerate() {
+            let transition = controller
+                .observe_runtime(&saturated)
+                .unwrap_or_else(|| panic!("saturation demotes (demotion #{})", demotion + 1));
+            assert_eq!(transition.mode, "pressure_limited");
+            assert_eq!(
+                controller.restore_hold_after_demotions(),
+                Duration::from_millis(*expected_hold_ms),
+                "hold after demotion #{}",
+                demotion + 1
+            );
+            // Inside the hold: no restore, even though nothing is pressuring.
+            assert!(controller.observe_runtime(&calm).is_none());
+            assert!(
+                controller
+                    .reason()
+                    .starts_with("holding_conservative_budget_after_pressure_demote_for_")
+            );
+            controller.last_transition_at =
+                Instant::now() - Duration::from_millis(*expected_hold_ms);
+            let restore = controller
+                .observe_runtime(&calm)
+                .expect("one calm sample after the hold restores");
+            assert_eq!(restore.new_budget, steady_budget);
+        }
+    }
+
     #[test]
     #[serial]
     fn lexical_rebuild_responsiveness_controller_demotes_on_new_handoff_wait_delta() {
@@ -42800,6 +43178,7 @@ mod tests {
             work_rx,
             msg_tx,
             Arc::clone(&flow_limiter),
+            None,
             None,
         );
 

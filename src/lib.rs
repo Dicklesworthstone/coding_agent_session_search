@@ -81013,20 +81013,38 @@ fn diagnostics_connector_paths(
         include_undetected: true,
         ..Default::default()
     };
-    match franken_agent_detection::detect_installed_agents(&opts) {
-        Ok(report) => report
-            .installed_agents
-            .into_iter()
-            .flat_map(|entry| {
-                let slug = entry.slug;
-                entry
+    let mut roots: Vec<(String, PathBuf)> =
+        match franken_agent_detection::detect_installed_agents(&opts) {
+            Ok(report) => report
+                .installed_agents
+                .into_iter()
+                .flat_map(|entry| {
+                    let slug = entry.slug;
+                    entry
+                        .root_paths
+                        .into_iter()
+                        .map(move |path| (slug.clone(), PathBuf::from(path)))
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+    // GH #448: the pinned registry probe ignores CLAUDE_CONFIG_DIR /
+    // XDG_CONFIG_HOME, so doctor reported zero Claude Code roots for exactly
+    // the redirected layouts the connector scans. Use the same env-aware
+    // detection the indexer's connector factory uses.
+    if !roots.iter().any(|(slug, _)| slug == "claude") {
+        let detection =
+            connectors::Connector::detect(&connectors::claude_code::ClaudeCodeConnector::new());
+        if detection.detected {
+            roots.extend(
+                detection
                     .root_paths
                     .into_iter()
-                    .map(move |path| (slug.clone(), PathBuf::from(path)))
-            })
-            .collect(),
-        Err(_) => Vec::new(),
+                    .map(|path| ("claude".to_string(), path)),
+            );
+        }
     }
+    roots
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -81591,7 +81609,7 @@ fn run_status(
     };
 
     let recommended_action = if rebuild_stalled {
-        Some("Index rebuild is wedged; see `cass status --json | jq .rebuild` for the stall age and capture a stack trace with `sudo gdb -batch -ex 'thread apply all bt' -p $(pgrep -f 'cass index') 2>/dev/null | head -200` for issue #258".to_string())
+        Some("Index rebuild is wedged; see `cass status --json | jq .rebuild` for the stall age and capture a stack trace with `sudo gdb -batch -ex 'thread apply all bt' -p $(pgrep -f 'cass index') 2>/dev/null | head -200` for a bug report".to_string())
     } else if rebuild_active {
         Some("Index rebuild is already in progress".to_string())
     } else if live_integrity_corrupt {
@@ -82349,7 +82367,7 @@ fn run_triage(
     };
     let observed_recommended_action = if rebuild_stalled {
         Some(
-            "Index rebuild is wedged; capture diagnostics for issue #258 and restart the watcher"
+            "Index rebuild is wedged; capture diagnostics for a bug report and restart the watcher"
                 .to_string(),
         )
     } else if rebuild_active {
@@ -101442,8 +101460,8 @@ const INDEX_STALL_HINT: &str = concat!(
     "Indexer made no forward progress for the configured stall window. ",
     "Capture a stack trace with `sudo cat /proc/$(pgrep -f 'cass index')/stack` ",
     "and/or `sudo gdb -batch -ex 'thread apply all bt' -p $(pgrep -f 'cass index') 2>/dev/null | head -200` ",
-    "and attach to issue #244 (indexing-phase wedges) or #258 (watch_startup wedges where the lock-file ",
-    "heartbeat keeps refreshing while one thread spins). Semantic replay, embedding, vector publish, manifest, ",
+    "and attach it to a new GitHub issue (say whether it is an indexing-phase wedge or a watch_startup wedge ",
+    "where the lock-file heartbeat keeps refreshing while one thread spins). Semantic replay, embedding, vector publish, manifest, ",
     "and finalize phases expose their own counters and are report-only; native HNSW construction is explicitly ",
     "labelled but opaque. Set CASS_INDEX_STALL_DETECT_SECS=0 to disable detection; set ",
     "CASS_INDEX_STALL_ABORT_SECS=0 to keep abort-eligible lexical stalls report-only; set ",
