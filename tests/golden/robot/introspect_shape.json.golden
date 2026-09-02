@@ -59222,6 +59222,23 @@
                             }
                           }
                         },
+                        "lexical_degrade_reason": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "enum": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
                         "wildcard_fallback": {
                           "type": "object",
                           "properties": {

@@ -283,85 +283,222 @@ NO_BEAD (no open/in-progress bead covers the gap).
 
 ---
 
-## 7. Bridge plan
+## 7. Bridge plan (Phase 2, comprehensive — revised in place 2026-09-01 evening)
 
-Ordering principle: stop user-visible bleeding and restore the gate first,
-then make the docs true, then pay down structure. Every workstream lists the
-concrete change, acceptance, and the test that proves it.
+This section is the Phase 2 deliverable of the reality-check flow: a plan
+detailed enough to close every gap in §2–§6 *properly* — harmonized with the
+existing architecture, with the highest reliability, performance, and
+robustness — and detailed enough that Phase 3a beads can be generated from it
+without consulting any other document. It supersedes the earlier summary that
+lived here; the progress log in §7b records what already landed today.
 
-### WS-A — Restore the quality gate (first 48 hours)
-A1. Re-enable `CI` and `Fresh Clone Build` workflows (or a self-hosted/rch-backed equivalent) with: fmt, clippy `-D warnings`, `cargo check --all-targets`, `cargo test --lib`, UBS on changed files. Acceptance: a green run on main within 24 h; red main blocks bead closure by convention.
-A2. Fix the 3 red lib tests (bet45): bisect f273ccc4 (content-bounded page limit) and 7af85c82 (strict read-only page-prep open) before blaming the engine; audit the "error before `wait_for_turn`" path named in cjugu. Acceptance: `cargo test --lib` 100% green, no `#[ignore]` added.
-A3. Produce one full integration-suite receipt (`cargo test --all-targets` via rch, batched) and record failures as beads. Acceptance: receipt commit with pass/fail/ignored counts.
-A4. Add `#![deny(unsafe_code)]` at crate root with `#[allow(unsafe_code)]` on the 12 audited sites (env at main.rs:185/218; FFI in daemon/resource.rs, indexer/mod.rs renameat2, responsiveness.rs getloadavg, tui_asciicast.rs fcntl, semantic_manifest.rs Windows attrs). Delete the string-grep Send/Sync test. Acceptance: builds; grep test removed.
-A5. Golden hygiene: add `triage.json.golden`; delete the 22 untracked `.actual` files (owner permission required per AGENTS.md rule 1); move or symlink swarm goldens under `tests/golden/robot/`. Re-bless the 15 February snapshot baselines with the TESTING.md review checklist.
-A6. Re-enable `Benchmarks` with `search_latency_e2e.rs` as a ratchet (p95 engine ≤ 60 ms on the bench corpus; one-shot CLI ≤ 250 ms after WS-B7).
+### 7.0 How to read this plan
 
-### WS-B — Large-archive reliability (the P0 user class)
-B1. **#441**: run Quill compaction at the end of every one-shot `cass index` (not only in the watch closure, mod.rs:16586); expose `CASS_QUILL_QUERY_FUEL_BUDGET` and set the reader's `QuillConfig` from it (quill_bridge.rs ~545); in hybrid, catch lexical fuel exhaustion and degrade to the semantic leg (or lexical-with-stopwords-dropped) with `lexical_fallback_reason:"query_fuel_exhausted"` instead of `?` at query.rs:6907. Tests: append-only corpus × N incrementals → segment count bounded; 8-word stopword query on 600-segment fixture returns hits; robot meta reports the degrade.
-B2. **#439**: emit progress ticks from `repair_fallback_fts_after_full_index_run` (mod.rs:9672) and daily-stats rebuild; make the stall watchdog phase-aware so post-publish phase 0 is report-only unless block IO and CPU are both idle for the full window. Test: fixture with published generation + slow FTS repair does not exit 70.
-B3. **#440**: in `reconcile_pending_lexical_commit` (mod.rs:8716) compare the durable cursor against the published Quill doc count/manifest and either advance the cursor or restart the staged rebuild; never exit 9 on a self-inflicted cursor lag. Test: SIGTERM mid force-rebuild → next plain `index` exits 0.
-B4. **health bounded open**: route `health` through `probe_state_db_strict_bounded` (lib.rs:19846) like `status`; forbid `attempt_dirty_wal_recovery_checkpoint` on any observation surface. Test: 200 MB dirty WAL fixture → `health` returns < 500 ms and WAL size unchanged.
-B5. **#391**: add a bead and a detection: run `quick_check` + rowid-monotonicity probe on `conversations` in `doctor check`; capture a support bundle automatically when the engine migration marker reports repaired orphaned pages. Test: corrupted-fixture → doctor reports `btree_rowid_order` finding.
-B6. **Memory governor in sqlite.rs**: consult `responsiveness` in FTS rebuild paging and migration V18–V20 (batch by keyset, commit per batch); pre-check free space ≥ 2× DB before any engine migration and surface the engine backup in doctor's asset taxonomy with a reclaim path. Tests: 1M-row fixture rebuild under 1 GB RSS cap; migration refuses when disk < 2× DB.
-B7. **Robot per-call overhead**: cache the storage-integrity preflight result keyed by (db mtime, size, WAL size) in `<data_dir>/state/`, skip it on the read path when fresh, and open read-only without recovery. Target: `other_ms` < 150 on this host. Test: bench asserts one-shot `search --robot` ≤ 250 ms warm on the 10 GB fixture.
-B8. **#395 residual**: defer `load_semantic_context` off the first-frame path (use the `_deferred` variant, model_manager.rs:600); never run `rebuild_analytics` in-process from the TUI — spawn `cass analytics rebuild --days 2` detached and show a toast. Test: headless TUI on the 2M-message fixture renders first frame < 2 s.
-B9. **GH#426 ledger** (fyepq): implement the per-source observation ledger so interrupted incremental runs resume from the last committed source; retire or wire `refresh_ledger.rs`. Test: kill mid-incremental → re-run reparses only unfinished sources.
-B10. Keep #413/#422 acceptance beads open until reporter-sized scratch proofs are attached.
+- **Task ids** are `WS-<letter>.<n>`. Each task states: *Change* (what, and
+  where in the code), *Acceptance* (a positive observable plus a planted
+  negative, so a green cannot be a zero-run green), *Proof* (the unit and
+  end-to-end tests and the logging/receipt that demonstrates it), *Depends on*,
+  *Size* (S ≤ ½ day, M ≤ 2 days, L ≤ 1 week, XL = program), and *Owner class*
+  (`cass` = pure cass change; `engine` = needs frankensqlite/frankensearch;
+  `owner` = a decision only the project owner can make).
+- **Status** reflects HEAD `73c471cc` plus the working tree at the time of
+  writing: `DONE` (landed today, see §7b), `PARTIAL`, `OPEN`.
+- Every task serves one or more **end states** from §7.1; the mapping is the
+  justification, and a task that serves none should be dropped, not done.
+- **Standards that apply to every task** (§7.4): no mocks presented as live
+  proof; tests carry a positive observable and a planted negative; every
+  long-running path emits a structured receipt (tracing event or JSON) that
+  the test asserts on; nothing closes on "compiles" alone; a closure cites the
+  exact commit and the command whose output proves the acceptance.
 
-### WS-C — Semantic: ship it or stop selling it (decision required)
-C1. Decision gate: either (a) fund ds7uy.1–.5 + wfm4e + jyfuq as one owned program with a frankensearch counterpart, or (b) cut README to "hybrid = lexical + single-tier MiniLM refinement; progressive and ANN are experimental flags." Default recommendation: **(b) now, (a) as a scheduled program**, because today's README promises a capability no test has ever exercised.
-C2. Real-model test lane: add a CI job (opt-in, cached) that downloads the safetensors MiniLM once and runs the 8 ignored embedder/reranker tests plus a restart/degrade/recover e2e (jyfuq). Replace the int8 ONNX fixtures.
-C3. Make `hnsw_ready` reflect native admission (wfm4e); build the ANN sidecar in backfill when the quality tier completes; let hybrid use ANN without `--approximate` when admitted.
-C4. Manifest: either land the writer (ds7uy.1) together with the reader (ds7uy.3) in one change, or delete the writer-less scaffolding and the `current.json` fail-closed reader. Never land one half.
-C5. Collapse the four readiness enums to one state machine feeding health/status/query (ds7uy.4).
-C6. Fix contract leaks: `preferred_backend:"fastembed"` → `"native"`, remove `OnnxEmbedderConfig`, README 256-d → 384-d.
+### 7.1 Definition of done — the vision as testable end states
 
-### WS-D — Make the docs true
-D1. README correction pass driven by the §2 table: schema v20; dedup keys; keyboard table regenerated from `impl From<Event> for CassMsg`; density rows; analytics/bulk keys; remove bookmarks or wire them (WS-E3); `--timeout` semantics; swarm = fixture-only until WS-F3; rsync flags; HTML export flags/JSON/exit 9; Tailwind statement; api-version fields; Homebrew tarballs; glibc gate reality; self-update reality; sub-60 ms claim scoped to engine time.
-D2. Document the hidden surface: `cass pages` (with a security note and the real key-recovery flow), `upgrade`, `man`, `storage`, `dedup`, `support-bundle`, `state`, `onboarding`, `quarantine`, `forget`, `fleet`, `lessons`, `import`, `release-verify`, `sources discover|reingest|artifact-manifest`.
-D3. AGENTS.md: connector table (26 incl. goose, muse), CI section rewritten to state that gates are agent-run via rch until WS-A1 lands, schema note, `RCH_REQUIRE_REMOTE` behavior.
-D4. In-app help and `mistake_recoveries` text aligned with code (Alt+N/Alt+I; typo correction statement).
-D5. Emit teaching notes on stderr in robot mode too (lib.rs:6730) — agents are the audience the README names.
-D6. Add a `docs/validate_docs.sh` check that every README key binding and CLI flag exists in code (keys via the `CassMsg` map; flags via `cass introspect --json`). Make it part of WS-A1.
+| End state | Testable statement | Today |
+|---|---|---|
+| **ES1 Robot latency** | A warm `cass search --robot` on a 10 GB, 500k-message archive answers in ≤ 300 ms wall (engine ≤ 60 ms) with no archive mutation. | 8.7 s in v0.7.1; fix landed, unmeasured |
+| **ES2 Index reliability at scale** | `cass index --full`, `index` (incremental, interrupted or not), and `--watch` complete on a 15k-conversation / 2M-message / 10 GB archive without exit 70, exit 9, OOM, or wedge, and every run ends with a truncated WAL and a consolidated lexical generation. | #439/#440/#441/#413/#422 open |
+| **ES3 Truthful search modes** | Hybrid = lexical + semantic refinement when the model is installed, proven by a real-model test; without a model, lexical fail-open with `_meta` telling the truth; no advertised mode is unreachable at runtime. | Progressive/two-tier unreachable; no real-model test |
+| **ES4 Observation surfaces never pay** | `health`, `status`, `diag`, `doctor check`, `search --no-maintenance` never mutate the archive and answer within a hard bound on any archive size. | health fixed today; others bounded |
+| **ES5 Docs are executable truth** | Every README claim maps to a golden, a test, or a validator; a docs validator runs in the gate. | README corrected; validator missing |
+| **ES6 A gate exists** | Every push to main runs fmt, clippy `-D warnings`, `cargo test --lib`, goldens, UBS; red main blocks bead closure. | All workflows disabled; agent-run only |
+| **ES7 No dead subsystems** | Zero modules with no production caller; zero env vars that are no-ops; no Tantivy-only code behind a hardcoded `None`. | ~4.4K dead lines, 5 dead modules |
+| **ES8 TUI at scale** | First frame ≤ 2 s and interactive on the 2M-message archive; no in-process multi-GB work on the effects thread. | Two hazards fixed today, unproven |
+| **ES9 Structure supports change** | `src/lib.rs` < 30K lines; no function > 300 lines in moved code; monoliths split by surface; tests do not string-scan source. | lib.rs 119K |
+| **ES10 Release discipline** | v0.7.2 ships from a green gate with reporter retests for #439/#440/#441/#395 attached and a Windows receipt. | No CI; dsr config missing |
+| **ES11 Tracker equals reality** | No done-but-open beads; every GitHub issue has a bead within 24 h; stale claims re-triaged monthly. | 14 done-but-open closed today; 12 remain |
+| **ES12 Safety fence** | `deny(unsafe_code)` outside tests; no raw cross-thread engine handles; secret redaction proven on every export surface. | Fence landed today |
 
-### WS-E — Dead code and structure
-E1. Delete the Tantivy-only staged-shard pipeline (`rebuild_tantivy_from_db_via_staged_shards` and the ~3.7K lines listed in the lexical audit), the 674-line federated helpers in tantivy.rs, the ~10 no-op `CASS_TANTIVY_*` vars, and the 31 "Tantivy-only" ignored tests. Keep `lexical_tantivy` only for the differential oracle. (File deletions need owner permission per AGENTS.md rule 1; code removal within files does not.)
-E2. Rename the Tantivy vocabulary (`rebuild_tantivy_from_db*`, user-facing "Tantivy lexical index completed") to Quill; keep env-var aliases for one release with a deprecation note.
-E3. Bookmarks: wire `bookmarks.rs` to a TUI key + palette action + `cass bookmarks list|add|export` CLI, or delete the module and the README section. Recommendation: wire it — the design is complete and advertised.
-E4. Remove `two_tier_search.rs` (or make it the progressive implementation under WS-C), `ProbeCache`, and the `backtrace` feature.
-E5. lib.rs decomposition (mechanical, golden-guarded, no behavior change): move `run_doctor_impl` + doctor helpers to `src/doctor/`, search rendering (`output_robot_results`, `run_cli_search`) to `src/search/cli/`, `run_index_with_data` to `src/indexer/cli.rs`, export-html to `src/html_export/cli.rs`, pack to `src/search/pack_cli.rs`, status/health to `src/status/`, schemas to `src/introspect.rs`. Target: lib.rs < 30K lines; no function > 300 lines in moved code. Same treatment for `indexer/mod.rs` (split pipeline/publish/watch) and `ui/app.rs` (split update arms by surface).
-E6. Make `doctor.rs:1543`/`lib.rs:71782` stop string-scanning source text; replace with a compile-time registry test.
+### 7.2 Workstreams
 
-### WS-F — Robot contract fixes
-F1. `--timeout`: return partial hits with `_meta.timed_out:true` and exit 8 (as documented), or change the docs. Recommendation: implement exit 8; agents already branch on it.
-F2. Exit 70 must go through the error envelope (`kind:"index-stalled"`).
-F3. Swarm: implement live adapters (beads: read `.beads/issues.jsonl`; Agent Mail: read the local archive or HTTP `/mcp`; rch: `rch status --json`; git: existing) behind the existing adapter trait, or label the commands `--fixture`-only in README and capabilities.
-F4. Add `_meta.cache_hit`, error on unknown `--source`, `<mark>` in HTML export highlight, fix api-version sample.
-F5. Unify the 4 snake_case error kinds to kebab-case with a one-release alias.
+#### WS-A — Restore the quality gate (ES5, ES6)
 
-### WS-G — Peripheral correctness
-G1. `sources setup`: actually run the final sync unless `--skip-sync`; make `install()` fall through the documented chain.
-G2. Installer: implement the glibc ≥ 2.38 probe with `--from-source` fallback; self-update: back up the current binary and restore on failed verify.
-G3. HTML export: add `--password` (with a warning) or remove it from docs; load Tailwind as documented or drop the claim; align the robot JSON shape with README or vice versa; document exit 9.
-G4. Pages: implement `cass pages key list|add|revoke|rotate` on top of `key_management.rs`, or rewrite docs/RECOVERY.md to the real recovery flow; fix `lighthouse.yml` bogus flag.
-G5. Doctor asset taxonomy: classify `*.pre-migration-bak*` and `.fsqlite-migration-state`, report their size, and offer a fingerprinted cleanup plan.
-G6. Un-ignore the SSH e2e tests in a Docker-capable CI lane.
+**A.1 Re-enable the CI workflows (owner + cass).** *Change:* `gh workflow enable` for `CI`, `Fresh Clone Build`, `Coverage`; trim `ci.yml` to the four blocking jobs (fmt, clippy `-D warnings`, `cargo test --lib`, goldens) plus `ubs-changed-files`, moving fuzz/bench/browser to `workflow_dispatch` and nightly schedules so a push never queues five workflows. If Actions minutes are the reason they were disabled (owner decision), add a self-hosted runner label backed by one rch worker and point only the blocking jobs at it. *Acceptance:* a green run on main within 24 h of the change; a deliberately red PR (planted: a test that panics) is blocked. *Proof:* the run URL recorded in bead notes; the planted-red PR's failed check. *Depends on:* owner decision on Actions. *Size:* M. *Status:* OPEN.
 
-### WS-H — Tracker hygiene (do immediately, cheap)
-H1. Close done-but-open beads with the landing commit in the closing note: rhmbf, lukne, 34irx, zqre2, and the 12 Pages/secret-scan beads (verify each against code first).
-H2. Close obsolete crates.io beads hvzel, wssow, 1ixp7 (0.7.0 published 2026-08-25).
-H3. File beads for every §5.1 gap; file `gh439-*`, `gh440-*`, `gh441-*`, `gh395-*`, `gh391-*`, `gh423-*` per convention.
-H4. Re-triage the 21 stale in_progress beads: either re-own with a dated note or return to open.
-H5. Correct bet45's root-cause narrative (cass-side suspects first).
-H6. Run `br doctor --repair` on a preserved copy (owner's call), fix the stale `beads.base.jsonl` merge anchor, remove the duplicate `br` from PATH.
-H7. Make "GitHub issue filed ⇒ bead within 24 h" a swarm rule in AGENTS.md.
+**A.2 Batched agent gate until A.1 lands (cass).** *Change:* add `scripts/gate.sh` that runs exactly what CI will run through ONE `rch exec --job --result-dir tests/golden` admission (fmt check, clippy, `cargo test --lib`, targeted integration tests, goldens verify) and prints one receipt line per stage (`STAGE=<name> EXIT=<code>`), so a fleet admission is never spent on `cargo check` alone. *Acceptance:* one invocation produces all receipts; a planted clippy warning yields `STAGE=clippy EXIT=101`. *Proof:* the script's own receipt output committed under `docs/artifacts/gate-receipts/<date>.txt` for the first run only (retire once A.1 is live). *Size:* S. *Status:* OPEN (the pattern was used ad hoc today).
 
-### Suggested sequencing
-Week 1: WS-H (day 1), WS-A1–A3, WS-B1–B4, WS-D5.
-Week 2: WS-B5–B8, WS-A4–A6, WS-F1–F2, WS-C1 decision + C2 lane.
-Week 3: WS-D1–D4, WS-G1–G3, WS-E1–E4.
-Week 4+: WS-E5 decomposition (rolling, golden-guarded), WS-C3–C6 if (a) chosen, WS-F3, WS-G4–G6, WS-B9.
+**A.3 Lib suite green (cass).** *Change:* root-cause the bet45 wedge family (`lexical_rebuild_packet_producer_builds_lookup_and_source_context_internally`, `…respects_planned_shard_boundaries`, `rebuild_tantivy_from_db_promotes_pipeline_budgets_after_first_commit`) starting from the two cass commits git evidence points at — f273ccc4 (content-bounded page limit forcing 1-conversation pages under tiny test budgets) and 7af85c82 (strict read-only page-prep open that returns errors instead of self-healing, which parks the producer at `result_rx.recv()` if a worker errors before `wait_for_turn`). Fix the producer's error-before-turn path to close the ordering so a worker failure cannot park the producer; make the shard-boundary test's budget realistic or make `finishes_planned_shard` reflect the content bound. *Acceptance:* `cargo test --lib` reports 0 failed, 0 newly ignored; the wedge test finishes in < 10 s; a planted negative (a worker that errors before taking its turn) fails the run with a typed error instead of hanging. *Proof:* full lib-suite receipt in the bead; `CASS_PIPELINE_TRACE=1` trace attached showing the error path unparking the producer. *Size:* M–L. *Status:* OPEN.
+
+**A.4 Full integration receipt (cass).** *Change:* run `cargo test --all-targets` through A.2, triage every failure into a bead with its panic text, un-ignore nothing. *Acceptance:* one receipt with pass/fail/ignored counts per test binary. *Size:* S (plus follow-up beads). *Status:* OPEN.
+
+**A.5 Unsafe fence (cass).** *Status:* DONE today (`#![cfg_attr(not(test), deny(unsafe_code))]` in lib.rs and main.rs, 14 scoped allows with SAFETY comments, fence-presence test). Remaining: none.
+
+**A.6 Golden hygiene and isolation (cass).** *Change:* (a) add `triage.json.golden` and `triage_shape.json.golden`; (b) remove the 22 untracked `tests/golden/robot/*.actual` files (owner permission required by AGENTS.md rule 1); (c) move `tests/golden/swarm_status/` under `tests/golden/robot/swarm/`; (d) make the golden harness refuse to regenerate unless `CASS_DATA_DIR` points inside the test's temp dir — today's remote regeneration leaked the worker's real archive into `search_robot` and `stats_full_payload` goldens (§7b), which is exactly the failure mode this guard prevents; (e) normalize trailing newlines in the writer so regen never produces newline-only diffs. *Acceptance:* `UPDATE_GOLDENS=1` on a host with a populated default data dir produces goldens identical to a clean host (planted: run with `CASS_DATA_DIR` unset → the harness errors instead of writing). *Proof:* two regen runs diffed. *Size:* S. *Status:* OPEN.
+
+**A.7 Snapshot baselines (cass).** *Change:* re-bless the 15 February snapshot baselines following `docs/planning/TESTING.md` review checklist; add a `snapshot_age_days` assertion that fails when a baseline is older than 120 days without a `# reviewed <date>` marker. *Acceptance:* all 36 baselines reviewed and dated. *Size:* M. *Status:* OPEN.
+
+**A.8 Performance ratchet (cass).** *Change:* wire `benches/search_latency_e2e.rs` into A.2/A.1 as a ratchet with two bounds on the bench corpus: engine p95 ≤ 60 ms and one-shot `cass search --robot` wall ≤ 300 ms; store results in `.bench-history/` per the gauntlet keep-gate rules. *Acceptance:* a planted regression (sleep 400 ms in the read path) fails the ratchet. *Depends on:* B.8. *Size:* M. *Status:* OPEN.
+
+**A.9 Docs validator (cass).** *Change:* `scripts/validate_docs.sh` (extend the existing script) checks: every key binding named in README's keyboard tables exists in `impl From<Event> for CassMsg`; every CLI flag and subcommand in README exists in `cass introspect --json`; every env var in the README table exists in `cass robot-docs env`; every `cass <verb>` in AGENTS.md examples parses under `--dry-run` where available. *Acceptance:* the validator is red on a planted fake key (`Ctrl+Shift+Q`) and green on HEAD. *Proof:* run in A.2. *Size:* M. *Status:* OPEN.
+
+**A.10 fmt drift (cass).** *Change:* run `cargo fmt` once over the pre-existing drift (raw_mirror.rs: 43 diffs at HEAD; mod.rs json_heap_bytes and friends) in its own commit so the fmt gate can be blocking. *Acceptance:* `cargo fmt --check` exit 0. *Size:* S. *Status:* OPEN.
+
+#### WS-B — Large-archive reliability (ES1, ES2, ES4)
+
+**B.1 #441 segment growth and query fuel (cass; engine follow-up).** *Status:* PARTIAL. Landed today: `cass_quill_config()` at every reader/writer open (visibility-lag seals disabled so snapshots publish only on cass commits — the root cause of per-second segment explosions; fuel budget at engine default with `CASS_QUILL_QUERY_FUEL_BUDGET` as an escape hatch), `optimize_if_idle` after incremental runs and `force_merge` (concat merge) after full rebuilds, hybrid degrade on fuel exhaustion with `_meta.lexical_degrade_reason`, an actionable lexical-only hint, and tests (`post_run_maintenance_bounds_segment_growth_on_append_only_commits`, `bounded_merge_folds_session_segments_into_one`, fuel recognition). *Remaining changes:* (a) expose `lexical_segment_count` and `lexical_last_merge_at` in `status --json`/`health --json`/`doctor check` with a `segment_pressure` finding when count > 8× threshold; (b) an e2e that ingests a 600-segment fixture (built by committing 600 tiny batches with maintenance disabled), runs `cass index`, and asserts the segment count falls below threshold and an 8-word stopword query succeeds within the default fuel budget; (c) decide with the owner whether the default budget should be raised for archives that fragmented before this fix (recommendation: keep the engine default now that consolidation is automatic, revisit after reporter retest); (d) reporter retest on #441 with `cass status --json` attached. *Acceptance:* (b) passes; planted negative: with maintenance disabled the same query returns the fuel error and the hint. *Proof:* e2e receipt; `_meta` JSON. *Size:* M. 
+
+**B.2 #439 false exit 70 after a healthy publish (cass).** *Status:* PARTIAL. Landed today (by a parallel agent, same design as planned): the post-publish FTS shadow rebuild ticks the indexer activity counter per page. *Remaining changes:* (a) every other post-publish phase-0 step must tick too — `optimize_if_idle` (now runs post-publish), daily-stats rebuild, checkpoint refresh — add a `phase0_maintenance` heartbeat wrapper that ticks before and after each step and logs `phase0_step=<name> ms=<n>`; (b) make the stall watchdog phase-aware: while `IndexingProgress.phase == 0 && published_generation_ready`, apply the finalize-class grace and require BOTH zero activity AND zero block-IO advance for the full window before aborting; (c) e2e: publish a generation on a fixture, inject `CASS_TEST_FTS_REPAIR_SLOW_MS=90000` with `CASS_INDEX_STALL_ABORT_SECS=30`, assert exit 0 and the `phase0_step` receipts; planted negative: a genuinely wedged post-publish step (test hook that parks) still aborts at the finalize threshold with `kind:"index-stalled"`. *Depends on:* F.2. *Size:* M.
+
+**B.3 #440 resume behind published authority (cass).** *Status:* PARTIAL (visibility-lag fix removes the engine's independent publication; the reconcile gap remains). *Change:* in `reconcile_pending_lexical_commit`, read the published Quill manifest's doc identities for the staging generation and compare with the durable cursor; if the manifest is ahead, advance the cursor to the manifest's last committed conversation (ids are monotonic) instead of re-inserting; if behind, continue; never return exit 9 for a self-inflicted lag — reserve 9 for a genuinely missing/unpublishable index. Persist the reconcile decision in `.lexical-rebuild-state.json` (`reconciled_from_manifest_at`). *Acceptance:* e2e: start `index --force-rebuild` on a 300-conversation fixture, SIGTERM after the first staged MANIFEST publish, run plain `index` → exit 0, all conversations searchable, no duplicate identities; planted negative: delete the staging MANIFEST → the run rebuilds from scratch and reports it. *Proof:* e2e with `CASS_PIPELINE_TRACE=1` receipts. *Size:* M.
+
+**B.4 Bounded observation surfaces (cass).** *Status:* PARTIAL. Landed today: `health` uses the strict bounded owner-thread probe. *Remaining:* (a) expose `db_bytes`, `wal_bytes`, `shm_present`, `probe_ms` in `health`/`status` so an oversized WAL is visible; (b) reporter-scale proof: run `health` and `status` against a 9 GB archive with a 200 MB dirty WAL and record wall time and `wal_bytes` before/after (must be unchanged); (c) `diag --json` must use the same strict probe (audit `probe_state_db` callers for any inline read opener left). *Acceptance:* all three surfaces < 1 s on the owner's archive with WAL unchanged; planted negative: a non-SQLite file surfaces as a hard open failure on every surface. *Size:* S–M.
+
+**B.5 WAL left untruncated by non-index write paths (cass; bead z2uon).** *Change:* (a) audit every path that writes the archive outside `run_index` — engine migration on first open, `doctor --fix` repairs, `analytics rebuild`, `quarantine retry`, `forget`, `dedup`, `sources agents exclude` — and route each through the same close-with-`wal_checkpoint(TRUNCATE)` finalize used by `close_storage_after_index`; (b) add a `wal_oversized` doctor check (WAL > 64 MiB with no `index-run.lock` holder) and a `--fix` repair that runs a bounded TRUNCATE checkpoint with the usual fingerprinted receipt; (c) `cass index` refuses nothing but logs `wal_bytes_before/after` at finalize. *Acceptance:* after each mutating command on a fixture, `wal_bytes < 32 MiB`; doctor detects a seeded 200 MB WAL and the repair truncates it without changing row counts; planted negative: with a concurrent reader pinning the WAL, the repair reports `busy` truthfully and leaves the WAL. *Proof:* per-command e2e receipts. *Size:* M.
+
+**B.6 #391 recurring btree corruption (cass; engine).** *Change:* (a) `doctor check` runs `PRAGMA quick_check` plus a rowid-monotonicity probe on `conversations` and `messages` (bounded by the existing bundle ceiling) and reports `btree_rowid_order` with the offending rowid range; (b) when the engine migration marker records `repair_orphaned_pages > 0`, doctor emits a `corruption_history` finding and offers `support-bundle`; (c) cross-link the frankensqlite bead for the writer-side cause and attach the owner's marker file as evidence. *Acceptance:* a fixture with an out-of-order rowid (constructed with a raw write) is detected; planted negative: a healthy fixture reports none. *Size:* M (cass side).
+
+**B.7 Memory governor and migration safety (cass).** *Change:* (a) consult `responsiveness` (in-flight bytes/worker clamps) inside `stream_fts_rows_via_frankensqlite` paging and inside migrations V18–V20 (keyset pages, one transaction per page, resumable via `_schema_migrations` progress row); (b) before any engine migration that copies the DB, require free space ≥ 2× DB + WAL and refuse with `kind:"disk-space"` otherwise; (c) classify the engine's `*.pre-migration-bak*` and `.fsqlite-migration-state` in doctor's asset taxonomy with sizes and a fingerprinted cleanup plan (never automatic). *Acceptance:* a 1M-row fixture FTS rebuild stays under a 1 GB RSS cap (measured by the existing memory tests); migration on a tmpfs with < 2× free refuses; doctor lists the backup with its byte size. *Size:* M–L.
+
+**B.8 Robot per-call overhead (cass).** *Status:* PARTIAL. Landed today: the lexical self-heal fingerprint is memoized on the archive's physical identity, removing the synchronous storage open that replayed the whole WAL. *Remaining:* (a) re-measure on the owner's archive with a main build (target: `other_ms` < 150, wall ≤ 300 ms warm); (b) audit the remaining read-path work between process start and `search_start` (state probe, checkpoint load, storage-integrity dedicated probe, semantic context load) and make each either O(1) or cached on the same identity; (c) make the strict `--no-maintenance` opener the default for the *read* half of a search, taking a maintenance-capable open only after the cheap signals say maintenance is needed. *Acceptance:* A.8 ratchet green; planted negative: touching the WAL invalidates the cache and the next search recomputes (observable via the `archive_fingerprint_cache=miss` debug event). *Size:* M.
+
+**B.9 #395 TUI at scale (cass).** *Status:* PARTIAL. Landed today: lazy semantic loader before the first frame; analytics rollup rebuild spawned as a detached child. *Remaining:* (a) headless e2e on the 2M-message fixture measuring time-to-first-frame ≤ 2 s and RSS ≤ 1 GB at first frame; (b) audit every `Cmd::task` closure for archive-scale work (grep `FrankenStorage::open` in `src/ui/`) and bound each with the same detach-or-page rule; (c) reporter retest. *Acceptance:* (a) passes; planted negative: reintroducing an in-process rebuild in a test build trips the RSS assertion. *Size:* M.
+
+**B.10 GH#426 per-source ingest ledger (cass; bead fyepq).** *Change:* persist a per-source observation ledger (`<data_dir>/index/.ingest-ledger.json`: source path, mtime, size, last committed conversation id, status) updated at every batch commit; on resume, skip sources whose ledger row matches and re-parse only unfinished ones; retire `refresh_ledger.rs` if it stays test-only after this lands. *Acceptance:* kill an incremental run mid-way on a 500-session fixture → the re-run reports `resumed_sources=N` and parses only the unfinished ones (counted via the ingest trace); planted negative: touching a finished source's mtime re-parses it. *Size:* L.
+
+**B.11 #413 / #422 acceptance (cass).** *Change:* attach reporter-sized scratch proofs (the 2.1 GB fixture recipe in the bead) for the sink-starvation flush and the search-triggered refresh watchdog; un-ignore the ignore-gated `gh413_full_rebuild_drains_when_one_conversation_exceeds_the_inflight_budget` once B.12's ingest bounding lands. *Size:* M (proof runs).
+
+**B.12 Engine-gated memory items (#379, #345, #329, #349, #320) (engine; cass mitigations).** *Change:* for each, keep the cass-side bound (batch caps, refusal with actionable hint, deferred repair) and cross-link the frankensqlite bead; add a `doctor check` finding `engine_bound_pending` listing which of these apply to the archive (size class, FTS shadow size) so users know why a repair is deferred. *Acceptance:* the finding appears on the owner's 10 GB archive and not on a 50 MB fixture. *Size:* S (cass side).
+
+**B.13 Windows receipts (#429, #406) (cass; dsr).** *Change:* register the cass dsr config (bead yviq2), build the windows/amd64 candidate, run `selftest`, `index --full` on a small corpus, and a cold query on Windows 11; fix the on-exit "threads should not terminate unexpectedly" panic (#406) by joining the sync-bridge runtime before exit. *Acceptance:* the receipt in the bead; planted negative: the pre-fix binary reproduces #406. *Size:* M.
+
+#### WS-C — Semantic: decide, then either ship it or retire it (ES3)
+
+**C.1 Decision (owner).** Documentation now tells the truth (progressive/two-tier inactive, ANN opt-in). Decide between (a) funding the semantic program below as one owned effort with a frankensearch counterpart, or (b) retiring the unreachable code (two_tier_search.rs, writer-less manifest, four readiness enums) and keeping hybrid = lexical + single-tier refinement. Recommendation: (b) for structure now (E.4), (a) as a scheduled program only if a real-model lane (C.2) exists first. *Size:* owner decision.
+
+**C.2 Real-model test lane (cass).** *Change:* a gate job that downloads the safetensors `all-MiniLM-L6-v2` once into a cached path, runs the 8 ignored embedder/reranker tests, and a restart/degrade/recover e2e: install → backfill → query (semantic hits present) → delete the model → query (lexical fail-open with `fallback_mode=lexical`) → reinstall → query. Replace the int8 ONNX fixtures under `tests/fixtures/models/` with the safetensors files or a documented download step. *Acceptance:* the lane is green on main; planted negative: corrupt `model.safetensors` → `models verify` fails and search reports `semantic_unavailable`. *Size:* M.
+
+**C.3 `hnsw_ready` truth and ANN by default (cass; bead wfm4e).** *Change:* `hnsw_ready` is computed by opening the sidecar through the native admission path (owner identity match, dimension match, checksum); backfill builds the sidecar when the quality tier completes; hybrid uses ANN whenever admitted, with `_meta.ann_admitted=true|false` and the reason. *Acceptance:* a stale sidecar from another embedder reports `hnsw_ready=false` with reason; planted negative: a truncated `.chsw` is refused, not served. *Size:* M.
+
+**C.4 Generation manifest writer + reader together (cass; beads ds7uy.1/.3).** *Change:* land the immutable generation manifest writer and the manifest-only reader in one change with an atomic `current.json` pointer; never ship the reader's fail-closed check without the writer. *Acceptance:* backfill publishes a generation, `models status` shows it, a query reads only that generation; planted negative: a half-written manifest is ignored and the previous pointer serves. *Size:* L.
+
+**C.5 One readiness state machine (cass; bead ds7uy.4).** *Change:* collapse `SemanticAvailability`, `SemanticReadinessState`, `SemanticReadinessReason`, and `TierReadiness` into one classifier consumed by health, status, doctor, and the query path. *Acceptance:* a property test enumerating on-disk states (model absent/present, vectors absent/partial/complete, ANN absent/stale/ready) produces identical readiness from all four surfaces. *Size:* M.
+
+**C.6 Contract leaks (cass).** *Change:* rename `preferred_backend:"fastembed"` → `"native"` behind a one-release alias in goldens, remove `OnnxEmbedderConfig`, and delete the `semantic` feature remnants. *Size:* S.
+
+**C.7 Daemon lifecycle e2e (cass).** *Change:* e2e that spawns the daemon, verifies attestation, runs a search through it, sets `CASS_DAEMON_INDEX_INTERVAL_SECS=1` and asserts one detached index child is spawned, then idles it out. *Size:* S.
+
+#### WS-D — Docs as executable truth (ES5)
+
+**D.1 README/AGENTS correction pass.** *Status:* DONE today (15 audited items, with code citations, plus the behaviors landed today). **D.2 Hidden subcommands documented.** *Status:* DONE today. **D.3 AGENTS connector table and CI reality.** *Status:* DONE today.
+
+**D.4 Remaining doc truth items (cass).** *Change:* (a) fix the shadowed `Alt+W` swarm-cockpit key in `app.rs` (reorder the `alt && !shift` workspace-filter arm) and document it, or drop the key; (b) align the in-app help strip and `capabilities.mistake_recoveries` text with code (Alt+N/Alt+I; typo correction statement); (c) `docs/RECOVERY.md`: replace the nonexistent `cass pages key …` commands with the real recovery flow until G.4 lands; (d) a CHANGELOG entry for everything landed today under a `[Unreleased]` heading. *Acceptance:* A.9 validator green. *Size:* S.
+
+**D.5 Robot teaching notes.** *Status:* DONE today.
+
+#### WS-E — Dead code and structure (ES7, ES9)
+
+**E.1 Remove the Tantivy-only staged-shard pipeline (cass).** *Change:* delete `rebuild_tantivy_from_db_via_staged_shards`, the shard builder/merge workers and controllers, `plan_lexical_rebuild_shards_from_*`, `finalize_staged_lexical_rebuild_publish_artifact*`, `validate_*shard*`, the staged-shard settings and ~10 no-op `CASS_TANTIVY_*` env vars, the 674 lines of federated helpers in `tantivy.rs`, and the 31 "Tantivy-only" ignored tests; keep `lexical_tantivy` only for the differential oracle. Also remove the `cass status` doc-count fallback that opens a Quill directory with the Tantivy reader. *Acceptance:* `cargo test --lib` green; `rg 'CASS_TANTIVY_STAGED|staged_shard_plan'` empty; the lib suite ignore count drops by 31. *Size:* L (mechanical but large; do in three commits: settings/env, workers/controllers, builder).
+
+**E.2 Vocabulary rename (cass).** *Change:* `rebuild_tantivy_from_db*` → `rebuild_lexical_from_db*`, user-facing "Tantivy lexical index completed" → "lexical index completed", `CASS_TANTIVY_*` → `CASS_LEXICAL_*` with one-release aliases and a deprecation warning. *Size:* M.
+
+**E.3 Bookmarks in the TUI (cass).** *Status:* CLI DONE today. *Change:* a `b` key in the results pane and a palette action that call `BookmarkStore::add` for the selected hit, plus a `Bookmarks` filter chip. *Acceptance:* headless TUI test bookmarks a hit and `cass bookmarks list --json` shows it. *Size:* S.
+
+**E.4 Retire unreachable semantic scaffolding if C.1 = (b) (cass).** *Change:* delete `two_tier_search.rs`, the owner-backed progressive lanes gated by hardcoded `false`, `ProbeCache`, and the vacuous `backtrace` feature. *Size:* M.
+
+**E.5 `lib.rs` decomposition (cass).** *Change:* mechanical, behavior-preserving moves guarded by goldens and the lib suite, one commit per module: `run_doctor_impl` + doctor helpers → `src/doctor/cli.rs`; `run_cli_search`/`output_robot_results`/`execute_search_operation` → `src/search/cli.rs`; `run_index_with_data` → `src/indexer/cli.rs`; `run_export_html` → `src/html_export/cli.rs`; `run_cli_pack` → `src/search/pack_cli.rs`; `run_status`/`run_health`/`state_meta_json*` → `src/status/mod.rs`; `build_response_schemas` → `src/introspect.rs`; `normalize_args` → `src/cli_normalize.rs`. Target lib.rs < 30K lines; no moved function > 300 lines (split by extracting the match arms into named functions during the move). *Acceptance:* every golden unchanged; `cass introspect --json` byte-identical before/after each move. *Size:* XL (rolling).
+
+**E.6 `indexer/mod.rs` and `ui/app.rs` splits (cass).** *Change:* indexer → `pipeline.rs` (producer/page-prep/sink), `publish.rs` (atomic swap, retention, recovery), `watch.rs`, `finalize.rs`; app.rs → per-surface update modules (`search`, `detail`, `analytics`, `sources`, `swarm`) with the key map in `keymap.rs`. *Acceptance:* snapshot tests and the lib suite unchanged. *Size:* XL (rolling, after E.1).
+
+**E.7 Replace source-scanning tests (cass).** *Change:* `doctor.rs` and `lib.rs` tests that `include_str!` the crate's own source and grep it become registry tests over the real dispatch tables. *Size:* S.
+
+#### WS-F — Robot contract (ES3, ES5)
+
+**F.1 `--timeout` semantics.** *Status:* DONE as documentation (exit 0 budget envelope is deliberate). *Optional change:* add `--timeout-exit-code 8` for agents that want a non-zero signal; not recommended unless requested.
+
+**F.2 Exit 70 through the envelope (cass).** *Change:* the stall abort emits `{error:{code:70, kind:"index-stalled", …}}` on stderr before exiting, with `phase`, `stall_elapsed_ms`, and the last progress fields. *Acceptance:* the B.2 planted-negative e2e parses the envelope. *Size:* S.
+
+**F.3 Swarm live adapters (cass).** *Change:* implement the adapter trait for live data — beads from `.beads/issues.jsonl`, Agent Mail from the local archive DB or the HTTP `/mcp` endpoint when reachable, rch from `rch status --json`, git from the existing helpers — and make fixtures test-only; capabilities must say `live` when live. *Acceptance:* `swarm status --json` on this repo reports real bead counts equal to `br list`; planted negative: an unreachable Agent Mail server yields `agent_mail.status="unreachable"`, not fixture data. *Size:* L.
+
+**F.4 Small contract holes (cass).** *Change:* add `_meta.cache_hit`; error (exit 2, `unknown-source`) on an unknown `--source`; `<mark>` wrapping in HTML export highlight; `has_json_output=true` for `bookmarks` in capabilities (subcommand-level flags must be reflected); unify the 4 snake_case error kinds to kebab-case with a one-release alias. *Acceptance:* goldens updated by intent; planted negative for `--source bogus`. *Size:* S.
+
+#### WS-G — Peripheral correctness (ES2, ES5)
+
+**G.1 `sources setup` (cass).** *Change:* run the final sync unless `--skip-sync`; make `install()` fall through binstall → prebuilt → cargo install → bootstrap on failure, recording each attempt in the setup state. *Acceptance:* the Docker sshd e2e completes setup + sync; planted negative: a host without cargo falls through to the prebuilt path. *Size:* M.
+
+**G.2 Installer and self-update (cass).** *Change:* glibc ≥ 2.38 probe in `install.sh` with automatic `--from-source` fallback; self-update backs up the current binary to `<dest>.bak`, verifies the new one with `selftest`, and restores on failure. *Acceptance:* `install-test.yml` matrix includes an Ubuntu 22.04 job that ends with a working `cass --version`; planted negative: a corrupted download restores the backup. *Size:* M.
+
+**G.3 HTML export (cass).** *Change:* decide Tailwind: either load it as documented with an `onerror` fallback or keep the current inline CSS and say so (docs already say so — keep); add `<mark>` highlighting; keep argv passwords rejected. *Size:* S.
+
+**G.4 Pages key management (cass).** *Change:* implement `cass pages key list|add|revoke|rotate` on top of `key_management.rs` (3,915 lines, zero callers) with the LUKS-style slot semantics the spec describes, or delete the module and the doc section if the owner prefers; fix the bogus `--output` flag in `lighthouse.yml`. *Acceptance:* a rotated key opens the bundle; the revoked key does not (planted negative). *Size:* M.
+
+**G.5 SSH e2e lane (cass).** *Change:* run the 9 ignored sshd Docker tests in a Docker-capable gate lane weekly. *Size:* S.
+
+#### WS-H — Tracker and swarm process (ES11)
+
+**H.1 Done-but-open beads.** *Status:* 7 closed today with commit-level evidence. *Remaining:* verify the 12 Pages/secret-scan beads (45jxv, 1hg2q, 4ydds, 7y2jt, c8gx1, cc7pi, h3ibc, kjdbv, z9sg6, yjjsg, h0rss, jfcgi) one by one against code and close each with the landing commit, or reopen with the missing acceptance condition named.
+
+**H.2 Obsolete beads.** *Status:* DONE (crates.io trio).
+
+**H.3 Beads for the no-bead gaps.** *Status:* 9 filed today (46nwq, 3yo55, 1xdho, 69vpt, nsleh, jrl45, xhw6y, jhkpq, z2uon). *Remaining:* file beads for A.1–A.10, B.3, B.5–B.7, B.10, B.12, C.2–C.7, D.4, E.1–E.7, F.2–F.4, G.1–G.5, H.4–H.8 when Phase 3a runs.
+
+**H.4 Stale in-progress re-triage.** *Change:* the 21 in-progress beads untouched > 30 days get a dated note from a current owner or return to open; the fleet-resilience epics (78/95 children closed) get closed or re-scoped.
+
+**H.5 bet45 narrative.** *Change:* correct the root-cause note to the cass-side suspects (see A.3).
+
+**H.6 `br` workspace health.** *Change:* run `br doctor --repair` on a preserved copy (owner's call), refresh the stale `beads.base.jsonl` merge anchor, remove the duplicate `br` from PATH.
+
+**H.7 Issue → bead rule.** *Change:* AGENTS.md rule: a GitHub issue gets a `gh<n>-<topic>` bead within 24 h, and the first triage comment cites it.
+
+**H.8 Swarm collision protocol (new, from today).** Today another agent committed this session's uncommitted working tree under its own messages and, in the same minutes, rewrote three files from older copies, dropping helper definitions whose callers had just been committed; main was red for ~35 minutes. *Change:* (a) AGENTS.md rule: never `git add -A`/`git commit -a`; stage only files you edited; (b) reserve shared monoliths (`src/lib.rs`, `src/indexer/mod.rs`, `src/storage/sqlite.rs`, `src/search/quill_bridge.rs`) through Agent Mail file reservations before editing, and install the Agent Mail pre-commit guard so a commit that includes a file reserved by another agent is refused; (c) prefer landing in small commits early over long-lived uncommitted trees. *Acceptance:* the guard refuses a planted commit touching a reserved file. *Size:* S.
+
+**H.9 Release path (bead yviq2).** *Change:* re-register the cass dsr config with the release.yml matrix so releases and Windows receipts do not depend on manual builds.
+
+#### WS-I — Release v0.7.2 (ES10)
+
+**I.1 Contents:** everything in §7b plus B.1–B.4 remaining items, F.2, F.4, D.4, A.6. **I.2 Gates:** A.2 receipts (or A.1 green), full lib suite green (A.3), integration receipt (A.4), goldens reviewed, UBS clean on changed files, CHANGELOG updated. **I.3 Reporter retests:** post the prepared comments on #441, #439, #395 (drafts exist) with the exact commit and ask for `cass status --json` after retest; #440 after B.3. **I.4 Platforms:** dsr-built candidates for the five targets with the Windows receipt (B.13). **I.5 Post-release:** brew/scoop bump, crates.io publish from the clean tag, main:master mirror.
+
+### 7.3 Dependencies and sequencing
+
+Critical path: **A.2 → A.3 → A.4** (a trustworthy gate) feeds everything; **B.1/B.2/B.3** are independent of each other and of A but their acceptance runs need A.2; **E.1** must precede **E.6**; **C.2** must precede any C.3–C.5 work; **F.2** precedes B.2's planted negative; **B.8** precedes A.8's ratchet; **H.8** should land before any further multi-agent editing of the monoliths.
+
+| Block | Tasks | Exit criterion |
+|---|---|---|
+| Day 1–2 | H.8, A.2, A.10, F.2, B.4(a), F.4, D.4, H.1 verification | one batched gate receipt green on main |
+| Week 1 | A.3, A.4, A.6, B.1(a,b), B.2(a,b,c), B.5, B.8(a,b) | lib suite green; #441/#439 e2e green; WAL truncation proven |
+| Week 2 | A.1 (owner), A.7, A.8, A.9, B.3, B.6, B.9(a), B.11, I.3 retest requests | CI green on push; bench ratchet live; reporters pinged with commits |
+| Week 3 | B.7, B.10, B.13, G.1, G.2, H.9, C.1 decision, C.2 | v0.7.2 candidate built on all platforms |
+| Week 4 | I.1–I.5 release; E.1, E.2, E.7; C.3–C.6 or E.4 per C.1 | v0.7.2 shipped with reporter retests |
+| Weeks 5–8 | E.5, E.6 (rolling), F.3, G.4, G.5, B.12, C.7 | lib.rs < 30K; no dead subsystems |
+
+### 7.4 Test, logging, and evidence standards (apply to every task)
+
+1. **Real fixtures, real binaries.** Integration tests use the built `cass` binary and temp data dirs; no mocks stand in for the engines. Large-archive claims use the recorded fixture recipes (2.1 GB bead-cjugu clone; 15k/2M synthetic corpus builder in `tests/util/`).
+2. **Positive observable + planted negative** in every test, named in the test's doc comment, plus a *No-claim* line stating what green does not prove.
+3. **Receipts, not prose.** Every long-running path emits structured events (`tracing::info!` with stable field names, or an NDJSON receipt under `--robot-trace-ingest`/`CASS_PIPELINE_TRACE`) and the e2e asserts on them; bead closes cite the command and the receipt.
+4. **No gate self-weakening.** Golden regeneration only after reading every diff; `#[ignore]` only with a reason naming the un-ignore condition; timeouts and thresholds change in their own commit with their own justification.
+5. **Independence.** A subagent's or peer's report is a claim; re-run its cited command before closing.
+
+### 7.5 Risks and mitigations
+
+- **Engine dependence** (frankensqlite scale behavior, Quill merge policy): keep every cass-side bound truthful (typed refusals with hints), cross-link engine beads, and never claim an engine fix from cass.
+- **Fleet admission scarcity**: batch gates (A.2); never spend an admission on a bare check.
+- **Swarm collisions** (H.8): file reservations + pre-commit guard; small early commits.
+- **Golden environment leaks** (A.6): isolation guard before any further regeneration.
+- **Decomposition churn** (E.5/E.6): one module per commit, goldens and introspect byte-identical between commits, no behavior changes mixed in.
+- **Semantic scope creep** (WS-C): nothing beyond C.2 until the owner decides C.1.
+
+### 7.6 Effort tally (cass-side)
+
+S: 17 tasks · M: 24 · L: 5 · XL: 2 (E.5, E.6). Roughly six focused agent-weeks for everything except E.5/E.6, which are rolling. The first two blocks (Day 1–2, Week 1) remove every user-visible failure class found in the reality check.
 
 ---
 
@@ -375,7 +512,7 @@ Landed in the working tree (verification status noted per item; nothing below is
 |---|---|---|---|
 | Robot teaching notes | WS-D5 | `emit_correction_notes`: robot mode prints `note: auto-corrected: …` on stderr; stdout untouched | `tests/cli_robot.rs::robot_mode_auto_correction_emits_teaching_note_on_stderr` |
 | Bounded `health` | WS-B4 | watermark lane routed through the strict, mutation-free, 30 s-deadline owner-thread probe (`probe_state_db_strict_bounded_scoped`); inline recovery-capable lane deleted | `lib.rs::health_watermark_probe_tests` (dirty WAL byte-identical; hard failure surfaces) |
-| #441 fuel + degrade | WS-B1 | `cass_quill_config()` (100M fuel default, `CASS_QUILL_*` env overrides) at every Quill open; hybrid degrades to semantic on fuel exhaustion with `_meta.lexical_degrade_reason`; lexical-only gets an actionable hint | `quill_bridge` tests incl. `production_config_bounds_segment_growth_on_append_only_commits` (segment-growth hypothesis, must run) |
+| #441 fuel + degrade | WS-B1 | `cass_quill_config()` at every Quill open (a parallel agent found the real segment-growth root cause: Quill's 1 s `max_visibility_lag_ms` sealed a segment per shard per second on cass's ingest pattern; it is now disabled so snapshots publish only on cass commits, and `force_merge` folds published runs via `concat_merge`); the fuel budget stays at the engine default with `CASS_QUILL_QUERY_FUEL_BUDGET` as an escape hatch; hybrid degrades to semantic on fuel exhaustion with `_meta.lexical_degrade_reason`; lexical-only gets an actionable hint | `quill_bridge` tests incl. `production_config_bounds_segment_growth_on_append_only_commits` (40 append-only commits must publish < 2× fan-out segments; must run) and fuel-recognition |
 | #439 heartbeat | WS-B2 | post-publish FTS shadow rebuild ticks `IndexingProgress.activity` per page via `FrankenStorage::set_progress_heartbeat` | `sqlite.rs::fts_rebuild_ticks_installed_progress_heartbeat_per_page` |
 | #395 TUI startup | WS-B8 | deferred (lazy) semantic loader before first frame; analytics rollup rebuild spawned as a detached `cass analytics rebuild` child | none yet (headless first-frame proof still owed) |
 | Robot per-call overhead | WS-B7 | root cause measured with the v0.7.1 binary + strace: the self-heal fingerprint's sync storage open replays the whole 201 MB WAL (~4 s) on every default search; fingerprint now memoized on archive physical identity (`.archive-fingerprint-cache.json`) | `indexer::cached_archive_fingerprint_hits_on_unchanged_identity_and_misses_after_writes`; wall-time re-measure owed |

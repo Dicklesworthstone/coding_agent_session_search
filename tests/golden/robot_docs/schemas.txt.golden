@@ -3254,6 +3254,7 @@ schemas: (auto-generated from contract)
         - stale: boolean
         - stale_threshold_seconds: integer
         - status: string
+      - lexical_degrade_reason: ?
       - max_tokens: ?
       - mode_defaulted: ?
       - next_cursor: ?

@@ -19858,18 +19858,9 @@ fn state_db_strict_open_error_message(
 /// - The real-column integrity probe honors the same physical bundle
 ///   ceiling as [`bounded_canonical_db_corruption_probe`]; above it the
 ///   integrity stays `unknown` rather than paying an archive-sized read.
-fn probe_state_db_strict_bounded(
-    db_path: &Path,
-    reason: &str,
-    busy_timeout: Duration,
-    include_counts: bool,
-) -> StateDbSnapshot {
-    probe_state_db_strict_bounded_scoped(db_path, reason, busy_timeout, include_counts, false)
-}
-
-/// [`probe_state_db_strict_bounded`] with the health watermark scope.
 ///
-/// `watermarks_only` reads just the single-row `meta` watermarks and skips
+/// `watermarks_only` (the `cass health` scope) reads just the single-row
+/// `meta` watermarks and skips
 /// the integrity probe and row counts. It exists so `cass health` (k2k20 ask
 /// #2) shares the strict, mutation-free, hard-deadline opener with `status`
 /// instead of the inline read opener, whose sanctioned recovery writes
@@ -28514,7 +28505,7 @@ fn execute_search_operation(
                          stopword-heavy query on an archive with many index segments); retry \
                          with fewer or rarer terms, raise {} above {}, or run 'cass index --full' \
                          to consolidate segments",
-                        crate::search::quill_bridge::CASS_QUILL_QUERY_FUEL_BUDGET_ENV,
+                        crate::search::quill_bridge::QUILL_QUERY_FUEL_BUDGET_ENV,
                         crate::search::quill_bridge::cass_quill_config().query_fuel_budget
                     ))
                 } else {
