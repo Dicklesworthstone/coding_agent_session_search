@@ -7590,11 +7590,24 @@ fn doctor_reports_integrity_unchecked_reason_code_when_the_deep_probe_is_deferre
     );
 
     // Plant the deferral: the deep probe declines anything that is not a
-    // regular file, and a symlink is the cheapest such archive.
+    // regular file, and a symlink is the cheapest such archive. The seed
+    // index and the first doctor run left a passing integrity attestation
+    // keyed on the archive's size and mtime, which would answer for the
+    // deferred probe — bumping the mtime retires it, so the deferred run has
+    // no verdict to fall back on (the shape a never-verified large archive
+    // presents).
     let db_path = data_dir.join("agent_search.db");
     let real_db_path = data_dir.join("agent_search.real.db");
     fs::rename(&db_path, &real_db_path).expect("move the archive aside");
     std::os::unix::fs::symlink(&real_db_path, &db_path).expect("symlink the archive");
+    let archive = fs::OpenOptions::new()
+        .write(true)
+        .open(&real_db_path)
+        .expect("open the archive for a timestamp bump");
+    archive
+        .set_modified(std::time::SystemTime::now())
+        .expect("bump the archive mtime");
+    drop(archive);
 
     let deferred = run_doctor();
     let database = database_check(&deferred);
