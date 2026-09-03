@@ -1492,10 +1492,22 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
     let now_secs: u64 = now_ms.div_euclid(1000).max(0) as u64;
     let age_seconds = last_indexed_at_ms
         .and_then(|ts| (ts > 0).then(|| now_secs.saturating_sub((ts / 1000) as u64)));
-    let age_stale = match age_seconds {
+    let age_exceeds_threshold = match age_seconds {
         Some(age) => age > stale_threshold,
         None => true,
     };
+    // GH #452: a checkpoint fingerprint that still matches the live database
+    // means no conversation and no message has been added since the last
+    // successful index (`content-v1:<conversations>:<max_conversation_id>:
+    // <max_message_id>`), so the index is not out of date — only old. Age alone
+    // must not mark it stale and send every ordinary read into a refresh.
+    //
+    // Only genuine age is covered: an index with NO recorded `last_indexed_at`
+    // is unproven rather than old, and stays stale. Every other staleness
+    // signal (contract, engine, checkpoint, fingerprint mismatch) is untouched.
+    let age_stale_covered_by_fingerprint =
+        age_seconds.is_some() && fingerprint_matches == Some(true);
+    let age_stale = age_exceeds_threshold && !age_stale_covered_by_fingerprint;
     let maintenance_targets_current_db = maintenance
         .db_path
         .as_ref()
@@ -2636,6 +2648,114 @@ mod tests {
         assert_eq!(state.processed_conversations, None);
         assert_eq!(state.total_conversations, None);
         assert_eq!(state.indexed_docs, None);
+    }
+
+    /// GH #452: an index whose checkpoint fingerprint still matches the live
+    /// database has nothing new to ingest, so an old `last_indexed_at` alone
+    /// must report `ready` — not `stale`, which sends every ordinary read into
+    /// an archive-scale refresh.
+    #[test]
+    fn lexical_state_treats_age_as_covered_by_a_matching_fingerprint() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v4");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db file");
+
+        let checkpoint = LexicalRebuildCheckpoint {
+            db_path: db_path.display().to_string(),
+            total_conversations: 10,
+            storage_fingerprint: "content-v1:10:10:100".to_string(),
+            committed_offset: 10,
+            committed_conversation_id: Some(10),
+            processed_conversations: 10,
+            indexed_docs: 100,
+            schema_hash: SCHEMA_HASH.to_string(),
+            page_size: LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
+            completed: true,
+            updated_at_ms: 1_733_000_000_000,
+        };
+        // Indexed long ago (well past the 60 s threshold) but the database has
+        // not gained a conversation or a message since.
+        let input = |current_db_fingerprint: Option<&'static str>| LexicalObservationInput {
+            index_path: &index_path,
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_ms: 1_733_000_600_000,
+            maintenance: SearchMaintenanceSnapshot::default(),
+            checkpoint: Some(&checkpoint),
+            current_db_fingerprint,
+        };
+
+        let covered = lexical_state_from_observations(input(Some("content-v1:10:10:100")));
+        assert_eq!(
+            covered.status, "ready",
+            "a matching fingerprint covers pure age-staleness"
+        );
+        assert_eq!(covered.status_reason, None);
+
+        // New content since the checkpoint still reports stale.
+        let changed = lexical_state_from_observations(input(Some("content-v1:11:11:120")));
+        assert_eq!(changed.status, "stale");
+
+        // No fingerprint probe at all: age still decides, unchanged.
+        let unprobed = lexical_state_from_observations(input(None));
+        assert_eq!(unprobed.status, "stale");
+        assert!(
+            unprobed
+                .status_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("older than the stale threshold"))
+        );
+    }
+
+    /// An index with a matching fingerprint but NO recorded `last_indexed_at`
+    /// is unproven, not merely old: it stays stale.
+    #[test]
+    fn lexical_state_keeps_unknown_age_stale_even_with_a_matching_fingerprint() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v4");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .expect("write quill manifest");
+        let db_path = temp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db file");
+
+        let checkpoint = LexicalRebuildCheckpoint {
+            db_path: db_path.display().to_string(),
+            total_conversations: 10,
+            storage_fingerprint: "content-v1:10:10:100".to_string(),
+            committed_offset: 10,
+            committed_conversation_id: Some(10),
+            processed_conversations: 10,
+            indexed_docs: 100,
+            schema_hash: SCHEMA_HASH.to_string(),
+            page_size: LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
+            completed: true,
+            updated_at_ms: 1_733_000_000_000,
+        };
+
+        let state = lexical_state_from_observations(LexicalObservationInput {
+            index_path: &index_path,
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: None,
+            now_ms: 1_733_000_600_000,
+            maintenance: SearchMaintenanceSnapshot::default(),
+            checkpoint: Some(&checkpoint),
+            current_db_fingerprint: Some("content-v1:10:10:100"),
+        });
+
+        assert_eq!(state.status, "stale");
     }
 
     #[test]
