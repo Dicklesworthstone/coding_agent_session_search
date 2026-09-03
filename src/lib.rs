@@ -87625,6 +87625,38 @@ pub(crate) fn run_doctor_impl(
         vec!["archive DB open, row counts, and integrity-style checks completed or were skipped by state".to_string()],
     );
 
+    // GH #413 follow-up (iify0): a background catch-up that keeps dying looks
+    // like nothing more than "stale" from a read path. The breaker state says
+    // what happened and where the child's output is.
+    if let Some(auto) = crate::indexer::background_refresh::load_state(&data_dir)
+        && auto.consecutive_failures > 0
+    {
+        let tripped =
+            auto.consecutive_failures >= crate::indexer::background_refresh::FAILURE_TRIP_THRESHOLD;
+        add_check!(
+            "auto_refresh",
+            "warn",
+            format!(
+                "{} background catch-up{} ended without advancing the index; auto-refresh is {}. \
+                 {}. Run `cass index` in the foreground to see why; the breaker resets when a run \
+                 completes",
+                auto.consecutive_failures,
+                if auto.consecutive_failures == 1 {
+                    ""
+                } else {
+                    "s in a row"
+                },
+                if tripped {
+                    "tripped (no auto-spawn until a run completes)"
+                } else {
+                    "backing off"
+                },
+                auto.last_failure.as_deref().unwrap_or("no detail recorded")
+            ),
+            false
+        );
+    }
+
     // WS-B.5 (z2uon): an untruncated WAL is a tax every opener pays (the
     // owner's archive carried 200 MB for 18 days; every default search
     // replayed it). Observe from metadata only; repair only under --fix, never

@@ -62,6 +62,26 @@ Everything below is on `main`; nothing is in a released binary yet.
   40-segment generation is folded by a plain `cass index`).
 
 ### Fixed
+- Stale-on-read auto-refresh no longer respawns a doomed background catch-up
+  on every read. On 2026-09-03 a catch-up spawned by an agent's `cass search`
+  inherited that session's 16 GB cgroup, crawled the FTS5 shadow write path
+  for an hour on a 10 GB archive, was OOM-killed at 14 GB without advancing
+  `last_indexed_at`, and the next stale read respawned it. The spawner now
+  judges the previous spawn against the index watermark: a spawn the index did
+  not outlive counts as a failure (1 h, then 6 h before the next attempt;
+  three in a row trip the breaker until any run completes). Surfaced as
+  `auto_refresh.outcome` = `backed_off`/`tripped` with `consecutive_failures`
+  and `detail` in `--robot-meta`/`status --json`, in `schedule status`, and as
+  a `doctor` warning.
+- An index run whose inline `fts_messages` shadow writes exceed a budget
+  (`CASS_FTS_INLINE_BUDGET_SECS`, default 300 s) skips the shadow for the rest
+  of the run instead of crawling for hours: canonical rows and the Quill index
+  still land and `last_indexed_at` advances; the shadow (read only by the SQL
+  search fallback) is left Partial with the reason persisted for `doctor`. The
+  paged shadow repair/rebuild gets a per-page budget
+  (`CASS_FTS_REPAIR_PAGE_BUDGET_SECS`, default 120 s) so `index --full` and
+  `doctor --fix` stop truthfully at the same engine wall (GH #413,
+  frankensqlite#405/#406).
 - `cass doctor --json` reports `reason_code: "integrity_unchecked"` (also in
   `degraded_reason_codes`) when the deep page-integrity probe was deferred, so
   an agent no longer reads a `healthy` status on a large archive as "the
