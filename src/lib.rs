@@ -21830,8 +21830,12 @@ fn maybe_auto_refresh_index_after_read(
         }
     };
     let trigger = background_refresh::catch_up_reason(freshness)?;
-    let outcome =
-        background_refresh::maybe_spawn_background_index_refresh(data_dir, db_path, trigger);
+    let outcome = background_refresh::maybe_spawn_background_index_refresh(
+        data_dir,
+        db_path,
+        trigger,
+        background_refresh::last_indexed_at_ms_from_freshness(freshness),
+    );
     let mut value = serde_json::to_value(&outcome).unwrap_or(serde_json::Value::Null);
     if let serde_json::Value::Object(map) = &mut value {
         map.insert(
@@ -93906,7 +93910,9 @@ fn response_schema_index_freshness() -> serde_json::Value {
                     "pid": { "type": ["integer", "null"] },
                     "reason": { "type": ["string", "null"] },
                     "remaining_secs": { "type": ["integer", "null"] },
-                    "error": { "type": ["string", "null"] }
+                    "error": { "type": ["string", "null"] },
+                    "consecutive_failures": { "type": ["integer", "null"] },
+                    "detail": { "type": ["string", "null"] }
                 }
             }
         }
@@ -119755,6 +119761,22 @@ fn run_schedule_command(subcmd: ScheduleCommand, cli: &Cli) -> CliResult<()> {
                     "  auto-refresh last spawn {when} (pid {}, {})",
                     auto.last_pid, auto.last_reason
                 );
+                if auto.consecutive_failures > 0 {
+                    let verdict = if auto.consecutive_failures
+                        >= crate::indexer::background_refresh::FAILURE_TRIP_THRESHOLD
+                    {
+                        "tripped: no auto-spawn until a run completes"
+                    } else {
+                        "backing off"
+                    };
+                    println!(
+                        "  auto-refresh breaker {} ({} consecutive catch-ups ended without \
+                         advancing the index): {}",
+                        verdict.yellow(),
+                        auto.consecutive_failures,
+                        auto.last_failure.as_deref().unwrap_or("no detail recorded")
+                    );
+                }
             }
             println!("  logs: {}", report.log_dir.display());
             Ok(())

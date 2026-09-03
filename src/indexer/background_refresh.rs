@@ -17,6 +17,17 @@
 //!   every time a file changes. The active-writer window inside the indexer
 //!   already defers files that are still being written.
 //! * **Opt-out.** `CASS_AUTO_REFRESH=0` disables the behaviour entirely.
+//! * **A child that dies is not respawned blindly.** The child inherits the
+//!   spawner's cgroup (an agent session capped at 16 GB, say) and can be
+//!   OOM-killed, stall-aborted, or crash without ever advancing
+//!   `last_indexed_at`. On 2026-09-03 that turned every stale read of a
+//!   10 GB archive into another hour-long doomed run. So the next evaluation
+//!   compares the index watermark with the last spawn: a spawn the index did
+//!   not outlive counts as a failure, failures space the next attempt out
+//!   (1 h, then 6 h), and three in a row trip the breaker — no more
+//!   auto-spawns until *any* run completes and advances the watermark. The
+//!   state is surfaced by `search --robot-meta`, `status --json`,
+//!   `schedule status`, and `doctor`.
 //!
 //! The child is `cass index --background --json --no-progress-events`, which
 //! applies `nice`/`ionice` to itself before doing any work.
@@ -34,6 +45,17 @@ use tracing::{debug, info, warn};
 
 /// Default minimum spacing between two auto-spawned catch-up runs.
 pub const DEFAULT_COOLDOWN_SECS: u64 = 300;
+
+/// Spacing after an auto-spawned catch-up ended without advancing the index,
+/// indexed by `consecutive_failures - 1`, measured from the moment the failure
+/// was detected. The last entry also covers any longer streak below the trip
+/// threshold.
+pub const FAILURE_BACKOFF_SECS: [u64; 2] = [3_600, 6 * 3_600];
+
+/// Consecutive failed catch-ups that trip the breaker: no auto-spawn until a
+/// run (foreground `cass index`, scheduled, or a later manual full run)
+/// completes and advances `last_indexed_at`.
+pub const FAILURE_TRIP_THRESHOLD: u32 = 3;
 
 /// Default nice value applied by `cass index --background`.
 pub const DEFAULT_BACKGROUND_NICE: i32 = 15;
@@ -94,6 +116,19 @@ pub enum AutoRefreshOutcome {
     GuardBusy,
     /// Could not start the child process.
     SpawnFailed { error: String },
+    /// The previous auto-spawned catch-up ended without advancing the index;
+    /// the next attempt waits out an escalated spacing.
+    BackedOff {
+        consecutive_failures: u32,
+        remaining_secs: u64,
+        detail: String,
+    },
+    /// [`FAILURE_TRIP_THRESHOLD`] catch-ups in a row failed; auto-spawn stays
+    /// off until a run completes and advances `last_indexed_at`.
+    Tripped {
+        consecutive_failures: u32,
+        detail: String,
+    },
 }
 
 impl AutoRefreshOutcome {
@@ -104,11 +139,27 @@ impl AutoRefreshOutcome {
 
 /// Durable record of the last auto-spawn, used for the cooldown and surfaced
 /// by `cass status`/`schedule status`.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AutoRefreshState {
     pub last_spawn_ms: i64,
     pub last_pid: u32,
     pub last_reason: String,
+    /// Auto-spawned catch-ups in a row that ended without advancing
+    /// `last_indexed_at`. Reset to zero as soon as any run advances it.
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    /// The spawn (`last_spawn_ms`) whose failure has already been counted, so
+    /// repeated reads between attempts do not inflate the streak.
+    #[serde(default)]
+    pub failure_counted_for_spawn_ms: i64,
+    /// When the most recent failure was detected; the backoff clock starts
+    /// here, not at the spawn (the doomed child may itself have run for an
+    /// hour).
+    #[serde(default)]
+    pub last_failure_detected_ms: i64,
+    /// What the most recent failure looked like, for `status`/`doctor`.
+    #[serde(default)]
+    pub last_failure: Option<String>,
 }
 
 pub fn state_path(data_dir: &Path) -> PathBuf {
@@ -141,6 +192,90 @@ fn save_state(data_dir: &Path, state: &AutoRefreshState) -> std::io::Result<()> 
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+fn rfc3339(ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| ms.to_string())
+}
+
+/// The index watermark carried by a freshness block: `last_indexed_at` is an
+/// RFC 3339 string in `cass status`/`--robot-meta` output; a bare millisecond
+/// integer is accepted too.
+pub fn last_indexed_at_ms_from_freshness(index_freshness: &serde_json::Value) -> Option<i64> {
+    let value = index_freshness.get("last_indexed_at")?;
+    if let Some(ms) = value.as_i64() {
+        return Some(ms);
+    }
+    chrono::DateTime::parse_from_rfc3339(value.as_str()?)
+        .ok()
+        .map(|t| t.timestamp_millis())
+}
+
+/// What the breaker says about spawning right now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BreakerVerdict {
+    Closed,
+    BackedOff { remaining_secs: u64 },
+    Tripped,
+}
+
+/// Judge the previous auto-spawn against the index watermark the caller just
+/// observed, updating the streak in `state` (persist it when it changed).
+///
+/// A spawn the watermark did not outlive is a failed catch-up: the child was
+/// OOM-killed, stall-aborted, or crashed before `last_indexed_at` was written.
+/// Each spawn is counted once. Any watermark at or past the spawn — that child
+/// finishing, a foreground `cass index`, the scheduler — resets the streak.
+/// `None` for the watermark means the caller cannot judge; nothing changes.
+pub fn judge_previous_spawn(
+    state: &mut AutoRefreshState,
+    last_indexed_at_ms: Option<i64>,
+    now_ms: i64,
+    child_log: &Path,
+) -> BreakerVerdict {
+    if state.last_spawn_ms <= 0 {
+        return BreakerVerdict::Closed;
+    }
+    let Some(watermark) = last_indexed_at_ms else {
+        return BreakerVerdict::Closed;
+    };
+    if watermark >= state.last_spawn_ms {
+        state.consecutive_failures = 0;
+        state.last_failure = None;
+        state.last_failure_detected_ms = 0;
+        return BreakerVerdict::Closed;
+    }
+    if state.failure_counted_for_spawn_ms != state.last_spawn_ms {
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        state.failure_counted_for_spawn_ms = state.last_spawn_ms;
+        state.last_failure_detected_ms = now_ms;
+        state.last_failure = Some(format!(
+            "background catch-up pid {} spawned {} ({}) ended without advancing the index \
+             (last_indexed_at {}); its output is in {}",
+            state.last_pid,
+            rfc3339(state.last_spawn_ms),
+            state.last_reason,
+            rfc3339(watermark),
+            child_log.display()
+        ));
+    }
+    if state.consecutive_failures >= FAILURE_TRIP_THRESHOLD {
+        return BreakerVerdict::Tripped;
+    }
+    let step = usize::try_from(state.consecutive_failures.saturating_sub(1)).unwrap_or(usize::MAX);
+    let backoff_ms = i64::try_from(FAILURE_BACKOFF_SECS[step.min(FAILURE_BACKOFF_SECS.len() - 1)])
+        .unwrap_or(i64::MAX)
+        .saturating_mul(1000);
+    let elapsed_ms = now_ms.saturating_sub(state.last_failure_detected_ms);
+    if elapsed_ms >= backoff_ms {
+        return BreakerVerdict::Closed;
+    }
+    let remaining_ms = backoff_ms - elapsed_ms;
+    BreakerVerdict::BackedOff {
+        remaining_secs: u64::try_from((remaining_ms + 999) / 1000).unwrap_or(u64::MAX),
+    }
 }
 
 /// Decide whether a freshness snapshot (the `index_freshness` block that
@@ -338,12 +473,14 @@ pub fn maybe_spawn_background_index_refresh(
     data_dir: &Path,
     db_path: &Path,
     reason: &str,
+    last_indexed_at_ms: Option<i64>,
 ) -> AutoRefreshOutcome {
     maybe_spawn_with_policy(
         data_dir,
         db_path,
         reason,
         false,
+        last_indexed_at_ms,
         AutoRefreshPolicy::from_env(),
     )
 }
@@ -355,11 +492,14 @@ pub fn maybe_spawn_background_full_index(
     db_path: &Path,
     reason: &str,
 ) -> AutoRefreshOutcome {
+    // The scheduler drives full passes on its own cadence; it does not hand
+    // over a watermark, so the breaker cannot (and does not) judge them.
     maybe_spawn_with_policy(
         data_dir,
         db_path,
         reason,
         true,
+        None,
         AutoRefreshPolicy::from_env(),
     )
 }
@@ -369,6 +509,7 @@ pub fn maybe_spawn_with_policy(
     db_path: &Path,
     reason: &str,
     full: bool,
+    last_indexed_at_ms: Option<i64>,
     policy: AutoRefreshPolicy,
 ) -> AutoRefreshOutcome {
     if !policy.enabled {
@@ -405,7 +546,48 @@ pub fn maybe_spawn_with_policy(
     }
 
     let now = now_ms();
-    let state = load_state(data_dir);
+    let mut state = load_state(data_dir);
+    if let Some(current) = state.as_mut() {
+        let before = current.clone();
+        let verdict = judge_previous_spawn(current, last_indexed_at_ms, now, &log_path(data_dir));
+        if *current != before
+            && let Err(error) = save_state(data_dir, current)
+        {
+            warn!(error = %error, "failed to persist auto-refresh breaker state");
+        }
+        let detail = current.last_failure.clone().unwrap_or_default();
+        match verdict {
+            BreakerVerdict::Closed => {}
+            BreakerVerdict::BackedOff { remaining_secs } => {
+                warn!(
+                    reason,
+                    consecutive_failures = current.consecutive_failures,
+                    remaining_secs,
+                    detail,
+                    "auto-refresh backed off: the previous background catch-up did not advance the index"
+                );
+                let _ = FileExt::unlock(&guard);
+                return AutoRefreshOutcome::BackedOff {
+                    consecutive_failures: current.consecutive_failures,
+                    remaining_secs,
+                    detail,
+                };
+            }
+            BreakerVerdict::Tripped => {
+                warn!(
+                    reason,
+                    consecutive_failures = current.consecutive_failures,
+                    detail,
+                    "auto-refresh tripped: run `cass index` in the foreground; auto-spawn resumes once a run completes"
+                );
+                let _ = FileExt::unlock(&guard);
+                return AutoRefreshOutcome::Tripped {
+                    consecutive_failures: current.consecutive_failures,
+                    detail,
+                };
+            }
+        }
+    }
     if let Some(remaining_secs) = cooldown_remaining(state.as_ref(), policy.cooldown, now) {
         debug!(reason, remaining_secs, "auto-refresh skipped: cooldown");
         let _ = FileExt::unlock(&guard);
@@ -433,10 +615,13 @@ pub fn maybe_spawn_with_policy(
                 data_dir = %data_dir.display(),
                 "spawned detached background index catch-up"
             );
+            // The streak survives the spawn: a child that dies again is the
+            // next consecutive failure, not the first.
             let new_state = AutoRefreshState {
                 last_spawn_ms: now,
                 last_pid: pid,
                 last_reason: reason.to_string(),
+                ..state.clone().unwrap_or_default()
             };
             if let Err(error) = save_state(data_dir, &new_state) {
                 warn!(error = %error, "failed to persist auto-refresh state");
@@ -517,6 +702,131 @@ mod tests {
     #[test]
     fn auto_refresh_is_enabled_by_default() {
         assert!(AutoRefreshPolicy::default().enabled);
+    }
+
+    #[test]
+    fn a_spawn_the_watermark_did_not_outlive_counts_once_and_backs_off() {
+        let log = Path::new("/scratch/auto-refresh.log");
+        let mut state = AutoRefreshState {
+            last_spawn_ms: 1_000_000,
+            last_pid: 42,
+            last_reason: "index-stale".to_string(),
+            ..AutoRefreshState::default()
+        };
+        let first = judge_previous_spawn(&mut state, Some(500_000), 5_000_000, log);
+        assert_eq!(
+            first,
+            BreakerVerdict::BackedOff {
+                remaining_secs: FAILURE_BACKOFF_SECS[0]
+            }
+        );
+        assert_eq!(state.consecutive_failures, 1);
+        assert_eq!(state.last_failure_detected_ms, 5_000_000);
+        // Read again ten seconds later at the same watermark: the same
+        // failure, not a second one.
+        let again = judge_previous_spawn(&mut state, Some(500_000), 5_010_000, log);
+        assert_eq!(
+            again,
+            BreakerVerdict::BackedOff {
+                remaining_secs: FAILURE_BACKOFF_SECS[0] - 10
+            }
+        );
+        assert_eq!(state.consecutive_failures, 1);
+        let detail = state.last_failure.clone().expect("failure detail");
+        assert!(
+            detail.contains("pid 42")
+                && detail.contains("index-stale")
+                && detail.contains("auto-refresh.log"),
+            "{detail}"
+        );
+        // Once the backoff elapses a new attempt is allowed; the streak stays
+        // so a second dead child counts as failure two.
+        let elapsed = 5_000_000 + i64::try_from(FAILURE_BACKOFF_SECS[0]).unwrap() * 1000;
+        assert_eq!(
+            judge_previous_spawn(&mut state, Some(500_000), elapsed, log),
+            BreakerVerdict::Closed
+        );
+        assert_eq!(state.consecutive_failures, 1);
+    }
+
+    #[test]
+    fn three_failed_spawns_trip_until_a_run_advances_the_watermark() {
+        let log = Path::new("/scratch/auto-refresh.log");
+        let mut state = AutoRefreshState::default();
+        let mut now = 10_000_000_i64;
+        for spawn in 1..=FAILURE_TRIP_THRESHOLD {
+            state.last_spawn_ms = now;
+            state.last_pid = spawn;
+            // The child ran for an hour and died without writing the watermark.
+            now += 3_600_000;
+            let verdict = judge_previous_spawn(&mut state, Some(1), now, log);
+            assert_eq!(state.consecutive_failures, spawn);
+            if spawn < FAILURE_TRIP_THRESHOLD {
+                assert!(
+                    matches!(verdict, BreakerVerdict::BackedOff { .. }),
+                    "{verdict:?}"
+                );
+                now += 7 * 3_600_000;
+            } else {
+                assert_eq!(verdict, BreakerVerdict::Tripped);
+            }
+        }
+        // Still tripped a week later at the same watermark.
+        assert_eq!(
+            judge_previous_spawn(&mut state, Some(1), now + 7 * 86_400_000, log),
+            BreakerVerdict::Tripped
+        );
+        // Any completed run resets the breaker.
+        assert_eq!(
+            judge_previous_spawn(&mut state, Some(now + 1), now + 2, log),
+            BreakerVerdict::Closed
+        );
+        assert_eq!(state.consecutive_failures, 0);
+        assert!(state.last_failure.is_none());
+        assert_eq!(state.last_failure_detected_ms, 0);
+    }
+
+    #[test]
+    fn breaker_does_not_judge_without_a_watermark_or_a_prior_spawn() {
+        let log = Path::new("/scratch/auto-refresh.log");
+        let mut fresh = AutoRefreshState::default();
+        assert_eq!(
+            judge_previous_spawn(&mut fresh, Some(1), 2, log),
+            BreakerVerdict::Closed
+        );
+        let mut spawned = AutoRefreshState {
+            last_spawn_ms: 5,
+            ..AutoRefreshState::default()
+        };
+        assert_eq!(
+            judge_previous_spawn(&mut spawned, None, 6, log),
+            BreakerVerdict::Closed
+        );
+        assert_eq!(spawned.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn state_files_written_before_the_breaker_still_load() {
+        let legacy = r#"{"last_spawn_ms": 1788455403951, "last_pid": 897803, "last_reason": "index-stale"}"#;
+        let state: AutoRefreshState = serde_json::from_str(legacy).expect("legacy state parses");
+        assert_eq!(state.last_pid, 897803);
+        assert_eq!(state.consecutive_failures, 0);
+        assert_eq!(state.failure_counted_for_spawn_ms, 0);
+        assert!(state.last_failure.is_none());
+    }
+
+    #[test]
+    fn last_indexed_at_ms_accepts_rfc3339_and_millis() {
+        let stamp = "2026-08-14T12:00:00+00:00";
+        let expected = chrono::DateTime::parse_from_rfc3339(stamp)
+            .unwrap()
+            .timestamp_millis();
+        let rfc = serde_json::json!({ "last_indexed_at": stamp });
+        assert_eq!(last_indexed_at_ms_from_freshness(&rfc), Some(expected));
+        let millis = serde_json::json!({ "last_indexed_at": expected });
+        assert_eq!(last_indexed_at_ms_from_freshness(&millis), Some(expected));
+        let missing = serde_json::json!({ "last_indexed_at": null });
+        assert_eq!(last_indexed_at_ms_from_freshness(&missing), None);
     }
 
     #[test]
@@ -601,6 +911,7 @@ mod tests {
             &missing.join("agent_search.db"),
             "test",
             false,
+            None,
             AutoRefreshPolicy {
                 enabled: false,
                 cooldown: Duration::from_secs(1),
@@ -628,6 +939,7 @@ mod tests {
             &data_dir.join("agent_search.db"),
             "test",
             false,
+            None,
             AutoRefreshPolicy {
                 enabled: true,
                 cooldown: Duration::from_secs(3600),
@@ -660,6 +972,7 @@ mod tests {
             &data_dir.join("agent_search.db"),
             "test",
             false,
+            None,
             AutoRefreshPolicy {
                 enabled: true,
                 ..AutoRefreshPolicy::default()
