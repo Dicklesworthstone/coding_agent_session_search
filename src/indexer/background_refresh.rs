@@ -806,6 +806,81 @@ mod tests {
     }
 
     #[test]
+    fn spawn_path_backs_off_on_a_failed_previous_spawn_and_persists_the_streak() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path();
+        // A spawn an hour ago whose child never advanced the watermark (the
+        // watermark is a day older than the spawn).
+        let spawn_ms = now_ms() - 3_600_000;
+        save_state(
+            data_dir,
+            &AutoRefreshState {
+                last_spawn_ms: spawn_ms,
+                last_pid: 4242,
+                last_reason: "index-stale".to_string(),
+                ..AutoRefreshState::default()
+            },
+        )
+        .unwrap();
+        let outcome = maybe_spawn_with_policy(
+            data_dir,
+            &data_dir.join("agent_search.db"),
+            "index-stale",
+            false,
+            Some(spawn_ms - 86_400_000),
+            AutoRefreshPolicy {
+                enabled: true,
+                cooldown: Duration::from_secs(1),
+            },
+        );
+        match &outcome {
+            AutoRefreshOutcome::BackedOff {
+                consecutive_failures,
+                remaining_secs,
+                detail,
+            } => {
+                assert_eq!(*consecutive_failures, 1);
+                assert!(
+                    *remaining_secs > FAILURE_BACKOFF_SECS[0] - 60
+                        && *remaining_secs <= FAILURE_BACKOFF_SECS[0],
+                    "{remaining_secs}"
+                );
+                assert!(detail.contains("pid 4242"), "{detail}");
+            }
+            other => panic!("expected BackedOff, got {other:?}"),
+        }
+        let saved = load_state(data_dir).expect("state persisted");
+        assert_eq!(saved.consecutive_failures, 1);
+        assert_eq!(saved.failure_counted_for_spawn_ms, spawn_ms);
+        assert_eq!(saved.last_pid, 4242, "no child was spawned");
+        let json = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(json["outcome"], "backed_off");
+        assert_eq!(json["consecutive_failures"], 1);
+
+        // A completed run since the spawn resets the streak and lets the
+        // ordinary cooldown decide (still inside it here: the state's spawn
+        // time is what the cooldown reads, and it is an hour old, so the
+        // 1 s cooldown has long expired — the spawn itself is attempted
+        // against a missing binary path only in real runs; here we just
+        // check the streak reset on disk).
+        let mut reset = load_state(data_dir).unwrap();
+        let verdict = judge_previous_spawn(
+            &mut reset,
+            Some(spawn_ms + 1),
+            now_ms(),
+            &log_path(data_dir),
+        );
+        assert_eq!(verdict, BreakerVerdict::Closed);
+        assert_eq!(reset.consecutive_failures, 0);
+        let tripped_json = serde_json::to_value(AutoRefreshOutcome::Tripped {
+            consecutive_failures: FAILURE_TRIP_THRESHOLD,
+            detail: "x".to_string(),
+        })
+        .unwrap();
+        assert_eq!(tripped_json["outcome"], "tripped");
+    }
+
+    #[test]
     fn state_files_written_before_the_breaker_still_load() {
         let legacy = r#"{"last_spawn_ms": 1788455403951, "last_pid": 897803, "last_reason": "index-stale"}"#;
         let state: AutoRefreshState = serde_json::from_str(legacy).expect("legacy state parses");
