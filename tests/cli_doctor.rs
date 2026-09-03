@@ -7528,3 +7528,97 @@ fn doctor_fix_wal_checkpoint_fails_truthfully_when_it_exceeds_its_deadline() {
         "a timed-out checkpoint must leave the sidecar as it found it"
     );
 }
+
+/// g3zyo (GH #382 follow-up): when doctor defers the deep page-integrity
+/// probe, the run can still be `healthy` (nothing failed) while the archive's
+/// structural health is unverified; an agent reading only `status` was misled
+/// on an archive stock `quick_check` calls corrupt. Positive observable: the
+/// deferred shape yields `reason_code == "integrity_unchecked"` next to the
+/// `database` warn and `status` stays `healthy`. Planted negative: the same
+/// archive as a regular file gets a `database` pass and no reason codes. The
+/// deferral is planted the cheap way — the probe refuses a non-regular file —
+/// so no multi-hundred-megabyte fixture is needed. No-claim: this does not
+/// make the probe run on large archives; it makes the skip visible.
+#[test]
+fn doctor_reports_integrity_unchecked_reason_code_when_the_deep_probe_is_deferred() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    seed_healthy_empty_index(test_home, &data_dir);
+
+    let run_doctor = || -> Value {
+        let out = cass_cmd(test_home)
+            .args([
+                "doctor",
+                "--json",
+                "--data-dir",
+                data_dir.to_str().expect("utf8"),
+            ])
+            .output()
+            .expect("run cass doctor --json");
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|err| {
+            panic!(
+                "doctor json: {err}\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })
+    };
+    let database_check = |payload: &Value| -> Value {
+        payload["checks"]
+            .as_array()
+            .expect("checks")
+            .iter()
+            .find(|check| check["name"].as_str() == Some("database"))
+            .cloned()
+            .expect("database check present")
+    };
+
+    let verified = run_doctor();
+    assert_eq!(verified["status"].as_str(), Some("healthy"), "{verified:#}");
+    assert_eq!(
+        database_check(&verified)["status"].as_str(),
+        Some("pass"),
+        "{verified:#}"
+    );
+    assert!(
+        verified["reason_code"].is_null()
+            && verified["degraded_reason_codes"]
+                .as_array()
+                .is_some_and(|codes| codes.is_empty()),
+        "a verified run carries no reason codes: {verified:#}"
+    );
+
+    // Plant the deferral: the deep probe declines anything that is not a
+    // regular file, and a symlink is the cheapest such archive.
+    let db_path = data_dir.join("agent_search.db");
+    let real_db_path = data_dir.join("agent_search.real.db");
+    fs::rename(&db_path, &real_db_path).expect("move the archive aside");
+    std::os::unix::fs::symlink(&real_db_path, &db_path).expect("symlink the archive");
+
+    let deferred = run_doctor();
+    let database = database_check(&deferred);
+    assert_eq!(database["status"].as_str(), Some("warn"), "{deferred:#}");
+    assert!(
+        database["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("structural integrity is unchecked")),
+        "{database}"
+    );
+    assert_eq!(
+        deferred["status"].as_str(),
+        Some("healthy"),
+        "nothing failed, so the fail-count contract keeps the status: {deferred:#}"
+    );
+    assert_eq!(
+        deferred["reason_code"].as_str(),
+        Some("integrity_unchecked"),
+        "the unchecked state must be machine-readable: {deferred:#}"
+    );
+    assert!(
+        deferred["degraded_reason_codes"]
+            .as_array()
+            .is_some_and(|codes| codes.iter().any(|code| code == "integrity_unchecked")),
+        "{deferred:#}"
+    );
+}

@@ -62,6 +62,10 @@ Everything below is on `main`; nothing is in a released binary yet.
   40-segment generation is folded by a plain `cass index`).
 
 ### Fixed
+- `cass doctor --json` reports `reason_code: "integrity_unchecked"` (also in
+  `degraded_reason_codes`) when the deep page-integrity probe was deferred, so
+  an agent no longer reads a `healthy` status on a large archive as "the
+  archive is verified"; `status`/`healthy` keep their fail-count contract.
 - Indexing a large archive no longer stalls "at a batch boundary" with one core
   pegged and no I/O (GH #413): every `INSERT INTO fts_messages` statement was
   making frankensqlite deep-clone the whole in-memory FTS5 table for its

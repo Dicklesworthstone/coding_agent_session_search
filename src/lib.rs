@@ -89925,6 +89925,21 @@ pub(crate) fn run_doctor_impl(
     {
         degraded_reason_codes.push("checkpoint_incomplete");
     }
+    // g3zyo (GH #382 follow-up): on a large archive the deep page-integrity
+    // probe is deferred (bounded doctor limit) and the `database` check is a
+    // warn saying "structural integrity is unchecked" — while `status` stays
+    // "healthy" because nothing failed. That summary misled a reader into
+    // "the archive is fine" on an archive stock `quick_check` calls corrupt.
+    // Surface the unchecked state as a stable reason code so an agent sees it
+    // without parsing the check message; `healthy` keeps its fail-count
+    // contract.
+    if checks.iter().any(|c| {
+        c.name == "database"
+            && c.status == "warn"
+            && c.message.contains("structural integrity is unchecked")
+    }) {
+        degraded_reason_codes.push("integrity_unchecked");
+    }
     let primary_reason_code = degraded_reason_codes.first().copied();
 
     // Output
@@ -89985,9 +90000,12 @@ pub(crate) fn run_doctor_impl(
             "status": doctor_status,
             // #287: machine-readable degradation taxonomy. `reason_code` is the
             // primary (highest-priority) entry of `degraded_reason_codes`; both
-            // are null/empty on healthy runs. Stable values:
+            // are null/empty on a fully verified healthy run. Stable values:
             // timeout_or_busy_spin_guard, db_unavailable,
-            // quarantine_circuit_breaker, checkpoint_incomplete.
+            // quarantine_circuit_breaker, checkpoint_incomplete,
+            // integrity_unchecked (status may still be "healthy": the deep
+            // page-integrity probe was deferred, so the archive's structural
+            // health is unverified rather than bad — g3zyo).
             "reason_code": primary_reason_code,
             "degraded_reason_codes": degraded_reason_codes,
             "health_class": health_class,
