@@ -6041,14 +6041,48 @@ fn blocking_sessions_file_pack_returns_bounded_partial_without_fabricated_eviden
     Ok(())
 }
 
+/// Budget for the pack timeout tests, derived from an unstalled run on the
+/// same fixture. The timeout must expire inside the injected planner/render
+/// stall, not in `search_setup`: on the debug-build fleet the archive open
+/// alone took anywhere from under 0.5 s to over 2 s across runs, so any fixed
+/// budget was wrong on some worker (bead zgzva). Returns `(budget_ms,
+/// stall_ms)`: three times the unstalled wall time (at least 2 s) and a stall
+/// of three budgets, so a run that waited the stall out is unmistakable.
+fn pack_timeout_budget_from_baseline(
+    data_dir: &std::path::Path,
+) -> Result<(u64, u64), Box<dyn Error>> {
+    let started = std::time::Instant::now();
+    let output = base_cmd()
+        .args([
+            "pack",
+            "hello",
+            "--json",
+            "--mode",
+            "lexical",
+            "--data-dir",
+            data_dir.to_str().ok_or("non-utf8 data dir")?,
+        ])
+        .output()?;
+    let baseline_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if !output.status.success() {
+        return Err(format!(
+            "baseline pack run failed: status={:?}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let budget_ms = (baseline_ms.saturating_mul(3)).max(2_000);
+    Ok((budget_ms, budget_ms.saturating_mul(3)))
+}
+
 #[test]
 fn timed_out_robot_pack_renderer_emits_fixed_size_partial_fallback() -> Result<(), Box<dyn Error>> {
     let data_dir = isolated_search_demo_data()?;
+    let (budget_ms, stall_ms) = pack_timeout_budget_from_baseline(data_dir.path())?;
     let started = std::time::Instant::now();
     let output = base_cmd()
-        // Same shape as the planner variant: 2 s budget against a 5 s injected
-        // render stall so the timeout lands in the stall, not in search_setup.
-        .env("CASS_TEST_PACK_RENDER_SLOW_MS", "5000")
+        .env("CASS_TEST_PACK_RENDER_SLOW_MS", stall_ms.to_string())
         .args([
             "pack",
             "hello",
@@ -6056,13 +6090,17 @@ fn timed_out_robot_pack_renderer_emits_fixed_size_partial_fallback() -> Result<(
             "--mode",
             "lexical",
             "--timeout",
-            "2000",
+            &budget_ms.to_string(),
             "--data-dir",
             data_dir.path().to_str().ok_or("non-utf8 data dir")?,
         ])
         .output()?;
-    if started.elapsed() >= std::time::Duration::from_millis(4500) {
-        return Err("pack command waited for the simulated five-second render stall".into());
+    if started.elapsed() >= std::time::Duration::from_millis(budget_ms + stall_ms / 2) {
+        return Err(format!(
+            "pack command waited for the simulated {stall_ms} ms render stall instead of \
+             stopping at its {budget_ms} ms budget"
+        )
+        .into());
     }
     if !output.status.success() {
         return Err(format!(
@@ -6110,8 +6148,8 @@ fn timed_out_robot_pack_renderer_emits_fixed_size_partial_fallback() -> Result<(
             .is_some_and(|probe| {
                 probe.starts_with("cass pack ")
                     && probe.contains("--data-dir")
-                    // The retry doubles the budget that timed out (2 s here).
-                    && probe.contains("--timeout 4000")
+                    // The retry doubles the budget that timed out.
+                    && probe.contains(&format!("--timeout {}", budget_ms * 2))
             })
     {
         return Err(format!(
@@ -6125,14 +6163,10 @@ fn timed_out_robot_pack_renderer_emits_fixed_size_partial_fallback() -> Result<(
 #[test]
 fn timed_out_robot_pack_planner_does_not_fabricate_selection() -> Result<(), Box<dyn Error>> {
     let data_dir = isolated_search_demo_data()?;
+    let (budget_ms, stall_ms) = pack_timeout_budget_from_baseline(data_dir.path())?;
     let started = std::time::Instant::now();
     let output = base_cmd()
-        // The budget must expire inside the injected planner stall, not in
-        // search_setup: on a loaded debug-build fleet worker the archive open
-        // alone exceeded the old 500 ms budget (skipped_sections started at
-        // search_setup, candidate_count 0), so the budget is 2 s against a 5 s
-        // stall and the guard below is 4.5 s (bead zgzva).
-        .env("CASS_TEST_PACK_PLAN_SLOW_MS", "5000")
+        .env("CASS_TEST_PACK_PLAN_SLOW_MS", stall_ms.to_string())
         .args([
             "pack",
             "hello",
@@ -6140,13 +6174,17 @@ fn timed_out_robot_pack_planner_does_not_fabricate_selection() -> Result<(), Box
             "--mode",
             "lexical",
             "--timeout",
-            "2000",
+            &budget_ms.to_string(),
             "--data-dir",
             data_dir.path().to_str().ok_or("non-utf8 data dir")?,
         ])
         .output()?;
-    if started.elapsed() >= std::time::Duration::from_millis(4500) {
-        return Err("pack command waited for the simulated five-second planner stall".into());
+    if started.elapsed() >= std::time::Duration::from_millis(budget_ms + stall_ms / 2) {
+        return Err(format!(
+            "pack command waited for the simulated {stall_ms} ms planner stall instead of \
+             stopping at its {budget_ms} ms budget"
+        )
+        .into());
     }
     if !output.status.success() {
         return Err(format!(
