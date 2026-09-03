@@ -12686,7 +12686,8 @@ impl FrankenStorage {
             budget_secs,
             last_flush_docs = docs,
             last_flush_ms = elapsed_ms,
-            "{detail}"
+            "{}",
+            detail
         );
         *suspended = Some(detail);
     }

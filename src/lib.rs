@@ -87631,8 +87631,8 @@ pub(crate) fn run_doctor_impl(
     if let Some(auto) = crate::indexer::background_refresh::load_state(&data_dir)
         && auto.consecutive_failures > 0
     {
-        let tripped = auto.consecutive_failures
-            >= crate::indexer::background_refresh::FAILURE_TRIP_THRESHOLD;
+        let tripped =
+            auto.consecutive_failures >= crate::indexer::background_refresh::FAILURE_TRIP_THRESHOLD;
         add_check!(
             "auto_refresh",
             "warn",
