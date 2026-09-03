@@ -5159,6 +5159,14 @@ pub struct CassApp {
     pub search_has_more: bool,
     /// Guard against overlapping async search requests (initial or load-more).
     pub search_in_flight: bool,
+    /// GH #452 / PR #451: true when the search currently in flight was itself
+    /// dispatched while another search was still running. Typing must be able
+    /// to preempt one slow search (typically the automatic empty-query search
+    /// issued at startup), but a further keystroke must NOT stack a third
+    /// concurrent backend search: on a multi-million-message archive each one
+    /// admits gigabytes of search state, so unbounded overlap wedges the
+    /// process. While this is set the debounce tick re-arms instead of firing.
+    pub search_preempted_in_flight: bool,
     /// True after initial live results arrive but refinement is still streaming.
     pub search_refining: bool,
     /// Which search mode is active (lexical / semantic / hybrid).
@@ -5522,6 +5530,7 @@ impl Default for CassApp {
             search_backend_offset: 0,
             search_has_more: false,
             search_in_flight: false,
+            search_preempted_in_flight: false,
             search_refining: false,
             search_mode: SearchMode::default(),
             match_mode: MatchMode::default(),
@@ -17066,6 +17075,10 @@ impl super::ftui_adapter::Model for CassApp {
                 );
                 self.search_dirty_since = None;
                 self.search_error_message = None;
+                // GH #452: remember whether THIS dispatch preempted a search
+                // that was still running. While that is true the debounce tick
+                // coalesces instead of stacking a third concurrent search.
+                self.search_preempted_in_flight = self.search_in_flight;
                 if self.progressive_search_service.is_some() && progressive {
                     self.search_generation = generation;
                     self.search_backend_offset = 0;
@@ -19864,13 +19877,23 @@ impl super::ftui_adapter::Model for CassApp {
                 if let Some(dirty_ts) = self.search_dirty_since {
                     let elapsed = dirty_ts.elapsed();
                     if elapsed >= SEARCH_DEBOUNCE {
-                        // Fire the new search even if one is already in-flight.
-                        // The generation counter ensures stale results from the
-                        // previous search are safely ignored when they arrive.
-                        // This prevents the user from waiting for an initial
-                        // empty-query search to finish before their typed query
-                        // starts executing.
-                        cmds.push(ftui::Cmd::msg(CassMsg::SearchRequested));
+                        if self.search_in_flight && self.search_preempted_in_flight {
+                            // A search is running that already preempted an
+                            // earlier one. Stacking a third concurrent backend
+                            // search would multiply the admitted search state
+                            // (GH #452), so keep the dirty flag and re-arm; the
+                            // pending query fires from the completion handler,
+                            // or from a later tick, as soon as we are idle.
+                            cmds.push(Self::delayed_tick(SEARCH_DEBOUNCE));
+                        } else {
+                            // Fire the new search even if one is already
+                            // in-flight. The generation counter ensures stale
+                            // results from the previous search are safely
+                            // ignored when they arrive. This prevents the user
+                            // from waiting for an initial empty-query search to
+                            // finish before their typed query starts executing.
+                            cmds.push(ftui::Cmd::msg(CassMsg::SearchRequested));
+                        }
                     } else {
                         cmds.push(Self::delayed_tick(SEARCH_DEBOUNCE.saturating_sub(elapsed)));
                     }
@@ -27432,6 +27455,71 @@ mod tests {
         assert!(
             matches!(cmd, ftui::Cmd::Batch(_)),
             "tick should return batch with SearchRequested when debounce elapsed"
+        );
+    }
+
+    /// GH #452 / PR #451: typing must still preempt ONE slow in-flight search
+    /// (the startup empty-query search), but the next keystroke must not stack
+    /// a third concurrent backend search.
+    #[test]
+    fn debounce_preempts_one_in_flight_search_then_coalesces() {
+        let mut app = CassApp::default();
+        app.search_in_flight = true;
+        app.search_preempted_in_flight = false;
+        app.search_dirty_since = Some(Instant::now() - std::time::Duration::from_millis(100));
+
+        let msgs = extract_msgs(app.update(CassMsg::Tick));
+        assert!(
+            msgs.iter()
+                .any(|msg| matches!(msg, CassMsg::SearchRequested)),
+            "the first keystroke must preempt the slow in-flight search"
+        );
+
+        // Simulate the dispatch the emitted SearchRequested performs: it marks
+        // the new search as one that preempted a running search.
+        app.search_preempted_in_flight = app.search_in_flight;
+        app.search_dirty_since = Some(Instant::now() - std::time::Duration::from_millis(100));
+
+        let msgs = extract_msgs(app.update(CassMsg::Tick));
+        assert!(
+            !msgs
+                .iter()
+                .any(|msg| matches!(msg, CassMsg::SearchRequested)),
+            "a second overlapping search must be coalesced, not stacked"
+        );
+        assert!(
+            app.search_dirty_since.is_some(),
+            "the pending query stays armed so it fires once the backend is idle"
+        );
+
+        // Once the in-flight search finishes, the pending query fires.
+        app.search_in_flight = false;
+        let msgs = extract_msgs(app.update(CassMsg::Tick));
+        assert!(
+            msgs.iter()
+                .any(|msg| matches!(msg, CassMsg::SearchRequested)),
+            "the coalesced query must fire as soon as the backend is idle"
+        );
+    }
+
+    /// The preemption budget is per in-flight search: a dispatch made while
+    /// nothing was running resets it, so the next keystroke may preempt again.
+    #[test]
+    fn search_requested_records_whether_it_preempted_a_running_search() {
+        let mut app = CassApp::default();
+        app.search_in_flight = true;
+        app.search_preempted_in_flight = false;
+        let _ = app.update(CassMsg::SearchRequested);
+        assert!(
+            app.search_preempted_in_flight,
+            "a dispatch made while a search was running is a preemption"
+        );
+
+        app.search_in_flight = false;
+        let _ = app.update(CassMsg::SearchRequested);
+        assert!(
+            !app.search_preempted_in_flight,
+            "a dispatch made while idle resets the preemption budget"
         );
     }
 

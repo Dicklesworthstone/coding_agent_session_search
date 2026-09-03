@@ -807,7 +807,8 @@ mod tests {
 
     #[test]
     fn state_files_written_before_the_breaker_still_load() {
-        let legacy = r#"{"last_spawn_ms": 1788455403951, "last_pid": 897803, "last_reason": "index-stale"}"#;
+        let legacy =
+            r#"{"last_spawn_ms": 1788455403951, "last_pid": 897803, "last_reason": "index-stale"}"#;
         let state: AutoRefreshState = serde_json::from_str(legacy).expect("legacy state parses");
         assert_eq!(state.last_pid, 897803);
         assert_eq!(state.consecutive_failures, 0);

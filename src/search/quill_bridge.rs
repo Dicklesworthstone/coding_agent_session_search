@@ -563,7 +563,7 @@ struct EngineLivenessProbe {
 }
 
 impl EngineLivenessProbe {
-    fn spawn(directory: PathBuf, heartbeat: EngineHeartbeat) -> Self {
+    fn spawn(targets: Vec<PathBuf>, heartbeat: EngineHeartbeat) -> Self {
         let armed = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let sampler = {
@@ -585,7 +585,7 @@ impl EngineLivenessProbe {
                             tracker = EngineLivenessTracker::default();
                             continue;
                         }
-                        let sample = EngineLivenessSample::capture(&directory);
+                        let sample = EngineLivenessSample::capture(&targets);
                         if tracker.observe(sample) {
                             heartbeat();
                         }
@@ -635,12 +635,53 @@ pub(crate) struct EngineLivenessSample {
 }
 
 impl EngineLivenessSample {
-    fn capture(directory: &Path) -> Self {
+    fn capture(targets: &[PathBuf]) -> Self {
         Self {
-            directory_footprint: directory_footprint(directory),
+            directory_footprint: watch_target_footprint(targets),
             process_cpu_time: process_cpu_time(),
         }
     }
+}
+
+/// Summed `(bytes, files)` over every watch target: a directory contributes
+/// its whole recursive footprint, a plain file contributes itself, and a
+/// missing path contributes nothing.
+fn watch_target_footprint(targets: &[PathBuf]) -> (u64, u64) {
+    let mut bytes = 0u64;
+    let mut files = 0u64;
+    for target in targets {
+        let Ok(metadata) = std::fs::metadata(target) else {
+            continue;
+        };
+        if metadata.is_dir() {
+            let (dir_bytes, dir_files) = directory_footprint(target);
+            bytes = bytes.saturating_add(dir_bytes);
+            files = files.saturating_add(dir_files);
+        } else if metadata.is_file() {
+            bytes = bytes.saturating_add(metadata.len());
+            files = files.saturating_add(1);
+        }
+    }
+    (bytes, files)
+}
+
+/// GH #450: run one opaque, potentially very long blocking call — a
+/// frankensqlite open that may perform a multi-gigabyte migration repair — with
+/// the same honest liveness sampler the Quill sink uses (see
+/// [`EngineLivenessProbe`]).
+///
+/// `targets` are the files/directories whose byte footprint counts as evidence
+/// of work (for a storage open: the database and its sidecars). `heartbeat` is
+/// called at most once per sample interval, and only in an interval where the
+/// footprint grew or the process burned CPU — so a genuinely wedged call still
+/// posts no progress and the stall watchdog still fires.
+pub(crate) fn run_with_liveness_ticks<T>(
+    targets: Vec<PathBuf>,
+    heartbeat: EngineHeartbeat,
+    op: impl FnOnce() -> T,
+) -> T {
+    let probe = EngineLivenessProbe::spawn(targets, heartbeat);
+    probe.during(op)
 }
 
 /// Pure decision core of the sampler: compares consecutive samples and says
@@ -804,7 +845,7 @@ impl QuillCassIndex {
     /// The indexer passes `IndexingProgress::tick_activity`.
     pub fn set_heartbeat(&mut self, heartbeat: Option<EngineHeartbeat>) {
         self.liveness = heartbeat
-            .map(|heartbeat| EngineLivenessProbe::spawn(self.directory.clone(), heartbeat));
+            .map(|heartbeat| EngineLivenessProbe::spawn(vec![self.directory.clone()], heartbeat));
     }
 
     fn tick_heartbeat(&self) {
@@ -1427,13 +1468,57 @@ mod tests {
     }
 
     #[test]
+    /// GH #450: a long blocking call that keeps growing a watched file must
+    /// post liveness ticks so the #258 stall detector does not call it a stall.
+    #[test]
+    fn run_with_liveness_ticks_reports_progress_for_a_long_growing_op() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let watched = tmp.path().join("archive.db");
+        std::fs::write(&watched, b"seed").expect("seed");
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let heartbeat: EngineHeartbeat = {
+            let ticks = Arc::clone(&ticks);
+            Arc::new(move || {
+                ticks.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+
+        let result = run_with_liveness_ticks(vec![watched.clone()], heartbeat, || {
+            // Three sample intervals: one to take the baseline, two that can
+            // observe growth.
+            for step in 0..3 {
+                std::fs::write(&watched, vec![b'x'; 1024 * (step + 1)]).expect("grow");
+                std::thread::sleep(ENGINE_LIVENESS_SAMPLE_INTERVAL + Duration::from_millis(250));
+            }
+            "done"
+        });
+
+        assert_eq!(result, "done");
+        assert!(
+            ticks.load(Ordering::Relaxed) > 0,
+            "a growing archive must post at least one liveness tick"
+        );
+    }
+
+    #[test]
     fn engine_liveness_sample_reads_real_footprint_and_cpu() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         std::fs::create_dir_all(tmp.path().join("nested")).expect("nested dir");
         std::fs::write(tmp.path().join("a.bin"), [0u8; 10]).expect("a");
         std::fs::write(tmp.path().join("nested").join("b.bin"), [0u8; 5]).expect("b");
-        let sample = EngineLivenessSample::capture(tmp.path());
+        let sample = EngineLivenessSample::capture(&[tmp.path().to_path_buf()]);
         assert_eq!(sample.directory_footprint, (15, 2));
+        // GH #450: a watch target may be a plain file (a database and its
+        // sidecars) or missing entirely.
+        assert_eq!(
+            watch_target_footprint(&[
+                tmp.path().join("a.bin"),
+                tmp.path().join("nested").join("b.bin"),
+                tmp.path().join("absent.bin"),
+            ]),
+            (15, 2),
+            "file targets sum their own sizes; a missing target contributes nothing"
+        );
         assert_eq!(
             directory_footprint(&tmp.path().join("does-not-exist")),
             (0, 0),

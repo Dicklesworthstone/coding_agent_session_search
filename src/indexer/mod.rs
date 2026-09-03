@@ -14748,8 +14748,47 @@ fn run_index_inner(
         ));
     }
 
+    // GH #450: this writable open is where frankensqlite runs its one-time
+    // migration repair, which copies and rewrites the whole archive and took
+    // ~25 minutes on a 2.6 GiB bundle. It posts no progress of its own, so the
+    // #258 stall detector saw `last_progress_at_ms` frozen and reported
+    // `status: "stalled"` at 0/N conversations while the process was doing
+    // sustained IO. Tick the same honest liveness signal the Quill sink uses
+    // (#446): progress is posted only in an interval where the database bundle
+    // (including the migration backup being written) grew or the process burned
+    // CPU, so a genuinely wedged open still reports `stalled`.
+    let open_liveness_targets = storage_open_liveness_targets(&opts.db_path);
+    let open_liveness_heartbeat: crate::search::quill_bridge::EngineHeartbeat = {
+        let progress = opts.progress.clone();
+        let progress_bump = Arc::clone(&progress_bump);
+        Arc::new(move || {
+            if let Some(progress) = progress.as_ref() {
+                progress.tick_activity();
+            }
+            bump_index_run_lock_progress_atomic(&progress_bump);
+        })
+    };
+    let storage_open_started = Instant::now();
     let (mut storage, canonical_storage_rebuilt, opened_fresh_for_full) =
-        open_storage_for_index(&opts.db_path, opts.full)?;
+        crate::search::quill_bridge::run_with_liveness_ticks(
+            open_liveness_targets,
+            open_liveness_heartbeat,
+            || open_storage_for_index(&opts.db_path, opts.full),
+        )?;
+    let storage_open_elapsed = storage_open_started.elapsed();
+    if storage_open_elapsed >= SLOW_STORAGE_OPEN_WARN_THRESHOLD {
+        // GH #450: name the cost. An open this long is a schema migration or
+        // frankensqlite's one-time migration repair, and the operator otherwise
+        // sees only a long silence before the first indexing phase.
+        tracing::warn!(
+            db_path = %opts.db_path.display(),
+            elapsed_secs = storage_open_elapsed.as_secs_f64(),
+            bundle_bytes = database_bundle_size_bytes(&opts.db_path),
+            "opening the canonical archive for writing took a long time; this phase covers schema \
+             migration and frankensqlite's one-time migration repair, and its cost scales with the \
+             archive size"
+        );
+    }
     complete_preflight_phase!();
 
     let defer_checkpoints = !opts.watch;
@@ -19201,6 +19240,31 @@ fn database_sidecar_paths(db_path: &Path) -> [PathBuf; 2] {
         database_path_with_suffix(db_path, "-wal"),
         database_path_with_suffix(db_path, "-shm"),
     ]
+}
+
+/// GH #450: how long a writable canonical open may take before it is worth an
+/// operator-visible warning naming the phase (schema migration / frankensqlite
+/// migration repair). Well above a healthy open on a multi-gigabyte archive.
+const SLOW_STORAGE_OPEN_WARN_THRESHOLD: Duration = Duration::from_secs(30);
+
+/// GH #450: the files whose byte footprint proves a writable storage open is
+/// still doing work. The archive and its WAL/SHM sidecars cover an ordinary
+/// open and a schema migration; the `.pre-migration-bak*` copies and the
+/// `.fsqlite-migration-state` marker cover frankensqlite's one-time migration
+/// repair, whose first (and longest) act is writing that backup.
+fn storage_open_liveness_targets(db_path: &Path) -> Vec<PathBuf> {
+    let mut targets = Vec::with_capacity(7);
+    targets.push(db_path.to_path_buf());
+    targets.extend(database_sidecar_paths(db_path));
+    for suffix in [
+        ".pre-migration-bak",
+        ".pre-migration-bak-wal",
+        ".pre-migration-bak-shm",
+        ".fsqlite-migration-state",
+    ] {
+        targets.push(database_path_with_suffix(db_path, suffix));
+    }
+    targets
 }
 
 fn database_path_with_suffix(db_path: &Path, suffix: &str) -> PathBuf {
@@ -46753,6 +46817,31 @@ mod tests {
 
         assert_eq!(wal, PathBuf::from("/tmp/cass.db-wal"));
         assert_eq!(shm, PathBuf::from("/tmp/cass.db-shm"));
+    }
+
+    /// GH #450: the storage-open liveness probe must watch the frankensqlite
+    /// migration-repair artifacts, not just the live archive — writing the
+    /// `.pre-migration-bak` copy is the longest, most opaque part of the open
+    /// and is the only footprint that grows while it runs.
+    #[test]
+    fn storage_open_liveness_targets_cover_the_migration_repair_artifacts() {
+        let db_path = PathBuf::from("/tmp/cass.db");
+        let targets = storage_open_liveness_targets(&db_path);
+
+        for expected in [
+            "/tmp/cass.db",
+            "/tmp/cass.db-wal",
+            "/tmp/cass.db-shm",
+            "/tmp/cass.db.pre-migration-bak",
+            "/tmp/cass.db.pre-migration-bak-wal",
+            "/tmp/cass.db.pre-migration-bak-shm",
+            "/tmp/cass.db.fsqlite-migration-state",
+        ] {
+            assert!(
+                targets.contains(&PathBuf::from(expected)),
+                "missing liveness watch target {expected}: {targets:?}"
+            );
+        }
     }
 
     #[test]
