@@ -32790,6 +32790,18 @@
                         "string",
                         "null"
                       ]
+                    },
+                    "consecutive_failures": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "detail": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   }
                 }

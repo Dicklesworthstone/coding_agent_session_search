@@ -2041,9 +2041,15 @@ fn gh413_inline_fts_shadow_writes_past_their_budget_suspend_and_the_run_still_co
     );
     let json: serde_json::Value =
         serde_json::from_slice(&search.stdout).expect("search --json output is JSON");
+    // Each fixture session carries the probe word in two messages, so count
+    // sessions (distinct source paths), not hits.
     let hits = json["hits"].as_array().expect("hits array");
+    let sessions: std::collections::BTreeSet<&str> = hits
+        .iter()
+        .filter_map(|hit| hit["source_path"].as_str())
+        .collect();
     assert_eq!(
-        hits.len(),
+        sessions.len(),
         2,
         "both sessions from the suspended run must be searchable through Quill: {json}"
     );
@@ -2304,10 +2310,18 @@ fn gh413_fts_shadow_over_its_corpus_bound_is_dropped_and_recreated_once_it_fits(
     );
     let search_json: serde_json::Value =
         serde_json::from_slice(&search.stdout).expect("search --json output is JSON");
+    let sessions: std::collections::BTreeSet<&str> = search_json["hits"]
+        .as_array()
+        .map(|hits| {
+            hits.iter()
+                .filter_map(|hit| hit["source_path"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
     assert_eq!(
-        search_json["hits"].as_array().map_or(0, Vec::len),
+        sessions.len(),
         2,
-        "Quill answers the search with the shadow gone: {search_json}"
+        "Quill answers the search for both seeded sessions with the shadow gone: {search_json}"
     );
 
     // The corpus fits again (bound lifted): the next full run recreates the
