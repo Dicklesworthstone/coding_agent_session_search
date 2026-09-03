@@ -83532,6 +83532,9 @@ enum DoctorFtsTableState {
     },
     Missing {
         frankensqlite_error: String,
+        /// The persisted reason when the shadow was dropped for size
+        /// (`fts_shadow_not_viable`, GH #413 follow-up).
+        not_viable: Option<String>,
     },
     /// The FTS virtual table answers queries but its docsize shadow cannot
     /// even be counted — the #362/#368 corruption class. Distinct from
@@ -83544,8 +83547,19 @@ enum DoctorFtsTableState {
 
 fn probe_doctor_fts_table<C: DoctorArchiveReadConnection>(conn: &C) -> DoctorFtsTableState {
     if let Err(frankensqlite_error) = conn.doctor_query("SELECT rowid FROM fts_messages LIMIT 1;") {
+        // GH #413 follow-up (iify0): an absent shadow may be a deliberate drop
+        // (the corpus is too large for the engine to materialize); say so.
+        let not_viable = conn
+            .doctor_query_row_map(
+                "SELECT value FROM meta WHERE key = 'fts_shadow_not_viable'",
+                &[] as &[crate::franken_sync::compat::ParamValue],
+                |row| row.get_typed::<String>(0),
+            )
+            .ok()
+            .filter(|detail| !detail.is_empty());
         return DoctorFtsTableState::Missing {
             frankensqlite_error: frankensqlite_error.to_string(),
+            not_viable,
         };
     }
     // Queryable is necessary but not sufficient (#355): an interrupted
@@ -87484,20 +87498,22 @@ pub(crate) fn run_doctor_impl(
                                                 }
                                                 Some(DoctorFtsTableState::Missing {
                                                     frankensqlite_error,
+                                                    not_viable,
                                                 }) => {
                                                     // An absent in-DB FTS shadow is benign
                                                     // here (lexical search falls back to
                                                     // Tantivy), so it does NOT feed the
                                                     // storage_state derivation — doctor
                                                     // reports it as a `pass` below.
-                                                    add_check!(
-                                                        "fts_table",
-                                                        "pass",
-                                                        format!(
+                                                    let message = match not_viable {
+                                                        Some(detail) => format!(
+                                                            "Database-resident FTS shadow was dropped on purpose: {detail}"
+                                                        ),
+                                                        None => format!(
                                                             "Database-resident FTS table is absent or not queryable via frankensqlite ({frankensqlite_error}); lexical search relies on the Tantivy index instead"
                                                         ),
-                                                        false
-                                                    );
+                                                    };
+                                                    add_check!("fts_table", "pass", message, false);
                                                 }
                                                 Some(DoctorFtsTableState::ShadowCorrupt {
                                                     frankensqlite_error,

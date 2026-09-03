@@ -9796,6 +9796,12 @@ enum FallbackFtsRepairOutcome {
     SkippedRepairFailed {
         detail: String,
     },
+    /// GH #413 follow-up (iify0): the shadow was dropped for size and the
+    /// corpus still exceeds the bound; there is nothing to repair until it
+    /// fits again. Quill serves lexical search; doctor carries the detail.
+    SkippedNotViable {
+        detail: String,
+    },
     Repaired(FtsConsistencyRepair),
 }
 
@@ -9812,6 +9818,9 @@ enum DailyStatsRepairOutcome {
 }
 
 fn nonfatal_fallback_fts_repair_outcome(detail: String) -> Option<FallbackFtsRepairOutcome> {
+    if crate::storage::sqlite::error_message_indicates_fts_shadow_not_viable(&detail) {
+        return Some(FallbackFtsRepairOutcome::SkippedNotViable { detail });
+    }
     if crate::storage::sqlite::error_message_indicates_populated_fts_shadow_without_rowid_reload(
         &detail,
     ) {
@@ -10049,9 +10058,8 @@ fn fallback_fts_repair_pending_detail(outcome: &FallbackFtsRepairOutcome) -> Opt
     match outcome {
         FallbackFtsRepairOutcome::SkippedRepairFailed { detail }
         | FallbackFtsRepairOutcome::SkippedCorruptDerivedIndex { detail }
-        | FallbackFtsRepairOutcome::SkippedUnsupportedPopulatedShadowReload { detail } => {
-            Some(detail.as_str())
-        }
+        | FallbackFtsRepairOutcome::SkippedUnsupportedPopulatedShadowReload { detail }
+        | FallbackFtsRepairOutcome::SkippedNotViable { detail } => Some(detail.as_str()),
         FallbackFtsRepairOutcome::Repaired(_)
         | FallbackFtsRepairOutcome::SkippedKnownHealthyForFingerprint { .. } => None,
     }
@@ -14791,6 +14799,71 @@ fn run_index_inner(
     }
     complete_preflight_phase!();
 
+    preflight_phase!("watch_startup:fts_shadow_viability");
+    // GH #413 follow-up (iify0): decide BEFORE the first write on this
+    // connection — the moment fsqlite rebuilds the whole in-memory index of a
+    // populated shadow (20 GB and minutes on a 10 GB archive) — whether the
+    // derived shadow may exist at all. The drop goes through a deferred-FTS5
+    // connection so it never hydrates what it removes.
+    match storage.fts_shadow_viability() {
+        Ok(crate::storage::sqlite::FtsShadowViability::NotViable {
+            corpus_bytes,
+            bound_bytes,
+        }) => {
+            let detail =
+                crate::storage::sqlite::fts_shadow_not_viable_detail(corpus_bytes, bound_bytes);
+            tracing::warn!(
+                db_path = %opts.db_path.display(),
+                corpus_bytes,
+                bound_bytes,
+                "dropping the derived fallback FTS shadow before the first write: the engine \
+                 cannot materialize a corpus this large (GH #413); Quill lexical search is \
+                 unaffected"
+            );
+            storage.close_best_effort_in_place();
+            let mut repair_storage =
+                crate::storage::sqlite::FrankenStorage::open_deferred_fts5_for_repair(
+                    &opts.db_path,
+                )
+                .with_context(|| {
+                    format!(
+                        "opening a deferred-FTS5 connection to drop the oversized shadow in {}",
+                        opts.db_path.display()
+                    )
+                })?;
+            let dropped = repair_storage.drop_fts_shadow_as_not_viable(&detail);
+            repair_storage.close_best_effort_in_place();
+            dropped.with_context(|| {
+                format!(
+                    "dropping the oversized fallback FTS shadow in {}",
+                    opts.db_path.display()
+                )
+            })?;
+            storage = crate::storage::sqlite::open_franken_storage_with_timeout(
+                &opts.db_path,
+                Duration::from_secs(10),
+            )
+            .with_context(|| {
+                format!(
+                    "reopening storage after dropping the oversized fallback FTS shadow in {}",
+                    opts.db_path.display()
+                )
+            })?;
+        }
+        Ok(crate::storage::sqlite::FtsShadowViability::Viable { corpus_bytes }) => {
+            storage.note_fts_shadow_corpus_bytes(corpus_bytes);
+        }
+        Ok(crate::storage::sqlite::FtsShadowViability::Absent) => {}
+        Err(err) => {
+            tracing::warn!(
+                db_path = %opts.db_path.display(),
+                error = %format!("{err:#}"),
+                "could not assess the fallback FTS shadow's viability; leaving it as it is"
+            );
+        }
+    }
+    complete_preflight_phase!();
+
     let defer_checkpoints = !opts.watch;
     let mut reopened_after_writable_preflight = false;
 
@@ -16578,6 +16651,26 @@ fn run_index_inner(
                 );
             }
         }
+        // GH #413 follow-up (iify0): a run that grew the corpus past the shadow
+        // bound drops the shadow now, on this connection (the vtab's destructor
+        // never reads it), so the next writable open pays nothing for it.
+        if storage.fts_shadow_drop_pending() {
+            let detail = storage
+                .fts_inline_suspension()
+                .unwrap_or_else(|| crate::storage::sqlite::fts_shadow_not_viable_detail(0, 0));
+            match storage.drop_fts_shadow_as_not_viable(&detail) {
+                Ok(()) => tracing::warn!(
+                    db_path = %opts.db_path.display(),
+                    "dropped the derived fallback FTS shadow: the corpus crossed the shadow bound \
+                     during this run (GH #413); Quill lexical search is unaffected"
+                ),
+                Err(err) => tracing::warn!(
+                    error = %format!("{err:#}"),
+                    "dropping the oversized fallback FTS shadow failed (non-fatal); the next run \
+                     retries at preflight"
+                ),
+            }
+        }
         // zn1xn F4: track the persistent lexical-repair deferral streak so
         // `status`/`index --json` expose the recurring full-rebuild
         // amplification (previously only a stderr warn). Increment when this
@@ -16788,6 +16881,14 @@ fn run_index_inner(
                     "optional derived fallback FTS repair failed; preserving the successful canonical SQLite and Tantivy build (#329). Lexical search is served by Tantivy; run 'cass doctor check --json' to inspect the shadow, and 'cass doctor --rebuild-canonical-fts --yes' for an explicit repair"
                 );
                 fts_repair_corruption_failure = Some(detail);
+            }
+            FallbackFtsRepairOutcome::SkippedNotViable { detail } => {
+                tracing::warn!(
+                    db_path = %opts.db_path.display(),
+                    detail = %detail,
+                    "derived fallback FTS shadow stays dropped: the corpus exceeds the shadow bound \
+                     (GH #413); Quill lexical search is unaffected"
+                );
             }
             FallbackFtsRepairOutcome::Repaired(FtsConsistencyRepair::AlreadyHealthy { rows }) => {
                 tracing::info!(

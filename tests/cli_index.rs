@@ -1958,6 +1958,394 @@ fn seed_fts_liveness_sessions(home: &std::path::Path) {
     );
 }
 
+/// GH #413 follow-up (iify0): once this run's inline `fts_messages` shadow
+/// writes exceed their budget the run skips the shadow and still completes:
+/// the new sessions are searchable through the Quill index, the run exits 0,
+/// and the reason is persisted where `status` (and doctor's snapshot) read
+/// it. Plants a 1 s budget and a 1.5 s park inside the first flush, so the
+/// first new conversation's flush trips the budget and the second one's is
+/// skipped. (`--json` pins the stderr log filter, so the warn line is not an
+/// observable here.) The negative control is a fresh archive indexed within
+/// budget: no marker.
+#[test]
+fn gh413_inline_fts_shadow_writes_past_their_budget_suspend_and_the_run_still_completes() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+    seed_fts_liveness_sessions(home);
+    let codex_root = home.join(".codex");
+
+    let full = base_cmd(home)
+        .current_dir(home)
+        .args([
+            "index",
+            "--full",
+            "--json",
+            "--no-progress-events",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .output()
+        .expect("seed the archive with a full index");
+    assert!(
+        full.status.success(),
+        "seed full index failed: {}",
+        String::from_utf8_lossy(&full.stderr)
+    );
+
+    make_codex_session(
+        &codex_root,
+        "2026/09/02",
+        "rollout-liveness-gamma.jsonl",
+        "fts liveness gamma budgetprobe",
+    );
+    make_codex_session(
+        &codex_root,
+        "2026/09/02",
+        "rollout-liveness-delta.jsonl",
+        "fts liveness delta budgetprobe",
+    );
+    let parked = base_cmd(home)
+        .current_dir(home)
+        .args(["index", "--json", "--no-progress-events", "--data-dir"])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_TEST_FTS_INLINE_FLUSH_PARK_MS", "1500")
+        .env("CASS_FTS_INLINE_BUDGET_SECS", "1")
+        .output()
+        .expect("run an incremental index whose first shadow flush blows the budget");
+    let stderr = String::from_utf8_lossy(&parked.stderr);
+    let stdout = String::from_utf8_lossy(&parked.stdout);
+    assert!(
+        parked.status.success(),
+        "a run whose shadow writes blew their budget must still complete; status={:?}\n\
+         stdout={stdout}\nstderr={stderr}",
+        parked.status
+    );
+
+    // Both new conversations landed: Quill (the lexical engine search uses)
+    // finds them although the shadow skipped at least one of them.
+    let search = base_cmd(home)
+        .current_dir(home)
+        .args(["search", "budgetprobe", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .output()
+        .expect("search the sessions indexed by the suspended run");
+    assert!(
+        search.status.success(),
+        "search failed: {}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&search.stdout).expect("search --json output is JSON");
+    let hits = json["hits"].as_array().expect("hits array");
+    assert_eq!(
+        hits.len(),
+        2,
+        "both sessions from the suspended run must be searchable through Quill: {json}"
+    );
+
+    // The reason is persisted where status (and doctor's snapshot) read it.
+    let status = base_cmd(home)
+        .current_dir(home)
+        .args(["status", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .output()
+        .expect("status after the suspended run");
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("status --json output is JSON");
+    let pending = &status_json["index"]["fallback_fts_repair"];
+    assert_eq!(
+        pending["pending"],
+        serde_json::json!(true),
+        "status must carry the suspended-shadow marker: {status_json}"
+    );
+    assert!(
+        pending["detail"].as_str().is_some_and(|detail| {
+            detail.contains("shadow writes suspended") && detail.contains("1 s budget")
+        }),
+        "the persisted detail names the suspension and the budget: {pending}"
+    );
+
+    // Negative control: a fresh archive whose incremental run stays inside the
+    // same 1 s budget (no park) carries no marker at all.
+    let control_tmp = TempDir::new().unwrap();
+    let control_home = control_tmp.path();
+    let control_data_dir = control_home.join("cass_data");
+    fs::create_dir_all(&control_data_dir).unwrap();
+    seed_fts_liveness_sessions(control_home);
+    let control_full = base_cmd(control_home)
+        .current_dir(control_home)
+        .args([
+            "index",
+            "--full",
+            "--json",
+            "--no-progress-events",
+            "--data-dir",
+        ])
+        .arg(&control_data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .output()
+        .expect("seed the control archive");
+    assert!(
+        control_full.status.success(),
+        "control seed failed: {}",
+        String::from_utf8_lossy(&control_full.stderr)
+    );
+    make_codex_session(
+        &control_home.join(".codex"),
+        "2026/09/02",
+        "rollout-liveness-epsilon.jsonl",
+        "fts liveness epsilon controlprobe",
+    );
+    let control = base_cmd(control_home)
+        .current_dir(control_home)
+        .args(["index", "--json", "--no-progress-events", "--data-dir"])
+        .arg(&control_data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_FTS_INLINE_BUDGET_SECS", "1")
+        .output()
+        .expect("run an incremental index within budget");
+    assert!(
+        control.status.success(),
+        "control run failed: {}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+    let control_status = base_cmd(control_home)
+        .current_dir(control_home)
+        .args(["status", "--json", "--data-dir"])
+        .arg(&control_data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .output()
+        .expect("status after the control run");
+    let control_json: serde_json::Value =
+        serde_json::from_slice(&control_status.stdout).expect("control status is JSON");
+    assert!(
+        control_json["index"].get("fallback_fts_repair").is_none(),
+        "a run inside the budget must leave no marker: {control_json}"
+    );
+}
+
+/// GH #413 follow-up (iify0): the paged post-publish shadow repair stops at
+/// its per-page budget instead of wedging, the `index --full` run still exits
+/// 0, and the reason is persisted where `status` reads it. The #439 PAGE_SLEEP
+/// hook stands in for a slow engine page (3 s against a 1 s budget), so the
+/// repair stops after its first page.
+#[test]
+fn gh413_paged_fts_shadow_repair_stops_at_its_page_budget_without_failing_the_run() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+    seed_fts_liveness_sessions(home);
+
+    let started = std::time::Instant::now();
+    // Not `fts_repair_liveness_index_cmd`: its 5 s / 20 s stall settings are
+    // calibrated for the #439 tests and aborted this run's `preparing` phase
+    // (exit 70) on a loaded debug worker before the repair began (verify35).
+    // The stall watchdog is not under test here; the page budget is.
+    let output = base_cmd(home)
+        .current_dir(home)
+        .args([
+            "index",
+            "--full",
+            "--json",
+            "--no-progress-events",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_FTS_REBUILD_BATCH_SIZE", "1")
+        .env("CASS_TEST_FTS_REPAIR_PAGE_SLEEP_MS", "3000")
+        .env("CASS_FTS_REPAIR_PAGE_BUDGET_SECS", "1")
+        .output()
+        .expect("run cass index --full with a repair page over its budget");
+    let elapsed = started.elapsed();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "a repair page over its budget must not fail the run; status={:?} elapsed={elapsed:?}\n\
+         stdout={stdout}\nstderr={stderr}",
+        output.status
+    );
+
+    let status = base_cmd(home)
+        .current_dir(home)
+        .args(["status", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .output()
+        .expect("status after the budget-stopped repair");
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("status --json output is JSON");
+    let pending = &status_json["index"]["fallback_fts_repair"];
+    assert_eq!(
+        pending["pending"],
+        serde_json::json!(true),
+        "status must carry the stopped-repair marker: {status_json}\nstderr={stderr}"
+    );
+    assert!(
+        pending["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("per-page budget")),
+        "the persisted detail names the page budget: {pending}"
+    );
+}
+
+/// GH #413 follow-up (iify0): with the shadow bound set below this fixture's
+/// corpus, `index --full` refuses to (re)create the SQL-fallback shadow, says
+/// so where `status` and `doctor` read it, and search still answers through
+/// Quill. Raising the bound lets the next full run recreate it and clears the
+/// marker.
+#[test]
+fn gh413_fts_shadow_over_its_corpus_bound_is_dropped_and_recreated_once_it_fits() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+    seed_fts_liveness_sessions(home);
+
+    // Seed with an unbounded shadow first, so the bounded run below exercises
+    // the preflight drop of an existing, populated shadow.
+    let seed = base_cmd(home)
+        .current_dir(home)
+        .args([
+            "index",
+            "--full",
+            "--json",
+            "--no-progress-events",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_FTS_SHADOW_MAX_CONTENT_BYTES", "0")
+        .output()
+        .expect("seed the archive with a shadow");
+    assert!(
+        seed.status.success(),
+        "seed failed: {}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+
+    let bounded = base_cmd(home)
+        .current_dir(home)
+        .args(["index", "--json", "--no-progress-events", "--data-dir"])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_FTS_SHADOW_MAX_CONTENT_BYTES", "1")
+        .output()
+        .expect("run an incremental index under a 1-byte shadow bound");
+    assert!(
+        bounded.status.success(),
+        "dropping an oversized shadow must not fail the run: {}",
+        String::from_utf8_lossy(&bounded.stderr)
+    );
+
+    let status = base_cmd(home)
+        .current_dir(home)
+        .args(["status", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .output()
+        .expect("status after the drop");
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("status --json output is JSON");
+    let pending = &status_json["index"]["fallback_fts_repair"];
+    assert_eq!(
+        pending["pending"],
+        serde_json::json!(true),
+        "status must carry the dropped-shadow marker: {status_json}"
+    );
+    assert!(
+        pending["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("not viable on this engine")),
+        "the persisted detail names the bound: {pending}"
+    );
+
+    let doctor = base_cmd(home)
+        .current_dir(home)
+        .args(["doctor", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .output()
+        .expect("doctor after the drop");
+    let doctor_json: serde_json::Value =
+        serde_json::from_slice(&doctor.stdout).expect("doctor --json output is JSON");
+    let fts_check = doctor_json["checks"]
+        .as_array()
+        .and_then(|checks| checks.iter().find(|check| check["name"] == "fts_table"))
+        .cloned()
+        .unwrap_or_else(|| panic!("doctor must report an fts_table check: {doctor_json}"));
+    assert_eq!(fts_check["status"], "pass", "{fts_check}");
+    assert!(
+        fts_check["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("dropped on purpose")),
+        "doctor says the drop was deliberate: {fts_check}"
+    );
+
+    let search = base_cmd(home)
+        .current_dir(home)
+        .args(["search", "liveness", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .output()
+        .expect("search without a shadow");
+    assert!(
+        search.status.success(),
+        "search failed without the shadow: {}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    let search_json: serde_json::Value =
+        serde_json::from_slice(&search.stdout).expect("search --json output is JSON");
+    assert_eq!(
+        search_json["hits"].as_array().map_or(0, Vec::len),
+        2,
+        "Quill answers the search with the shadow gone: {search_json}"
+    );
+
+    // The corpus fits again (bound lifted): the next full run recreates the
+    // shadow and clears the marker.
+    let recreate = base_cmd(home)
+        .current_dir(home)
+        .args([
+            "index",
+            "--full",
+            "--json",
+            "--no-progress-events",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_FTS_SHADOW_MAX_CONTENT_BYTES", "0")
+        .output()
+        .expect("full index with the bound lifted");
+    assert!(
+        recreate.status.success(),
+        "recreate run failed: {}",
+        String::from_utf8_lossy(&recreate.stderr)
+    );
+    let status = base_cmd(home)
+        .current_dir(home)
+        .args(["status", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .output()
+        .expect("status after the recreate");
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("status --json output is JSON");
+    assert!(
+        status_json["index"].get("fallback_fts_repair").is_none(),
+        "a recreated shadow leaves no marker: {status_json}"
+    );
+}
+
 #[test]
 fn gh439_slow_post_publish_fts_repair_is_not_aborted_while_it_heartbeats() {
     let tmp = TempDir::new().unwrap();
@@ -2089,9 +2477,13 @@ fn gh382_final_wal_checkpoint_is_bounded_and_leaves_the_wal_for_the_next_run() {
     );
     // The bound, measured against the same worker's load: a run that waited
     // for the 60 s park would take at least the plain run plus 60 s; a
-    // bounded one takes the plain run plus about a second (the budget).
+    // bounded one takes the plain run plus about a second (the budget) plus
+    // the full run's own base cost, which reached 38 s over the plain
+    // incremental run with two parking siblings on a loaded debug worker
+    // (verify35). 50 s keeps the discrimination: the parked path is at least
+    // 60 s over the base.
     assert!(
-        parked_elapsed < plain_elapsed + std::time::Duration::from_secs(30),
+        parked_elapsed < plain_elapsed + std::time::Duration::from_secs(50),
         "the parked run must return once the 1 s checkpoint budget passes, not wait for \
          the 60 s park; parked={parked_elapsed:?} plain={plain_elapsed:?}\nstderr={stderr}"
     );

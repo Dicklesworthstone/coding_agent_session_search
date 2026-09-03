@@ -1527,6 +1527,14 @@ const FTS_FRANKEN_REBUILD_FINGERPRINT_META_KEY: &str = "fts_frankensqlite_archiv
 /// index --json` / `status` expose the half-built shadow immediately, rather
 /// than only when doctor's next PartialParity/ShadowCorrupt check catches it.
 const FTS_FALLBACK_REPAIR_PENDING_META_KEY: &str = "fts_fallback_repair_pending";
+/// GH #413 follow-up (iify0): set when the derived fts5 shadow was dropped
+/// because the engine cannot materialize a corpus this large (see
+/// `fts_shadow_max_content_bytes`). Gates recreation.
+const FTS_SHADOW_NOT_VIABLE_META_KEY: &str = "fts_shadow_not_viable";
+/// Prefix of the error the shadow repair raises when it refuses to recreate a
+/// dropped, still-oversized shadow; the index run maps it to a nonfatal outcome.
+pub(crate) const FTS_SHADOW_NOT_VIABLE_ERROR_PREFIX: &str =
+    "fallback FTS shadow not viable on this engine: ";
 /// Bound on the persisted failure detail so a pathological error chain cannot
 /// bloat the `meta` row.
 const FTS_FALLBACK_REPAIR_PENDING_DETAIL_MAX_BYTES: usize = 400;
@@ -4668,6 +4676,12 @@ pub struct FrankenStorage {
     /// `fts_inline_flush_budget`.
     fts_inline_spent_ms: AtomicU64,
     fts_inline_suspended: parking_lot::Mutex<Option<String>>,
+    /// Corpus bytes the shadow already holds (noted at preflight) plus the
+    /// bytes this process has flushed into it, against
+    /// `fts_shadow_max_content_bytes`; and whether crossing the bound mid-run
+    /// left a drop for the run's finalize step.
+    fts_shadow_content_bytes_seen: AtomicU64,
+    fts_shadow_drop_pending: AtomicBool,
 }
 
 /// Keep ordinary storage commits from tripping over frequent auto-checkpoints
@@ -4876,6 +4890,8 @@ impl FrankenStorage {
             fts_maintenance_heartbeat: parking_lot::Mutex::new(None),
             fts_inline_spent_ms: AtomicU64::new(0),
             fts_inline_suspended: parking_lot::Mutex::new(None),
+            fts_shadow_content_bytes_seen: AtomicU64::new(0),
+            fts_shadow_drop_pending: AtomicBool::new(false),
         }
     }
 
@@ -12668,10 +12684,6 @@ impl FrankenStorage {
         if spent_ms <= u64::try_from(budget.as_millis()).unwrap_or(u64::MAX) {
             return;
         }
-        let mut suspended = self.fts_inline_suspended.lock();
-        if suspended.is_some() {
-            return;
-        }
         let budget_secs = budget.as_secs();
         let detail = format!(
             "inline fts_messages shadow writes suspended for this run: {spent_ms} ms spent \
@@ -12680,16 +12692,28 @@ impl FrankenStorage {
              on a shadow this size (GH #413, frankensqlite#405/#406). The shadow is behind \
              until a repair; Quill lexical search is unaffected"
         );
-        tracing::warn!(
-            target: "cass::fts_inline",
-            spent_ms,
-            budget_secs,
-            last_flush_docs = docs,
-            last_flush_ms = elapsed_ms,
-            "{}",
-            detail
-        );
+        if self.suspend_fts_inline_writes(detail) {
+            tracing::warn!(
+                target: "cass::fts_inline",
+                spent_ms,
+                budget_secs,
+                last_flush_docs = docs,
+                last_flush_ms = elapsed_ms,
+                "inline fallback-FTS shadow writes suspended: budget exceeded"
+            );
+        }
+    }
+
+    /// Suspend inline shadow writes for the rest of this process with the
+    /// given reason. Returns `false` when they were already suspended (the
+    /// first reason stands).
+    fn suspend_fts_inline_writes(&self, detail: String) -> bool {
+        let mut suspended = self.fts_inline_suspended.lock();
+        if suspended.is_some() {
+            return false;
+        }
         *suspended = Some(detail);
+        true
     }
 
     fn fts_inline_writes_suspended(&self) -> bool {
@@ -12700,6 +12724,152 @@ impl FrankenStorage {
     /// they were (GH #413 follow-up). The index run persists it for `doctor`.
     pub(crate) fn fts_inline_suspension(&self) -> Option<String> {
         self.fts_inline_suspended.lock().clone()
+    }
+
+    /// Bytes of message text the canonical archive holds
+    /// (`SUM(conversations.total_chars)`, chars ≈ bytes): what a complete
+    /// shadow would have to materialize. Cheap: one pass over `conversations`.
+    pub(crate) fn fts_shadow_corpus_bytes(&self) -> Result<u64> {
+        let total: i64 = self
+            .conn
+            .query_row_map(
+                "SELECT COALESCE(SUM(total_chars), 0) FROM conversations",
+                fparams![],
+                |row| row.get_typed::<i64>(0),
+            )
+            .with_context(|| "summing the canonical corpus size for the FTS shadow bound")?;
+        Ok(u64::try_from(total).unwrap_or(0))
+    }
+
+    fn fts_shadow_registered(&self) -> Result<bool> {
+        let rows: i64 = self
+            .conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages' AND rootpage > 0",
+                fparams![],
+                |row| row.get_typed::<i64>(0),
+            )
+            .with_context(|| "probing the catalog for the fts_messages shadow")?;
+        Ok(rows > 0)
+    }
+
+    /// GH #413 follow-up (iify0): may the derived shadow exist for this
+    /// archive's corpus? Reads only the catalog and `conversations`, so it is
+    /// safe before the first write on a fresh connection (the point at which
+    /// fsqlite would materialize a populated shadow in memory).
+    pub(crate) fn fts_shadow_viability(&self) -> Result<FtsShadowViability> {
+        self.fts_shadow_viability_with_bound(fts_shadow_max_content_bytes())
+    }
+
+    pub(crate) fn fts_shadow_viability_with_bound(
+        &self,
+        bound_bytes: Option<u64>,
+    ) -> Result<FtsShadowViability> {
+        if !self.fts_shadow_registered()? {
+            return Ok(FtsShadowViability::Absent);
+        }
+        let corpus_bytes = self.fts_shadow_corpus_bytes()?;
+        Ok(match bound_bytes {
+            Some(bound_bytes) if corpus_bytes > bound_bytes => FtsShadowViability::NotViable {
+                corpus_bytes,
+                bound_bytes,
+            },
+            _ => FtsShadowViability::Viable { corpus_bytes },
+        })
+    }
+
+    /// Remember how much corpus the shadow already covers, so inline flushes
+    /// can tell when this run crosses the bound.
+    pub(crate) fn note_fts_shadow_corpus_bytes(&self, corpus_bytes: u64) {
+        self.fts_shadow_content_bytes_seen
+            .store(corpus_bytes, Ordering::SeqCst);
+    }
+
+    /// Drop the derived shadow because the engine cannot materialize it, and
+    /// record why: the not-viable marker gates recreation, the repair-pending
+    /// marker is what `status`/`doctor` already surface. Safe on a deferred-
+    /// FTS5 connection (nothing is hydrated) and on an ordinary one (the
+    /// vtab's destructor never reads the shadow).
+    pub(crate) fn drop_fts_shadow_as_not_viable(&self, detail: &str) -> Result<()> {
+        self.invalidate_fts_messages_present_cache();
+        self.conn
+            .execute("DROP TABLE IF EXISTS fts_messages")
+            .with_context(|| "dropping the not-viable FTS5 shadow")?;
+        for table in FTS_MESSAGES_REQUIRED_SHADOW_TABLES {
+            self.conn
+                .execute(&format!("DROP TABLE IF EXISTS {table}"))
+                .with_context(|| format!("dropping the not-viable FTS5 shadow table {table}"))?;
+        }
+        self.set_fts_messages_present_cache(false);
+        self.fts_shadow_drop_pending.store(false, Ordering::SeqCst);
+        let bounded: String = detail
+            .chars()
+            .take(FTS_FALLBACK_REPAIR_PENDING_DETAIL_MAX_BYTES)
+            .collect();
+        self.conn
+            .execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams![FTS_SHADOW_NOT_VIABLE_META_KEY, bounded],
+            )
+            .with_context(|| "recording the not-viable FTS shadow marker")?;
+        self.record_fallback_fts_repair_pending(Some(detail))?;
+        Ok(())
+    }
+
+    /// The persisted not-viable marker, if the shadow was dropped for size.
+    pub(crate) fn fts_shadow_not_viable_marker(&self) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams![FTS_SHADOW_NOT_VIABLE_META_KEY],
+                |row| row.get_typed(0),
+            )
+            .optional()?
+            .filter(|detail: &String| !detail.is_empty()))
+    }
+
+    fn clear_fts_shadow_not_viable_marker(&self) -> Result<()> {
+        self.conn
+            .execute_compat(
+                "DELETE FROM meta WHERE key = ?1",
+                fparams![FTS_SHADOW_NOT_VIABLE_META_KEY],
+            )
+            .with_context(|| "clearing the not-viable FTS shadow marker")?;
+        Ok(())
+    }
+
+    /// Whether an inline flush crossed the bound during this run, leaving the
+    /// drop for the run's finalize step (the shadow is oversized now).
+    pub(crate) fn fts_shadow_drop_pending(&self) -> bool {
+        self.fts_shadow_drop_pending.load(Ordering::SeqCst)
+    }
+
+    /// When the shadow was dropped for size, refuse to recreate it while the
+    /// corpus still exceeds the bound (`Some(detail)`); clear the marker and
+    /// allow the rebuild once it fits again.
+    fn fts_shadow_recreate_refused(&self) -> Result<Option<String>> {
+        self.fts_shadow_recreate_refused_with_bound(fts_shadow_max_content_bytes())
+    }
+
+    fn fts_shadow_recreate_refused_with_bound(
+        &self,
+        bound_bytes: Option<u64>,
+    ) -> Result<Option<String>> {
+        if self.fts_shadow_not_viable_marker()?.is_none() {
+            return Ok(None);
+        }
+        let corpus_bytes = self.fts_shadow_corpus_bytes()?;
+        if let Some(bound_bytes) = bound_bytes
+            && corpus_bytes > bound_bytes
+        {
+            return Ok(Some(fts_shadow_not_viable_detail(
+                corpus_bytes,
+                bound_bytes,
+            )));
+        }
+        self.clear_fts_shadow_not_viable_marker()?;
+        Ok(None)
     }
 
     /// #439: install (or, with `None`, clear) the liveness callback that
@@ -13454,6 +13624,12 @@ impl FrankenStorage {
                 })
             }
             FtsShadowParityStatus::Absent => {
+                // GH #413 follow-up (iify0): a shadow dropped for size stays
+                // dropped while the corpus is over the bound; the index run
+                // maps this error to a nonfatal outcome.
+                if let Some(detail) = self.fts_shadow_recreate_refused()? {
+                    anyhow::bail!("{detail}");
+                }
                 let inserted_rows = self.rebuild_unusable_fts_shadow(&before)?;
                 self.require_healthy_fts_parity("FTS recreation")?;
                 self.record_fts_franken_rebuild_generation()?;
@@ -15454,6 +15630,61 @@ fn fts_repair_page_budget() -> Option<Duration> {
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_FTS_REPAIR_PAGE_BUDGET_SECS);
     (secs > 0).then_some(Duration::from_secs(secs))
+}
+
+/// Largest canonical corpus (sum of message chars, `conversations.total_chars`)
+/// for which cass keeps the derived `fts_messages` shadow at all.
+///
+/// fsqlite's FTS5 rebuilds the whole in-memory index of a populated shadow on
+/// the first write after a writable open
+/// (`rebuild_materialized_live_vtab_instances_from_reload` →
+/// `Fts5Table::rebuild_documents`), at roughly 35 KB of RAM per message on the
+/// owner's archive: 538k messages cost about 20 GB resident and minutes
+/// before cass has written a single row (accept/L2, 2026-09-03), and every
+/// later write transaction clones that index again. Above this bound the
+/// shadow is dropped — it is derived data; Quill is the lexical engine and the
+/// SQL search fallback scans `messages` when no shadow exists — and it is not
+/// recreated until the corpus fits again. `CASS_FTS_SHADOW_MAX_CONTENT_BYTES`
+/// overrides; `0` disables the bound.
+const DEFAULT_FTS_SHADOW_MAX_CONTENT_BYTES: u64 = 512 * 1024 * 1024;
+
+pub(crate) fn fts_shadow_max_content_bytes() -> Option<u64> {
+    let bytes = dotenvy::var("CASS_FTS_SHADOW_MAX_CONTENT_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_FTS_SHADOW_MAX_CONTENT_BYTES);
+    (bytes > 0).then_some(bytes)
+}
+
+/// Whether the derived fts5 shadow may exist for the archive's corpus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FtsShadowViability {
+    /// No `fts_messages` table in the catalog.
+    Absent,
+    Viable {
+        corpus_bytes: u64,
+    },
+    NotViable {
+        corpus_bytes: u64,
+        bound_bytes: u64,
+    },
+}
+
+/// The one sentence every surface (index log, status marker, doctor) uses
+/// for a shadow the engine cannot materialize.
+pub(crate) fn fts_shadow_not_viable_detail(corpus_bytes: u64, bound_bytes: u64) -> String {
+    format!(
+        "{FTS_SHADOW_NOT_VIABLE_ERROR_PREFIX}the canonical corpus is {corpus_bytes} bytes of \
+         message text, over the {bound_bytes} byte bound (CASS_FTS_SHADOW_MAX_CONTENT_BYTES); \
+         fsqlite's FTS5 rebuilds the whole shadow in memory on the first write after every \
+         writable open (about 35 KB of RAM per message; GH #413), so the derived shadow was \
+         dropped. Quill lexical search is unaffected; the SQL search fallback scans messages. \
+         The shadow is recreated by the next `cass index --full` once the corpus fits the bound"
+    )
+}
+
+pub(crate) fn error_message_indicates_fts_shadow_not_viable(detail: &str) -> bool {
+    detail.contains(FTS_SHADOW_NOT_VIABLE_ERROR_PREFIX)
 }
 
 fn defer_analytics_updates_enabled() -> bool {
@@ -20510,6 +20741,33 @@ fn flush_pending_fts_entries(
     }
 
     if storage.fts_messages_present_cached(tx) {
+        // GH #413 follow-up (iify0): a run that grows the corpus past the
+        // shadow bound stops feeding the shadow here and leaves the drop to
+        // the run's finalize step (see `fts_shadow_max_content_bytes`).
+        if let Some(bound_bytes) = fts_shadow_max_content_bytes() {
+            let batch_bytes = u64::try_from(*pending_chars).unwrap_or(u64::MAX);
+            let seen = storage
+                .fts_shadow_content_bytes_seen
+                .fetch_add(batch_bytes, Ordering::SeqCst)
+                .saturating_add(batch_bytes);
+            if seen > bound_bytes {
+                let detail = fts_shadow_not_viable_detail(seen, bound_bytes);
+                storage
+                    .fts_shadow_drop_pending
+                    .store(true, Ordering::SeqCst);
+                if storage.suspend_fts_inline_writes(detail) {
+                    tracing::warn!(
+                        target: "cass::fts_inline",
+                        corpus_bytes_seen = seen,
+                        bound_bytes,
+                        "inline fallback-FTS shadow writes suspended: the corpus crossed the shadow bound; the shadow is dropped at finalize"
+                    );
+                }
+                entries.clear();
+                *pending_chars = 0;
+                return Ok(());
+            }
+        }
         let started = Instant::now();
         *inserted_total += franken_batch_insert_fts(storage, tx, entries)?;
         // Test hook (tests/cli_index.rs): make a flush look as slow as the
@@ -21048,6 +21306,104 @@ mod tests {
                 "phase {phase} must not leak the uncommitted replacement shadow"
             );
         }
+    }
+
+    /// GH #413 follow-up (iify0): the shadow bound drops an oversized shadow,
+    /// records both markers, refuses to recreate it while the corpus is over
+    /// the bound, and lets the ordinary repair recreate it once it fits.
+    #[test]
+    fn fts_shadow_bound_drops_and_refuses_to_recreate_until_the_corpus_fits() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("fts-shadow-bound.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        seed_atomic_fts_rebuild_fixture(&storage);
+        let corpus = storage.fts_shadow_corpus_bytes().unwrap();
+        assert!(
+            corpus > 0,
+            "the fixture conversation carries its message chars"
+        );
+
+        // At the bound the shadow is viable; one byte under it is not.
+        assert_eq!(
+            storage
+                .fts_shadow_viability_with_bound(Some(corpus))
+                .unwrap(),
+            FtsShadowViability::Viable {
+                corpus_bytes: corpus
+            }
+        );
+        assert_eq!(
+            storage.fts_shadow_viability_with_bound(None).unwrap(),
+            FtsShadowViability::Viable {
+                corpus_bytes: corpus
+            }
+        );
+        let not_viable = storage
+            .fts_shadow_viability_with_bound(Some(corpus - 1))
+            .unwrap();
+        assert_eq!(
+            not_viable,
+            FtsShadowViability::NotViable {
+                corpus_bytes: corpus,
+                bound_bytes: corpus - 1
+            }
+        );
+
+        let detail = fts_shadow_not_viable_detail(corpus, corpus - 1);
+        assert!(error_message_indicates_fts_shadow_not_viable(&detail));
+        storage.drop_fts_shadow_as_not_viable(&detail).unwrap();
+        assert_eq!(
+            storage.fts_shadow_viability_with_bound(Some(1)).unwrap(),
+            FtsShadowViability::Absent
+        );
+        for table in std::iter::once("fts_messages").chain(FTS_MESSAGES_REQUIRED_SHADOW_TABLES) {
+            let rows: i64 = storage
+                .raw()
+                .query_row_map(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
+                    fparams![table],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 0, "{table} must be gone after the drop");
+        }
+        assert!(
+            storage
+                .fts_shadow_not_viable_marker()
+                .unwrap()
+                .is_some_and(|marker| marker.contains("not viable on this engine"))
+        );
+        assert!(
+            storage
+                .read_fallback_fts_repair_pending()
+                .unwrap()
+                .is_some_and(|pending| pending.contains("not viable on this engine")),
+            "status/doctor read the drop through the repair-pending marker"
+        );
+
+        // Still over the bound: recreation is refused and the marker stays.
+        assert!(
+            storage
+                .fts_shadow_recreate_refused_with_bound(Some(corpus - 1))
+                .unwrap()
+                .is_some()
+        );
+        assert!(storage.fts_shadow_not_viable_marker().unwrap().is_some());
+        // Fits again: the marker clears and the ordinary repair recreates it.
+        assert!(
+            storage
+                .fts_shadow_recreate_refused_with_bound(Some(corpus))
+                .unwrap()
+                .is_none()
+        );
+        assert!(storage.fts_shadow_not_viable_marker().unwrap().is_none());
+        storage.ensure_search_fallback_fts_consistency().unwrap();
+        assert_eq!(
+            storage.fts_shadow_viability_with_bound(None).unwrap(),
+            FtsShadowViability::Viable {
+                corpus_bytes: corpus
+            }
+        );
     }
 
     #[test]
