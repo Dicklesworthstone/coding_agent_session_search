@@ -53,10 +53,16 @@ const SEARCH_DEMO_DATA_DIR: &str = "tests/fixtures/search_demo_data";
 
 fn is_transient_lexical_build_path(path: &Path) -> bool {
     path.components().any(|component| {
-        component
-            .as_os_str()
-            .to_str()
-            .is_some_and(|name| name.starts_with("cass-lexical-shards."))
+        component.as_os_str().to_str().is_some_and(|name| {
+            name.starts_with("cass-lexical-shards.")
+                // The lexical self-heal's archive-fingerprint sidecar is a
+                // derived cache written next to the index through a
+                // `.<pid>.tmp` file and a rename. In-place robot tests running
+                // in parallel with a fixture clone make that temp file vanish
+                // between the directory walk and the copy (bead zgzva); the
+                // clone never needs it — a copied archive re-derives it.
+                || name.starts_with(".archive-fingerprint-cache.json")
+        })
     })
 }
 
