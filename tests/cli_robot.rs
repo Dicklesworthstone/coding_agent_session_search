@@ -6110,7 +6110,8 @@ fn timed_out_robot_pack_renderer_emits_fixed_size_partial_fallback() -> Result<(
             .is_some_and(|probe| {
                 probe.starts_with("cass pack ")
                     && probe.contains("--data-dir")
-                    && probe.contains("--timeout 1000")
+                    // The retry doubles the budget that timed out (2 s here).
+                    && probe.contains("--timeout 4000")
             })
     {
         return Err(format!(
