@@ -6046,7 +6046,9 @@ fn timed_out_robot_pack_renderer_emits_fixed_size_partial_fallback() -> Result<(
     let data_dir = isolated_search_demo_data()?;
     let started = std::time::Instant::now();
     let output = base_cmd()
-        .env("CASS_TEST_PACK_RENDER_SLOW_MS", "2000")
+        // Same shape as the planner variant: 2 s budget against a 5 s injected
+        // render stall so the timeout lands in the stall, not in search_setup.
+        .env("CASS_TEST_PACK_RENDER_SLOW_MS", "5000")
         .args([
             "pack",
             "hello",
@@ -6054,13 +6056,13 @@ fn timed_out_robot_pack_renderer_emits_fixed_size_partial_fallback() -> Result<(
             "--mode",
             "lexical",
             "--timeout",
-            "500",
+            "2000",
             "--data-dir",
             data_dir.path().to_str().ok_or("non-utf8 data dir")?,
         ])
         .output()?;
-    if started.elapsed() >= std::time::Duration::from_millis(1500) {
-        return Err("pack command waited for the simulated two-second render stall".into());
+    if started.elapsed() >= std::time::Duration::from_millis(4500) {
+        return Err("pack command waited for the simulated five-second render stall".into());
     }
     if !output.status.success() {
         return Err(format!(
@@ -6124,7 +6126,12 @@ fn timed_out_robot_pack_planner_does_not_fabricate_selection() -> Result<(), Box
     let data_dir = isolated_search_demo_data()?;
     let started = std::time::Instant::now();
     let output = base_cmd()
-        .env("CASS_TEST_PACK_PLAN_SLOW_MS", "2000")
+        // The budget must expire inside the injected planner stall, not in
+        // search_setup: on a loaded debug-build fleet worker the archive open
+        // alone exceeded the old 500 ms budget (skipped_sections started at
+        // search_setup, candidate_count 0), so the budget is 2 s against a 5 s
+        // stall and the guard below is 4.5 s (bead zgzva).
+        .env("CASS_TEST_PACK_PLAN_SLOW_MS", "5000")
         .args([
             "pack",
             "hello",
@@ -6132,13 +6139,13 @@ fn timed_out_robot_pack_planner_does_not_fabricate_selection() -> Result<(), Box
             "--mode",
             "lexical",
             "--timeout",
-            "500",
+            "2000",
             "--data-dir",
             data_dir.path().to_str().ok_or("non-utf8 data dir")?,
         ])
         .output()?;
-    if started.elapsed() >= std::time::Duration::from_millis(1500) {
-        return Err("pack command waited for the simulated two-second planner stall".into());
+    if started.elapsed() >= std::time::Duration::from_millis(4500) {
+        return Err("pack command waited for the simulated five-second planner stall".into());
     }
     if !output.status.success() {
         return Err(format!(
