@@ -2206,13 +2206,6 @@ fn producer_state_transition_is_work(previous: &str, current: &str) -> bool {
     previous != current && !(previous.starts_with("waiting_") && current.starts_with("waiting_"))
 }
 
-/// #366: true when the pipeline runtime snapshot moved on a field that only
-/// changes with forward progress — pages flowing, prep/build/merge jobs
-/// starting or finishing, the producer moving between park sites. Pure wait
-/// counters/durations, host metrics, controller mode/reason, budget
-/// generation, and waiting↔waiting park flaps are deliberately excluded:
-/// they keep changing while the pipeline is genuinely wedged and must not
-/// defeat the stall watchdog.
 /// GH #446: the stall watchdog's liveness signal, shaped for the Quill sink
 /// (`quill_bridge::EngineLivenessProbe`). `None` when the run has no progress
 /// tracker, in which case the sink stays silent as before.
@@ -2243,6 +2236,13 @@ fn open_lexical_index_with_heartbeat(
     Ok(t_index)
 }
 
+/// #366: true when the pipeline runtime snapshot moved on a field that only
+/// changes with forward progress — pages flowing, prep/build/merge jobs
+/// starting or finishing, the producer moving between park sites. Pure wait
+/// counters/durations, host metrics, controller mode/reason, budget
+/// generation, and waiting↔waiting park flaps are deliberately excluded:
+/// they keep changing while the pipeline is genuinely wedged and must not
+/// defeat the stall watchdog.
 fn lexical_rebuild_pipeline_work_advanced(
     previous: &LexicalRebuildPipelineRuntimeSnapshot,
     current: &LexicalRebuildPipelineRuntimeSnapshot,
