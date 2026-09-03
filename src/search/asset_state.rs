@@ -1539,9 +1539,14 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         // `stalled` like the indexer just hadn't gotten there yet.
         !exists || contract_mismatch || engine_incompatible
     } else {
+        // Fingerprint match suppresses pure age-staleness: when the
+        // checkpoint fingerprint still matches the live DB, no new content
+        // arrived, so an old mtime alone must not mark the index stale.
+        // Missing fingerprint info (None) still falls back to age.
+        let age_stale_without_fingerprint_cover = age_stale && fingerprint_matches != Some(true);
         exists
             && (engine_incompatible
-                || age_stale
+                || age_stale_without_fingerprint_cover
                 || checkpoint_db_mismatch
                 || checkpoint_incomplete
                 || contract_mismatch

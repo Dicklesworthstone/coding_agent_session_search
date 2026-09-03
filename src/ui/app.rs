@@ -19864,13 +19864,17 @@ impl super::ftui_adapter::Model for CassApp {
                 if let Some(dirty_ts) = self.search_dirty_since {
                     let elapsed = dirty_ts.elapsed();
                     if elapsed >= SEARCH_DEBOUNCE {
-                        // Fire the new search even if one is already in-flight.
-                        // The generation counter ensures stale results from the
-                        // previous search are safely ignored when they arrive.
-                        // This prevents the user from waiting for an initial
-                        // empty-query search to finish before their typed query
-                        // starts executing.
-                        cmds.push(ftui::Cmd::msg(CassMsg::SearchRequested));
+                        // Coalesce overlapping searches: if a search is already
+                        // in-flight, keep the dirty flag and re-tick instead of
+                        // firing a second concurrent backend search. The pending
+                        // query fires from SearchCompleted once idle, so typing
+                        // never stacks concurrent searches (80s overlap wedge).
+                        // Generation counter still guards stale completions.
+                        if self.search_in_flight {
+                            cmds.push(Self::delayed_tick(SEARCH_DEBOUNCE));
+                        } else {
+                            cmds.push(ftui::Cmd::msg(CassMsg::SearchRequested));
+                        }
                     } else {
                         cmds.push(Self::delayed_tick(SEARCH_DEBOUNCE.saturating_sub(elapsed)));
                     }

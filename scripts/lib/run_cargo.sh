@@ -38,9 +38,14 @@ fi
 # easy to reproduce.
 run_cargo() {
     if [ -z "$RCH_BIN" ]; then
-        printf '[run_cargo] ERROR: rch not found on PATH or in ~/.local/bin/rch\n' >&2
-        printf '[run_cargo] hint: install rch first, or set RCH_BIN=/path/to/rch\n' >&2
-        return 127
+        if [ "${RCH_REQUIRE_REMOTE:-}" = "1" ]; then
+            printf '[run_cargo] ERROR: rch not found on PATH or in ~/.local/bin/rch\n' >&2
+            printf '[run_cargo] hint: install rch first, or set RCH_BIN=/path/to/rch\n' >&2
+            return 127
+        fi
+        printf '[run_cargo] WARN: rch not found; failing open to local cargo (set RCH_REQUIRE_REMOTE=1 to fail closed)\n' >&2
+        env CARGO_TARGET_DIR="$RCH_TARGET_DIR" cargo "$@"
+        return $?
     fi
     printf '[run_cargo] cmd=cargo %s cwd=%s target=%s rch_bin=%s\n' \
         "$*" "$PWD" "$RCH_TARGET_DIR" "$RCH_BIN" >&2
