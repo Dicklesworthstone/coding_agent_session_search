@@ -5837,10 +5837,11 @@ fn implicit_robot_pack_query_uses_pack_when_pack_only_flags_present() {
 fn timed_out_robot_pack_returns_bounded_partial_and_names_shed_work() -> Result<(), Box<dyn Error>>
 {
     let data_dir = isolated_search_demo_data()?;
+    let (stall_ms, guard) = pack_stall_and_guard_from_baseline(data_dir.path())?;
     let started = std::time::Instant::now();
     let output = base_cmd()
         .env("CASS_PACK_BUDGET_MS", "100")
-        .env("CASS_TEST_PACK_SLOW_MS", "2000")
+        .env("CASS_TEST_PACK_SLOW_MS", stall_ms.to_string())
         .args([
             "pack",
             "hello",
@@ -5858,8 +5859,12 @@ fn timed_out_robot_pack_returns_bounded_partial_and_names_shed_work() -> Result<
             data_dir.path().to_str().ok_or("non-utf8 data dir")?,
         ])
         .output()?;
-    if started.elapsed() >= std::time::Duration::from_millis(1500) {
-        return Err("pack command waited for the simulated two-second search stall".into());
+    if started.elapsed() >= guard {
+        return Err(format!(
+            "pack command waited for the simulated {stall_ms} ms search stall instead of \
+             stopping at its 100 ms budget"
+        )
+        .into());
     }
     if !output.status.success() {
         return Err(format!(
@@ -6051,6 +6056,15 @@ fn blocking_sessions_file_pack_returns_bounded_partial_without_fabricated_eviden
 fn pack_timeout_budget_from_baseline(
     data_dir: &std::path::Path,
 ) -> Result<(u64, u64), Box<dyn Error>> {
+    let baseline_ms = pack_unstalled_baseline_ms(data_dir)?;
+    let budget_ms = (baseline_ms.saturating_mul(3)).max(2_000);
+    Ok((budget_ms, budget_ms.saturating_mul(3)))
+}
+
+/// Wall time of one unstalled `cass pack hello --mode lexical` on `data_dir`,
+/// measured right before a stalled run so the stalled run's guard is relative
+/// to the worker's speed at that moment rather than to a fixed number.
+fn pack_unstalled_baseline_ms(data_dir: &std::path::Path) -> Result<u64, Box<dyn Error>> {
     let started = std::time::Instant::now();
     let output = base_cmd()
         .args([
@@ -6072,8 +6086,20 @@ fn pack_timeout_budget_from_baseline(
         )
         .into());
     }
-    let budget_ms = (baseline_ms.saturating_mul(3)).max(2_000);
-    Ok((budget_ms, budget_ms.saturating_mul(3)))
+    Ok(baseline_ms)
+}
+
+/// Stall and return-guard for a pack test that injects a stall the budget is
+/// expected to cut short: the stall is three unstalled baselines (at least
+/// 2 s) and the guard is one baseline plus half the stall, so a command that
+/// waited the stall out cannot pass and a bounded one on a loaded worker can.
+fn pack_stall_and_guard_from_baseline(
+    data_dir: &std::path::Path,
+) -> Result<(u64, std::time::Duration), Box<dyn Error>> {
+    let baseline_ms = pack_unstalled_baseline_ms(data_dir)?;
+    let stall_ms = (baseline_ms.saturating_mul(3)).max(2_000);
+    let guard = std::time::Duration::from_millis(baseline_ms.saturating_add(stall_ms / 2));
+    Ok((stall_ms, guard))
 }
 
 #[test]
