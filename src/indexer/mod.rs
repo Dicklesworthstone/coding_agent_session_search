@@ -16521,6 +16521,24 @@ fn run_index_inner(
             scan_start_ts,
             now_ms,
         )?;
+        // GH #413 follow-up: when this run's inline `fts_messages` writes blew
+        // their budget the shadow was left behind on purpose (canonical rows
+        // and the Quill index landed; only the SQL fallback lags). Persist the
+        // reason where `doctor` already reads it. Best-effort observability.
+        if let Some(detail) = storage.fts_inline_suspension() {
+            tracing::warn!(
+                db_path = %opts.db_path.display(),
+                detail = %detail,
+                "inline fallback-FTS shadow writes were suspended for this run; the shadow is behind \
+                 (Quill lexical search is unaffected) and `cass doctor` reports it"
+            );
+            if let Err(err) = storage.record_fallback_fts_repair_pending(Some(&detail)) {
+                tracing::warn!(
+                    error = %err,
+                    "recording the suspended inline FTS shadow writes failed (non-fatal)"
+                );
+            }
+        }
         // zn1xn F4: track the persistent lexical-repair deferral streak so
         // `status`/`index --json` expose the recurring full-rebuild
         // amplification (previously only a stderr warn). Increment when this

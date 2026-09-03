@@ -4663,6 +4663,11 @@ pub struct FrankenStorage {
     /// stall watchdog reads a healthy multi-minute shadow rebuild as a wedge
     /// and exits 70 after the base abort threshold.
     fts_maintenance_heartbeat: parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// GH #413 follow-up: wall-clock this process has spent inside inline
+    /// `fts_messages` flushes, and the reason once they were suspended. See
+    /// `fts_inline_flush_budget`.
+    fts_inline_spent_ms: AtomicU64,
+    fts_inline_suspended: parking_lot::Mutex<Option<String>>,
 }
 
 /// Keep ordinary storage commits from tripping over frequent auto-checkpoints
@@ -4869,6 +4874,8 @@ impl FrankenStorage {
             ensured_daily_stats_keys,
             fts_messages_present_cache: AtomicI8::new(FTS_MESSAGES_PRESENT_UNKNOWN),
             fts_maintenance_heartbeat: parking_lot::Mutex::new(None),
+            fts_inline_spent_ms: AtomicU64::new(0),
+            fts_inline_suspended: parking_lot::Mutex::new(None),
         }
     }
 
@@ -12646,6 +12653,54 @@ impl FrankenStorage {
         self.ensure_fts_consistency_via_frankensqlite()
     }
 
+    /// GH #413 follow-up: charge one inline shadow flush against this run's
+    /// budget (`fts_inline_flush_budget`); past it the rest of this process
+    /// skips the shadow and remembers why.
+    fn charge_fts_inline_flush(&self, elapsed: Duration, docs: usize) {
+        let Some(budget) = fts_inline_flush_budget() else {
+            return;
+        };
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        let spent_ms = self
+            .fts_inline_spent_ms
+            .fetch_add(elapsed_ms, Ordering::SeqCst)
+            .saturating_add(elapsed_ms);
+        if spent_ms <= u64::try_from(budget.as_millis()).unwrap_or(u64::MAX) {
+            return;
+        }
+        let mut suspended = self.fts_inline_suspended.lock();
+        if suspended.is_some() {
+            return;
+        }
+        let budget_secs = budget.as_secs();
+        let detail = format!(
+            "inline fts_messages shadow writes suspended for this run: {spent_ms} ms spent \
+             (last flush: {docs} docs in {elapsed_ms} ms) exceeded the {budget_secs} s budget \
+             (CASS_FTS_INLINE_BUDGET_SECS); fsqlite's FTS5 does O(table) work per statement \
+             on a shadow this size (GH #413, frankensqlite#405/#406). The shadow is behind \
+             until a repair; Quill lexical search is unaffected"
+        );
+        tracing::warn!(
+            target: "cass::fts_inline",
+            spent_ms,
+            budget_secs,
+            last_flush_docs = docs,
+            last_flush_ms = elapsed_ms,
+            "{detail}"
+        );
+        *suspended = Some(detail);
+    }
+
+    fn fts_inline_writes_suspended(&self) -> bool {
+        self.fts_inline_suspended.lock().is_some()
+    }
+
+    /// Why inline `fts_messages` writes were suspended in this process, if
+    /// they were (GH #413 follow-up). The index run persists it for `doctor`.
+    pub(crate) fn fts_inline_suspension(&self) -> Option<String> {
+        self.fts_inline_suspended.lock().clone()
+    }
+
     /// #439: install (or, with `None`, clear) the liveness callback that
     /// fallback-FTS shadow maintenance invokes once per streamed page. See
     /// the `fts_maintenance_heartbeat` field.
@@ -13689,6 +13744,7 @@ impl FrankenStorage {
             let inserted_before_batch = total_inserted;
             let skipped_before_batch = total_skipped_orphans;
             let existing_before_batch = total_skipped_existing;
+            let page_started = Instant::now();
 
             for row in page.rows {
                 if existing_fts_rowids
@@ -13740,6 +13796,26 @@ impl FrankenStorage {
                 );
                 entries.clear();
                 pending_chars = 0;
+            }
+
+            // GH #413 follow-up: a page that takes longer than the budget is
+            // the engine's O(table)-per-statement wall; stop truthfully here
+            // instead of wedging the run for hours. The caller's parity check
+            // reports the shadow as Partial and `doctor` carries this reason.
+            if let Some(budget) = fts_repair_page_budget() {
+                let page_elapsed = page_started.elapsed();
+                if page_elapsed > budget {
+                    anyhow::bail!(
+                        "fallback FTS shadow maintenance stopped: a page of {fetched_count} rows \
+                         took {:.1} s, over the {} s per-page budget \
+                         (CASS_FTS_REPAIR_PAGE_BUDGET_SECS); fsqlite's FTS5 does O(table) work \
+                         per statement on a shadow this size (GH #413, frankensqlite#405/#406). \
+                         {total_inserted} rows were streamed before stopping; the shadow stays \
+                         Partial and Quill lexical search is unaffected",
+                        page_elapsed.as_secs_f64(),
+                        budget.as_secs()
+                    );
+                }
             }
 
             tracing::debug!(
@@ -15336,6 +15412,45 @@ fn env_flag_enabled(name: &str) -> bool {
 
 fn defer_storage_lexical_updates_enabled() -> bool {
     env_flag_enabled("CASS_DEFER_LEXICAL_UPDATES")
+}
+
+/// GH #413 follow-up: how much of one index run the inline `fts_messages`
+/// shadow writes may cost before the rest of the run skips them.
+///
+/// fsqlite's FTS5 does O(table) work per statement on a populated shadow: the
+/// in-memory index is hydrated on the first write and, on the pinned engine,
+/// cloned per transaction (frankensqlite#405, #406). Past a few hundred
+/// thousand messages that turns an incremental run into an hour-long crawl
+/// whose process dies before `last_indexed_at` is written — on 2026-09-03 a
+/// background catch-up on a 10 GB archive was OOM-killed at 14 GB after an
+/// hour, and every stale read respawned it. Skipping the shadow keeps the
+/// canonical rows and the Quill index landing; the shadow, which only the SQL
+/// search fallback reads, is left Partial with the reason recorded for
+/// `doctor`. `CASS_FTS_INLINE_BUDGET_SECS` overrides; `0` disables the budget.
+const DEFAULT_FTS_INLINE_BUDGET_SECS: u64 = 300;
+
+fn fts_inline_flush_budget() -> Option<Duration> {
+    let secs = dotenvy::var("CASS_FTS_INLINE_BUDGET_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_FTS_INLINE_BUDGET_SECS);
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// Per-page budget for the paged shadow repair and rebuild
+/// (`stream_fts_rows_via_frankensqlite`). A page of `CASS_FTS_REBUILD_BATCH_SIZE`
+/// rows that takes longer than this has hit the same engine wall, and the
+/// maintenance stops with the reason instead of wedging the run for hours
+/// (GH #345/#369/#413). `CASS_FTS_REPAIR_PAGE_BUDGET_SECS` overrides; `0`
+/// disables the budget.
+const DEFAULT_FTS_REPAIR_PAGE_BUDGET_SECS: u64 = 120;
+
+fn fts_repair_page_budget() -> Option<Duration> {
+    let secs = dotenvy::var("CASS_FTS_REPAIR_PAGE_BUDGET_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_FTS_REPAIR_PAGE_BUDGET_SECS);
+    (secs > 0).then(|| Duration::from_secs(secs))
 }
 
 fn defer_analytics_updates_enabled() -> bool {
@@ -20383,8 +20498,27 @@ fn flush_pending_fts_entries(
         return Ok(());
     }
 
+    // GH #413 follow-up: once this run's shadow writes blew their budget the
+    // canonical rows still land and the shadow is left Partial on purpose.
+    if storage.fts_inline_writes_suspended() {
+        entries.clear();
+        *pending_chars = 0;
+        return Ok(());
+    }
+
     if storage.fts_messages_present_cached(tx) {
+        let started = Instant::now();
         *inserted_total += franken_batch_insert_fts(storage, tx, entries)?;
+        // Test hook (tests/cli_index.rs): make a flush look as slow as the
+        // engine does on a huge shadow. Unset in production.
+        if let Some(park_ms) = dotenvy::var("CASS_TEST_FTS_INLINE_FLUSH_PARK_MS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+        {
+            std::thread::sleep(Duration::from_millis(park_ms));
+        }
+        storage.charge_fts_inline_flush(started.elapsed(), entries.len());
     }
     entries.clear();
     *pending_chars = 0;
