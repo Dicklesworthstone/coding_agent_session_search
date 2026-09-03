@@ -40637,12 +40637,22 @@ mod tests {
         LexicalRebuildPipelineBudgetSnapshot,
         LexicalRebuildPipelineBudgetSnapshot,
     ) {
-        let startup_budget =
-            LexicalRebuildPipelineBudgetSnapshot::new(32, 64, 1024, 640 << 20, 2_048, 128, 4_096);
+        // Byte limits mirror production shape (startup: 640 MiB inflight,
+        // 128 MiB page fetch; steady: ~2.2 GiB inflight, 512 MiB page fetch)
+        // so a 100 MB pending batch is routine, not a saturation trigger.
+        let startup_budget = LexicalRebuildPipelineBudgetSnapshot::new(
+            32,
+            64,
+            128 << 20,
+            640 << 20,
+            2_048,
+            128,
+            4_096,
+        );
         let steady_budget = LexicalRebuildPipelineBudgetSnapshot::new(
             256,
             512,
-            4096,
+            512 << 20,
             2_357_809_664,
             10_000,
             8_192,
