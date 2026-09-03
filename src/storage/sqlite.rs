@@ -16785,7 +16785,20 @@ fn franken_batch_insert_fts(
             param_values.push(SqliteValue::from(entry.created_at));
         }
 
-        match tx.execute_with_params(&sql, &param_values) {
+        // GH #413 (bead cjugu): frankensqlite wraps every statement in an
+        // internal savepoint, and a savepoint on a live fts5 table deep-clones
+        // the table's whole in-memory state (Fts5Table::snapshot_state) — so a
+        // plain execute here costs O(|fts_messages|) per statement, minutes each
+        // and a ~35 GB transient once the table holds half a million rows
+        // (the "wedge at a batch boundary" on large archives). The enclosing
+        // batch transaction is the rollback boundary for these rows, so the
+        // statement savepoint is skipped. The per-transaction `begin` clone
+        // remains until frankensqlite#405 lands. Consequence, accepted: a
+        // chunk whose INSERT fails midway may leave some of its rows pending
+        // in the transaction (the error path below keeps the transaction so
+        // the canonical rows still commit); the derived FTS is best-effort and
+        // the post-run parity repair rebuilds it when rows are missing.
+        match tx.execute_with_params_skip_statement_savepoint(&sql, &param_values) {
             Ok(_) => {
                 inserted += chunk.len();
             }
