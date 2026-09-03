@@ -61,6 +61,15 @@ Everything below is on `main`; nothing is in a released binary yet.
   resumes with a plain `cass index`, no duplicate identities), and GH #441 (a
   40-segment generation is folded by a plain `cass index`).
 
+### Fixed
+- Indexing a large archive no longer stalls "at a batch boundary" with one core
+  pegged and no I/O (GH #413): every `INSERT INTO fts_messages` statement was
+  making frankensqlite deep-clone the whole in-memory FTS5 table for its
+  per-statement savepoint (O(table) per statement, a ~35 GB transient at
+  538k rows). The batch insert now skips the statement savepoint; the batch
+  transaction remains the rollback boundary. The per-transaction clone is an
+  engine issue (frankensqlite#405).
+
 ### Changed
 - The index run's final `wal_checkpoint(TRUNCATE)` runs under a wall-clock
   budget (900 s, `CASS_INDEX_FINAL_WAL_CHECKPOINT_TIMEOUT_SECS`): on an archive
