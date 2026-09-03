@@ -13721,6 +13721,9 @@ impl FrankenStorage {
 
         loop {
             let page = self.fetch_fts_rebuild_message_page(last_rowid, batch_limit)?;
+            // GH #413 follow-up: the per-page budget clock starts here, so the
+            // #439 PAGE_SLEEP hook below also stands in for a slow engine page.
+            let page_started = Instant::now();
             // #439: every fetched page is forward progress the stall watchdog
             // cannot otherwise see.
             self.tick_fts_maintenance_heartbeat();
@@ -13744,7 +13747,6 @@ impl FrankenStorage {
             let inserted_before_batch = total_inserted;
             let skipped_before_batch = total_skipped_orphans;
             let existing_before_batch = total_skipped_existing;
-            let page_started = Instant::now();
 
             for row in page.rows {
                 if existing_fts_rowids
@@ -15434,7 +15436,7 @@ fn fts_inline_flush_budget() -> Option<Duration> {
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_FTS_INLINE_BUDGET_SECS);
-    (secs > 0).then(|| Duration::from_secs(secs))
+    (secs > 0).then_some(Duration::from_secs(secs))
 }
 
 /// Per-page budget for the paged shadow repair and rebuild
@@ -15450,7 +15452,7 @@ fn fts_repair_page_budget() -> Option<Duration> {
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_FTS_REPAIR_PAGE_BUDGET_SECS);
-    (secs > 0).then(|| Duration::from_secs(secs))
+    (secs > 0).then_some(Duration::from_secs(secs))
 }
 
 fn defer_analytics_updates_enabled() -> bool {
