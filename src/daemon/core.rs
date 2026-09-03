@@ -417,10 +417,14 @@ impl ModelDaemon {
             .clone()
             .unwrap_or_else(crate::default_data_dir);
         let db_path = data_dir.join("agent_search.db");
+        // The daemon tick has no freshness block in hand, so it does not feed
+        // the breaker a watermark; the stale-on-read path (search/pack/TUI)
+        // does, and its verdict is what stops a doomed child from respawning.
         let outcome = background_refresh::maybe_spawn_background_index_refresh(
             &data_dir,
             &db_path,
             "daemon-periodic",
+            None,
         );
         info!(?outcome, "daemon periodic index evaluated");
     }
