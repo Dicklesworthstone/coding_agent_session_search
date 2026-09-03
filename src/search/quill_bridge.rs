@@ -1467,7 +1467,6 @@ mod tests {
         assert!(tracker.observe(no_cpu(2)));
     }
 
-    #[test]
     /// GH #450: a long blocking call that keeps growing a watched file must
     /// post liveness ticks so the #258 stall detector does not call it a stall.
     #[test]
