@@ -9,6 +9,78 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# These cases exercise the production batched-gate parsers directly. Inputs are
+# terminal-output fixtures, not substitute cargo/ubs executables or live proof.
+if [ "${1:-}" = --batched-only ]; then
+    proof_dir="$(mktemp -d -t cass-gate-parser.XXXXXX)"
+    gate="$PROJECT_ROOT/scripts/gate.sh"
+    pass=0
+    fail=0
+    check_exit() {
+        local label="$1" expected="$2" actual=0
+        shift 2
+        "$@" > "$proof_dir/$label.log" 2>&1 || actual=$?
+        if [ "$actual" -eq "$expected" ]; then
+            echo "PASS $label"
+            pass=$((pass + 1))
+        else
+            echo "FAIL $label expected=$expected actual=$actual"
+            cat "$proof_dir/$label.log"
+            fail=$((fail + 1))
+        fi
+    }
+    receipt="$proof_dir/complete.txt"
+    cat > "$receipt" <<'RECEIPT'
+STAGE=source-identity EXIT=0
+STAGE=fmt EXIT=0
+STAGE=clippy EXIT=0
+STAGE=ubs EXIT=0
+TEST_COUNT=lib-tests PASSED=4 BINARIES=1
+STAGE=lib-tests EXIT=0
+TEST_COUNT=test-e2e_lexical_fail_open PASSED=1 BINARIES=1
+STAGE=test-e2e_lexical_fail_open EXIT=0
+TEST_COUNT=goldens PASSED=20 BINARIES=2
+STAGE=goldens EXIT=0
+STAGE=job-complete EXIT=0
+RECEIPT
+    expected=(source-identity fmt clippy ubs lib-tests test-e2e_lexical_fail_open goldens job-complete)
+    check_exit digits-and-positive-counts 0 bash "$gate" --verify-receipt "$receipt" 0 "${expected[@]}"
+    check_exit transport-refusal 1 bash "$gate" --verify-receipt "$receipt" 103 "${expected[@]}"
+    check_exit transport-timeout 1 bash "$gate" --verify-receipt "$receipt" 124 "${expected[@]}"
+    for stage in source-identity fmt clippy ubs lib-tests test-e2e_lexical_fail_open goldens job-complete; do
+        awk -v stage="$stage" '$0 != "STAGE=" stage " EXIT=0"' "$receipt" > "$proof_dir/missing-$stage.txt"
+        check_exit "missing-$stage" 1 bash "$gate" --verify-receipt "$proof_dir/missing-$stage.txt" 0 "${expected[@]}"
+        awk -v stage="$stage" '{if ($0 == "STAGE=" stage " EXIT=0") print "STAGE=" stage " EXIT=1"; else print}' \
+            "$receipt" > "$proof_dir/failing-$stage.txt"
+        check_exit "failing-$stage" 1 bash "$gate" --verify-receipt "$proof_dir/failing-$stage.txt" 0 "${expected[@]}"
+    done
+    awk '!/^TEST_COUNT=/' "$receipt" > "$proof_dir/no-counts.txt"
+    check_exit no-test-counts 1 bash "$gate" --verify-receipt "$proof_dir/no-counts.txt" 0 "${expected[@]}"
+    cat "$receipt" "$receipt" > "$proof_dir/duplicate.txt"
+    check_exit duplicate-stage 1 bash "$gate" --verify-receipt "$proof_dir/duplicate.txt" 0 "${expected[@]}"
+    { cat "$receipt"; echo 'STAGE=unexpected-after-completion EXIT=0'; } > "$proof_dir/not-terminal.txt"
+    check_exit nonterminal-job-complete 1 bash "$gate" --verify-receipt "$proof_dir/not-terminal.txt" 0 "${expected[@]}"
+    check_exit stale-docs-binary 1 bash "$gate" --verify-receipt "$receipt" 0 "${expected[@]}" docs-build docs-binary-identity docs-truth
+
+    printf 'test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out\n' > "$proof_dir/tests-positive.txt"
+    printf 'test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out\n' > "$proof_dir/tests-empty.txt"
+    printf 'running 3 tests\n' > "$proof_dir/tests-truncated.txt"
+    cat "$proof_dir/tests-positive.txt" "$proof_dir/tests-empty.txt" > "$proof_dir/tests-mixed.txt"
+    cat "$proof_dir/tests-positive.txt" "$proof_dir/tests-positive.txt" > "$proof_dir/tests-two-binaries.txt"
+    check_exit positive-tests 0 bash "$gate" --verify-test-log "$proof_dir/tests-positive.txt"
+    check_exit two-positive-binaries 0 bash "$gate" --verify-test-log "$proof_dir/tests-two-binaries.txt"
+    check_exit zero-selected-tests 1 bash "$gate" --verify-test-log "$proof_dir/tests-empty.txt"
+    check_exit truncated-tests 1 bash "$gate" --verify-test-log "$proof_dir/tests-truncated.txt"
+    check_exit positive-and-empty-binary 1 bash "$gate" --verify-test-log "$proof_dir/tests-mixed.txt"
+    { cat "$proof_dir/tests-positive.txt"; echo 'test result: FAILED. 1 passed; 1 failed;'; } > "$proof_dir/tests-failed.txt"
+    check_exit positive-and-failed-binary 1 bash "$gate" --verify-test-log "$proof_dir/tests-failed.txt"
+    check_exit repeated-integration-target 2 bash "$gate" --integration 'e2e_lexical_fail_open:a,e2e_lexical_fail_open:b'
+    echo "Batched gate parser: PASS=$pass FAIL=$fail fixtures=$proof_dir"
+    [ "$fail" -eq 0 ]
+    exit $?
+fi
+
 RCH_TARGET_DIR="${RCH_TARGET_DIR:-/tmp/cass-dpfvr-target}"
 LOG="$RCH_TARGET_DIR/dpfvr-e2e.log"
 mkdir -p "$RCH_TARGET_DIR"
