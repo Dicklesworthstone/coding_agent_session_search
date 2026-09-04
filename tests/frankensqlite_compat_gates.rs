@@ -40,20 +40,18 @@ fn rusqlite_is_dev_dependency_only() {
     );
 }
 
-/// The fsqlite engine family resolves from one immutable upstream git
-/// revision (re-established with the 0.3.11 pin, e16d39a2, after the
-/// crates.io-only era; the registry archive line is redirected through
-/// `[patch.crates-io].fsqlite` for transitive consumers such as
-/// franken-agent-detection). Freeze the complete source identity across
-/// the manifest, lockfile, build-time validator, and user-facing dependency
-/// contract so a partial bump cannot silently bifurcate the engine family.
+/// The fsqlite engine family resolves from one exact crates.io release for
+/// every direct and transitive consumer (registry-only since the 0.3.14
+/// pin, 5acc0dc6 — no git source, no patch redirect; build.rs rejects
+/// fsqlite-family registry patches and duplicate family resolution).
+/// Freeze the complete source identity across the manifest, lockfile,
+/// build-time validator, and dependency contract so a partial bump cannot
+/// silently bifurcate the engine family.
 #[test]
 fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
-    const VERSION: &str = "0.3.13";
-    const EXACT_REQUIREMENT: &str = "=0.3.13";
-    const EXPECTED_GIT: &str = "https://github.com/Dicklesworthstone/frankensqlite";
-    const EXPECTED_REV: &str = "2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4";
-    const GIT_SOURCE: &str = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4#2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4";
+    const VERSION: &str = "0.3.16";
+    const EXACT_REQUIREMENT: &str = "=0.3.16";
+    const EXPECTED_FACADE_FEATURES: &[&str] = &["fts5", "async-api"];
 
     let manifest: toml::Table =
         toml::from_str(include_str!("../Cargo.toml")).expect("parse Cargo.toml");
@@ -78,60 +76,46 @@ fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
             Some(EXACT_REQUIREMENT),
             "{dependency_name} declared version drifted in [{table_name}]"
         );
-        assert_eq!(
-            dependency.get("git").and_then(toml::Value::as_str),
-            Some(EXPECTED_GIT),
-            "{dependency_name} in [{table_name}] must pin the reviewed upstream git source"
-        );
-        assert_eq!(
-            dependency.get("rev").and_then(toml::Value::as_str),
-            Some(EXPECTED_REV),
-            "{dependency_name} in [{table_name}] must pin the exact upstream revision"
-        );
         assert!(
-            dependency.get("path").is_none()
+            dependency.get("git").is_none()
+                && dependency.get("rev").is_none()
+                && dependency.get("path").is_none()
                 && dependency.get("branch").is_none()
                 && dependency.get("tag").is_none(),
-            "{dependency_name} in [{table_name}] must be a pure exact-rev git pin"
+            "{dependency_name} in [{table_name}] must resolve from the exact \
+             crates.io release, not a source override"
         );
     }
 
-    // franken-agent-detection names the crates.io facade; exactly one
-    // narrowly scoped [patch.crates-io].fsqlite redirect keeps that
-    // transitive entry point in the same engine universe. No other
-    // fsqlite-family patch entry may exist (build.rs enforces the same).
-    let crates_io_patch = manifest
-        .get("patch")
+    // The facade keeps its reviewed feature set.
+    let facade = manifest
+        .get("dependencies")
         .and_then(toml::Value::as_table)
-        .and_then(|patches| patches.get("crates-io"))
+        .and_then(|table| table.get("frankensqlite"))
         .and_then(toml::Value::as_table)
-        .expect("[patch.crates-io] must redirect the fsqlite registry facade");
-    let patch_entry = crates_io_patch
-        .get("fsqlite")
-        .and_then(toml::Value::as_table)
-        .expect("[patch.crates-io].fsqlite must exist for transitive consumers");
+        .expect("missing frankensqlite facade entry");
+    let features: Vec<&str> = facade
+        .get("features")
+        .and_then(toml::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     assert_eq!(
-        patch_entry.get("version").and_then(toml::Value::as_str),
-        Some(EXACT_REQUIREMENT),
-        "[patch.crates-io].fsqlite version drifted"
+        features, EXPECTED_FACADE_FEATURES,
+        "fsqlite facade feature set drifted"
     );
-    assert_eq!(
-        patch_entry.get("git").and_then(toml::Value::as_str),
-        Some(EXPECTED_GIT),
-        "[patch.crates-io].fsqlite git source drifted"
+
+    // No [patch] section may redirect the fsqlite family (build.rs rejects
+    // fsqlite-family registry patches too).
+    assert!(
+        manifest.get("patch").is_none(),
+        "a [patch] section bifurcates the fsqlite family; the family must \
+         resolve from crates.io"
     );
-    assert_eq!(
-        patch_entry.get("rev").and_then(toml::Value::as_str),
-        Some(EXPECTED_REV),
-        "[patch.crates-io].fsqlite rev drifted"
-    );
-    for dependency_name in crates_io_patch.keys() {
-        assert!(
-            !dependency_name.starts_with("fsqlite-"),
-            "[patch.crates-io].{dependency_name} bifurcates the fsqlite family; \
-             only the facade entry may redirect it"
-        );
-    }
 
     let lockfile: toml::Value =
         toml::from_str(include_str!("../Cargo.lock")).expect("parse Cargo.lock");
@@ -164,25 +148,26 @@ fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
             Some(VERSION),
             "{name} resolved at a different version than the pinned engine release"
         );
-        assert_eq!(
-            package.get("source").and_then(toml::Value::as_str),
-            Some(GIT_SOURCE),
-            "{name} resolved away from the pinned upstream revision"
+        let source = package
+            .get("source")
+            .and_then(toml::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            source.starts_with("registry+https://github.com/rust-lang/crates.io-index"),
+            "{name} resolved away from the pinned crates.io release"
         );
     }
 
     let build_contract = include_str!("../build.rs");
     assert!(
-        build_contract.contains("expected_version: \"0.3.13\"")
-            && build_contract
-                .contains("expected_rev: \"2d8a68b9ad82d685f8bacd9d5fe3c8fe5304a0e4\"")
-            && build_contract.contains("fn validate_fsqlite_source_pin"),
-        "build.rs must validate the exact FrankenSQLite source identity"
+        build_contract.contains("expected_version: \"0.3.16\"")
+            && build_contract.contains("expected_features: &[\"fts5\", \"async-api\"]"),
+        "build.rs must validate the exact FrankenSQLite crates.io identity"
     );
     let readme = include_str!("../README.md");
     assert!(
-        readme.contains("=0.3.13") && readme.contains("[patch.crates-io]"),
-        "README must document the exact fsqlite engine pin and the facade patch"
+        readme.contains(EXACT_REQUIREMENT),
+        "README must document the exact fsqlite engine pin"
     );
 }
 
