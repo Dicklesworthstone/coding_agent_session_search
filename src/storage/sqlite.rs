@@ -12754,11 +12754,14 @@ impl FrankenStorage {
         Ok(u64::try_from(total).unwrap_or(0))
     }
 
+    /// Is the shadow in the catalog? Virtual tables carry `rootpage = 0`, so
+    /// this must not filter on rootpage (the unit test caught a probe that
+    /// did and reported every shadow as absent).
     fn fts_shadow_registered(&self) -> Result<bool> {
         let rows: i64 = self
             .conn
             .query_row_map(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'fts_messages' AND rootpage > 0",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'fts_messages'",
                 fparams![],
                 |row| row.get_typed::<i64>(0),
             )
