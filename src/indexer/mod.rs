@@ -11344,6 +11344,29 @@ pub(crate) fn lexical_storage_fingerprint_for_db_cached(
     Ok(fingerprint)
 }
 
+/// GH #353: the sidecar-cached archive fingerprint WITHOUT opening the
+/// database. The watermark health lane and other `open_skipped` surfaces
+/// promise a mutation-free probe with no archive open (k2k20: a readonly
+/// open on a large dirty-WAL archive can take minutes), but they must still
+/// compare the SAME storage fingerprint `search` defers repair on. Served
+/// from the identity-keyed sidecar only; `None` when the sidecar does not
+/// describe the current physical identity — an honest "not computed", never
+/// a guess. Search primes that sidecar after every real fingerprint
+/// computation, so a status that follows any search sees what search saw.
+pub(crate) fn lexical_storage_fingerprint_for_db_cached_readonly(
+    db_path: &Path,
+    index_path: &Path,
+) -> Option<String> {
+    let identity = lexical_storage_physical_identity(db_path)?;
+    let cache_path = index_path.join(ARCHIVE_FINGERPRINT_CACHE_FILE);
+    let raw = fs::read(cache_path).ok()?;
+    let cached = serde_json::from_slice::<ArchiveFingerprintCache>(&raw).ok()?;
+    (cached.schema_version == ARCHIVE_FINGERPRINT_CACHE_SCHEMA_VERSION
+        && cached.identity == identity
+        && cached.fingerprint.starts_with("content-v1:"))
+    .then_some(cached.fingerprint)
+}
+
 /// Same fingerprint as [`lexical_storage_fingerprint_for_db`], computed on an
 /// already-open read-only handle so callers that have paid the archive open
 /// cost (semantic context loading, which opens the DB for filter maps anyway)
@@ -57423,6 +57446,223 @@ mod tests {
             checkpoint.indexed_docs, 35,
             "pending indexed doc counts should stay visible to status/health readers"
         );
+    }
+
+    #[test]
+    fn status_skip_open_lane_sees_checkpoint_fingerprint_mismatch_from_sidecar() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let agent = crate::model::types::Agent {
+            id: None,
+            slug: "tester".into(),
+            name: "Tester".into(),
+            version: None,
+            kind: crate::model::types::AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let insert_one = |external: &str, idx: i64| {
+            let conv = norm_conv(Some(external), vec![norm_msg(idx, 1_700_000_000_000 + idx)]);
+            storage
+                .insert_conversation_tree(
+                    agent_id,
+                    None,
+                    &crate::model::types::Conversation {
+                        id: None,
+                        agent_slug: conv.agent_slug.clone(),
+                        workspace: conv.workspace.clone(),
+                        external_id: conv.external_id.clone(),
+                        title: conv.title.clone(),
+                        source_path: conv.source_path.clone(),
+                        started_at: conv.started_at,
+                        ended_at: conv.ended_at,
+                        approx_tokens: None,
+                        metadata_json: conv.metadata.clone(),
+                        messages: conv
+                            .messages
+                            .iter()
+                            .map(|m| crate::model::types::Message {
+                                id: None,
+                                idx: m.idx,
+                                role: crate::model::types::MessageRole::User,
+                                author: m.author.clone(),
+                                created_at: m.created_at,
+                                content: m.content.clone(),
+                                extra_json: m.extra.clone(),
+                                snippets: Vec::new(),
+                            })
+                            .collect(),
+                        source_id: "local".to_string(),
+                        origin_host: None,
+                    },
+                )
+                .unwrap();
+        };
+        insert_one("gh353-a", 0);
+
+        let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
+        fs::create_dir_all(&index_path).unwrap();
+        fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .unwrap();
+        fs::write(index_path.join("meta.json"), b"stable-meta").unwrap();
+
+        // A completed checkpoint frozen at the one-conversation fingerprint.
+        let mut state = LexicalRebuildState::new(
+            lexical_rebuild_db_state(&storage, &db_path).unwrap(),
+            LEXICAL_REBUILD_PAGE_SIZE,
+        );
+        state.mark_completed(index_meta_fingerprint(&index_path).unwrap());
+        persist_lexical_rebuild_state(&index_path, &state).unwrap();
+        let checkpoint_fingerprint = load_lexical_rebuild_checkpoint(&index_path)
+            .unwrap()
+            .expect("checkpoint")
+            .storage_fingerprint;
+
+        // New canonical rows land afterwards: the checkpoint fingerprint is
+        // now stale, which is exactly the GH #353 drift.
+        insert_one("gh353-b", 1);
+        // Search runs, computes the current fingerprint through the cached
+        // path, and primes the identity-keyed sidecar.
+        let current = lexical_storage_fingerprint_for_db_cached(&db_path, &index_path).unwrap();
+        assert_ne!(current, checkpoint_fingerprint);
+
+        // The status skip-open lane (db_available, no fingerprint compute)
+        // must see the same mismatch without opening the archive.
+        let readonly = lexical_storage_fingerprint_for_db_cached_readonly(&db_path, &index_path);
+        assert_eq!(readonly.as_deref(), Some(current.as_str()));
+        let snapshot = crate::search::asset_state::inspect_search_assets(
+            crate::search::asset_state::InspectSearchAssetsInput {
+                data_dir: &data_dir,
+                db_path: &db_path,
+                stale_threshold: 3600,
+                last_indexed_at_ms: Some(FrankenStorage::now_millis()),
+                now_ms: FrankenStorage::now_millis(),
+                maintenance: crate::search::asset_state::SearchMaintenanceSnapshot::default(),
+                semantic_preference: crate::search::asset_state::SemanticPreference::HashFallback,
+                db_available: true,
+                compute_lexical_fingerprint: false,
+                inspect_semantic: false,
+            },
+        )
+        .unwrap();
+        let lexical = &snapshot.lexical;
+        assert_eq!(
+            lexical.fingerprint.current_db_fingerprint.as_deref(),
+            Some(current.as_str()),
+            "skip-open status must surface the sidecar fingerprint search uses"
+        );
+        assert_eq!(
+            lexical.fingerprint.matches_current_db_fingerprint,
+            Some(false),
+            "GH #353: the fingerprint comparison must be truthful, not null"
+        );
+        assert_eq!(lexical.status, "stale");
+        assert_eq!(
+            lexical.checkpoint.db_matches,
+            Some(true),
+            "checkpoint.db_matches stays path-scoped; the fingerprint truth lives in the fingerprint block"
+        );
+        let reason = lexical.status_reason.clone().unwrap_or_default();
+        assert!(
+            reason.contains("fingerprint"),
+            "stale reason should name the fingerprint mismatch, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn status_skip_open_lane_stays_null_when_sidecar_does_not_describe_archive() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+        let agent = crate::model::types::Agent {
+            id: None,
+            slug: "tester".into(),
+            name: "Tester".into(),
+            version: None,
+            kind: crate::model::types::AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conv = norm_conv(Some("gh353-c"), vec![norm_msg(0, 1_700_000_000_000)]);
+        storage
+            .insert_conversation_tree(
+                agent_id,
+                None,
+                &crate::model::types::Conversation {
+                    id: None,
+                    agent_slug: conv.agent_slug.clone(),
+                    workspace: conv.workspace.clone(),
+                    external_id: conv.external_id.clone(),
+                    title: conv.title.clone(),
+                    source_path: conv.source_path.clone(),
+                    started_at: conv.started_at,
+                    ended_at: conv.ended_at,
+                    approx_tokens: None,
+                    metadata_json: conv.metadata.clone(),
+                    messages: conv
+                        .messages
+                        .iter()
+                        .map(|m| crate::model::types::Message {
+                            id: None,
+                            idx: m.idx,
+                            role: crate::model::types::MessageRole::User,
+                            author: m.author.clone(),
+                            created_at: m.created_at,
+                            content: m.content.clone(),
+                            extra_json: m.extra.clone(),
+                            snippets: Vec::new(),
+                        })
+                        .collect(),
+                    source_id: "local".to_string(),
+                    origin_host: None,
+                },
+            )
+            .unwrap();
+        drop(storage);
+
+        // No sidecar was ever primed for this archive: the skip-open lane
+        // must report an honestly null comparison, never an assumed-good one.
+        assert_eq!(
+            lexical_storage_fingerprint_for_db_cached_readonly(
+                &db_path,
+                &crate::search::tantivy::expected_index_dir(&data_dir),
+            ),
+            None,
+        );
+        let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
+        fs::create_dir_all(&index_path).unwrap();
+        fs::write(
+            index_path.join(crate::search::quill_bridge::QUILL_INDEX_MARKER),
+            b"{}",
+        )
+        .unwrap();
+        let snapshot = crate::search::asset_state::inspect_search_assets(
+            crate::search::asset_state::InspectSearchAssetsInput {
+                data_dir: &data_dir,
+                db_path: &db_path,
+                stale_threshold: 3600,
+                last_indexed_at_ms: Some(FrankenStorage::now_millis()),
+                now_ms: FrankenStorage::now_millis(),
+                maintenance: crate::search::asset_state::SearchMaintenanceSnapshot::default(),
+                semantic_preference: crate::search::asset_state::SemanticPreference::HashFallback,
+                db_available: true,
+                compute_lexical_fingerprint: false,
+                inspect_semantic: false,
+            },
+        )
+        .unwrap();
+        let lexical = &snapshot.lexical;
+        assert_eq!(lexical.fingerprint.current_db_fingerprint, None);
+        assert_eq!(lexical.fingerprint.matches_current_db_fingerprint, None);
+        assert_ne!(lexical.status, "error");
     }
     #[test]
     fn refresh_completed_lexical_rebuild_checkpoint_preserves_content_fingerprint_across_meta_only_writes()

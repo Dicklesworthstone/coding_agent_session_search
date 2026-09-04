@@ -62,6 +62,16 @@ Everything below is on `main`; nothing is in a released binary yet.
   40-segment generation is folded by a plain `cass index`).
 
 ### Fixed
+- `cass status --json` / `cass health --json` no longer report a lexical
+  checkpoint as healthy while search defers repair on a storage-fingerprint
+  mismatch (GH #353). The skip-open surfaces (health watermark lane,
+  count-less status) now compare the same fingerprint search defers on,
+  served from the identity-keyed sidecar cache without ever opening the
+  archive — an absent sidecar stays an honest null instead of an
+  assumed-good — and the search-side deferral warning names the repair that
+  actually runs: `cass index --full` on an archive above the
+  incremental-repair size policy, where plain `cass index` defers the same
+  repair.
 - Stale-on-read auto-refresh no longer respawns a doomed background catch-up
   on every read. On 2026-09-03 a catch-up spawned by an agent's `cass search`
   inherited that session's 16 GB cgroup, crawled the FTS5 shadow write path

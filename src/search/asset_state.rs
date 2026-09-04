@@ -1413,6 +1413,15 @@ fn inspect_lexical_assets(input: InspectLexicalAssetsInput<'_>) -> Result<Lexica
                 )
             })?,
         )
+    } else if db_available {
+        // GH #353: the skip-open surfaces (health watermark lane, count-less
+        // status) deliberately never open the archive, but they must still
+        // compare the storage fingerprint `search` defers repair on instead
+        // of leaving `matches_current_db_fingerprint` null while reporting
+        // fresh. Serve the identity-keyed sidecar fingerprint — never an
+        // open — and stay honestly null when the sidecar does not describe
+        // the current archive identity.
+        crate::indexer::lexical_storage_fingerprint_for_db_cached_readonly(db_path, &index_path)
     } else {
         None
     };

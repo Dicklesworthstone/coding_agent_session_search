@@ -26793,6 +26793,19 @@ impl SearchLexicalSelfHealDiagnosis {
     }
 }
 
+/// gh353: the repair step a deferred fingerprint-mismatch repair hands to
+/// the operator. Above the incremental auto-repair size policy, plain
+/// `cass index` defers the repair too — recommending it sent users in a
+/// circle (search defers to index, index defers the repair), so the step
+/// names `--full` exactly there.
+fn deferred_repair_next_step(db_size_bytes: u64) -> &'static str {
+    if db_size_bytes > crate::indexer::incremental_authoritative_lexical_repair_max_db_bytes() {
+        "run `cass index --full` to repair the lexical checkpoint; plain `cass index` defers the repair on a database this size"
+    } else {
+        "run `cass index` to repair the lexical checkpoint"
+    }
+}
+
 fn search_lexical_self_heal_diagnosis(
     index_path: &Path,
     db_path: &Path,
@@ -27274,11 +27287,20 @@ fn ensure_lexical_assets_for_search(
     }
 
     if initial_index_exists && diagnosis.existing_index_search_allowed {
+        // gh353: on an archive above the incremental-repair size policy,
+        // plain `cass index` defers the authoritative lexical repair, so a
+        // storage-fingerprint mismatch bounces between search (defers to
+        // index) and index (defers the repair) forever. Name the repair
+        // that actually runs in the step the deferral hands to the operator.
+        let next_step = deferred_repair_next_step(
+            crate::indexer::db_size_bytes_for_incremental_lexical_repair_policy(db_path),
+        );
         tracing::warn!(
             reason = %reason,
             data_dir = %data_dir.display(),
             db_path = %db_path.display(),
-            "search detected stale lexical checkpoint metadata; using existing readable lexical index and deferring heavyweight repair to cass index"
+            next_step,
+            "search detected stale lexical checkpoint metadata; using existing readable lexical index and deferring heavyweight repair"
         );
         return Ok(SearchLexicalSelfHeal {
             action: "deferred-repair-searching-existing-index",
@@ -27385,6 +27407,17 @@ mod search_lexical_self_heal_tests {
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use crate::search::query::{FieldMask, SearchClient, SearchFilters};
     use crate::storage::sqlite::FrankenStorage;
+    #[test]
+    fn deferred_repair_next_step_names_full_index_above_size_policy() {
+        assert_eq!(
+            deferred_repair_next_step(0),
+            "run `cass index` to repair the lexical checkpoint"
+        );
+        assert_eq!(
+            deferred_repair_next_step(u64::MAX),
+            "run `cass index --full` to repair the lexical checkpoint; plain `cass index` defers the repair on a database this size"
+        );
+    }
 
     fn seed_search_db_at(db_path: &Path, content: &str, external_id: &str) {
         let storage = FrankenStorage::open(db_path).expect("open canonical db");
