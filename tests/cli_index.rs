@@ -2229,7 +2229,7 @@ fn gh413_fts_shadow_over_its_corpus_bound_is_dropped_and_recreated_once_it_fits(
         ])
         .arg(&data_dir)
         .env("CASS_AUTO_REFRESH", "0")
-        .env("CASS_FTS_SHADOW_MAX_CONTENT_BYTES", "0")
+        .env("CASS_FTS_SHADOW_MAX_MESSAGES", "0")
         .output()
         .expect("seed the archive with a shadow");
     assert!(
@@ -2243,7 +2243,7 @@ fn gh413_fts_shadow_over_its_corpus_bound_is_dropped_and_recreated_once_it_fits(
         .args(["index", "--json", "--no-progress-events", "--data-dir"])
         .arg(&data_dir)
         .env("CASS_AUTO_REFRESH", "0")
-        .env("CASS_FTS_SHADOW_MAX_CONTENT_BYTES", "1")
+        .env("CASS_FTS_SHADOW_MAX_MESSAGES", "1")
         .output()
         .expect("run an incremental index under a 1-byte shadow bound");
     assert!(
@@ -2337,7 +2337,7 @@ fn gh413_fts_shadow_over_its_corpus_bound_is_dropped_and_recreated_once_it_fits(
         ])
         .arg(&data_dir)
         .env("CASS_AUTO_REFRESH", "0")
-        .env("CASS_FTS_SHADOW_MAX_CONTENT_BYTES", "0")
+        .env("CASS_FTS_SHADOW_MAX_MESSAGES", "0")
         .output()
         .expect("full index with the bound lifted");
     assert!(

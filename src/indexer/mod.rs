@@ -14807,15 +14807,17 @@ fn run_index_inner(
     // connection so it never hydrates what it removes.
     match storage.fts_shadow_viability() {
         Ok(crate::storage::sqlite::FtsShadowViability::NotViable {
-            corpus_bytes,
-            bound_bytes,
+            corpus_messages,
+            bound_messages,
         }) => {
-            let detail =
-                crate::storage::sqlite::fts_shadow_not_viable_detail(corpus_bytes, bound_bytes);
+            let detail = crate::storage::sqlite::fts_shadow_not_viable_detail(
+                corpus_messages,
+                bound_messages,
+            );
             tracing::warn!(
                 db_path = %opts.db_path.display(),
-                corpus_bytes,
-                bound_bytes,
+                corpus_messages,
+                bound_messages,
                 "dropping the derived fallback FTS shadow before the first write: the engine \
                  cannot materialize a corpus this large (GH #413); Quill lexical search is \
                  unaffected"
@@ -14850,8 +14852,8 @@ fn run_index_inner(
                 )
             })?;
         }
-        Ok(crate::storage::sqlite::FtsShadowViability::Viable { corpus_bytes }) => {
-            storage.note_fts_shadow_corpus_bytes(corpus_bytes);
+        Ok(crate::storage::sqlite::FtsShadowViability::Viable { corpus_messages }) => {
+            storage.note_fts_shadow_corpus_messages(corpus_messages);
         }
         Ok(crate::storage::sqlite::FtsShadowViability::Absent) => {}
         Err(err) => {

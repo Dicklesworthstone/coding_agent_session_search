@@ -83,11 +83,13 @@ Everything below is on `main`; nothing is in a released binary yet.
   `doctor --fix` stop truthfully at the same engine wall (GH #413,
   frankensqlite#405/#406).
 - The `fts_messages` SQL-fallback shadow is bounded by corpus size
-  (`CASS_FTS_SHADOW_MAX_CONTENT_BYTES`, default 512 MiB). Measured on a copy
-  of a 10 GB archive: fsqlite rebuilds the whole shadow in memory on the first
-  write after a writable open, 20 GB resident and minutes before cass has
-  indexed anything, and every later write transaction clones it — the actual
-  reason the owner's background catch-ups died. Above the bound the index run
+  (`CASS_FTS_SHADOW_MAX_MESSAGES`, default 100,000 indexable messages).
+  Measured on a copy of a 10 GB, 631k-message archive: fsqlite re-tokenizes
+  the whole shadow into memory at every memdb reload after a write
+  transaction (frankensqlite#408), 20 GB resident and about two minutes per
+  statement boundary before cass has indexed anything, and every later write
+  transaction clones it — the actual reason the owner's background catch-ups
+  died and spent an hour in `preparing`. Above the bound the index run
   drops the shadow before its first write (deferred-FTS5 connection, nothing
   hydrated), a run whose ingest crosses the bound stops feeding it and drops
   it at finalize, `index --full`/`doctor --fix` refuse to recreate it while
