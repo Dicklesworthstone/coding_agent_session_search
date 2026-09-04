@@ -4008,18 +4008,50 @@ impl SearchClient {
                 )
             })
             .ok();
-        let client_id = SEARCH_CLIENT_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let cache_namespace = format!(
-            "v{}|schema:{}|client:{}|index:{}",
-            CACHE_KEY_VERSION,
-            FS_CASS_SCHEMA_HASH,
-            client_id,
-            index_path.display()
-        );
         let federated_readers = if tantivy.is_none() {
             crate::search::tantivy::open_federated_search_readers(index_path)
                 .ok()
                 .flatten()
+                .filter(|readers| !readers.is_empty())
+        } else {
+            None
+        };
+
+        if tantivy.is_none() && federated_readers.is_none() && db_path.is_some_and(Path::exists) {
+            tracing::warn!(
+                index_path = %index_path.display(),
+                "Tantivy search index not found or incompatible. \
+                 Search results will be degraded. \
+                 Run `cass index --full` to rebuild the index."
+            );
+        }
+
+        Self::from_opened_lexical_index(
+            crate::search::tantivy::OpenedLexicalIndex {
+                path: index_path.to_path_buf(),
+                reader: tantivy,
+                federated_readers,
+            },
+            db_path,
+            options,
+        )
+    }
+
+    /// Consume the reader used by lexical admission without opening its path
+    /// again. This preserves the admitted snapshot even if publication changes
+    /// between validation and constructing the client.
+    pub(crate) fn from_opened_lexical_index(
+        index: crate::search::tantivy::OpenedLexicalIndex,
+        db_path: Option<&Path>,
+        options: SearchClientOptions,
+    ) -> Result<Option<Self>> {
+        let crate::search::tantivy::OpenedLexicalIndex {
+            path: index_path,
+            reader: tantivy,
+            federated_readers,
+        } = index;
+        let federated_readers =
+            federated_readers
                 .filter(|readers| !readers.is_empty())
                 .map(|readers| {
                     Arc::new(
@@ -4028,21 +4060,17 @@ impl SearchClient {
                             .map(|(reader, fields)| FederatedIndexReader { reader, fields })
                             .collect::<Vec<_>>(),
                     )
-                })
-        } else {
-            None
-        };
+                });
+        let client_id = SEARCH_CLIENT_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let cache_namespace = format!(
+            "v{}|schema:{}|client:{}|index:{}",
+            CACHE_KEY_VERSION,
+            FS_CASS_SCHEMA_HASH,
+            client_id,
+            index_path.display()
+        );
 
         let sqlite_path = db_path.map(Path::to_path_buf).filter(|path| path.exists());
-
-        if tantivy.is_none() && federated_readers.is_none() && sqlite_path.is_some() {
-            tracing::warn!(
-                index_path = %index_path.display(),
-                "Tantivy search index not found or incompatible. \
-                 Search results will be degraded. \
-                 Run `cass index --full` to rebuild the index."
-            );
-        }
 
         if tantivy.is_none() && federated_readers.is_none() && sqlite_path.is_none() {
             return Ok(None);
@@ -6253,17 +6281,6 @@ impl SearchClient {
         if canonical.trim().is_empty() {
             return Ok((Vec::new(), None));
         }
-        let limit = if limit == 0 {
-            self.total_docs().min(no_limit_result_cap()).max(1)
-        } else {
-            limit
-        };
-        let target_hits = limit.saturating_add(offset);
-        if target_hits == 0 {
-            return Ok((Vec::new(), None));
-        }
-        let initial_fetch_limit = target_hits;
-        let fallback_fetch_limit = target_hits.saturating_mul(3);
         loop {
             let (
                 embedding,
@@ -6329,6 +6346,24 @@ impl SearchClient {
                 );
             };
 
+            // A semantic-only client deliberately has no lexical reader. Use
+            // this admitted vector generation for an unlimited request's cap,
+            // rather than silently truncating it to one lexical document.
+            let limit = if limit == 0 {
+                candidate_context
+                    .artifacts
+                    .iter()
+                    .fold(0usize, |count, artifact| {
+                        count.saturating_add(artifact.index().record_count())
+                    })
+                    .min(no_limit_result_cap())
+                    .max(1)
+            } else {
+                limit
+            };
+            let target_hits = limit.saturating_add(offset);
+            let initial_fetch_limit = target_hits;
+            let fallback_fetch_limit = target_hits.saturating_mul(3);
             let finalize_hits =
                 |results: &[VectorSearchResult]| -> Result<(usize, Vec<SearchHit>)> {
                     let hits = self.hydrate_semantic_hits(results, field_mask)?;
@@ -21876,6 +21911,36 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn gh452_semantic_no_limit_uses_vector_count_without_a_lexical_reader() -> Result<()> {
+        for sharded in [false, true] {
+            let fixture =
+                build_semantic_test_fixture_with_options(sharded, SemanticAnnFixtureMode::Missing)?;
+            assert!(!fixture.client.has_tantivy());
+            let (hits, _) = fixture.client.search_semantic(
+                "semantic fixture query",
+                SearchFilters::default(),
+                0,
+                0,
+                FieldMask::FULL,
+                false,
+            )?;
+            assert_eq!(hits.len(), 3);
+            let (page, _) = fixture.client.search_semantic(
+                "semantic fixture query",
+                SearchFilters::default(),
+                0,
+                1,
+                FieldMask::FULL,
+                false,
+            )?;
+            assert_eq!(page.len(), 2);
+            assert_eq!(page[0].source_path, hits[1].source_path);
+            assert_eq!(page[1].source_path, hits[2].source_path);
+        }
         Ok(())
     }
 

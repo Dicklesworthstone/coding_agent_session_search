@@ -924,19 +924,39 @@ pub fn searchable_index_exists(index_path: &Path) -> bool {
         || federated_search_manifest_path(index_path).exists()
 }
 
+/// Readers and their source path travel together from admission into search.
+/// Retaining these owners avoids reopening (and revalidating) every segment
+/// after the strict read-only contract check has already succeeded.
+pub(crate) struct OpenedLexicalIndex {
+    pub(crate) path: PathBuf,
+    pub(crate) reader: Option<(frankensearch::quill::QuillSearchIndex, Fields)>,
+    pub(crate) federated_readers: Option<Vec<(frankensearch::quill::QuillSearchIndex, Fields)>>,
+}
+
+impl std::fmt::Debug for OpenedLexicalIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenedLexicalIndex")
+            .field("path", &self.path)
+            .field("standard_reader", &self.reader.is_some())
+            .field(
+                "federated_readers",
+                &self.federated_readers.as_ref().map(Vec::len),
+            )
+            .finish()
+    }
+}
+
 pub fn validate_searchable_index_contract(index_path: &Path) -> Result<()> {
-    if let Some(manifest) = load_federated_search_manifest_internal(index_path)? {
-        validate_federated_search_manifest(index_path, &manifest, true)?;
-        for shard in manifest.shards {
-            let shard_path = index_path.join(&shard.relative_path);
-            crate::search::quill_bridge::open_cass_reader(&shard_path).with_context(|| {
-                format!(
-                    "opening federated lexical shard reader {}",
-                    shard_path.display()
-                )
-            })?;
-        }
-        return Ok(());
+    open_validated_lexical_index(index_path).map(|_| ())
+}
+
+pub(crate) fn open_validated_lexical_index(index_path: &Path) -> Result<OpenedLexicalIndex> {
+    if let Some(readers) = open_federated_search_readers(index_path)? {
+        return Ok(OpenedLexicalIndex {
+            path: index_path.to_path_buf(),
+            reader: None,
+            federated_readers: Some(readers),
+        });
     }
 
     // No `meta.json` fallback here, unlike `searchable_index_exists` — the
@@ -957,13 +977,17 @@ pub fn validate_searchable_index_contract(index_path: &Path) -> Result<()> {
         ));
     }
     current_schema_hash_file_matches(index_path)?;
-    crate::search::quill_bridge::open_cass_reader(index_path).with_context(|| {
+    let reader = crate::search::quill_bridge::open_cass_reader(index_path).with_context(|| {
         format!(
             "opening standard lexical index reader {}",
             index_path.display()
         )
     })?;
-    Ok(())
+    Ok(OpenedLexicalIndex {
+        path: index_path.to_path_buf(),
+        reader: Some((reader, cass_field_handles())),
+        federated_readers: None,
+    })
 }
 
 pub fn searchable_index_modified_time(index_path: &Path) -> Option<SystemTime> {

@@ -108,6 +108,16 @@ thread_local! {
     static DRIVER: RefCell<Option<Runtime>> = const { RefCell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    static READER_OPEN_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reader_open_count() -> u64 {
+    READER_OPEN_COUNT.with(std::cell::Cell::get)
+}
+
 pub(crate) fn shutdown_driver() -> bool {
     DRIVER
         .with(|slot| slot.borrow_mut().take())
@@ -378,6 +388,8 @@ pub fn content_snippet_generator(
 ///
 /// Returns an error when the published snapshot cannot be opened.
 pub fn open_cass_reader(path: &Path) -> Result<QuillSearchIndex> {
+    #[cfg(test)]
+    READER_OPEN_COUNT.with(|count| count.set(count.get() + 1));
     drive(|cx| {
         let path = path.to_path_buf();
         async move {

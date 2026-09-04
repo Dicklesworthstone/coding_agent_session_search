@@ -27023,6 +27023,7 @@ fn search_lexical_repair_failed_error(reason: &str, err: anyhow::Error) -> CliEr
 fn search_lexical_read_only_diagnosis(
     index_path: &Path,
     db_path: &Path,
+    opened_index: &anyhow::Result<crate::search::tantivy::OpenedLexicalIndex>,
 ) -> CliResult<Option<SearchLexicalSelfHealDiagnosis>> {
     if !crate::search::tantivy::searchable_index_exists(index_path) {
         return Ok(Some(SearchLexicalSelfHealDiagnosis::rebuild(
@@ -27030,7 +27031,7 @@ fn search_lexical_read_only_diagnosis(
         )));
     }
 
-    if let Err(err) = crate::search::tantivy::validate_searchable_index_contract(index_path) {
+    if let Err(err) = opened_index {
         return Ok(Some(SearchLexicalSelfHealDiagnosis::rebuild(format!(
             "lexical artifact contract is unusable: {err:#}"
         ))));
@@ -27098,13 +27099,17 @@ fn inspect_lexical_assets_for_search_read_only(
     data_dir: &Path,
     db_path: &Path,
     index_path: &Path,
-) -> CliResult<SearchLexicalSelfHeal> {
+) -> CliResult<(
+    SearchLexicalSelfHeal,
+    Option<crate::search::tantivy::OpenedLexicalIndex>,
+)> {
     if !db_path.exists() {
-        return Ok(SearchLexicalSelfHeal::skipped());
+        return Ok((SearchLexicalSelfHeal::skipped(), None));
     }
 
     let index_exists = crate::search::tantivy::searchable_index_exists(index_path);
-    let diagnosis = search_lexical_read_only_diagnosis(index_path, db_path)?;
+    let opened_index = crate::search::tantivy::open_validated_lexical_index(index_path);
+    let diagnosis = search_lexical_read_only_diagnosis(index_path, db_path, &opened_index)?;
     let active = probe_index_run_lock(data_dir, db_path).active;
     if active {
         if index_exists
@@ -27112,13 +27117,17 @@ fn inspect_lexical_assets_for_search_read_only(
                 SearchLexicalSelfHealDiagnosis::permits_existing_index_during_active_rebuild,
             )
         {
-            return Ok(SearchLexicalSelfHeal {
-                action: "no-maintenance-active-rebuild-searching-existing-index",
-                reason: Some(
-                    "lexical maintenance is active; --no-maintenance did not join it".to_string(),
-                ),
-                indexed_docs: None,
-            });
+            return Ok((
+                SearchLexicalSelfHeal {
+                    action: "no-maintenance-active-rebuild-searching-existing-index",
+                    reason: Some(
+                        "lexical maintenance is active; --no-maintenance did not join it"
+                            .to_string(),
+                    ),
+                    indexed_docs: None,
+                },
+                opened_index.ok(),
+            ));
         }
         return Err(CliError {
             code: 7,
@@ -27136,7 +27145,7 @@ fn inspect_lexical_assets_for_search_read_only(
     }
 
     let Some(diagnosis) = diagnosis else {
-        return Ok(SearchLexicalSelfHeal::skipped());
+        return Ok((SearchLexicalSelfHeal::skipped(), opened_index.ok()));
     };
     if index_exists && diagnosis.existing_index_search_allowed {
         tracing::warn!(
@@ -27144,11 +27153,14 @@ fn inspect_lexical_assets_for_search_read_only(
             data_dir = %data_dir.display(),
             "--no-maintenance is using the readable lexical index without changing its stale checkpoint metadata"
         );
-        return Ok(SearchLexicalSelfHeal {
-            action: "no-maintenance-searching-existing-index",
-            reason: Some(diagnosis.reason),
-            indexed_docs: None,
-        });
+        return Ok((
+            SearchLexicalSelfHeal {
+                action: "no-maintenance-searching-existing-index",
+                reason: Some(diagnosis.reason),
+                indexed_docs: None,
+            },
+            opened_index.ok(),
+        ));
     }
 
     Err(CliError {
@@ -27557,6 +27569,181 @@ mod search_lexical_self_heal_tests {
     }
 
     #[test]
+    fn gh452_strict_search_setup_opens_the_admitted_reader_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_canonical_search_db(data_dir);
+        build_standalone_lexical_index_without_checkpoint(data_dir, "admittedneedle");
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        let before = data_tree_snapshot(data_dir);
+        let fields = FieldMask::new(false, false, true, false);
+        let reference = SearchClient::open_with_options(
+            &index_path,
+            None,
+            crate::search::query::SearchClientOptions {
+                enable_reload: false,
+                enable_warm: false,
+                strict_read_only: true,
+            },
+        )
+        .expect("open reference reader")
+        .expect("reference generation");
+        let expected = reference
+            .search("admittedneedle", SearchFilters::default(), 10, 0, fields)
+            .expect("reference query");
+
+        for mode in [
+            None,
+            Some(crate::search::query::SearchMode::Lexical),
+            Some(crate::search::query::SearchMode::Hybrid),
+        ] {
+            let opens = crate::search::quill_bridge::reader_open_count();
+            let setup = open_cli_search_setup(
+                data_dir,
+                &db_path,
+                &index_path,
+                mode,
+                None,
+                Instant::now(),
+                true,
+                true,
+            )
+            .unwrap_or_else(|err| panic!("open strict search: {err:?}"));
+            assert_eq!(crate::search::quill_bridge::reader_open_count() - opens, 1);
+            let hits = setup
+                .client
+                .search("admittedneedle", SearchFilters::default(), 10, 0, fields)
+                .expect("search admitted generation");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(
+                serde_json::to_value(&hits).expect("serialize retained hits"),
+                serde_json::to_value(&expected).expect("serialize reference hits"),
+                "reader transfer must preserve identity, ordering, score and provenance"
+            );
+            assert_eq!(crate::search::quill_bridge::reader_open_count() - opens, 1);
+        }
+        assert_eq!(before, data_tree_snapshot(data_dir));
+    }
+
+    #[test]
+    fn gh452_admitted_reader_survives_replacement_before_client_construction() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_canonical_search_db(data_dir);
+        build_standalone_lexical_index_without_checkpoint(data_dir, "originalneedle");
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        let (_, admitted) =
+            inspect_lexical_assets_for_search_read_only(data_dir, &db_path, &index_path)
+                .expect("admit original generation");
+        std::fs::rename(&index_path, data_dir.join("retained-original-index"))
+            .expect("retain original generation");
+        build_standalone_lexical_index_without_checkpoint(data_dir, "replacementneedle");
+
+        let opens = crate::search::quill_bridge::reader_open_count();
+        let client = SearchClient::from_opened_lexical_index(
+            admitted.expect("owned reader"),
+            None,
+            crate::search::query::SearchClientOptions {
+                enable_reload: false,
+                enable_warm: false,
+                strict_read_only: true,
+            },
+        )
+        .expect("construct client")
+        .expect("reader available");
+        for (query, count) in [("originalneedle", 1), ("replacementneedle", 0)] {
+            let hits = client
+                .search(
+                    query,
+                    SearchFilters::default(),
+                    10,
+                    0,
+                    FieldMask::new(false, false, true, false),
+                )
+                .expect("search retained generation");
+            assert_eq!(hits.len(), count, "query={query}");
+        }
+        assert_eq!(crate::search::quill_bridge::reader_open_count(), opens);
+    }
+
+    #[test]
+    fn gh452_strict_admission_retains_valid_manifest_fallback() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_canonical_search_db(data_dir);
+        build_standalone_lexical_index_without_checkpoint(data_dir, "fallbackneedle");
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        assert!(index_path.join("MANIFEST.prev").is_file());
+        std::fs::write(index_path.join("MANIFEST"), b"invalid current manifest")
+            .expect("damage current manifest only");
+        let before = data_tree_snapshot(data_dir);
+        let opens = crate::search::quill_bridge::reader_open_count();
+        let setup = open_cli_search_setup(
+            data_dir,
+            &db_path,
+            &index_path,
+            Some(crate::search::query::SearchMode::Lexical),
+            None,
+            Instant::now(),
+            true,
+            true,
+        )
+        .unwrap_or_else(|err| panic!("valid prior manifest remains readable: {err:?}"));
+        assert!(setup.client.has_tantivy());
+        assert_eq!(crate::search::quill_bridge::reader_open_count() - opens, 1);
+        assert_eq!(before, data_tree_snapshot(data_dir));
+    }
+
+    #[test]
+    fn gh452_corrupt_lexical_contract_is_rejected_but_semantic_setup_skips_it() {
+        for damaged_file in ["schema_hash.json", "MANIFEST"] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let data_dir = temp.path();
+            let db_path = seed_canonical_search_db(data_dir);
+            build_standalone_lexical_index_without_checkpoint(data_dir, "contractneedle");
+            let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+            std::fs::write(index_path.join(damaged_file), b"invalid contract")
+                .expect("damage test lexical contract");
+            if damaged_file == "MANIFEST" {
+                // Keeper can legitimately use a valid prior manifest. Damage
+                // both slots to exercise an actually unreadable generation.
+                std::fs::write(index_path.join("MANIFEST.prev"), b"invalid prior contract")
+                    .expect("damage prior manifest");
+            }
+            let before = data_tree_snapshot(data_dir);
+            let err = open_cli_search_setup(
+                data_dir,
+                &db_path,
+                &index_path,
+                Some(crate::search::query::SearchMode::Lexical),
+                None,
+                Instant::now(),
+                true,
+                true,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("strict lexical admission must reject {damaged_file}"));
+            assert_eq!(err.kind, "maintenance-required", "{damaged_file}");
+
+            let opens = crate::search::quill_bridge::reader_open_count();
+            let setup = open_cli_search_setup(
+                data_dir,
+                &db_path,
+                &index_path,
+                Some(crate::search::query::SearchMode::Semantic),
+                None,
+                Instant::now(),
+                true,
+                true,
+            )
+            .unwrap_or_else(|err| panic!("semantic setup must skip lexical admission: {err:?}"));
+            assert!(!setup.client.has_tantivy());
+            assert_eq!(crate::search::quill_bridge::reader_open_count(), opens);
+            assert_eq!(before, data_tree_snapshot(data_dir));
+        }
+    }
+
+    #[test]
     fn gh422_no_maintenance_refuses_missing_index_without_creating_assets() {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = temp.path();
@@ -27581,8 +27768,9 @@ mod search_lexical_self_heal_tests {
         let index_path = crate::search::tantivy::expected_index_dir(data_dir);
         let before = data_tree_snapshot(data_dir);
 
-        let outcome = inspect_lexical_assets_for_search_read_only(data_dir, &db_path, &index_path)
-            .expect("a readable index may fail open without maintenance");
+        let (outcome, _) =
+            inspect_lexical_assets_for_search_read_only(data_dir, &db_path, &index_path)
+                .expect("a readable index may fail open without maintenance");
         assert_eq!(outcome.action, "no-maintenance-searching-existing-index");
         assert_eq!(before, data_tree_snapshot(data_dir));
     }
@@ -27598,8 +27786,9 @@ mod search_lexical_self_heal_tests {
         let before = data_tree_snapshot(data_dir);
         let started = Instant::now();
 
-        let outcome = inspect_lexical_assets_for_search_read_only(data_dir, &db_path, &index_path)
-            .expect("read-only search must use the existing index immediately");
+        let (outcome, _) =
+            inspect_lexical_assets_for_search_read_only(data_dir, &db_path, &index_path)
+                .expect("read-only search must use the existing index immediately");
         assert_eq!(
             outcome.action,
             "no-maintenance-active-rebuild-searching-existing-index"
@@ -27636,8 +27825,9 @@ mod search_lexical_self_heal_tests {
         std::fs::write(&db_path, b"not a sqlite database")
             .expect("replace canonical fixture with a planted unreadable database");
         let before = data_tree_snapshot(data_dir);
-        let outcome = inspect_lexical_assets_for_search_read_only(data_dir, &db_path, &index_path)
-            .expect("passive checkpoint validation must not open the canonical database");
+        let (outcome, _) =
+            inspect_lexical_assets_for_search_read_only(data_dir, &db_path, &index_path)
+                .expect("passive checkpoint validation must not open the canonical database");
         assert_eq!(outcome.action, "skipped");
         assert_eq!(before, data_tree_snapshot(data_dir));
     }
@@ -29046,35 +29236,45 @@ fn open_cli_search_setup(
     use crate::search::query::{SearchClient, SearchClientOptions};
 
     maybe_test_search_worker_delay("CASS_TEST_SEARCH_SETUP_SLOW_MS");
-    let self_heal = if search_request_skips_lexical_self_heal(mode) {
-        SearchLexicalSelfHeal::skipped()
+    let (self_heal, opened_index) = if search_request_skips_lexical_self_heal(mode) {
+        (
+            SearchLexicalSelfHeal::skipped(),
+            Some(crate::search::tantivy::OpenedLexicalIndex {
+                path: index_path.to_path_buf(),
+                reader: None,
+                federated_readers: None,
+            }),
+        )
     } else if no_maintenance {
         inspect_lexical_assets_for_search_read_only(data_dir, db_path, index_path)?
     } else {
-        ensure_lexical_assets_for_search(
-            data_dir,
-            db_path,
-            index_path,
-            timeout_ms,
-            started_at,
-            false,
-            robot_bounded_degraded,
-        )?
+        (
+            ensure_lexical_assets_for_search(
+                data_dir,
+                db_path,
+                index_path,
+                timeout_ms,
+                started_at,
+                false,
+                robot_bounded_degraded,
+            )?,
+            None,
+        )
     };
     let lexical_initialized = crate::search::tantivy::searchable_index_exists(index_path);
     let rebuild_active = probe_index_run_lock(data_dir, db_path).active;
     let db_exists = db_path.exists();
+    let options = SearchClientOptions {
+        enable_reload: false,
+        enable_warm: false,
+        strict_read_only: no_maintenance,
+    };
+    let client = match opened_index {
+        Some(index) => SearchClient::from_opened_lexical_index(index, Some(db_path), options),
+        None => SearchClient::open_with_options(index_path, Some(db_path), options),
+    };
     let client = std::sync::Arc::new(
-        SearchClient::open_with_options(
-            index_path,
-            Some(db_path),
-            SearchClientOptions {
-                enable_reload: false,
-                enable_warm: false,
-                strict_read_only: no_maintenance,
-            },
-        )
-        .map_err(|error| CliError {
+        client.map_err(|error| CliError {
             code: 9,
             kind: CliErrorKind::OpenIndex.kind_str(),
             message: format!("failed to open index: {error}"),
@@ -29426,7 +29626,7 @@ fn run_cli_search(
             "search lexical self-heal completed"
         );
     }
-    if !client.has_tantivy() {
+    if !client.has_tantivy() && !search_request_skips_lexical_self_heal(mode) {
         eprintln!(
             "Warning: Tantivy search index not found at {}. \
              Results will be severely limited. \

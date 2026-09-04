@@ -646,6 +646,67 @@ fn no_maintenance_hybrid_search_with_semantic_assets_is_byte_stable() {
 }
 
 #[test]
+fn gh452_semantic_only_search_ignores_corrupt_lexical_assets() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_semantic_isolation_data");
+    fs::create_dir_all(&data_dir).unwrap();
+    for idx in 1..=3 {
+        seed_codex_session(
+            &codex_home,
+            &format!("rollout-semantic-isolation-{idx:02}.jsonl"),
+            &format!("semanticisolationneedle independent vector retrieval {idx}"),
+        );
+    }
+    run_fresh_index(home, &data_dir);
+    // Hash embeddings isolate dispatch and hydration; this is not a MiniLM
+    // relevance or performance claim.
+    build_hash_semantic_assets(&data_dir, true);
+    let index_path = coding_agent_search::search::tantivy::expected_index_dir(&data_dir);
+    fs::write(index_path.join("MANIFEST"), b"invalid lexical contract").unwrap();
+    fs::write(index_path.join("MANIFEST.prev"), b"invalid prior lexical contract").unwrap();
+    let before = data_tree_snapshot(&data_dir);
+    let output = cass_cmd(home)
+        .args([
+            "search",
+            "semanticisolationneedle",
+            "--json",
+            "--robot-meta",
+            "--mode",
+            "semantic",
+            "--model",
+            "hash",
+            "--no-maintenance",
+            "--limit",
+            "0",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .timeout(Duration::from_secs(20))
+        .output()
+        .expect("run semantic-only search subprocess");
+    assert!(
+        output.status.success(),
+        "semantic-only search must ignore corrupt lexical assets. stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("search JSON");
+    assert!(
+        payload["hits"]
+            .as_array()
+            .is_some_and(|hits| hits.len() > 1)
+    );
+    assert_eq!(payload["_meta"]["search_mode"], "semantic");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("Tantivy search index"),
+        "intentional semantic-only admission must not emit a missing lexical warning"
+    );
+    assert_eq!(before, data_tree_snapshot(&data_dir));
+}
+
+#[test]
 fn explicit_hybrid_mode_fails_open_to_lexical_when_semantic_assets_missing() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path();
