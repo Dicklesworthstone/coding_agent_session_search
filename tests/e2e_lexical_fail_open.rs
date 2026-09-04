@@ -665,7 +665,11 @@ fn gh452_semantic_only_search_ignores_corrupt_lexical_assets() {
     build_hash_semantic_assets(&data_dir, true);
     let index_path = coding_agent_search::search::tantivy::expected_index_dir(&data_dir);
     fs::write(index_path.join("MANIFEST"), b"invalid lexical contract").unwrap();
-    fs::write(index_path.join("MANIFEST.prev"), b"invalid prior lexical contract").unwrap();
+    fs::write(
+        index_path.join("MANIFEST.prev"),
+        b"invalid prior lexical contract",
+    )
+    .unwrap();
     let before = data_tree_snapshot(&data_dir);
     let output = cass_cmd(home)
         .args([
