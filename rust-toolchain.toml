@@ -15,6 +15,6 @@
 # run. Bump it deliberately, as its own commit, after a green gate -- never by
 # letting it float.
 [toolchain]
-channel = "nightly-2026-08-25"
+channel = "nightly-2026-08-31"
 components = ["rustfmt", "clippy"]
 profile = "default"
