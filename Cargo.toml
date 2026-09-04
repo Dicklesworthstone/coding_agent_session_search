@@ -66,14 +66,15 @@ notify = "8.2.0"
 # behavior is required by CASS's pre-mutation full-rebuild integrity gate on
 # Windows. 0.3.13 adds the
 # autoindex-vanish corruption-writer fixes (the cass#434 writer class).
-# The engine API is async
-# (!Send futures); CASS's synchronous call shape is preserved by
-# src/franken_sync.rs, which drives every engine future on a private
-# current-thread asupersync runtime.
-frankensqlite = { version = "=0.3.14", package = "fsqlite", features = ["fts5", "async-api"] }
+# 0.3.16 (adopted 2026-09-04) adds the GH#382 appended-WAL-tail fix
+# (8d012706a — the per-page WAL rescan that looped the owner-archive
+# writable open, bead g3zyo), the GH#405 FTS5 savepoint undo log
+# (savepoints no longer clone the whole table per statement), and the
+# GH#406 content-backed INSERT persisted as an incremental segment append.
+frankensqlite = { version = "=0.3.16", package = "fsqlite", features = ["fts5", "async-api"] }
 # The production storage-integrity probe calls FrankenSQLite's public VFS API
 # directly so it can inspect native writer locks without opening the pager.
-fsqlite-types = { version = "=0.3.14", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.3.16", package = "fsqlite-types" }
 rayon = "1.12.0"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
@@ -218,10 +219,10 @@ rand_chacha = "0.10"
 rusqlite = { version = "0.40.2", features = ["bundled", "modern_sqlite"] }
 # The manifest-policy build gate requires this explicit dev entry for compat
 # fixture assertions, even though production also uses the same pinned crate.
-fsqlite-types = { version = "=0.3.14", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.3.16", package = "fsqlite-types" }
 
 # The fsqlite family resolves from the exact registry version for every direct
-# and transitive consumer. build.rs enforces a single 0.3.13 family source.
+# and transitive consumer. build.rs enforces a single 0.3.16 family source.
 
 [[bin]]
 name = "cass"

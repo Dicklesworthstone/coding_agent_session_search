@@ -48,27 +48,26 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "fsqlite",
         manifest_package_field: Some("fsqlite"),
         // Exact upstream source pin (established with the fsqlite 0.2.1
-        // migration, bead bo000; now at 0.3.14. 0.3.15 was evaluated on
+        // migration, bead bo000; now at 0.3.16. 0.3.15 was evaluated on
         // 2026-09-02 (bead gh382-fsqlite-pin) and NOT adopted: cass's own
-        // writable open still loops on a large archive with a large WAL
-        // (reclaim sweep x per-page WAL rescan, cass GH #382 / bead g3zyo —
-        // fixed upstream in frankensqlite 8d012706a, next release) and its
-        // open is ~5 s slower on a fresh archive. 0.3.13 carried the asupersync
-        // 0.4.3 runtime migration, the GH#333/GH#334 bug-fix wave, the
-        // cass#393 namespace-sidecar st_dev repair, the 0.3.1
-        // allocator/freelist/concurrent-writer correctness wave, and the
-        // later FTS5 correctness fixes plus the GH#438 Windows sidecar-less
-        // read-only close repair shipped in 0.3.9). Revisions 22af0753 and
-        // 027f62f2 admit the semantically read-only FTS5 integrity command
-        // through both the physically read-only pager and `PRAGMA query_only`
-        // guards, which CASS's full-rebuild preflight requires on Windows
-        // without weakening its corruption gate. 0.3.13 adds the
-        // autoindex-vanish corruption-writer fixes (the cass#434 writer
-        // class).
+        // writable open still looped on a large archive with a large WAL
+        // (reclaim sweep x per-page WAL rescan, cass GH #382 / bead g3zyo).
+        // 0.3.16 carries that fix — frankensqlite 8d012706a, index the
+        // appended WAL tail once per stable tail instead of rescanning it
+        // per page — plus the GH#405 FTS5 undo log (savepoints no longer
+        // clone the whole table), the GH#406 content-backed INSERT as an
+        // incremental segment append, lazy contentless FTS5 on the ordinary
+        // open path, prefix-BM25 scoring parity, and the 0.3.15 line (FTS5
+        // 'optimize', origin-poison self-heal, macOS clippy gate). Adopted
+        // 2026-09-04 by owner instruction. The 0.3.13 semantics CASS relies
+        // on (asupersync 0.4.3 runtime migration, GH#333/GH#334, the
+        // cass#393 namespace-sidecar repair, the GH#438 Windows sidecar-less
+        // read-only close, integrity-check through read-only guards, and
+        // the cass#434 autoindex-vanish fixes) all carry forward.
         // fsqlite resolves from crates.io at the exact version below.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.14",
+        expected_version: "0.3.16",
         // `async-api` exposes frankensqlite::AsyncConnection, which
         // src/search/query.rs uses (as SearchSqliteConnection) for the
         // no-hit alternate-agent suggestions without a full storage open.
@@ -89,7 +88,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // Keep shared types on the identical registry version as the facade.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.14",
+        expected_version: "0.3.16",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -107,7 +106,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // Keep shared types on the identical registry version as the facade.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.14",
+        expected_version: "0.3.16",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
