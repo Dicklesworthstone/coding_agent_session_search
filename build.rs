@@ -442,7 +442,7 @@ fn validate_fsqlite_source_pin(manifest_dir: &Path, manifest: &Value, packaged_m
     // The fsqlite engine family must resolve exclusively from crates.io at
     // one exact version. The single-source identity is load-bearing for the
     // read-only FTS5 integrity preflight used by CASS on Windows.
-    const EXPECTED_VERSION: &str = "0.3.14";
+    const EXPECTED_VERSION: &str = "0.3.16";
     const EXPECTED_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
     // 1. With the family on crates.io (e926644f), a `[patch]` table is no
