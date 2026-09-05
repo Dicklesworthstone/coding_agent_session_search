@@ -28,12 +28,17 @@ set -uo pipefail
 
 test_log_counts() {
     awk '
+        /^running [0-9]+ tests?$/ {
+            if (started != binaries) incomplete++
+            started++
+        }
         /^test result: ok\. [0-9]+ passed;/ {
+            if (started != binaries + 1) incomplete++
             binaries++; passed += $4; if ($4 == 0) empty++
         }
         /^test result: FAILED\./ { empty++ }
         END {
-            if (binaries == 0 || empty > 0) exit 1
+            if (binaries == 0 || empty > 0 || incomplete > 0 || started != binaries) exit 1
             printf "PASSED=%d BINARIES=%d\n", passed, binaries
         }
     ' "$1"
@@ -242,7 +247,9 @@ run_ubs() {
         return 0
     fi
     printf 'UBS_FILE=%s\n' "$@"
-    bash "$scanner" --format=json --ci --fail-on-warning "$@"
+    # The pinned runner emits only aggregate Rust counts in JSON/JSONL mode.
+    # Text retains categories and source samples needed to diagnose a red gate.
+    bash "$scanner" --no-auto-update --format=text --ci --fail-on-warning "$@"
 }
 
 # Every stage records its own exit code and preserves complete test output.
@@ -264,7 +271,7 @@ fi
 # Every stage the remote script will run, in order. The receipt check below
 # requires each one to report: a job cut short by the fleet's SSH ceiling
 # leaves later stages missing, and a missing stage is RED, never green.
-EXPECTED_STAGES=(source-identity fmt clippy ubs)
+EXPECTED_STAGES=(source-identity fmt clippy)
 [ "$RUN_LIB" = 1 ] && EXPECTED_STAGES+=(lib-tests)
 integration_stage=""
 if [ "$RUN_INTEGRATION" = 1 ]; then
@@ -326,9 +333,11 @@ echo STAGE=source-identity EXIT=\${identity_rc}
 if [ \"\$identity_rc\" -ne 0 ]; then exit 1; fi
 cargo fmt --check; echo STAGE=fmt EXIT=\$?; \
 cargo clippy --locked -j ${BUILD_JOBS} --all-targets -- -D warnings; echo STAGE=clippy EXIT=\$?; \
-run_ubs ${UBS_FILES_ARG}; echo STAGE=ubs EXIT=\$?; \
-${lib_stage} ${integration_stage} ${docs_truth_stage} ${golden_regen_stage} ${golden_stage} echo STAGE=job-complete EXIT=0"
-EXPECTED_STAGES+=(job-complete)
+${lib_stage} ${integration_stage} ${golden_regen_stage} ${golden_stage} ${docs_truth_stage} \
+run_ubs ${UBS_FILES_ARG}; echo STAGE=ubs EXIT=\$?; echo STAGE=job-complete EXIT=0"
+# Scan after behavioral validation: a slow scanner must not consume the whole
+# admission before any product test runs. UBS remains mandatory and blocking.
+EXPECTED_STAGES+=(ubs job-complete)
 
 run_once() {
     if [ "$LOCAL" = 1 ]; then

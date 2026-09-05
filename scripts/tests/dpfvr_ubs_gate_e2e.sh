@@ -63,8 +63,8 @@ RECEIPT
     check_exit nonterminal-job-complete 1 bash "$gate" --verify-receipt "$proof_dir/not-terminal.txt" 0 "${expected[@]}"
     check_exit stale-docs-binary 1 bash "$gate" --verify-receipt "$receipt" 0 "${expected[@]}" docs-build docs-binary-identity docs-truth
 
-    printf 'test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out\n' > "$proof_dir/tests-positive.txt"
-    printf 'test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out\n' > "$proof_dir/tests-empty.txt"
+    printf 'running 3 tests\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out\n' > "$proof_dir/tests-positive.txt"
+    printf 'running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out\n' > "$proof_dir/tests-empty.txt"
     printf 'running 3 tests\n' > "$proof_dir/tests-truncated.txt"
     cat "$proof_dir/tests-positive.txt" "$proof_dir/tests-empty.txt" > "$proof_dir/tests-mixed.txt"
     cat "$proof_dir/tests-positive.txt" "$proof_dir/tests-positive.txt" > "$proof_dir/tests-two-binaries.txt"
@@ -73,6 +73,10 @@ RECEIPT
     check_exit zero-selected-tests 1 bash "$gate" --verify-test-log "$proof_dir/tests-empty.txt"
     check_exit truncated-tests 1 bash "$gate" --verify-test-log "$proof_dir/tests-truncated.txt"
     check_exit positive-and-empty-binary 1 bash "$gate" --verify-test-log "$proof_dir/tests-mixed.txt"
+    cat "$proof_dir/tests-positive.txt" "$proof_dir/tests-truncated.txt" > "$proof_dir/tests-tail-truncated.txt"
+    check_exit positive-and-truncated-binary 1 bash "$gate" --verify-test-log "$proof_dir/tests-tail-truncated.txt"
+    printf 'test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out\n' > "$proof_dir/tests-missing-start.txt"
+    check_exit missing-test-start 1 bash "$gate" --verify-test-log "$proof_dir/tests-missing-start.txt"
     { cat "$proof_dir/tests-positive.txt"; echo 'test result: FAILED. 1 passed; 1 failed;'; } > "$proof_dir/tests-failed.txt"
     check_exit positive-and-failed-binary 1 bash "$gate" --verify-test-log "$proof_dir/tests-failed.txt"
     check_exit repeated-integration-target 2 bash "$gate" --integration 'e2e_lexical_fail_open:a,e2e_lexical_fail_open:b'
