@@ -855,6 +855,7 @@ fn markdown_pack_preserves_json_excerpts_without_interpreting_source_markup() {
         );
         let mut expected = Vec::new();
         let mut safe_record_verified = false;
+        let mut secret_record_selected = false;
         for item in evidence {
             let excerpt = item["excerpt"].as_str().expect("JSON excerpt");
             expected.push(if excerpt.ends_with('\n') {
@@ -874,6 +875,10 @@ fn markdown_pack_preserves_json_excerpts_without_interpreting_source_markup() {
                 assert_eq!(item["citation"]["verified"], true);
                 assert_eq!(item["citation"]["line_start"], 2);
                 safe_record_verified = true;
+            } else if source.file_name().and_then(|name| name.to_str())
+                == Some("rollout-markdown-secret.jsonl")
+            {
+                secret_record_selected = true;
             }
             if max_excerpt_chars == "80" {
                 assert_eq!(item["excerpt_truncated"], true);
@@ -886,6 +891,10 @@ fn markdown_pack_preserves_json_excerpts_without_interpreting_source_markup() {
         assert!(
             safe_record_verified,
             "the verifiable source must be selected"
+        );
+        assert!(
+            secret_record_selected,
+            "the credential-bearing source must be selected to prove redaction"
         );
         let mut excerpts = Vec::new();
         let mut current_excerpt = None::<String>;

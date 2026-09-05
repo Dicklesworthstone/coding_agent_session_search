@@ -1118,7 +1118,10 @@ pub(crate) fn verify_pack_source_citations(
             };
             for (slot, evidence_index) in matches.iter_mut().zip(&indices) {
                 let candidate = &plan.evidence[*evidence_index].candidate;
-                if message.content == candidate.excerpt
+                // The modern Codex parser trims message boundaries, while
+                // archived FAD messages can retain that whitespace. Preserve
+                // internal whitespace and require a unique normalized record.
+                if message.content == candidate.excerpt.trim()
                     && candidate
                         .created_at_ms
                         .is_none_or(|created| message.created_at == Some(created))
@@ -2921,6 +2924,55 @@ mod tests {
         assert!(!oversized.evidence[0].candidate.citation_verified);
         assert_eq!(oversized.evidence[0].candidate.line_start, None);
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 8 * 1024 * 1024 + 1);
+    }
+
+    #[test]
+    fn source_citations_normalize_only_message_boundary_whitespace() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("rollout-whitespace.jsonl");
+        let excerpt = "\n\nverified needle \t\n";
+        let record = |text: &str| {
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}]
+                }
+            })
+            .to_string()
+        };
+        let mut item = candidate("whitespace", "local", path.to_str().unwrap(), 10.0);
+        item.created_at_ms = None;
+        item.excerpt = excerpt.to_string();
+        let base = plan_answer_pack(request(vec![item])).unwrap();
+        let raw = record(excerpt);
+        for (source, verified) in [
+            (raw.clone(), true),
+            (record("verified needle"), true),
+            (record("verified  needle"), false),
+            (format!("{raw}\n{}", record("verified needle")), false),
+        ] {
+            std::fs::write(&path, &source).unwrap();
+            let mut plan = base.clone();
+            verify_pack_source_citations(
+                &mut plan,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            );
+            let evidence = &plan.evidence[0];
+            assert_eq!(evidence.excerpt, excerpt);
+            assert_eq!(evidence.candidate.excerpt, excerpt);
+            assert_eq!(evidence.candidate.citation_verified, verified);
+            assert_eq!(evidence.candidate.line_start, verified.then_some(1));
+            assert_eq!(evidence.candidate.line_end, verified.then_some(1));
+            if verified {
+                assert_eq!(
+                    evidence.candidate.span_hash,
+                    blake3::hash(source.as_bytes()).to_hex().to_string()
+                );
+            }
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        }
     }
 
     #[cfg(unix)]
