@@ -795,16 +795,11 @@ fn markdown_pack_preserves_json_excerpts_without_interpreting_source_markup() {
     let data_dir = home.join("markdown_pack_data");
     let secret = "sk-12345678901234567890";
     let content = format!(
-        "markdownpackneedle <script>alert(1)</script> [link](https://example.invalid)\n{}\n\n\
-         ```rust\nfn main() {{}}\n```\n~~~\n# source heading\nfinal preserved context",
+        "\n\nmarkdownpackneedle <script>alert(1)</script> [link](https://example.invalid)\n{}\n\n\
+         ```rust\nfn main() {{}}\n```\n~~~\n# source heading\nfinal preserved context\n\n",
         "Unicode αβ 🚀 context. ".repeat(25)
     );
-    util::seed_codex_session(
-        &codex_home,
-        "rollout-markdown-safe.jsonl",
-        &content,
-        false,
-    );
+    util::seed_codex_session(&codex_home, "rollout-markdown-safe.jsonl", &content, false);
     util::seed_codex_session(
         &codex_home,
         "rollout-markdown-secret.jsonl",
@@ -858,9 +853,14 @@ fn markdown_pack_preserves_json_excerpts_without_interpreting_source_markup() {
             "both real source records must be selected"
         );
         let mut expected = Vec::new();
+        let mut safe_record_verified = false;
         for item in evidence {
             let excerpt = item["excerpt"].as_str().expect("JSON excerpt");
-            expected.push(format!("{excerpt}\n"));
+            expected.push(if excerpt.ends_with('\n') {
+                excerpt.to_string()
+            } else {
+                format!("{excerpt}\n")
+            });
             let source = Path::new(
                 item["citation"]["source_path"]
                     .as_str()
@@ -872,6 +872,7 @@ fn markdown_pack_preserves_json_excerpts_without_interpreting_source_markup() {
             {
                 assert_eq!(item["citation"]["verified"], true);
                 assert_eq!(item["citation"]["line_start"], 2);
+                safe_record_verified = true;
             }
             if max_excerpt_chars == "80" {
                 assert_eq!(item["excerpt_truncated"], true);
@@ -881,6 +882,7 @@ fn markdown_pack_preserves_json_excerpts_without_interpreting_source_markup() {
                 assert!(excerpt.chars().count() > 220);
             }
         }
+        assert!(safe_record_verified, "the verifiable source must be selected");
         let mut excerpts = Vec::new();
         let mut current_excerpt = None::<String>;
         for event in Parser::new(&outputs[1]) {

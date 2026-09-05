@@ -2513,15 +2513,25 @@ fn render_answer_pack_markdown(envelope: &RenderedAnswerPack) -> String {
                 }
             }
             out.push_str("\n\n");
-            // Keep the complete prepared excerpt: the handoff bullet is only
-            // a short preview. Indented code preserves source line breaks and
-            // makes embedded fences, links and HTML literal Markdown content.
-            for line in item.excerpt.split('\n') {
-                out.push_str("    ");
-                out.push_str(line);
+            // Preserve the complete prepared excerpt, including blank lines.
+            // A longer fence keeps source fences, links and HTML literal.
+            let fence_length = item
+                .excerpt
+                .split(|character| character != '`')
+                .map(str::len)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1)
+                .max(3);
+            let fence = "`".repeat(fence_length);
+            out.push_str(&fence);
+            out.push_str("text\n");
+            out.push_str(&item.excerpt);
+            if !item.excerpt.ends_with('\n') {
                 out.push('\n');
             }
-            out.push('\n');
+            out.push_str(&fence);
+            out.push_str("\n\n");
         }
     }
 
@@ -3125,7 +3135,8 @@ mod tests {
                  ## Handoff\n\
                  - 0123456789abcdef [{evidence_id}]\n\n\
                  ## Evidence\n\
-                 [{evidence_id}] codex local /s/a.jsonl:10-12\n\n    0123456789abcdef\n\n\n\
+                 [{evidence_id}] codex local /s/a.jsonl:10-12\n\n\
+                 ```text\n0123456789abcdef\n```\n\n\n\
                  ## Omitted\n\
                  - duplicate_content: /s/b.jsonl:10\n"
             )
@@ -3138,20 +3149,26 @@ mod tests {
 
         let mut first = candidate("literal", "local", "/s/[literal].jsonl", 10.0);
         first.excerpt = format!(
-            "<script>alert(1)</script> [link](https://example.invalid)\n{}\n\n\
+            "\n\n<script>alert(1)</script> [link](https://example.invalid)\n{}\n\n\
              ```rust\nfn main() {{}}\n```\n~~~\n# source heading\n\
              Authorization: Bearer abcdefghijklmnopqrst\nfinal preserved context",
             "Unicode αβ 🚀 context. ".repeat(25)
         );
         let mut second = candidate("second", "local", "/s/second.jsonl", 9.0);
-        second.excerpt = "Second record\n    original indentation\nlast line".into();
+        second.excerpt = "Second record\n    original indentation\n\ttab and trailing spaces  \n\n".into();
         let mut plan_request = request(vec![first, second]);
         plan_request.limits.max_tokens = 12_000;
         plan_request.limits.max_excerpt_chars = 1_600;
         let plan = plan_answer_pack(plan_request).expect("plan literal excerpts");
         assert_eq!(plan.evidence.len(), 2);
         assert!(plan.evidence[0].excerpt.chars().count() > 220);
-        assert!(plan.evidence[0].excerpt.ends_with("final preserved context"));
+        assert!(plan.evidence[0].excerpt.starts_with("\n\n"));
+        assert!(
+            plan.evidence[0]
+                .excerpt
+                .ends_with("final preserved context")
+        );
+        assert!(plan.evidence[1].excerpt.ends_with("\n\n"));
         let mut req = render_request(PackRenderFormat::Markdown);
         req.limits.max_tokens = 12_000;
         req.limits.max_excerpt_chars = 1_600;
@@ -3189,7 +3206,13 @@ mod tests {
             let expected = plan
                 .evidence
                 .iter()
-                .map(|item| format!("{}\n", item.excerpt))
+                .map(|item| {
+                    if item.excerpt.ends_with('\n') {
+                        item.excerpt.clone()
+                    } else {
+                        format!("{}\n", item.excerpt)
+                    }
+                })
                 .collect::<Vec<_>>();
             assert_eq!(
                 excerpts, expected,
@@ -3205,10 +3228,12 @@ mod tests {
             .expect("empty Markdown pack");
         assert!(rendered.contains("No evidence selected."));
         assert!(rendered.contains("No cited evidence."));
-        assert!(!pulldown_cmark::Parser::new(&rendered).any(|event| matches!(
-            event,
-            pulldown_cmark::Event::Start(pulldown_cmark::Tag::CodeBlock(_))
-        )));
+        assert!(
+            !pulldown_cmark::Parser::new(&rendered).any(|event| matches!(
+                event,
+                pulldown_cmark::Event::Start(pulldown_cmark::Tag::CodeBlock(_))
+            ))
+        );
     }
 
     #[test]
@@ -3644,6 +3669,8 @@ mod tests {
 
     #[test]
     fn render_pack_redacts_home_directory_paths_in_evidence_and_omitted_output() {
+        use pulldown_cmark::{Event, Parser};
+
         let source_path = "/home/alice/projects/private/session.jsonl";
         let duplicate_path = "/Users/alice/projects/private/duplicate.jsonl";
         let mut first = candidate("private-path", "local", source_path, 10.0);
@@ -3660,10 +3687,20 @@ mod tests {
         let json_rendered = render_answer_pack(&plan, &json_req).unwrap();
         let markdown_rendered = render_answer_pack(&plan, &markdown_req).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json_rendered).unwrap();
+        let markdown_text = Parser::new(&markdown_rendered)
+            .filter_map(|event| match event {
+                Event::Text(text) | Event::Code(text) => Some(text),
+                _ => None,
+            })
+            .fold(String::new(), |mut output, text| {
+                output.push_str(&text);
+                output
+            });
 
         for raw in ["/home/alice", "/Users/alice", "~/notes", "old-laptop"] {
             assert!(!json_rendered.contains(raw));
             assert!(!markdown_rendered.contains(raw));
+            assert!(!markdown_text.contains(raw));
         }
         assert_eq!(
             value["evidence"][0]["citation"]["source_path"],
@@ -3679,8 +3716,8 @@ mod tests {
                 .unwrap()
                 .starts_with("omitted_")
         );
-        assert!(markdown_rendered.contains("[REDACTED_PATH]/session.jsonl"));
-        assert!(markdown_rendered.contains("[REDACTED_PATH]/duplicate.jsonl"));
+        assert!(markdown_text.contains("[REDACTED_PATH]/session.jsonl"));
+        assert!(markdown_text.contains("[REDACTED_PATH]/duplicate.jsonl"));
         assert_eq!(value["privacy"]["redaction_applied"], true);
         assert!(
             value["privacy"]["redaction_counts"]["private_path"]
