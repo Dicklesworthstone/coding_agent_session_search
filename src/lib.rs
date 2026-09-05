@@ -20530,8 +20530,13 @@ fn read_index_run_lock_snapshot(
 fn probe_index_run_lock(
     data_dir: &Path,
     db_path: &Path,
+    reap_stale: bool,
 ) -> crate::search::asset_state::SearchMaintenanceSnapshot {
-    let snapshot = read_index_run_lock_snapshot(data_dir);
+    let snapshot = if reap_stale {
+        read_index_run_lock_snapshot(data_dir)
+    } else {
+        crate::search::asset_state::read_search_maintenance_snapshot(data_dir)
+    };
     // An active advisory lock is data-dir scoped. Legacy or interrupted
     // writers may have incomplete db_path metadata, but the held flock is
     // still the authoritative signal that maintenance is in progress.
@@ -21070,7 +21075,7 @@ fn state_meta_json_inner(
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let db_exists = db_path.exists();
-    let index_run = probe_index_run_lock(data_dir, db_path);
+    let index_run = probe_index_run_lock(data_dir, db_path, !passive_db_probe);
 
     // F4 (cass tech debt): capture the wall clock at full millisecond
     // precision so the stall-detection comparison against
@@ -26939,7 +26944,7 @@ fn wait_for_searchable_index_after_active_rebuild(
 ) -> bool {
     let deadline = Instant::now() + max_wait;
     loop {
-        let rebuild_active = probe_index_run_lock(data_dir, db_path).active;
+        let rebuild_active = probe_index_run_lock(data_dir, db_path, true).active;
         if crate::search::tantivy::searchable_index_exists(index_path) && !rebuild_active {
             return true;
         }
@@ -27110,7 +27115,7 @@ fn inspect_lexical_assets_for_search_read_only(
     let index_exists = crate::search::tantivy::searchable_index_exists(index_path);
     let opened_index = crate::search::tantivy::open_validated_lexical_index(index_path);
     let diagnosis = search_lexical_read_only_diagnosis(index_path, db_path, &opened_index)?;
-    let active = probe_index_run_lock(data_dir, db_path).active;
+    let active = probe_index_run_lock(data_dir, db_path, false).active;
     if active {
         if index_exists
             && diagnosis.as_ref().is_none_or(
@@ -27235,7 +27240,7 @@ fn ensure_lexical_assets_for_search(
     }
 
     let initial_index_exists = crate::search::tantivy::searchable_index_exists(index_path);
-    let initial_rebuild_active = probe_index_run_lock(data_dir, db_path).active;
+    let initial_rebuild_active = probe_index_run_lock(data_dir, db_path, true).active;
     if initial_rebuild_active {
         if initial_index_exists {
             let diagnosis = search_lexical_self_heal_diagnosis(index_path, db_path)?;
@@ -27740,6 +27745,65 @@ mod search_lexical_self_heal_tests {
             assert!(!setup.client.has_tantivy());
             assert_eq!(crate::search::quill_bridge::reader_open_count(), opens);
             assert_eq!(before, data_tree_snapshot(data_dir));
+        }
+    }
+
+    #[test]
+    fn gh452_strict_admission_rejects_incompatible_checkpoint_without_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_canonical_search_db(data_dir);
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+            false,
+        )
+        .expect("build checkpointed lexical generation");
+        let checkpoint_path = index_path.join(".lexical-rebuild-state.json");
+        let original: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&checkpoint_path).expect("read checkpoint"))
+                .expect("parse checkpoint");
+
+        for (field, value) in [
+            ("/completed", serde_json::json!(false)),
+            ("/schema_hash", serde_json::json!("incompatible-schema")),
+            ("/page_size", serde_json::json!(0)),
+            (
+                "/db/db_path",
+                serde_json::json!(data_dir.join("unrelated-archive.db")),
+            ),
+        ] {
+            let mut checkpoint = original.clone();
+            *checkpoint
+                .pointer_mut(field)
+                .expect("existing checkpoint field") = value;
+            std::fs::write(
+                &checkpoint_path,
+                serde_json::to_vec(&checkpoint).expect("serialize damaged checkpoint"),
+            )
+            .expect("plant incompatible checkpoint");
+            let before = data_tree_snapshot(data_dir);
+            let opens = crate::search::quill_bridge::reader_open_count();
+            let error = open_cli_search_setup(
+                data_dir,
+                &db_path,
+                &index_path,
+                Some(crate::search::query::SearchMode::Lexical),
+                None,
+                Instant::now(),
+                true,
+                true,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("strict admission must reject incompatible {field}"));
+            assert_eq!(error.kind, "maintenance-required", "field={field}");
+            assert_eq!(crate::search::quill_bridge::reader_open_count() - opens, 1);
+            assert_eq!(before, data_tree_snapshot(data_dir), "field={field}");
         }
     }
 
@@ -29262,7 +29326,12 @@ fn open_cli_search_setup(
         )
     };
     let lexical_initialized = crate::search::tantivy::searchable_index_exists(index_path);
-    let rebuild_active = probe_index_run_lock(data_dir, db_path).active;
+    let rebuild_active = probe_index_run_lock(
+        data_dir,
+        db_path,
+        !no_maintenance && !search_request_skips_lexical_self_heal(mode),
+    )
+    .active;
     let db_exists = db_path.exists();
     let options = SearchClientOptions {
         enable_reload: false,
@@ -29459,7 +29528,9 @@ fn run_cli_search(
     let sessions_filter_stats: Option<SessionsFilterStats> =
         sessions_from.as_ref().map(|_| SessionsFilterStats {
             requested: filters.session_paths.len(),
-            matched: if no_maintenance || effective_robot.is_some() {
+            matched: if filters.session_paths.is_empty() {
+                Some(0)
+            } else if no_maintenance || effective_robot.is_some() {
                 None
             } else {
                 count_indexed_session_paths(&db_path, &filters.session_paths)
@@ -29982,31 +30053,42 @@ fn run_cli_search(
 
     // Track search timing breakdown (T7.4)
     let search_start = Instant::now();
-    let bounded_result =
-        if semantic_setup_timed_out && matches!(mode_meta.requested, SearchMode::Semantic) {
-            None
-        } else if let Some(budget) = search_budget.as_ref() {
-            let worker_client = Arc::clone(&client);
-            let worker_query = query.to_string();
-            let worker_filters = filters.clone();
-            let worker_mode_meta = mode_meta.clone();
-            run_read_only_search_worker(budget.remaining_ms(), move || {
-                execute_search_operation(
-                    worker_client,
-                    worker_query,
-                    worker_filters,
-                    search_limit,
-                    search_offset,
-                    search_sparse_threshold,
-                    field_mask,
-                    approximate,
-                    semantic_execution_tier,
-                    worker_mode_meta,
-                )
-            })?
-        } else {
-            None
-        };
+    let bounded_result = if sessions_from.is_some() && filters.session_paths.is_empty() {
+        // An explicitly empty candidate stream selects no sessions. The
+        // backend uses an empty set to mean no restriction, so never send
+        // this scope into lexical, semantic, or wildcard-fallback search.
+        mode_meta.semantic_work_completed = false;
+        Some((
+            crate::search::query::SearchResult {
+                total_count: Some(0),
+                ..empty_search_result()
+            },
+            mode_meta.clone(),
+        ))
+    } else if semantic_setup_timed_out && matches!(mode_meta.requested, SearchMode::Semantic) {
+        None
+    } else if let Some(budget) = search_budget.as_ref() {
+        let worker_client = Arc::clone(&client);
+        let worker_query = query.to_string();
+        let worker_filters = filters.clone();
+        let worker_mode_meta = mode_meta.clone();
+        run_read_only_search_worker(budget.remaining_ms(), move || {
+            execute_search_operation(
+                worker_client,
+                worker_query,
+                worker_filters,
+                search_limit,
+                search_offset,
+                search_sparse_threshold,
+                field_mask,
+                approximate,
+                semantic_execution_tier,
+                worker_mode_meta,
+            )
+        })?
+    } else {
+        None
+    };
     let result = if let Some((result, realized_mode_meta)) = bounded_result {
         mode_meta = realized_mode_meta;
         result
@@ -31223,6 +31305,23 @@ fn run_cli_pack(
             .fall_back_to_lexical("pack semantic enrichment unavailable; using lexical evidence");
     }
 
+    if cass_not_initialized(
+        db_path.exists(),
+        crate::search::tantivy::searchable_index_exists(&index_path),
+        probe_index_run_lock(&data_dir, &db_path, !structured_pack).active,
+    ) {
+        return Err(CliError {
+            code: 3,
+            kind: CliErrorKind::MissingIndex.kind_str(),
+            message: format!(
+                "cass has not been initialized in {} yet, so pack generation cannot run until the first index completes.",
+                data_dir.display()
+            ),
+            hint: Some(cass_not_initialized_recommended_action()),
+            retryable: true,
+        });
+    }
+
     if let Some(ref sessions_from_arg) = sessions_from {
         match read_session_paths_bounded(
             sessions_from_arg,
@@ -31251,7 +31350,7 @@ fn run_cli_pack(
                 Some(crate::search::query::SearchMode::Lexical),
                 timeout_ms,
                 start_time,
-                false,
+                true,
                 true,
             )
         })?
@@ -33226,7 +33325,7 @@ fn search_cursor_manifest_json(input: SearchCursorManifestInput<'_>) -> serde_js
         "lower_bound"
     };
     let count_reason = if input.total_matches_exact {
-        "search backend returned an exact total without an extra recount"
+        "total_matches is exact; no extra recount was needed"
     } else {
         "total_matches is a lower bound from the current result window; no expensive recount was requested"
     };
@@ -69199,7 +69298,7 @@ mod doctor_asset_taxonomy_tests {
         crate::search::asset_state::write_index_run_lock_metadata_sidecar(&lock_path, &metadata)
             .expect("write lock metadata sidecar");
 
-        let snapshot = probe_index_run_lock(data_dir, &db_path);
+        let snapshot = probe_index_run_lock(data_dir, &db_path, true);
         let doctor_lock = DoctorMutationLockObservation::Absent {
             path: doctor_mutation_lock_path(data_dir),
         };
@@ -87139,7 +87238,7 @@ pub(crate) fn run_doctor_impl(
     let lock_path = data_dir.join(".index.lock");
     let mut timing_spans: Vec<DoctorTimingSpanReport> = Vec::new();
     let lock_probe_started = Instant::now();
-    let maintenance_snapshot = probe_index_run_lock(&data_dir, &db_path);
+    let maintenance_snapshot = probe_index_run_lock(&data_dir, &db_path, true);
     let rebuild_active = maintenance_snapshot.active;
     let cleanup_apply_requested = command_surface == doctor::DoctorCommandSurface::Cleanup
         && execution_mode == doctor::DoctorExecutionMode::CleanupApply;

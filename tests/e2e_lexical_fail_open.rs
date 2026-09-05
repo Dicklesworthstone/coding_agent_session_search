@@ -42,6 +42,23 @@ fn cass_cmd(temp_home: &std::path::Path) -> Command {
     cmd.env("XDG_DATA_HOME", temp_home.join(".local/share"));
     cmd.env("XDG_CONFIG_HOME", temp_home.join(".config"));
     cmd.env("CODEX_HOME", temp_home.join(".codex"));
+    // Provider overrides and CWD discovery precede HOME for some connectors.
+    // Keep concurrent fleet tests and the worker's own sessions out of fixtures.
+    cmd.current_dir(temp_home);
+    cmd.env("CLAUDE_HOME", temp_home.join(".claude"));
+    cmd.env("GEMINI_HOME", temp_home.join(".gemini"));
+    cmd.env("OPENCODE_STORAGE_ROOT", temp_home.join(".opencode"));
+    cmd.env("CASS_AIDER_DATA_ROOT", temp_home.join(".aider-missing"));
+    cmd.env("PI_SESSIONS_DIR", temp_home.join(".pi-sessions-missing"));
+    cmd.env("PI_CODING_AGENT_DIR", temp_home.join(".pi-agent-missing"));
+    cmd.env(
+        "PI_CODING_AGENT_SESSION_DIR",
+        temp_home.join(".pi-coding-agent-sessions-missing"),
+    );
+    cmd.env_remove("PI_CONFIG_DIR");
+    cmd.env_remove("PI_PROFILE");
+    cmd.env("CASS_AUTO_REFRESH", "0");
+    cmd.env("CASS_DAEMON_SOCKET", temp_home.join("cass-daemon.sock"));
     cmd
 }
 
@@ -643,6 +660,298 @@ fn no_maintenance_hybrid_search_with_semantic_assets_is_byte_stable() {
         data_tree_snapshot(&data_dir),
         "semantic search --no-maintenance must leave every data-dir byte and path unchanged"
     );
+}
+
+#[test]
+fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("pack_read_only_data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let filename = "rollout-pack-read-only.jsonl";
+    seed_codex_session(&codex_home, filename, "packreadonlyneedle");
+    run_fresh_index(home, &data_dir);
+    let index_path = coding_agent_search::search::tantivy::expected_index_dir(&data_dir);
+    let mut checkpoint = lexical_checkpoint(&data_dir);
+    *checkpoint
+        .pointer_mut("/db/storage_fingerprint")
+        .expect("existing storage fingerprint") =
+        Value::String("missing-passive-fingerprint".into());
+    fs::write(
+        index_path.join(".lexical-rebuild-state.json"),
+        serde_json::to_vec(&checkpoint).unwrap(),
+    )
+    .unwrap();
+    let before = data_tree_snapshot(&data_dir);
+    let source_path = codex_home.join("sessions/2026/04/23").join(filename);
+    let source = fs::read_to_string(&source_path).unwrap();
+
+    let output = cass_cmd(home)
+        .args([
+            "pack",
+            "packreadonlyneedle",
+            "--json",
+            "--mode",
+            "lexical",
+            "--require-evidence",
+            "--freshness-policy",
+            "allow-stale",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .timeout(Duration::from_secs(20))
+        .output()
+        .expect("run structured pack on readable stale generation");
+    assert!(
+        output.status.success(),
+        "pack must return existing evidence: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("pack JSON");
+    let evidence = payload["evidence"].as_array().expect("evidence array");
+    assert!(!evidence.is_empty(), "pack must return useful evidence");
+    for item in evidence {
+        let citation = &item["citation"];
+        assert_eq!(
+            Path::new(citation["source_path"].as_str().expect("source path")),
+            source_path
+        );
+        let line = citation["line_start"].as_u64().expect("citation line") as usize;
+        assert!(line > 0);
+        let cited = source.lines().nth(line - 1).expect("line exists in source");
+        assert!(cited.contains("packreadonlyneedle"));
+        assert!(
+            item["excerpt"]
+                .as_str()
+                .unwrap()
+                .contains("packreadonlyneedle")
+        );
+    }
+    assert_eq!(
+        before,
+        data_tree_snapshot(&data_dir),
+        "structured pack must not repair checkpoints or mutate archive assets"
+    );
+    assert_eq!(source, fs::read_to_string(source_path).unwrap());
+}
+
+#[test]
+fn structured_pack_refuses_unreadable_lexical_assets_without_repair() {
+    for missing in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let data_dir = home.join("pack_unreadable_data");
+        fs::create_dir_all(&data_dir).unwrap();
+        seed_codex_session(
+            &home.join(".codex"),
+            "rollout-pack-unreadable.jsonl",
+            "packunreadableneedle",
+        );
+        run_fresh_index(home, &data_dir);
+        let index_path = coding_agent_search::search::tantivy::expected_index_dir(&data_dir);
+        if missing {
+            fs::rename(&index_path, data_dir.join("retained-lexical-before-pack")).unwrap();
+        } else {
+            for manifest in ["MANIFEST", "MANIFEST.prev"] {
+                fs::write(index_path.join(manifest), b"unreadable lexical generation").unwrap();
+            }
+        }
+        let before = data_tree_snapshot(&data_dir);
+        let output = cass_cmd(home)
+            .args([
+                "pack",
+                "packunreadableneedle",
+                "--json",
+                "--mode",
+                "lexical",
+                "--data-dir",
+            ])
+            .arg(&data_dir)
+            .timeout(Duration::from_secs(20))
+            .output()
+            .expect("run structured pack with unreadable lexical assets");
+        assert_eq!(output.status.code(), Some(5), "missing={missing}");
+        assert!(
+            output.stdout.is_empty(),
+            "a refused pack has no data output"
+        );
+        let stderr = String::from_utf8(output.stderr).expect("UTF-8 diagnostics");
+        let payload: Value = serde_json::from_str(stderr.lines().last().expect("error line"))
+            .expect("pack error JSON");
+        assert_eq!(payload["error"]["kind"], "maintenance-required");
+        assert_eq!(
+            before,
+            data_tree_snapshot(&data_dir),
+            "structured pack must not rebuild an unreadable generation; missing={missing}"
+        );
+    }
+}
+
+#[test]
+fn explicit_empty_session_scope_never_expands_to_the_archive() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("empty_scope_data");
+    fs::create_dir_all(&data_dir).unwrap();
+    for filename in [
+        "rollout-scope-selected.jsonl",
+        "rollout-scope-excluded.jsonl",
+    ] {
+        let content = format!("sessionboundaryneedle {filename}");
+        seed_codex_session(&codex_home, filename, &content);
+    }
+    run_fresh_index(home, &data_dir);
+    build_hash_semantic_assets(&data_dir, true);
+    let selected = codex_home
+        .join("sessions/2026/04/23")
+        .join("rollout-scope-selected.jsonl");
+    let scope_path = home.join("session-scope.txt");
+    let before = data_tree_snapshot(&data_dir);
+
+    for mode in ["lexical", "semantic", "hybrid"] {
+        for (contents, offset, empty) in [
+            (Some(String::new()), "0", true),
+            (Some("  \n# no candidates\n\t\n".to_string()), "0", true),
+            (Some(String::new()), "50", true),
+            (Some(format!("{}\n", selected.display())), "0", false),
+            (None, "0", false),
+        ] {
+            let mut cmd = cass_cmd(home);
+            cmd.arg("search");
+            if let Some(contents) = &contents {
+                fs::write(&scope_path, contents).unwrap();
+                cmd.arg("--sessions-from").arg(&scope_path);
+            }
+            let output = cmd
+                .args([
+                    "sessionboundaryneedle",
+                    "--json",
+                    "--robot-meta",
+                    "--no-maintenance",
+                    "--mode",
+                    mode,
+                    "--model",
+                    "hash",
+                    "--limit",
+                    "10",
+                    "--offset",
+                    offset,
+                ])
+                .arg("--data-dir")
+                .arg(&data_dir)
+                .timeout(Duration::from_secs(20))
+                .output()
+                .expect("search within explicit session scope");
+            assert!(
+                output.status.success(),
+                "mode={mode}, empty={empty}, stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let payload: Value = serde_json::from_slice(&output.stdout).expect("search JSON");
+            let hits = payload["hits"].as_array().expect("hits array");
+            if empty {
+                assert!(
+                    hits.is_empty(),
+                    "an empty scope must not become unrestricted"
+                );
+                assert_eq!(payload["total_matches"], 0, "offset cannot invent matches");
+                assert_eq!(payload["sessions_filter"]["requested"], 0);
+                assert_eq!(payload["sessions_filter"]["matched"], 0);
+                assert_eq!(payload["_meta"]["semantic_refinement"], false);
+            } else if contents.is_some() {
+                assert!(
+                    !hits.is_empty(),
+                    "a populated scope must return matching evidence"
+                );
+                for hit in hits {
+                    assert_eq!(
+                        Path::new(hit["source_path"].as_str().expect("hit source")),
+                        selected
+                    );
+                }
+            } else {
+                let paths = hits
+                    .iter()
+                    .map(|hit| hit["source_path"].as_str().expect("hit source"))
+                    .collect::<std::collections::HashSet<_>>();
+                assert_eq!(
+                    paths.len(),
+                    2,
+                    "omitting the scope searches both sessions: mode={mode}, paths={paths:?}"
+                );
+            }
+            assert_eq!(before, data_tree_snapshot(&data_dir));
+        }
+    }
+}
+
+#[test]
+fn no_maintenance_search_and_structured_pack_preserve_abandoned_lock() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let data_dir = home.join("abandoned_lock_data");
+    fs::create_dir_all(&data_dir).unwrap();
+    seed_codex_session(
+        &home.join(".codex"),
+        "rollout-abandoned-lock.jsonl",
+        "abandonedlockneedle",
+    );
+    seed_codex_session(
+        &home.join(".codex"),
+        "rollout-abandoned-lock-second.jsonl",
+        "abandonedlockneedle independent session",
+    );
+    run_fresh_index(home, &data_dir);
+    build_hash_semantic_assets(&data_dir, true);
+    let metadata = format!(
+        "pid=4242\nstarted_at_ms=1733000111000\nupdated_at_ms=1733000112000\ndb_path={}\nmode=index\njob_id=abandoned-4242\njob_kind=lexical_refresh\nphase=rebuilding\n",
+        data_dir.join("agent_search.db").display()
+    );
+    fs::write(data_dir.join("index-run.lock"), &metadata).unwrap();
+    let before = data_tree_snapshot(&data_dir);
+
+    for (command, mode) in [
+        ("search", "lexical"),
+        ("search", "semantic"),
+        ("search", "hybrid"),
+        ("pack", "lexical"),
+    ] {
+        let mut cmd = cass_cmd(home);
+        cmd.args([command, "abandonedlockneedle", "--json", "--mode", mode]);
+        if command == "search" {
+            cmd.args(["--no-maintenance", "--robot-meta", "--model", "hash"]);
+        }
+        let output = cmd
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .timeout(Duration::from_secs(20))
+            .output()
+            .expect("read evidence with abandoned lock metadata");
+        assert!(
+            output.status.success(),
+            "command={command}, mode={mode}, stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload: Value = serde_json::from_slice(&output.stdout).expect("evidence JSON");
+        let evidence_field = if command == "search" {
+            "hits"
+        } else {
+            "evidence"
+        };
+        assert!(
+            !payload[evidence_field].as_array().unwrap().is_empty(),
+            "abandoned metadata must not prevent useful evidence"
+        );
+        assert_eq!(
+            before,
+            data_tree_snapshot(&data_dir),
+            "{command} {mode} must not reap abandoned lock metadata"
+        );
+    }
 }
 
 #[test]
