@@ -201,6 +201,18 @@ or certified as false positives. These are temporary-fixture correctness
 results, not an owner-archive performance result or independent review.
 The partial rows above do not increase the full-contract coverage totals.
 
+The canonical-source rerun, `/tmp/cass-pack-repair-gate-20260905-s.log`, completed
+at 2026-09-05 03:27:43 UTC against commit `63ab2b15` and source-content SHA-256
+`d9433a36b0b57fcfa907aedb36047387932dbf7935dfda42840350b0f5d0adc6`.
+Formatting, all-target clippy and all 198 selected test executions passed: the
+194 above plus four semantic-loader candidate-probe regressions. UBS remained
+blocking on the three files changed by that commit (151 critical labels, 2,647
+warnings); the earlier seven-file scan also remains unresolved. These differing
+scan scopes are not evidence of fewer defects. The gate additionally reported
+`source-stability EXIT=1`: concurrent commits changed only Beads notes and this
+matrix, with no changes to the verified build inputs. The complete gate is red;
+neither this rerun nor the documentation update closes the original acceptance.
+
 ## Known Draft Gaps
 
 - Planner unit tests cover several selection rows, but they do not by themselves
