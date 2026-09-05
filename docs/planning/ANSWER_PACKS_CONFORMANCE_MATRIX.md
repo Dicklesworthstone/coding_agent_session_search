@@ -2,8 +2,8 @@
 
 **Spec:** `docs/planning/ANSWER_PACKS_CONTRACT.md`
 **Bead:** `coding_agent_session_search-uuwye.6`
-**Status:** Draft coverage map for implementation and golden gates
-**Date:** 2026-05-08
+**Status:** Partial implementation evidence; full contract reconciliation remains open
+**Date:** 2026-09-05 UTC (original coverage map: 2026-05-08)
 
 This matrix turns the answer-pack contract into testable requirements. It is not
 evidence of conformance by itself. A row is conformant only when the named test
@@ -87,10 +87,10 @@ are clear.
 | AP-SCHEMA-003 | MUST | JSON Response Schema | `realized` truthfully reports search mode, fallback, semantic join, candidates, selected evidence, and selected sessions. | Fixture covering lexical fallback and semantic unavailable. | Planned |
 | AP-EV-001 | MUST | Evidence Item Schema | Evidence ids use `ev_<base32(blake3(citation core))>` and are stable. | Deterministic id unit test. | Planned |
 | AP-EV-002 | MUST | Evidence Item Schema | Evidence rank is one-indexed final pack rank. | Planner ordering unit test. | Planned |
-| AP-EV-003 | MUST | Evidence Item Schema | Excerpts are UTF-8-safe, redacted before token estimation, and mark truncation. | Redaction and truncation unit tests. | Planned |
+| AP-EV-003 | MUST | Evidence Item Schema | Excerpts are UTF-8-safe, redacted before token estimation, and mark truncation. | `pack_redacts_credentials_before_excerpt_truncation` and `pack_budgets_emitted_text_after_redaction_expansion_and_unicode`; complete CLI privacy-policy matrix remains. | Unit Partial |
 | AP-EV-004 | MUST | Evidence Item Schema | Every selected evidence item includes citation, selection, roles, matched terms, and redactions fields. | JSON schema/golden assertion. | Planned |
 | AP-CIT-001 | MUST | Citation Fields | Citation carries path, source id, origin kind, workspace, agent, line/message positions, ids, hashes, timestamps, match type, and verification status. | Citation schema test with complete fixture. | Planned |
-| AP-CIT-002 | MUST | Citation Fields | Citation path and line fields resolve to readable source lines in the no-mock fixture. | No-mock integration fixture. | Planned |
+| AP-CIT-002 | MUST | Citation Fields | Citation path and line fields resolve to readable source lines in the no-mock fixture. | `structured_pack_preserves_stale_checkpoint_and_returns_real_citations` verifies physical local Codex lines and raw-line hashes, then preserves archived evidence after moving the source. Other providers and the citation-path privacy contract remain. | CLI Partial |
 | AP-CIT-003 | MUST | Citation Fields | `match_type` uses the existing search robot spelling, not Rust debug variant names. | Aggregation/pack regression for `implicit_wildcard`. | Planned |
 | AP-PACK-001 | MUST | Pack Object Schema | Pack title, answer outline, source summary, and handoff are deterministic display scaffolding, not LLM summaries. | Unit fixture comparing exact output from fixed evidence. | Planned |
 | AP-PACK-002 | MUST | Pack Object Schema | Outline headings are deterministic from matched terms and labels. | Planner/render unit test. | Planned |
@@ -107,7 +107,7 @@ are clear.
 | AP-OMIT-002 | MUST | Omitted Reasons | Reasons are exactly the documented snake_case values. | Enum serialization/schema test. | Planned |
 | AP-OMIT-003 | MUST | Omitted Reasons | Hard-omitted candidates are emitted once and removed from future consideration. | `duplicate_content_is_omitted_after_first_selection` covers the duplicate-content hard omission; stale/redacted variants remain. | Unit Partial |
 | AP-OMIT-004 | MUST | Omitted Reasons | Budget-omitted candidates are emitted once and not later emitted as max evidence. | `exact_token_budget_boundary_selects_until_budget_exhausted` covers token-budget omission at the exact boundary. | Unit Partial |
-| AP-BUDGET-001 | MUST | Token Budget | Token estimates use ceil UTF-8 char count divided by four after redaction and truncation. | Token estimator unit test. | Planned |
+| AP-BUDGET-001 | MUST | Token Budget | Token estimates use ceil UTF-8 char count divided by four after redaction and truncation. | `pack_budgets_emitted_text_after_redaction_expansion_and_unicode` checks actual emitted text, item costs, sum and evidence budget; CLI budget tests cover valid/invalid caps and totals. Complete policy/format coverage remains. | Unit/CLI Partial |
 | AP-BUDGET-002 | MUST | Token Budget | Budget reserves 15% metadata, 15% outline, 60% evidence, 10% omitted/warnings. | Planner budget unit test. | Planned |
 | AP-BUDGET-003 | MUST | Token Budget | Planner shortens excerpts before dropping evidence. | Truncation/drop ordering test. | Planned |
 | AP-BUDGET-004 | MUST | Token Budget | Selected evidence never loses citation fields to fit budget. | Small budget JSON golden. | Planned |
@@ -123,7 +123,7 @@ are clear.
 | AP-PRIV-004 | MUST | Privacy Contract | Redaction never changes citation path or line fields. | Redaction/citation invariant test. | Planned |
 | AP-PRIV-005 | MUST | Privacy Contract | Redaction preserves UTF-8 validity. | Unicode secret fixture. | Planned |
 | AP-PRIV-006 | MUST | Privacy Contract | Redaction events include kind, start char, end char, and replacement. | Redaction event schema test. | Planned |
-| AP-PRIV-007 | MUST | Privacy Contract | `privacy.redaction_applied=true` when any excerpt changes. | JSON fixture. | Planned |
+| AP-PRIV-007 | MUST | Privacy Contract | `privacy.redaction_applied=true` when any excerpt changes. | `render_pack_redacts_api_keys_and_bearer_tokens_in_json_and_markdown` checks one recorded redaction pass and the SHA-256 of emitted excerpt text. Other secret/path/host/encrypted-payload renderer cases pass; full CLI policy coverage remains. | Renderer Partial |
 | AP-PRIV-008 | MUST | Privacy Contract | Fully redacted candidates are omitted with `redacted_to_empty`. | Redaction unit test. | Planned |
 | AP-PRIV-009 | MUST | Privacy Contract | Pack never reads `.env` directly and includes `.env` content only when indexed evidence passes policy. | No-mock fixture with `.env` file present and indexed secret text. | Planned |
 | AP-PRIV-010 | MUST | Privacy Contract | Skill payload excerpts are included only when `--include-skill-content` is explicitly set. | Privacy fixture pair for default exclusion and explicit inclusion. | Planned |
@@ -141,11 +141,11 @@ are clear.
 | AP-BOUND-002 | MUST | Implementation Boundaries | Selection logic reuses `SearchClient` and existing filters instead of duplicating index logic. | Unit test via injected search outputs plus code review. | Planned |
 | AP-BOUND-003 | MUST | Implementation Boundaries | New SQLite access uses frankensqlite only. | `rg "rusqlite"` delta check plus review. | Planned |
 | AP-BOUND-004 | MUST | Implementation Boundaries | Session spans are read through existing view/expand-style helpers where possible. | Citation resolution integration test. | Planned |
-| AP-BOUND-005 | MUST | Implementation Boundaries | Pack does not mutate source logs, indexes, quarantine directories, or health state. | No-mock fixture snapshots source/index metadata before and after. | Planned |
+| AP-BOUND-005 | MUST | Implementation Boundaries | Pack does not mutate source logs, indexes, quarantine directories, or health state. | Structured-pack CLI fixtures compare archive paths and bytes plus source contents across success, missing/corrupt lexical assets, source loss and abandoned locks. All command/output modes remain to reconcile. | CLI Partial |
 | AP-BOUND-006 | MUST | Non-Goals | Pack does not call external LLMs or rewrite evidence into model-generated summaries. | Code-path audit plus fixture proving pack output is derived from selected evidence only. | Planned |
 | AP-BOUND-007 | MUST | Non-Goals | Pack never auto-downloads semantic models; missing models must use truthful lexical fallback or semantic errors. | Missing-model fixture that checks no model artifact is created and no acquisition path runs. | Planned |
-| AP-BOUND-008 | MUST | Non-Goals | Pack does not run hidden `doctor --fix`, manual index repair, or quarantine garbage collection. | State-snapshot integration test around pack execution. | Planned |
-| AP-BOUND-009 | MUST | Non-Goals | Pack does not delete or clean up derived assets while preparing output. | State-snapshot integration test covering index, quarantine, and publish-backup directories. | Planned |
+| AP-BOUND-008 | MUST | Non-Goals | Pack does not run hidden `doctor --fix`, manual index repair, or quarantine garbage collection. | `structured_pack_refuses_unreadable_lexical_assets_without_repair` preserves the full archive snapshot and requires an actionable separate index command. Other output modes remain to reconcile. | CLI Partial |
+| AP-BOUND-009 | MUST | Non-Goals | Pack does not delete or clean up derived assets while preparing output. | Structured-pack success/refusal and abandoned-lock fixtures require unchanged archive paths and bytes. Other output modes remain to reconcile. | CLI Partial |
 | AP-GATE-001 | MUST | Verification Commands | `rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-answer-pack-target cargo fmt --check` is part of closeout. | Implementation closeout evidence. | Planned |
 | AP-GATE-002 | MUST | Verification Commands | `rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-answer-pack-target cargo check --all-targets` is part of closeout. | Implementation closeout evidence. | Planned |
 | AP-GATE-003 | MUST | Verification Commands | `rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-answer-pack-target cargo clippy --all-targets -- -D warnings` is part of closeout. | Implementation closeout evidence. | Planned |
@@ -167,7 +167,7 @@ Use three layers:
 
 ## Planner Unit Evidence
 
-The current planner-only proof set lives in `src/search/pack_planner.rs`:
+The original planner-only proof set lives in `src/search/pack_planner.rs`:
 
 | Test | Rows Informed | Limit |
 |------|---------------|-------|
@@ -179,13 +179,44 @@ The current planner-only proof set lives in `src/search/pack_planner.rs`:
 | `lexical_score_drives_relevance_when_semantic_is_absent` | AP-SCHEMA-003, AP-HEALTH-004 | Planner score proof only; realized mode/fallback metadata still needs command fixtures. |
 | `stable_tie_breaks_do_not_depend_on_input_order` | AP-SEL-003 | Covers source-path stability only. |
 
+## Focused CLI and Renderer Evidence (2026-09-05)
+
+Bead `coding_agent_session_search-2l1b0.20` records the commands, failures and
+remaining TODOs. The isolated RCH run in
+`/tmp/cass-pack-repair-gate-20260905-r.log` verified source-content SHA-256
+`80ae0231bf80f6e16735c106ccefe86fcf2eb12e9e2bada326df733d96f06a25`.
+Formatting and all-target clippy passed. The 194 selected test executions were:
+
+- 45 planner/renderer tests, including credential truncation, Unicode token
+  accounting, emitted-excerpt SHA-256, missing/ambiguous/oversized sources,
+  CRLF, symlinks and FIFOs.
+- 3 structured-pack CLI tests for real physical citations and unchanged archive
+  assets; 13 CLI pack/alias/timeout tests. The aliases index a real temporary
+  Codex auth record and require the exact excerpt and verified source path.
+- 2 pack golden tests, 4 budget contract tests plus 59 shared test-utility tests,
+  and 68 standard robot JSON/docs golden tests. No golden was regenerated.
+
+UBS remained blocking (`STAGE=ubs EXIT=1`); the full finding set was not waived
+or certified as false positives. These are temporary-fixture correctness
+results, not an owner-archive performance result or independent review.
+The partial rows above do not increase the full-contract coverage totals.
+
 ## Known Draft Gaps
 
-- Planner unit tests now exist for several selection rows, but they do not by
-  themselves satisfy this matrix. Full conformance also requires the pack command,
-  robot schemas, golden outputs, privacy fixtures, and no-mock citation
-  resolution.
-- Planner work is still in progress under `coding_agent_session_search-uuwye.2`.
+- Planner unit tests cover several selection rows, but they do not by themselves
+  satisfy this matrix. Full conformance requires contract coverage across the
+  pack command, robot schemas, golden outputs, privacy fixtures and source
+  citation resolution.
+- Current contract reconciliation remains in progress under
+  `coding_agent_session_search-2l1b0.20`; the focused evidence above does not
+  close the original acceptance criteria.
+- Physical source verification currently supports modern local Codex JSONL
+  only, bounded to 8 MiB per file, 32 MiB total and a one-second source deadline.
+  Other providers, remote sources and files beyond these bounds retain archived
+  evidence with `verified=false` and null physical lines.
+- Resolve the contract's citation-path invariance requirement against existing
+  home-path redaction, and finish policy flags, field masks, all output modes,
+  readiness, total output-budget and citation identity/hash coverage.
 - The pack conformance gate must not be marked passing from planner unit tests
   alone; robot output and no-mock citation resolution are separate obligations.
 - Planner unit rows above were verified against `c9eafb8b` with
