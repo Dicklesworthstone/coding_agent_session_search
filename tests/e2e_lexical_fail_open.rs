@@ -793,6 +793,7 @@ fn markdown_pack_preserves_json_excerpts_without_interpreting_source_markup() {
     let home = fixture.path();
     let codex_home = home.join(".codex");
     let data_dir = home.join("markdown_pack_data");
+    // ubs:ignore — Synthetic credential verifies ingestion/output redaction; no live secret.
     let secret = "sk-12345678901234567890";
     let content = format!(
         "\n\nmarkdownpackneedle <script>alert(1)</script> [link](https://example.invalid)\n{}\n\n\
@@ -882,7 +883,10 @@ fn markdown_pack_preserves_json_excerpts_without_interpreting_source_markup() {
                 assert!(excerpt.chars().count() > 220);
             }
         }
-        assert!(safe_record_verified, "the verifiable source must be selected");
+        assert!(
+            safe_record_verified,
+            "the verifiable source must be selected"
+        );
         let mut excerpts = Vec::new();
         let mut current_excerpt = None::<String>;
         for event in Parser::new(&outputs[1]) {

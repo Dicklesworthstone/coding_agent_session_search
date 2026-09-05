@@ -3155,7 +3155,8 @@ mod tests {
             "Unicode αβ 🚀 context. ".repeat(25)
         );
         let mut second = candidate("second", "local", "/s/second.jsonl", 9.0);
-        second.excerpt = "Second record\n    original indentation\n\ttab and trailing spaces  \n\n".into();
+        second.excerpt =
+            "Second record\n    original indentation\n\ttab and trailing spaces  \n\n".into();
         let mut plan_request = request(vec![first, second]);
         plan_request.limits.max_tokens = 12_000;
         plan_request.limits.max_excerpt_chars = 1_600;
