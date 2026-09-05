@@ -1064,7 +1064,7 @@ pub(crate) fn verify_pack_source_citations(
                 .push(index);
         }
     }
-    for (path, indices) in by_path {
+    'source_files: for (path, indices) in by_path {
         if std::time::Instant::now() >= deadline || remaining_bytes == 0 {
             break;
         }
@@ -1107,7 +1107,7 @@ pub(crate) fn verify_pack_source_citations(
         let mut matches = vec![(0usize, 0usize, None); indices.len()];
         for (line_index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
             if std::time::Instant::now() >= deadline {
-                return;
+                break 'source_files;
             }
             let line = line.strip_suffix(b"\r").unwrap_or(line);
             let Ok(raw) = serde_json::from_slice(line) else {
@@ -1144,6 +1144,12 @@ pub(crate) fn verify_pack_source_citations(
                 }
             }
         }
+    }
+    // Verification can replace both physical coordinates and the span hash.
+    // Bind IDs to the resulting citation, including unverified deadline exits,
+    // before renderers use them in evidence, outlines and handoffs.
+    for item in &mut plan.evidence {
+        item.id = evidence_id(&item.candidate);
     }
 }
 
@@ -2973,6 +2979,64 @@ mod tests {
             }
             assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
         }
+    }
+
+    #[test]
+    fn source_citation_ids_follow_verified_spans_and_unverified_exits() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join("rollout-identity.jsonl");
+        let raw = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "identity needle"}]
+            }
+        })
+        .to_string();
+        let mut item = candidate("identity", "local", path.to_str().unwrap(), 10.0);
+        item.created_at_ms = None;
+        item.excerpt = "identity needle".to_string();
+        let base = plan_answer_pack(request(vec![item])).unwrap();
+        let mut verified_ids = Vec::new();
+        for prefix in ["", "\n"] {
+            let source = format!("{prefix}{raw}\n");
+            std::fs::write(&path, &source).unwrap();
+            let mut plan = base.clone();
+            let expected_line = prefix.len() + 1;
+            for _ in 0..2 {
+                verify_pack_source_citations(
+                    &mut plan,
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                );
+                let evidence = &plan.evidence[0];
+                assert!(evidence.candidate.citation_verified);
+                assert_eq!(evidence.candidate.line_start, Some(expected_line));
+                assert_eq!(evidence.id, evidence_id(&evidence.candidate));
+                assert_ne!(evidence.id, base.evidence[0].id);
+                assert_eq!(evidence.excerpt, base.evidence[0].excerpt);
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+                verified_ids.push(evidence.id.clone());
+            }
+
+            let verified = plan.clone();
+            for unavailable in [false, true] {
+                let mut plan = verified.clone();
+                if unavailable {
+                    plan.evidence[0].candidate.agent = "unsupported".to_string();
+                }
+                verify_pack_source_citations(&mut plan, std::time::Instant::now());
+                let evidence = &plan.evidence[0];
+                assert!(!evidence.candidate.citation_verified);
+                assert_eq!(evidence.candidate.line_start, None);
+                assert_eq!(evidence.id, evidence_id(&evidence.candidate));
+                assert_ne!(evidence.id, verified.evidence[0].id);
+                assert_eq!(evidence.excerpt, verified.evidence[0].excerpt);
+            }
+        }
+        assert_eq!(verified_ids[0], verified_ids[1]);
+        assert_eq!(verified_ids[2], verified_ids[3]);
+        assert_ne!(verified_ids[0], verified_ids[2]);
     }
 
     #[cfg(unix)]
