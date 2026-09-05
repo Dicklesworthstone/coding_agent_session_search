@@ -735,7 +735,10 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
         );
         assert_eq!(
             item["id"],
-            format!("ev_{}", &blake3::hash(citation_core.as_bytes()).to_hex()[..16]),
+            format!(
+                "ev_{}",
+                &blake3::hash(citation_core.as_bytes()).to_hex()[..16]
+            ),
             "evidence identity must bind the actual verified source span"
         );
         assert!(citation["message_index"].is_u64());
@@ -842,7 +845,9 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
         let entries = payload["pack"][section].as_array().expect("pack section");
         assert_eq!(entries.len(), evidence.len());
         for entry in entries {
-            let ids = entry["evidence_ids"].as_array().expect("evidence references");
+            let ids = entry["evidence_ids"]
+                .as_array()
+                .expect("evidence references");
             assert!(!ids.is_empty());
             for id in ids {
                 assert!(evidence.iter().any(|item| item["id"] == *id));

@@ -85,7 +85,7 @@ are clear.
 | AP-SCHEMA-001 | MUST | JSON Response Schema | All object keys are stable and snake_case. | Golden plus schema walk rejecting non-snake keys. | Planned |
 | AP-SCHEMA-002 | MUST | JSON Response Schema | `_meta.partial`, format, request id, generated time, elapsed time, and warnings are present. | Scrubbed JSON golden. | Planned |
 | AP-SCHEMA-003 | MUST | JSON Response Schema | `realized` truthfully reports search mode, fallback, semantic join, candidates, selected evidence, and selected sessions. | Fixture covering lexical fallback and semantic unavailable. | Planned |
-| AP-EV-001 | MUST | Evidence Item Schema | Evidence ids use `ev_<base32(blake3(citation core))>` and are stable. | Deterministic id unit test. | Planned |
+| AP-EV-001 | MUST | Evidence Item Schema | Evidence ids use `ev_<base32(blake3(citation core))>` and are stable. | `source_citation_ids_follow_verified_spans_and_unverified_exits` and the real structured-pack fixture bind IDs to verified lines/hashes, preserve repeated-verification identity and update it after source relocation/loss. Current encoding is still truncated hexadecimal, not the specified base32. | Unit/CLI Partial |
 | AP-EV-002 | MUST | Evidence Item Schema | Evidence rank is one-indexed final pack rank. | Planner ordering unit test. | Planned |
 | AP-EV-003 | MUST | Evidence Item Schema | Excerpts are UTF-8-safe, redacted before token estimation, and mark truncation. | `pack_redacts_credentials_before_excerpt_truncation` and `pack_budgets_emitted_text_after_redaction_expansion_and_unicode`; complete CLI privacy-policy matrix remains. | Unit Partial |
 | AP-EV-004 | MUST | Evidence Item Schema | Every selected evidence item includes citation, selection, roles, matched terms, and redactions fields. | JSON schema/golden assertion. | Planned |
@@ -132,9 +132,9 @@ are clear.
 | AP-ERR-002 | MUST | Error Contract | Consumers can branch on `err.kind`; numeric code alone is not relied on. | Introspect/docs schema test. | Planned |
 | AP-ERR-003 | MUST | Error Contract | Empty search results succeed by default with `no_evidence_found`. | Empty fixture golden. | Planned |
 | AP-ERR-004 | MUST | Error Contract | `pack-invalid-field`, `pack-budget-too-small`, `partial-result`, and `timeout` use documented codes, retryability, and hints. | Table-driven error-envelope regression. | Planned |
-| AP-FMT-001 | MUST | Format Contracts | Pretty JSON and compact JSON contain the same fields. | Structural equality test after parsing. | Planned |
-| AP-FMT-002 | MUST | Format Contracts | JSONL emits meta, pack, evidence items, omitted, and privacy in documented order. | JSONL golden. | Planned |
-| AP-FMT-003 | MUST | Format Contracts | TOON encodes the same payload through the existing `toon` crate path. | JSON-vs-TOON decoded equality test if decoder is available; otherwise golden. | Planned |
+| AP-FMT-001 | MUST | Format Contracts | Pretty JSON and compact JSON contain the same fields. | `structured_pack_preserves_stale_checkpoint_and_returns_real_citations` compares stable citation/excerpt fields and pack/omitted/privacy sections across actual JSON and compact commands. Freshness age varies between invocations; full-envelope equality remains. | CLI Partial |
+| AP-FMT-002 | MUST | Format Contracts | JSONL emits meta, pack, evidence items, omitted, and privacy in documented order. | The real structured-pack fixture asserts exact JSONL record count/order and evidence/reference equality with JSON; `render_jsonl_empty_pack_matches_golden_line_order` covers empty output. A dedicated JSONL golden remains. | Unit/CLI Partial |
+| AP-FMT-003 | MUST | Format Contracts | TOON encodes the same payload through the existing `toon` crate path. | The real structured-pack fixture decodes TOON and compares stable citation/excerpt fields and pack/omitted/privacy with JSON using the encoder's numeric value model. Full-envelope equality remains. | CLI Partial |
 | AP-FMT-004 | MUST | Format Contracts | Markdown includes inline evidence ids and an evidence section with path and line range. | Markdown golden. | Planned |
 | AP-FMT-005 | MUST | Format Contracts | JSON goldens land before Markdown is treated as conformant. | Gate checklist in test docs. | Planned |
 | AP-BOUND-001 | MUST | Implementation Boundaries | CLI parsing follows existing `src/lib.rs` patterns. | Code review checklist and CLI tests. | Planned |
@@ -212,6 +212,19 @@ scan scopes are not evidence of fewer defects. The gate additionally reported
 `source-stability EXIT=1`: concurrent commits changed only Beads notes and this
 matrix, with no changes to the verified build inputs. The complete gate is red;
 neither this rerun nor the documentation update closes the original acceptance.
+
+The citation-ID/projection run, `/tmp/cass-pack-citation-id-gate-20260905-x.log`,
+completed at 2026-09-05 07:27:46 UTC with source-content SHA-256
+`6363ae661badcd938d6db87c45da16c4e84ff2e0c25eabfab0125e97d7964340`.
+All-target clippy and all 198 selected executions passed: 49 pack unit tests,
+3 structured-pack integration tests, 13 CLI pack tests, 2 pack goldens,
+4 budget contracts plus 59 utility tests, and 68 standard goldens. The gate
+remained red: two test-formatting differences, unresolved UBS findings on two
+whole Rust files (106 critical labels, 956 warnings), and a checkout-stability
+failure after concurrent commits. The compiled-input digest was rechecked
+unchanged after those commits. The known Markdown preparation mutation was
+excluded from this structured-pack run and remains pending a shared-file
+reservation for its privately validated dispatch fix. No golden was regenerated.
 
 ## Known Draft Gaps
 
