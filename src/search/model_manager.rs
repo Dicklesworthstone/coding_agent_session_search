@@ -544,11 +544,35 @@ fn load_complete_shard_artifacts_for_current_db(
     context_label: &'static str,
     strict_read_only: bool,
 ) -> Option<Vec<SemanticIndexArtifact>> {
-    let db_fingerprint = match if strict_read_only {
-        crate::indexer::lexical_storage_fingerprint_for_db_strict(db_path)
-    } else {
-        crate::indexer::lexical_storage_fingerprint_for_db(db_path)
-    } {
+    load_complete_shard_artifacts_with_fingerprint(
+        data_dir,
+        embedder_id,
+        expected_dimension,
+        context_label,
+        || {
+            if strict_read_only {
+                crate::indexer::lexical_storage_fingerprint_for_db_strict(db_path)
+            } else {
+                crate::indexer::lexical_storage_fingerprint_for_db(db_path)
+            }
+        },
+    )
+}
+
+fn load_complete_shard_artifacts_with_fingerprint(
+    data_dir: &Path,
+    embedder_id: &str,
+    expected_dimension: usize,
+    context_label: &'static str,
+    fingerprint: impl FnOnce() -> anyhow::Result<String>,
+) -> Option<Vec<SemanticIndexArtifact>> {
+    // GH #452: a monolithic FSVI is not evidence that shards exist. Probe
+    // metadata before opening the archive solely to fingerprint a possible
+    // shard generation; the normal staleness/filter-map path opens it later.
+    if !complete_shard_generation_candidate_exists(data_dir, embedder_id) {
+        return None;
+    }
+    let db_fingerprint = match fingerprint() {
         Ok(fingerprint) => fingerprint,
         Err(err) => {
             tracing::debug!(
@@ -769,20 +793,14 @@ fn load_hash_semantic_context_inner(
             };
         }
     };
-    let shard_artifacts = if monolithic_present
-        || complete_shard_generation_candidate_exists(data_dir, embedder.id())
-    {
-        load_complete_shard_artifacts_for_current_db(
-            data_dir,
-            db_path,
-            embedder.id(),
-            embedder.dimension(),
-            "hash semantic",
-            strict_read_only,
-        )
-    } else {
-        None
-    };
+    let shard_artifacts = load_complete_shard_artifacts_for_current_db(
+        data_dir,
+        db_path,
+        embedder.id(),
+        embedder.dimension(),
+        "hash semantic",
+        strict_read_only,
+    );
     if !monolithic_present && shard_artifacts.is_none() {
         return SemanticSetup {
             availability: SemanticAvailability::IndexMissing { index_path },
@@ -953,20 +971,14 @@ fn load_semantic_context_inner(
             };
         }
     };
-    let shard_artifacts = if monolithic_present
-        || complete_shard_generation_candidate_exists(data_dir, &config.embedder_id)
-    {
-        load_complete_shard_artifacts_for_current_db(
-            data_dir,
-            db_path,
-            &config.embedder_id,
-            config.dimension,
-            "semantic",
-            strict_read_only,
-        )
-    } else {
-        None
-    };
+    let shard_artifacts = load_complete_shard_artifacts_for_current_db(
+        data_dir,
+        db_path,
+        &config.embedder_id,
+        config.dimension,
+        "semantic",
+        strict_read_only,
+    );
     if !monolithic_present && shard_artifacts.is_none() {
         return SemanticSetup {
             availability: SemanticAvailability::IndexMissing { index_path },
@@ -1994,6 +2006,16 @@ mod tests {
             !complete_shard_generation_candidate_exists(tmp.path(), "fnv1a-384"),
             "missing shard manifest must not trigger a current-DB fingerprint"
         );
+        assert!(
+            load_complete_shard_artifacts_with_fingerprint(
+                tmp.path(),
+                "fnv1a-384",
+                384,
+                "test",
+                || panic!("missing shards must not open the archive for fingerprinting"),
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -2007,6 +2029,16 @@ mod tests {
         assert!(
             !complete_shard_generation_candidate_exists(tmp.path(), "fnv1a-384"),
             "corrupt shard metadata must not trigger a query-time current-DB fingerprint"
+        );
+        assert!(
+            load_complete_shard_artifacts_with_fingerprint(
+                tmp.path(),
+                "fnv1a-384",
+                384,
+                "test",
+                || panic!("invalid shards must not open the archive for fingerprinting"),
+            )
+            .is_none()
         );
     }
 
@@ -2026,6 +2058,16 @@ mod tests {
             !complete_shard_generation_candidate_exists(tmp.path(), "fnv1a-384"),
             "incomplete or unrelated shard generations must not trigger a current-DB fingerprint"
         );
+        assert!(
+            load_complete_shard_artifacts_with_fingerprint(
+                tmp.path(),
+                "fnv1a-384",
+                384,
+                "test",
+                || panic!("incomplete or unrelated shards must not fingerprint the archive"),
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -2043,6 +2085,26 @@ mod tests {
         assert!(
             complete_shard_generation_candidate_exists(tmp.path(), "fnv1a-384"),
             "complete candidate generations should allow the current-DB fingerprint check"
+        );
+        let fingerprint_calls = std::cell::Cell::new(0);
+        assert!(
+            load_complete_shard_artifacts_with_fingerprint(
+                tmp.path(),
+                "fnv1a-384",
+                384,
+                "test",
+                || {
+                    fingerprint_calls.set(fingerprint_calls.get() + 1);
+                    Ok("fp-current".to_string())
+                },
+            )
+            .is_none(),
+            "metadata completeness alone must not admit missing shard artifacts"
+        );
+        assert_eq!(
+            fingerprint_calls.get(),
+            1,
+            "a complete candidate must still fingerprint the current archive exactly once"
         );
     }
 
