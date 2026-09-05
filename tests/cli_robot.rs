@@ -1215,16 +1215,51 @@ fn pack_named_query_flag_attaches_to_query_positional() {
 }
 
 fn assert_pack_alias_runs(alias: &str) {
-    // The last direct shared-fixture consumer in this file (bead xwi3f): a
-    // CLI subprocess pointed at tests/fixtures/search_demo_data can rebuild
-    // derived lexical/sqlite assets in place and race every parallel test
-    // that copies the fixture mid-rebuild. Always search an isolated copy.
-    let fixture = isolated_search_demo_data().expect("isolated search demo fixture");
-    util::prepare_copied_search_fixture(fixture.path()).expect("admit relocated pack fixture");
-    let mut cmd = base_cmd();
+    // The legacy demo archive has no auth evidence. Index an explicit source
+    // so each alias must return a real message, not just a well-shaped envelope.
+    let fixture = TempDir::new().expect("isolated pack alias home");
+    let home = fixture.path();
+    let data_dir = home.join("cass_data");
+    let codex_home = home.join(".codex");
+    let filename = "rollout-pack-alias.jsonl";
+    util::seed_codex_session(&codex_home, filename, "auth alias evidence", false);
+    let source_path = codex_home.join("sessions/2026/04/23").join(filename);
+    let mut index = isolated_cass_cmd(home);
+    for (key, relative) in [
+        ("CLAUDE_HOME", ".claude"),
+        ("GEMINI_HOME", ".gemini"),
+        ("OPENCODE_STORAGE_ROOT", ".opencode"),
+        ("CASS_AIDER_DATA_ROOT", ".aider-missing"),
+        ("PI_SESSIONS_DIR", ".pi-sessions-missing"),
+        ("PI_CODING_AGENT_DIR", ".pi-agent-missing"),
+        (
+            "PI_CODING_AGENT_SESSION_DIR",
+            ".pi-coding-agent-sessions-missing",
+        ),
+    ] {
+        index.env(key, home.join(relative));
+    }
+    index
+        .env_remove("PI_CONFIG_DIR")
+        .env_remove("PI_PROFILE")
+        .env("CASS_AUTO_REFRESH", "0")
+        .args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .timeout(std::time::Duration::from_secs(120))
+        .assert()
+        .success();
+    let mut cmd = isolated_cass_cmd(home);
     cmd.args([alias, "auth", "--json", "--data-dir"]);
-    cmd.arg(fixture.path());
-    cmd.args(["--limit", "1", "--max-evidence", "1", "--max-sessions", "1"]);
+    cmd.arg(&data_dir);
+    cmd.args([
+        "--limit",
+        "1",
+        "--max-evidence",
+        "1",
+        "--max-sessions",
+        "1",
+        "--require-evidence",
+    ]);
 
     let output = cmd.assert().success().get_output().clone();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1235,6 +1270,13 @@ fn assert_pack_alias_runs(alias: &str) {
     assert_eq!(json["limits"]["max_evidence"].as_u64(), Some(1));
     assert_eq!(json["limits"]["max_sessions"].as_u64(), Some(1));
     assert_eq!(json["evidence"].as_array().expect("pack evidence").len(), 1);
+    assert_eq!(json["evidence"][0]["excerpt"], "auth alias evidence");
+    let citation = &json["evidence"][0]["citation"];
+    assert_eq!(
+        Path::new(citation["source_path"].as_str().expect("source path")),
+        source_path
+    );
+    assert_eq!(citation["verified"], true);
 }
 
 #[test]

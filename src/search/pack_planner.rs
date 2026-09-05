@@ -378,6 +378,7 @@ pub struct PackPlannerBudget {
 pub struct PlannedPackEvidence {
     pub id: String,
     pub rank: usize,
+    /// Redacted and truncated output whose exact text was charged to the budget.
     pub excerpt: String,
     pub excerpt_truncated: bool,
     pub estimated_tokens: usize,
@@ -1053,7 +1054,9 @@ pub(crate) fn verify_pack_source_citations(
             && candidate.source_id == "local"
             && candidate.origin_kind == "local"
             && path.is_absolute()
-            && path.extension().is_some_and(|extension| extension == "jsonl")
+            && path
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
         {
             by_path
                 .entry(candidate.source_path.clone())
@@ -2109,7 +2112,9 @@ fn rendered_evidence(
 ) -> RenderedEvidence {
     let candidate = &item.candidate;
     let mut redactions = item.redactions.clone();
-    let excerpt = redact_pack_output_text(&item.excerpt, &mut redactions);
+    // Selection already sanitized and budgeted this text. Secret patterns are
+    // not idempotent: another pass can rewrite markers and count events twice.
+    let excerpt = item.excerpt.clone();
     let source_id = redacted_source_label(
         &candidate.source_id,
         &candidate.origin_kind,
@@ -3458,11 +3463,14 @@ mod tests {
         let emitted_excerpt = value["evidence"][0]["excerpt"].as_str().unwrap();
         assert_ne!(emitted_excerpt, plan.evidence[0].candidate.excerpt);
         assert_eq!(emitted_excerpt, plan.evidence[0].excerpt);
-        let emitted_digest =
-            <sha2::Sha256 as sha2::Digest>::digest(emitted_excerpt.as_bytes());
+        let emitted_digest = <sha2::Sha256 as sha2::Digest>::digest(emitted_excerpt.as_bytes());
         assert_eq!(
-            hex::decode(value["evidence"][0]["citation"]["excerpt_sha256"].as_str().unwrap())
-                .unwrap(),
+            hex::decode(
+                value["evidence"][0]["citation"]["excerpt_sha256"]
+                    .as_str()
+                    .unwrap()
+            )
+            .unwrap(),
             emitted_digest.to_vec(),
             "the citation hash must verify the bytes the consumer actually receives"
         );

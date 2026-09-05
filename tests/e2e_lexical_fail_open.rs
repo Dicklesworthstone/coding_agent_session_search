@@ -774,7 +774,12 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
         assert!(item["citation"]["line_start"].is_null());
         assert!(item["citation"]["line_end"].is_null());
         assert!(item["citation"]["message_index"].is_u64());
-        assert!(item["excerpt"].as_str().unwrap().contains("packreadonlyneedle"));
+        assert!(
+            item["excerpt"]
+                .as_str()
+                .unwrap()
+                .contains("packreadonlyneedle")
+        );
     }
     assert_eq!(before, data_tree_snapshot(&data_dir));
     assert_eq!(source, fs::read_to_string(retained_source).unwrap());
