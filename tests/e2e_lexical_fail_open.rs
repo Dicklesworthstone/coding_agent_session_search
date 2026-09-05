@@ -786,6 +786,134 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
 }
 
 #[test]
+fn markdown_pack_preserves_json_excerpts_without_interpreting_source_markup() {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+
+    let fixture = TempDir::new().expect("isolated Markdown pack fixture");
+    let home = fixture.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("markdown_pack_data");
+    let secret = "sk-12345678901234567890";
+    let content = format!(
+        "markdownpackneedle <script>alert(1)</script> [link](https://example.invalid)\n{}\n\n\
+         ```rust\nfn main() {{}}\n```\n~~~\n# source heading\nfinal preserved context",
+        "Unicode αβ 🚀 context. ".repeat(25)
+    );
+    util::seed_codex_session(
+        &codex_home,
+        "rollout-markdown-safe.jsonl",
+        &content,
+        false,
+    );
+    util::seed_codex_session(
+        &codex_home,
+        "rollout-markdown-secret.jsonl",
+        &format!("{content}\nAPI_KEY={secret}"),
+        false,
+    );
+    run_fresh_index(home, &data_dir);
+    let archive_before = data_tree_snapshot(&data_dir);
+    let sources_before = data_tree_snapshot(&codex_home);
+
+    for max_excerpt_chars in ["80", "1600"] {
+        let mut outputs = Vec::new();
+        for format in [&["--json"][..], &["--display", "markdown"][..]] {
+            let output = cass_cmd(home)
+                .args([
+                    "pack",
+                    "markdownpackneedle",
+                    "--mode",
+                    "lexical",
+                    "--require-evidence",
+                    "--freshness-policy",
+                    "allow-stale",
+                    "--max-evidence",
+                    "2",
+                    "--max-excerpt-chars",
+                    max_excerpt_chars,
+                    "--data-dir",
+                ])
+                .arg(&data_dir)
+                .args(format)
+                .timeout(Duration::from_secs(20))
+                .output()
+                .expect("run pack format comparison");
+            assert!(
+                output.status.success(),
+                "pack {format:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let text = String::from_utf8(output.stdout).expect("UTF-8 pack output");
+            assert!(
+                !text.contains(secret),
+                "source credential must not reach output"
+            );
+            outputs.push(text);
+        }
+        let json: Value = serde_json::from_str(&outputs[0]).expect("pack JSON");
+        let evidence = json["evidence"].as_array().expect("selected evidence");
+        assert_eq!(
+            evidence.len(),
+            2,
+            "both real source records must be selected"
+        );
+        let mut expected = Vec::new();
+        for item in evidence {
+            let excerpt = item["excerpt"].as_str().expect("JSON excerpt");
+            expected.push(format!("{excerpt}\n"));
+            let source = Path::new(
+                item["citation"]["source_path"]
+                    .as_str()
+                    .expect("source path"),
+            );
+            assert!(source.is_file());
+            if source.file_name().and_then(|name| name.to_str())
+                == Some("rollout-markdown-safe.jsonl")
+            {
+                assert_eq!(item["citation"]["verified"], true);
+                assert_eq!(item["citation"]["line_start"], 2);
+            }
+            if max_excerpt_chars == "80" {
+                assert_eq!(item["excerpt_truncated"], true);
+                assert!(excerpt.chars().count() <= 80);
+            } else {
+                assert!(excerpt.contains("final preserved context"));
+                assert!(excerpt.chars().count() > 220);
+            }
+        }
+        let mut excerpts = Vec::new();
+        let mut current_excerpt = None::<String>;
+        for event in Parser::new(&outputs[1]) {
+            match event {
+                Event::Start(Tag::CodeBlock(_)) => {
+                    current_excerpt = Some(String::new());
+                }
+                Event::Text(text) => {
+                    if let Some(excerpt) = current_excerpt.as_mut() {
+                        excerpt.push_str(&text);
+                    }
+                }
+                Event::End(TagEnd::CodeBlock) => {
+                    excerpts.push(current_excerpt.take().expect("open evidence block"));
+                }
+                Event::Html(_)
+                | Event::InlineHtml(_)
+                | Event::Start(Tag::Link { .. } | Tag::Image { .. }) => {
+                    panic!("session markup must not become active Markdown content");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            excerpts, expected,
+            "Markdown must carry the same selected excerpts as JSON"
+        );
+        assert_eq!(data_tree_snapshot(&data_dir), archive_before);
+        assert_eq!(data_tree_snapshot(&codex_home), sources_before);
+    }
+}
+
+#[test]
 fn structured_pack_refuses_unreadable_lexical_assets_without_repair() {
     for missing in [false, true] {
         let tmp = TempDir::new().unwrap();

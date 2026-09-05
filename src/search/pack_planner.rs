@@ -2466,12 +2466,12 @@ fn json_line(
 fn render_answer_pack_markdown(envelope: &RenderedAnswerPack) -> String {
     let mut out = String::new();
     out.push_str("# ");
-    out.push_str(&markdown_line(&envelope.pack.title));
+    out.push_str(&markdown_literal_line(&envelope.pack.title));
     if !envelope.warnings.is_empty() {
         out.push_str("\n\n## Warnings\n");
         for warning in &envelope.warnings {
             out.push_str("- ");
-            out.push_str(&markdown_line(warning));
+            out.push_str(&markdown_literal_line(warning));
             out.push('\n');
         }
     }
@@ -2481,7 +2481,7 @@ fn render_answer_pack_markdown(envelope: &RenderedAnswerPack) -> String {
     } else {
         for item in &envelope.pack.handoff {
             out.push_str("- ");
-            out.push_str(&markdown_line(&item.text));
+            out.push_str(&markdown_literal_line(&item.text));
             out.push_str(" [");
             out.push_str(&item.evidence_ids.join(", "));
             out.push_str("]\n");
@@ -2496,11 +2496,11 @@ fn render_answer_pack_markdown(envelope: &RenderedAnswerPack) -> String {
             out.push('[');
             out.push_str(&item.id);
             out.push_str("] ");
-            out.push_str(&markdown_line(&item.citation.agent));
+            out.push_str(&markdown_literal_line(&item.citation.agent));
             out.push(' ');
-            out.push_str(&markdown_line(&item.citation.source_id));
+            out.push_str(&markdown_literal_line(&item.citation.source_id));
             out.push(' ');
-            out.push_str(&markdown_line(&item.citation.source_path));
+            out.push_str(&markdown_literal_line(&item.citation.source_path));
             if let Some(line_start) = item.citation.line_start {
                 out.push(':');
                 out.push_str(&line_start.to_string());
@@ -2512,6 +2512,15 @@ fn render_answer_pack_markdown(envelope: &RenderedAnswerPack) -> String {
                     out.push_str(&line_end.to_string());
                 }
             }
+            out.push_str("\n\n");
+            // Keep the complete prepared excerpt: the handoff bullet is only
+            // a short preview. Indented code preserves source line breaks and
+            // makes embedded fences, links and HTML literal Markdown content.
+            for line in item.excerpt.split('\n') {
+                out.push_str("    ");
+                out.push_str(line);
+                out.push('\n');
+            }
             out.push('\n');
         }
     }
@@ -2522,7 +2531,7 @@ fn render_answer_pack_markdown(envelope: &RenderedAnswerPack) -> String {
             out.push_str("- ");
             out.push_str(omitted_reason_label(item.reason));
             out.push_str(": ");
-            out.push_str(&markdown_line(&item.source_path));
+            out.push_str(&markdown_literal_line(&item.source_path));
             if let Some(line_start) = item.line_start {
                 out.push(':');
                 out.push_str(&line_start.to_string());
@@ -2548,6 +2557,20 @@ fn compact_excerpt(excerpt: &str, max_chars: usize) -> String {
 
 fn markdown_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn markdown_literal_line(text: &str) -> String {
+    let mut out = String::new();
+    for character in markdown_line(text).chars() {
+        if matches!(
+            character,
+            '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>' | '!' | '|' | '~' | '&' | '#'
+        ) {
+            out.push('\\');
+        }
+        out.push(character);
+    }
+    out
 }
 
 fn sha256_hex(text: &str) -> String {
@@ -3098,15 +3121,94 @@ mod tests {
             format!(
                 "# pack handoff\n\n\
                  ## Warnings\n\
-                 - semantic_fallback_lexical\n\n\
+                 - semantic\\_fallback\\_lexical\n\n\
                  ## Handoff\n\
                  - 0123456789abcdef [{evidence_id}]\n\n\
                  ## Evidence\n\
-                 [{evidence_id}] codex local /s/a.jsonl:10-12\n\n\
+                 [{evidence_id}] codex local /s/a.jsonl:10-12\n\n    0123456789abcdef\n\n\n\
                  ## Omitted\n\
                  - duplicate_content: /s/b.jsonl:10\n"
             )
         );
+    }
+
+    #[test]
+    fn render_markdown_preserves_complete_redacted_excerpts_as_literal_code() {
+        use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+
+        let mut first = candidate("literal", "local", "/s/[literal].jsonl", 10.0);
+        first.excerpt = format!(
+            "<script>alert(1)</script> [link](https://example.invalid)\n{}\n\n\
+             ```rust\nfn main() {{}}\n```\n~~~\n# source heading\n\
+             Authorization: Bearer abcdefghijklmnopqrst\nfinal preserved context",
+            "Unicode αβ 🚀 context. ".repeat(25)
+        );
+        let mut second = candidate("second", "local", "/s/second.jsonl", 9.0);
+        second.excerpt = "Second record\n    original indentation\nlast line".into();
+        let mut plan_request = request(vec![first, second]);
+        plan_request.limits.max_tokens = 12_000;
+        plan_request.limits.max_excerpt_chars = 1_600;
+        let plan = plan_answer_pack(plan_request).expect("plan literal excerpts");
+        assert_eq!(plan.evidence.len(), 2);
+        assert!(plan.evidence[0].excerpt.chars().count() > 220);
+        assert!(plan.evidence[0].excerpt.ends_with("final preserved context"));
+        let mut req = render_request(PackRenderFormat::Markdown);
+        req.limits.max_tokens = 12_000;
+        req.limits.max_excerpt_chars = 1_600;
+        req.query_text = "handoff <img src=x> [query](https://example.invalid)".into();
+
+        for rendered in [
+            render_answer_pack(&plan, &req).expect("render Markdown"),
+            render_answer_pack_without_trust_correlation(&plan, &req)
+                .expect("render Markdown without advisory correlation"),
+        ] {
+            assert!(!rendered.contains("abcdefghijklmnopqrst"));
+            let mut excerpts = Vec::new();
+            let mut current_excerpt = None::<String>;
+            for event in Parser::new(&rendered) {
+                match event {
+                    Event::Start(Tag::CodeBlock(_)) => {
+                        current_excerpt = Some(String::new());
+                    }
+                    Event::Text(text) => {
+                        if let Some(excerpt) = current_excerpt.as_mut() {
+                            excerpt.push_str(&text);
+                        }
+                    }
+                    Event::End(TagEnd::CodeBlock) => {
+                        excerpts.push(current_excerpt.take().expect("open evidence block"));
+                    }
+                    Event::Html(_)
+                    | Event::InlineHtml(_)
+                    | Event::Start(Tag::Link { .. } | Tag::Image { .. }) => {
+                        panic!("source markup must remain literal text");
+                    }
+                    _ => {}
+                }
+            }
+            let expected = plan
+                .evidence
+                .iter()
+                .map(|item| format!("{}\n", item.excerpt))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                excerpts, expected,
+                "each complete excerpt must survive Markdown parsing"
+            );
+        }
+    }
+
+    #[test]
+    fn render_markdown_empty_pack_does_not_invent_evidence_blocks() {
+        let plan = plan_answer_pack(request(Vec::new())).expect("empty plan");
+        let rendered = render_answer_pack(&plan, &render_request(PackRenderFormat::Markdown))
+            .expect("empty Markdown pack");
+        assert!(rendered.contains("No evidence selected."));
+        assert!(rendered.contains("No cited evidence."));
+        assert!(!pulldown_cmark::Parser::new(&rendered).any(|event| matches!(
+            event,
+            pulldown_cmark::Event::Start(pulldown_cmark::Tag::CodeBlock(_))
+        )));
     }
 
     #[test]
