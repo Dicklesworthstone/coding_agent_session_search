@@ -30,6 +30,64 @@ pub fn cass_bin() -> String {
         .unwrap_or_else(|| env!("CARGO_BIN_EXE_cass").to_string())
 }
 
+/// Admit a copied archive through the real CLI before a read-only pack probe.
+/// Checkpoints identify the database path, so copying bytes alone does not
+/// produce a valid relocated lexical generation. Keep repair out of timed runs.
+#[allow(dead_code)]
+pub fn prepare_copied_search_fixture(
+    data_dir: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let home = tempfile::TempDir::new()?;
+    let output = assert_cmd::Command::new(cass_bin())
+        .current_dir(home.path())
+        .env("HOME", home.path())
+        .env("XDG_DATA_HOME", home.path().join(".local/share"))
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .args([
+            "search",
+            "the",
+            "--json",
+            "--mode",
+            "lexical",
+            "--limit",
+            "1",
+            "--timeout",
+            "60000",
+            "--data-dir",
+        ])
+        .arg(data_dir)
+        .timeout(std::time::Duration::from_secs(90))
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "copied fixture admission failed: status={}, stdout={}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+        .into());
+    }
+    let index_path = coding_agent_search::search::tantivy::expected_index_dir(data_dir);
+    let checkpoint: serde_json::Value = serde_json::from_slice(&std::fs::read(
+        index_path.join(".lexical-rebuild-state.json"),
+    )?)?;
+    let expected_db = data_dir.join("agent_search.db").canonicalize()?;
+    let actual_db = checkpoint
+        .pointer("/db/db_path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("repaired fixture checkpoint lacks database identity")?;
+    if std::path::Path::new(actual_db).canonicalize()? != expected_db {
+        return Err(std::io::Error::other(
+            "real CLI repair did not bind the copied fixture to its database",
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Write a minimal Codex session JSONL fixture under
 /// `<codex_home>/sessions/2026/04/23/<filename>` containing a
 /// `session_meta` line and a user `input_text` carrying `keyword`.

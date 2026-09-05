@@ -722,6 +722,13 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
         assert!(line > 0);
         let cited = source.lines().nth(line - 1).expect("line exists in source");
         assert!(cited.contains("packreadonlyneedle"));
+        assert_eq!(citation["verified"], true);
+        assert_eq!(citation["line_end"], citation["line_start"]);
+        assert_eq!(
+            citation["span_hash"],
+            blake3::hash(cited.as_bytes()).to_hex().to_string()
+        );
+        assert!(citation["message_index"].is_u64());
         assert!(
             item["excerpt"]
                 .as_str()
@@ -734,7 +741,43 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
         data_tree_snapshot(&data_dir),
         "structured pack must not repair checkpoints or mutate archive assets"
     );
-    assert_eq!(source, fs::read_to_string(source_path).unwrap());
+    assert_eq!(source, fs::read_to_string(&source_path).unwrap());
+
+    let retained_source = source_path.with_extension("retained-jsonl");
+    fs::rename(&source_path, &retained_source).unwrap();
+    let output = cass_cmd(home)
+        .args([
+            "pack",
+            "packreadonlyneedle",
+            "--json",
+            "--mode",
+            "lexical",
+            "--require-evidence",
+            "--freshness-policy",
+            "allow-stale",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .timeout(Duration::from_secs(20))
+        .output()
+        .expect("pack must preserve archived evidence after the source moves");
+    assert!(
+        output.status.success(),
+        "source loss must not lose archived evidence: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("archived pack JSON");
+    let evidence = payload["evidence"].as_array().expect("archived evidence");
+    assert!(!evidence.is_empty());
+    for item in evidence {
+        assert_eq!(item["citation"]["verified"], false);
+        assert!(item["citation"]["line_start"].is_null());
+        assert!(item["citation"]["line_end"].is_null());
+        assert!(item["citation"]["message_index"].is_u64());
+        assert!(item["excerpt"].as_str().unwrap().contains("packreadonlyneedle"));
+    }
+    assert_eq!(before, data_tree_snapshot(&data_dir));
+    assert_eq!(source, fs::read_to_string(retained_source).unwrap());
 }
 
 #[test]
@@ -781,6 +824,11 @@ fn structured_pack_refuses_unreadable_lexical_assets_without_repair() {
         let payload: Value = serde_json::from_str(stderr.lines().last().expect("error line"))
             .expect("pack error JSON");
         assert_eq!(payload["error"]["kind"], "maintenance-required");
+        let hint = payload["error"]["hint"].as_str().expect("pack repair hint");
+        assert!(hint.contains("index --full --json"));
+        assert!(hint.contains(data_dir.to_str().unwrap()));
+        assert!(hint.contains(data_dir.join("agent_search.db").to_str().unwrap()));
+        assert!(!hint.contains("--no-maintenance"));
         assert_eq!(
             before,
             data_tree_snapshot(&data_dir),

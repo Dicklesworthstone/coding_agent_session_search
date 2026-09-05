@@ -35,6 +35,8 @@ use serde_json::Value;
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
+mod util;
+
 type TestResult = Result<(), Box<dyn Error>>;
 
 fn test_error(message: impl Into<String>) -> Box<dyn Error> {
@@ -251,6 +253,7 @@ fn check_budget_respected(data_dir: &Path, budget: i64) -> TestResult {
 fn pack_estimated_tokens_never_exceeds_max_tokens_budget() -> TestResult {
     let tmp = TempDir::new()?;
     let data_dir = copy_search_demo_fixture(tmp.path())?;
+    util::prepare_copied_search_fixture(&data_dir)?;
 
     // Sweep several valid budgets. Each must produce a pack whose realized
     // `estimated_tokens` is at or below the requested cap. The min-bound
@@ -266,6 +269,7 @@ fn pack_estimated_tokens_never_exceeds_max_tokens_budget() -> TestResult {
 fn pack_per_evidence_estimated_tokens_sum_matches_limits_total() -> TestResult {
     let tmp = TempDir::new()?;
     let data_dir = copy_search_demo_fixture(tmp.path())?;
+    util::prepare_copied_search_fixture(&data_dir)?;
     // Pick a comfortably large budget so the planner is not the binding
     // constraint; we are checking sum consistency, not budget pressure.
     let outcome = run_pack(&data_dir, 50000)?;

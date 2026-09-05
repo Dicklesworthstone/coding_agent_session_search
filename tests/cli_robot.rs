@@ -1220,6 +1220,7 @@ fn assert_pack_alias_runs(alias: &str) {
     // derived lexical/sqlite assets in place and race every parallel test
     // that copies the fixture mid-rebuild. Always search an isolated copy.
     let fixture = isolated_search_demo_data().expect("isolated search demo fixture");
+    util::prepare_copied_search_fixture(fixture.path()).expect("admit relocated pack fixture");
     let mut cmd = base_cmd();
     cmd.args([alias, "auth", "--json", "--data-dir"]);
     cmd.arg(fixture.path());
@@ -1233,6 +1234,7 @@ fn assert_pack_alias_runs(alias: &str) {
     assert_eq!(json["query"]["text"].as_str(), Some("auth"));
     assert_eq!(json["limits"]["max_evidence"].as_u64(), Some(1));
     assert_eq!(json["limits"]["max_sessions"].as_u64(), Some(1));
+    assert_eq!(json["evidence"].as_array().expect("pack evidence").len(), 1);
 }
 
 #[test]
@@ -5808,13 +5810,15 @@ fn implicit_robot_search_folds_unquoted_query_words() {
 
 #[test]
 fn implicit_robot_pack_query_uses_pack_when_pack_only_flags_present() {
+    let fixture = isolated_search_demo_data().expect("isolated implicit pack fixture");
+    util::prepare_copied_search_fixture(fixture.path()).expect("admit relocated pack fixture");
     let mut cmd = base_cmd();
     cmd.args([
         "auth",
         "failed",
         "--json",
         "--data-dir",
-        "tests/fixtures/search_demo_data",
+        fixture.path().to_str().unwrap(),
         "--limit",
         "1",
         "--max-evidence",
@@ -5837,6 +5841,7 @@ fn implicit_robot_pack_query_uses_pack_when_pack_only_flags_present() {
 fn timed_out_robot_pack_returns_bounded_partial_and_names_shed_work() -> Result<(), Box<dyn Error>>
 {
     let data_dir = isolated_search_demo_data()?;
+    util::prepare_copied_search_fixture(data_dir.path())?;
     let (stall_ms, guard) = pack_stall_and_guard_from_baseline(data_dir.path())?;
     let started = std::time::Instant::now();
     let output = base_cmd()
@@ -6105,6 +6110,7 @@ fn pack_stall_and_guard_from_baseline(
 #[test]
 fn timed_out_robot_pack_renderer_emits_fixed_size_partial_fallback() -> Result<(), Box<dyn Error>> {
     let data_dir = isolated_search_demo_data()?;
+    util::prepare_copied_search_fixture(data_dir.path())?;
     let (budget_ms, stall_ms) = pack_timeout_budget_from_baseline(data_dir.path())?;
     let started = std::time::Instant::now();
     let output = base_cmd()
@@ -6189,6 +6195,7 @@ fn timed_out_robot_pack_renderer_emits_fixed_size_partial_fallback() -> Result<(
 #[test]
 fn timed_out_robot_pack_planner_does_not_fabricate_selection() -> Result<(), Box<dyn Error>> {
     let data_dir = isolated_search_demo_data()?;
+    util::prepare_copied_search_fixture(data_dir.path())?;
     let (budget_ms, stall_ms) = pack_timeout_budget_from_baseline(data_dir.path())?;
     let started = std::time::Instant::now();
     let output = base_cmd()
@@ -6249,6 +6256,8 @@ fn timed_out_robot_pack_planner_does_not_fabricate_selection() -> Result<(), Box
 
 #[test]
 fn explicit_search_pack_only_flags_run_pack_in_robot_mode() {
+    let fixture = isolated_search_demo_data().expect("isolated explicit pack fixture");
+    util::prepare_copied_search_fixture(fixture.path()).expect("admit relocated pack fixture");
     for command in ["search", "find"] {
         let mut cmd = base_cmd();
         cmd.args([
@@ -6257,7 +6266,7 @@ fn explicit_search_pack_only_flags_run_pack_in_robot_mode() {
             "failed",
             "--json",
             "--data-dir",
-            "tests/fixtures/search_demo_data",
+            fixture.path().to_str().unwrap(),
             "--limit",
             "1",
             "--max-evidence",

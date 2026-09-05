@@ -31353,6 +31353,16 @@ fn run_cli_pack(
                 true,
                 true,
             )
+            .map_err(|mut error| {
+                if error.kind == "maintenance-required" {
+                    error.hint = Some(format!(
+                        "Run `cass --db {} index --full --json --data-dir {}` in a mutating workflow, then retry this pack. Structured pack output does not repair archive assets.",
+                        shell_quote_arg(&worker_db_path.display().to_string()),
+                        shell_quote_arg(&worker_data_dir.display().to_string()),
+                    ));
+                }
+                error
+            })
         })?
     } else if structured_pack {
         None
@@ -31509,11 +31519,20 @@ fn run_cli_pack(
                 .map_err(pack_invalid_limit_error)?
         } else {
             let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let source_deadline =
+                Instant::now() + Duration::from_millis(pack_budget.remaining_ms().min(1_000));
             std::thread::Builder::new()
                 .name("cass-pack-budgeted-planner".to_string())
                 .spawn(move || {
                     maybe_test_pack_plan_delay();
-                    let _ = sender.send(plan_answer_pack(plan_request));
+                    let result = plan_answer_pack(plan_request).map(|mut plan| {
+                        crate::search::pack_planner::verify_pack_source_citations(
+                            &mut plan,
+                            source_deadline,
+                        );
+                        plan
+                    });
+                    let _ = sender.send(result);
                 })
                 .map_err(|error| {
                     CliError::unknown(format!(
@@ -31539,7 +31558,12 @@ fn run_cli_pack(
             }
         }
     } else {
-        plan_answer_pack(plan_request).map_err(pack_invalid_limit_error)?
+        let mut plan = plan_answer_pack(plan_request).map_err(pack_invalid_limit_error)?;
+        crate::search::pack_planner::verify_pack_source_citations(
+            &mut plan,
+            Instant::now() + Duration::from_millis(pack_budget.remaining_ms().min(1_000)),
+        );
+        plan
     };
     if skipped_sections
         .iter()

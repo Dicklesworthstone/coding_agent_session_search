@@ -207,7 +207,7 @@ fn tick_augment_progress(progress_tick: Option<&(dyn Fn() + Send + Sync)>, line_
     }
 }
 
-fn modern_codex_message(raw: &Value) -> Option<NormalizedMessage> {
+pub(crate) fn modern_codex_message(raw: &Value) -> Option<NormalizedMessage> {
     let entry_type = raw.get("type").and_then(Value::as_str)?;
     let payload = raw.get("payload")?;
     let created_at = raw.get("timestamp").and_then(parse_timestamp);
