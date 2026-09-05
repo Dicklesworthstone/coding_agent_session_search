@@ -728,6 +728,16 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
             citation["span_hash"],
             blake3::hash(cited.as_bytes()).to_hex().to_string()
         );
+        let citation_core = format!(
+            "local\n{}\n{line}\n{line}\n{}",
+            source_path.display(),
+            blake3::hash(cited.as_bytes()).to_hex()
+        );
+        assert_eq!(
+            item["id"],
+            format!("ev_{}", &blake3::hash(citation_core.as_bytes()).to_hex()[..16]),
+            "evidence identity must bind the actual verified source span"
+        );
         assert!(citation["message_index"].is_u64());
         assert!(
             item["excerpt"]
@@ -742,6 +752,107 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
         "structured pack must not repair checkpoints or mutate archive assets"
     );
     assert_eq!(source, fs::read_to_string(&source_path).unwrap());
+
+    // Each command reads the real archive. Compare stable citation/evidence
+    // fields; freshness age legitimately advances between invocations. TOON's
+    // value model compares equivalent integer/float JSON numbers numerically.
+    let stable_evidence = |value: &Value| {
+        value["evidence"]
+            .as_array()
+            .expect("evidence array")
+            .iter()
+            .map(|item| {
+                let mut citation = item["citation"].clone();
+                citation
+                    .as_object_mut()
+                    .expect("citation object")
+                    .remove("freshness_age_seconds");
+                toon::JsonValue::from(serde_json::json!({
+                    "id": item["id"],
+                    "excerpt": item["excerpt"],
+                    "excerpt_truncated": item["excerpt_truncated"],
+                    "citation": citation,
+                }))
+            })
+            .collect::<Vec<_>>()
+    };
+    let expected_evidence = stable_evidence(&payload);
+    for format in ["compact", "jsonl", "toon"] {
+        let output = cass_cmd(home)
+            .args([
+                "pack",
+                "packreadonlyneedle",
+                "--robot-format",
+                format,
+                "--mode",
+                "lexical",
+                "--require-evidence",
+                "--freshness-policy",
+                "allow-stale",
+                "--data-dir",
+            ])
+            .arg(&data_dir)
+            .timeout(Duration::from_secs(20))
+            .output()
+            .expect("run structured pack format against real archive");
+        assert!(
+            output.status.success(),
+            "pack {format} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = std::str::from_utf8(&output.stdout).expect("UTF-8 pack output");
+        let projected: Value = match format {
+            "jsonl" => {
+                let lines = text
+                    .lines()
+                    .map(|line| serde_json::from_str::<Value>(line).expect("JSONL object"))
+                    .collect::<Vec<_>>();
+                assert_eq!(lines.len(), evidence.len() + 4);
+                assert_eq!(lines[0]["_meta"]["format"], "jsonl");
+                assert!(lines[1]["pack"].is_object());
+                let items = lines[2..2 + evidence.len()]
+                    .iter()
+                    .map(|line| line["evidence"].clone())
+                    .collect::<Vec<_>>();
+                serde_json::json!({
+                    "pack": lines[1]["pack"],
+                    "evidence": items,
+                    "omitted": lines[lines.len() - 2]["omitted"],
+                    "privacy": lines[lines.len() - 1]["privacy"],
+                })
+            }
+            "toon" => Value::from(toon::try_decode(text, None).expect("valid TOON pack")),
+            _ => {
+                assert_eq!(text.lines().count(), 1, "compact JSON is one line");
+                serde_json::from_str(text).expect("compact JSON pack")
+            }
+        };
+        assert_eq!(stable_evidence(&projected), expected_evidence, "{format}");
+        for section in ["pack", "omitted", "privacy"] {
+            assert_eq!(
+                toon::JsonValue::from(projected[section].clone()),
+                toon::JsonValue::from(payload[section].clone()),
+                "{format} {section} projection"
+            );
+        }
+        assert_eq!(before, data_tree_snapshot(&data_dir), "{format}");
+        assert_eq!(source, fs::read_to_string(&source_path).unwrap());
+    }
+    for section in ["answer_outline", "handoff"] {
+        let entries = payload["pack"][section].as_array().expect("pack section");
+        assert_eq!(entries.len(), evidence.len());
+        for entry in entries {
+            let ids = entry["evidence_ids"].as_array().expect("evidence references");
+            assert!(!ids.is_empty());
+            for id in ids {
+                assert!(evidence.iter().any(|item| item["id"] == *id));
+            }
+        }
+    }
+    let verified_ids = evidence
+        .iter()
+        .map(|item| item["id"].as_str().expect("evidence ID").to_string())
+        .collect::<Vec<_>>();
 
     let retained_source = source_path.with_extension("retained-jsonl");
     fs::rename(&source_path, &retained_source).unwrap();
@@ -773,6 +884,10 @@ fn structured_pack_preserves_stale_checkpoint_and_returns_real_citations() {
         assert_eq!(item["citation"]["verified"], false);
         assert!(item["citation"]["line_start"].is_null());
         assert!(item["citation"]["line_end"].is_null());
+        assert!(
+            !verified_ids.iter().any(|id| item["id"] == *id),
+            "unverified archive evidence must not reuse a verified physical-span ID"
+        );
         assert!(item["citation"]["message_index"].is_u64());
         assert!(
             item["excerpt"]
