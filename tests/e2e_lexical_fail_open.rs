@@ -1249,6 +1249,262 @@ fn pack_final_output_budget_bounds_all_formats_and_refuses_oversized_metadata() 
 }
 
 #[test]
+fn structured_pack_retains_source_verification_after_slow_planning() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("planning_source_budget");
+    let content = "planningdelayneedle verified evidence after a bounded planning delay";
+    util::seed_codex_session(&codex_home, "rollout-planning.jsonl", content, false);
+    run_fresh_index(home, &data_dir);
+    let archive_before = data_tree_snapshot(&data_dir);
+    let sources_before = data_tree_snapshot(&codex_home);
+
+    let output = cass_cmd(home)
+        .env("CASS_TEST_PACK_PLAN_SLOW_MS", "1200")
+        .args([
+            "pack",
+            "planningdelayneedle",
+            "--json",
+            "--mode",
+            "lexical",
+            "--require-evidence",
+            "--freshness-policy",
+            "allow-stale",
+            "--timeout",
+            "10000",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .timeout(Duration::from_secs(20))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(archive_before, data_tree_snapshot(&data_dir));
+    assert_eq!(sources_before, data_tree_snapshot(&codex_home));
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["budget"]["budget_ms"], 10000);
+    assert_eq!(value["budget"]["timed_out"], false);
+    let elapsed_ms = value["budget"]["elapsed_ms"].as_u64().unwrap();
+    assert!(elapsed_ms >= 1200, "the planning delay must actually run");
+    assert!(elapsed_ms < 10000, "the request still has time to verify");
+    let evidence = value["evidence"].as_array().unwrap();
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(evidence[0]["excerpt"], content);
+    let citation = &evidence[0]["citation"];
+    assert_eq!(
+        citation["verified"], true,
+        "planning must not consume the source phase allowance: budget={} citation={citation}",
+        value["budget"]
+    );
+    let source_path = codex_home.join("sessions/2026/04/23/rollout-planning.jsonl");
+    assert_eq!(
+        citation["source_path"],
+        source_path.to_string_lossy().as_ref()
+    );
+    assert_eq!(citation["line_start"], 2);
+    let source = fs::read_to_string(source_path).unwrap();
+    assert_eq!(
+        citation["span_hash"],
+        blake3::hash(source.lines().nth(1).unwrap().as_bytes())
+            .to_hex()
+            .as_str()
+    );
+}
+
+#[test]
+fn pack_excludes_skill_payloads_without_losing_ordinary_evidence() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("pack_skill_privacy");
+    let ordinary = "skillprivacyneedle ordinary skill design remains useful";
+    util::seed_codex_session(&codex_home, "rollout-ordinary.jsonl", ordinary, false);
+    for (index, marker) in [
+        "Base directory for this skill:",
+        "<system-reminder>",
+        "The following skills are available for use with the Skill tool:",
+        "skillInjection: matchedSkills",
+        "<!-- skillInjection:",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        util::seed_codex_session(
+            &codex_home,
+            &format!("rollout-skill-{index}.jsonl"),
+            &format!(
+                "skillprivacyneedle onlyinjectedneedle PROPRIETARY PLAYBOOK {} {marker}",
+                "界".repeat(120)
+            ),
+            false,
+        );
+    }
+    run_fresh_index(home, &data_dir);
+    let archive_before = data_tree_snapshot(&data_dir);
+    let sources_before = data_tree_snapshot(&codex_home);
+
+    for format in ["json", "compact", "jsonl", "toon", "markdown"] {
+        let mut command = cass_cmd(home);
+        command
+            .args([
+                "pack",
+                "skillprivacyneedle",
+                "--mode",
+                "lexical",
+                "--require-evidence",
+                "--freshness-policy",
+                "allow-stale",
+                "--max-excerpt-chars",
+                "80",
+                "--data-dir",
+            ])
+            .arg(&data_dir);
+        if format == "markdown" {
+            command.args(["--display", "markdown"]);
+        } else {
+            command.args(["--robot-format", format]);
+        }
+        let output = command.timeout(Duration::from_secs(20)).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{format}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            text.contains(ordinary),
+            "{format} must retain ordinary evidence"
+        );
+        assert!(!text.contains("PROPRIETARY PLAYBOOK"), "{format}");
+        assert!(!text.contains("onlyinjectedneedle"), "{format}");
+        if format != "markdown" {
+            let (evidence, omitted, privacy) = if format == "jsonl" {
+                let records = text
+                    .lines()
+                    .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                    .collect::<Vec<_>>();
+                let evidence = records
+                    .iter()
+                    .filter_map(|record| record.get("evidence").cloned())
+                    .collect::<Vec<_>>();
+                let omitted = records
+                    .iter()
+                    .find_map(|record| record.get("omitted"))
+                    .unwrap()
+                    .clone();
+                let privacy = records
+                    .iter()
+                    .find_map(|record| record.get("privacy"))
+                    .unwrap()
+                    .clone();
+                (evidence, omitted, privacy)
+            } else {
+                let value = if format == "toon" {
+                    Value::from(toon::try_decode(&text, None).unwrap())
+                } else {
+                    serde_json::from_str::<Value>(&text).unwrap()
+                };
+                (
+                    value["evidence"].as_array().unwrap().clone(),
+                    value["omitted"].clone(),
+                    value["privacy"].clone(),
+                )
+            };
+            assert_eq!(evidence.len(), 1, "{format}");
+            assert_eq!(evidence[0]["excerpt"], ordinary);
+            let citation = &evidence[0]["citation"];
+            assert_eq!(citation["verified"], true);
+            let source = fs::read_to_string(citation["source_path"].as_str().unwrap()).unwrap();
+            let line = source.lines().nth(1).unwrap();
+            assert_eq!(
+                citation["span_hash"],
+                blake3::hash(line.as_bytes()).to_hex().as_str()
+            );
+            assert_eq!(
+                toon::JsonValue::from(citation["line_start"].clone()),
+                toon::JsonValue::from(serde_json::json!(2))
+            );
+            let omitted = omitted["items"].as_array().unwrap();
+            assert_eq!(omitted.len(), 5, "{format}");
+            for item in omitted {
+                assert_eq!(item["reason"], "redacted_to_empty");
+            }
+            assert_eq!(privacy["skill_content_included"], false);
+            assert_eq!(privacy["redaction_applied"], true);
+        }
+        assert_eq!(archive_before, data_tree_snapshot(&data_dir));
+        assert_eq!(sources_before, data_tree_snapshot(&codex_home));
+    }
+
+    for require_evidence in [false, true] {
+        let mut command = cass_cmd(home);
+        command
+            .args([
+                "pack",
+                "onlyinjectedneedle",
+                "--json",
+                "--mode",
+                "lexical",
+                "--freshness-policy",
+                "allow-stale",
+                "--data-dir",
+            ])
+            .arg(&data_dir);
+        if require_evidence {
+            command.arg("--require-evidence");
+        }
+        let output = command.timeout(Duration::from_secs(20)).output().unwrap();
+        if require_evidence {
+            assert_eq!(output.status.code(), Some(13));
+            assert!(output.stdout.is_empty());
+            let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+            assert_eq!(error["error"]["kind"], "not-found");
+            assert_eq!(error["error"]["retryable"], false);
+        } else {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert!(value["evidence"].as_array().unwrap().is_empty());
+            assert_eq!(value["omitted"]["items"].as_array().unwrap().len(), 5);
+            assert!(
+                value["warnings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|warning| warning == "no_evidence_found")
+            );
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("PROPRIETARY PLAYBOOK"));
+        }
+        assert_eq!(archive_before, data_tree_snapshot(&data_dir));
+        assert_eq!(sources_before, data_tree_snapshot(&codex_home));
+    }
+
+    // The shared policy must retain export's explicit operator opt-in.
+    let source_path = codex_home.join("sessions/2026/04/23/rollout-skill-0.jsonl");
+    let output = cass_cmd(home)
+        .args(["export", "--format", "json", "--include-skills"])
+        .arg(&source_path)
+        .timeout(Duration::from_secs(20))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("PROPRIETARY PLAYBOOK"));
+    assert_eq!(sources_before, data_tree_snapshot(&codex_home));
+}
+
+#[test]
 fn markdown_pack_preserves_json_excerpts_without_interpreting_source_markup() {
     use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 

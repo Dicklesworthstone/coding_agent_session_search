@@ -11,6 +11,17 @@ use std::borrow::Cow;
 
 use crate::search::query::SearchHit;
 
+/// Whole-message skill and hook injections excluded from handoffs and exports
+/// unless the caller explicitly opts in. Inspect the full message before any
+/// excerpt truncation so a retained suffix cannot hide its injection marker.
+pub(crate) fn is_skill_injection(content: &str) -> bool {
+    content.contains("Base directory for this skill:")
+        || content.contains("<system-reminder>")
+        || content.contains("The following skills are available for use with the Skill tool:")
+        || (content.contains("skillInjection:") && content.contains("matchedSkills"))
+        || content.contains("<!-- skillInjection:")
+}
+
 /// Supported export formats
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ExportFormat {
@@ -415,6 +426,31 @@ fn truncate_text(text: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skill_injection_policy_preserves_ordinary_discussion() {
+        for marker in [
+            "Base directory for this skill:",
+            "<system-reminder>",
+            "The following skills are available for use with the Skill tool:",
+            "skillInjection: metadata matchedSkills",
+            "<!-- skillInjection:",
+        ] {
+            assert!(is_skill_injection(&format!(
+                "{}\n{marker}",
+                "界".repeat(200)
+            )));
+        }
+        for ordinary in [
+            "",
+            "Implement a new skill and test it.",
+            "matchedSkills is the parser field name.",
+            "skillInjection: is a label without matched entries.",
+            "The skill tool should preserve ordinary discussion.",
+        ] {
+            assert!(!is_skill_injection(ordinary), "{ordinary}");
+        }
+    }
 
     fn sample_hit() -> SearchHit {
         SearchHit {

@@ -67,6 +67,10 @@ fn extract_kind_literals() -> BTreeMap<String, Vec<usize>> {
 
 fn extract_kind_exit_codes() -> BTreeMap<String, Vec<i32>> {
     let source = std::fs::read_to_string(lib_rs_path()).expect("read src/lib.rs");
+    extract_kind_exit_codes_from_source(&source)
+}
+
+fn extract_kind_exit_codes_from_source(source: &str) -> BTreeMap<String, Vec<i32>> {
     let kind_re =
         regex::Regex::new(r#"CliErrorKind::([A-Za-z][A-Za-z0-9]*)\.kind_str\(\)"#).unwrap();
     let code_re = regex::Regex::new(r"code:\s*(\d+)").unwrap();
@@ -84,16 +88,18 @@ fn extract_kind_exit_codes() -> BTreeMap<String, Vec<i32>> {
                 panic!("CliErrorKind::{variant} used in src/lib.rs but not mapped in kind_str()");
             };
 
-            // Look backwards up to 10 lines for `code: N` struct fields or
-            // `CliError::already_reported(N, ...)` helper calls.
-            for candidate in lines.iter().take(i + 1).skip(i.saturating_sub(10)) {
+            // Associate this kind with its nearest code field or helper call.
+            // Earlier codes in the window can belong to adjacent error producers.
+            for candidate in lines.iter().take(i + 1).skip(i.saturating_sub(10)).rev() {
                 if let Some(cm) = code_re.captures(candidate) {
                     let code: i32 = cm[1].parse().unwrap();
                     kind_codes.entry(kind.clone()).or_default().insert(code);
+                    break;
                 }
                 if let Some(cm) = already_reported_code_re.captures(candidate) {
                     let code: i32 = cm[1].parse().unwrap();
                     kind_codes.entry(kind.clone()).or_default().insert(code);
+                    break;
                 }
             }
         }
@@ -120,6 +126,39 @@ fn build_golden_json(kinds: &BTreeMap<String, Vec<i32>>) -> serde_json::Value {
         },
         "kinds": kinds_obj,
     })
+}
+
+#[test]
+fn error_kind_exit_codes_do_not_leak_from_adjacent_producers() {
+    let source = r#"
+        let manifest = read_manifest().map_err(|err| CliError {
+            code: 5,
+            kind: CliErrorKind::Storage.kind_str(),
+            message: err.to_string(),
+        })?.ok_or_else(|| CliError {
+            code: 3,
+            kind: CliErrorKind::IndexMissing.kind_str(),
+        })?;
+        let first = CliError {
+            code: 9,
+            kind: CliErrorKind::Io.kind_str(),
+        };
+        let second = CliError {
+            code: 14,
+            kind: CliErrorKind::Io.kind_str(),
+        };
+        let reported = CliError::already_reported(1, CliErrorKind::Selftest.kind_str(), message);
+        let from = CliError::already_reported_from(2, CliErrorKind::Selftest.kind_str(), error);
+    "#;
+    assert_eq!(
+        serde_json::to_value(extract_kind_exit_codes_from_source(source)).unwrap(),
+        serde_json::json!({
+            "index-missing": [3],
+            "io": [9, 14],
+            "selftest": [1, 2],
+            "storage": [5],
+        })
+    );
 }
 
 #[test]

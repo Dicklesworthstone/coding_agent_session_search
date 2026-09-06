@@ -915,6 +915,11 @@ pub fn plan_answer_pack(
         .candidates
         .iter()
         .map(|candidate| {
+            if crate::export::is_skill_injection(&candidate.excerpt) {
+                // Pack has no skill-content opt-in yet. Reuse the export
+                // default and account for exclusion as redacted_to_empty.
+                return (String::new(), false, Vec::new());
+            }
             let mut redactions = Vec::new();
             let redacted = redact_pack_output_text(&candidate.excerpt, &mut redactions);
             let (excerpt, truncated) =
@@ -2939,6 +2944,59 @@ mod tests {
             ],
             recommended_next_probe: Some("cass health --json".to_string()),
         }
+    }
+
+    #[test]
+    fn pack_omits_skill_injections_before_truncation_and_preserves_safe_evidence() {
+        let mut safe = candidate("safe", "local", "/work/safe.jsonl", 1.0);
+        safe.excerpt = "Ordinary skill design discussion stays useful.".to_string();
+        let mut candidates = vec![safe.clone()];
+        for (index, marker) in [
+            "Base directory for this skill:",
+            "<system-reminder>",
+            "The following skills are available for use with the Skill tool:",
+            "skillInjection: matchedSkills",
+            "<!-- skillInjection:",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut injected = candidate(
+                &format!("skill-{index}"),
+                "local",
+                &format!("/work/skill-{index}.jsonl"),
+                100.0,
+            );
+            injected.excerpt = format!("PROPRIETARY PLAYBOOK {} {marker}", "界".repeat(120));
+            candidates.push(injected);
+        }
+        let plan = plan_answer_pack(request(candidates.clone())).unwrap();
+        assert_eq!(plan.candidate_count, 6);
+        assert_eq!(plan.selected_evidence_count, 1);
+        assert_eq!(plan.evidence[0].candidate, safe);
+        assert_eq!(plan.evidence[0].excerpt, safe.excerpt);
+        assert_eq!(plan.omitted.len(), 5);
+        let mut omitted_ids = HashSet::new();
+        for omitted in &plan.omitted {
+            assert_eq!(omitted.reason, PackOmittedReason::RedactedToEmpty);
+            assert_eq!(omitted.estimated_tokens, 0);
+            assert!(omitted_ids.insert(&omitted.candidate_id));
+        }
+        let value = render_answer_pack_value_without_trust_correlation(
+            &plan,
+            &render_request(PackRenderFormat::Json),
+        )
+        .unwrap();
+        assert_eq!(value["privacy"]["redaction_applied"], true);
+        assert_eq!(value["privacy"]["skill_content_included"], false);
+        assert_eq!(value["privacy"]["redaction_counts"]["redacted_to_empty"], 5);
+        assert!(!value.to_string().contains("PROPRIETARY PLAYBOOK"));
+
+        candidates.remove(0);
+        let excluded = plan_answer_pack(request(candidates)).unwrap();
+        assert!(excluded.evidence.is_empty());
+        assert_eq!(excluded.omitted.len(), 5);
+        assert_eq!(excluded.estimated_tokens, 0);
     }
 
     #[test]

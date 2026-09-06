@@ -115,6 +115,7 @@ pub enum ErrorKind {
     OpencodeParse,
     OpencodeSqliteParse,
     OutputNotWritable,
+    PackBudgetTooSmall,
     PackEmptyQuery,
     PackInvalidField,
     PackInvalidLimit,
@@ -219,6 +220,7 @@ impl ErrorKind {
             Self::OpencodeParse => "opencode-parse",
             Self::OpencodeSqliteParse => "opencode-sqlite-parse",
             Self::OutputNotWritable => "output-not-writable",
+            Self::PackBudgetTooSmall => "pack-budget-too-small",
             Self::PackEmptyQuery => "pack-empty-query",
             Self::PackInvalidField => "pack-invalid-field",
             Self::PackInvalidLimit => "pack-invalid-limit",
@@ -321,6 +323,7 @@ impl ErrorKind {
             "opencode-parse" => Self::OpencodeParse,
             "opencode-sqlite-parse" => Self::OpencodeSqliteParse,
             "output-not-writable" => Self::OutputNotWritable,
+            "pack-budget-too-small" => Self::PackBudgetTooSmall,
             "pack-empty-query" => Self::PackEmptyQuery,
             "pack-invalid-field" => Self::PackInvalidField,
             "pack-invalid-limit" => Self::PackInvalidLimit,
@@ -423,6 +426,7 @@ impl ErrorKind {
             Self::OpencodeParse,
             Self::OpencodeSqliteParse,
             Self::OutputNotWritable,
+            Self::PackBudgetTooSmall,
             Self::PackEmptyQuery,
             Self::PackInvalidField,
             Self::PackInvalidLimit,
@@ -521,10 +525,10 @@ mod tests {
     /// drift immediately at CI time.
     #[test]
     fn variant_count_matches_audited_lib_rs_kind_literals() {
-        // 93 unique kinds after the archive-independent selftest and the
-        // `schedule` background-indexing kind landed. If lib.rs grows a new
+        // 94 unique kinds after the final answer-pack output budget adds
+        // `pack-budget-too-small`. If lib.rs grows a new
         // kind, bump this count AND add the variant + arms above.
-        const AUDITED_KIND_COUNT: usize = 93;
+        const AUDITED_KIND_COUNT: usize = 94;
         assert_eq!(
             ErrorKind::all_variants().len(),
             AUDITED_KIND_COUNT,

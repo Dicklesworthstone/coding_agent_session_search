@@ -31820,7 +31820,7 @@ fn render_cli_pack_with_output_budget(
         if !plan.reduce_for_output_budget(output_tokens - token_limit, require_evidence) {
             return Err(CliError {
                 code: 2,
-                kind: "pack-budget-too-small",
+                kind: CliErrorKind::PackBudgetTooSmall.kind_str(),
                 message: format!(
                     "pack output needs {output_tokens} estimated tokens, exceeding the {token_limit}-token tolerance for --max-tokens {}",
                     request.limits.max_tokens
@@ -107116,22 +107116,7 @@ fn run_export(
     if !include_skills {
         messages.retain(|msg| {
             let content = extract_text_content(msg);
-            if content.contains("Base directory for this skill:") {
-                return false;
-            }
-            if content.contains("<system-reminder>") {
-                return false;
-            }
-            if content.contains("The following skills are available for use with the Skill tool:") {
-                return false;
-            }
-            if content.contains("skillInjection:") && content.contains("matchedSkills") {
-                return false;
-            }
-            if content.contains("<!-- skillInjection:") {
-                return false;
-            }
-            true
+            !crate::export::is_skill_injection(&content)
         });
     }
 
@@ -107883,29 +107868,8 @@ fn run_export_html(
             // injected as a user message starting with "Base directory for this skill:".
             // These are often highly proprietary. DROP THE ENTIRE MESSAGE — don't try
             // to parse, redact, or pattern-match the content. Just skip it.
-            if !include_skills {
-                if content.contains("Base directory for this skill:") {
-                    return Vec::new();
-                }
-                // System reminders contain skill listings, hook metadata, and other
-                // internal context. Drop entire messages that are system-reminder blocks.
-                if content.contains("<system-reminder>") {
-                    return Vec::new();
-                }
-                // Skill listing dumps (injected by hooks)
-                if content
-                    .contains("The following skills are available for use with the Skill tool:")
-                {
-                    return Vec::new();
-                }
-                // Vercel plugin hook injections with skill metadata
-                if content.contains("skillInjection:") && content.contains("matchedSkills") {
-                    return Vec::new();
-                }
-                // Hook injection blocks (contain skill names, patterns, metadata)
-                if content.contains("<!-- skillInjection:") {
-                    return Vec::new();
-                }
+            if !include_skills && crate::export::is_skill_injection(&content) {
+                return Vec::new();
             }
 
             // Skip non-message records (queue-operation, summary, etc.)
@@ -107971,13 +107935,7 @@ fn run_export_html(
         let text = extract_text_content(msg);
 
         // Skip messages that would be dropped by skill filtering
-        if !include_skills
-            && (text.contains("Base directory for this skill:")
-                || text.contains("<system-reminder>")
-                || text.contains("The following skills are available for use with the Skill tool:")
-                || (text.contains("skillInjection:") && text.contains("matchedSkills"))
-                || text.contains("<!-- skillInjection:"))
-        {
+        if !include_skills && crate::export::is_skill_injection(&text) {
             continue;
         }
 
