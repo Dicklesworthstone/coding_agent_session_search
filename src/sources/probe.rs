@@ -634,10 +634,11 @@ fn infer_agent_type(path: &str) -> String {
         "codex".to_string()
     } else if path.contains(".cursor") || path.contains("Cursor") {
         "cursor".to_string()
-    } else if path.contains("antigravity-cli") || path.contains("antigravity") {
-        // Antigravity (agy) lives under ~/.gemini/antigravity-cli/, which also
-        // contains ".gemini" — so it MUST be matched before the gemini branch
-        // below, or agy roots would be mislabeled as legacy Gemini CLI.
+    } else if path.contains("antigravity") {
+        // Antigravity lives under ~/.gemini/antigravity/ (IDE) and
+        // ~/.gemini/antigravity-cli/ (agy CLI), which also contain ".gemini"
+        // — so it MUST be matched before the gemini branch below, or those
+        // roots would be mislabeled as legacy Gemini CLI.
         "antigravity".to_string()
     } else if path.contains(".gemini") {
         "gemini".to_string()
@@ -924,6 +925,12 @@ mod tests {
         );
         assert_eq!(
             infer_agent_type("~/.gemini/antigravity-cli/brain/abc/.system_generated/logs"),
+            "antigravity"
+        );
+        // The Antigravity IDE store (#454) shares the same parent.
+        assert_eq!(infer_agent_type("~/.gemini/antigravity"), "antigravity");
+        assert_eq!(
+            infer_agent_type("~/.gemini/antigravity/brain/abc/.system_generated/logs"),
             "antigravity"
         );
         assert_eq!(

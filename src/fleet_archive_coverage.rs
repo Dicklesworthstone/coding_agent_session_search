@@ -88,8 +88,9 @@ pub fn classify_root_kind(path: &str, agent: Option<&str>) -> RootKind {
         RootKind::Claude
     } else if lower.contains(".codex") || lower.contains("/codex") {
         RootKind::Codex
-    } else if lower.contains("antigravity-cli") || lower.contains("antigravity") {
-        // Must precede the .gemini check: agy lives under ~/.gemini/antigravity-cli.
+    } else if lower.contains("antigravity") {
+        // Must precede the .gemini check: the Antigravity IDE and agy CLI stores
+        // live under ~/.gemini/antigravity and ~/.gemini/antigravity-cli.
         RootKind::Antigravity
     } else if lower.contains(".gemini") || lower.contains("/gemini") {
         RootKind::Gemini
@@ -450,6 +451,10 @@ mod tests {
         );
         assert_eq!(
             classify_root_kind("/home/u/.gemini/antigravity-cli", None),
+            RootKind::Antigravity
+        );
+        assert_eq!(
+            classify_root_kind("/home/u/.gemini/antigravity", None),
             RootKind::Antigravity
         );
         assert_eq!(

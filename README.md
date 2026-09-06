@@ -398,7 +398,7 @@ Ingests history from 26 local agents, normalizing them into a unified `Conversat
 - **Muse Code**: `~/.local/share/muse/sessions/<YYYY>/<MM>/<DD>/<session-id>/session.jsonl`, including nested `subagent/*/session.jsonl` transcripts (override with `CASS_MUSE_DATA_ROOT`)
 - **Qwen Code**: `~/.qwen/tmp/*/chats/session-*.json` (Chat JSON)
 - **Factory (Droid)**: `~/.factory/sessions` (JSONL files organized by workspace slug)
-- **Antigravity (agy)**: `~/.gemini/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript.jsonl` (clean JSONL transcript), with the durable per-conversation `conversations/<uuid>.db` (SQLite) mirrored alongside. Resume with `cass resume <transcript> --agent agy` (`agy --conversation <uuid>`).
+- **Antigravity (IDE + agy CLI)**: both stores are probed by default — the IDE's `~/.gemini/antigravity/` and the CLI's `~/.gemini/antigravity-cli/` — each holding `brain/<uuid>/.system_generated/logs/transcript.jsonl` (clean JSONL transcript) with the durable per-conversation `conversations/<uuid>.db` (SQLite) mirrored alongside. IDE conversations are keyed `ide/<uuid>` so the two stores never collide; `CASS_ANTIGRAVITY_DATA_ROOT` replaces both with one explicit base. Resume with `cass resume <transcript> --agent agy` (`agy --conversation <uuid>`).
 - **OpenHands (OpenDevin)**: `~/.openhands/conversations/<id>/` — `base_state.json` metadata plus an `events/event-NNNNN-<uuid>.json` event stream (JSON)
 - **Grok Build (xAI `grok`)**: `~/.grok/sessions/<percent-encoded-cwd>/<session-uuid>/` — `updates.jsonl` (authoritative ACP session-update stream) with `summary.json` metadata and `chat_history.jsonl` fallback (override the base dir with `GROK_HOME`). Resume with `grok --resume <session-id>`.
 
