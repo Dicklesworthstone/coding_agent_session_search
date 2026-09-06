@@ -1450,7 +1450,8 @@ pub enum RecoveryConversationRow {
         coercions: Vec<String>,
     },
     /// The row's `id` itself was not an integer, so nothing downstream can
-    /// address it; `stored_id` is the offending value's display form.
+    /// address it; `stored_id` is the offending value's SQLite type name
+    /// (`text`, `blob`, ...) or `<missing>` — never its content.
     Unreadable { stored_id: String, reason: String },
 }
 
