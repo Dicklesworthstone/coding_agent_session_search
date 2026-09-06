@@ -1439,6 +1439,151 @@ fn franken_read_metadata_compat(
     serde_json::Value::Object(serde_json::Map::new())
 }
 
+/// One canonical `conversations` row as read by
+/// [`FrankenStorage::list_conversations_for_recovery`].
+#[derive(Debug)]
+pub enum RecoveryConversationRow {
+    /// The row was readable, possibly after coercing columns whose stored
+    /// type disagreed with the schema; `coercions` names each such column.
+    Readable {
+        conversation: Box<Conversation>,
+        coercions: Vec<String>,
+    },
+    /// The row's `id` itself was not an integer, so nothing downstream can
+    /// address it; `stored_id` is the offending value's display form.
+    Unreadable { stored_id: String, reason: String },
+}
+
+/// Read a schema-`TEXT` column leniently: NULL stays `None`, text is taken
+/// as-is, and numeric or blob values (which a healthy engine never stores
+/// under TEXT affinity) are coerced to text and recorded in `coercions`.
+fn lenient_text_column(
+    row: &FrankenRow,
+    idx: usize,
+    column: &str,
+    coercions: &mut Vec<String>,
+) -> Option<String> {
+    match row.get(idx)? {
+        SqliteValue::Null => None,
+        SqliteValue::Text(text) => Some(text.to_string()),
+        SqliteValue::Integer(n) => {
+            coercions.push(format!("{column}: integer {n} stored in TEXT column"));
+            Some(n.to_string())
+        }
+        SqliteValue::Float(f) => {
+            coercions.push(format!("{column}: real {f} stored in TEXT column"));
+            Some(f.to_string())
+        }
+        SqliteValue::Blob(bytes) => {
+            coercions.push(format!(
+                "{column}: {}-byte blob stored in TEXT column",
+                bytes.len()
+            ));
+            Some(String::from_utf8_lossy(bytes).into_owned())
+        }
+    }
+}
+
+/// Read a schema-`INTEGER` column leniently: integers are taken as-is, a
+/// real or a numeric string is coerced (and recorded), anything else drops to
+/// `None` with a note rather than failing the row.
+fn lenient_integer_column(
+    row: &FrankenRow,
+    idx: usize,
+    column: &str,
+    coercions: &mut Vec<String>,
+) -> Option<i64> {
+    match row.get(idx)? {
+        SqliteValue::Null => None,
+        SqliteValue::Integer(n) => Some(*n),
+        SqliteValue::Float(f) => {
+            coercions.push(format!("{column}: real {f} stored in INTEGER column"));
+            // Truncation toward zero is the intended lenient reading of a
+            // real that landed in an integer column.
+            Some(*f as i64)
+        }
+        SqliteValue::Text(text) => {
+            let text = text.to_string();
+            let parsed = text.trim().parse::<i64>().ok();
+            coercions.push(format!(
+                "{column}: text {text:?} stored in INTEGER column{}",
+                if parsed.is_some() { "" } else { " (dropped)" }
+            ));
+            parsed
+        }
+        SqliteValue::Blob(bytes) => {
+            coercions.push(format!(
+                "{column}: {}-byte blob stored in INTEGER column (dropped)",
+                bytes.len()
+            ));
+            None
+        }
+    }
+}
+
+/// Map one row of the recovery listing (column order as in
+/// [`FrankenStorage::list_conversations_for_recovery`]) without letting a
+/// schema/type disagreement fail the page.
+pub(crate) fn recovery_conversation_row_from_lenient_columns(
+    row: &FrankenRow,
+) -> RecoveryConversationRow {
+    let id = match row.get(0) {
+        Some(SqliteValue::Integer(id)) => *id,
+        other => {
+            let stored_id = other.map_or_else(
+                || "<missing>".to_string(),
+                |value| value.typeof_str().to_string(),
+            );
+            return RecoveryConversationRow::Unreadable {
+                stored_id,
+                reason: "conversation id is not an integer; the row cannot be addressed for \
+                         message reconstruction"
+                    .to_string(),
+            };
+        }
+    };
+    let mut coercions = Vec::new();
+    let agent_slug = lenient_text_column(row, 1, "agent_slug", &mut coercions)
+        .filter(|slug| !slug.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    let workspace = lenient_text_column(row, 2, "workspace", &mut coercions)
+        .map(|p| Path::new(&p).to_path_buf());
+    let external_id = lenient_text_column(row, 3, "external_id", &mut coercions);
+    let title = lenient_text_column(row, 4, "title", &mut coercions);
+    let source_path = lenient_text_column(row, 5, "source_path", &mut coercions)
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| {
+            coercions.push("source_path: NULL or empty in NOT NULL column".to_string());
+            format!("<unreadable-source-path-{id}>")
+        });
+    let started_at = lenient_integer_column(row, 6, "started_at", &mut coercions);
+    let ended_at = lenient_integer_column(row, 7, "ended_at", &mut coercions);
+    let approx_tokens = lenient_integer_column(row, 8, "approx_tokens", &mut coercions);
+    let raw_source_id = lenient_text_column(row, 10, "source_id", &mut coercions);
+    let raw_origin_host = lenient_text_column(row, 11, "origin_host", &mut coercions);
+    let (source_id, _, origin_host) =
+        normalized_storage_source_parts(raw_source_id.as_deref(), None, raw_origin_host.as_deref());
+    RecoveryConversationRow::Readable {
+        conversation: Box::new(Conversation {
+            id: Some(id),
+            agent_slug,
+            workspace,
+            external_id,
+            title,
+            source_path: Path::new(&source_path).to_path_buf(),
+            started_at,
+            ended_at,
+            approx_tokens,
+            // Already tolerant: falls back to an empty object on any decode error.
+            metadata_json: franken_read_metadata_compat(row, 9, 12),
+            messages: Vec::new(),
+            source_id,
+            origin_host,
+        }),
+        coercions,
+    }
+}
+
 fn franken_read_message_extra_compat(
     row: &FrankenRow,
     json_idx: usize,
@@ -9820,6 +9965,44 @@ impl FrankenStorage {
             .with_context(|| "listing conversations")
     }
 
+    /// Page canonical conversations for `doctor --recover-from-archive`,
+    /// tolerating rows whose stored types no longer match the schema.
+    ///
+    /// A page-aliasing corruption (#391: a 26-column `conversations` payload
+    /// reachable from the 9-column `messages` tree, integers stored where
+    /// `TEXT` is declared) makes the strict [`Self::list_conversations`] mapper
+    /// fail with `type mismatch: expected text, got integer` at the first bad
+    /// row — and the recovery export, whose whole purpose is a damaged
+    /// archive, aborted with nothing written. This reader keys by `id` (no
+    /// `ORDER BY started_at` sort over a damaged tree) and maps each row
+    /// leniently: numeric/blob values in text columns are coerced to text and
+    /// reported as coercions, non-integer timestamps are dropped, and a row
+    /// whose `id` is unreadable is returned as
+    /// [`RecoveryConversationRow::Unreadable`] instead of failing the page.
+    /// Engine-level page errors still surface as `Err`.
+    pub fn list_conversations_for_recovery(
+        &self,
+        after_id: i64,
+        limit: i64,
+    ) -> Result<Vec<RecoveryConversationRow>> {
+        self.conn
+            .query_map_collect(
+                "SELECT c.id,
+                        COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown'),
+                        (SELECT w.path FROM workspaces w WHERE w.id = c.workspace_id),
+                        c.external_id, c.title, c.source_path,
+                        c.started_at, c.ended_at, c.approx_tokens,
+                        c.metadata_json, c.source_id, c.origin_host, c.metadata_bin
+                 FROM conversations c
+                 WHERE c.id > ?1
+                 ORDER BY c.id
+                 LIMIT ?2",
+                fparams![after_id, limit],
+                |row| Ok(recovery_conversation_row_from_lenient_columns(row)),
+            )
+            .with_context(|| "listing conversations for recovery")
+    }
+
     /// Build lookup maps for agents and workspaces to avoid JOINs in
     /// paged conversation queries.  Both tables are tiny (tens of rows)
     /// so this is effectively free.
@@ -15826,17 +16009,31 @@ fn franken_insert_external_conversation_tail_lookup(
     )
 }
 
-/// Recover the first pi-family ingest after a previously indexed transcript
-/// acquires the stable session id embedded in its header.
+/// Providers whose transcript path is a durable identity for the
+/// conversation, so an external-id re-key may be reconciled by source path.
 ///
-/// Older Pi Agent and OMP connectors derived external ids from paths relative
-/// to a discovery root. The same transcript can therefore acquire a different
-/// external id when the connector starts preferring its embedded session id or
-/// a newer detector selects a more-specific root. The transcript's
-/// source-qualified absolute path plus the normal source-path merge evidence
-/// is the durable identity in that upgrade case. Keep this fallback restricted
-/// to the pi family: other providers may legitimately reuse a source path for
-/// unrelated external sessions.
+/// - `omp` / `pi_agent`: older connectors derived external ids from paths
+///   relative to a discovery root; the same transcript acquires a different
+///   external id when the connector starts preferring its embedded session id
+///   or a newer detector selects a more-specific root.
+/// - `antigravity`: the transcript lives at
+///   `<base>/brain/<uuid>/.system_generated/logs/transcript.jsonl`, so the path
+///   already embeds the conversation uuid and is never reused for a different
+///   session. Conversations under the IDE store re-key from the bare `<uuid>`
+///   to `ide/<uuid>` once the connector distinguishes the two stores (#454).
+///
+/// Other providers may legitimately reuse a source path for unrelated
+/// external sessions and must stay out of this lane.
+fn source_path_is_durable_conversation_identity(agent_slug: &str) -> bool {
+    matches!(agent_slug, "omp" | "pi_agent" | "antigravity")
+}
+
+/// Recover the first ingest after a previously indexed transcript acquires a
+/// different external id (see [`source_path_is_durable_conversation_identity`]
+/// for the providers where the transcript path is a durable identity).
+///
+/// The transcript's source-qualified absolute path plus the normal source-path
+/// merge evidence is the durable identity in that upgrade case.
 fn franken_promote_pi_family_external_identity_by_source_path(
     tx: &FrankenTransaction<'_>,
     source_id: &str,
@@ -15844,7 +16041,8 @@ fn franken_promote_pi_family_external_identity_by_source_path(
     external_id: &str,
     conv: Option<&Conversation>,
 ) -> Result<Option<ExistingConversationWithTail>> {
-    let Some(conv) = conv.filter(|conv| matches!(conv.agent_slug.as_str(), "omp" | "pi_agent"))
+    let Some(conv) =
+        conv.filter(|conv| source_path_is_durable_conversation_identity(&conv.agent_slug))
     else {
         return Ok(None);
     };
@@ -32443,6 +32641,160 @@ mod tests {
                 .iter()
                 .all(|conversation| conversation.agent_slug == "omp")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn literal_rowid_in_list_plans_as_primary_key_seek() -> anyhow::Result<()> {
+        // GH #382 (semantic hydration stall): frankensqlite plans a
+        // parameterized `WHERE id IN (?,?)` over `messages` as a full SCAN,
+        // so search hydration renders the ids as literals. Pin the plan the
+        // literal form gets so an engine or query regression is caught here
+        // rather than as a multi-minute hydration on a large archive.
+        let dir = TempDir::new()?;
+        let storage = SqliteStorage::open(&dir.path().join("test.db"))?;
+        let plan_for = |sql: &str| -> anyhow::Result<String> {
+            let rows: Vec<String> = storage.conn.query_map_collect(
+                &format!("EXPLAIN QUERY PLAN {sql}"),
+                fparams![],
+                |row| {
+                    Ok(match row.get(3) {
+                        Some(SqliteValue::Text(detail)) => detail.to_string(),
+                        other => format!("{other:?}"),
+                    })
+                },
+            )?;
+            Ok(rows.join(" | "))
+        };
+        let literal = plan_for(&format!(
+            "SELECT id, conversation_id, content FROM messages WHERE id IN ({})",
+            crate::search::query::sql_rowid_literal_list(&[3, 99, 100_000])
+        ))?;
+        assert!(
+            literal.contains("SEARCH") && literal.contains("INTEGER PRIMARY KEY"),
+            "literal rowid IN-list must seek by primary key, got: {literal}"
+        );
+        assert!(
+            !literal.contains("SCAN"),
+            "literal rowid IN-list must not scan messages, got: {literal}"
+        );
+        let conversations = plan_for(&format!(
+            "SELECT c.id FROM conversations c WHERE c.id IN ({})",
+            crate::search::query::sql_rowid_literal_list(&[1, 2])
+        ))?;
+        assert!(
+            conversations.contains("SEARCH") && !conversations.contains("SCAN"),
+            "literal conversation id IN-list must seek, got: {conversations}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn antigravity_ide_rekey_promotes_external_identity_by_source_path() -> anyhow::Result<()> {
+        // #454: conversations under the Antigravity IDE store were keyed by
+        // the bare `<uuid>` until the connector learned to distinguish the IDE
+        // and CLI stores; they now arrive as `ide/<uuid>`. The transcript path
+        // embeds the uuid, so the re-key must reuse the existing row instead
+        // of inserting a duplicate.
+        let dir = TempDir::new()?;
+        let storage = SqliteStorage::open(&dir.path().join("test.db"))?;
+        let uuid = "00f0c687-1c8a-412b-a942-ec58f4b03c00";
+        let source_path = dir
+            .path()
+            .join("home/.gemini/antigravity/brain")
+            .join(uuid)
+            .join(".system_generated/logs/transcript.jsonl");
+        let started_at = 1_000_i64;
+        let message = |idx: i64, content: &str| Message {
+            id: None,
+            idx,
+            role: if idx == 0 {
+                MessageRole::User
+            } else {
+                MessageRole::Agent
+            },
+            author: None,
+            created_at: Some(started_at + idx),
+            content: content.to_owned(),
+            extra_json: serde_json::Value::Null,
+            snippets: Vec::new(),
+        };
+        let conversation =
+            |agent_slug: &str, external_id: &str, messages: Vec<Message>| Conversation {
+                id: None,
+                agent_slug: agent_slug.into(),
+                workspace: None,
+                external_id: Some(external_id.to_owned()),
+                title: Some("Antigravity IDE session".into()),
+                source_path: source_path.clone(),
+                started_at: Some(started_at),
+                ended_at: messages.iter().filter_map(|m| m.created_at).max(),
+                approx_tokens: None,
+                metadata_json: serde_json::json!({"source": agent_slug}),
+                messages,
+                source_id: LOCAL_SOURCE_ID.into(),
+                origin_host: None,
+            };
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "antigravity".into(),
+            name: "Antigravity".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+
+        // Legacy row: bare uuid.
+        let legacy = conversation("antigravity", uuid, vec![message(0, "hello")]);
+        let outcomes = storage.insert_conversations_batched(&[(agent_id, None, &legacy)])?;
+        assert!(outcomes[0].conversation_inserted);
+
+        // Re-scan with the store-qualified id and one appended message.
+        let current = conversation(
+            "antigravity",
+            &format!("ide/{uuid}"),
+            vec![message(0, "hello"), message(1, "world")],
+        );
+        let outcomes = storage.insert_conversations_batched(&[(agent_id, None, &current)])?;
+        assert!(
+            !outcomes[0].conversation_inserted,
+            "the qualified id must reuse the legacy row, not insert a duplicate"
+        );
+        assert_eq!(outcomes[0].inserted_indices, vec![1]);
+
+        let rows: Vec<(String, i64)> = storage.conn.query_map_collect(
+            "SELECT c.external_id, COUNT(m.id)
+             FROM conversations c LEFT JOIN messages m ON m.conversation_id = c.id
+             WHERE c.agent_id = ?1
+             GROUP BY c.id",
+            fparams![agent_id],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        )?;
+        assert_eq!(rows, vec![(format!("ide/{uuid}"), 2)]);
+
+        // Control: the lane stays closed for providers whose source path may be
+        // reused for unrelated sessions — a re-keyed codex row is a new row.
+        let codex_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let first = conversation("codex", "codex-a", vec![message(0, "hello")]);
+        storage.insert_conversations_batched(&[(codex_id, None, &first)])?;
+        let rekeyed = conversation(
+            "codex",
+            "codex-b",
+            vec![message(0, "hello"), message(1, "world")],
+        );
+        let outcomes = storage.insert_conversations_batched(&[(codex_id, None, &rekeyed)])?;
+        assert!(outcomes[0].conversation_inserted);
+        let codex_rows: i64 = storage.conn.query_row_map(
+            "SELECT COUNT(*) FROM conversations WHERE agent_id = ?1",
+            fparams![codex_id],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(codex_rows, 2);
         Ok(())
     }
 

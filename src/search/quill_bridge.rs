@@ -456,6 +456,90 @@ pub fn segment_file_count(path: &Path) -> Option<usize> {
     )
 }
 
+/// On-disk footprint of one Quill index directory, split by what a full
+/// rebuild has to reproduce versus what the engine reclaims on its own (#453).
+///
+/// A concat merge publishes its output and drops the folded inputs from the
+/// MANIFEST, but the input files stay on disk until the engine's writer-open
+/// garbage sweep has seen them unreferenced by both durable slots for a full
+/// grace period (`frankensearch_quill::DEFAULT_GARBAGE_GRACE`). Those files
+/// are not part of the index a rebuild rewrites, so the headroom preflight
+/// must not double them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuillDirectoryFootprint {
+    /// Bytes of the segment files the current MANIFEST references, plus every
+    /// other regular file in the directory (MANIFEST slots, lock record,
+    /// repair sidecars, staged temporaries).
+    pub live_bytes: u64,
+    /// Bytes of `seg-*.fslx` files the current MANIFEST no longer references
+    /// (merge-folded inputs awaiting the engine sweep) and of their
+    /// `.retired` receipts.
+    pub retired_bytes: u64,
+    /// Number of unreferenced `seg-*.fslx` files behind `retired_bytes`.
+    pub retired_segment_files: usize,
+}
+
+/// Canonical file name of a Quill segment, as the engine writes it.
+fn canonical_segment_file_name(segment_id: u64) -> String {
+    format!("{QUILL_SEGMENT_FILE_PREFIX}{segment_id:016x}{QUILL_SEGMENT_FILE_SUFFIX}")
+}
+
+/// Suffix of the engine's per-segment retirement receipt (`seg-<id>.fslx.retired`).
+const QUILL_RETIREMENT_RECEIPT_SUFFIX: &str = ".retired";
+
+/// Split one Quill index directory's regular files into live and retired
+/// bytes by reading the published MANIFEST (no engine open, no segment I/O).
+///
+/// Returns `None` when `path` is not a Quill index or its MANIFEST cannot be
+/// read, so a caller sizing storage falls back to counting everything as
+/// live: an unreadable manifest is a reason to be conservative, never to
+/// call bytes reclaimable. Only direct children are inspected; a Quill index
+/// directory is flat.
+#[must_use]
+pub fn quill_directory_footprint(path: &Path) -> Option<QuillDirectoryFootprint> {
+    if !path.join(QUILL_INDEX_MARKER).is_file() {
+        return None;
+    }
+    let loaded = frankensearch::quill::load_manifest_pair(path).ok()?;
+    let live_segments: std::collections::HashSet<String> = loaded
+        .manifest
+        .segments
+        .iter()
+        .map(|segment| canonical_segment_file_name(segment.segment_id))
+        .collect();
+    let mut footprint = QuillDirectoryFootprint::default();
+    for entry in std::fs::read_dir(path).ok()?.filter_map(Result::ok) {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            footprint.live_bytes = footprint.live_bytes.saturating_add(metadata.len());
+            continue;
+        };
+        let is_segment = name.starts_with(QUILL_SEGMENT_FILE_PREFIX)
+            && name.ends_with(QUILL_SEGMENT_FILE_SUFFIX);
+        let is_receipt = name
+            .strip_suffix(QUILL_RETIREMENT_RECEIPT_SUFFIX)
+            .is_some_and(|base| {
+                base.starts_with(QUILL_SEGMENT_FILE_PREFIX)
+                    && base.ends_with(QUILL_SEGMENT_FILE_SUFFIX)
+            });
+        if is_segment && !live_segments.contains(name) {
+            footprint.retired_bytes = footprint.retired_bytes.saturating_add(metadata.len());
+            footprint.retired_segment_files += 1;
+        } else if is_receipt {
+            footprint.retired_bytes = footprint.retired_bytes.saturating_add(metadata.len());
+        } else {
+            footprint.live_bytes = footprint.live_bytes.saturating_add(metadata.len());
+        }
+    }
+    Some(footprint)
+}
+
 /// Field handles for the compiled CASS schema.
 ///
 /// The Tantivy incumbent resolved these from a runtime schema read, because a
@@ -1861,5 +1945,83 @@ mod tests {
             files_after >= live_after,
             "segment files ({files_after}) must still bound the live count ({live_after})"
         );
+    }
+
+    /// #453: the byte split behind doctor's full-rebuild headroom. After a
+    /// merge the folded inputs are still on disk but no longer referenced by
+    /// the MANIFEST; they must land in `retired_bytes`, never in
+    /// `live_bytes`, and the two must add up to the directory's regular
+    /// files.
+    #[test]
+    fn quill_directory_footprint_splits_manifest_referenced_bytes_from_retired_inputs() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        assert_eq!(
+            quill_directory_footprint(directory.path()),
+            None,
+            "a directory without a MANIFEST is not a Quill index"
+        );
+
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open or create");
+        for commit in 0..4_u64 {
+            index
+                .add_cass_documents(&[sample(
+                    &format!("session-{commit}"),
+                    0,
+                    "footprint fixture with a few distinct tokens",
+                )])
+                .expect("index batch");
+            index.commit().expect("commit batch");
+        }
+        let before = quill_directory_footprint(directory.path()).expect("published index");
+        assert_eq!(before.retired_bytes, 0, "nothing is folded yet: {before:?}");
+        assert_eq!(before.retired_segment_files, 0);
+        assert!(before.live_bytes > 0);
+
+        index.force_merge().expect("force merge");
+        assert_eq!(published_segment_count(&index), 1);
+        let after = quill_directory_footprint(directory.path()).expect("published index");
+        let files_after = segment_file_count(directory.path()).expect("published index");
+        assert_eq!(
+            after.retired_segment_files,
+            files_after - 1,
+            "every segment file but the merge output is retired: {after:?}"
+        );
+        assert!(after.retired_bytes > 0, "{after:?}");
+
+        // The split is exhaustive over the directory's regular files.
+        let regular_bytes: u64 = std::fs::read_dir(directory.path())
+            .expect("read index directory")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.metadata().ok())
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.len())
+            .sum();
+        assert_eq!(after.live_bytes + after.retired_bytes, regular_bytes);
+
+        // The live figure is exactly what the MANIFEST references plus the
+        // non-segment bookkeeping files.
+        let manifest = frankensearch::quill::load_manifest_pair(directory.path())
+            .expect("load manifest")
+            .manifest;
+        let referenced: u64 = manifest
+            .segments
+            .iter()
+            .map(|segment| segment.file_len)
+            .sum();
+        let bookkeeping: u64 = std::fs::read_dir(directory.path())
+            .expect("read index directory")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                !(name.starts_with(QUILL_SEGMENT_FILE_PREFIX)
+                    && (name.ends_with(QUILL_SEGMENT_FILE_SUFFIX)
+                        || name.ends_with(QUILL_RETIREMENT_RECEIPT_SUFFIX)))
+            })
+            .filter_map(|entry| entry.metadata().ok())
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.len())
+            .sum();
+        assert_eq!(after.live_bytes, referenced + bookkeeping);
     }
 }

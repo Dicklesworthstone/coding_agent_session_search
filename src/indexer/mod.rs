@@ -19279,6 +19279,8 @@ fn required_index_headroom_bytes(
 /// Human-readable statement of the full-rebuild headroom rule, reported by
 /// `doctor` next to the numbers so an agent can see *why* a rebuild is
 /// blocked. Keep in sync with [`full_rebuild_headroom_projection`].
+/// `lexical_index_bytes` is the LIVE lexical footprint (see
+/// [`LexicalIndexFootprint::live_bytes`]).
 pub(crate) const FULL_REBUILD_HEADROOM_FORMULA: &str =
     "max(512 MiB, db_bundle_bytes * 2 + lexical_index_bytes * 2)";
 
@@ -19292,8 +19294,21 @@ pub(crate) struct FullRebuildHeadroomProjection {
     pub(crate) floor_bytes: u64,
     /// `agent_search.db` plus its `-wal`/`-shm` sidecars.
     pub(crate) db_bundle_bytes: u64,
-    /// On-disk size of the lexical (Tantivy) index tree.
+    /// Live on-disk size of the lexical index tree: the bytes a rebuild has
+    /// to write a second copy of ([`LexicalIndexFootprint::live_bytes`]).
     pub(crate) lexical_index_bytes: u64,
+    /// Merge-retired segment files still on disk under the lexical index
+    /// ([`LexicalIndexFootprint::retired_segment_bytes`]). Already consumed,
+    /// reclaimed by the engine, never rewritten by a rebuild: excluded from
+    /// `required_bytes`.
+    pub(crate) retired_segment_bytes: u64,
+    /// Number of files behind `retired_segment_bytes`.
+    pub(crate) retired_segment_files: usize,
+    /// Prior generations parked under `index/.lexical-publish-backups/`
+    /// ([`LexicalIndexFootprint::retained_backup_bytes`]). A rebuild replaces
+    /// them (retention keeps the newest, `cass doctor cleanup` reclaims the
+    /// rest); excluded from `required_bytes`.
+    pub(crate) retained_backup_bytes: u64,
 }
 
 /// Single source of truth for the authoritative (full) rebuild headroom rule.
@@ -19308,31 +19323,173 @@ pub(crate) struct FullRebuildHeadroomProjection {
 /// free, then consumed ~115 GB and died on `disk I/O error (10)`.
 /// Counting the lexical index makes that case fail the preflight
 /// instead of failing mid-commit.
+///
+/// Only the LIVE lexical bytes count (#453). Merge-retired segment files the
+/// MANIFEST no longer references and prior generations parked under
+/// `.lexical-publish-backups/` are already on disk and are not rewritten by
+/// the rebuild -- the engine sweep and backup retention reclaim them -- so
+/// doubling them would refuse a rebuild the disk can hold. On the archive
+/// that motivated this, 4.2 GB of folded inputs plus a 6.4 GB retained
+/// backup sat next to a 6.8 GB live index; the recursive size demanded
+/// 48 GB and refused, while the rebuild itself needed 37 GB against 43 GB
+/// free.
 pub(crate) fn full_rebuild_headroom_projection(
     data_dir: &Path,
     db_path: &Path,
 ) -> FullRebuildHeadroomProjection {
     let db_bundle_bytes = database_bundle_size_bytes(db_path);
-    let lexical_index_bytes = lexical_index_size_bytes(data_dir);
+    let footprint = lexical_index_footprint(data_dir);
     let projected = db_bundle_bytes
         .saturating_mul(2)
-        .saturating_add(lexical_index_bytes.saturating_mul(2));
+        .saturating_add(footprint.live_bytes.saturating_mul(2));
     FullRebuildHeadroomProjection {
         required_bytes: INDEX_MIN_FREE_SPACE_BYTES.max(projected),
         floor_bytes: INDEX_MIN_FREE_SPACE_BYTES,
         db_bundle_bytes,
-        lexical_index_bytes,
+        lexical_index_bytes: footprint.live_bytes,
+        retired_segment_bytes: footprint.retired_segment_bytes,
+        retired_segment_files: footprint.retired_segment_files,
+        retained_backup_bytes: footprint.retained_backup_bytes,
     }
 }
 
-/// Total bytes of the on-disk lexical index, or 0 when it does not exist yet.
+/// On-disk bytes under `<data_dir>/index/`, split by whether a full rebuild
+/// has to reproduce them (#453).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct LexicalIndexFootprint {
+    /// Everything a rebuild rewrites: segment files the current MANIFEST
+    /// references, manifests and sidecars, schema markers, staging scratch,
+    /// and any file whose classification is uncertain.
+    pub(crate) live_bytes: u64,
+    /// `seg-*.fslx` files (and `.retired` receipts) inside a readable Quill
+    /// index directory that its MANIFEST no longer references: merge-folded
+    /// inputs the engine unlinks once they have been unreferenced by both
+    /// durable slots for its grace period.
+    pub(crate) retired_segment_bytes: u64,
+    /// Number of unreferenced `seg-*.fslx` files behind `retired_segment_bytes`.
+    pub(crate) retired_segment_files: usize,
+    /// Everything under `index/.lexical-publish-backups/`: prior live
+    /// generations kept for rollback, pruned to the retention cap on the next
+    /// staged publish and reclaimable through `cass doctor cleanup`.
+    pub(crate) retained_backup_bytes: u64,
+}
+
+impl LexicalIndexFootprint {
+    /// Recursive size of the tree, the figure the pre-#453 preflight doubled.
+    #[cfg(test)]
+    pub(crate) fn total_bytes(&self) -> u64 {
+        self.live_bytes
+            .saturating_add(self.retired_segment_bytes)
+            .saturating_add(self.retained_backup_bytes)
+    }
+}
+
+/// Directory under `index/` where staged publishes park the prior live
+/// generation (see `lexical_publish_backups_dir`).
+const LEXICAL_PUBLISH_BACKUPS_DIR_NAME: &str = ".lexical-publish-backups";
+
+/// Outcome of one explicit lexical garbage sweep (`cass index --gc`, #453).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LexicalSegmentGcReport {
+    /// The Quill index directory that was swept.
+    pub index_path: PathBuf,
+    /// Segments the published MANIFEST references after the sweep: the count
+    /// a query pays for.
+    pub live_segments: usize,
+    /// `seg-*.fslx` files on disk before and after the sweep.
+    pub segment_files_before: usize,
+    pub segment_files_after: usize,
+    /// Bytes of MANIFEST-unreferenced segment files (and their receipts)
+    /// before and after the sweep.
+    pub retired_bytes_before: u64,
+    pub retired_bytes_after: u64,
+    /// What the sweep unlinked.
+    pub reclaimed_files: usize,
+    pub reclaimed_bytes: u64,
+    /// The engine's grace period: a retired segment survives at least this
+    /// long after the publication that dropped it from every MANIFEST slot,
+    /// so a reader that opened the previous generation can still finish
+    /// opening its segments.
+    pub grace_secs: u64,
+}
+
+/// Reclaim merge-retired lexical segment files without indexing anything
+/// (`cass index --gc`, #453).
+///
+/// The engine owns the reader-safety rule for unlinking a segment (a file is
+/// removed only once no durable MANIFEST slot has referenced it for the
+/// grace period), so cass never deletes segment files itself: it opens the
+/// lexical writer, which runs that sweep under the writer admission, and
+/// reports the before/after footprint. This is the same sweep every
+/// incremental `cass index` performs at open; the flag exists so an operator
+/// can run it on its own and see what it reclaimed.
+///
+/// # Errors
+///
+/// Fails when no published lexical index exists, when the writer admission
+/// cannot be acquired (another `cass index` holds it), or when the engine
+/// refuses to open the index.
+pub fn run_lexical_segment_gc(data_dir: &Path) -> Result<LexicalSegmentGcReport> {
+    use crate::search::quill_bridge::{
+        QUILL_INDEX_MARKER, QuillCassIndex, quill_directory_footprint, segment_file_count,
+    };
+
+    let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+    if !index_path.join(QUILL_INDEX_MARKER).is_file() {
+        anyhow::bail!(
+            "no published lexical index at {} (run `cass index` first)",
+            index_path.display()
+        );
+    }
+    let before = quill_directory_footprint(&index_path).with_context(|| {
+        format!(
+            "reading the lexical MANIFEST at {} before the sweep",
+            index_path.display()
+        )
+    })?;
+    let segment_files_before = segment_file_count(&index_path).unwrap_or(0);
+
+    // Opening the writer is the sweep: `KeeperWriter::open` witnesses
+    // orphans and collects aged garbage before it hands the writer back.
+    let index = QuillCassIndex::open_or_create(&index_path)
+        .with_context(|| format!("opening the lexical writer at {}", index_path.display()))?;
+    let live_segments = index.segment_count();
+    drop(index);
+
+    let after = quill_directory_footprint(&index_path).with_context(|| {
+        format!(
+            "reading the lexical MANIFEST at {} after the sweep",
+            index_path.display()
+        )
+    })?;
+    let segment_files_after = segment_file_count(&index_path).unwrap_or(0);
+    Ok(LexicalSegmentGcReport {
+        index_path,
+        live_segments,
+        segment_files_before,
+        segment_files_after,
+        retired_bytes_before: before.retired_bytes,
+        retired_bytes_after: after.retired_bytes,
+        reclaimed_files: segment_files_before.saturating_sub(segment_files_after),
+        reclaimed_bytes: before.retired_bytes.saturating_sub(after.retired_bytes),
+        grace_secs: frankensearch::quill::DEFAULT_GARBAGE_GRACE.as_secs(),
+    })
+}
+
+/// Classify every byte under `<data_dir>/index/`, or all zeros when it does
+/// not exist yet.
 ///
 /// Walks explicitly (rather than following symlinks) so a symlinked index dir
-/// cannot make the projection wander outside the data dir.
-fn lexical_index_size_bytes(data_dir: &Path) -> u64 {
-    let mut total = 0u64;
-    let mut stack = vec![data_dir.join(LEXICAL_INDEX_ROOT_DIR)];
-    while let Some(path) = stack.pop() {
+/// cannot make the projection wander outside the data dir. A directory that
+/// holds a readable Quill MANIFEST is split through
+/// [`crate::search::quill_bridge::quill_directory_footprint`]; anything the
+/// manifest cannot vouch for is counted live, because an unreadable manifest
+/// is a reason to over-provision, never to call bytes reclaimable.
+pub(crate) fn lexical_index_footprint(data_dir: &Path) -> LexicalIndexFootprint {
+    let mut footprint = LexicalIndexFootprint::default();
+    // (path, whether an ancestor is the retained-backups directory)
+    let mut stack = vec![(data_dir.join(LEXICAL_INDEX_ROOT_DIR), false)];
+    while let Some((path, in_backups)) = stack.pop() {
         let Ok(metadata) = std::fs::symlink_metadata(&path) else {
             continue;
         };
@@ -19340,17 +19497,48 @@ fn lexical_index_size_bytes(data_dir: &Path) -> u64 {
             continue;
         }
         if metadata.is_file() {
-            total = total.saturating_add(metadata.len());
-        } else if metadata.is_dir() {
-            let Ok(entries) = std::fs::read_dir(&path) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                stack.push(entry.path());
+            if in_backups {
+                footprint.retained_backup_bytes = footprint
+                    .retained_backup_bytes
+                    .saturating_add(metadata.len());
+            } else {
+                footprint.live_bytes = footprint.live_bytes.saturating_add(metadata.len());
             }
+            continue;
+        }
+        if !metadata.is_dir() {
+            continue;
+        }
+        let in_backups = in_backups
+            || path
+                .file_name()
+                .is_some_and(|name| name == LEXICAL_PUBLISH_BACKUPS_DIR_NAME);
+        let quill = if in_backups {
+            None
+        } else {
+            crate::search::quill_bridge::quill_directory_footprint(&path)
+        };
+        if let Some(quill) = quill {
+            footprint.live_bytes = footprint.live_bytes.saturating_add(quill.live_bytes);
+            footprint.retired_segment_bytes = footprint
+                .retired_segment_bytes
+                .saturating_add(quill.retired_bytes);
+            footprint.retired_segment_files += quill.retired_segment_files;
+        }
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            // A Quill directory's regular children were already accounted
+            // for through the manifest split; only descend into
+            // subdirectories there.
+            if quill.is_some() && !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            stack.push((entry.path(), in_backups));
         }
     }
-    total
+    footprint
 }
 
 fn database_bundle_size_bytes(db_path: &Path) -> u64 {
@@ -46920,6 +47108,221 @@ mod tests {
             ),
             INDEX_MIN_FREE_SPACE_BYTES
         );
+    }
+
+    /// Build a real Quill index at the data dir's expected lexical path with
+    /// `rounds` single-document commits, then fold them into one segment so
+    /// the folded inputs sit on disk unreferenced by the MANIFEST (#453).
+    fn plant_merged_quill_index(data_dir: &Path, rounds: u64) -> PathBuf {
+        use crate::search::quill_bridge::QuillCassIndex;
+        use frankensearch::quill::cass::CassDocument;
+
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        std::fs::create_dir_all(&index_path).unwrap();
+        let mut index = QuillCassIndex::open_or_create(&index_path).expect("open or create");
+        for round in 0..rounds {
+            index
+                .add_cass_documents(&[CassDocument {
+                    agent: "claude".to_owned(),
+                    workspace: Some("cass".to_owned()),
+                    workspace_original: Some("cass".to_owned()),
+                    source_path: format!("/transcripts/session-{round}.jsonl"),
+                    msg_idx: 0,
+                    created_at: Some(1_700_000_000),
+                    title: Some("footprint fixture".to_owned()),
+                    content: format!("footprint fixture round {round} with distinct tokens"),
+                    source_id: format!("session-{round}"),
+                    origin_kind: "local".to_owned(),
+                    origin_host: None,
+                    conversation_id: Some(1),
+                }])
+                .expect("index batch");
+            index.commit().expect("commit batch");
+        }
+        index.force_merge().expect("force merge");
+        assert_eq!(
+            index.segment_count(),
+            1,
+            "merge must leave one live segment"
+        );
+        index_path
+    }
+
+    /// #453: the headroom projection doubles only the live lexical bytes.
+    /// Merge-retired segment files and retained publish backups are already
+    /// on disk and are not rewritten by a rebuild, so they are reported but
+    /// excluded from the requirement.
+    #[test]
+    fn full_rebuild_headroom_excludes_retired_segments_and_retained_backups() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let db_path = data_dir.join("agent_search.db");
+        std::fs::File::create(&db_path)
+            .unwrap()
+            .set_len(300 * 1024 * 1024)
+            .unwrap();
+        let index_path = plant_merged_quill_index(&data_dir, 4);
+
+        let footprint = lexical_index_footprint(&data_dir);
+        let quill = crate::search::quill_bridge::quill_directory_footprint(&index_path)
+            .expect("published Quill index");
+        assert_eq!(footprint.live_bytes, quill.live_bytes);
+        assert_eq!(footprint.retired_segment_bytes, quill.retired_bytes);
+        assert_eq!(footprint.retired_segment_files, quill.retired_segment_files);
+        assert_eq!(
+            footprint.retired_segment_files, 4,
+            "four folded inputs remain on disk"
+        );
+        assert!(footprint.retired_segment_bytes > 0);
+        assert_eq!(footprint.retained_backup_bytes, 0);
+
+        // A retained prior generation and a stray file next to the index.
+        let backup_dir = data_dir
+            .join(LEXICAL_INDEX_ROOT_DIR)
+            .join(LEXICAL_PUBLISH_BACKUPS_DIR_NAME)
+            .join("2026-09-05T00-00-00Z");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        std::fs::File::create(backup_dir.join("seg-000000000000abcd.fslx"))
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        std::fs::write(
+            backup_dir.join("MANIFEST"),
+            b"not parsed: backups are never split",
+        )
+        .unwrap();
+        std::fs::write(
+            data_dir
+                .join(LEXICAL_INDEX_ROOT_DIR)
+                .join("schema_hash.json"),
+            vec![b'x'; 40],
+        )
+        .unwrap();
+
+        let with_extras = lexical_index_footprint(&data_dir);
+        assert_eq!(with_extras.live_bytes, footprint.live_bytes + 40);
+        assert_eq!(
+            with_extras.retired_segment_bytes,
+            footprint.retired_segment_bytes
+        );
+        assert_eq!(
+            with_extras.retained_backup_bytes,
+            64 * 1024 * 1024 + "not parsed: backups are never split".len() as u64
+        );
+        assert_eq!(
+            with_extras.total_bytes(),
+            recursive_size_for_test(&data_dir.join(LEXICAL_INDEX_ROOT_DIR)),
+            "the classification is exhaustive over the index tree"
+        );
+
+        let projection = full_rebuild_headroom_projection(&data_dir, &db_path);
+        assert_eq!(projection.lexical_index_bytes, with_extras.live_bytes);
+        assert_eq!(
+            projection.retired_segment_bytes,
+            with_extras.retired_segment_bytes
+        );
+        assert_eq!(projection.retired_segment_files, 4);
+        assert_eq!(
+            projection.retained_backup_bytes,
+            with_extras.retained_backup_bytes
+        );
+        // db(300 MiB)*2 clears the floor, so the requirement is exactly the
+        // rule over live bytes: the 64 MiB backup and the retired inputs are
+        // not doubled into it.
+        assert_eq!(
+            projection.required_bytes,
+            projection.db_bundle_bytes * 2 + with_extras.live_bytes * 2
+        );
+        assert!(
+            projection.required_bytes
+                < projection.db_bundle_bytes * 2 + with_extras.total_bytes() * 2,
+            "the recursive size would have demanded more"
+        );
+    }
+
+    /// An unreadable MANIFEST must make the walk conservative: every byte in
+    /// that directory counts as live.
+    #[test]
+    fn lexical_footprint_treats_an_unreadable_manifest_as_all_live() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
+        std::fs::create_dir_all(&index_path).unwrap();
+        std::fs::write(index_path.join("MANIFEST"), b"garbage").unwrap();
+        std::fs::write(
+            index_path.join("seg-0000000000000001.fslx"),
+            vec![0u8; 1000],
+        )
+        .unwrap();
+        std::fs::write(
+            index_path.join("seg-0000000000000001.fslx.retired"),
+            vec![0u8; 40],
+        )
+        .unwrap();
+        let footprint = lexical_index_footprint(&data_dir);
+        assert_eq!(footprint.live_bytes, 1000 + 40 + "garbage".len() as u64);
+        assert_eq!(footprint.retired_segment_bytes, 0);
+        assert_eq!(footprint.retired_segment_files, 0);
+    }
+
+    /// `cass index --gc` plumbing (#453): the sweep opens the writer, reports
+    /// the footprint on both sides, and cannot reclaim inside the engine's
+    /// grace period (the folded inputs were retired seconds ago).
+    #[test]
+    fn lexical_segment_gc_reports_the_footprint_and_respects_the_grace_period() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        assert!(
+            run_lexical_segment_gc(&data_dir)
+                .unwrap_err()
+                .to_string()
+                .contains("no published lexical index"),
+            "a missing index is a typed refusal, not a create"
+        );
+        let index_path = plant_merged_quill_index(&data_dir, 3);
+        let before = crate::search::quill_bridge::quill_directory_footprint(&index_path)
+            .expect("published Quill index");
+
+        let report = run_lexical_segment_gc(&data_dir).expect("sweep");
+        assert_eq!(report.index_path, index_path);
+        assert_eq!(report.live_segments, 1);
+        assert_eq!(
+            report.segment_files_before, 4,
+            "three inputs plus the merge output"
+        );
+        assert_eq!(
+            report.segment_files_after, 4,
+            "inputs are inside the grace period"
+        );
+        assert_eq!(report.retired_bytes_before, before.retired_bytes);
+        assert_eq!(report.retired_bytes_after, before.retired_bytes);
+        assert_eq!(report.reclaimed_files, 0);
+        assert_eq!(report.reclaimed_bytes, 0);
+        assert_eq!(
+            report.grace_secs,
+            frankensearch::quill::DEFAULT_GARBAGE_GRACE.as_secs()
+        );
+        let json = serde_json::to_value(&report).expect("serialize");
+        assert_eq!(json["live_segments"], 1);
+        assert_eq!(json["reclaimed_files"], 0);
+    }
+
+    fn recursive_size_for_test(root: &Path) -> u64 {
+        let mut total = 0u64;
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.is_file() {
+                total += metadata.len();
+            } else if metadata.is_dir() {
+                for entry in std::fs::read_dir(&path).unwrap().flatten() {
+                    stack.push(entry.path());
+                }
+            }
+        }
+        total
     }
 
     #[test]

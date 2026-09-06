@@ -44,7 +44,18 @@ Everything below is on `main`; nothing is in a released binary yet.
 - `cass doctor` checks `archive_wal` (an untruncated WAL sidecar above 64 MiB is
   reported with its size; `--fix` checkpoints it and reports pass, blocked, or
   failed truthfully) and `index_segments` (a lexical generation fragmented past
-  8× the merge threshold is reported with the `cass index --full` remedy).
+  8× the merge threshold is reported with the incremental `cass index` remedy,
+  whose maintenance pass folds it in place).
+- `cass index --gc` (GH #453): run the lexical engine's grace-period garbage
+  sweep on its own and report the merge-retired segment files and bytes it
+  reclaimed (`--json` for automation). Every incremental `cass index` performs
+  the same sweep at open; a folded segment file is unlinked only once no
+  published MANIFEST generation has referenced it for the engine's 300 s grace
+  period, so readers on the previous generation are never broken.
+- `cass doctor --json` `storage_pressure.full_rebuild_readiness` reports
+  `retired_segment_bytes`, `retired_segment_files`, and
+  `retained_publish_backup_bytes` next to the live `lexical_index_bytes`, with a
+  note naming the path that reclaims each class (GH #453).
 - `cass status --json` / `cass health --json` report `index.segment_files`, a
   metadata-only upper bound on the published lexical segment count.
 - `install.sh` probes the host's glibc before downloading a Linux prebuilt
@@ -62,6 +73,15 @@ Everything below is on `main`; nothing is in a released binary yet.
   40-segment generation is folded by a plain `cass index`).
 
 ### Fixed
+- The full-rebuild headroom preflight (`cass index --full`, doctor's
+  `full_rebuild_readiness`) doubles only the LIVE lexical bytes — what the
+  current MANIFEST references — instead of the recursive size of `index/`
+  (GH #453). Merge-retired segment files awaiting the engine sweep and prior
+  generations under `index/.lexical-publish-backups/` are already on disk and
+  are not rewritten by a rebuild; counting them twice refused a rebuild the
+  disk could hold (48 GB demanded, 37 GB needed, 43 GB free on the reporting
+  archive). The `index_segments` warning and the query-fuel hint name the
+  incremental `cass index` remedy instead of the rebuild the shortfall blocks.
 - `cass status --json` / `cass health --json` no longer report a lexical
   checkpoint as healthy while search defers repair on a storage-fingerprint
   mismatch (GH #353). The skip-open surfaces (health watermark lane,
@@ -117,6 +137,23 @@ Everything below is on `main`; nothing is in a released binary yet.
   538k rows). The batch insert now skips the statement savepoint; the batch
   transaction remains the rollback boundary. The per-transaction clone is an
   engine issue (frankensqlite#405).
+- `cass doctor --recover-from-archive` no longer aborts at the first canonical
+  row whose stored type disagrees with the schema (GH #391: `listing
+  conversations at offset 0: type mismatch: expected text, got integer` on a
+  page-aliased archive). The export now pages by `id`, coerces numeric/blob
+  values found in `TEXT` columns (reported per session as `coercions`), records
+  a row whose `id` is unreadable instead of failing (`rows_unreadable`,
+  `rows_coerced` in the JSON envelope), and treats a failed total count as
+  reporting-only. Conversations whose message pages are themselves damaged are
+  still recorded as `reconstruct failed` and skipped.
+- Antigravity IDE sessions are indexed out of the box (GH #454). The default
+  source presets, `cass resume` agent detection, and the docs now cover the
+  IDE store `~/.gemini/antigravity/` alongside the `agy` CLI store
+  `~/.gemini/antigravity-cli/`; the connector-side change (probe both roots,
+  key IDE conversations `ide/<uuid>`) lands with the next
+  `franken-agent-detection` release, and a conversation re-keyed from the bare
+  uuid reuses its existing canonical row by transcript path instead of
+  duplicating.
 
 ### Changed
 - The index run's final `wal_checkpoint(TRUNCATE)` runs under a wall-clock

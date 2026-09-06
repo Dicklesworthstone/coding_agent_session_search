@@ -1416,6 +1416,15 @@
             "lexical_index_bytes": {
               "type": "integer"
             },
+            "retired_segment_bytes": {
+              "type": "integer"
+            },
+            "retired_segment_files": {
+              "type": "integer"
+            },
+            "retained_publish_backup_bytes": {
+              "type": "integer"
+            },
             "available_bytes": {
               "type": "integer"
             },

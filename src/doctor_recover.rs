@@ -28,6 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::storage::sqlite::{
     FrankenStorage, FtsConsistencyRepair, FtsDryRunParity, FtsShadowParity, FtsShadowParityStatus,
+    RecoveryConversationRow,
 };
 use crate::{CliError, CliResult, RobotFormat, default_data_dir};
 
@@ -185,12 +186,16 @@ fn print_json(envelope: &serde_json::Value) -> CliResult<()> {
 /// One reconstructed session file (or a skip with the reason).
 #[derive(Debug)]
 struct ReconstructedSession {
-    conversation_id: i64,
+    /// `None` when the canonical row's `id` itself was unreadable (#391).
+    conversation_id: Option<i64>,
     external_id: Option<String>,
     relative_or_source_path: String,
     written_path: Option<PathBuf>,
     line_count: usize,
     skipped_reason: Option<String>,
+    /// Columns whose stored type disagreed with the schema and were coerced
+    /// while reading the canonical row (empty for a healthy row).
+    coercions: Vec<String>,
 }
 
 /// Compute the on-disk output path for a reconstructed session.
@@ -281,9 +286,12 @@ pub fn run_doctor_recover_from_archive(
         )
     })?;
 
-    let total = storage
-        .total_conversation_count()
-        .map_err(|e| storage_error(format!("counting conversations: {e:#}"), None))?;
+    // The count is reporting only; on a damaged tree it may itself fail, and
+    // that must not stop the row-by-row export below (#391).
+    let (total, total_count_error) = match storage.total_conversation_count() {
+        Ok(total) => (Some(total), None),
+        Err(e) => (None, Some(format!("{e:#}"))),
+    };
 
     std::fs::create_dir_all(&target_dir).map_err(|e| {
         io_error(
@@ -298,27 +306,63 @@ pub fn run_doctor_recover_from_archive(
     let mut results: Vec<ReconstructedSession> = Vec::new();
     let mut written = 0usize;
     let mut skipped = 0usize;
+    let mut unreadable_rows = 0usize;
+    let mut coerced_rows = 0usize;
     let mut total_lines = 0usize;
 
-    let mut offset: i64 = 0;
+    // Keyset pagination by `id`: no `ORDER BY started_at` sort over a possibly
+    // damaged tree, and a page is never re-read after a partial failure.
+    let mut after_id: i64 = 0;
     loop {
-        let conversations = storage
-            .list_conversations(RECOVER_CONVERSATION_PAGE, offset)
+        let rows = storage
+            .list_conversations_for_recovery(after_id, RECOVER_CONVERSATION_PAGE)
             .map_err(|e| {
                 storage_error(
-                    format!("listing conversations at offset {offset}: {e:#}"),
-                    None,
+                    format!("listing conversations after id {after_id}: {e:#}"),
+                    Some(
+                        "The page walk itself failed inside the engine, so the rows after this id cannot be reached read-only. Sessions already written are complete; recover the rest from a backup ('cass doctor backups list') or a remote mirror.",
+                    ),
                 )
             })?;
-        if conversations.is_empty() {
+        if rows.is_empty() {
             break;
         }
-        let page_len = conversations.len() as i64;
+        let page_len = rows.len() as i64;
+        let page_start_id = after_id;
+        let mut page_saw_unreadable = false;
 
-        for conversation in conversations {
+        for row in rows {
+            let (conversation, coercions) = match row {
+                RecoveryConversationRow::Readable {
+                    conversation,
+                    coercions,
+                } => (*conversation, coercions),
+                RecoveryConversationRow::Unreadable { stored_id, reason } => {
+                    // #391: a row whose id is not an integer cannot be addressed
+                    // for message reconstruction. Record it and keep exporting
+                    // the rest instead of aborting with nothing written.
+                    skipped += 1;
+                    unreadable_rows += 1;
+                    page_saw_unreadable = true;
+                    results.push(ReconstructedSession {
+                        conversation_id: None,
+                        external_id: None,
+                        relative_or_source_path: format!("<unreadable row: id {stored_id}>"),
+                        written_path: None,
+                        line_count: 0,
+                        skipped_reason: Some(format!("unreadable canonical row: {reason}")),
+                        coercions: Vec::new(),
+                    });
+                    continue;
+                }
+            };
             let Some(conversation_id) = conversation.id else {
                 continue;
             };
+            after_id = after_id.max(conversation_id);
+            if !coercions.is_empty() {
+                coerced_rows += 1;
+            }
             let source_path_display = conversation.source_path.display().to_string();
 
             let lines = match storage.reconstruct_source_jsonl_for_conversation(conversation_id) {
@@ -326,12 +370,13 @@ pub fn run_doctor_recover_from_archive(
                 Err(e) => {
                     skipped += 1;
                     results.push(ReconstructedSession {
-                        conversation_id,
+                        conversation_id: Some(conversation_id),
                         external_id: conversation.external_id.clone(),
                         relative_or_source_path: source_path_display,
                         written_path: None,
                         line_count: 0,
                         skipped_reason: Some(format!("reconstruct failed: {e:#}")),
+                        coercions,
                     });
                     continue;
                 }
@@ -340,7 +385,7 @@ pub fn run_doctor_recover_from_archive(
             if lines.is_empty() {
                 skipped += 1;
                 results.push(ReconstructedSession {
-                    conversation_id,
+                    conversation_id: Some(conversation_id),
                     external_id: conversation.external_id.clone(),
                     relative_or_source_path: source_path_display,
                     written_path: None,
@@ -349,6 +394,7 @@ pub fn run_doctor_recover_from_archive(
                         "no preserved source events (extra_json/extra_bin) to reconstruct"
                             .to_string(),
                     ),
+                    coercions,
                 });
                 continue;
             }
@@ -375,17 +421,24 @@ pub fn run_doctor_recover_from_archive(
             written += 1;
             total_lines += lines.len();
             results.push(ReconstructedSession {
-                conversation_id,
+                conversation_id: Some(conversation_id),
                 external_id: conversation.external_id.clone(),
                 relative_or_source_path: source_path_display,
                 written_path: Some(out_path),
                 line_count: lines.len(),
                 skipped_reason: None,
+                coercions,
             });
         }
 
-        offset += page_len;
         if page_len < RECOVER_CONVERSATION_PAGE {
+            break;
+        }
+        // `ORDER BY c.id` sorts every non-integer id after all integer ids,
+        // so a page that carried an unreadable row has already reached the
+        // end of the addressable rows; and a page that advanced nothing would
+        // be re-read forever. Stop rather than loop or double-report.
+        if page_saw_unreadable || after_id == page_start_id {
             break;
         }
     }
@@ -397,8 +450,12 @@ pub fn run_doctor_recover_from_archive(
         "db_path": db_path.display().to_string(),
         "target_dir": target_dir.display().to_string(),
         "conversations_total": total,
+        "conversations_total_error": total_count_error,
         "sessions_written": written,
         "sessions_skipped": skipped,
+        // #391: rows the strict reader would have aborted the export on.
+        "rows_unreadable": unreadable_rows,
+        "rows_coerced": coerced_rows,
         "lines_written": total_lines,
         "sessions": results
             .iter()
@@ -409,6 +466,7 @@ pub fn run_doctor_recover_from_archive(
                 "written_path": r.written_path.as_ref().map(|p| p.display().to_string()),
                 "line_count": r.line_count,
                 "skipped_reason": r.skipped_reason,
+                "coercions": r.coercions,
             }))
             .collect::<Vec<_>>(),
         "next_action": format!(
@@ -426,7 +484,14 @@ pub fn run_doctor_recover_from_archive(
             target_dir.display()
         );
         if skipped > 0 {
-            println!("  {skipped} conversation(s) had no preserved events and were skipped.");
+            println!(
+                "  {skipped} conversation(s) were skipped (no preserved events, or unreadable)."
+            );
+        }
+        if unreadable_rows > 0 || coerced_rows > 0 {
+            println!(
+                "  Damaged canonical rows tolerated: {unreadable_rows} unreadable, {coerced_rows} with coerced column types (see --json for details)."
+            );
         }
         println!(
             "Next: re-ingest with 'cass index --full' over {} into a fresh data dir.",
@@ -1652,6 +1717,109 @@ mod tests {
         assert!(
             hint.contains("Tantivy") && hint.contains("No action is needed"),
             "hint must state search still works and no action is needed"
+        );
+    }
+    #[test]
+    fn recovery_listing_tolerates_type_mismatched_rows() {
+        // #391: a page-aliasing corruption leaves integers where TEXT is
+        // declared. The strict lister failed the whole page with
+        // `type mismatch: expected text, got integer`; the recovery lister
+        // must coerce, report the coercion, and keep going.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+        let agent_id = seed_agent(&storage);
+        let healthy = seed_conversation(&storage, agent_id, "sess-ok", "/orig/ok.jsonl");
+        let damaged = seed_conversation(&storage, agent_id, "sess-bad", "/orig/bad.jsonl");
+        // TEXT affinity rewrites an integer to text on INSERT/UPDATE, so the
+        // mismatch (what stock SQLite's integrity_check reports as "NUMERIC
+        // value in conversations.title") cannot be planted through SQL.
+        // Exercise the mapper directly with a SELECT shaped exactly like the
+        // listing projection, presenting the values a damaged page would.
+        let rows: Vec<RecoveryConversationRow> = storage
+            .raw()
+            .query_map_collect(
+                "SELECT ?1, 'claude', NULL, 4242, 7, ?2, 1000, 'not-a-timestamp', 1.5,
+                        NULL, 'local', NULL, NULL",
+                &[
+                    ParamValue::from(damaged),
+                    ParamValue::from("/orig/bad.jsonl"),
+                ] as &[ParamValue],
+                |row| {
+                    Ok(crate::storage::sqlite::recovery_conversation_row_from_lenient_columns(row))
+                },
+            )
+            .expect("query");
+        assert_eq!(rows.len(), 1);
+        match &rows[0] {
+            RecoveryConversationRow::Readable {
+                conversation,
+                coercions,
+            } => {
+                assert_eq!(conversation.id, Some(damaged));
+                assert_eq!(conversation.external_id.as_deref(), Some("4242"));
+                assert_eq!(conversation.title.as_deref(), Some("7"));
+                assert_eq!(conversation.started_at, Some(1000));
+                assert_eq!(conversation.ended_at, None, "unparseable text is dropped");
+                assert_eq!(conversation.approx_tokens, Some(1), "real truncates");
+                assert_eq!(coercions.len(), 4, "{coercions:?}");
+                assert!(coercions[0].starts_with("external_id: integer 4242"));
+                assert!(coercions[1].starts_with("title: integer 7"));
+                assert!(coercions[2].contains("ended_at: text \"not-a-timestamp\""));
+                assert!(coercions[2].ends_with("(dropped)"));
+                assert!(coercions[3].starts_with("approx_tokens: real 1.5"));
+            }
+            other => panic!("expected a readable row, got {other:?}"),
+        }
+
+        // An id that is not an integer is reported, not fatal.
+        let rows: Vec<RecoveryConversationRow> = storage
+            .raw()
+            .query_map_collect(
+                "SELECT 'garbage', 'claude', NULL, NULL, NULL, '/p', NULL, NULL, NULL,
+                        NULL, 'local', NULL, NULL",
+                &[] as &[ParamValue],
+                |row| {
+                    Ok(crate::storage::sqlite::recovery_conversation_row_from_lenient_columns(row))
+                },
+            )
+            .expect("query");
+        match &rows[0] {
+            RecoveryConversationRow::Unreadable { stored_id, reason } => {
+                assert_eq!(stored_id, "text");
+                assert!(reason.contains("not an integer"));
+            }
+            other => panic!("expected an unreadable row, got {other:?}"),
+        }
+
+        // The real listing pages by id and reads healthy rows unchanged.
+        let page = storage
+            .list_conversations_for_recovery(0, 1)
+            .expect("first page");
+        assert_eq!(page.len(), 1);
+        let RecoveryConversationRow::Readable {
+            conversation,
+            coercions,
+        } = &page[0]
+        else {
+            panic!("healthy row must be readable");
+        };
+        assert_eq!(conversation.id, Some(healthy));
+        assert_eq!(conversation.external_id.as_deref(), Some("sess-ok"));
+        assert!(coercions.is_empty());
+        let page = storage
+            .list_conversations_for_recovery(healthy, 10)
+            .expect("second page");
+        assert_eq!(page.len(), 1);
+        let RecoveryConversationRow::Readable { conversation, .. } = &page[0] else {
+            panic!("second row must be readable");
+        };
+        assert_eq!(conversation.id, Some(damaged));
+        assert!(
+            storage
+                .list_conversations_for_recovery(damaged, 10)
+                .expect("past the end")
+                .is_empty()
         );
     }
 }

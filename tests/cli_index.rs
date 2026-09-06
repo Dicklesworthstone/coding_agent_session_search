@@ -2763,7 +2763,8 @@ fn gh440_plain_index_resumes_a_force_rebuild_killed_between_commit_and_checkpoin
 /// - Planted state, asserted not assumed: after the fragmenting build,
 ///   `status --json` reports `index.segment_files` above the pressure bound
 ///   and `doctor --json` reports `index_segments` as a warning that names
-///   `cass index --full`.
+///   the incremental `cass index` remedy (#453: not the full rebuild the
+///   fragmented footprint may block).
 /// - Positive observable: after one more session is ingested by a plain
 ///   `cass index` (no flags, no hook), the post-run maintenance folds the
 ///   generation below the bound, doctor's `index_segments` passes, and a
@@ -2872,11 +2873,14 @@ fn gh441_plain_index_consolidates_a_fragmented_generation_and_doctor_reports_it(
     let warn = doctor_index_segments(&data_dir);
     assert_eq!(warn["status"].as_str(), Some("warn"), "{warn}");
     assert_eq!(warn["fix_available"].as_bool(), Some(true), "{warn}");
+    // #453: the remedy is the incremental run this test performs next (its
+    // maintenance pass folds the generation), not a full rebuild, which the
+    // fragmented index's own disk footprint may block.
     assert!(
         warn["message"]
             .as_str()
-            .is_some_and(|m| m.contains("cass index --full")),
-        "the warning must name the remedy: {warn}"
+            .is_some_and(|m| m.contains("Run `cass index`")),
+        "the warning must name the incremental remedy: {warn}"
     );
 
     // One more session, then an ordinary incremental run: the post-run
@@ -2946,4 +2950,334 @@ fn gh441_plain_index_consolidates_a_fragmented_generation_and_doctor_reports_it(
         fragmented_sessions + 1,
         "every session must survive consolidation: {search_json}"
     );
+}
+
+/// GH #453: after the maintenance merge folds a generation, the folded
+/// segment files stay on disk until the engine's grace-period sweep has seen
+/// them unreferenced by both MANIFEST slots; back-to-back incremental runs
+/// therefore leave a growing population of `seg-*.fslx` files behind one or
+/// two live segments. cass must (a) size the full-rebuild headroom from the
+/// LIVE bytes, not the recursive directory size, (b) report the retired
+/// bytes and the path that reclaims them, and (c) offer `cass index --gc` as
+/// that path.
+///
+/// The reclamation itself needs the engine's 300 s grace to elapse and is
+/// proven with clock injection in the engine's own suite
+/// (`later_publications_do_not_postpone_a_receipted_retirement`,
+/// `retired_merge_inputs_are_reclaimed_while_an_older_reader_keeps_working`);
+/// `gh453_gc_reclaims_folded_segments_after_the_grace_period` (ignored)
+/// waits it out against the real binary.
+#[test]
+fn gh453_back_to_back_runs_report_retired_segments_and_size_headroom_from_live_bytes() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let codex_root = home.join(".codex");
+
+    let snapshot = gh453_run_rounds(home, &data_dir, &codex_root, 3);
+    assert!(
+        snapshot.segment_files > snapshot.live_segments,
+        "folded inputs must still be on disk after back-to-back runs: {snapshot:?}"
+    );
+    assert!(
+        snapshot.retired_segment_bytes > 0,
+        "doctor must report the retired bytes: {snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.retired_segment_files,
+        snapshot.segment_files - snapshot.live_segments,
+        "every unreferenced segment file is retired: {snapshot:?}"
+    );
+    assert!(
+        snapshot.lexical_index_bytes < snapshot.recursive_index_bytes,
+        "the live figure must exclude the retired files: {snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.required_bytes,
+        (512_u64 * 1024 * 1024)
+            .max(snapshot.db_bundle_bytes * 2 + snapshot.lexical_index_bytes * 2),
+        "the requirement doubles only live bytes: {snapshot:?}"
+    );
+    let retired_note = snapshot
+        .notes
+        .iter()
+        .find(|note| note.contains("merge-retired segment file"))
+        .unwrap_or_else(|| panic!("readiness must explain the retired bytes: {snapshot:?}"));
+    assert!(retired_note.contains("cass index --gc"), "{retired_note}");
+
+    // `cass index --gc` inside the grace period: a truthful no-op report.
+    let gc = base_cmd(home)
+        .current_dir(home)
+        .args(["index", "--gc", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .output()
+        .expect("cass index --gc");
+    assert!(
+        gc.status.success(),
+        "gc failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&gc.stdout),
+        String::from_utf8_lossy(&gc.stderr)
+    );
+    let gc_json: serde_json::Value = serde_json::from_slice(&gc.stdout).expect("gc json");
+    assert_eq!(gc_json["success"], true, "{gc_json}");
+    assert_eq!(
+        gc_json["live_segments"].as_u64(),
+        Some(snapshot.live_segments)
+    );
+    assert_eq!(
+        gc_json["segment_files_before"].as_u64(),
+        Some(snapshot.segment_files),
+        "{gc_json}"
+    );
+    assert_eq!(gc_json["reclaimed_files"].as_u64(), Some(0), "{gc_json}");
+    assert_eq!(gc_json["grace_secs"].as_u64(), Some(300), "{gc_json}");
+    assert_eq!(
+        gc_json["retired_bytes_after"].as_u64(),
+        Some(snapshot.retired_segment_bytes),
+        "{gc_json}"
+    );
+
+    // The flag is exclusive with a real run and refuses without an index.
+    let conflict = base_cmd(home)
+        .current_dir(home)
+        .args(["index", "--gc", "--full", "--data-dir"])
+        .arg(&data_dir)
+        .output()
+        .expect("conflicting flags");
+    assert!(!conflict.status.success());
+    let missing = base_cmd(home)
+        .current_dir(home)
+        .args(["index", "--gc", "--json", "--data-dir"])
+        .arg(home.join("no_such_data_dir"))
+        .output()
+        .expect("gc without an index");
+    assert!(!missing.status.success());
+    let missing_stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        missing_stderr.contains("missing-index")
+            || missing_stderr.contains("no published lexical index"),
+        "stderr={missing_stderr}"
+    );
+    assert!(
+        !home.join("no_such_data_dir").join("index").exists(),
+        "--gc must never create an index"
+    );
+}
+
+/// GH #453, the slow half: with the grace period elapsed, `cass index --gc`
+/// unlinks every folded input and the live figure equals the directory.
+/// Ignored because it sleeps past the engine's 300 s grace; run with
+/// `cargo test --test cli_index gh453_gc_reclaims -- --ignored --nocapture`.
+#[test]
+#[ignore = "sleeps past the engine's 300 s garbage grace period"]
+fn gh453_gc_reclaims_folded_segments_after_the_grace_period() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let codex_root = home.join(".codex");
+
+    let before = gh453_run_rounds(home, &data_dir, &codex_root, 3);
+    assert!(before.retired_segment_files > 0, "{before:?}");
+    eprintln!("gh453: before grace: {before:?}");
+    std::thread::sleep(std::time::Duration::from_secs(305));
+
+    let gc = base_cmd(home)
+        .current_dir(home)
+        .args(["index", "--gc", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .output()
+        .expect("cass index --gc");
+    assert!(
+        gc.status.success(),
+        "{}",
+        String::from_utf8_lossy(&gc.stderr)
+    );
+    let gc_json: serde_json::Value = serde_json::from_slice(&gc.stdout).expect("gc json");
+    eprintln!("gh453: gc report: {gc_json}");
+    let after = gh453_snapshot(home, &data_dir);
+    eprintln!("gh453: after gc: {after:?}");
+    assert_eq!(after.retired_segment_files, 0, "{after:?}");
+    assert_eq!(after.segment_files, after.live_segments, "{after:?}");
+    assert!(
+        gc_json["reclaimed_files"].as_u64().unwrap_or(0) >= before.retired_segment_files,
+        "{gc_json}"
+    );
+
+    // Search still answers over the consolidated generation.
+    let search = base_cmd(home)
+        .current_dir(home)
+        .args([
+            "search",
+            "reclaimprobe",
+            "--json",
+            "--limit",
+            "200",
+            "--mode",
+            "lexical",
+        ])
+        .args(["--color=never", "--data-dir"])
+        .arg(&data_dir)
+        .output()
+        .expect("search after gc");
+    assert!(search.status.success());
+    let hits: serde_json::Value = serde_json::from_slice(&search.stdout).expect("search json");
+    assert!(
+        hits["hits"].as_array().is_some_and(|hits| hits.len() >= 3),
+        "{hits}"
+    );
+}
+
+#[derive(Debug)]
+struct Gh453Snapshot {
+    segment_files: u64,
+    live_segments: u64,
+    retired_segment_files: u64,
+    retired_segment_bytes: u64,
+    lexical_index_bytes: u64,
+    recursive_index_bytes: u64,
+    db_bundle_bytes: u64,
+    required_bytes: u64,
+    notes: Vec<String>,
+}
+
+/// A fragmenting full build (one segment per conversation, final merge
+/// skipped -- the gh441 fixture), then `rounds` incremental `cass index`
+/// runs with one new session each and no pause between them. The first
+/// incremental's maintenance pass folds the fragmented run; the next run's
+/// publication drops the folded inputs from `MANIFEST.prev` and stamps
+/// their retirement receipts; every run after that finds them inside the
+/// engine's grace period.
+fn gh453_run_rounds(
+    home: &std::path::Path,
+    data_dir: &std::path::Path,
+    codex_root: &std::path::Path,
+    rounds: usize,
+) -> Gh453Snapshot {
+    for n in 0..8 {
+        make_codex_session(
+            codex_root,
+            "2026/09/05",
+            &format!("rollout-453-seed-{n}.jsonl"),
+            &format!("reclaimprobe seed {n}"),
+        );
+    }
+    let fragment = base_cmd(home)
+        .current_dir(home)
+        .args([
+            "index",
+            "--full",
+            "--json",
+            "--no-progress-events",
+            "--data-dir",
+        ])
+        .arg(data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CASS_TEST_SKIP_POST_RUN_LEXICAL_MAINTENANCE", "1")
+        .env("CASS_TANTIVY_REBUILD_BATCH_FETCH_CONVERSATIONS", "1")
+        .env(
+            "CASS_TANTIVY_REBUILD_INITIAL_BATCH_FETCH_CONVERSATIONS",
+            "1",
+        )
+        .env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_CONVERSATIONS", "1")
+        .env(
+            "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_CONVERSATIONS",
+            "1",
+        )
+        .output()
+        .expect("fragmenting full index");
+    assert!(
+        fragment.status.success(),
+        "fragmenting build failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&fragment.stdout),
+        String::from_utf8_lossy(&fragment.stderr)
+    );
+    let fragmented = gh453_snapshot(home, data_dir);
+    assert!(
+        fragmented.live_segments >= 8,
+        "the planted build must be fragmented: {fragmented:?}"
+    );
+
+    for round in 0..rounds {
+        make_codex_session(
+            codex_root,
+            "2026/09/06",
+            &format!("rollout-453-round-{round}.jsonl"),
+            &format!("reclaimprobe round {round}"),
+        );
+        let run = base_cmd(home)
+            .current_dir(home)
+            .args(["index", "--json", "--no-progress-events", "--data-dir"])
+            .arg(data_dir)
+            .env("CASS_AUTO_REFRESH", "0")
+            .output()
+            .expect("incremental index");
+        assert!(
+            run.status.success(),
+            "round {round} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let snapshot = gh453_snapshot(home, data_dir);
+        eprintln!("gh453: after incremental round {round}: {snapshot:?}");
+    }
+    gh453_snapshot(home, data_dir)
+}
+
+fn gh453_snapshot(home: &std::path::Path, data_dir: &std::path::Path) -> Gh453Snapshot {
+    let index_dir = coding_agent_search::search::tantivy::expected_index_dir(data_dir);
+    let segment_files = coding_agent_search::search::quill_bridge::segment_file_count(&index_dir)
+        .expect("published Quill index") as u64;
+    let live_segments = coding_agent_search::search::quill_bridge::live_segment_count(&index_dir)
+        .expect("published Quill index") as u64;
+    let recursive_index_bytes = walkdir::WalkDir::new(data_dir.join("index"))
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|metadata| metadata.len())
+        .sum();
+
+    let out = base_cmd(home)
+        .current_dir(home)
+        .args(["doctor", "--check", "--json", "--data-dir"])
+        .arg(data_dir)
+        .env("CASS_AUTO_REFRESH", "0")
+        .output()
+        .expect("cass doctor --check --json");
+    let payload: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|err| {
+        panic!(
+            "doctor json: {err}\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    let readiness = &payload["storage_pressure"]["full_rebuild_readiness"];
+    let field = |name: &str| -> u64 {
+        readiness[name].as_u64().unwrap_or_else(|| {
+            panic!("full_rebuild_readiness.{name} must be an integer: {readiness}")
+        })
+    };
+    Gh453Snapshot {
+        segment_files,
+        live_segments,
+        retired_segment_files: field("retired_segment_files"),
+        retired_segment_bytes: field("retired_segment_bytes"),
+        lexical_index_bytes: field("lexical_index_bytes"),
+        recursive_index_bytes,
+        db_bundle_bytes: field("db_bundle_bytes"),
+        required_bytes: field("required_bytes"),
+        notes: readiness["notes"]
+            .as_array()
+            .map(|notes| {
+                notes
+                    .iter()
+                    .filter_map(|note| note.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
 }

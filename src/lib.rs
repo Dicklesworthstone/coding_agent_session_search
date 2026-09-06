@@ -417,6 +417,17 @@ pub enum Commands {
         #[arg(long, value_name = "CONVERSATION_ID", conflicts_with_all = ["full", "watch", "semantic"])]
         reconcile_conversation: Option<i64>,
 
+        /// Reclaim merge-retired lexical segment files and exit (gh#453).
+        /// Opens the lexical writer, which runs the engine's grace-period
+        /// garbage sweep: a segment file is unlinked only once no published
+        /// MANIFEST generation has referenced it for the engine's grace
+        /// period (300 s), so readers on the previous generation are safe.
+        /// Scans no sources and re-indexes nothing; every incremental
+        /// `cass index` performs the same sweep at open. Reports files and
+        /// bytes reclaimed (`--json` for automation).
+        #[arg(long, conflicts_with_all = ["full", "force_rebuild", "reconcile_conversation", "watch", "watch_once", "semantic"])]
+        gc: bool,
+
         /// Watch for changes and reindex automatically
         #[arg(long)]
         watch: bool,
@@ -7135,6 +7146,7 @@ async fn execute_cli(
                     full,
                     force_rebuild,
                     reconcile_conversation,
+                    gc,
                     watch,
                     watch_once,
                     watch_interval,
@@ -7157,6 +7169,9 @@ async fn execute_cli(
                             conversation_id,
                             structured_format,
                         );
+                    }
+                    if gc {
+                        return run_lexical_gc_cli(cli.db.clone(), data_dir, structured_format);
                     }
                     run_index_with_data(
                         cli.db.clone(),
@@ -28950,8 +28965,10 @@ fn execute_search_operation(
                     Some(format!(
                         "the lexical engine hit its per-query work ceiling (usually a long, \
                          stopword-heavy query on an archive with many index segments); retry \
-                         with fewer or rarer terms, raise {} above {}, or run 'cass index --full' \
-                         to consolidate segments",
+                         with fewer or rarer terms, raise {} above {}, or run 'cass index' \
+                         (its maintenance pass consolidates segments in place; 'cass index \
+                         --full' rebuilds from scratch and needs the headroom doctor's \
+                         full_rebuild_readiness reports)",
                         crate::search::quill_bridge::CASS_QUILL_QUERY_FUEL_BUDGET_ENV,
                         crate::search::quill_bridge::cass_quill_config().query_fuel_budget
                     ))
@@ -42552,7 +42569,20 @@ struct DoctorFullRebuildReadinessReport {
     required_bytes: u64,
     floor_bytes: u64,
     db_bundle_bytes: u64,
+    /// Live lexical bytes: what the current MANIFEST references plus the
+    /// index's own bookkeeping files. This is the figure the formula doubles.
     lexical_index_bytes: u64,
+    /// #453: merge-retired segment files still under the lexical index. The
+    /// engine's writer-open sweep reclaims them once they have been
+    /// unreferenced by both MANIFEST slots for its grace period; a rebuild
+    /// never rewrites them, so they are excluded from `required_bytes`.
+    retired_segment_bytes: u64,
+    /// Number of files behind `retired_segment_bytes`.
+    retired_segment_files: usize,
+    /// #453: prior generations parked under `index/.lexical-publish-backups/`
+    /// (retention keeps the newest; `cass doctor cleanup` reclaims the rest).
+    /// Excluded from `required_bytes` for the same reason.
+    retained_publish_backup_bytes: u64,
     /// Free bytes at the most constrained probe path (`None` when unknown).
     available_bytes: Option<u64>,
     /// `required_bytes - available_bytes` when blocked, else 0.
@@ -42669,6 +42699,20 @@ fn build_doctor_full_rebuild_readiness(
         projection.lexical_index_bytes,
         projection.floor_bytes
     ));
+    if projection.retired_segment_bytes > 0 {
+        notes.push(format!(
+            "The lexical figure counts only bytes the current MANIFEST references; {} merge-retired segment file(s) totalling {} bytes sit next to it and are not doubled. The engine unlinks them at the next `cass index` open once they have been unreferenced for its {}-second grace period (`cass index --gc` runs that sweep on its own).",
+            projection.retired_segment_files,
+            projection.retired_segment_bytes,
+            frankensearch::quill::DEFAULT_GARBAGE_GRACE.as_secs()
+        ));
+    }
+    if projection.retained_backup_bytes > 0 {
+        notes.push(format!(
+            "{} bytes of prior lexical generations are retained under index/.lexical-publish-backups/ and are not doubled either; a staged publish prunes them to the retention cap, and `cass doctor cleanup` reclaims them earlier.",
+            projection.retained_backup_bytes
+        ));
+    }
     if !enforced {
         notes.push(
             "CASS_INDEX_SKIP_DISK_HEADROOM_CHECK is set, so the indexer would skip this preflight; the verdict is advisory."
@@ -42684,6 +42728,9 @@ fn build_doctor_full_rebuild_readiness(
         floor_bytes: projection.floor_bytes,
         db_bundle_bytes: projection.db_bundle_bytes,
         lexical_index_bytes: projection.lexical_index_bytes,
+        retired_segment_bytes: projection.retired_segment_bytes,
+        retired_segment_files: projection.retired_segment_files,
+        retained_publish_backup_bytes: projection.retained_backup_bytes,
         available_bytes,
         shortfall_bytes,
         probe_path,
@@ -86350,6 +86397,28 @@ mod cli_read_db_tests {
     }
 
     #[test]
+    fn resume_detects_antigravity_ide_store_from_transcript_path() {
+        // #454: the Antigravity IDE store is `~/.gemini/antigravity/` (no
+        // `-cli` suffix) with the same brain/<uuid> layout. It must also win
+        // over the gemini arm and resolve the uuid.
+        let uuid = "00f0c687-1c8a-412b-a942-ec58f4b03c00";
+        let path = PathBuf::from(format!(
+            "/home/dev/.gemini/antigravity/brain/{uuid}/.system_generated/logs/transcript.jsonl"
+        ));
+        let target = resolve_resume_target(&path, None).expect("resolve");
+        assert_eq!(target.agent, "antigravity");
+        assert_eq!(target.session_id.as_deref(), Some(uuid));
+        assert_eq!(target.argv, vec!["agy", "--conversation", uuid]);
+        // The bare IDE base must not fall through to the gemini arm either.
+        let detected = detect_resume_agent(
+            Path::new("/home/dev/.gemini/antigravity/conversations/x.db"),
+            None,
+        )
+        .expect("detect");
+        assert_eq!(detected.slug, "antigravity");
+    }
+
+    #[test]
     fn resume_antigravity_override_and_agy_alias() {
         // Both `--agent antigravity` and `--agent agy` map to the antigravity
         // slug; the UUID is recovered from the transcript path in either case.
@@ -88269,7 +88338,9 @@ pub(crate) fn run_doctor_impl(
                             format!(
                                 "Search index has {segments} {unit} (> {pressure}); queries pay \
                                  per segment and long queries can exhaust the engine's fuel \
-                                 budget. Run `cass index --full` to consolidate"
+                                 budget. Run `cass index`: its maintenance pass folds the \
+                                 fragmented generation in place (`--full` rebuilds from scratch \
+                                 and needs the headroom full_rebuild_readiness reports)"
                             ),
                             true
                         );
@@ -99967,6 +100038,86 @@ mod response_schema_tests {
         );
     }
 
+    /// #453: reclaimable lexical bytes are reported next to the requirement
+    /// they are excluded from, with the path that reclaims each class, and
+    /// the remedy never points at the rebuild the shortfall blocks.
+    #[test]
+    fn doctor_full_rebuild_readiness_reports_reclaimable_lexical_bytes_and_their_remedy() {
+        let projection = crate::indexer::FullRebuildHeadroomProjection {
+            required_bytes: 37_000_000_000,
+            floor_bytes: 512 * 1024 * 1024,
+            db_bundle_bytes: 11_900_000_000,
+            lexical_index_bytes: 6_800_000_000,
+            retired_segment_bytes: 4_200_000_000,
+            retired_segment_files: 1_642,
+            retained_backup_bytes: 6_400_000_000,
+        };
+        let root = PathBuf::from("/probe");
+        let blocked = build_doctor_full_rebuild_readiness(
+            projection,
+            vec![(root.clone(), Ok(30_000_000_000))],
+            true,
+        );
+        assert_eq!(blocked.status, "blocked");
+        assert_eq!(blocked.lexical_index_bytes, 6_800_000_000);
+        assert_eq!(blocked.retired_segment_bytes, 4_200_000_000);
+        assert_eq!(blocked.retired_segment_files, 1_642);
+        assert_eq!(blocked.retained_publish_backup_bytes, 6_400_000_000);
+        let retired_note = blocked
+            .notes
+            .iter()
+            .find(|note| note.contains("merge-retired segment file"))
+            .expect("retired-segment note");
+        assert!(retired_note.contains("1642"), "{retired_note}");
+        assert!(retired_note.contains("4200000000 bytes"), "{retired_note}");
+        assert!(retired_note.contains("cass index --gc"), "{retired_note}");
+        assert!(
+            retired_note.contains(&format!(
+                "{}-second grace",
+                frankensearch::quill::DEFAULT_GARBAGE_GRACE.as_secs()
+            )),
+            "{retired_note}"
+        );
+        let backup_note = blocked
+            .notes
+            .iter()
+            .find(|note| note.contains(".lexical-publish-backups"))
+            .expect("retained-backup note");
+        assert!(backup_note.contains("6400000000 bytes"), "{backup_note}");
+        assert!(backup_note.contains("cass doctor cleanup"), "{backup_note}");
+        assert!(
+            blocked
+                .notes
+                .iter()
+                .all(|note| !note.contains("Run `cass index --full`")),
+            "a blocked rebuild must not be prescribed as its own remedy: {:?}",
+            blocked.notes
+        );
+
+        let json = serde_json::to_value(&blocked).expect("serialize readiness");
+        assert_eq!(json["retired_segment_bytes"].as_u64(), Some(4_200_000_000));
+        assert_eq!(json["retired_segment_files"].as_u64(), Some(1_642));
+        assert_eq!(
+            json["retained_publish_backup_bytes"].as_u64(),
+            Some(6_400_000_000)
+        );
+
+        // With nothing reclaimable the notes stay exactly the two-line shape
+        // the robot goldens pin.
+        let clean = build_doctor_full_rebuild_readiness(
+            crate::indexer::FullRebuildHeadroomProjection {
+                retired_segment_bytes: 0,
+                retired_segment_files: 0,
+                retained_backup_bytes: 0,
+                ..projection
+            },
+            vec![(root, Ok(37_000_000_000))],
+            true,
+        );
+        assert_eq!(clean.status, "ready");
+        assert_eq!(clean.notes.len(), 2, "{:?}", clean.notes);
+    }
+
     #[test]
     fn doctor_config_exclusion_risks_detect_cache_path() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -104064,6 +104215,74 @@ fn run_lexical_reconcile_cli(
     Ok(())
 }
 
+/// `cass index --gc` (gh#453): run the lexical engine's garbage sweep on its
+/// own and report what it reclaimed.
+fn run_lexical_gc_cli(
+    db_override: Option<PathBuf>,
+    data_dir_override: Option<PathBuf>,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    use colored::Colorize;
+
+    let data_dir = resolve_data_dir(&data_dir_override, db_override.as_ref());
+    let report = crate::indexer::run_lexical_segment_gc(&data_dir).map_err(|err| {
+        let message = format!("lexical garbage sweep failed: {err:#}");
+        let (kind, hint) = if message.contains("no published lexical index") {
+            (
+                CliErrorKind::MissingIndex,
+                "Run 'cass index' to build the lexical index first.",
+            )
+        } else {
+            (
+                CliErrorKind::Index,
+                "If another `cass index` is running, let it finish and retry; it performs the same sweep at open.",
+            )
+        };
+        CliError {
+            code: 5,
+            kind: kind.kind_str(),
+            message,
+            hint: Some(hint.into()),
+            retryable: true,
+        }
+    })?;
+
+    let structured_format = output_format.or_else(robot_format_from_env);
+    if structured_format.is_some() {
+        let mut payload = serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}));
+        if let serde_json::Value::Object(ref mut map) = payload {
+            map.insert("success".into(), serde_json::json!(true));
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{} lexical garbage sweep at {}",
+        "✓".green(),
+        report.index_path.display()
+    );
+    println!(
+        "  Reclaimed {} file(s), {} bytes; segment files {} -> {} ({} live)",
+        report.reclaimed_files,
+        report.reclaimed_bytes,
+        report.segment_files_before,
+        report.segment_files_after,
+        report.live_segments
+    );
+    if report.retired_bytes_after > 0 {
+        println!(
+            "  {} bytes of retired segment files remain inside the engine's {}-second grace \
+             period; rerun once that long has passed since the last `cass index` publish.",
+            report.retired_bytes_after, report.grace_secs
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_index_with_data(
     db_override: Option<PathBuf>,
@@ -105895,17 +106114,21 @@ fn detect_resume_agent(path: &Path, agent_override: Option<&str>) -> CliResult<D
             reason: "path contains .pi/agent".to_string(),
         });
     }
-    // Antigravity (`agy`) stores its transcripts under
-    // `~/.gemini/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript.jsonl`.
-    // That path ALSO contains `.gemini/`, so it must be matched BEFORE the
-    // gemini arm below or an antigravity session would be misrouted to the
-    // Gemini harness. (probe.rs / fleet_archive_coverage.rs enforce the same
+    // Antigravity stores its transcripts under
+    // `~/.gemini/antigravity{,-cli}/brain/<uuid>/.system_generated/logs/transcript.jsonl`
+    // (IDE store and `agy` CLI store respectively, #454). Those paths ALSO
+    // contain `.gemini/`, so they must be matched BEFORE the gemini arm below
+    // or an antigravity session would be misrouted to the Gemini harness.
+    // (probe.rs / fleet_archive_coverage.rs enforce the same
     // antigravity-before-gemini ordering.)
-    if path_str.contains("antigravity-cli") || path_str.contains(".system_generated") {
+    if path_str.contains("/antigravity/")
+        || path_str.contains("antigravity-cli")
+        || path_str.contains(".system_generated")
+    {
         return Ok(DetectedAgent {
             slug: "antigravity",
             is_override: false,
-            reason: "path contains antigravity-cli storage".to_string(),
+            reason: "path contains antigravity storage".to_string(),
         });
     }
     if path_str.contains(".gemini/") || path_str.contains("/gemini/sessions") {
@@ -106207,10 +106430,9 @@ fn extract_opencode_session_id(path: &Path, strict: bool) -> CliResult<String> {
 /// Extract the Antigravity conversation UUID from a transcript source path.
 ///
 /// Antigravity records each conversation under
-/// `<...>/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript.jsonl`
+/// `<...>/antigravity{,-cli}/brain/<uuid>/.system_generated/logs/transcript.jsonl`
 /// (a `transcript_full.jsonl` sibling may also appear). The `<uuid>` — the same
-/// id `agy --conversation <uuid>` resumes by, and the connector's normalized
-/// `external_id` — is the name of the directory that contains
+/// id `agy --conversation <uuid>` resumes by — is the name of the directory that contains
 /// `.system_generated`. We locate that segment structurally rather than by a
 /// fixed depth so extraction still works when a remote mirror adds leading path
 /// components, and fall back to the component immediately after a `brain`
@@ -106253,7 +106475,7 @@ fn extract_antigravity_conversation_id(path: &Path) -> CliResult<String> {
             path.display()
         ),
         hint: Some(
-            "Expected an Antigravity transcript path like '<...>/antigravity-cli/brain/<uuid>/.system_generated/logs/transcript.jsonl'."
+            "Expected an Antigravity transcript path like '<...>/antigravity/brain/<uuid>/.system_generated/logs/transcript.jsonl' (IDE) or '<...>/antigravity-cli/brain/<uuid>/...' (agy CLI)."
                 .into(),
         ),
         retryable: false,
