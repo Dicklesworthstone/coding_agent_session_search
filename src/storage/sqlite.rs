@@ -32691,6 +32691,41 @@ mod tests {
     }
 
     #[test]
+    fn literal_rowid_in_list_at_hydration_chunk_size_executes_and_seeks() -> anyhow::Result<()> {
+        // GH #382: FTS5 hydration renders up to SQLITE_FTS5_HYDRATE_PARAM_CHUNK
+        // (30_000) rowids as literals in ONE statement. A list that long goes
+        // through a different parser/planner path than the three-element list
+        // above (the parameterized form it replaced was bounded by the
+        // 32_766 variable limit, which literals are not), so pin that
+        // frankensqlite both executes it and still seeks by primary key.
+        let dir = TempDir::new()?;
+        let storage = SqliteStorage::open(&dir.path().join("test.db"))?;
+        let ids: Vec<i64> = (1..=30_000_i64).map(|i| i * 7).collect();
+        let list = crate::search::query::sql_rowid_literal_list(&ids);
+        let sql = format!("SELECT id FROM messages WHERE id IN ({list})");
+        let plan: Vec<String> = storage.conn.query_map_collect(
+            &format!("EXPLAIN QUERY PLAN {sql}"),
+            fparams![],
+            |row| {
+                Ok(match row.get(3) {
+                    Some(SqliteValue::Text(detail)) => detail.to_string(),
+                    other => format!("{other:?}"),
+                })
+            },
+        )?;
+        let plan = plan.join(" | ");
+        assert!(
+            plan.contains("SEARCH") && !plan.contains("SCAN"),
+            "a 30_000-literal rowid IN-list must still seek by primary key, got: {plan}"
+        );
+        let rows: Vec<bool> = storage
+            .conn
+            .query_map_collect(&sql, fparams![], |row| Ok(row.get(0).is_some()))?;
+        assert!(rows.is_empty(), "empty messages table yields no rows");
+        Ok(())
+    }
+
+    #[test]
     fn antigravity_ide_rekey_promotes_external_identity_by_source_path() -> anyhow::Result<()> {
         // #454: conversations under the Antigravity IDE store were keyed by
         // the bare `<uuid>` until the connector learned to distinguish the IDE
