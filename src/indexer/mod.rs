@@ -14407,11 +14407,14 @@ fn connector_local_scan_since_ts_from_state(
     connector_last_scan_ts: Option<i64>,
     connector_has_conversations: bool,
 ) -> Option<i64> {
+    // A full scan or deliberate repair has no cutoff. A saved connector
+    // watermark must not turn that request back into an incremental scan.
+    let fallback_since_ts = fallback_since_ts?;
     if let Some(ts) = connector_last_scan_ts {
         return Some(ts.saturating_sub(1).max(0));
     }
     if connector_has_conversations {
-        fallback_since_ts
+        Some(fallback_since_ts)
     } else {
         None
     }
@@ -41765,7 +41768,21 @@ mod tests {
         drop(storage);
 
         let (tx, rx) = bounded::<LexicalRebuildPipelineMessage>(4);
-        let flow_limiter = Arc::new(StreamingByteLimiter::new(8 * 1024));
+        // Keep the lookup fixture at one three-conversation page. The live
+        // governor may shrink a runtime request under load, so inject the
+        // fixed page budget and use its matching in-flight limit.
+        let pipeline_budget = LexicalRebuildPipelineBudgetSnapshot::new(
+            3,
+            32,
+            3 * 8 * 1024 * 1024,
+            15 * 8 * 1024 * 1024,
+            3,
+            32,
+            3 * 8 * 1024 * 1024,
+        );
+        let flow_limiter = Arc::new(StreamingByteLimiter::new(
+            pipeline_budget.max_message_bytes_in_flight,
+        ));
         let handle = spawn_lexical_rebuild_packet_producer(
             db_path,
             None,
@@ -41773,35 +41790,18 @@ mod tests {
             LEXICAL_REBUILD_PAGE_SIZE,
             4,
             None,
-            Arc::new(LexicalRebuildPipelineBudgetController::new(
-                // bet45/f273ccc4: the content-bounded page limit divides the
-                // byte budget by the 8 MiB per-conversation content cap, so a
-                // byte budget below 3 * 8 MiB collapses this fixture into
-                // one-conversation pages. That starves later page-prep
-                // reservations behind the consumer-held first batch and parks
-                // the pipeline forever. Budget three full conversations so the
-                // fixture stays a single three-packet page.
-                lexical_rebuild_runtime_pipeline_budget_snapshot(
-                    3,
-                    32,
-                    3 * 8 * 1024 * 1024,
-                    4,
-                    3,
-                    32,
-                    3 * 8 * 1024 * 1024,
-                ),
-            )),
+            Arc::new(LexicalRebuildPipelineBudgetController::new(pipeline_budget)),
             tx,
             flow_limiter.clone(),
             None,
             Arc::new(LexicalRebuildProducerTelemetry::default()),
         );
 
-        let batch = match rx.recv().unwrap() {
+        let batch = match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
             LexicalRebuildPipelineMessage::Batch(batch) => batch,
             other => panic!("expected prepared batch, got {other:?}"),
         };
-        match rx.recv().unwrap() {
+        match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
             LexicalRebuildPipelineMessage::Done => {}
             other => panic!("expected pipeline completion, got {other:?}"),
         }
@@ -42320,10 +42320,32 @@ mod tests {
         let planned_shard_plan =
             plan_lexical_rebuild_shards_from_storage_with_settings(&storage, &planned_settings, 6)
                 .unwrap();
+        assert_eq!(
+            planned_shard_plan
+                .shards
+                .iter()
+                .map(|shard| shard.conversation_count)
+                .collect::<Vec<_>>(),
+            vec![3, 3]
+        );
         storage.close_without_checkpoint().unwrap();
 
         let (tx, rx) = bounded::<LexicalRebuildPipelineMessage>(2);
-        let flow_limiter = Arc::new(StreamingByteLimiter::new(256 * 1024));
+        // This test exercises exact shard boundaries, so inject a fixed
+        // budget. The runtime helper applies live machine pressure and can
+        // reduce the requested three-conversation page to a smaller page.
+        let pipeline_budget = LexicalRebuildPipelineBudgetSnapshot::new(
+            64,
+            256,
+            3 * 8 * 1024 * 1024,
+            9 * 8 * 1024 * 1024,
+            64,
+            256,
+            3 * 8 * 1024 * 1024,
+        );
+        let flow_limiter = Arc::new(StreamingByteLimiter::new(
+            pipeline_budget.max_message_bytes_in_flight,
+        ));
         let handle = spawn_lexical_rebuild_packet_producer(
             db_path,
             None,
@@ -42331,21 +42353,7 @@ mod tests {
             LEXICAL_REBUILD_PAGE_SIZE,
             2,
             None,
-            Arc::new(LexicalRebuildPipelineBudgetController::new(
-                // bet45/f273ccc4: keep the byte budget at 3 * 8 MiB (three
-                // per-conversation content caps) so the content-bounded page
-                // limit stays at three conversations per page and each page
-                // still closes exactly one planned shard.
-                lexical_rebuild_runtime_pipeline_budget_snapshot(
-                    64,
-                    256,
-                    3 * 8 * 1024 * 1024,
-                    2,
-                    64,
-                    256,
-                    3 * 8 * 1024 * 1024,
-                ),
-            )),
+            Arc::new(LexicalRebuildPipelineBudgetController::new(pipeline_budget)),
             tx,
             flow_limiter.clone(),
             None,
@@ -45578,6 +45586,19 @@ mod tests {
             None,
             "full scans already have no cutoff"
         );
+        for has_conversations in [false, true] {
+            for watermark in [0, 2000, i64::MAX] {
+                assert_eq!(
+                    connector_local_scan_since_ts_from_state(
+                        None,
+                        Some(watermark),
+                        has_conversations
+                    ),
+                    None,
+                    "a saved connector watermark must not restrict a full or repair scan"
+                );
+            }
+        }
         assert_eq!(
             connector_local_scan_since_ts_from_state(global_incremental_since_ts, Some(0), false),
             Some(0),
