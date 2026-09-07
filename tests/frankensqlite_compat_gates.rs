@@ -49,8 +49,8 @@ fn rusqlite_is_dev_dependency_only() {
 /// silently bifurcate the engine family.
 #[test]
 fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
-    const VERSION: &str = "0.3.16";
-    const EXACT_REQUIREMENT: &str = "=0.3.16";
+    const VERSION: &str = "0.3.17";
+    const EXACT_REQUIREMENT: &str = "=0.3.17";
     const EXPECTED_FACADE_FEATURES: &[&str] = &["fts5", "async-api"];
 
     let manifest: toml::Table =
@@ -160,7 +160,7 @@ fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
 
     let build_contract = include_str!("../build.rs");
     assert!(
-        build_contract.contains("expected_version: \"0.3.16\"")
+        build_contract.contains("expected_version: \"0.3.17\"")
             && build_contract.contains("expected_features: &[\"fts5\", \"async-api\"]"),
         "build.rs must validate the exact FrankenSQLite crates.io identity"
     );

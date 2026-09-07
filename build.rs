@@ -48,7 +48,7 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "fsqlite",
         manifest_package_field: Some("fsqlite"),
         // Exact upstream source pin (established with the fsqlite 0.2.1
-        // migration, bead bo000; now at 0.3.16. 0.3.15 was evaluated on
+        // migration, bead bo000; now at 0.3.17. 0.3.15 was evaluated on
         // 2026-09-02 (bead gh382-fsqlite-pin) and NOT adopted: cass's own
         // writable open still looped on a large archive with a large WAL
         // (reclaim sweep x per-page WAL rescan, cass GH #382 / bead g3zyo).
@@ -64,10 +64,15 @@ const CONTRACTS: &[DependencyContract] = &[
         // cass#393 namespace-sidecar repair, the GH#438 Windows sidecar-less
         // read-only close, integrity-check through read-only guards, and
         // the cass#434 autoindex-vanish fixes) all carry forward.
+        // 0.3.17 adds incremental WAL-tail folding, reserved lock-byte and
+        // freelist repair (GH#410), FTS metadata/visibility fixes (GH#408),
+        // and prepared-read schema-retry cleanup. The facade API and
+        // asupersync requirement are unchanged. Adopted by owner request
+        // 2026-09-06; this is not a mixed-engine concurrent-WAL safety claim.
         // fsqlite resolves from crates.io at the exact version below.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.16",
+        expected_version: "0.3.17",
         // `async-api` exposes frankensqlite::AsyncConnection, which
         // src/search/query.rs uses (as SearchSqliteConnection) for the
         // no-hit alternate-agent suggestions without a full storage open.
@@ -88,7 +93,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // Keep shared types on the identical registry version as the facade.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.16",
+        expected_version: "0.3.17",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -106,7 +111,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // Keep shared types on the identical registry version as the facade.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.16",
+        expected_version: "0.3.17",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -442,7 +447,7 @@ fn validate_fsqlite_source_pin(manifest_dir: &Path, manifest: &Value, packaged_m
     // The fsqlite engine family must resolve exclusively from crates.io at
     // one exact version. The single-source identity is load-bearing for the
     // read-only FTS5 integrity preflight used by CASS on Windows.
-    const EXPECTED_VERSION: &str = "0.3.16";
+    const EXPECTED_VERSION: &str = "0.3.17";
     const EXPECTED_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
     // 1. With the family on crates.io (e926644f), a `[patch]` table is no
