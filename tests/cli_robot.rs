@@ -1214,7 +1214,7 @@ fn pack_named_query_flag_attaches_to_query_positional() {
     );
 }
 
-fn assert_pack_alias_runs(alias: &str) {
+fn assert_pack_command_returns_evidence(command: &str, extra_args: &[&str]) {
     // The legacy demo archive has no auth evidence. Index an explicit source
     // so each alias must return a real message, not just a well-shaped envelope.
     let fixture = TempDir::new().expect("isolated pack alias home");
@@ -1249,7 +1249,7 @@ fn assert_pack_alias_runs(alias: &str) {
         .assert()
         .success();
     let mut cmd = isolated_cass_cmd(home);
-    cmd.args([alias, "auth", "--json", "--data-dir"]);
+    cmd.args([command, "auth", "--json", "--data-dir"]);
     cmd.arg(&data_dir);
     cmd.args([
         "--limit",
@@ -1260,6 +1260,7 @@ fn assert_pack_alias_runs(alias: &str) {
         "1",
         "--require-evidence",
     ]);
+    cmd.args(extra_args);
 
     let output = cmd.assert().success().get_output().clone();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1281,27 +1282,34 @@ fn assert_pack_alias_runs(alias: &str) {
 
 #[test]
 fn answer_alias_runs_pack_command() {
-    assert_pack_alias_runs("answer");
+    assert_pack_command_returns_evidence("answer", &[]);
 }
 
 #[test]
 fn handoff_alias_runs_pack_command() {
-    assert_pack_alias_runs("handoff");
+    assert_pack_command_returns_evidence("handoff", &[]);
 }
 
 #[test]
 fn why_alias_runs_pack_command() {
-    assert_pack_alias_runs("why");
+    assert_pack_command_returns_evidence("why", &[]);
 }
 
 #[test]
 fn explain_alias_runs_pack_command() {
-    assert_pack_alias_runs("explain");
+    assert_pack_command_returns_evidence("explain", &[]);
 }
 
 #[test]
 fn rca_alias_runs_pack_command() {
-    assert_pack_alias_runs("rca");
+    assert_pack_command_returns_evidence("rca", &[]);
+}
+
+#[test]
+fn pack_contract_field_masks_return_real_cited_evidence() {
+    for preset in ["standard", "full"] {
+        assert_pack_command_returns_evidence("pack", &["--field-mask", preset]);
+    }
 }
 
 #[test]
@@ -5902,6 +5910,7 @@ fn timed_out_robot_pack_returns_bounded_partial_and_names_shed_work() -> Result<
             "--limit",
             "7",
             "--explain-selection",
+            "--include-skill-content",
             "--data-dir",
             data_dir.path().to_str().ok_or("non-utf8 data dir")?,
         ])
@@ -5938,6 +5947,9 @@ fn timed_out_robot_pack_returns_bounded_partial_and_names_shed_work() -> Result<
     if payload["query"]["text"] != "hello" {
         return Err("pack timeout discarded the requested query identity".into());
     }
+    if payload["privacy"]["skill_content_included"] != false {
+        return Err("timed-out pack claimed to include skill content without evidence".into());
+    }
     if !["search", "selection_explanations"].iter().all(|expected| {
         skipped
             .iter()
@@ -5953,6 +5965,7 @@ fn timed_out_robot_pack_returns_bounded_partial_and_names_shed_work() -> Result<
                     && probe.contains("--agent codex")
                     && probe.contains("--source local")
                     && probe.contains("--limit 7")
+                    && probe.contains("--include-skill-content")
                     && probe.contains("--data-dir")
             })
     {

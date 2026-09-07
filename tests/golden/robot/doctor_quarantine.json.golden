@@ -934,10 +934,10 @@
       "required_bytes": 536870912,
       "floor_bytes": 536870912,
       "db_bundle_bytes": 0,
-      "lexical_index_bytes": 1119,
+      "lexical_index_bytes": 1069,
       "retired_segment_bytes": 0,
       "retired_segment_files": 0,
-      "retained_publish_backup_bytes": 0,
+      "retained_publish_backup_bytes": 50,
       "available_bytes": "[LIVE_BYTES]",
       "shortfall_bytes": 0,
       "probe_path": "[TEST_HOME]/cass-data",
@@ -946,7 +946,8 @@
       ],
       "notes": [
         "A full rebuild (cass index --full / --force-rebuild) needs 536870912 bytes free at [TEST_HOME]/cass-data, and the free space there covers it, so the indexer's headroom preflight would pass.",
-        "Requirement is max(512 MiB, db_bundle_bytes * 2 + lexical_index_bytes * 2): db bundle 0 bytes, lexical index 1119 bytes, floor 536870912 bytes."
+        "Requirement is max(512 MiB, db_bundle_bytes * 2 + lexical_index_bytes * 2): db bundle 0 bytes, lexical index 1069 bytes, floor 536870912 bytes.",
+        "50 bytes of prior lexical generations are retained under index/.lexical-publish-backups/ and are not doubled either; a staged publish prunes them to the retention cap, and `cass doctor cleanup` reclaims them earlier."
       ]
     },
     "total_accounted_bytes": 1138,

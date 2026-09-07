@@ -702,8 +702,8 @@ pub enum Commands {
         /// Output as JSON (--robot also works). Equivalent to --robot-format json.
         #[arg(long, visible_alias = "robot")]
         json: bool,
-        /// Select answer-pack top-level fields. Presets: minimal, summary, all.
-        #[arg(long, value_delimiter = ',')]
+        /// Select answer-pack fields. Presets: minimal, standard, full, summary, all.
+        #[arg(long, visible_alias = "field-mask", value_delimiter = ',')]
         fields: Option<Vec<String>>,
         /// Soft pack token budget.
         #[arg(long, default_value_t = 12_000)]
@@ -762,6 +762,9 @@ pub enum Commands {
         /// Evidence freshness window in seconds.
         #[arg(long, default_value_t = DEFAULT_PACK_FRESHNESS_WINDOW_SECONDS)]
         freshness_window_seconds: i64,
+        /// Include skill payload excerpts. Credentials remain redacted.
+        #[arg(long, default_value_t = false)]
+        include_skill_content: bool,
         /// Return an error instead of an empty successful pack.
         #[arg(long, default_value_t = false)]
         require_evidence: bool,
@@ -4085,9 +4088,9 @@ fn assignment_option_for_command(command: &str, key: &str) -> Option<AssignmentO
                 aliases: &["--workspace"],
                 repeatable: true,
             }),
-            "fields" => Some(AssignmentOption {
+            "fields" | "field-mask" | "field_mask" => Some(AssignmentOption {
                 flag: "--fields",
-                aliases: &["--fields"],
+                aliases: &["--fields", "--field-mask"],
                 repeatable: false,
             }),
             "max-tokens" | "max_tokens" => Some(AssignmentOption {
@@ -4580,7 +4583,9 @@ fn search_like_option_value_count(command: &str, arg: &str) -> Option<usize> {
         (command, name.as_str()),
         (
             "pack",
-            "max-sessions"
+            "field-mask"
+                | "field_mask"
+                | "max-sessions"
                 | "max_sessions"
                 | "max-evidence"
                 | "max_evidence"
@@ -4630,7 +4635,12 @@ fn search_like_option_value_count(command: &str, arg: &str) -> Option<usize> {
         (command, name.as_str()),
         (
             "pack",
-            "require-evidence" | "require_evidence" | "explain-selection" | "explain_selection"
+            "require-evidence"
+                | "require_evidence"
+                | "explain-selection"
+                | "explain_selection"
+                | "include-skill-content"
+                | "include_skill_content"
         )
     );
 
@@ -5031,11 +5041,13 @@ fn arg_marks_implicit_pack_intent(arg: &str) -> bool {
         let name = flag.split_once('=').map_or(flag, |(name, _)| name);
         return matches!(
             name,
-            "max-sessions"
+            "field-mask"
+                | "max-sessions"
                 | "max-evidence"
                 | "max-excerpt-chars"
                 | "freshness-policy"
                 | "freshness-window-seconds"
+                | "include-skill-content"
                 | "require-evidence"
                 | "explain-selection"
         );
@@ -5049,7 +5061,9 @@ fn arg_marks_implicit_pack_intent(arg: &str) -> bool {
     }
     matches!(
         key.to_ascii_lowercase().as_str(),
-        "max-sessions"
+        "field-mask"
+            | "field_mask"
+            | "max-sessions"
             | "max_sessions"
             | "max-evidence"
             | "max_evidence"
@@ -6421,6 +6435,105 @@ mod canonical_top_level_command_tests {
         assert!(looks_like_top_level_command_or_typo("upgrade"));
     }
 
+    #[test]
+    fn pack_field_mask_contract_flag_survives_query_recovery() {
+        for args in [
+            vec![
+                "cass",
+                "pack",
+                "maskneedle",
+                "--field-mask",
+                "standard",
+                "--json",
+            ],
+            vec![
+                "cass",
+                "pack",
+                "--field-mask",
+                "standard",
+                "maskneedle",
+                "--json",
+            ],
+            vec!["cass", "maskneedle", "--field-mask", "standard", "--json"],
+            vec![
+                "cass",
+                "search",
+                "maskneedle",
+                "--field-mask",
+                "standard",
+                "--json",
+            ],
+            vec![
+                "cass",
+                "pack",
+                "maskneedle",
+                "field_mask=standard",
+                "--json",
+            ],
+            vec!["cass", "maskneedle", "field-mask=standard", "--json"],
+            vec![
+                "cass",
+                "pack",
+                "maskneedle",
+                "--fields",
+                "standard",
+                "--json",
+            ],
+        ] {
+            let (normalized, _) = normalize_args(args.into_iter().map(str::to_string).collect());
+            let cli = Cli::try_parse_from(normalized).expect("parse documented pack mask");
+            let Some(Commands::Pack { query, fields, .. }) = cli.command else {
+                panic!("the pack-only field-mask flag must preserve pack intent");
+            };
+            assert_eq!(query, "maskneedle");
+            assert_eq!(fields, Some(vec!["standard".to_string()]));
+        }
+    }
+
+    #[test]
+    fn pack_skill_opt_in_survives_query_recovery_and_defaults_to_exclusion() {
+        for (args, expected) in [
+            (
+                vec!["cass", "privacyneedle", "--json", "--include-skill-content"],
+                true,
+            ),
+            (
+                vec![
+                    "cass",
+                    "search",
+                    "privacyneedle",
+                    "--json",
+                    "--include-skill-content",
+                ],
+                true,
+            ),
+            (
+                vec![
+                    "cass",
+                    "pack",
+                    "--include-skill-content",
+                    "privacyneedle",
+                    "--json",
+                ],
+                true,
+            ),
+            (vec!["cass", "pack", "privacyneedle", "--json"], false),
+        ] {
+            let (normalized, _) = normalize_args(args.into_iter().map(str::to_string).collect());
+            let cli = Cli::try_parse_from(normalized).expect("parse recovered pack arguments");
+            let Some(Commands::Pack {
+                query,
+                include_skill_content,
+                ..
+            }) = cli.command
+            else {
+                panic!("skill-content opt-in must select the pack command");
+            };
+            assert_eq!(query, "privacyneedle");
+            assert_eq!(include_skill_content, expected);
+        }
+    }
+
     /// Behavioral pin for the #367 repro: the robot flag must not turn a
     /// recognized subcommand into a search query.
     #[test]
@@ -7376,6 +7489,7 @@ async fn execute_cli(
                     mode,
                     freshness_policy,
                     freshness_window_seconds,
+                    include_skill_content,
                     require_evidence,
                     explain_selection,
                     refresh,
@@ -7416,6 +7530,7 @@ async fn execute_cli(
                         eff_mode,
                         &freshness_policy,
                         freshness_window_seconds,
+                        include_skill_content,
                         require_evidence,
                         explain_selection,
                         refresh,
@@ -25524,12 +25639,13 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass pack <query> [--robot] [--max-tokens N] [--limit N]".to_string(),
             "    Build a deterministic, cited answer pack for agent handoffs without external summarization.".to_string(),
             "    --sessions-from FILE|-  Restrict evidence to newline-delimited session paths; '-' reads stdin.".to_string(),
-            "    --fields minimal|summary|all,F1,F2  Select top-level pack fields for JSON/TOON output.".to_string(),
+            "    --field-mask minimal|standard|full|summary|all,F1,F2  Select pack fields for JSON/TOON output (--fields also works).".to_string(),
             "    --max-sessions N  Cap how many sessions can contribute evidence to the pack.".to_string(),
             "    --max-evidence N  Cap cited evidence items selected into the pack.".to_string(),
             "    --max-excerpt-chars N  Bound each excerpt before token estimation.".to_string(),
             "    --freshness-policy prefer-recent|strict|allow-stale  Evidence freshness policy.".to_string(),
             "    --freshness-window-seconds N  Freshness window used for stale-evidence warnings and strict filtering.".to_string(),
+            "    --include-skill-content  Include skill payload excerpts; credentials remain redacted.".to_string(),
             "    --require-evidence  Return a JSON error envelope instead of an empty successful pack.".to_string(),
             "    --explain-selection  Include score components and omission diagnostics for audits.".to_string(),
             "    Output includes health, freshness, privacy, evidence, omitted, and warnings fields.".to_string(),
@@ -31051,6 +31167,7 @@ fn pack_retry_command(
     mode: Option<crate::search::query::SearchMode>,
     freshness_policy: crate::search::pack_planner::PackFreshnessPolicy,
     freshness_window_seconds: i64,
+    include_skill_content: bool,
     require_evidence: bool,
     explain_selection: bool,
     render_format: crate::search::pack_planner::PackRenderFormat,
@@ -31120,6 +31237,9 @@ fn pack_retry_command(
     );
     args.push("--freshness-window-seconds".to_string());
     args.push(freshness_window_seconds.to_string());
+    if include_skill_content {
+        args.push("--include-skill-content".to_string());
+    }
     if require_evidence {
         args.push("--require-evidence".to_string());
     }
@@ -31167,6 +31287,7 @@ fn run_cli_pack(
     mode: Option<crate::search::query::SearchMode>,
     freshness_policy: &str,
     freshness_window_seconds: i64,
+    include_skill_content: bool,
     require_evidence: bool,
     explain_selection: bool,
     refresh: bool,
@@ -31484,6 +31605,7 @@ fn run_cli_pack(
         freshness_window_seconds,
         candidates,
         explain_selection: realized_explain_selection,
+        include_skill_content,
     };
     let candidate_count = plan_request.candidates.len();
     let mut plan = if structured_pack {
@@ -31494,16 +31616,17 @@ fn run_cli_pack(
                 .map_err(pack_invalid_limit_error)?
         } else {
             let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-            let source_deadline =
-                Instant::now() + Duration::from_millis(pack_budget.remaining_ms().min(1_000));
             std::thread::Builder::new()
                 .name("cass-pack-budgeted-planner".to_string())
                 .spawn(move || {
                     maybe_test_pack_plan_delay();
                     let result = plan_answer_pack(plan_request).map(|mut plan| {
+                        // Planning must not consume the source phase allowance.
+                        // The remaining request budget still bounds this phase.
                         crate::search::pack_planner::verify_pack_source_citations(
                             &mut plan,
-                            source_deadline,
+                            Instant::now()
+                                + Duration::from_millis(pack_budget.remaining_ms().min(1_000)),
                         );
                         plan
                     });
@@ -31591,6 +31714,7 @@ fn run_cli_pack(
                 mode,
                 freshness_policy,
                 freshness_window_seconds,
+                include_skill_content,
                 require_evidence,
                 explain_selection,
                 render_format,
@@ -31620,7 +31744,6 @@ fn run_cli_pack(
         freshness_window_seconds,
         redaction_policy: "strict".to_string(),
         sensitive_output: false,
-        skill_content_included: false,
         explain_selection: realized_explain_selection,
         readiness: PackReadinessSnapshot {
             index_generation: search_self_heal
@@ -32006,6 +32129,9 @@ fn expand_pack_field_mask(fields: &[String]) -> CliResult<Option<PackFieldMask>>
         requested_fields.push(field.to_string());
         match field {
             "*" | "all" => return Ok(None),
+            "standard" | "full" => {
+                set.extend(PACK_TOP_LEVEL_FIELDS.iter().copied().map(str::to_string));
+            }
             "minimal" => {
                 set.extend([
                     "schema_version".to_string(),
@@ -32085,7 +32211,7 @@ fn pack_invalid_field_error(field: &str) -> CliError {
         kind: CliErrorKind::PackInvalidField.kind_str(),
         message: format!("unknown pack field mask: {field}"),
         hint: Some(
-            "Use minimal, summary, all, or top-level fields such as evidence, health, freshness, omitted, privacy."
+            "Use minimal, standard, full, summary, all, or top-level fields such as evidence, health, freshness, omitted, privacy."
                 .to_string(),
         ),
         retryable: false,
@@ -32366,6 +32492,16 @@ mod pack_field_mask_tests {
                 "fallback_mode": null,
                 "semantic_joined": false
             },
+            "health": {
+                "healthy": true,
+                "lexical_readiness": "ready",
+                "semantic_state": "unavailable"
+            },
+            "freshness": {
+                "policy": "prefer_recent",
+                "window_seconds": 86400,
+                "stale_evidence_count": 0
+            },
             "pack": {
                 "title": "checkout",
                 "answer_outline": [{"rank": 1, "heading": "checkout", "evidence_ids": ["ev_1"]}],
@@ -32391,6 +32527,26 @@ mod pack_field_mask_tests {
 
     fn fields(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn pack_standard_and_full_masks_preserve_the_complete_public_envelope() {
+        for preset in ["standard", "full"] {
+            let input = sample_pack_value();
+            let filtered = filter_pack_fields(input.clone(), Some(&fields(&[preset]))).unwrap();
+            assert_eq!(filtered, input, "preset {preset}");
+
+            let filtered = filter_pack_fields(
+                sample_pack_value(),
+                Some(&fields(&[preset, "no_such_field"])),
+            )
+            .unwrap();
+            assert_eq!(filtered["evidence"], input["evidence"]);
+            assert_eq!(
+                filtered["_meta"]["warnings"],
+                serde_json::json!(["unknown_pack_field_mask_ignored:no_such_field"])
+            );
+        }
     }
 
     #[test]

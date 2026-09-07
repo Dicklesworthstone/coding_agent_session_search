@@ -317,6 +317,7 @@ fn pack_bench_plan(candidates: Vec<PackCandidate>, limits: PackPlannerLimits) ->
         freshness_window_seconds: PACK_BENCH_FRESHNESS_WINDOW_SECONDS,
         candidates,
         explain_selection: true,
+        include_skill_content: false,
     })
     .expect("answer pack benchmark plan")
 }
@@ -347,7 +348,6 @@ fn pack_bench_render_request(
         freshness_window_seconds: PACK_BENCH_FRESHNESS_WINDOW_SECONDS,
         redaction_policy: "strict".to_string(),
         sensitive_output: false,
-        skill_content_included: false,
         explain_selection: true,
         readiness: PackReadinessSnapshot {
             index_generation: Some("bench-generation".to_string()),

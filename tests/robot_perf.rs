@@ -148,6 +148,7 @@ fn answer_pack_perf_plan(
         freshness_window_seconds: ANSWER_PACK_FRESHNESS_WINDOW_SECONDS,
         candidates,
         explain_selection: true,
+        include_skill_content: false,
     })
     .expect("answer pack SLO plan")
 }
@@ -178,7 +179,6 @@ fn answer_pack_perf_render_request(
         freshness_window_seconds: ANSWER_PACK_FRESHNESS_WINDOW_SECONDS,
         redaction_policy: "strict".to_string(),
         sensitive_output: false,
-        skill_content_included: false,
         explain_selection: true,
         readiness: Default::default(),
     }

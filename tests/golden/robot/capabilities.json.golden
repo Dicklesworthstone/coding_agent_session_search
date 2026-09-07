@@ -274,6 +274,16 @@
           "required": false
         },
         {
+          "name": "gc",
+          "description": "Reclaim merge-retired lexical segment files and exit (gh#453). Opens the lexical writer, which runs the engine's grace-period garbage sweep: a segment file is unlinked only once no published MANIFEST generation has referenced it for the engine's grace period (300 s), so readers on the previous generation are safe. Scans no sources and re-indexes nothing; every incremental `cass index` performs the same sweep at open. Reports files and bytes reclaimed (`--json` for automation)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "watch",
           "description": "Watch for changes and reindex automatically",
           "arg_type": "flag",
@@ -1073,6 +1083,17 @@
           "value_type": "integer",
           "required": false,
           "default": "2592000"
+        },
+        {
+          "name": "include-skill-content",
+          "description": "Include skill payload excerpts. Credentials remain redacted",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
         },
         {
           "name": "require-evidence",
