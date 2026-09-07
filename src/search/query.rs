@@ -623,12 +623,11 @@ fn intern_cache_key(s: &str) -> Arc<str> {
 /// Render rowids as a literal SQL list (`1,2,3`) for an `IN (...)` over an
 /// `INTEGER PRIMARY KEY`.
 ///
-/// frankensqlite (verified on 0.3.16, cass GH #382) plans a *parameterized*
-/// `WHERE id IN (?,?,...)` on a rowid table as `SCAN messages` — a full
-/// walk from the leftmost leaf — while the same list written as integer
-/// literals plans as `SEARCH ... USING INTEGER PRIMARY KEY (rowid=?)`, one
-/// seek per id. On a multi-million-message archive the difference is
-/// minutes versus milliseconds for search hydration. The ids come from
+/// FrankenSQLite through 0.3.17 (verified on 0.3.16, cass GH #382) planned
+/// parameterized `WHERE id IN (?,?,...)` as `SCAN messages`, a full table
+/// walk, while integer literals used primary-key seeks. Version 0.3.18
+/// adds parameterized seeks; this established literal path remains covered
+/// at the full hydration chunk size. The ids come from
 /// cass's own index (never from user text) and `i64`'s `Display` emits only
 /// an optional `-` and ASCII digits, so embedding them cannot form SQL.
 pub fn sql_rowid_literal_list(ids: &[i64]) -> String {
@@ -5756,8 +5755,8 @@ impl SearchClient {
             }
         }
 
-        // Literal rowid list, not placeholders: see `sql_rowid_literal_list`
-        // (frankensqlite scans the whole table for a parameterized IN).
+        // Retain the literal rowid path: see `sql_rowid_literal_list`.
+        // FrankenSQLite through 0.3.17 scanned parameterized IN-lists.
         let message_rowids = unique_message_ids
             .iter()
             .map(|message_id| i64::try_from(*message_id))
@@ -7880,8 +7879,8 @@ impl SearchClient {
         };
         let normalized_source_sql =
             normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
-        // Literal rowid list: a parameterized IN scans `messages` on
-        // frankensqlite (see `sql_rowid_literal_list`).
+        // Literal rowid list: avoids the parameterized IN scan used by
+        // FrankenSQLite through 0.3.17 (see `sql_rowid_literal_list`).
         let rowids = sql_rowid_literal_list(message_ids);
 
         format!(

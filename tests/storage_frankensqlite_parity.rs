@@ -246,6 +246,74 @@ fn gh402_populated_archive_reopens_readonly_after_page_reclamation_without_mutat
     );
 }
 
+#[test]
+fn readonly_live_wal_preserves_archive_bytes_and_modification_times() {
+    let dir = TempDir::new().expect("temp dir");
+    let db_path = dir.path().join("live-wal-readonly.db");
+    let writer = FrankenStorage::open(&db_path).expect("create CASS archive");
+    writer
+        .raw()
+        .execute("PRAGMA wal_autocheckpoint = 0")
+        .expect("retain live WAL frames");
+    let agent_id = writer
+        .ensure_agent(&make_agent("codex", "Codex"))
+        .expect("create agent");
+    let conversation = make_conversation(
+        "codex",
+        "readonly-live-wal",
+        "Live WAL sentinel",
+        vec![make_message(0, MessageRole::User, "committed WAL content")],
+    );
+    let outcomes = writer
+        .insert_conversations_batched(&[(agent_id, None, &conversation)])
+        .expect("commit live WAL conversation");
+    let conversation_id = outcomes
+        .first()
+        .expect("inserted conversation")
+        .conversation_id;
+    assert_eq!(writer.total_conversation_count().expect("writer count"), 1);
+
+    let snapshot = || {
+        [
+            "live-wal-readonly.db",
+            "live-wal-readonly.db-wal",
+            "live-wal-readonly.db-shm",
+        ]
+        .map(|name| {
+            let path = dir.path().join(name);
+            let bytes = std::fs::read(&path).expect("read existing live archive artifact");
+            let modified = std::fs::metadata(&path)
+                .expect("live archive metadata")
+                .modified()
+                .expect("live archive modification time");
+            (bytes, modified)
+        })
+    };
+    let before = snapshot();
+    assert!(before[1].0.len() > 32, "fixture must retain WAL frames");
+    assert!(!before[2].0.is_empty(), "fixture must have a WAL index");
+
+    let reader = FrankenStorage::open_readonly(&db_path).expect("open live archive read-only");
+    assert_eq!(reader.total_conversation_count().expect("reader count"), 1);
+    let messages = reader
+        .fetch_messages(conversation_id)
+        .expect("read WAL message");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].content, "committed WAL content");
+    assert_eq!(
+        snapshot(),
+        before,
+        "read-only queries must preserve DB/WAL/SHM"
+    );
+    reader.close().expect("close read-only live archive");
+    assert_eq!(
+        snapshot(),
+        before,
+        "read-only close must preserve DB/WAL/SHM bytes and modification times"
+    );
+    writer.close().expect("close fixture writer");
+}
+
 // ============================================================================
 // 1. SCHEMA PARITY (PASSING)
 // ============================================================================
