@@ -914,7 +914,7 @@
         },
         {
           "name": "fields",
-          "description": "Select answer-pack top-level fields. Presets: minimal, summary, all",
+          "description": "Select answer-pack fields. Presets: minimal, standard, full, summary, all",
           "arg_type": "option",
           "value_type": "string",
           "required": false,

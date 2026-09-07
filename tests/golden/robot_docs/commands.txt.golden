@@ -27,7 +27,7 @@ commands:
   cass pack <query> [--robot] [--max-tokens N] [--limit N]
     Build a deterministic, cited answer pack for agent handoffs without external summarization.
     --sessions-from FILE|-  Restrict evidence to newline-delimited session paths; '-' reads stdin.
-    --fields minimal|summary|all,F1,F2  Select top-level pack fields for JSON/TOON output.
+    --field-mask minimal|standard|full|summary|all,F1,F2  Select pack fields for JSON/TOON output (--fields also works).
     --max-sessions N  Cap how many sessions can contribute evidence to the pack.
     --max-evidence N  Cap cited evidence items selected into the pack.
     --max-excerpt-chars N  Bound each excerpt before token estimation.
