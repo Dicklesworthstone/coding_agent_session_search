@@ -188,9 +188,25 @@ Everything below is on `main`; nothing is in a released binary yet.
   duplicating it.
 
 ### Changed
-- `frankensearch` remains pinned to crates.io `=0.4.2`, and
-  `franken-agent-detection` remains pinned to `=0.2.2`. Later upstream
-  connector and segment-reclamation changes are not included in these pins.
+- `frankensearch` remains pinned to crates.io `=0.4.2`. The 0.4.3 line
+  (`frankensearch-quill 0.2.3`, whose receipt-clocked segment sweep is the
+  engine half of GH #453) is published but cannot be consumed from the
+  registry: its quill calls `asupersync::Cx::is_cancelled`, which exists only
+  on unreleased asupersync `main` (neither 0.4.9 nor 0.4.10 has it), so the
+  crate fails to compile against any registry asupersync (verified
+  2026-09-07 with cass's exact `=0.4.9` pin and by reading the published
+  0.4.10 source). Until a fixed engine publish exists, the `cass index --gc`
+  path reclaims folded inputs once 300 s have passed since the previous
+  publish (the engine's quiet-period rule).
+- `franken-agent-detection` pinned from crates.io `=0.2.2` to `=0.2.3`: the
+  Antigravity connector probes the IDE store (`~/.gemini/antigravity`) as
+  well as the `agy` CLI store, so IDE sessions index without
+  `CASS_ANTIGRAVITY_DATA_ROOT` (GH #454); Claude Code detection honors
+  `CLAUDE_CONFIG_DIR` / `XDG_CONFIG_HOME` (GH #448); Codex token usage is
+  read from real rollouts; Claude tool results are kept as `role:"tool"`
+  messages; Cursor/OpenCode mirrors are deduped; the 100 MB scan cap applies
+  to every connector; Shelley discovery names the canonical database path
+  like scan. The new `devin` connector feature is not enabled here.
 - Upgraded the complete FrankenSQLite family from the `0.3.13` line in v0.7.1
   to registry `0.3.18`. This adds parameterized rowid seeks (GH#415/cass#382),
   read-only WAL byte/timestamp preservation, reader-registration error

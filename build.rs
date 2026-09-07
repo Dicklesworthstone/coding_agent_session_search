@@ -128,15 +128,19 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "franken-agent-detection",
         crate_package_name: "franken-agent-detection",
         manifest_package_field: None,
-        // GH#416: registry pin. crates.io 0.2.2 is the upstream release tag
-        // f19e7e0 (2026-09: cursor/antigravity/grok scan-root scoping plus the
-        // aider/copilot-cli/amp/opencode/clawdbot/muse session-loss fixes).
+        // GH#416: registry pin. crates.io 0.2.3 (2026-09-07) probes the
+        // Antigravity IDE store as well as the agy CLI store (cass#454),
+        // honors CLAUDE_CONFIG_DIR/XDG_CONFIG_HOME for Claude Code (cass#448),
+        // and carries the Codex token-usage, Claude tool-result, Cursor/OpenCode
+        // dedupe and Shelley canonical-discovery fixes on top of 0.2.2's
+        // (upstream tag f19e7e0) cursor/antigravity/grok scan-root scoping and
+        // aider/copilot-cli/amp/opencode/clawdbot/muse session-loss fixes.
         // The Shelley connector, FAD#22 source-boundary seam, and the
         // chatgpt/omp injection seams live past this tag and wait on the next
         // publish. crates.io refuses git dependencies, hence version-only.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.2.2",
+        expected_version: "0.2.3",
         expected_features: &[
             "chatgpt",
             "connectors",
@@ -183,7 +187,10 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensearch",
         crate_package_name: "frankensearch",
         manifest_package_field: None,
-        // Registry pin (gh#429, gh#410). 0.4.2 extends the native Windows Quill
+        // Registry pin (gh#429, gh#410). 0.4.3 (quill 0.2.3, cass#453) is
+        // published but not adoptable: its quill calls
+        // `asupersync::Cx::is_cancelled`, unreleased in every asupersync 0.4.x.
+        // 0.4.2 extends the native Windows Quill
         // publication line with the explicit multilingual MiniLM embedding
         // profile while preserving the first crates.io line carrying
         // the pure-Rust `native` feature and the explicit `cass-compat` ->

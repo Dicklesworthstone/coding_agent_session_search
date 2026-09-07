@@ -130,8 +130,12 @@ bytemuck = "1.25.0"
 # Registry pin (gh#410): 0.4.2 adds the distinct opt-in multilingual native
 # embedding space to the Windows Quill publication line introduced in 0.4.1;
 # registry 0.3.2 was a stale same-version twin and must never be resolved.
+# 0.4.3 (gh#453 receipt-clocked segment sweep) is published but NOT adoptable
+# yet: registry `frankensearch-quill 0.2.3` calls `asupersync::Cx::is_cancelled`,
+# which exists only on unreleased asupersync main (no 0.4.x release has it), so
+# it fails to compile against any registry asupersync (verified 2026-09-07).
 frankensearch = { version = "=0.4.2", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
-franken-agent-detection = { version = "=0.2.2", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes"] }
+franken-agent-detection = { version = "=0.2.3", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
