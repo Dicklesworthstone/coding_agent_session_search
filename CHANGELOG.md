@@ -188,20 +188,9 @@ Everything below is on `main`; nothing is in a released binary yet.
   duplicating it.
 
 ### Changed
-- `frankensearch` pinned from crates.io `=0.4.2` to `=0.4.3` (with the
-  `frankensearch-quill 0.2.3` engine): the writer-open garbage sweep ages a
-  merge-retired segment from its retirement receipt alone, so back-to-back
-  incremental runs (or `cass index --gc`) reclaim folded inputs once 300 s
-  have passed since the publication that retired them, regardless of how
-  many runs happened since (GH #453).
-- `franken-agent-detection` pinned from crates.io `=0.2.2` to `=0.2.3`: the
-  Antigravity connector probes the IDE store (`~/.gemini/antigravity`) as
-  well as the `agy` CLI store, so IDE sessions index without
-  `CASS_ANTIGRAVITY_DATA_ROOT` (GH #454); Claude Code detection honors
-  `CLAUDE_CONFIG_DIR` / `XDG_CONFIG_HOME` (GH #448); Codex token usage is
-  read from real rollouts; Claude tool results are kept as `role:"tool"`
-  messages; Cursor/OpenCode mirrors are deduped; the 100 MB scan cap applies
-  to every connector. The new `devin` connector feature is not enabled here.
+- `frankensearch` remains pinned to crates.io `=0.4.2`, and
+  `franken-agent-detection` remains pinned to `=0.2.2`. Later upstream
+  connector and segment-reclamation changes are not included in these pins.
 - Upgraded the complete FrankenSQLite family from the `0.3.13` line in v0.7.1
   to registry `0.3.18`. This adds parameterized rowid seeks (GH#415/cass#382),
   read-only WAL byte/timestamp preservation, reader-registration error
