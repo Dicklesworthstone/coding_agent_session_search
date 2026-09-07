@@ -1204,7 +1204,8 @@ fn gate3_schema_parity_transitioned_db_matches_fresh_frankensqlite_db() {
     let db_a_path = dir.path().join("db_a_rusqlite_then_transition.db");
     let db_b_path = dir.path().join("db_b_fresh_frankensqlite.db");
 
-    // DB-A: create with rusqlite-backed cass storage, then transition via FrankenStorage.
+    // DB-A: create through CASS's established storage path, then reopen through
+    // FrankenStorage. Both paths now use FrankenSQLite; gate2 covers C-SQLite interop.
     {
         let storage = SqliteStorage::open(&db_a_path).expect("create db-a with SqliteStorage");
         assert_eq!(
