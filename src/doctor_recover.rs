@@ -339,10 +339,9 @@ pub fn run_doctor_recover_from_archive(
                     coercions,
                 } => (*conversation, coercions),
                 RecoveryConversationRow::Quarantined { id, coercions } => {
-                    // #391: the id is an integer but an identity column was
-                    // not text — a mis-typed aliased record, not a
-                    // conversation. Exporting it would file some other
-                    // conversation's messages under a synthetic identity.
+                    // #391: identity types are inconsistent with CASS's
+                    // contract, so messages cannot safely be attributed to
+                    // this row. The types alone do not diagnose page aliasing.
                     // Count it, keep paging past its id, export nothing.
                     after_id = after_id.max(id);
                     skipped += 1;
@@ -354,8 +353,8 @@ pub fn run_doctor_recover_from_archive(
                         written_path: None,
                         line_count: 0,
                         skipped_reason: Some(
-                            "quarantined canonical row: identity columns were not text (mis-typed \
-                             aliased record, not a conversation)"
+                            "quarantined canonical row: identity columns violate the text/path \
+                             contract; message ownership cannot be verified"
                                 .to_string(),
                         ),
                         coercions,

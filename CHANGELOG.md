@@ -81,11 +81,10 @@ Everything below is on `main`; nothing is in a released binary yet.
 - `cass doctor --recover-from-archive` quarantines a canonical row whose
   identity columns (`agent_slug`, `workspace`, `external_id`, `source_path`,
   `source_id`, `origin_host`) held a non-text value, or whose `source_path`
-  was NULL in its NOT NULL column, instead of exporting it under a synthetic
-  identity (GH #391). Such a row is a foreign cell decoded through the
-  `conversations` schema — an aliased page from another tree — not a
-  conversation with one damaged cell, and its integer `id` would have filed
-  some other conversation's messages under it. The row is counted
+  was NULL or empty, instead of exporting it under a synthetic identity
+  (GH #391). Those values violate CASS's identity contract; their types alone
+  do not prove page aliasing or establish which messages belong to the row.
+  The row is counted
   (`rows_quarantined` in the JSON envelope and the text summary), listed in
   `sessions` with a `quarantined canonical row` reason and its coercions,
   and paging continues past it; a row whose only coercions are title or

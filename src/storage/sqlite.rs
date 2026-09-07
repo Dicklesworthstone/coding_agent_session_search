@@ -1454,13 +1454,12 @@ pub enum RecoveryConversationRow {
     /// The row's `id` is an integer, but an identity column (`agent_slug`,
     /// `workspace`, `external_id`, `source_path`, `source_id`, `origin_host`)
     /// held a non-text value, or `source_path` was NULL/empty in its NOT NULL
-    /// column. A healthy engine never stores those under TEXT affinity, so
-    /// the row is a mis-typed cell decoded through the `conversations` schema
-    /// (#391: an aliased page from another tree), not a conversation with one
-    /// damaged cell. Its `id` would address some other conversation's
-    /// messages, so it is quarantined — skipped and counted — rather than
-    /// exported under a synthetic identity. `coercions` lists every coerced
-    /// column, identity columns first.
+    /// column. These values violate CASS's identity contract. They can occur
+    /// when a damaged page decodes a foreign record (#391), but the types
+    /// alone do not establish that cause: SQLite also permits BLOB values
+    /// in a TEXT-affinity column. Skip and count the row rather than risk
+    /// exporting messages under an invented identity. `coercions` lists
+    /// every coerced column, identity columns first.
     Quarantined { id: i64, coercions: Vec<String> },
     /// The row's `id` itself was not an integer, so nothing downstream can
     /// address it; `stored_id` is the offending value's SQLite type name
@@ -1469,8 +1468,8 @@ pub enum RecoveryConversationRow {
 }
 
 /// Read a schema-`TEXT` column leniently: NULL stays `None`, text is taken
-/// as-is, and numeric or blob values (which a healthy engine never stores
-/// under TEXT affinity) are coerced to text and recorded in `coercions`.
+/// as-is, and numeric or blob values are coerced to text and recorded in
+/// `coercions`. TEXT affinity does not prevent a stored BLOB value.
 fn lenient_text_column(
     row: &FrankenRow,
     idx: usize,
