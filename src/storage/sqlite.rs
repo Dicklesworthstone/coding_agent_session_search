@@ -32676,8 +32676,8 @@ mod tests {
 
     #[test]
     fn literal_rowid_in_list_plans_as_primary_key_seek() -> anyhow::Result<()> {
-        // GH #382 (semantic hydration stall): frankensqlite plans a
-        // parameterized `WHERE id IN (?,?)` over `messages` as a full SCAN,
+        // GH #382 (semantic hydration stall): FrankenSQLite through 0.3.17
+        // planned parameterized `WHERE id IN (?,?)` as a full messages SCAN,
         // so search hydration renders the ids as literals. Pin the plan the
         // literal form gets so an engine or query regression is caught here
         // rather than as a multi-minute hydration on a large archive.
