@@ -7,10 +7,16 @@ fn test_query_after_migrations() {
 
     let fs = FrankenStorage::open(&db_path).unwrap();
 
-    // Instead of querying sqlite_master, try querying the table directly
-    let res = fs.raw().query("SELECT 1 FROM meta LIMIT 1;");
-    println!("query meta direct: {:?}", res.is_ok());
+    let rows = fs
+        .raw()
+        .query("SELECT 1 FROM meta LIMIT 1;")
+        .expect("the migrated meta table must be queryable");
+    assert_eq!(rows.len(), 1, "migrations must populate the meta table");
 
-    let res = fs.raw().query("SELECT 1 FROM non_existent_table LIMIT 1;");
-    println!("query non_existent: {:?}", res.is_ok());
+    assert!(
+        fs.raw()
+            .query("SELECT 1 FROM non_existent_table LIMIT 1;")
+            .is_err(),
+        "a missing table must return an error instead of an empty result"
+    );
 }
