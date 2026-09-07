@@ -7635,3 +7635,159 @@ fn doctor_reports_integrity_unchecked_reason_code_when_the_deep_probe_is_deferre
         "{deferred:#}"
     );
 }
+
+/// GH #391: `doctor --recover-from-archive` quarantines a canonical row whose
+/// identity columns were not text (a mis-typed aliased record, not a
+/// conversation with one damaged cell) and reports it in both output modes,
+/// while a row with only a coerced title is still exported.
+#[test]
+fn recover_from_archive_reports_quarantined_and_coerced_rows() {
+    use coding_agent_search::franken_sync::params;
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let data_dir = temp.path().join("data");
+    fs::create_dir_all(&home).expect("home");
+    fs::create_dir_all(&data_dir).expect("data dir");
+    let db_path = data_dir.join("agent_search.db");
+
+    let mut ids = BTreeMap::new();
+    {
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+        let conn = storage.raw();
+        conn.execute_compat(
+            "INSERT INTO agents(slug, name, version, kind, created_at, updated_at) \
+             VALUES('claude', 'Claude Code', NULL, 'cli', 1000, 1000)",
+            params![],
+        )
+        .expect("insert agent");
+        let agent_id: i64 = conn
+            .query_row_map("SELECT last_insert_rowid()", params![], |row| {
+                row.get_typed::<i64>(0)
+            })
+            .expect("agent id");
+        for (external_id, source_path) in [
+            ("sess-ok", "/orig/ok.jsonl"),
+            ("sess-title", "/orig/title.jsonl"),
+            ("sess-alias", "/orig/alias.jsonl"),
+        ] {
+            conn.execute_compat(
+                "INSERT INTO conversations(agent_id, external_id, title, source_path, started_at) \
+                 VALUES(?1, ?2, 'untitled', ?3, 1000)",
+                params![agent_id, external_id, source_path],
+            )
+            .expect("insert conversation");
+            let cid: i64 = conn
+                .query_row_map("SELECT last_insert_rowid()", params![], |row| {
+                    row.get_typed::<i64>(0)
+                })
+                .expect("conversation id");
+            // One preserved raw line each, so a readable row has something to export.
+            let wrapper = json!({
+                "__cass_historical_raw_json__":
+                    format!(r#"{{"type":"user","uuid":"u{cid}","text":"hi"}}"#)
+            })
+            .to_string();
+            conn.execute_compat(
+                "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) \
+                 VALUES(?1, 0, 'user', NULL, 1000, 'hi', ?2, NULL)",
+                params![cid, wrapper],
+            )
+            .expect("insert message");
+            ids.insert(external_id, cid);
+        }
+        // TEXT affinity converts numerics on write but stores a BLOB as-is, so
+        // a blob is the mis-typed value that can be planted through SQL.
+        conn.execute_compat(
+            "UPDATE conversations SET title = X'DEADBEEF' WHERE id = ?1",
+            params![ids["sess-title"]],
+        )
+        .expect("plant title blob");
+        conn.execute_compat(
+            "UPDATE conversations SET source_path = X'DEADBEEF' WHERE id = ?1",
+            params![ids["sess-alias"]],
+        )
+        .expect("plant source_path blob");
+    }
+
+    let target = temp.path().join("recovered-json");
+    let out = cass_cmd(&home)
+        .args([
+            "doctor",
+            "--recover-from-archive",
+            target.to_str().expect("utf8"),
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+            "--db",
+            db_path.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run recover");
+    assert!(
+        out.status.success(),
+        "recover failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&out.stdout).expect("recover JSON");
+    assert_eq!(envelope["sessions_written"], json!(2), "{envelope:#}");
+    assert_eq!(envelope["sessions_skipped"], json!(1), "{envelope:#}");
+    assert_eq!(envelope["rows_unreadable"], json!(0), "{envelope:#}");
+    assert_eq!(envelope["rows_quarantined"], json!(1), "{envelope:#}");
+    assert_eq!(envelope["rows_coerced"], json!(1), "{envelope:#}");
+    let sessions = envelope["sessions"].as_array().expect("sessions array");
+    let quarantined = sessions
+        .iter()
+        .find(|s| s["conversation_id"] == json!(ids["sess-alias"]))
+        .expect("quarantined row is listed");
+    assert!(quarantined["written_path"].is_null(), "{quarantined:#}");
+    assert!(
+        quarantined["skipped_reason"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("quarantined canonical row")),
+        "{quarantined:#}"
+    );
+    assert!(
+        quarantined["coercions"][0]
+            .as_str()
+            .is_some_and(|c| c.starts_with("source_path: 4-byte blob")),
+        "{quarantined:#}"
+    );
+    let coerced = sessions
+        .iter()
+        .find(|s| s["conversation_id"] == json!(ids["sess-title"]))
+        .expect("coerced row is listed");
+    assert!(coerced["written_path"].is_string(), "{coerced:#}");
+    assert!(coerced["skipped_reason"].is_null(), "{coerced:#}");
+    assert!(
+        coerced["coercions"][0]
+            .as_str()
+            .is_some_and(|c| c.starts_with("title: 4-byte blob")),
+        "{coerced:#}"
+    );
+
+    let target_text = temp.path().join("recovered-text");
+    let out = cass_cmd(&home)
+        .args([
+            "doctor",
+            "--recover-from-archive",
+            target_text.to_str().expect("utf8"),
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+            "--db",
+            db_path.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run recover (text)");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stdout={stdout}");
+    assert!(stdout.contains("Recovered 2 session(s)"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "0 unreadable, 1 quarantined (identity columns mis-typed), 1 with coerced column types"
+        ),
+        "{stdout}"
+    );
+}

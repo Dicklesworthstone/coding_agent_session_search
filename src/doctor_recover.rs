@@ -307,6 +307,7 @@ pub fn run_doctor_recover_from_archive(
     let mut written = 0usize;
     let mut skipped = 0usize;
     let mut unreadable_rows = 0usize;
+    let mut quarantined_rows = 0usize;
     let mut coerced_rows = 0usize;
     let mut total_lines = 0usize;
 
@@ -337,6 +338,30 @@ pub fn run_doctor_recover_from_archive(
                     conversation,
                     coercions,
                 } => (*conversation, coercions),
+                RecoveryConversationRow::Quarantined { id, coercions } => {
+                    // #391: the id is an integer but an identity column was
+                    // not text — a mis-typed aliased record, not a
+                    // conversation. Exporting it would file some other
+                    // conversation's messages under a synthetic identity.
+                    // Count it, keep paging past its id, export nothing.
+                    after_id = after_id.max(id);
+                    skipped += 1;
+                    quarantined_rows += 1;
+                    results.push(ReconstructedSession {
+                        conversation_id: Some(id),
+                        external_id: None,
+                        relative_or_source_path: format!("<quarantined row: id {id}>"),
+                        written_path: None,
+                        line_count: 0,
+                        skipped_reason: Some(
+                            "quarantined canonical row: identity columns were not text (mis-typed \
+                             aliased record, not a conversation)"
+                                .to_string(),
+                        ),
+                        coercions,
+                    });
+                    continue;
+                }
                 RecoveryConversationRow::Unreadable { stored_id, reason } => {
                     // #391: a row whose id is not an integer cannot be addressed
                     // for message reconstruction. Record it and keep exporting
@@ -455,6 +480,7 @@ pub fn run_doctor_recover_from_archive(
         "sessions_skipped": skipped,
         // #391: rows the strict reader would have aborted the export on.
         "rows_unreadable": unreadable_rows,
+        "rows_quarantined": quarantined_rows,
         "rows_coerced": coerced_rows,
         "lines_written": total_lines,
         "sessions": results
@@ -485,12 +511,12 @@ pub fn run_doctor_recover_from_archive(
         );
         if skipped > 0 {
             println!(
-                "  {skipped} conversation(s) were skipped (no preserved events, or unreadable)."
+                "  {skipped} conversation(s) were skipped (no preserved events, unreadable, or quarantined)."
             );
         }
-        if unreadable_rows > 0 || coerced_rows > 0 {
+        if unreadable_rows > 0 || quarantined_rows > 0 || coerced_rows > 0 {
             println!(
-                "  Damaged canonical rows tolerated: {unreadable_rows} unreadable, {coerced_rows} with coerced column types (see --json for details)."
+                "  Damaged canonical rows tolerated: {unreadable_rows} unreadable, {quarantined_rows} quarantined (identity columns mis-typed), {coerced_rows} with coerced column types (see --json for details)."
             );
         }
         println!(
@@ -1739,7 +1765,7 @@ mod tests {
         let rows: Vec<RecoveryConversationRow> = storage
             .raw()
             .query_map_collect(
-                "SELECT ?1, 'claude', NULL, 4242, 7, ?2, 1000, 'not-a-timestamp', 1.5,
+                "SELECT ?1, 'claude', NULL, 'sess-bad', 7, ?2, 1000, 'not-a-timestamp', 1.5,
                         NULL, 'local', NULL, NULL",
                 &[
                     ParamValue::from(damaged),
@@ -1757,17 +1783,16 @@ mod tests {
                 coercions,
             } => {
                 assert_eq!(conversation.id, Some(damaged));
-                assert_eq!(conversation.external_id.as_deref(), Some("4242"));
+                assert_eq!(conversation.external_id.as_deref(), Some("sess-bad"));
                 assert_eq!(conversation.title.as_deref(), Some("7"));
                 assert_eq!(conversation.started_at, Some(1000));
                 assert_eq!(conversation.ended_at, None, "unparseable text is dropped");
                 assert_eq!(conversation.approx_tokens, Some(1), "real truncates");
-                assert_eq!(coercions.len(), 4, "{coercions:?}");
-                assert!(coercions[0].starts_with("external_id: integer 4242"));
-                assert!(coercions[1].starts_with("title: integer 7"));
-                assert!(coercions[2].contains("ended_at: text \"not-a-timestamp\""));
-                assert!(coercions[2].ends_with("(dropped)"));
-                assert!(coercions[3].starts_with("approx_tokens: real 1.5"));
+                assert_eq!(coercions.len(), 3, "{coercions:?}");
+                assert!(coercions[0].starts_with("title: integer 7"));
+                assert!(coercions[1].contains("ended_at: text \"not-a-timestamp\""));
+                assert!(coercions[1].ends_with("(dropped)"));
+                assert!(coercions[2].starts_with("approx_tokens: real 1.5"));
             }
             other => panic!("expected a readable row, got {other:?}"),
         }
@@ -1820,6 +1845,192 @@ mod tests {
                 .list_conversations_for_recovery(damaged, 10)
                 .expect("past the end")
                 .is_empty()
+        );
+    }
+
+    /// Plant a BLOB in a declared-TEXT column. TEXT affinity converts numerics
+    /// on write but stores a blob as-is, so this is the one mis-typed value
+    /// that can be planted through SQL (the shape stock SQLite reports as
+    /// "NUMERIC value in conversations.title" otherwise needs a damaged page).
+    fn plant_blob(storage: &FrankenStorage, conversation_id: i64, column: &str) {
+        storage
+            .raw()
+            .execute_compat(
+                &format!("UPDATE conversations SET {column} = X'DEADBEEF' WHERE id = ?1"),
+                &[ParamValue::from(conversation_id)] as &[ParamValue],
+            )
+            .expect("plant blob");
+    }
+
+    #[test]
+    fn recovery_listing_quarantines_rows_with_mistyped_identity_columns() {
+        // #391: an aliased page decodes a foreign cell through the
+        // `conversations` schema, so an identity column (`source_path`,
+        // `external_id`, ...) holds a non-text value. Such a row is not a
+        // conversation with one damaged cell — its `id` would address some
+        // other conversation's messages — so it is quarantined, while a row
+        // whose only coercions are title/timestamps still exports.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+        let agent_id = seed_agent(&storage);
+        let healthy = seed_conversation(&storage, agent_id, "sess-ok", "/orig/ok.jsonl");
+        let coerced = seed_conversation(&storage, agent_id, "sess-title", "/orig/title.jsonl");
+        let aliased = seed_conversation(&storage, agent_id, "sess-alias", "/orig/alias.jsonl");
+        plant_blob(&storage, coerced, "title");
+        plant_blob(&storage, aliased, "source_path");
+
+        let page = storage
+            .list_conversations_for_recovery(0, 10)
+            .expect("page");
+        assert_eq!(page.len(), 3, "{page:?}");
+        let RecoveryConversationRow::Readable {
+            conversation,
+            coercions,
+        } = &page[0]
+        else {
+            panic!("healthy row must be readable: {:?}", page[0]);
+        };
+        assert_eq!(conversation.id, Some(healthy));
+        assert!(coercions.is_empty());
+        let RecoveryConversationRow::Readable {
+            conversation,
+            coercions,
+        } = &page[1]
+        else {
+            panic!(
+                "a row with only a coerced title must stay readable: {:?}",
+                page[1]
+            );
+        };
+        assert_eq!(conversation.id, Some(coerced));
+        assert_eq!(conversation.source_path, Path::new("/orig/title.jsonl"));
+        assert_eq!(coercions.len(), 1, "{coercions:?}");
+        assert!(coercions[0].starts_with("title: 4-byte blob"));
+        let RecoveryConversationRow::Quarantined { id, coercions } = &page[2] else {
+            panic!(
+                "a row with a mis-typed source_path must be quarantined: {:?}",
+                page[2]
+            );
+        };
+        assert_eq!(*id, aliased);
+        assert_eq!(coercions.len(), 1, "{coercions:?}");
+        assert!(coercions[0].starts_with("source_path: 4-byte blob"));
+
+        // Paging by id continues past a quarantined row.
+        let rest = storage
+            .list_conversations_for_recovery(aliased, 10)
+            .expect("past the end");
+        assert!(rest.is_empty(), "{rest:?}");
+
+        // The other shapes an aliased page presents, exercised on the mapper
+        // with the listing projection: an integer or NULL where `source_path`
+        // is declared, an integer `external_id`, an integer `source_id`.
+        let mapper = |row: &crate::franken_sync::Row| {
+            Ok(crate::storage::sqlite::recovery_conversation_row_from_lenient_columns(row))
+        };
+        for (sql, expect) in [
+            (
+                "SELECT ?1, 'claude', NULL, 'sess-x', 7, 1700000000, 1000, NULL, NULL,
+                        NULL, 'local', NULL, NULL",
+                "source_path: integer 1700000000",
+            ),
+            (
+                "SELECT ?1, 'claude', NULL, 'sess-x', NULL, NULL, 1000, NULL, NULL,
+                        NULL, 'local', NULL, NULL",
+                "source_path: NULL or empty",
+            ),
+            (
+                "SELECT ?1, 'claude', NULL, 4242, NULL, '/p', 1000, NULL, NULL,
+                        NULL, 'local', NULL, NULL",
+                "external_id: integer 4242",
+            ),
+            (
+                "SELECT ?1, 'claude', NULL, 'sess-x', NULL, '/p', 1000, NULL, NULL,
+                        NULL, 99, NULL, NULL",
+                "source_id: integer 99",
+            ),
+        ] {
+            let rows: Vec<RecoveryConversationRow> = storage
+                .raw()
+                .query_map_collect(sql, &[ParamValue::from(aliased)] as &[ParamValue], mapper)
+                .expect("query");
+            match &rows[0] {
+                RecoveryConversationRow::Quarantined { id, coercions } => {
+                    assert_eq!(*id, aliased);
+                    assert!(coercions[0].starts_with(expect), "{sql}: {coercions:?}");
+                }
+                other => panic!("{sql}: expected a quarantined row, got {other:?}"),
+            }
+        }
+        // Identity coercions are listed before content coercions on the same row.
+        let rows: Vec<RecoveryConversationRow> = storage
+            .raw()
+            .query_map_collect(
+                "SELECT ?1, 'claude', NULL, 'sess-x', 7, 1700000000, 1000, NULL, NULL,
+                        NULL, 'local', NULL, NULL",
+                &[ParamValue::from(aliased)] as &[ParamValue],
+                mapper,
+            )
+            .expect("query");
+        let RecoveryConversationRow::Quarantined { coercions, .. } = &rows[0] else {
+            panic!("expected a quarantined row, got {:?}", rows[0]);
+        };
+        assert_eq!(coercions.len(), 2, "{coercions:?}");
+        assert!(coercions[0].starts_with("source_path: integer 1700000000"));
+        assert!(coercions[1].starts_with("title: integer 7"));
+    }
+
+    #[test]
+    fn recover_from_archive_quarantines_mistyped_rows_and_exports_coerced_ones() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("agent_search.db");
+        let target = tmp.path().join("recovered");
+        {
+            let storage = FrankenStorage::open(&db_path).expect("open db");
+            let agent_id = seed_agent(&storage);
+            let healthy = seed_conversation(&storage, agent_id, "sess-ok", "/orig/ok.jsonl");
+            let coerced = seed_conversation(&storage, agent_id, "sess-title", "/orig/title.jsonl");
+            let aliased = seed_conversation(&storage, agent_id, "sess-alias", "/orig/alias.jsonl");
+            for cid in [healthy, coerced, aliased] {
+                write_message(
+                    &storage,
+                    cid,
+                    0,
+                    &format!(r#"{{"type":"user","uuid":"u{cid}","text":"hi"}}"#),
+                );
+            }
+            plant_blob(&storage, coerced, "title");
+            plant_blob(&storage, aliased, "source_path");
+        }
+
+        run_doctor_recover_from_archive(
+            Some(tmp.path().to_path_buf()),
+            Some(db_path.clone()),
+            target.clone(),
+            Some(RobotFormat::Json),
+        )
+        .expect("recover");
+
+        let mut written: Vec<String> = std::fs::read_dir(&target)
+            .expect("read recovered dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".jsonl"))
+            .collect();
+        written.sort();
+        assert_eq!(written.len(), 2, "{written:?}");
+        assert!(
+            written.iter().any(|n| n.starts_with("sess-ok")),
+            "{written:?}"
+        );
+        assert!(
+            written.iter().any(|n| n.starts_with("sess-title")),
+            "a row with only a coerced title still exports: {written:?}"
+        );
+        assert!(
+            !written.iter().any(|n| n.starts_with("sess-alias")),
+            "a quarantined row must not be exported: {written:?}"
         );
     }
 }

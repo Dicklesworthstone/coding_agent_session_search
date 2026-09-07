@@ -1443,12 +1443,25 @@ fn franken_read_metadata_compat(
 /// [`FrankenStorage::list_conversations_for_recovery`].
 #[derive(Debug)]
 pub enum RecoveryConversationRow {
-    /// The row was readable, possibly after coercing columns whose stored
-    /// type disagreed with the schema; `coercions` names each such column.
+    /// The row was readable, possibly after coercing content columns (title,
+    /// timestamps, token count) whose stored type disagreed with the schema;
+    /// `coercions` names each such column. Identity columns are never
+    /// coerced here — see [`Self::Quarantined`].
     Readable {
         conversation: Box<Conversation>,
         coercions: Vec<String>,
     },
+    /// The row's `id` is an integer, but an identity column (`agent_slug`,
+    /// `workspace`, `external_id`, `source_path`, `source_id`, `origin_host`)
+    /// held a non-text value, or `source_path` was NULL/empty in its NOT NULL
+    /// column. A healthy engine never stores those under TEXT affinity, so
+    /// the row is a mis-typed cell decoded through the `conversations` schema
+    /// (#391: an aliased page from another tree), not a conversation with one
+    /// damaged cell. Its `id` would address some other conversation's
+    /// messages, so it is quarantined — skipped and counted — rather than
+    /// exported under a synthetic identity. `coercions` lists every coerced
+    /// column, identity columns first.
+    Quarantined { id: i64, coercions: Vec<String> },
     /// The row's `id` itself was not an integer, so nothing downstream can
     /// address it; `stored_id` is the offending value's SQLite type name
     /// (`text`, `blob`, ...) or `<missing>` — never its content.
@@ -1543,25 +1556,39 @@ pub(crate) fn recovery_conversation_row_from_lenient_columns(
             };
         }
     };
+    // Identity columns are tracked apart from content columns: a coercion on
+    // any of them quarantines the row (see `RecoveryConversationRow::
+    // Quarantined`), whereas a coerced title or timestamp still leaves an
+    // addressable conversation worth exporting.
+    let mut identity_coercions = Vec::new();
     let mut coercions = Vec::new();
-    let agent_slug = lenient_text_column(row, 1, "agent_slug", &mut coercions)
+    let agent_slug = lenient_text_column(row, 1, "agent_slug", &mut identity_coercions)
         .filter(|slug| !slug.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
-    let workspace = lenient_text_column(row, 2, "workspace", &mut coercions)
+    let workspace = lenient_text_column(row, 2, "workspace", &mut identity_coercions)
         .map(|p| Path::new(&p).to_path_buf());
-    let external_id = lenient_text_column(row, 3, "external_id", &mut coercions);
+    let external_id = lenient_text_column(row, 3, "external_id", &mut identity_coercions);
     let title = lenient_text_column(row, 4, "title", &mut coercions);
-    let source_path = lenient_text_column(row, 5, "source_path", &mut coercions)
+    let source_path = lenient_text_column(row, 5, "source_path", &mut identity_coercions)
         .filter(|p| !p.is_empty())
         .unwrap_or_else(|| {
-            coercions.push("source_path: NULL or empty in NOT NULL column".to_string());
-            format!("<unreadable-source-path-{id}>")
+            identity_coercions.push("source_path: NULL or empty in NOT NULL column".to_string());
+            // Never exported: the identity coercion just recorded quarantines
+            // the row below.
+            String::new()
         });
     let started_at = lenient_integer_column(row, 6, "started_at", &mut coercions);
     let ended_at = lenient_integer_column(row, 7, "ended_at", &mut coercions);
     let approx_tokens = lenient_integer_column(row, 8, "approx_tokens", &mut coercions);
-    let raw_source_id = lenient_text_column(row, 10, "source_id", &mut coercions);
-    let raw_origin_host = lenient_text_column(row, 11, "origin_host", &mut coercions);
+    let raw_source_id = lenient_text_column(row, 10, "source_id", &mut identity_coercions);
+    let raw_origin_host = lenient_text_column(row, 11, "origin_host", &mut identity_coercions);
+    if !identity_coercions.is_empty() {
+        identity_coercions.extend(coercions);
+        return RecoveryConversationRow::Quarantined {
+            id,
+            coercions: identity_coercions,
+        };
+    }
     let (source_id, _, origin_host) =
         normalized_storage_source_parts(raw_source_id.as_deref(), None, raw_origin_host.as_deref());
     RecoveryConversationRow::Readable {
@@ -9977,8 +10004,10 @@ impl FrankenStorage {
     /// archive, aborted with nothing written. This reader keys by `id` (no
     /// `ORDER BY started_at` sort over a damaged tree) and maps each row
     /// leniently: numeric/blob values in text columns are coerced to text and
-    /// reported as coercions, non-integer timestamps are dropped, and a row
-    /// whose `id` is unreadable is returned as
+    /// reported as coercions, non-integer timestamps are dropped, a row whose
+    /// identity columns were not text is returned as
+    /// [`RecoveryConversationRow::Quarantined`] (a mis-typed aliased record,
+    /// not a conversation), and a row whose `id` is unreadable is returned as
     /// [`RecoveryConversationRow::Unreadable`] instead of failing the page.
     /// Engine-level page errors still surface as `Err`.
     pub fn list_conversations_for_recovery(

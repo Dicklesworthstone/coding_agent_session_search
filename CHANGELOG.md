@@ -73,6 +73,18 @@ Everything below is on `main`; nothing is in a released binary yet.
   40-segment generation is folded by a plain `cass index`).
 
 ### Fixed
+- `cass doctor --recover-from-archive` quarantines a canonical row whose
+  identity columns (`agent_slug`, `workspace`, `external_id`, `source_path`,
+  `source_id`, `origin_host`) held a non-text value, or whose `source_path`
+  was NULL in its NOT NULL column, instead of exporting it under a synthetic
+  identity (GH #391). Such a row is a foreign cell decoded through the
+  `conversations` schema — an aliased page from another tree — not a
+  conversation with one damaged cell, and its integer `id` would have filed
+  some other conversation's messages under it. The row is counted
+  (`rows_quarantined` in the JSON envelope and the text summary), listed in
+  `sessions` with a `quarantined canonical row` reason and its coercions,
+  and paging continues past it; a row whose only coercions are title or
+  timestamp columns is still exported and reported under `rows_coerced`.
 - Search hydrates message IDs using validated integer literals, avoiding the
   FrankenSQLite parameterized-`IN` query shape that could return no message
   bodies even when Quill found matching documents (`6057b8e4`).
@@ -165,6 +177,20 @@ Everything below is on `main`; nothing is in a released binary yet.
   duplicating it.
 
 ### Changed
+- `frankensearch` pinned from crates.io `=0.4.2` to `=0.4.3` (with the
+  `frankensearch-quill 0.2.3` engine): the writer-open garbage sweep ages a
+  merge-retired segment from its retirement receipt alone, so back-to-back
+  incremental runs (or `cass index --gc`) reclaim folded inputs once 300 s
+  have passed since the publication that retired them, regardless of how
+  many runs happened since (GH #453).
+- `franken-agent-detection` pinned from crates.io `=0.2.2` to `=0.2.3`: the
+  Antigravity connector probes the IDE store (`~/.gemini/antigravity`) as
+  well as the `agy` CLI store, so IDE sessions index without
+  `CASS_ANTIGRAVITY_DATA_ROOT` (GH #454); Claude Code detection honors
+  `CLAUDE_CONFIG_DIR` / `XDG_CONFIG_HOME` (GH #448); Codex token usage is
+  read from real rollouts; Claude tool results are kept as `role:"tool"`
+  messages; Cursor/OpenCode mirrors are deduped; the 100 MB scan cap applies
+  to every connector. The new `devin` connector feature is not enabled here.
 - Upgraded the complete FrankenSQLite family from the `0.3.13` line in v0.7.1
   to registry `0.3.17`. This includes incremental WAL-tail folding (GH#382),
   reserved lock-byte/freelist repair (GH#410), FTS metadata and foreign-write
