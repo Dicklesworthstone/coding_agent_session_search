@@ -73,6 +73,15 @@ Everything below is on `main`; nothing is in a released binary yet.
   40-segment generation is folded by a plain `cass index`).
 
 ### Fixed
+- Search hydrates message IDs using validated integer literals, avoiding the
+  FrankenSQLite parameterized-`IN` query shape that could return no message
+  bodies even when Quill found matching documents (`6057b8e4`).
+- Answer packs verify citations against ingested, redacted source messages,
+  bind evidence IDs to the verified spans, and retain the same excerpts across
+  JSON and Markdown projections. Whole-message skill and hook injections are
+  excluded before truncation. The serialized output must fit the requested
+  token budget; an envelope that cannot retain required evidence returns
+  `pack-budget-too-small` (exit 2).
 - The full-rebuild headroom preflight (`cass index --full`, doctor's
   `full_rebuild_readiness`) doubles only the LIVE lexical bytes — what the
   current MANIFEST references — instead of the recursive size of `index/`
@@ -146,22 +155,30 @@ Everything below is on `main`; nothing is in a released binary yet.
   `rows_coerced` in the JSON envelope), and treats a failed total count as
   reporting-only. Conversations whose message pages are themselves damaged are
   still recorded as `reconstruct failed` and skipped.
-- Antigravity IDE sessions are indexed out of the box (GH #454). The default
+- Antigravity source presets recognize the IDE store (GH #454). The default
   source presets, `cass resume` agent detection, and the docs now cover the
   IDE store `~/.gemini/antigravity/` alongside the `agy` CLI store
-  `~/.gemini/antigravity-cli/`; the connector-side change (probe both roots,
-  key IDE conversations `ide/<uuid>`) lands with the next
-  `franken-agent-detection` release, and a conversation re-keyed from the bare
-  uuid reuses its existing canonical row by transcript path instead of
-  duplicating.
+  `~/.gemini/antigravity-cli/`. Automatic IDE ingestion still awaits the
+  next `franken-agent-detection` release to probe both roots and key IDE
+  conversations as `ide/<uuid>`. A conversation re-keyed from the bare UUID
+  will reuse its existing canonical row by transcript path instead of
+  duplicating it.
 
 ### Changed
+- Upgraded the complete FrankenSQLite family from the `0.3.13` line in v0.7.1
+  to registry `0.3.17`. This includes incremental WAL-tail folding (GH#382),
+  reserved lock-byte/freelist repair (GH#410), FTS metadata and foreign-write
+  visibility fixes (GH#408), incremental FTS segment writes and savepoint undo
+  logs, prefix-BM25 ranking fixes, and prepared-read schema-retry cleanup.
+  All 20 family crates share the exact pin; asupersync remains `0.4.9`.
+  These fixes do not establish repair of an already corrupted archive, and
+  upstream GH#411 mixed-engine concurrent-WAL safety remains unresolved.
 - The index run's final `wal_checkpoint(TRUNCATE)` runs under a wall-clock
   budget (900 s, `CASS_INDEX_FINAL_WAL_CHECKPOINT_TIMEOUT_SECS`): on an archive
   whose frankensqlite writable path loops (GH #382) the run no longer hangs
   after a successful publish; the WAL is left for the next opener and a
   warning names the remedy. The loop itself is fixed upstream in frankensqlite
-  `8d012706a` and cass consumes it with the release that carries it.
+  `8d012706a`, included in the `0.3.17` engine consumed here.
 - The TUI analytics dashboard's load task is one production function with the
   detached-rebuild spawn injected (`load_chart_data_with_auto_rebuild`); the
   test-only stub that returned canned data is gone, and unit tests prove that
