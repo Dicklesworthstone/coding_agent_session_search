@@ -1323,6 +1323,7 @@ fn pack_excludes_skill_payloads_without_losing_ordinary_evidence() {
     let codex_home = home.join(".codex");
     let data_dir = home.join("pack_skill_privacy");
     let ordinary = "skillprivacyneedle ordinary skill design remains useful";
+    let credential = "abcdefghijklmnopqrst";
     util::seed_codex_session(&codex_home, "rollout-ordinary.jsonl", ordinary, false);
     for (index, marker) in [
         "Base directory for this skill:",
@@ -1338,7 +1339,7 @@ fn pack_excludes_skill_payloads_without_losing_ordinary_evidence() {
             &codex_home,
             &format!("rollout-skill-{index}.jsonl"),
             &format!(
-                "skillprivacyneedle onlyinjectedneedle PROPRIETARY PLAYBOOK {} {marker}",
+                "skillprivacyneedle onlyinjectedneedle PROPRIETARY PLAYBOOK Authorization: Bearer {credential}\n{} {marker}",
                 "界".repeat(120)
             ),
             false,
@@ -1436,6 +1437,77 @@ fn pack_excludes_skill_payloads_without_losing_ordinary_evidence() {
             }
             assert_eq!(privacy["skill_content_included"], false);
             assert_eq!(privacy["redaction_applied"], true);
+        }
+        assert_eq!(archive_before, data_tree_snapshot(&data_dir));
+        assert_eq!(sources_before, data_tree_snapshot(&codex_home));
+    }
+
+    for format in ["json", "compact", "jsonl", "toon", "markdown"] {
+        let mut command = cass_cmd(home);
+        command
+            .args([
+                "pack",
+                "skillprivacyneedle",
+                "--include-skill-content",
+                "--mode",
+                "lexical",
+                "--require-evidence",
+                "--freshness-policy",
+                "allow-stale",
+                "--max-excerpt-chars",
+                "800",
+                "--data-dir",
+            ])
+            .arg(&data_dir);
+        if format == "markdown" {
+            command.args(["--display", "markdown"]);
+        } else {
+            command.args(["--robot-format", format]);
+        }
+        let output = command.timeout(Duration::from_secs(20)).output().unwrap();
+        assert!(
+            output.status.success(),
+            "opt-in {format}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains(ordinary), "opt-in {format}");
+        assert!(text.contains("PROPRIETARY PLAYBOOK"), "opt-in {format}");
+        assert!(text.contains("onlyinjectedneedle"), "opt-in {format}");
+        assert!(!text.contains(credential), "opt-in {format}");
+        if format != "markdown" {
+            let value = match format {
+                "jsonl" => {
+                    let records = text
+                        .lines()
+                        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                        .collect::<Vec<_>>();
+                    serde_json::json!({
+                        "evidence": records.iter().filter_map(|record| record.get("evidence")).collect::<Vec<_>>(),
+                        "privacy": records.iter().find_map(|record| record.get("privacy")).unwrap(),
+                        "omitted": records.iter().find_map(|record| record.get("omitted")).unwrap(),
+                    })
+                }
+                "toon" => Value::from(toon::try_decode(&text, None).unwrap()),
+                _ => serde_json::from_str(&text).unwrap(),
+            };
+            let evidence = value["evidence"].as_array().unwrap();
+            assert_eq!(evidence.len(), 6, "opt-in {format}");
+            assert_eq!(value["privacy"]["skill_content_included"], true);
+            assert_eq!(value["privacy"]["redaction_applied"], true);
+            assert_eq!(value["privacy"]["redaction_policy"], "strict");
+            assert!(value["omitted"]["items"].as_array().unwrap().is_empty());
+            for item in evidence {
+                let citation = &item["citation"];
+                assert_eq!(citation["verified"], true, "opt-in {format}");
+                let source = fs::read_to_string(citation["source_path"].as_str().unwrap()).unwrap();
+                assert_eq!(
+                    citation["span_hash"],
+                    blake3::hash(source.lines().nth(1).unwrap().as_bytes())
+                        .to_hex()
+                        .as_str()
+                );
+            }
         }
         assert_eq!(archive_before, data_tree_snapshot(&data_dir));
         assert_eq!(sources_before, data_tree_snapshot(&codex_home));

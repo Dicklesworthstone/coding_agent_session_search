@@ -21,6 +21,11 @@ Reality-check bridge work (see `docs/planning/REALITY_CHECK_AND_BRIDGE_PLAN_2026
 Everything below is on `main`; nothing is in a released binary yet.
 
 ### Added
+- `cass pack --field-mask` selects the existing field projection, including the
+  documented `standard` and `full` presets. `--fields` accepts the same presets.
+- `cass pack --include-skill-content` explicitly includes skill payload excerpts
+  while keeping credential redaction active. Default packs still exclude these
+  payloads; privacy metadata reports only skill evidence retained in the output.
 - `cass bookmarks add|list|search|remove|export|import` — the bookmarks module the
   README advertised is now reachable from the CLI (exit codes 13 not-found, 14 io).
 - `cass search --robot` reports `_meta.lexical_degrade_reason` (`query_fuel_exhausted`)
@@ -85,6 +90,9 @@ Everything below is on `main`; nothing is in a released binary yet.
   `sessions` with a `quarantined canonical row` reason and its coercions,
   and paging continues past it; a row whose only coercions are title or
   timestamp columns is still exported and reported under `rows_coerced`.
+- Full indexing and deliberate repair scans now ignore saved connector cutoffs,
+  so older local sessions are rescanned as requested. Incremental scans retain
+  their connector-specific timestamps.
 - Search hydrates message IDs using validated integer literals, avoiding the
   FrankenSQLite parameterized-`IN` query shape that could return no message
   bodies even when Quill found matching documents (`6057b8e4`).
@@ -94,6 +102,9 @@ Everything below is on `main`; nothing is in a released binary yet.
   excluded before truncation. The serialized output must fit the requested
   token budget; an envelope that cannot retain required evidence returns
   `pack-budget-too-small` (exit 2).
+- Answer-pack source verification receives its phase allowance after planning
+  completes, capped by the remaining request budget. Slow planning no longer
+  consumes the citation-check allowance before verification starts.
 - The full-rebuild headroom preflight (`cass index --full`, doctor's
   `full_rebuild_readiness`) doubles only the LIVE lexical bytes — what the
   current MANIFEST references — instead of the recursive size of `index/`
@@ -192,8 +203,10 @@ Everything below is on `main`; nothing is in a released binary yet.
   messages; Cursor/OpenCode mirrors are deduped; the 100 MB scan cap applies
   to every connector. The new `devin` connector feature is not enabled here.
 - Upgraded the complete FrankenSQLite family from the `0.3.13` line in v0.7.1
-  to registry `0.3.17`. This includes incremental WAL-tail folding (GH#382),
-  reserved lock-byte/freelist repair (GH#410), FTS metadata and foreign-write
+  to registry `0.3.18`. This adds parameterized rowid seeks (GH#415/cass#382),
+  read-only WAL byte/timestamp preservation, reader-registration error
+  propagation and I/O buffer lifetime fixes. It retains incremental WAL-tail
+  folding (GH#382), reserved lock-byte/freelist repair (GH#410), FTS metadata and foreign-write
   visibility fixes (GH#408), incremental FTS segment writes and savepoint undo
   logs, prefix-BM25 ranking fixes, and prepared-read schema-retry cleanup.
   All 20 family crates share the exact pin; asupersync remains `0.4.9`.
@@ -204,7 +217,7 @@ Everything below is on `main`; nothing is in a released binary yet.
   whose frankensqlite writable path loops (GH #382) the run no longer hangs
   after a successful publish; the WAL is left for the next opener and a
   warning names the remedy. The loop itself is fixed upstream in frankensqlite
-  `8d012706a`, included in the `0.3.17` engine consumed here.
+  `8d012706a`, included in the `0.3.18` engine consumed here.
 - The TUI analytics dashboard's load task is one production function with the
   detached-rebuild spawn injected (`load_chart_data_with_auto_rebuild`); the
   test-only stub that returned canned data is gone, and unit tests prove that
@@ -2524,7 +2537,7 @@ Initial development. Project scaffolding, architecture design, and first impleme
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.6.26...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.7.1...HEAD
 [v0.7.0]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.6.26...1f6cdcf9
 [v0.6.25]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.6.24...v0.6.25
 [v0.6.24]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.6.23...v0.6.24

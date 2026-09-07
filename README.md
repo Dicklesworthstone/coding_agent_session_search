@@ -983,6 +983,11 @@ or `no_evidence_found` are data, not prose; branch on the JSON fields before
 copying the pack into another tool. Stale selected evidence is structural:
 inspect `freshness.stale_evidence_count`.
 
+Packs exclude injected skill payloads by default. Add `--include-skill-content`
+to include them explicitly; credential redaction still applies.
+`privacy.skill_content_included` reports whether the selected evidence includes
+skill payloads, including after token-budget trimming.
+
 ### Swarm Operations Workflow
 
 Use the swarm surfaces when multiple agents are sharing one repo and you need a
@@ -1042,6 +1047,7 @@ LLMs have context limits. `cass` provides multiple levers to control output size
 | `pack --max-sessions N` | Limit how many sessions can contribute evidence |
 | `pack --max-excerpt-chars N` | Shorten each cited excerpt before token estimation |
 | `pack --fields summary` | Return top-level summary fields for a smaller JSON envelope |
+| `pack --field-mask minimal\|standard\|full` | Select a documented pack projection; `--fields` accepts the same presets |
 | `pack --freshness-policy strict --freshness-window-seconds N` | Reject stale evidence instead of silently mixing it into a pack |
 | `pack --sessions-from FILE` | Restrict pack evidence to newline-delimited session paths; use `-` for stdin |
 
@@ -3266,8 +3272,8 @@ Update check state is stored in the data directory:
 
 | Dependency | Pinned source |
 |------------|-----------------|
-| `frankensqlite` / `fsqlite-types` | crates.io `=0.3.17` (updated 2026-09-06; adds incremental WAL-tail indexing for GH#382, reserved lock-byte/freelist repair for GH#410, FTS metadata preservation and foreign-write visibility for GH#408, prefix-BM25 ranking fixes, and prepared-read schema-retry transaction cleanup). Retains 0.3.16's FTS5 savepoint undo log, incremental content-backed INSERT, read-only integrity preflight, Windows sidecar-less read-only close, and earlier allocator/recovery repairs. The whole family resolves from one exact registry version; `build.rs` rejects any fsqlite-family registry patch, duplicate package resolution, wrong version, or non-crates.io lockfile source. The async facade and asupersync requirement are unchanged; `src/franken_sync.rs` preserves cass's synchronous call shape via a current-thread asupersync `block_on` bridge. This version does not resolve upstream GH#411's mixed-engine concurrent-WAL limitation. |
-| `franken-agent-detection` | crates.io `=0.2.1` (2026-08-24; `src/` byte-identical to the previously pinned git rev `82424dc8` — first-class Oh My Pi v18 connector with profile, XDG, direct-root, and sub-agent discovery; preserves pi-family remote provenance; includes Muse Code and VS Code Copilot; aligned with fsqlite 0.3.x + asupersync 0.4.x) |
+| `frankensqlite` / `fsqlite-types` | crates.io `=0.3.18` (updated 2026-09-07; adds parameterized rowid IN-list seeks for GH#415/cass#382, read-only WAL byte/timestamp preservation, reader-registration error propagation, I/O buffer lifetime fixes, and WAL-mode transition and scalar-query corrections). Retains 0.3.17's WAL-tail indexing, reserved lock-byte/freelist repair, FTS metadata/visibility and prefix-BM25 fixes, plus earlier FTS5 savepoint undo, incremental content-backed INSERT, read-only integrity preflight and Windows close repairs. The whole family resolves from one exact registry version; `build.rs` rejects any fsqlite-family registry patch, duplicate package resolution, wrong version, or non-crates.io lockfile source. The async facade and asupersync requirement are unchanged; `src/franken_sync.rs` preserves cass's synchronous call shape via a current-thread asupersync `block_on` bridge. This version does not resolve upstream GH#411's mixed-engine concurrent-WAL limitation. |
+| `franken-agent-detection` | crates.io `=0.2.2` (2026-09; adds Cursor/Antigravity/Grok scan-root scoping and Aider, Copilot CLI, Amp, OpenCode, ClawdBot and Muse session-loss fixes to 0.2.1's Oh My Pi v18 connector). The Shelley connector and newer ChatGPT/OMP injection seams await the next publish. Aligned with fsqlite 0.3.x + asupersync 0.4.x. |
 | `asupersync` | `=0.4.9` (fsqlite 0.3.x requires the 0.4.x line, whose types its public API names; 0.4.9 preserves the typed-result cancellation contract) |
 | `frankensearch` | crates.io `=0.4.2` (2026-08-28, cass#410/frankensearch#40: adds the distinct opt-in `paraphrase-multilingual-MiniLM-L12-v2` native embedding space, immutable artifact/producer identity, explicit-only acquisition, and dynamic 6/12-layer Frankentorch loading to the 0.4.1 Windows Quill publication line. It retains the CASS→Quill lexical flip with `cass-compat` → `lexical-tantivy` for the differential oracle and schema-generation sentinel, pure-Rust `native`, architecture-safe HNSW, consumer-owned `TwoTierIndexPaths`, non-mutating lexical admission, cancellation-safe facade opening, and generation-pinned Quill hydration. Registry `0.3.2` is a stale same-version twin of an older tree (no quill/cass-compat/native) — the exact pin exists so resolution can never reach it. frankentorch resolves from crates.io as `frankentorch-*`; the HNSW fork is registry `frankenhnsw 0.3.5`; tantivy is registry `=0.26.1` (RUSTSEC-2026-0253 on its lru is unreachable: the advisory needs a panicking `Drop` on a cache key under `catch_unwind`, and tantivy's cache keys are trivially droppable) — cass #308, #333, #410, bd-8nqz.5, bd-07os, bd-r65a.1) |
 | `frankentui` (`ftui`, `ftui-runtime`, `ftui-tty`, `ftui-extras`) | crates.io `=0.5.0` (2026-08-21; previously git `5f78cfa0` / 0.3.1 — the 0.5 API compiled with zero call-site changes) |

@@ -332,6 +332,7 @@ pub struct PackPlanRequest {
     pub freshness_window_seconds: i64,
     pub candidates: Vec<PackCandidate>,
     pub explain_selection: bool,
+    pub include_skill_content: bool,
 }
 
 impl Default for PackPlanRequest {
@@ -343,6 +344,7 @@ impl Default for PackPlanRequest {
             freshness_window_seconds: DEFAULT_FRESHNESS_WINDOW_SECONDS,
             candidates: Vec::new(),
             explain_selection: false,
+            include_skill_content: false,
         }
     }
 }
@@ -534,7 +536,6 @@ pub struct PackRenderRequest {
     pub freshness_window_seconds: i64,
     pub redaction_policy: String,
     pub sensitive_output: bool,
-    pub skill_content_included: bool,
     pub explain_selection: bool,
     pub readiness: PackReadinessSnapshot,
 }
@@ -563,7 +564,6 @@ impl Default for PackRenderRequest {
             freshness_window_seconds: DEFAULT_FRESHNESS_WINDOW_SECONDS,
             redaction_policy: "strict".to_string(),
             sensitive_output: false,
-            skill_content_included: false,
             explain_selection: false,
             readiness: PackReadinessSnapshot::default(),
         }
@@ -915,9 +915,11 @@ pub fn plan_answer_pack(
         .candidates
         .iter()
         .map(|candidate| {
-            if crate::export::is_skill_injection(&candidate.excerpt) {
-                // Pack has no skill-content opt-in yet. Reuse the export
-                // default and account for exclusion as redacted_to_empty.
+            if !request.include_skill_content
+                && crate::export::is_skill_injection(&candidate.excerpt)
+            {
+                // Reuse the export default unless the operator opted in.
+                // Credential redaction still applies to included skills.
                 return (String::new(), false, Vec::new());
             }
             let mut redactions = Vec::new();
@@ -1890,7 +1892,10 @@ fn rendered_answer_pack_with_correlation(
             redaction_policy: request.redaction_policy.clone(),
             redaction_applied,
             sensitive_output: request.sensitive_output,
-            skill_content_included: request.skill_content_included,
+            skill_content_included: plan
+                .evidence
+                .iter()
+                .any(|item| crate::export::is_skill_injection(&item.candidate.excerpt)),
             redaction_counts,
         },
         warnings,
@@ -2895,6 +2900,7 @@ mod tests {
             freshness_window_seconds: 60,
             candidates,
             explain_selection: false,
+            include_skill_content: false,
         }
     }
 
@@ -2927,7 +2933,6 @@ mod tests {
             freshness_window_seconds: 60,
             redaction_policy: "strict".to_string(),
             sensitive_output: false,
-            skill_content_included: false,
             explain_selection: false,
             readiness: PackReadinessSnapshot::default(),
         }
@@ -2997,6 +3002,59 @@ mod tests {
         assert!(excluded.evidence.is_empty());
         assert_eq!(excluded.omitted.len(), 5);
         assert_eq!(excluded.estimated_tokens, 0);
+    }
+
+    #[test]
+    fn pack_skill_opt_in_keeps_credentials_redacted_and_reports_retained_evidence() {
+        let credential = "abcdefghijklmnopqrst";
+        let mut injected = candidate("skill", "local", "/work/skill.jsonl", 1.0);
+        injected.excerpt = format!(
+            "Base directory for this skill: /work/playbook\nUseful skill instructions.\nAuthorization: Bearer {credential}"
+        );
+        let mut plan_request = request(vec![injected]);
+        plan_request.limits.max_excerpt_chars = 800;
+        let excluded = plan_answer_pack(plan_request.clone()).unwrap();
+        assert!(excluded.evidence.is_empty());
+        assert_eq!(
+            excluded.omitted[0].reason,
+            PackOmittedReason::RedactedToEmpty
+        );
+
+        plan_request.include_skill_content = true;
+        let plan = plan_answer_pack(plan_request).unwrap();
+        assert_eq!(plan.selected_evidence_count, 1);
+        assert!(plan.omitted.is_empty());
+        assert!(
+            plan.evidence[0]
+                .excerpt
+                .contains("Useful skill instructions.")
+        );
+        assert!(!plan.evidence[0].excerpt.contains(credential));
+        assert!(plan.evidence[0].excerpt.contains(REDACTED_VALUE_MARKER));
+
+        let render_request = render_request(PackRenderFormat::Json);
+        let value =
+            render_answer_pack_value_without_trust_correlation(&plan, &render_request).unwrap();
+        assert_eq!(value["privacy"]["skill_content_included"], true);
+        assert_eq!(value["privacy"]["redaction_applied"], true);
+        assert!(!value.to_string().contains(credential));
+
+        // Rendering is repeated after output-budget trimming. An opt-in alone
+        // cannot claim that a fallback or reduced pack still contains skills.
+        let empty = budget_fallback_answer_pack(&render_request.limits, 1).unwrap();
+        let value =
+            render_answer_pack_value_without_trust_correlation(&empty, &render_request).unwrap();
+        assert_eq!(value["privacy"]["skill_content_included"], false);
+        let ordinary = plan_answer_pack(request(vec![candidate(
+            "ordinary",
+            "local",
+            "/work/ordinary.jsonl",
+            1.0,
+        )]))
+        .unwrap();
+        let value =
+            render_answer_pack_value_without_trust_correlation(&ordinary, &render_request).unwrap();
+        assert_eq!(value["privacy"]["skill_content_included"], false);
     }
 
     #[test]

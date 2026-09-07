@@ -33,6 +33,7 @@ commands:
     --max-excerpt-chars N  Bound each excerpt before token estimation.
     --freshness-policy prefer-recent|strict|allow-stale  Evidence freshness policy.
     --freshness-window-seconds N  Freshness window used for stale-evidence warnings and strict filtering.
+    --include-skill-content  Include skill payload excerpts; credentials remain redacted.
     --require-evidence  Return a JSON error envelope instead of an empty successful pack.
     --explain-selection  Include score components and omission diagnostics for audits.
     Output includes health, freshness, privacy, evidence, omitted, and warnings fields.

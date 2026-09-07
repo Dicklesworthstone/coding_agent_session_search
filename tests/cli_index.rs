@@ -1743,15 +1743,10 @@ fn plain_index_self_heals_when_entire_lexical_index_directory_is_missing() {
 /// pre-fix binary; the starvation flush must release the budget and let the
 /// run drain.
 ///
-/// Currently ignore-gated: on current main the ingest path parks on the
-/// oversized conversation itself (heartbeat shows `rebuild_pipeline` fully
-/// idle — `page_prep_workers=0`, `producer_state=null` — while ingest crawls
-/// at ~0.02 conv/s), so the run never reaches the lexical pipeline phase
-/// where the GH#413 retention wedge lives. That is the same mwkw0-class
-/// ingest park MossyBridge documented when first attempting a tiny GH#413
-/// repro, not this fix. Un-ignore once ingest bounding lands; this then
-/// becomes the definitive pipeline-level receipt for cjugu.
-#[ignore = "ingest path parks on multi-MiB conversations before the lexical pipeline starts (mwkw0-class); see bead cjugu comments"]
+/// The fixture serializes embedded newlines as JSON escapes so the connector
+/// receives one valid oversized message. This regression passed with the
+/// pinned FrankenSQLite 0.3.18 engine and stays in the default suite; the
+/// separate archive-scale GH#413 acceptance remains tracked in bead cjugu.
 #[test]
 fn gh413_full_rebuild_drains_when_one_conversation_exceeds_the_inflight_budget() {
     let tmp = TempDir::new().unwrap();
@@ -1768,20 +1763,42 @@ fn gh413_full_rebuild_drains_when_one_conversation_exceeds_the_inflight_budget()
     huge_text.push_str(huge_marker);
 
     let write_session = |name: &str, user_text: &str, session_id: &str| {
-        let sample = format!(
-            concat!(
-                "{{\"timestamp\":\"2025-09-30T15:42:34.559Z\",\"type\":\"session_meta\",",
-                "\"payload\":{{\"id\":\"{session_id}\",\"cwd\":\"/test/workspace\",\"cli_version\":\"0.42.0\"}}}}\n",
-                "{{\"timestamp\":\"2025-09-30T15:42:36.190Z\",\"type\":\"response_item\",",
-                "\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",",
-                "\"text\":\"{user_text}\"}}]}}}}\n",
-                "{{\"timestamp\":\"2025-09-30T15:42:43.000Z\",\"type\":\"response_item\",",
-                "\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",",
-                "\"text\":\"acknowledged\"}}]}}}}\n"
-            ),
-            session_id = session_id,
-            user_text = user_text
-        );
+        // The oversized text contains newlines. Serialize them as JSON escapes
+        // so the connector receives one valid message, not thousands of broken lines.
+        let records = [
+            serde_json::json!({
+                "timestamp": "2025-09-30T15:42:34.559Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "cwd": "/test/workspace",
+                    "cli_version": "0.42.0"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2025-09-30T15:42:36.190Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": user_text}]
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2025-09-30T15:42:43.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "acknowledged"}]
+                }
+            }),
+        ];
+        let mut sample = String::new();
+        for record in records {
+            sample.push_str(&serde_json::to_string(&record).unwrap());
+            sample.push('\n');
+        }
         fs::write(codex_root.join(name), sample).unwrap();
     };
     write_session("rollout-huge.jsonl", &huge_text, "gh413-huge");

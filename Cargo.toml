@@ -73,12 +73,14 @@ notify = "8.2.0"
 # GH#406 content-backed INSERT persisted as an incremental segment append.
 # 0.3.17 adds incremental WAL-tail folding, reserved lock-byte/freelist
 # repair (GH#410), FTS metadata and foreign-write visibility fixes (GH#408),
-# and prepared-read schema-retry transaction cleanup. The async API and
-# asupersync requirement remain unchanged.
-frankensqlite = { version = "=0.3.17", package = "fsqlite", features = ["fts5", "async-api"] }
+# and prepared-read schema-retry transaction cleanup. 0.3.18 adds parameterized
+# rowid IN-list seeks (GH#415/cass#382), mutation-free read-only WAL readers,
+# reader-registration error propagation and I/O buffer lifetime fixes.
+# The async API and asupersync requirement remain unchanged.
+frankensqlite = { version = "=0.3.18", package = "fsqlite", features = ["fts5", "async-api"] }
 # The production storage-integrity probe calls FrankenSQLite's public VFS API
 # directly so it can inspect native writer locks without opening the pager.
-fsqlite-types = { version = "=0.3.17", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.3.18", package = "fsqlite-types" }
 rayon = "1.12.0"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
@@ -223,10 +225,10 @@ rand_chacha = "0.10"
 rusqlite = { version = "0.40.2", features = ["bundled", "modern_sqlite"] }
 # The manifest-policy build gate requires this explicit dev entry for compat
 # fixture assertions, even though production also uses the same pinned crate.
-fsqlite-types = { version = "=0.3.17", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.3.18", package = "fsqlite-types" }
 
 # The fsqlite family resolves from the exact registry version for every direct
-# and transitive consumer. build.rs enforces a single 0.3.17 family source.
+# and transitive consumer. build.rs enforces a single 0.3.18 family source.
 
 [[bin]]
 name = "cass"
