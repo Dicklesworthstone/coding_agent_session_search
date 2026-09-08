@@ -119050,8 +119050,8 @@ fn run_models_backfill(
     }
 
     let tier = parse_models_backfill_tier(tier_raw)?;
-    let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
-    let db_path = db_override.unwrap_or_else(default_db_path);
+    let data_dir = resolve_data_dir(&data_dir_override, db_override.as_ref());
+    let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     if !db_path.is_file() {
         return Err(CliError {
             code: 3,

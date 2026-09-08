@@ -396,6 +396,85 @@ fn assert_default_hybrid_contract(
 }
 
 #[test]
+fn robot_models_backfill_keeps_archive_and_assets_scoped_to_path_overrides() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let ambient = temp.path().join("ambient");
+    fs::create_dir_all(&ambient)?;
+    let ambient_db = ambient.join("agent_search.db");
+    {
+        let storage = FrankenStorage::open(&ambient_db)?;
+        let agent_id = storage.ensure_agent(&sample_agent())?;
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &sample_conversation("ambient", "this archive was not selected"),
+        )?;
+    }
+    let ambient_before = fs::read(&ambient_db)?;
+
+    for (name, explicit_data_dir, explicit_db) in [
+        ("data-dir-only", true, false),
+        ("db-only", false, true),
+        ("split-layout", true, true),
+    ] {
+        let root = temp.path().join(name);
+        let data_dir = root.join("assets");
+        let db_path = if explicit_db {
+            root.join("archive").join("selected.db")
+        } else {
+            data_dir.join("agent_search.db")
+        };
+        let db_parent = db_path.parent().ok_or("fixture DB needs a parent")?;
+        fs::create_dir_all(db_parent)?;
+        seed_canonical_db(&db_path)?;
+        let expected_assets = if explicit_data_dir {
+            data_dir.as_path()
+        } else {
+            db_parent
+        };
+
+        let mut command = cargo_bin_cmd!("cass");
+        command.args([
+            "models", "backfill", "--tier", "fast", "--embedder", "hash", "--json",
+        ]);
+        if explicit_data_dir {
+            command.arg("--data-dir").arg(&data_dir);
+        }
+        if explicit_db {
+            command.arg("--db").arg(&db_path);
+        }
+        let output = command
+            .env("CASS_DATA_DIR", &ambient)
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .timeout(Duration::from_secs(20))
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{name}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(report["status"], "published", "{name}: {report}");
+        assert_eq!(report["total_conversations"], 2, "{name}: {report}");
+        assert_eq!(report["embedded_docs"], 2, "{name}: {report}");
+        let manifest = SemanticManifest::load(expected_assets)?
+            .ok_or("selected data directory should contain the published manifest")?;
+        assert_eq!(
+            manifest
+                .fast_tier
+                .as_ref()
+                .map(|tier| (tier.ready, tier.doc_count)),
+            Some((true, 2)),
+            "{name}"
+        );
+        assert!(SemanticManifest::load(&ambient)?.is_none(), "{name}");
+        assert_eq!(fs::read(&ambient_db)?, ambient_before, "{name}");
+    }
+    Ok(())
+}
+
+#[test]
 fn robot_models_backfill_checkpoints_then_publishes_fast_tier() -> TestResult {
     let temp = tempfile::tempdir()?;
     let data_dir = temp.path().join("cass-data");
