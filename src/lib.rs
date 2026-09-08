@@ -94420,6 +94420,7 @@ fn response_schema_rebuild_state() -> serde_json::Value {
         "properties": {
             "active": { "type": "boolean" },
             "orphaned": { "type": "boolean" },
+            "engine_incompatible": { "type": "boolean" },
             "pid": { "type": ["integer", "null"] },
             "mode": { "type": ["string", "null"] },
             "job_id": { "type": ["string", "null"] },
@@ -96850,6 +96851,8 @@ fn response_schema_doctor_raw_mirror() -> serde_json::Value {
                     "interrupted_capture_count": { "type": "integer" },
                     "duplicate_blob_reference_count": { "type": "integer" },
                     "total_blob_bytes": { "type": "integer" },
+                    "orphan_blob_count": { "type": "integer", "minimum": 0 },
+                    "orphan_blob_bytes": { "type": "integer", "minimum": 0 },
                     "amplified_source_count": { "type": "integer" },
                     "amplified_source_referenced_bytes": { "type": "integer" },
                     "amplified_source_excess_bytes": { "type": "integer" },
@@ -97379,6 +97382,56 @@ fn response_schema_root_cause_attribution() -> serde_json::Value {
         },
         "required": ["schema_version", "family", "locus", "confidence", "evidence_refs", "summary"]
     })
+}
+
+/// Triage alone can leave a readiness component uninspected when its budget
+/// expires. Keep the other surfaces' observed-value contracts unchanged.
+fn response_schema_triage_inspection(mut schema: serde_json::Value) -> serde_json::Value {
+    schema["properties"]["inspected"] = serde_json::json!({ "type": "boolean" });
+    schema
+}
+
+fn response_schema_triage_search_completeness() -> serde_json::Value {
+    let mut schema = response_schema_triage_inspection(response_schema_search_completeness());
+    schema["properties"]["quarantine_status"]["enum"] =
+        serde_json::json!(["ok", "degraded", "not_inspected"]);
+    schema["properties"]["quarantined_conversations"]["type"] =
+        serde_json::json!(["integer", "null"]);
+    for field in ["complete", "can_search", "coverage_suspect"] {
+        schema["properties"][field]["type"] = serde_json::json!(["boolean", "null"]);
+    }
+    schema
+}
+
+fn response_schema_triage_readiness() -> serde_json::Value {
+    let mut index = response_schema_triage_inspection(response_schema_index_state());
+    index["properties"]["exists"]["type"] = serde_json::json!(["boolean", "null"]);
+    let mut database = response_schema_triage_inspection(response_schema_state_database());
+    database["properties"]["exists"]["type"] = serde_json::json!(["boolean", "null"]);
+    response_schema_object([
+        ("index", index),
+        ("database", database),
+        (
+            "pending",
+            response_schema_triage_inspection(response_schema_pending_state()),
+        ),
+        (
+            "rebuild",
+            response_schema_triage_inspection(response_schema_rebuild_state()),
+        ),
+        (
+            "rebuild_progress",
+            response_schema_triage_inspection(response_schema_rebuild_progress()),
+        ),
+        (
+            "semantic",
+            response_schema_triage_inspection(response_schema_semantic_state()),
+        ),
+        (
+            "ingest_quarantine",
+            response_schema_triage_inspection(response_schema_ingest_quarantine()),
+        ),
+    ])
 }
 
 fn response_schema_budget_block() -> serde_json::Value {
@@ -98042,20 +98095,9 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "recommended_action": { "type": ["string", "null"] },
                 "recommended_commands": response_schema_recommended_commands(),
                 "next_command": { "type": ["string", "null"] },
-                "search_completeness": response_schema_search_completeness(),
-                "root_cause": response_schema_root_cause_attribution(),
-                "readiness": {
-                    "type": "object",
-                    "properties": {
-                        "index": response_schema_index_state(),
-                        "database": response_schema_state_database(),
-                        "pending": response_schema_pending_state(),
-                        "rebuild": response_schema_rebuild_state(),
-                        "rebuild_progress": response_schema_rebuild_progress(),
-                        "semantic": response_schema_semantic_state(),
-                        "ingest_quarantine": response_schema_ingest_quarantine()
-                    }
-                },
+                "search_completeness": response_schema_triage_search_completeness(),
+                "root_cause": response_schema_triage_inspection(response_schema_root_cause_attribution()),
+                "readiness": response_schema_triage_readiness(),
                 "discovery": {
                     "type": "object",
                     "properties": {
