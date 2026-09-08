@@ -174,6 +174,32 @@ mean that every acceptance row, platform, or reporter archive has been verified.
   40-segment generation is folded by a plain `cass index`).
 
 ### Fixed
+- A hollow published Quill generation — one serving a handful of documents
+  while its completed rebuild checkpoint, content fingerprint and generation
+  manifest all still look right — no longer reads as healthy (GH #457).
+  Readiness now compares the live document count from the engine's MANIFEST
+  (metadata only, no segment open) against the count the completed checkpoint
+  certified: `cass status`/`cass health` report `index.status: "hollow"`,
+  `index.hollow`, `index.live_documents`, an `index hollow` error and a
+  `cass index` recommendation; `cass doctor check` warns in
+  `index_sync` (also when the index serves under 10% of the archive's
+  messages); readiness projections classify it as rebuild-now. On the publish
+  side, a rebuild's post-publish document-count proof fails when the count
+  cannot be observed instead of being skipped, the direct-commit rebuild writes
+  the generation manifest before marking its checkpoint completed, and every
+  `cass index` run re-checks the served count at its end and refuses to
+  certify a hollow generation (a plain `cass index` already rebuilds one it
+  finds at startup through the pre-scan sparse-index repair).
+- Lexical merge runs are planned under a byte cap (GH #456):
+  `CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES`, default 1 GiB, charged with the docid
+  hull a Q1-preserving concat merge carries. The end-of-rebuild fold used to
+  merge every segment into one and the incremental fold could plan one run over
+  a fully fragmented generation; the engine assembles each merge output as one
+  in-memory buffer sized to the finished file, so the fold's memory scaled with
+  the whole index (GH #453's 6.75 GB single segment). A generation now
+  is folded in bounded planned runs; oversized singleton segments are left
+  unmerged. The cap controls estimated merge-output allocation, not the total
+  RSS of indexing or every engine allocation.
 - Route every enabled connector through filesystem watching and quarantine
   retries, including Prime Agent, Kiro, Devin, OpenHands, Goose, Crush, and Hermes.
   This completes CASS's dispatch adapters; it does not enable FAD's optional

@@ -8696,6 +8696,71 @@ fn completed_lexical_rebuild_meta_fingerprint(
     }
 }
 
+/// GH #457: the post-publish proof that a rebuild's generation serves exactly
+/// the documents it counted. A count that cannot be observed — no manifest
+/// landed, or no reader can open what did — is a FAILED proof, never a
+/// skipped one: the previous `if let Some(observed)` shape verified nothing
+/// in exactly the cases that matter, so a generation whose MANIFEST never
+/// landed could still be certified by a completed checkpoint.
+fn verify_published_lexical_doc_count(
+    index_path: &Path,
+    indexed_docs: usize,
+    publish_mode: &str,
+) -> Result<()> {
+    let summary = crate::search::tantivy::searchable_index_summary(index_path)
+        .with_context(|| {
+            format!(
+                "{publish_mode} lexical rebuild published {indexed_docs} docs but the generation at {} \
+                 cannot be opened for verification; refusing to certify it (GH #457)",
+                index_path.display()
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{publish_mode} lexical rebuild published {indexed_docs} docs but no searchable \
+                 generation was found at {}; refusing to certify it (GH #457)",
+                index_path.display()
+            )
+        })?;
+    if summary.docs != indexed_docs {
+        return Err(anyhow::anyhow!(
+            "{publish_mode} lexical rebuild published {indexed_docs} docs but a fresh reader only \
+             sees {}; refusing to certify the generation (GH #457)",
+            summary.docs
+        ));
+    }
+    Ok(())
+}
+
+/// GH #457: a run must not certify a hollow generation. Every full rebuild
+/// proves `live == indexed_docs` before completing its checkpoint, and the
+/// pre-scan sparse check (`choose_incremental_canonical_lexical_repair_plan`)
+/// rebuilds a generation that was already hollow when the run started, so at
+/// the end of any run the served count (read from the MANIFEST the run just
+/// committed, no engine open) must still cover what the checkpoint certified.
+/// This is the backstop for a generation hollowed DURING the run: a shortfall
+/// past the readiness floor is a hard failure naming the remedy, and the
+/// ingest itself is already durable.
+fn verify_lexical_generation_not_hollow_after_run(index_path: &Path, db_path: &Path) -> Result<()> {
+    let Some(expected_docs) =
+        crate::search::asset_state::completed_lexical_checkpoint_indexed_docs(index_path, db_path)
+    else {
+        return Ok(());
+    };
+    let live_docs = crate::search::tantivy::searchable_index_live_doc_count(index_path);
+    if let Some(verdict) = crate::search::asset_state::lexical_generation_hollow_verdict(
+        Some(expected_docs),
+        live_docs,
+    ) {
+        return Err(anyhow::anyhow!(
+            "refusing to certify the lexical generation at {} after this run: {}",
+            index_path.display(),
+            verdict.reason()
+        ));
+    }
+    Ok(())
+}
+
 fn live_tantivy_doc_count(index_path: &Path) -> Result<Option<usize>> {
     match crate::search::tantivy::searchable_index_summary(index_path) {
         Ok(Some(summary)) => Ok(Some(summary.docs)),
@@ -16190,6 +16255,11 @@ fn run_index_inner(
         t_index
     };
 
+    // GH #457: whatever this run did (incremental ingest, no-op scan, or a
+    // rebuild that already proved itself), the generation it leaves behind
+    // must serve what its completed checkpoint certified.
+    verify_lexical_generation_not_hollow_after_run(&index_path, &opts.db_path)?;
+
     if legacy_omp_upgrade.lexical_rebuild_required {
         if !exact_completed_lexical_checkpoint {
             anyhow::bail!(
@@ -23151,15 +23221,7 @@ fn rebuild_tantivy_from_db_via_staged_shards(
             index_path.display()
         )
     })?;
-    if let Some(observed_tantivy_docs) = live_tantivy_doc_count(index_path)?
-        && observed_tantivy_docs != indexed_docs
-    {
-        return Err(anyhow::anyhow!(
-            "staged lexical rebuild published {} docs but a fresh Tantivy reader only sees {}",
-            indexed_docs,
-            observed_tantivy_docs
-        ));
-    }
+    verify_published_lexical_doc_count(index_path, indexed_docs, "staged")?;
     let refresh_ledger =
         build_authoritative_lexical_refresh_ledger(AuthoritativeLexicalRefreshLedgerInput {
             publish_mode: "atomic_staged_swap",
@@ -24381,15 +24443,7 @@ fn rebuild_tantivy_from_db_with_options(
             index_path.display()
         )
     })?;
-    if let Some(observed_tantivy_docs) = live_tantivy_doc_count(&index_path)?
-        && observed_tantivy_docs != indexed_docs
-    {
-        return Err(anyhow::anyhow!(
-            "lexical rebuild committed {} docs but a fresh Tantivy reader only sees {}",
-            indexed_docs,
-            observed_tantivy_docs
-        ));
-    }
+    verify_published_lexical_doc_count(&index_path, indexed_docs, "direct")?;
 
     storage.close_without_checkpoint().with_context(|| {
         format!(
@@ -24416,6 +24470,24 @@ fn rebuild_tantivy_from_db_with_options(
     rebuild_state.committed_conversation_id = last_processed_conversation_id;
     rebuild_state.processed_conversations = processed_conversations;
     rebuild_state.indexed_docs = indexed_docs;
+    // GH #457: the generation manifest is durable BEFORE the checkpoint is
+    // marked completed (the staged path's ordering). A crash between the two
+    // used to leave `completed: true` over a generation with no manifest, so
+    // every readiness surface reported ready with nothing to read the doc
+    // count from.
+    let lexical_rebuild_duration = lexical_rebuild_started.elapsed();
+    let publish_started = Instant::now();
+    let equivalence_evidence = equivalence_accumulator.finalize();
+    let generation_manifest = persist_lexical_rebuild_generation_artifacts(
+        &index_path,
+        &rebuild_state.db.storage_fingerprint,
+        rebuild_state.processed_conversations,
+        final_total_conversations,
+        final_observed_messages,
+        indexed_docs,
+        &equivalence_evidence,
+    )?;
+    log_lexical_generation_manifest_published(&generation_manifest, &equivalence_evidence);
     rebuild_state.mark_completed(completed_lexical_rebuild_meta_fingerprint(
         &rebuild_state,
         &index_path,
@@ -24438,19 +24510,6 @@ fn rebuild_tantivy_from_db_with_options(
         profile.log_summary();
     }
 
-    let lexical_rebuild_duration = lexical_rebuild_started.elapsed();
-    let publish_started = Instant::now();
-    let equivalence_evidence = equivalence_accumulator.finalize();
-    let generation_manifest = persist_lexical_rebuild_generation_artifacts(
-        &index_path,
-        &rebuild_state.db.storage_fingerprint,
-        rebuild_state.processed_conversations,
-        final_total_conversations,
-        final_observed_messages,
-        indexed_docs,
-        &equivalence_evidence,
-    )?;
-    log_lexical_generation_manifest_published(&generation_manifest, &equivalence_evidence);
     let refresh_ledger =
         build_authoritative_lexical_refresh_ledger(AuthoritativeLexicalRefreshLedgerInput {
             publish_mode: "direct_live_commit",

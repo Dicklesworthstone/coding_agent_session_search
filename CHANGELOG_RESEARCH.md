@@ -34,8 +34,8 @@ status; they are not counted as product features.
 
 ## Publication follow-through
 
-- Integrate already-published 6b2ab22d into the local release preparation without
-  overwriting local version/changelog edits; then validate its new code/goldens.
+- Already-published 6b2ab22d was integrated without conflicts or overwriting
+  local version/changelog edits. Its new code/goldens still need release validation.
 - At actual release publication, replace the candidate's pending date/state and
   compare-to-main link with the published version metadata. Do not do that early.
 

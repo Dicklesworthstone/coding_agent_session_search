@@ -21412,6 +21412,8 @@ fn state_meta_json_inner(
                 processed_conversations: None,
                 total_conversations: None,
                 indexed_docs: None,
+                hollow: false,
+                live_docs: None,
                 status_reason: Some(format!("asset inspection failed: {summary}")),
                 fingerprint: crate::search::asset_state::LexicalFingerprintState {
                     current_db_fingerprint: None,
@@ -21620,7 +21622,13 @@ fn state_meta_json_inner(
     // the published generation manifest: status only needs the durable count
     // for stale/empty diagnostics, while opening a large Tantivy reader here
     // fans out across every segment file on the hot robot path.
-    let index_doc_count: Option<u64> = if db_opened && message_count > 0 && lexical.exists {
+    // GH #457: prefer the count the engine SERVES (its MANIFEST, metadata
+    // only) over the count a rebuild once RECORDED (the generation manifest):
+    // a hollow generation keeps the recorded count while serving almost
+    // nothing, which is exactly the gap that let `healthy: true` stand.
+    let index_doc_count: Option<u64> = if let Some(live_docs) = lexical.live_docs {
+        Some(live_docs)
+    } else if db_opened && message_count > 0 && lexical.exists {
         lexical_manifest_indexed_doc_count(&index_path).or_else(|| {
             frankensearch::lexical_tantivy::cass_open_search_reader(
                 &index_path,
@@ -21712,6 +21720,11 @@ fn state_meta_json_inner(
                     .to_rfc3339()
             }),
             "documents": index_doc_count,
+            // GH #457: what the published generation serves (manifest
+            // metadata only) and whether that contradicts the completed
+            // checkpoint. `reason` carries the operator-facing verdict.
+            "live_documents": lexical.live_docs,
+            "hollow": lexical.hollow,
             // #441: upper bound on published Quill segments, metadata only.
             "segment_files": lexical_segment_files,
             "empty_with_messages": index_empty_with_messages,
@@ -22423,6 +22436,19 @@ fn lexical_readiness_from_state(
     if status == "legacy_engine"
         || index
             .and_then(|idx| idx.get("engine_incompatible"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+    {
+        return LexicalReadinessState::Missing;
+    }
+    // GH #457: a hollow generation serves a small fraction of the corpus while
+    // every other signal says ready. Search technically runs, but its answers
+    // are wrong ("no prior work found"), so it is the rebuild-now class —
+    // never "stale but searchable" (which promises correct answers for what
+    // is already indexed).
+    if status == "hollow"
+        || index
+            .and_then(|idx| idx.get("hollow"))
             .and_then(|value| value.as_bool())
             .unwrap_or(false)
     {
@@ -82118,6 +82144,12 @@ fn run_status(
         .and_then(|i| i.get("fresh"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // GH #457: served count contradicts the completed checkpoint.
+    let index_hollow = state
+        .get("index")
+        .and_then(|i| i.get("hollow"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let index_age_secs = state
         .get("index")
         .and_then(|i| i.get("age_seconds"))
@@ -82328,6 +82360,11 @@ fn run_status(
             "Run 'cass index --full' to rebuild the search index for the current engine (a legacy Tantivy generation was found; one-time full lexical rebuild, cost scales with message count — `--force-rebuild` skips the filesystem rescan)"
                 .to_string(),
         )
+    } else if index_hollow {
+        // GH #457: name the repair (the pre-scan sparse check rebuilds the
+        // generation from the canonical DB) rather than the generic stale
+        // advice, so the operator knows why the next run rebuilds.
+        Some(HOLLOW_INDEX_RECOMMENDED_ACTION.to_string())
     } else if index_empty_with_messages {
         Some("Run 'cass index --full' to populate the empty search index".to_string())
     } else if ingest_quarantine_critical {
@@ -83539,6 +83576,13 @@ fn run_selftest(output_format: Option<RobotFormat>) -> CliResult<()> {
     }
 }
 
+/// GH #457: `errors[]` entry for a hollow lexical generation on `cass health`.
+const HOLLOW_INDEX_HEALTH_ERROR: &str = "index hollow — the published lexical generation serves far fewer documents than its completed rebuild checkpoint certified; run 'cass index' to rebuild it from the canonical database";
+
+/// GH #457: `recommended_action` shared by `cass health` and `cass status`
+/// for a hollow lexical generation.
+const HOLLOW_INDEX_RECOMMENDED_ACTION: &str = "Run 'cass index' to rebuild the hollow search index from the canonical database (the published generation serves far fewer documents than its completed checkpoint certified; the pre-scan repair rebuilds it, and 'cass index --full' does the same after a full rescan).";
+
 /// Minimal health check (<50ms). Exit 0=healthy, 1=unhealthy.
 /// Designed for agent pre-flight checks before complex operations.
 ///
@@ -83581,6 +83625,12 @@ fn run_health(
     let index_fresh = state
         .get("index")
         .and_then(|i| i.get("fresh"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // GH #457: served count contradicts the completed checkpoint.
+    let index_hollow = state
+        .get("index")
+        .and_then(|i| i.get("hollow"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let rebuild_active = state
@@ -83683,6 +83733,10 @@ fn run_health(
         // b4uax: mirror run_status — a legacy Tantivy generation needs the
         // one-time full rebuild, and an incremental refresh cannot help.
         Some("Run 'cass index --full' to rebuild the search index for the current engine (a legacy Tantivy generation was found; one-time full lexical rebuild, cost scales with message count).".to_string())
+    } else if index_hollow {
+        // GH #457: mirror run_status — name the repair, not the generic
+        // stale advice, so the operator knows why the run will rebuild.
+        Some(HOLLOW_INDEX_RECOMMENDED_ACTION.to_string())
     } else if ingest_quarantine_critical || (healthy && quarantined_conversations > 0) {
         ingest_quarantine_recommended_action
     } else if !healthy {
@@ -83710,7 +83764,9 @@ fn run_health(
             "index not found".to_string()
         });
     }
-    if index_exists && !index_fresh && !not_initialized {
+    if index_hollow {
+        errors.push(HOLLOW_INDEX_HEALTH_ERROR.to_string());
+    } else if index_exists && !index_fresh && !not_initialized {
         errors.push("index stale".to_string());
     }
     if rebuild_stalled {
@@ -83913,7 +83969,9 @@ fn run_health(
         if !index_exists {
             println!("  - index not found");
         }
-        if index_exists && !index_fresh {
+        if index_hollow {
+            println!("  - {HOLLOW_INDEX_HEALTH_ERROR}");
+        } else if index_exists && !index_fresh {
             println!("  - index stale");
         }
         if index_empty_with_messages {
@@ -87584,6 +87642,13 @@ fn run_bounded_doctor_archive_db_probe(
     }
 }
 
+/// GH #457: `doctor` coverage floor for the served lexical document count as
+/// a percentage of the archive's `messages` rows. Not every message becomes a
+/// document (empty and diverted payloads are skipped; real archives sit
+/// between ~45% and ~100%), so this floor is deliberately loose and only
+/// catches the hollow shape (3 documents against a million messages).
+const DOCTOR_LEXICAL_COVERAGE_FLOOR_PERCENT: u64 = 10;
+
 /// Internal doctor executor reached through the typed `doctor` module.
 /// CRITICAL: This function NEVER deletes user data. It only rebuilds derived data (index, db)
 /// from source session files. This is essential because users may have only one copy of their
@@ -88572,7 +88637,34 @@ pub(crate) fn run_doctor_impl(
                 // message count from the bounded archive-DB probe above instead
                 // of re-opening the database and running another unbounded
                 // COUNT on the main thread.
-                if num_docs == 0
+                // GH #457: `num_docs` above came from the engine's own
+                // reader, so it is what queries are served from. Compare it
+                // with what the completed checkpoint certified (the exact
+                // signal readiness uses) and, as a second floor, with the
+                // archive's message count: a generation that serves less
+                // than a tenth of the messages is hollow whatever the
+                // checkpoint says.
+                let served_docs = u64::try_from(num_docs).unwrap_or(u64::MAX);
+                let hollow_vs_checkpoint =
+                    crate::search::asset_state::lexical_generation_hollow_verdict(
+                        crate::search::asset_state::completed_lexical_checkpoint_indexed_docs(
+                            &index_path,
+                            &db_path,
+                        ),
+                        Some(served_docs),
+                    );
+                let hollow_vs_messages = db_messages
+                    .filter(|&count| count > 0)
+                    .map(|count| u64::try_from(count).unwrap_or(u64::MAX))
+                    .filter(|&messages| {
+                        served_docs.saturating_mul(100)
+                            < messages.saturating_mul(DOCTOR_LEXICAL_COVERAGE_FLOOR_PERCENT)
+                    });
+                if let Some(verdict) = hollow_vs_checkpoint {
+                    storage_lexical_index_drifted = true;
+                    add_check!("index_sync", "warn", verdict.reason(), true);
+                    needs_rebuild = true;
+                } else if num_docs == 0
                     && archive_queryable_for_non_destructive_derived_rebuild
                     && let Some(msg_count) = db_messages.filter(|&count| count > 0)
                 {
@@ -88581,6 +88673,22 @@ pub(crate) fn run_doctor_impl(
                         "index_sync",
                         "warn",
                         format!("Index is empty but database has {} messages", msg_count),
+                        true
+                    );
+                    needs_rebuild = true;
+                } else if let Some(messages) = hollow_vs_messages
+                    && archive_queryable_for_non_destructive_derived_rebuild
+                {
+                    storage_lexical_index_drifted = true;
+                    add_check!(
+                        "index_sync",
+                        "warn",
+                        format!(
+                            "Index serves {num_docs} document(s) but the database has {messages} \
+                             messages (below {DOCTOR_LEXICAL_COVERAGE_FLOOR_PERCENT}% coverage); \
+                             the published lexical generation is hollow — run `cass index` to \
+                             rebuild it from the canonical database"
+                        ),
                         true
                     );
                     needs_rebuild = true;

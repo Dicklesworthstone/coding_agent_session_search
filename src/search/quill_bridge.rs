@@ -456,6 +456,67 @@ pub fn segment_file_count(path: &Path) -> Option<usize> {
     )
 }
 
+/// Live-document accounting for a published Quill generation, read from the
+/// engine's MANIFEST alone (GH #457).
+///
+/// Every segment record in a Quill MANIFEST carries its live-at-seal
+/// `doc_count` and the generation's tombstone set for that segment, so the
+/// number of documents a query can actually return is
+/// `Σ (doc_count − tombstones)`. No segment file is opened, mapped or hashed,
+/// which keeps this cheap enough for `status`, `health` and
+/// `search --robot-meta`, none of which may spend an engine open.
+///
+/// This is the count a hollow generation cannot hide behind: the cass
+/// generation manifest and the rebuild checkpoint both record what a rebuild
+/// *published*, while this reads what the engine currently *serves*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuillManifestLiveDocs {
+    /// Documents that survive the generation's tombstones.
+    pub live_docs: u64,
+    /// Documents sealed into the referenced segments before any tombstoning.
+    pub sealed_docs: u64,
+    /// Tombstoned documents across every referenced segment.
+    pub tombstones: u64,
+    /// Segments the MANIFEST references (the count a query pays for).
+    pub segments: usize,
+    /// Monotone publication generation of the MANIFEST that was read.
+    pub generation: u64,
+    /// `true` when `MANIFEST` was missing or corrupt and the contents came
+    /// from `MANIFEST.prev` (the engine's own read-only crash recovery).
+    pub recovered_from_previous: bool,
+}
+
+/// Read [`QuillManifestLiveDocs`] for the Quill index at `path`.
+///
+/// `None` when the directory holds no decodable MANIFEST slot (an absent or
+/// corrupt generation is reported by the readiness surfaces on their own).
+#[must_use]
+pub fn manifest_live_doc_count(path: &Path) -> Option<QuillManifestLiveDocs> {
+    let loaded = frankensearch::quill::load_manifest_pair(path).ok()?;
+    let manifest = &loaded.manifest;
+    let mut live_docs = 0_u64;
+    let mut sealed_docs = 0_u64;
+    let mut tombstones = 0_u64;
+    for segment in &manifest.segments {
+        let sealed = u64::from(segment.doc_count);
+        let live = u64::from(segment.live_doc_count());
+        sealed_docs = sealed_docs.saturating_add(sealed);
+        live_docs = live_docs.saturating_add(live);
+        tombstones = tombstones.saturating_add(sealed.saturating_sub(live));
+    }
+    Some(QuillManifestLiveDocs {
+        live_docs,
+        sealed_docs,
+        tombstones,
+        segments: manifest.segments.len(),
+        generation: manifest.generation,
+        recovered_from_previous: !matches!(
+            loaded.source,
+            frankensearch::quill::ManifestSource::Current
+        ),
+    })
+}
+
 /// On-disk footprint of one Quill index directory, split by what a full
 /// rebuild has to reproduce versus what the engine reclaims on its own (#453).
 ///
@@ -1218,26 +1279,68 @@ impl QuillCassIndex {
         Ok(merged || compacted)
     }
 
-    /// Fold every published segment into one, regardless of policy, then
-    /// reclaim tombstones.
+    /// Fold the published segments into as few as the merge-output byte cap
+    /// allows, regardless of the idle policy, then reclaim tombstones.
     ///
     /// This is the end-of-rebuild step: a from-scratch build seals one segment
     /// per ingest shard per accumulation budget, and the query planner's
     /// per-segment dictionary probes make segment count the dominant query
-    /// cost (#441), so a freshly published generation should start at one.
+    /// cost (#441), so a freshly published generation should start small.
+    ///
+    /// It used to fold everything into ONE segment. The engine assembles a
+    /// concat-merge output as a single in-memory buffer sized to the finished
+    /// file and re-verifies it in place before writing, so that fold held the
+    /// entire lexical generation in anonymous memory at once — the
+    /// publish-tail RSS spike of GH #456 (36 GB on a 1.1M-message archive),
+    /// and the 6.75 GB single segment of GH #453. The runs are now planned
+    /// under [`lexical_merge_max_output_bytes`], which bounds the peak merge
+    /// allocation by the cap and the generation by roughly
+    /// `index_bytes / cap` segments — a handful, not the hundreds #441 was
+    /// about.
     ///
     /// # Errors
     ///
     /// Returns an error when the merge or compaction fails. Requires a fully
     /// committed index (call [`Self::commit`] first).
     pub fn force_merge(&mut self) -> Result<()> {
-        let segments = self.published_segment_profile()?;
-        if segments.len() >= 2 {
-            let source_ids: Vec<u64> = segments.iter().map(|segment| segment.0).collect();
-            self.concat_merge_run(&source_ids)?;
+        self.force_merge_with_output_cap(lexical_merge_max_output_bytes())
+    }
+
+    /// [`Self::force_merge`] with an explicit merge-output byte cap.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the merge or compaction fails.
+    pub fn force_merge_with_output_cap(&mut self, max_output_bytes: u64) -> Result<()> {
+        let runs =
+            plan_capped_merge_runs(&self.published_segment_fold_profile()?, max_output_bytes);
+        for run in runs {
+            self.concat_merge_run(&run)?;
         }
         self.compact_tombstones()?;
         Ok(())
+    }
+
+    /// The fold profile of every published segment, in manifest (docid)
+    /// order: what the merge-output cap plans against.
+    fn published_segment_fold_profile(&self) -> Result<Vec<SegmentFoldProfile>> {
+        let snapshot = self
+            .index
+            .snapshot()
+            .map_err(|error| anyhow!("reading the Quill CASS manifest: {error}"))?;
+        Ok(snapshot
+            .segments()
+            .iter()
+            .map(|segment| {
+                let manifest = segment.manifest();
+                SegmentFoldProfile {
+                    segment_id: manifest.segment_id,
+                    file_len: manifest.file_len,
+                    docid_lo: manifest.docid_lo,
+                    docid_hi: manifest.docid_hi,
+                }
+            })
+            .collect())
     }
 
     /// `(segment_id, live_doc_count)` for every published segment, in manifest
@@ -1262,16 +1365,37 @@ impl QuillCassIndex {
 
     /// Apply [`plan_bounded_segment_merge`] until it has nothing left to fold.
     /// Returns whether at least one merge ran.
+    ///
+    /// GH #456: the document-tiered run is split under the merge-output byte
+    /// cap before it is folded, for the same reason as [`Self::force_merge`]:
+    /// a fragmented generation whose segments are all "small" by document
+    /// share is one run covering the whole index, and folding it at once
+    /// materialises the whole index in memory during an ordinary
+    /// `cass index`. A pass that can fold nothing under the cap ends the loop.
     fn merge_small_segment_runs(&mut self) -> Result<bool> {
+        let max_output_bytes = lexical_merge_max_output_bytes();
         let mut merged_any = false;
-        // Each iteration strictly reduces the segment count, so this loop is
-        // bounded by the initial count; the cap is a belt-and-braces guard.
+        // Each productive iteration strictly reduces the segment count, so
+        // this loop is bounded by the initial count; the cap is a
+        // belt-and-braces guard.
         for _ in 0..MAX_BOUNDED_MERGE_PASSES {
             let profile = self.published_segment_profile()?;
             let Some(run) = plan_bounded_segment_merge(&profile) else {
                 break;
             };
-            self.concat_merge_run(&run)?;
+            let fold_profile = self.published_segment_fold_profile()?;
+            let run_profile: Vec<SegmentFoldProfile> = fold_profile
+                .iter()
+                .filter(|segment| run.contains(&segment.segment_id))
+                .copied()
+                .collect();
+            let sub_runs = plan_capped_merge_runs(&run_profile, max_output_bytes);
+            if sub_runs.is_empty() {
+                break;
+            }
+            for sub_run in sub_runs {
+                self.concat_merge_run(&sub_run)?;
+            }
             merged_any = true;
         }
         Ok(merged_any)
@@ -1409,6 +1533,125 @@ fn plan_bounded_segment_merge(profile: &[(u64, u64)]) -> Option<Vec<u64>> {
             .map(|(id, _)| *id)
             .collect()
     })
+}
+
+/// GH #456: default upper bound on the estimated output of one concat merge
+/// (1 GiB; see [`estimated_fold_output_bytes`]).
+///
+/// The engine builds a merge output as one in-memory buffer sized to the
+/// finished segment file, then re-verifies it in place before writing, so the
+/// peak anonymous allocation of a fold is about the output size plus the
+/// inputs' term dictionaries. Without a cap the end-of-rebuild fold (and an
+/// incremental fold over a fully fragmented generation) is sized to the whole
+/// lexical index. With it, a generation converges to roughly
+/// `index_bytes / cap` segments — a handful even at 10 GB — and the fold's
+/// memory no longer grows with archive size.
+pub const CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES_DEFAULT: u64 = 1 << 30;
+
+/// Environment override for [`CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES_DEFAULT`]
+/// (bytes; underscores allowed; `0`/unparsable keep the default).
+pub const CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES_ENV: &str = "CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES";
+
+/// The effective merge-output byte cap (GH #456).
+#[must_use]
+pub fn lexical_merge_max_output_bytes() -> u64 {
+    lexical_merge_max_output_bytes_from(
+        dotenvy::var(CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn lexical_merge_max_output_bytes_from(raw: Option<&str>) -> u64 {
+    raw.map(|value| value.trim().replace('_', ""))
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|&bytes| bytes > 0)
+        .unwrap_or(CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES_DEFAULT)
+}
+
+/// What the merge-output cap plans against for one published segment
+/// (GH #456): its file bytes and its Q1 docid range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SegmentFoldProfile {
+    pub segment_id: u64,
+    pub file_len: u64,
+    pub docid_lo: u64,
+    pub docid_hi: u64,
+}
+
+/// Conservative per-docid cost of the docid *hull* a concat-merge output
+/// spans (GH #456). A Q1-preserving merge keeps global docids, so its output
+/// carries per-docid structures for every id between the first input's
+/// `docid_lo` and the last input's `docid_hi` — holes included. Two 3 KB
+/// session segments one lease apart merge into a 4,624,714-byte file over a
+/// 65,538-docid hull (measured on quill 0.2.3: ~70.5 bytes per hull docid);
+/// an archive built session by session is nothing but such holes, which is
+/// how #453's incremental fold of 1,605 session segments produced one
+/// 6.75 GB file. 128 leaves headroom over the measurement so the estimate
+/// stays an upper bound (`force_merge_under_a_byte_cap_…` asserts it).
+pub(crate) const FOLD_HULL_BYTES_PER_DOCID: u64 = 128;
+
+/// Upper-bound estimate of the file a concat merge of `run` would assemble
+/// (and therefore hold in memory): the inputs' bytes plus the hull cost.
+fn estimated_fold_output_bytes(run: &[SegmentFoldProfile]) -> u64 {
+    let bytes = run
+        .iter()
+        .map(|segment| segment.file_len)
+        .fold(0_u64, u64::saturating_add);
+    let lo = run
+        .iter()
+        .map(|segment| segment.docid_lo)
+        .min()
+        .unwrap_or(0);
+    let hi = run
+        .iter()
+        .map(|segment| segment.docid_hi)
+        .max()
+        .unwrap_or(0);
+    bytes.saturating_add(
+        hi.saturating_sub(lo)
+            .saturating_mul(FOLD_HULL_BYTES_PER_DOCID),
+    )
+}
+
+/// Split a manifest-ordered fold profile into consecutive runs whose
+/// estimated merge output ([`estimated_fold_output_bytes`]) stays at or below
+/// `max_output_bytes`, keeping only runs of two or more segments (a single
+/// segment has nothing to fold into). A segment whose own estimate exceeds
+/// the cap closes the run before it and is left as it is. Greedy and
+/// deterministic in manifest order, so the runs stay consecutive — the shape
+/// a Q1-preserving concat merge requires — and merging one run never breaks
+/// the adjacency of another.
+pub(crate) fn plan_capped_merge_runs(
+    profile: &[SegmentFoldProfile],
+    max_output_bytes: u64,
+) -> Vec<Vec<u64>> {
+    let mut runs: Vec<Vec<u64>> = Vec::new();
+    let mut current: Vec<SegmentFoldProfile> = Vec::new();
+    let close = |current: &mut Vec<SegmentFoldProfile>, runs: &mut Vec<Vec<u64>>| {
+        if current.len() >= 2 {
+            runs.push(current.iter().map(|segment| segment.segment_id).collect());
+        }
+        current.clear();
+    };
+    for &segment in profile {
+        if !current.is_empty() {
+            current.push(segment);
+            if estimated_fold_output_bytes(&current) > max_output_bytes {
+                current.pop();
+                close(&mut current, &mut runs);
+            } else {
+                continue;
+            }
+        }
+        if estimated_fold_output_bytes(std::slice::from_ref(&segment)) > max_output_bytes {
+            // Oversized on its own: never a merge input under this cap.
+            continue;
+        }
+        current.push(segment);
+    }
+    close(&mut current, &mut runs);
+    runs
 }
 
 /// A random, nonzero segment id absent from `profile`.
@@ -1778,6 +2021,208 @@ mod tests {
             .expect("upsert converges on the published identities");
         index.commit().expect("publish replay");
         assert_eq!(index.doc_count().expect("doc count"), 3);
+    }
+
+    /// GH #456: the merge planner keeps every run under the byte cap, skips
+    /// oversized segments, and never emits a single-segment run.
+    #[test]
+    fn capped_merge_runs_respect_the_output_byte_cap() {
+        // Dense: every segment's hull is exactly its own docids, so the
+        // estimate is bytes plus `FOLD_HULL_BYTES_PER_DOCID` per docid.
+        let dense = |id: u64, bytes: u64, lo: u64, docs: u64| SegmentFoldProfile {
+            segment_id: id,
+            file_len: bytes,
+            docid_lo: lo,
+            docid_hi: lo + docs,
+        };
+        let profile = [
+            dense(1, 300, 0, 1),
+            dense(2, 300, 1, 1),
+            dense(3, 300, 2, 1),
+            dense(4, 300, 3, 1),
+            dense(5, 2_000, 4, 1),
+            dense(6, 100, 5, 1),
+            dense(7, 100, 6, 1),
+        ];
+        let h = FOLD_HULL_BYTES_PER_DOCID;
+        // 1..=3: 900 + 3h fits exactly; adding 4 -> 1200 + 4h does not.
+        // 5 alone: 2000 + h is oversized. 6+7: 200 + 2h fits.
+        assert_eq!(
+            plan_capped_merge_runs(&profile, 900 + 3 * h),
+            vec![vec![1, 2, 3], vec![6, 7]],
+            "four 300-byte segments do not fit; segment 5 is oversized; 4 stands alone"
+        );
+        assert_eq!(
+            plan_capped_merge_runs(&profile, u64::MAX),
+            vec![vec![1, 2, 3, 4, 5, 6, 7]],
+            "an unbounded cap folds everything into one run"
+        );
+        assert_eq!(
+            plan_capped_merge_runs(&profile, 200 + 2 * h),
+            vec![vec![6, 7]],
+            "only the two 100-byte segments fit together"
+        );
+        assert!(
+            plan_capped_merge_runs(&profile, 100 + h - 1).is_empty(),
+            "a cap below every segment folds nothing"
+        );
+        assert!(plan_capped_merge_runs(&[dense(9, 10, 0, 1)], 1_000).is_empty());
+        assert!(plan_capped_merge_runs(&[], 1_000).is_empty());
+
+        // Sparse: two tiny segments a whole lease apart cost the hull, not
+        // their bytes — the shape of a session-built archive (#453).
+        let lease = 65_536_u64;
+        let sparse = [
+            dense(1, 3_000, 0, 2),
+            dense(2, 3_000, lease, 2),
+            dense(3, 3_000, 2 * lease, 2),
+        ];
+        let hull_two = 6_000 + (lease + 2) * FOLD_HULL_BYTES_PER_DOCID;
+        assert!(
+            plan_capped_merge_runs(&sparse, hull_two - 1).is_empty(),
+            "under the two-lease hull cost nothing folds"
+        );
+        assert_eq!(
+            plan_capped_merge_runs(&sparse, hull_two),
+            vec![vec![1, 2]],
+            "exactly the two-lease hull folds the first pair and leaves the third"
+        );
+        assert_eq!(
+            plan_capped_merge_runs(&sparse, u64::MAX),
+            vec![vec![1, 2, 3]]
+        );
+    }
+
+    #[test]
+    fn merge_output_cap_env_parsing_keeps_the_default_on_junk() {
+        assert_eq!(
+            lexical_merge_max_output_bytes_from(None),
+            CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES_DEFAULT
+        );
+        assert_eq!(
+            lexical_merge_max_output_bytes_from(Some("0")),
+            CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES_DEFAULT
+        );
+        assert_eq!(
+            lexical_merge_max_output_bytes_from(Some("lots")),
+            CASS_LEXICAL_MERGE_MAX_OUTPUT_BYTES_DEFAULT
+        );
+        assert_eq!(
+            lexical_merge_max_output_bytes_from(Some(" 268_435_456 ")),
+            268_435_456
+        );
+    }
+
+    /// GH #456: under a cap that fits only some of the session segments, the
+    /// end-of-rebuild fold still folds what fits, keeps every document
+    /// searchable, and never assembles more than the cap in one output.
+    #[test]
+    fn force_merge_under_a_byte_cap_folds_partially_and_keeps_every_document() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        let sessions = 6_u64;
+        for session in 0..sessions {
+            let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open session");
+            index
+                .add_cass_documents(&[
+                    sample(&format!("cap{session}"), 0, "capped fold alpha message"),
+                    sample(&format!("cap{session}"), 1, "capped fold beta message"),
+                ])
+                .expect("index session documents");
+            index.commit().expect("commit session");
+        }
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("reopen");
+        let before = index
+            .published_segment_fold_profile()
+            .expect("fold profile");
+        assert!(before.len() >= usize::try_from(sessions).expect("small"));
+        // Room for exactly the first two session segments (their hull plus
+        // bytes), which is less than any three.
+        let cap = estimated_fold_output_bytes(&before[..2]);
+        assert!(estimated_fold_output_bytes(&before[..3]) > cap);
+        let planned = plan_capped_merge_runs(&before, cap);
+        assert!(
+            !planned.is_empty() && planned.iter().all(|run| run.len() == 2),
+            "the cap admits pairs only: {planned:?}"
+        );
+
+        index
+            .force_merge_with_output_cap(cap)
+            .expect("capped force merge");
+        let after = index
+            .published_segment_fold_profile()
+            .expect("fold profile");
+        assert_eq!(
+            after.len(),
+            before.len() - planned.len(),
+            "every planned pair folded into one segment: {before:?} -> {after:?}"
+        );
+        assert!(
+            after.len() > 1,
+            "the cap must stop the fold short of a single segment: {after:?}"
+        );
+        // The estimate is an upper bound on what the engine actually wrote,
+        // which is what makes the cap a memory bound: every merged output
+        // stays under the cap it was planned for.
+        let merged_ids: std::collections::BTreeSet<u64> = after
+            .iter()
+            .map(|segment| segment.segment_id)
+            .filter(|id| !before.iter().any(|segment| segment.segment_id == *id))
+            .collect();
+        assert_eq!(merged_ids.len(), planned.len());
+        assert!(
+            after
+                .iter()
+                .filter(|segment| merged_ids.contains(&segment.segment_id))
+                .all(|segment| segment.file_len <= cap),
+            "a merged output exceeded the cap {cap} it was planned under: {after:?}"
+        );
+        assert_eq!(index.doc_count().expect("doc count"), sessions * 2);
+
+        index
+            .force_merge_with_output_cap(u64::MAX)
+            .expect("uncapped force merge");
+        assert_eq!(published_segment_count(&index), 1);
+        assert_eq!(index.doc_count().expect("doc count"), sessions * 2);
+    }
+
+    /// GH #457: the MANIFEST-only live count must track what the engine
+    /// serves — every sealed document before any deletion, zero once
+    /// `delete_all` publishes the hollow successor — without a reader open.
+    #[test]
+    fn manifest_live_doc_count_tracks_served_documents_without_a_reader() {
+        let directory = tempfile::tempdir().expect("bridge index directory");
+        assert_eq!(
+            manifest_live_doc_count(directory.path()),
+            None,
+            "no MANIFEST has been published yet"
+        );
+        let mut index = QuillCassIndex::open_or_create(directory.path()).expect("open");
+        index
+            .add_cass_documents(&[
+                sample("hollow", 0, "alpha"),
+                sample("hollow", 1, "beta"),
+                sample("hollow", 2, "gamma"),
+            ])
+            .expect("index documents");
+        index.commit().expect("commit");
+
+        let live = manifest_live_doc_count(directory.path()).expect("published manifest");
+        assert_eq!(live.live_docs, 3);
+        assert_eq!(live.sealed_docs, 3);
+        assert_eq!(live.tombstones, 0);
+        assert!(live.segments >= 1, "a commit seals at least one segment");
+        assert!(!live.recovered_from_previous);
+        assert_eq!(live.live_docs, index.doc_count().expect("engine count"));
+
+        index.delete_all().expect("publish the hollow successor");
+        let hollow = manifest_live_doc_count(directory.path()).expect("hollow manifest");
+        assert_eq!(hollow.live_docs, 0);
+        assert_eq!(hollow.segments, 0);
+        assert!(
+            hollow.generation > live.generation,
+            "the hollow successor is a later generation"
+        );
+        assert_eq!(index.doc_count().expect("engine count"), 0);
     }
 
     /// #441: one writer session per open leases fresh docid blocks, so every

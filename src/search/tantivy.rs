@@ -1096,6 +1096,27 @@ pub fn searchable_index_summary(index_path: &Path) -> Result<Option<SearchableIn
     }))
 }
 
+/// Live-document count of a searchable lexical generation from manifest
+/// metadata alone (GH #457): the Quill MANIFEST of a single generation, or
+/// the sum over every shard of a federated bundle. Never opens a segment.
+///
+/// `None` for a Tantivy-era directory (no live count without an engine open)
+/// and when no manifest decodes.
+#[must_use]
+pub fn searchable_index_live_doc_count(index_path: &Path) -> Option<u64> {
+    if let Ok(Some(manifest)) = load_federated_search_manifest_internal(index_path) {
+        let mut total = 0_u64;
+        for shard in &manifest.shards {
+            let shard_live = crate::search::quill_bridge::manifest_live_doc_count(
+                &index_path.join(&shard.relative_path),
+            )?;
+            total = total.saturating_add(shard_live.live_docs);
+        }
+        return Some(total);
+    }
+    crate::search::quill_bridge::manifest_live_doc_count(index_path).map(|live| live.live_docs)
+}
+
 fn searchable_index_summary_from_tantivy_meta(
     index_path: &Path,
 ) -> Result<Option<SearchableIndexSummary>> {
