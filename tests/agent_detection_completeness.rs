@@ -483,6 +483,147 @@ fn new_agent_auto_discovery_documented() {
 /// GH449: the Devin factory exists even when its SQLite parser is compiled out.
 /// Exercise the persisted provider format through the factory and real CLI so
 /// slug enumeration alone cannot certify support again.
+mod prime_ingestion {
+    use super::*;
+    use coding_agent_search::connectors::{ScanContext, ScanRoot};
+    use serde_json::{Value, json};
+    use std::fs;
+    use std::io::Write;
+    use std::time::Duration;
+
+    #[test]
+    fn prime_active_branch_survives_cli_ingestion_and_incremental_append() {
+        let home = tempfile::tempdir().expect("isolated Prime home");
+        let sessions = home.path().join(".prime/agent/sessions");
+        let data = home.path().join("cass-data");
+        fs::create_dir_all(&sessions).expect("Prime session root");
+        let source = sessions.join("custom-session-id.jsonl");
+        let records = [
+            json!({"type":"session", "version":3, "id":"prime-session",
+                "timestamp":"2026-01-05T10:00:00Z", "cwd":"/work/prime"}),
+            json!({"type":"message", "id":"aaaa0001", "parentId":null,
+                "message":{"role":"user", "content":"primeneedle investigate"}}),
+            json!({"type":"message", "id":"aaaa0002", "parentId":"aaaa0001",
+                "message":{"role":"assistant", "content":"excludedbranch"}}),
+            json!({"type":"message", "id":"aaaa0003", "parentId":"aaaa0001",
+                "message":{"role":"assistant", "model":"model", "provider":"provider",
+                    "content":[{"type":"text", "text":"primeneedle corrected"},
+                        {"type":"thinking", "thinking":"inspect the active branch"},
+                        {"type":"image", "mimeType":"image/png", "data":"excludedimage"}],
+                    "usage":{"input":12,"output":7,"cacheRead":1,"cacheWrite":2}}}),
+            json!({"type":"message", "id":"aaaa0004", "parentId":"aaaa0003",
+                "message":{"role":"toolResult", "toolCallId":"call", "toolName":"shell",
+                    "content":[{"type":"text", "text":"primeneedle verified"}]}}),
+        ];
+        let mut bytes = records
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        bytes.push('\n');
+        fs::write(&source, &bytes).expect("versioned Prime transcript");
+
+        let (_, factory) = get_connector_factories()
+            .into_iter()
+            .find(|(slug, _)| *slug == "prime_agent")
+            .expect("Prime factory");
+        let ctx = ScanContext::with_roots(
+            home.path().to_path_buf(),
+            vec![ScanRoot::local(sessions)],
+            None,
+        );
+        let conversations = factory().scan(&ctx).expect("Prime scan");
+        assert_eq!(conversations.len(), 1);
+        let conversation = &conversations[0];
+        assert_eq!(conversation.agent_slug, "prime_agent");
+        assert_eq!(conversation.external_id.as_deref(), Some("prime-session"));
+        assert_eq!(conversation.metadata["omitted_branch_entry_count"], 1);
+        assert_eq!(conversation.messages.len(), 3);
+        assert_eq!(conversation.messages[2].role, "tool");
+        assert!(
+            conversation.messages[1]
+                .content
+                .contains("inspect the active branch")
+        );
+        assert_eq!(conversation.messages[1].extra["usage"]["cacheRead"], 1);
+        for message in &conversation.messages {
+            assert!(!message.content.contains("excluded"));
+            assert!(!message.extra.to_string().contains("excludedimage"));
+        }
+
+        let cass = || {
+            let mut cmd = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+            cmd.env_clear()
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .env("PATH", "")
+                .env("XDG_DATA_HOME", home.path().join(".local/share"))
+                .env("XDG_CONFIG_HOME", home.path().join(".config"))
+                .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+                .env("CASS_AUTO_REFRESH", "0")
+                .env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0")
+                .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+                .env("RUST_MIN_STACK", "134217728")
+                .current_dir(home.path())
+                .arg("--data-dir")
+                .arg(&data)
+                .timeout(Duration::from_secs(120));
+            if let Ok(system_root) = dotenvy::var("SystemRoot") {
+                cmd.env("SystemRoot", system_root);
+            }
+            cmd
+        };
+        for round in 0..3 {
+            if round == 1 {
+                let line = json!({"type":"message", "id":"aaaa0005", "parentId":"aaaa0004",
+                    "message":{"role":"user", "content":"primeneedle followup"}})
+                .to_string()
+                    + "\n";
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&source)
+                    .expect("append source")
+                    .write_all(line.as_bytes())
+                    .expect("new Prime turn");
+                bytes.push_str(&line);
+            }
+            cass()
+                .args(if round == 0 {
+                    vec!["index", "--full", "--json"]
+                } else {
+                    vec!["index", "--json"]
+                })
+                .assert()
+                .success();
+            let output = cass()
+                .args([
+                    "search",
+                    "primeneedle",
+                    "--agent",
+                    "prime_agent",
+                    "--mode",
+                    "lexical",
+                    "--json",
+                    "--limit",
+                    "20",
+                ])
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            let result: Value = serde_json::from_slice(&output).expect("Prime search JSON");
+            let hits = result["hits"].as_array().expect("Prime hits");
+            assert_eq!(hits.len(), if round == 0 { 3 } else { 4 }, "{result}");
+            assert!(hits.iter().all(|hit| hit["agent"] == "prime_agent"));
+            assert_eq!(
+                fs::read_to_string(&source).expect("preserved transcript"),
+                bytes
+            );
+        }
+    }
+}
+
 mod devin_ingestion {
     use super::*;
     use coding_agent_search::connectors::{ScanContext, ScanRoot};

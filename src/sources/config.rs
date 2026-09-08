@@ -691,6 +691,7 @@ pub fn get_preset_paths(preset: &str) -> Result<Vec<String>, ConfigError> {
             "~/.gemini/antigravity".into(),
             "~/.gemini/antigravity-cli".into(),
             "~/.pi/agent/sessions".into(),
+            "~/.prime/agent/sessions".into(),
             "~/.omp/agent/sessions".into(),
             "~/.omp/profiles".into(),
             "~/.local/share/omp".into(),
@@ -710,6 +711,7 @@ pub fn get_preset_paths(preset: &str) -> Result<Vec<String>, ConfigError> {
             "~/.gemini/antigravity".into(),
             "~/.gemini/antigravity-cli".into(),
             "~/.pi/agent/sessions".into(),
+            "~/.prime/agent/sessions".into(),
             "~/.omp/agent/sessions".into(),
             "~/.omp/profiles".into(),
             "~/.local/share/omp".into(),
@@ -2153,6 +2155,7 @@ paths = ["~/.claude/projects"]
         assert!(macos.iter().any(|p| p == "~/.gemini/antigravity"));
         assert!(macos.iter().any(|p| p == "~/.gemini/antigravity-cli"));
         assert!(macos.iter().any(|p| p == "~/.omp/agent/sessions"));
+        assert!(macos.iter().any(|p| p == "~/.prime/agent/sessions"));
         assert!(macos.iter().any(|p| p == "~/.omp/profiles"));
         assert!(macos.iter().any(|p| p == "~/.local/share/omp"));
 
@@ -2161,6 +2164,7 @@ paths = ["~/.claude/projects"]
         assert!(linux.iter().any(|p| p == "~/.gemini/antigravity"));
         assert!(linux.iter().any(|p| p == "~/.gemini/antigravity-cli"));
         assert!(linux.iter().any(|p| p == "~/.omp/agent/sessions"));
+        assert!(linux.iter().any(|p| p == "~/.prime/agent/sessions"));
         assert!(linux.iter().any(|p| p == "~/.omp/profiles"));
         assert!(linux.iter().any(|p| p == "~/.local/share/omp"));
 

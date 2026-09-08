@@ -644,6 +644,8 @@ fn infer_agent_type(path: &str) -> String {
         "gemini".to_string()
     } else if path.contains("/.pi/") || path.ends_with("/.pi") {
         "pi_agent".to_string()
+    } else if path.contains("/.prime/agent/") || path.ends_with("/.prime/agent") {
+        "prime_agent".to_string()
     } else if path.contains("/.omp/")
         || path.ends_with("/.omp")
         || path.contains("/omp/sessions")
@@ -1437,6 +1439,9 @@ CASS_VERSION=0.4.2
             "amp"
         );
         assert_eq!(infer_agent_type("~/.pi/agent/sessions"), "pi_agent");
+        assert_eq!(infer_agent_type("~/.prime/agent/sessions"), "prime_agent");
+        assert_eq!(infer_agent_type("/home/user/.prime/agent"), "prime_agent");
+        assert_eq!(infer_agent_type("/home/user/.prime/agent-other"), "unknown");
         assert_eq!(infer_agent_type("~/.omp/agent/sessions"), "omp");
         assert_eq!(
             infer_agent_type("~/.omp/profiles/work/agent/sessions"),
