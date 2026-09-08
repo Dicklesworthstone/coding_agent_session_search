@@ -23447,6 +23447,7 @@ fn rebuild_tantivy_from_db_with_options(
         });
     }
 
+    let resumed_from_checkpoint = rebuild_state.processed_conversations > 0;
     let restart_from_zero =
         rebuild_state.processed_conversations == 0 && rebuild_state.pending.is_none();
 
@@ -24481,6 +24482,15 @@ fn rebuild_tantivy_from_db_with_options(
     })?;
     verify_published_lexical_doc_count(&index_path, indexed_docs, "direct")?;
 
+    // GH #440: indexed_docs omits hard-noise messages from the committed
+    // prefix, so prefix docs + newly streamed rows is not an exact canonical
+    // count after resume. Count once at completion while the readonly handle
+    // is still open; fresh rebuilds already observed every canonical packet.
+    let final_observed_messages = if resumed_from_checkpoint {
+        count_total_messages_exact(&storage)?
+    } else {
+        observed_messages.max(indexed_docs)
+    };
     storage.close_without_checkpoint().with_context(|| {
         format!(
             "closing readonly database after Tantivy rebuild without checkpoint: {}",
@@ -24498,9 +24508,13 @@ fn rebuild_tantivy_from_db_with_options(
             max_conversation_id,
             max_message_id,
         );
+    } else {
+        // A compatible interrupted checkpoint may carry content-pending-v1.
+        // This run obtained an exact startup fingerprint: publish that value,
+        // rather than certifying the placeholder loaded from the checkpoint.
+        rebuild_state.db.storage_fingerprint = db_state.storage_fingerprint;
     }
     rebuild_state.db.total_conversations = final_total_conversations;
-    let final_observed_messages = observed_messages.max(indexed_docs);
     rebuild_state.db.total_messages = final_observed_messages;
     rebuild_state.committed_offset = i64::try_from(final_total_conversations).unwrap_or(i64::MAX);
     rebuild_state.committed_conversation_id = last_processed_conversation_id;

@@ -2591,6 +2591,7 @@ fn gh439_parked_post_publish_fts_repair_still_aborts_with_the_index_stalled_enve
 /// proves the resume contract, not its scale.
 #[test]
 fn gh440_plain_index_resumes_a_force_rebuild_killed_between_commit_and_checkpoint() {
+    use std::io::Write;
     use std::process::{Command as StdCommand, Stdio};
 
     let tmp = TempDir::new().unwrap();
@@ -2600,12 +2601,26 @@ fn gh440_plain_index_resumes_a_force_rebuild_killed_between_commit_and_checkpoin
     let codex_root = home.join(".codex");
     let sessions = 6_usize;
     for n in 0..sessions {
-        make_codex_session(
+        let source = make_codex_session(
             &codex_root,
             "2026/09/02",
             &format!("rollout-resume-{n}.jsonl"),
             &format!("resumeprobe session {n}"),
         );
+        // Canonical history also contains acknowledgements omitted from the
+        // lexical index. Resume must not substitute indexed-doc counts for
+        // these canonical rows (the September 4 GH #440 follow-up).
+        let acknowledgement = serde_json::json!({
+            "timestamp": "2026-09-02T12:00:00Z",
+            "type": "response_item",
+            "payload": {"type":"message", "role":"assistant",
+                "content":[{"type":"output_text", "text":"OK"}]}
+        });
+        writeln!(
+            OpenOptions::new().append(true).open(source).unwrap(),
+            "{acknowledgement}"
+        )
+        .unwrap();
     }
 
     // A live generation first, so the force-rebuild builds into staging.
@@ -2627,6 +2642,15 @@ fn gh440_plain_index_resumes_a_force_rebuild_killed_between_commit_and_checkpoin
         "initial index failed: stdout={} stderr={}",
         String::from_utf8_lossy(&initial.stdout),
         String::from_utf8_lossy(&initial.stderr)
+    );
+    let checkpoint_path = coding_agent_search::search::tantivy::expected_index_dir(&data_dir)
+        .join(".lexical-rebuild-state.json");
+    let initial_checkpoint: serde_json::Value =
+        serde_json::from_slice(&fs::read(&checkpoint_path).unwrap()).unwrap();
+    assert!(
+        initial_checkpoint["db"]["total_messages"].as_u64().unwrap()
+            > initial_checkpoint["indexed_docs"].as_u64().unwrap(),
+        "fixture must contain canonical messages excluded from lexical search: {initial_checkpoint}"
     );
 
     // Force-rebuild with one commit per conversation and park after the
@@ -2767,6 +2791,39 @@ fn gh440_plain_index_resumes_a_force_rebuild_killed_between_commit_and_checkpoin
         sessions,
         "every seeded session must be found after resume: {search_json}"
     );
+    for round in 0..2 {
+        let checkpoint: serde_json::Value =
+            serde_json::from_slice(&fs::read(&checkpoint_path).unwrap()).unwrap();
+        assert_eq!(checkpoint["completed"], true, "{checkpoint}");
+        assert_eq!(
+            checkpoint["db"], initial_checkpoint["db"],
+            "resume must replace its pending fingerprint and retain canonical counts: {checkpoint}"
+        );
+        let status = base_cmd(home)
+            .current_dir(home)
+            .args([
+                "status",
+                "--json",
+                "--stale-threshold",
+                "3600",
+                "--data-dir",
+            ])
+            .arg(&data_dir)
+            .output()
+            .expect("status after resume");
+        let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(status["healthy"], true, "{status}");
+        assert_eq!(status["index"]["status"], "ready", "{status}");
+        if round == 0 {
+            base_cmd(home)
+                .current_dir(home)
+                .args(["index", "--json", "--no-progress-events", "--data-dir"])
+                .arg(&data_dir)
+                .env("CASS_AUTO_REFRESH", "0")
+                .assert()
+                .success();
+        }
+    }
 }
 
 /// GH #441 / WS-B.1b: an archive that fragmented under v0.7.1 (one Quill
