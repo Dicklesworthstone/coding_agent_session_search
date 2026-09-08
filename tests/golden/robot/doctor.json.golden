@@ -742,6 +742,8 @@
     "engine_incompatible": false,
     "activity_at": null,
     "documents": null,
+    "live_documents": null,
+    "hollow": false,
     "segment_files": null,
     "empty_with_messages": false,
     "quarantined_conversations": 0,

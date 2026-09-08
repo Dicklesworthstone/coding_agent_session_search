@@ -5777,6 +5777,15 @@
                 "null"
               ]
             },
+            "live_documents": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "hollow": {
+              "type": "boolean"
+            },
             "segment_files": {
               "type": [
                 "integer",
@@ -29506,6 +29515,15 @@
                     "null"
                   ]
                 },
+                "live_documents": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "hollow": {
+                  "type": "boolean"
+                },
                 "segment_files": {
                   "type": [
                     "integer",
@@ -32021,6 +32039,15 @@
                         "null"
                       ]
                     },
+                    "live_documents": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "hollow": {
+                      "type": "boolean"
+                    },
                     "segment_files": {
                       "type": [
                         "integer",
@@ -33244,6 +33271,15 @@
                 "integer",
                 "null"
               ]
+            },
+            "live_documents": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "hollow": {
+              "type": "boolean"
             },
             "segment_files": {
               "type": [
@@ -35322,6 +35358,15 @@
                 "null"
               ]
             },
+            "live_documents": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "hollow": {
+              "type": "boolean"
+            },
             "segment_files": {
               "type": [
                 "integer",
@@ -37377,6 +37422,15 @@
                     "integer",
                     "null"
                   ]
+                },
+                "live_documents": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "hollow": {
+                  "type": "boolean"
                 },
                 "segment_files": {
                   "type": [

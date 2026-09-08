@@ -399,7 +399,9 @@ schemas: (auto-generated from contract)
         - current_db_fingerprint: ?
         - matches_current_db_fingerprint: ?
       - fresh: boolean
+      - hollow: boolean
       - last_indexed_at: ?
+      - live_documents: ?
       - partial: boolean
       - partial_reason: ?
       - quarantined_conversations: integer
@@ -2996,7 +2998,9 @@ schemas: (auto-generated from contract)
         - exists: boolean
         - fingerprint: object
         - fresh: boolean
+        - hollow: boolean
         - last_indexed_at: ?
+        - live_documents: ?
         - partial: boolean
         - partial_reason: ?
         - quarantined_conversations: integer
@@ -3494,7 +3498,9 @@ schemas: (auto-generated from contract)
         - current_db_fingerprint: ?
         - matches_current_db_fingerprint: ?
       - fresh: boolean
+      - hollow: boolean
       - last_indexed_at: ?
+      - live_documents: ?
       - partial: boolean
       - partial_reason: ?
       - quarantined_conversations: integer
@@ -3884,7 +3890,9 @@ schemas: (auto-generated from contract)
         - current_db_fingerprint: ?
         - matches_current_db_fingerprint: ?
       - fresh: boolean
+      - hollow: boolean
       - last_indexed_at: ?
+      - live_documents: ?
       - partial: boolean
       - partial_reason: ?
       - quarantined_conversations: integer
@@ -4147,7 +4155,9 @@ schemas: (auto-generated from contract)
         - exists: boolean
         - fingerprint: object
         - fresh: boolean
+        - hollow: boolean
         - last_indexed_at: ?
+        - live_documents: ?
         - partial: boolean
         - partial_reason: ?
         - quarantined_conversations: integer

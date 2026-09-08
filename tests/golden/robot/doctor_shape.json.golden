@@ -859,6 +859,12 @@
         "documents": {
           "type": "null"
         },
+        "live_documents": {
+          "type": "null"
+        },
+        "hollow": {
+          "type": "boolean"
+        },
         "segment_files": {
           "type": "null"
         },

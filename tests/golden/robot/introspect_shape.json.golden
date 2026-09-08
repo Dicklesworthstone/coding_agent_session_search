@@ -4241,6 +4241,25 @@
                             }
                           }
                         },
+                        "live_documents": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        "hollow": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
                         "segment_files": {
                           "type": "object",
                           "properties": {
@@ -54728,6 +54747,25 @@
                                     }
                                   }
                                 },
+                                "live_documents": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "hollow": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
                                 "segment_files": {
                                   "type": "object",
                                   "properties": {
@@ -60508,6 +60546,25 @@
                                             }
                                           }
                                         },
+                                        "live_documents": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
+                                        "hollow": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
                                         "segment_files": {
                                           "type": "object",
                                           "properties": {
@@ -63150,6 +63207,25 @@
                               "items": {
                                 "type": "string"
                               }
+                            }
+                          }
+                        },
+                        "live_documents": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        "hollow": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
                             }
                           }
                         },
@@ -67634,6 +67710,25 @@
                             }
                           }
                         },
+                        "live_documents": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        "hollow": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
                         "segment_files": {
                           "type": "object",
                           "properties": {
@@ -72036,6 +72131,25 @@
                                       "items": {
                                         "type": "string"
                                       }
+                                    }
+                                  }
+                                },
+                                "live_documents": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "hollow": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
                                     }
                                   }
                                 },
