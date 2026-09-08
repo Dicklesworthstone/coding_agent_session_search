@@ -184,4 +184,26 @@ The actual native MiniLM bundle was downloaded to isolated test storage and all
 five manifest sizes/checksums matched. An old-binary control first encountered
 a fleet refusal, then failed CLI argument parsing before model installation or
 inference. The corrected probe also blocks ancestor dotenv files and requires
-exact agreement on all six fixture documents. Model execution is still pending.
+exact agreement on all six fixture documents. The corrected F7 native admission
+was refused with RCH103/queue_timeout before inference; model execution is still
+pending in the combined F8 admission.
+
+F7 terminated with 697 passed, six failed and three ignored tests across 13
+executed test binaries. Separate Clippy and backfill integration compilation
+failed on the unavailable helper API; the latter ran zero tests. The ordinary
+and legacy FTS restart regressions and the interrupted-commit metadata test
+passed. All five watch failures stopped at the suppressed INFO startup signal.
+The populated introspection comparison exposed eight undeclared runtime paths:
+the orphan-blob count/bytes, rebuild engine_incompatible on four surfaces, and
+two triage inspected fields. The prepared correction follows the emitters and
+adds actual zero-budget triage coverage without widening ordinary status types.
+The corrected watch/lock/schema tests await F8; its pinned formatter output was
+reviewed and applied manually. F8's 1040 input files match canonical source at
+d176dbbb610b23485d929b755306dac72ed312253cb5bf499172b9bbb7100870.
+
+The two isolated patch-level lock updates are now canonical: chacha20 0.10.2
+and libssh2-sys 0.3.3. Only their version/checksum records changed; F7 executed
+the nine real crypto tests and the explicitly selected Docker SFTP fallback
+test successfully on that exact lock. Those tests do not clear the unrelated
+F7 failures. Strict UBS actually timed out at 300 seconds, so it remains an
+incomplete blocking result. No release publication is implied.

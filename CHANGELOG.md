@@ -187,8 +187,9 @@ mean that every acceptance row, platform, or reporter archive has been verified.
   Missing checkpoint files restart coverage safely; partial repairs revoke
   stale readiness, and publication retains the prior WAL before validating the
   replacement. Backfills share the indexing lock and report real progress.
-  The candidate's regression and native-model validation remain pending; this
-  does not establish large-archive throughput. See [#458](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/458).
+  Seven storage/vector regressions pass; process-lock and native-model
+  validation remain pending. This does not establish large-archive throughput.
+  See [#458](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/458).
 - Watches of an explicit Devin database follow its WAL/SHM events without
   ingesting neighboring databases. Provider timestamps older than filesystem
   events no longer hide later WAL commits. See [#449](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/449).
@@ -206,6 +207,11 @@ mean that every acceptance row, platform, or reporter archive has been verified.
 - Doctor distinguishes a queryable FTS table from verified structural integrity;
   a successful query no longer dismisses a structural checker failure as a
   harmless engine difference. See [#438](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/438).
+- Introspection describes the emitted rebuild engine-compatibility and orphan
+  raw-blob counters. Triage schemas distinguish uninspected sections and unknown
+  values when its budget expires, while ordinary status schemas retain their
+  observed-value types. The real CLI contract regression includes zero-budget
+  triage; corrected runtime validation is pending.
 - A hollow published Quill generation — one serving a handful of documents
   while its completed rebuild checkpoint, content fingerprint and generation
   manifest all still look right — no longer reads as healthy (GH #457).
@@ -367,6 +373,9 @@ mean that every acceptance row, platform, or reporter archive has been verified.
   duplicating it.
 
 ### Changed
+- The lockfile adopts `chacha20` 0.10.2 and `libssh2-sys` 0.3.3; crypto
+  vectors, round-trip properties, and the real Docker SFTP fallback passed
+  with these patch updates.
 - `asupersync` is pinned to crates.io `=0.4.10`, which publishes the
   `Cx::is_cancelled` API required by FrankenSearch 0.4.3.
 - `frankensearch` is pinned to `=0.4.3` (Quill `0.2.3`). Segment collection
