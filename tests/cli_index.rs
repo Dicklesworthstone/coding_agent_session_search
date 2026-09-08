@@ -3090,16 +3090,76 @@ fn gh453_back_to_back_runs_report_retired_segments_and_size_headroom_from_live_b
 #[test]
 #[ignore = "sleeps past the engine's 300 s garbage grace period"]
 fn gh453_gc_reclaims_folded_segments_after_the_grace_period() {
+    gh453_assert_reclamation_after_grace(false);
+}
+
+/// Later publications must not restart the grace clock for older retirements.
+#[test]
+#[ignore = "sleeps past the engine's 300 s garbage grace period"]
+fn gh453_gc_reclaims_despite_publication_during_the_grace_period() {
+    gh453_assert_reclamation_after_grace(true);
+}
+
+fn gh453_assert_reclamation_after_grace(publish_during_grace: bool) {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path();
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
     let codex_root = home.join(".codex");
 
-    let before = gh453_run_rounds(home, &data_dir, &codex_root, 3);
+    // Two rounds have retired the original fold and leave room for one new
+    // segment below the four-segment merge threshold. The quiet control keeps
+    // its original three-round fixture.
+    let rounds = if publish_during_grace { 2 } else { 3 };
+    let before = gh453_run_rounds(home, &data_dir, &codex_root, rounds);
     assert!(before.retired_segment_files > 0, "{before:?}");
     eprintln!("gh453: before grace: {before:?}");
-    std::thread::sleep(std::time::Duration::from_secs(305));
+    let grace_start = std::time::Instant::now();
+    let recent_publication_start = if publish_during_grace {
+        let index_dir = coding_agent_search::search::tantivy::expected_index_dir(&data_dir);
+        let manifest_before = fs::read(index_dir.join("MANIFEST")).expect("published manifest");
+        std::thread::sleep(std::time::Duration::from_secs(150));
+        make_codex_session(
+            &codex_root,
+            "2026/09/07",
+            "rollout-453-during-grace.jsonl",
+            "reclaimprobe publication during grace",
+        );
+        let publication_start = std::time::Instant::now();
+        let run = base_cmd(home)
+            .current_dir(home)
+            .args(["index", "--json", "--no-progress-events", "--data-dir"])
+            .arg(&data_dir)
+            .env("CASS_AUTO_REFRESH", "0")
+            .output()
+            .expect("publish during the retirement grace period");
+        assert!(
+            run.status.success(),
+            "publication failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&run.stdout),
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_ne!(
+            fs::read(index_dir.join("MANIFEST")).expect("successor manifest"),
+            manifest_before,
+            "the intervening index must publish a successor generation"
+        );
+        assert!(
+            grace_start.elapsed() < std::time::Duration::from_secs(300),
+            "the intervening publication must finish before the original grace expires"
+        );
+        let during = gh453_snapshot(home, &data_dir);
+        assert_eq!(
+            during.retired_segment_files, before.retired_segment_files,
+            "this fixture must preserve the original retired population: {during:?}"
+        );
+        Some(publication_start)
+    } else {
+        None
+    };
+    std::thread::sleep(
+        std::time::Duration::from_secs(305).saturating_sub(grace_start.elapsed()),
+    );
 
     let gc = base_cmd(home)
         .current_dir(home)
@@ -3108,6 +3168,12 @@ fn gh453_gc_reclaims_folded_segments_after_the_grace_period() {
         .env("CASS_AUTO_REFRESH", "0")
         .output()
         .expect("cass index --gc");
+    if let Some(publication_start) = recent_publication_start {
+        assert!(
+            publication_start.elapsed() < std::time::Duration::from_secs(300),
+            "GC must finish while the intervening publication is younger than the grace period"
+        );
+    }
     assert!(
         gc.status.success(),
         "{}",
@@ -3146,6 +3212,16 @@ fn gh453_gc_reclaims_folded_segments_after_the_grace_period() {
         hits["hits"].as_array().is_some_and(|hits| hits.len() >= 3),
         "{hits}"
     );
+    if publish_during_grace {
+        assert!(
+            hits["hits"].as_array().is_some_and(|hits| hits.iter().any(|hit| {
+                hit["source_path"]
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("rollout-453-during-grace.jsonl"))
+            })),
+            "the intervening publication must remain searchable after GC: {hits}"
+        );
+    }
 }
 
 #[derive(Debug)]
