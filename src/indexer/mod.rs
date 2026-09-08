@@ -139,6 +139,7 @@ enum ActiveSessionSourceReason {
 struct ActiveSessionSourceFilter {
     writable_file_ids: HashSet<SourceFileId>,
     recent_write_window: Option<Duration>,
+    deferred_sources: Mutex<BTreeSet<PathBuf>>,
 }
 
 impl ActiveSessionSourceFilter {
@@ -146,6 +147,7 @@ impl ActiveSessionSourceFilter {
         Self {
             writable_file_ids: collect_writable_open_session_file_ids(),
             recent_write_window: active_session_recent_write_window(enable_recent_write_window),
+            deferred_sources: Mutex::default(),
         }
     }
 
@@ -154,7 +156,17 @@ impl ActiveSessionSourceFilter {
         Self {
             writable_file_ids: HashSet::new(),
             recent_write_window,
+            deferred_sources: Mutex::default(),
         }
+    }
+
+    fn take_deferred_sources(&self) -> BTreeSet<PathBuf> {
+        std::mem::take(
+            &mut *self
+                .deferred_sources
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        )
     }
 
     fn active_writer_reason(&self, path: &Path) -> Option<ActiveSessionSourceReason> {
@@ -251,6 +263,11 @@ fn should_skip_active_session_source(
         return false;
     };
     ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(true, Ordering::Relaxed);
+    active_source_filter
+        .deferred_sources
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(source_path.to_path_buf());
     tracing::info!(
         source_path = %source_path.display(),
         ?reason,
@@ -964,12 +981,15 @@ struct NonWatchIngestOutcome {
     lexical_update_deferred: bool,
     scanned_connectors: BTreeSet<String>,
     scan_had_errors: bool,
+    deferred_sources: BTreeSet<PathBuf>,
 }
 
 impl NonWatchIngestOutcome {
     fn accumulate(self, other: Self) -> Self {
         let mut scanned_connectors = self.scanned_connectors;
         scanned_connectors.extend(other.scanned_connectors);
+        let mut deferred_sources = self.deferred_sources;
+        deferred_sources.extend(other.deferred_sources);
         Self {
             canonical_mutations: self
                 .canonical_mutations
@@ -980,6 +1000,7 @@ impl NonWatchIngestOutcome {
             lexical_update_deferred: self.lexical_update_deferred || other.lexical_update_deferred,
             scanned_connectors,
             scan_had_errors: self.scan_had_errors || other.scan_had_errors,
+            deferred_sources,
         }
     }
 }
@@ -13978,10 +13999,13 @@ fn run_streaming_index_with_connector_factories(
         return Err(anyhow::anyhow!(error));
     }
 
-    let (discovered_names, ingest_outcome) = match consumer_result {
+    let (discovered_names, mut ingest_outcome) = match consumer_result {
         Ok(result) => result,
         Err(_) => unreachable!("handled above"),
     };
+    ingest_outcome
+        .deferred_sources
+        .extend(producer_config.active_source_filter.take_deferred_sources());
 
     // Update discovered agent names in progress tracker
     if let Some(p) = &opts.progress
@@ -14451,6 +14475,9 @@ fn run_batch_index_with_connector_factories(
 
     ingest_outcome.scanned_connectors.extend(scanned_connectors);
     ingest_outcome.scan_had_errors |= scan_had_errors;
+    ingest_outcome
+        .deferred_sources
+        .extend(active_source_filter.take_deferred_sources());
 
     Ok(ingest_outcome)
 }
@@ -15347,6 +15374,7 @@ fn run_index_inner(
     let mut scanned_connectors = BTreeSet::new();
     let mut scan_had_errors = false;
     let mut stale_index_ingest_quarantine_retry_attempted = false;
+    let mut deferred_watch_sources = BTreeSet::new();
 
     let mut tantivy_requires_rebuild = false;
     let mut observed_tantivy_docs = None;
@@ -16053,6 +16081,7 @@ fn run_index_inner(
                     scan_lexical_update_deferred |= scan_outcome.lexical_update_deferred;
                     scanned_connectors.extend(scan_outcome.scanned_connectors);
                     scan_had_errors |= scan_outcome.scan_had_errors;
+                    deferred_watch_sources.extend(scan_outcome.deferred_sources);
                 } else {
                     tracing::info!(
                         "using batch indexing (streaming disabled via CASS_STREAMING_INDEX=0)"
@@ -16074,6 +16103,7 @@ fn run_index_inner(
                     scan_lexical_update_deferred |= scan_outcome.lexical_update_deferred;
                     scanned_connectors.extend(scan_outcome.scanned_connectors);
                     scan_had_errors |= scan_outcome.scan_had_errors;
+                    deferred_watch_sources.extend(scan_outcome.deferred_sources);
                 }
                 // #372: persist remote mirror fingerprints only after an
                 // error-free scan (the same signal that gates last_scan_ts), so
@@ -17189,8 +17219,10 @@ fn run_index_inner(
             event_channel,
             stale_detector,
             opts.watch_interval_secs,
+            deferred_watch_sources,
             move |paths, roots, is_rebuild| {
                 let mut semantic_delta = WatchSemanticDelta::default();
+                let active_source_filter = ActiveSessionSourceFilter::new(!watch_once_mode);
                 let indexed = if is_rebuild {
                     if let Ok(mut g) = state.lock() {
                         g.clear();
@@ -17203,7 +17235,7 @@ fn run_index_inner(
                     // For rebuild, trigger reindex on all active roots
                     let all_root_paths: Vec<PathBuf> =
                         roots.iter().map(|(_, root)| root.path.clone()).collect();
-                    let indexed = reindex_paths(
+                    let indexed = reindex_paths_with_semantic_delta(
                         &opts_clone,
                         all_root_paths,
                         roots,
@@ -17212,6 +17244,8 @@ fn run_index_inner(
                         &t_index,
                         &index_path_for_watch,
                         true,
+                        None,
+                        &active_source_filter,
                     );
                     finalize_watch_reindex_result(
                         indexed,
@@ -17231,6 +17265,7 @@ fn run_index_inner(
                             &index_path_for_watch,
                             false,
                             semantic_enabled.then_some(&mut semantic_delta),
+                            &active_source_filter,
                         ),
                         &detector_clone,
                         opts_clone.progress.as_ref(),
@@ -17280,6 +17315,7 @@ fn run_index_inner(
                             &index_path_for_watch,
                             false,
                             semantic_enabled.then_some(&mut semantic_delta),
+                            &active_source_filter,
                         ),
                         &detector_clone,
                         opts_clone.progress.as_ref(),
@@ -17379,7 +17415,7 @@ fn run_index_inner(
                     }
                 }
 
-                Ok(())
+                Ok(active_source_filter.take_deferred_sources())
             },
         );
 
@@ -24664,6 +24700,7 @@ fn ingest_batch_detailed(
         lexical_update_deferred: batch_outcome.lexical_update_deferred,
         scanned_connectors: BTreeSet::new(),
         scan_had_errors: false,
+        deferred_sources: BTreeSet::new(),
     })
 }
 
@@ -24890,6 +24927,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
             lexical_update_deferred: true,
             scanned_connectors: BTreeSet::new(),
             scan_had_errors: false,
+            deferred_sources: BTreeSet::new(),
         });
     }
 
@@ -24921,6 +24959,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
         lexical_update_deferred: true,
         scanned_connectors: BTreeSet::new(),
         scan_had_errors: false,
+        deferred_sources: BTreeSet::new(),
     })
 }
 
@@ -27145,14 +27184,45 @@ fn watch_ingest_chunk_size() -> usize {
     }
 }
 
-fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) -> Result<()>>(
+/// Keep deferred sources in the watch loop, including sources skipped during
+/// startup. An active writer may close without producing another filesystem
+/// event; the cooldown must therefore drive retries itself (GH455).
+fn dispatch_watch_callback<F>(
+    pending: &mut BTreeSet<PathBuf>,
+    roots: &[(ConnectorKind, ScanRoot)],
+    is_rebuild: bool,
+    callback: &F,
+) where
+    F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) -> Result<BTreeSet<PathBuf>>,
+{
+    let paths = if is_rebuild {
+        Vec::new()
+    } else {
+        pending.iter().cloned().collect()
+    };
+    match callback(paths, roots, is_rebuild) {
+        Ok(deferred) => *pending = deferred,
+        Err(error) => {
+            tracing::warn!(%error, is_rebuild, "watch callback failed; retaining sources for retry");
+            if is_rebuild {
+                pending.extend(roots.iter().map(|(_, root)| root.path.clone()));
+            }
+        }
+    }
+}
+
+fn watch_sources<F>(
     watch_once_paths: Option<Vec<PathBuf>>,
     roots: Vec<(ConnectorKind, ScanRoot)>,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
     stale_detector: Arc<StaleDetector>,
     watch_interval_secs: u64,
+    deferred_sources: BTreeSet<PathBuf>,
     callback: F,
-) -> Result<()> {
+) -> Result<()>
+where
+    F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) -> Result<BTreeSet<PathBuf>>,
+{
     if let Some(paths) = watch_once_paths {
         if !paths.is_empty() {
             callback(paths, &roots, false)?;
@@ -27195,8 +27265,8 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) -> Resu
     let min_scan_interval = Duration::from_secs(watch_interval_secs.max(1));
     // Stale check interval: check every 5 minutes for quicker detection
     let stale_check_interval = Duration::from_secs(300);
-    let mut pending: Vec<PathBuf> = Vec::new();
-    let mut first_event: Option<Instant> = None;
+    let mut pending = deferred_sources;
+    let mut first_event = (!pending.is_empty()).then(Instant::now);
     let mut last_stale_check = Instant::now();
     // Initialize to the past so the first scan can fire immediately.
     // Use checked_sub to avoid panic if system uptime < min_scan_interval
@@ -27233,11 +27303,9 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) -> Resu
             if elapsed >= max_wait {
                 if cooldown_remaining.is_zero() {
                     // Cooldown elapsed and max_wait exceeded: fire now.
-                    if let Err(error) = callback(std::mem::take(&mut pending), &roots, false) {
-                        tracing::warn!(error = %error, "watch incremental callback failed");
-                    }
+                    dispatch_watch_callback(&mut pending, &roots, false, &callback);
                     last_scan = Instant::now();
-                    first_event = None;
+                    first_event = (!pending.is_empty()).then(Instant::now);
                     continue;
                 }
                 // max_wait exceeded but cooldown still active: wait for
@@ -27262,26 +27330,20 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) -> Resu
                 ReindexCommand::Full => {
                     // Full rebuild commands bypass cooldown for responsive
                     // operator-initiated rebuilds.
-                    if !pending.is_empty()
-                        && let Err(error) = callback(std::mem::take(&mut pending), &roots, false)
-                    {
-                        tracing::warn!(error = %error, "watch incremental callback failed");
+                    if !pending.is_empty() {
+                        dispatch_watch_callback(&mut pending, &roots, false, &callback);
                     }
-                    if let Err(error) = callback(vec![], &roots, true) {
-                        tracing::warn!(error = %error, "watch rebuild callback failed");
-                    }
+                    dispatch_watch_callback(&mut pending, &roots, true, &callback);
                     last_scan = Instant::now();
-                    first_event = None;
+                    first_event = (!pending.is_empty()).then(Instant::now);
                 }
             },
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 // Process pending events only if cooldown has elapsed
                 if !pending.is_empty() && last_scan.elapsed() >= min_scan_interval {
-                    if let Err(error) = callback(std::mem::take(&mut pending), &roots, false) {
-                        tracing::warn!(error = %error, "watch incremental callback failed");
-                    }
+                    dispatch_watch_callback(&mut pending, &roots, false, &callback);
                     last_scan = Instant::now();
-                    first_event = None;
+                    first_event = (!pending.is_empty()).then(Instant::now);
                 }
 
                 // Periodic stale check
@@ -27311,13 +27373,9 @@ fn watch_sources<F: Fn(Vec<PathBuf>, &[(ConnectorKind, ScanRoot)], bool) -> Resu
                                     "stale state detected, triggering automatic full rebuild"
                                 );
                                 // Trigger full rebuild
-                                if let Err(error) = callback(vec![], &roots, true) {
-                                    tracing::warn!(
-                                        error = %error,
-                                        "watch stale-rebuild callback failed"
-                                    );
-                                }
+                                dispatch_watch_callback(&mut pending, &roots, true, &callback);
                                 last_scan = Instant::now();
+                                first_event = (!pending.is_empty()).then(Instant::now);
                             }
                             StaleAction::None => {
                                 // Stale detection disabled, should not reach here
@@ -27366,6 +27424,7 @@ fn reset_storage(storage: &FrankenStorage) -> Result<()> {
 /// Returns `Ok(count)` where count is the number of conversations successfully indexed.
 /// This count is used by the stale detector to track indexing activity.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn reindex_paths(
     opts: &IndexOptions,
     paths: Vec<PathBuf>,
@@ -27377,7 +27436,18 @@ fn reindex_paths(
     force_full: bool,
 ) -> Result<usize> {
     reindex_paths_with_semantic_delta(
-        opts, paths, roots, state, storage, t_index, index_path, force_full, None,
+        opts,
+        paths,
+        roots,
+        state,
+        storage,
+        t_index,
+        index_path,
+        force_full,
+        None,
+        &ActiveSessionSourceFilter::new(
+            opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
+        ),
     )
 }
 
@@ -27392,6 +27462,7 @@ fn reindex_paths_with_semantic_delta(
     index_path: &Path,
     force_full: bool,
     semantic_delta: Option<&mut WatchSemanticDelta>,
+    active_source_filter: &ActiveSessionSourceFilter,
 ) -> Result<usize> {
     // DO NOT lock storage/index here for the whole duration.
     // We only need them for the ingest phase, not the scan phase.
@@ -27411,9 +27482,6 @@ fn reindex_paths_with_semantic_delta(
 
     let mut semantic_delta = semantic_delta;
     let preserve_watch_watermark = scan_path_exclusions_active();
-    let active_source_filter = ActiveSessionSourceFilter::new(
-        opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
-    );
 
     for (kind, root, min_ts, max_ts) in triggers {
         let conn = kind.create_connector();
@@ -27479,11 +27547,7 @@ fn reindex_paths_with_semantic_delta(
         };
 
         if root.path.is_file()
-            && should_skip_active_session_source(
-                &active_source_filter,
-                root.origin.kind,
-                &root.path,
-            )
+            && should_skip_active_session_source(active_source_filter, root.origin.kind, &root.path)
         {
             tracing::debug!(
                 ?kind,
@@ -27508,7 +27572,7 @@ fn reindex_paths_with_semantic_delta(
                 kind.slug(),
                 std::slice::from_ref(&root),
                 since_ts,
-                &active_source_filter,
+                active_source_filter,
             );
 
         // SCAN PHASE: IO-heavy, no locks held
@@ -27531,7 +27595,7 @@ fn reindex_paths_with_semantic_delta(
         let pre_active_filter_count = convs.len();
         convs.retain(|conv| {
             !should_skip_active_session_source(
-                &active_source_filter,
+                active_source_filter,
                 root.origin.kind,
                 &conv.source_path,
             )
@@ -55261,6 +55325,7 @@ mod tests {
             &index_path,
             false,
             Some(&mut first_delta),
+            &ActiveSessionSourceFilter::new(false),
         )
         .unwrap();
         assert_eq!(indexed, 1);
@@ -55302,6 +55367,7 @@ mod tests {
             &index_path,
             false,
             Some(&mut second_delta),
+            &ActiveSessionSourceFilter::new(false),
         )
         .unwrap();
         assert_eq!(indexed, 1);
