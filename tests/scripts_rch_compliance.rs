@@ -12,6 +12,7 @@
 //!   - The invocation appears inside a `run_cargo()` function body or via
 //!     `$RCH_BIN exec --` substitution.
 //!   - The line defines a function named `*cargo*` (definition, not call).
+//!   - gate.sh's formatter callback is serialized into its remote command.
 //!
 //! ## Compliance rule 2: avoid `set -e + ((VAR++))`
 //!
@@ -121,12 +122,11 @@ fn logical_lines(body: &str) -> Vec<(usize, String)> {
 /// is intentionally bash-naive: nested quotes, $(...) interpolation, and
 /// heredocs are not modeled — these have rare-enough collisions with cargo
 /// invocations that we accept the residual risk.
-fn cargo_spans_outside_quotes(line: &str) -> Vec<(usize, usize)> {
+fn cargo_spans_outside_quotes(line: &str, quote_state: &mut (bool, bool)) -> Vec<(usize, usize)> {
     let bytes = line.as_bytes();
     let mut spans = Vec::new();
     let mut i = 0;
-    let mut in_single = false;
-    let mut in_double = false;
+    let (mut in_single, mut in_double) = *quote_state;
     while i < bytes.len() {
         let c = bytes[i];
         if !in_single && !in_double && bytes[i..].starts_with(b"cargo")
@@ -153,6 +153,7 @@ fn cargo_spans_outside_quotes(line: &str) -> Vec<(usize, usize)> {
         }
         i += 1;
     }
+    *quote_state = (in_single, in_double);
     spans
 }
 
@@ -178,14 +179,25 @@ fn scan_for_bare_cargo(path: &Path) -> Vec<Finding> {
         regex::Regex::new(r"\bcargo\s+(build|test|bench|clippy|run|check|fmt|update|install)\b")
             .expect("regex compiles");
     let mut findings = Vec::new();
+    let mut quote_state = (false, false);
+    let serialized_gate_formatter = path == project_root().join("scripts/gate.sh")
+        && body.contains("REMOTE_SCRIPT=\"$(declare -f test_log_counts run_tests run_fmt run_ubs)");
+    let mut in_gate_formatter = false;
     for (start_line, logical) in logical_lines(&body) {
         let line = strip_trailing_comment(&logical);
+        if serialized_gate_formatter && line.trim() == "run_fmt() {" {
+            in_gate_formatter = true;
+        } else if line.trim() == "}" {
+            in_gate_formatter = false;
+        }
+        // Shell assignments can contain a multiline remote script. Carry the
+        // quote state even through lines that contain no cargo command.
+        let cargo_positions = cargo_spans_outside_quotes(line, &mut quote_state);
         if !cargo_subcmd_re.is_match(line) {
             continue;
         }
         // Filter out cargo occurrences inside quoted strings — they are echo
         // text, log messages, --help text, etc., not real invocations.
-        let cargo_positions: Vec<(usize, usize)> = cargo_spans_outside_quotes(line);
         if cargo_positions.is_empty() {
             continue;
         }
@@ -201,6 +213,11 @@ fn scan_for_bare_cargo(path: &Path) -> Vec<Finding> {
             }
         }
         if !has_real_match {
+            continue;
+        }
+        // This exact callback is copied into the admitted remote command by
+        // declare -f. Keep scanning every command outside its function body.
+        if in_gate_formatter {
             continue;
         }
         // Skip lines that ARE the rch-wrapped form. The wrapped form contains
@@ -723,6 +740,21 @@ fn scanner_handles_line_continuations_for_rch() {
         findings.is_empty(),
         "cargo following an `rch exec --` continuation line must not trigger; got {findings:?}"
     );
+}
+
+#[test]
+fn scanner_tracks_multiline_quotes_and_still_flags_following_cargo() {
+    let tmp = tempdir_for_test("rch_compliance_multiline");
+    let path = tmp.join("remote.sh");
+    std::fs::write(
+        &path,
+        b"#!/usr/bin/env bash\nREMOTE_SCRIPT=\"set -o pipefail\ncargo fmt --check\ncargo test\"\nrch exec --job -- bash -c \"$REMOTE_SCRIPT\"\ncargo build\n",
+    )
+    .unwrap();
+    let findings = scan_for_bare_cargo(&path);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].line, 6);
+    assert_eq!(findings[0].snippet, "cargo build");
 }
 
 #[test]

@@ -24,7 +24,7 @@ anyhow = "1.0.102"
 thiserror = "2.0.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "ansi", "json"] }
-asupersync = { version = "=0.4.9", features = ["test-internals", "tls-native-roots"] }
+asupersync = { version = "=0.4.10", features = ["test-internals", "tls-native-roots"] }
 clap = { version = "4.6.1", features = ["derive", "cargo", "env", "unicode", "wrap_help"] }
 clap_complete = "4.6.5"
 clap_mangen = "0.3.0"
@@ -130,10 +130,9 @@ bytemuck = "1.25.0"
 # Registry pin (gh#410): 0.4.2 adds the distinct opt-in multilingual native
 # embedding space to the Windows Quill publication line introduced in 0.4.1;
 # registry 0.3.2 was a stale same-version twin and must never be resolved.
-# 0.4.3 (gh#453 receipt-clocked segment sweep) is published but NOT adoptable
-# yet: registry `frankensearch-quill 0.2.3` calls `asupersync::Cx::is_cancelled`,
-# which exists only on unreleased asupersync main (no 0.4.x release has it), so
-# it fails to compile against any registry asupersync (verified 2026-09-07).
+# 0.4.3 (gh#453 receipt-clocked segment sweep) needs Cx::is_cancelled,
+# published in asupersync 0.4.10. Validate that runtime update before
+# adopting the new search engine.
 frankensearch = { version = "=0.4.2", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
 franken-agent-detection = { version = "=0.2.3", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
@@ -291,7 +290,7 @@ inherits = "release"
 debug = "line-tables-only"
 strip = false
 
-# The dependency graph is pinned to the asupersync 0.4.x line (0.4.9). Keep
+# The dependency graph is pinned to the asupersync 0.4.x line (0.4.10). Keep
 # the frankensqlite, frankensearch, and franken-agent-detection registry pins
 # aligned so Cargo.lock does not reintroduce a parallel asupersync 0.3.x stack.
 #

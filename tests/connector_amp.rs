@@ -167,11 +167,11 @@ fn amp_parses_alternate_fields() {
     let c = &convs[0];
     assert_eq!(c.messages.len(), 2);
 
-    assert_eq!(c.messages[0].role, "human");
+    assert_eq!(c.messages[0].role, "user");
     assert_eq!(c.messages[0].content, "Hello Amp");
     assert_eq!(c.messages[0].created_at, Some(1000000)); // 1000 seconds -> 1000000 ms
 
-    assert_eq!(c.messages[1].role, "bot");
+    assert_eq!(c.messages[1].role, "assistant");
     assert_eq!(c.messages[1].content, "Hello Human");
     assert_eq!(c.messages[1].created_at, Some(2000000)); // 2000 seconds -> 2000000 ms
 }
@@ -423,8 +423,8 @@ fn amp_normalizes_roles() {
 
     let msgs = &convs[0].messages;
     assert_eq!(msgs[0].role, "user");
-    assert_eq!(msgs[1].role, "model");
-    assert_eq!(msgs[2].role, "agent");
+    assert_eq!(msgs[1].role, "assistant");
+    assert_eq!(msgs[2].role, "assistant");
 }
 
 /// Test external ID extraction
@@ -444,7 +444,7 @@ fn amp_extracts_external_id() {
     )
     .unwrap();
 
-    // Case 2: ID from filename
+    // Case 2: no native ID, so use the root-relative filename including extension.
     let session2 = serde_json::json!({
         "messages": [{"role": "user", "content": "test"}]
     });
@@ -467,8 +467,9 @@ fn amp_extracts_external_id() {
         .iter()
         .find(|c| c.source_path.to_string_lossy().contains("thread-id1"))
         .unwrap();
-    // external_id comes from file stem (takes priority over JSON "id" field)
-    assert_eq!(c1.external_id, Some("thread-id1".to_string()));
+    // Amp addresses threads by their native ID. Generic file stems can collide
+    // across thread directories, so the published connector prefers JSON "id".
+    assert_eq!(c1.external_id, Some("internal-id-123".to_string()));
 
     let c2 = convs
         .iter()
@@ -478,7 +479,7 @@ fn amp_extracts_external_id() {
                 .contains("thread-filename-id")
         })
         .unwrap();
-    assert_eq!(c2.external_id, Some("thread-filename-id".to_string()));
+    assert_eq!(c2.external_id, Some("thread-filename-id.json".to_string()));
 }
 
 // ============================================================================

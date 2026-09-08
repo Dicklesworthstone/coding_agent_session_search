@@ -124,8 +124,24 @@ fn connector_factories_all_instantiate_and_detect() {
 
     // Required base connectors always present
     for required in [
-        "codex", "cline", "gemini", "claude", "clawdbot", "vibe", "amp", "aider", "pi_agent",
-        "factory", "omp", "openclaw", "copilot", "grok", "muse",
+        "codex",
+        "cline",
+        "gemini",
+        "claude",
+        "clawdbot",
+        "vibe",
+        "amp",
+        "aider",
+        "pi_agent",
+        "factory",
+        "omp",
+        "openclaw",
+        "copilot",
+        "grok",
+        "muse",
+        "prime_agent",
+        "kiro",
+        "devin",
     ] {
         assert!(
             unique.contains(required),
@@ -146,7 +162,7 @@ fn feature_gated_connectors_available() {
              Check Cargo.toml enables the feature for franken-agent-detection"
         );
     }
-    assert_eq!(slugs.len(), 26, "Expected 26 connector factories");
+    assert_eq!(slugs.len(), 29, "Expected 29 connector factories");
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +217,16 @@ fn probe_paths_cover_all_factory_connectors() {
 fn probe_paths_are_tilde_relative() {
     let paths = franken_agent_detection::default_probe_paths_tilde();
     for (slug, paths) in &paths {
+        if *slug == "shelley" {
+            // A live SQLite database and WAL cannot yet be copied as a
+            // consistent remote bundle (GH #415). Local detection remains
+            // available, but advertising remote paths would be unsafe.
+            assert!(
+                paths.is_empty(),
+                "Shelley remote probes must remain disabled"
+            );
+            continue;
+        }
         assert!(!paths.is_empty(), "Connector '{slug}' has no probe paths");
         for path in paths {
             assert!(

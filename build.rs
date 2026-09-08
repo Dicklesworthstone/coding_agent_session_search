@@ -136,8 +136,8 @@ const CONTRACTS: &[DependencyContract] = &[
         // (upstream tag f19e7e0) cursor/antigravity/grok scan-root scoping and
         // aider/copilot-cli/amp/opencode/clawdbot/muse session-loss fixes.
         // The Shelley connector, FAD#22 source-boundary seam, and the
-        // chatgpt/omp injection seams live past this tag and wait on the next
-        // publish. crates.io refuses git dependencies, hence version-only.
+        // chatgpt/omp injection seams are published in 0.2.3.
+        // crates.io refuses git dependencies, hence version-only.
         expected_git: "",
         expected_rev: "",
         expected_version: "0.2.3",
@@ -166,13 +166,13 @@ const CONTRACTS: &[DependencyContract] = &[
         // crates.io-only exact pin: every source (direct dep, frankensqlite
         // transitive, frankensearch transitive) resolves to a single published
         // release. The 0.4.x line (>=0.4.3,<0.5) is required by fsqlite 0.3.x,
-        // whose public API names asupersync 0.4.x types. The current 0.4.9 pin
-        // preserves the 0.4.x typed-result cancellation contract.
+        // whose public API names asupersync 0.4.x types. The 0.4.10 pin
+        // adds the published Cx::is_cancelled API needed by Quill 0.2.3.
         // Empty `expected_git` signals `validate_manifest_dependency_spec`
         // to skip git/rev checks.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.4.9",
+        expected_version: "0.4.10",
         expected_features: &["test-internals", "tls-native-roots"],
         expected_default_features: None,
         repo_rel: "../asupersync",
@@ -187,9 +187,9 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensearch",
         crate_package_name: "frankensearch",
         manifest_package_field: None,
-        // Registry pin (gh#429, gh#410). 0.4.3 (quill 0.2.3, cass#453) is
-        // published but not adoptable: its quill calls
-        // `asupersync::Cx::is_cancelled`, unreleased in every asupersync 0.4.x.
+        // Registry pin (gh#429, gh#410). 0.4.3 (quill 0.2.3, cass#453)
+        // needs Cx::is_cancelled, published in asupersync 0.4.10. Its
+        // adoption follows validation of that runtime update.
         // 0.4.2 extends the native Windows Quill
         // publication line with the explicit multilingual MiniLM embedding
         // profile while preserving the first crates.io line carrying

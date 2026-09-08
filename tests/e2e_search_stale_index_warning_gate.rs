@@ -11,10 +11,9 @@
 //! binary and proves the human probe is mutation-free (the searchable index
 //! manifest and the canonical DB are byte-identical before/after).
 //!
-//! Staleness is induced deterministically: the strict-read (no DB open)
-//! freshness path derives `last_indexed_at` from the searchable index's
-//! publication manifest mtime, so ageing that mtime past the default
-//! threshold (1800s) is exactly the on-disk signature of an old index.
+//! Age alone does not imply staleness when the archive fingerprint still
+//! matches (GH #452). After proving that case, append a real archived message
+//! without republishing the lexical index and verify the stale warning.
 
 mod util;
 
@@ -23,6 +22,8 @@ use std::process::{Command, Output};
 use std::time::{Duration, SystemTime};
 
 use assert_cmd::cargo::cargo_bin;
+use coding_agent_search::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
+use coding_agent_search::storage::sqlite::FrankenStorage;
 use serde_json::Value;
 
 use util::timeout::spawn_with_timeout_or_diag;
@@ -174,8 +175,46 @@ fn check() -> Result<(), String> {
         return Err(format!("fresh index must not warn stale: {line}"));
     }
 
-    // Age the published index past the stale threshold.
+    // GH #452: an old index that still covers the archive needs no warning.
     age_manifest(&manifest)?;
+    let old_unchanged = run(
+        &fixture,
+        "human_old_unchanged",
+        &["search", KEYWORD, "--no-maintenance"],
+        SURFACE_TIMEOUT,
+    );
+    if !old_unchanged.status.success() || !text(&old_unchanged.stdout).contains(KEYWORD) {
+        return Err(format!(
+            "old unchanged search failed: {}",
+            text(&old_unchanged.stderr)
+        ));
+    }
+    if let Some(line) = stale_line(&text(&old_unchanged.stderr)) {
+        return Err(format!("unchanged archive must not warn stale: {line}"));
+    }
+
+    // Add a real row to the canonical archive without rebuilding its derived
+    // index. Reads below disable maintenance so this missing projection stays
+    // observable and the archive/index mutation assertions remain meaningful.
+    let storage = FrankenStorage::open(&db_path).map_err(|e| e.to_string())?;
+    let (conversation_id, next_idx): (i64, i64) = storage
+        .raw()
+        .query_row_map(
+            "SELECT conversation_id, MAX(idx) + 1 FROM messages GROUP BY conversation_id ORDER BY conversation_id LIMIT 1",
+            &[] as &[ParamValue],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        )
+        .map_err(|e| e.to_string())?;
+    storage
+        .raw()
+        .execute_compat(
+            "INSERT INTO messages (conversation_id, idx, role, content) VALUES (?1, ?2, 'user', 'archived message awaiting lexical projection')",
+            &[ParamValue::from(conversation_id), ParamValue::from(next_idx)],
+        )
+        .map_err(|e| e.to_string())?;
+    storage
+        .close_without_checkpoint()
+        .map_err(|e| e.to_string())?;
     let manifest_before = snapshot(&manifest)?;
     let db_before = snapshot(&db_path)?;
 
@@ -183,7 +222,7 @@ fn check() -> Result<(), String> {
     let human = run(
         &fixture,
         "human_stale",
-        &["search", KEYWORD],
+        &["search", KEYWORD, "--no-maintenance"],
         SURFACE_TIMEOUT,
     );
     let human_out = text(&human.stdout);

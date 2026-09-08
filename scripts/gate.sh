@@ -85,6 +85,24 @@ verify_receipt() {
     return "$failed"
 }
 
+run_fmt() {
+    local formatter wrapper rc
+    formatter="${RUSTFMT:-$(command -v rustfmt)}" || return 1
+    wrapper="$(mktemp -t cass-gate-rustfmt.XXXXXX)" || return 1
+    # cargo-fmt maps a signal-killed rustfmt's missing exit code to success.
+    # A waiting shell converts that signal into a normal nonzero exit status.
+    # Keep the wrapper for diagnostics and never exec away its waiting shell.
+    cat > "$wrapper" <<'SH'
+#!/usr/bin/env bash
+"${CASS_GATE_RUSTFMT:?}" "$@"
+exit "$?"
+SH
+    chmod +x "$wrapper" || return 1
+    CASS_GATE_RUSTFMT="$formatter" RUSTFMT="$wrapper" cargo fmt --check
+    rc=$?
+    return "$rc"
+}
+
 # Exercise the exact receipt parser without admitting a build or substituting
 # tools. The shell regression suite feeds it recorded terminal-output shapes.
 if [ "${1:-}" = --verify-receipt ]; then
@@ -94,6 +112,10 @@ if [ "${1:-}" = --verify-receipt ]; then
 fi
 if [ "${1:-}" = --verify-test-log ]; then
     test_log_counts "$2"
+    exit $?
+fi
+if [ "${1:-}" = --verify-fmt ]; then
+    run_fmt
     exit $?
 fi
 
@@ -323,7 +345,7 @@ fi;"
     EXPECTED_STAGES+=(docs-build docs-binary-identity docs-truth)
 fi
 
-REMOTE_SCRIPT="$(declare -f test_log_counts run_tests run_ubs)
+REMOTE_SCRIPT="$(declare -f test_log_counts run_tests run_fmt run_ubs)
 set -o pipefail
 actual_content=\$(printf '%s' '${SOURCE_PATHS}' | base64 -d | gzip -d | xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1)
 identity_rc=\$?
@@ -331,7 +353,7 @@ if [ \"\$actual_content\" != '${SOURCE_CONTENT}' ]; then identity_rc=1; fi
 echo SOURCE_HEAD=${SOURCE_HEAD} SOURCE_CONTENT_SHA256=\$actual_content EXPECTED=${SOURCE_CONTENT}
 echo STAGE=source-identity EXIT=\${identity_rc}
 if [ \"\$identity_rc\" -ne 0 ]; then exit 1; fi
-cargo fmt --check; echo STAGE=fmt EXIT=\$?; \
+run_fmt; echo STAGE=fmt EXIT=\$?; \
 cargo clippy --locked -j ${BUILD_JOBS} --all-targets -- -D warnings; echo STAGE=clippy EXIT=\$?; \
 ${lib_stage} ${integration_stage} ${golden_regen_stage} ${golden_stage} ${docs_truth_stage} \
 run_ubs ${UBS_FILES_ARG}; echo STAGE=ubs EXIT=\$?; echo STAGE=job-complete EXIT=0"

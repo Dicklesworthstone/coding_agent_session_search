@@ -12,7 +12,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # These cases exercise the production batched-gate parsers directly. Inputs are
 # terminal-output fixtures, not substitute cargo/ubs executables or live proof.
-if [ "${1:-}" = --batched-only ]; then
+if [ "${1:-}" = --batched-only ] || [ "${1:-}" = --formatter-only ]; then
     proof_dir="$(mktemp -d -t cass-gate-parser.XXXXXX)"
     gate="$PROJECT_ROOT/scripts/gate.sh"
     pass=0
@@ -30,6 +30,47 @@ if [ "${1:-}" = --batched-only ]; then
             fail=$((fail + 1))
         fi
     }
+    if [ "${1:-}" = --formatter-only ]; then
+        # Use real cargo-fmt and rustfmt for both format outcomes. Then inject
+        # process failures through cargo-fmt's RUSTFMT override: the waiting
+        # shell must preserve a normal error, SIGABRT, and silent SIGKILL.
+        # No project source is formatted in place and all fixtures are retained.
+        ulimit -c 0
+        export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-$(rustup show active-toolchain | cut -d' ' -f1)}"
+        export CASS_TEST_REAL_RUSTFMT="$(rustup which rustfmt)"
+        mkdir -p "$proof_dir/crate/src"
+        cat > "$proof_dir/crate/Cargo.toml" <<'TOML'
+[package]
+name = "cass-format-gate-probe"
+version = "0.0.0"
+edition = "2024"
+[workspace]
+TOML
+        printf 'fn main() {}\n' > "$proof_dir/crate/src/main.rs"
+        cd "$proof_dir/crate"
+        check_exit formatter-clean 0 env RUSTFMT="$CASS_TEST_REAL_RUSTFMT" bash "$gate" --verify-fmt
+        printf 'fn main(){ }\n' > src/main.rs
+        check_exit formatter-diff 1 env RUSTFMT="$CASS_TEST_REAL_RUSTFMT" bash "$gate" --verify-fmt
+        cat > "$proof_dir/formatter-process-failure" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then
+    exec "${CASS_TEST_REAL_RUSTFMT:?}" "$@"
+fi
+case "${CASS_TEST_FORMATTER_FAILURE:?}" in
+    error) exit 42 ;;
+    abort) kill -ABRT "$$" ;;
+    kill) kill -KILL "$$" ;;
+    *) exit 99 ;;
+esac
+SH
+        chmod +x "$proof_dir/formatter-process-failure"
+        check_exit formatter-error 42 env RUSTFMT="$proof_dir/formatter-process-failure" CASS_TEST_FORMATTER_FAILURE=error bash "$gate" --verify-fmt
+        check_exit formatter-abort 134 env RUSTFMT="$proof_dir/formatter-process-failure" CASS_TEST_FORMATTER_FAILURE=abort bash "$gate" --verify-fmt
+        check_exit formatter-killed 137 env RUSTFMT="$proof_dir/formatter-process-failure" CASS_TEST_FORMATTER_FAILURE=kill bash "$gate" --verify-fmt
+        echo "Formatter gate: PASS=$pass FAIL=$fail fixtures=$proof_dir"
+        [ "$fail" -eq 0 ]
+        exit $?
+    fi
     receipt="$proof_dir/complete.txt"
     cat > "$receipt" <<'RECEIPT'
 STAGE=source-identity EXIT=0

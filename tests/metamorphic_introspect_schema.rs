@@ -80,6 +80,14 @@ fn isolated_search_demo_data(test_home: &Path) -> Result<PathBuf, Box<dyn Error>
             fs::copy(entry.path(), &dst)?;
         }
     }
+    // Exercise the same publication path that build-hnsw consumes, including
+    // its semantic manifest. Legacy vector files alone are not a publication.
+    cass_cmd(test_home)
+        .args(["models", "backfill", "--tier", "fast", "--embedder", "hash"])
+        .args(["--json", "--data-dir"])
+        .arg(&dst_root)
+        .assert()
+        .success();
     Ok(dst_root)
 }
 
@@ -298,6 +306,19 @@ fn surface_command(
             ));
         }
         "introspect" => vec!["introspect", "--json"],
+        "models-build-hnsw" => {
+            return Some((
+                vec![
+                    "models".to_string(),
+                    "build-hnsw".to_string(),
+                    "--check".to_string(),
+                    "--json".to_string(),
+                    "--data-dir".to_string(),
+                    demo_data.to_string(),
+                ],
+                ExpectStatus::ExitOk,
+            ));
+        }
         "models-check-update" => vec!["models", "check-update", "--json"],
         "models-status" => vec!["models", "status", "--json"],
         "models-verify" => vec!["models", "verify", "--json"],

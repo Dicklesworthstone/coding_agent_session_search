@@ -42,7 +42,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use crate::search::trust_scoring::{OutcomeMarker, ProofStatus};
 
@@ -116,8 +116,9 @@ pub struct CorrelationIndex {
     /// for cheap reference matching.
     commit_by_prefix: HashMap<String, String>,
     /// Commit/Bead `source_ref` -> content-stable lesson ids derived from the
-    /// same live repository evidence as `cass lessons`.
-    lesson_by_source: HashMap<String, Vec<String>>,
+    /// same live repository evidence as `cass lessons`. Extracted only when
+    /// an explicit commit or closed-Bead reference needs lesson citations.
+    lesson_by_source: OnceLock<HashMap<String, Vec<String>>>,
     /// The `<project>-` prefix used to recognize this project's bead ids in text
     /// (e.g. `coding_agent_session_search-`). `None` disables bead matching.
     project_prefix: Option<String>,
@@ -135,6 +136,13 @@ fn corroborated_lesson_ids(
     bead: Option<&str>,
     commit: Option<&str>,
 ) -> Vec<String> {
+    let lesson_by_source = index.lesson_by_source.get_or_init(|| {
+        index
+            .repo_root
+            .as_deref()
+            .map(build_lesson_source_index)
+            .unwrap_or_default()
+    });
     let mut lessons = Vec::new();
     for source_ref in [
         bead.map(|id| format!("bead:{id}")),
@@ -143,7 +151,7 @@ fn corroborated_lesson_ids(
     .into_iter()
     .flatten()
     {
-        if let Some(ids) = index.lesson_by_source.get(&source_ref) {
+        if let Some(ids) = lesson_by_source.get(&source_ref) {
             lessons.extend(ids.iter().cloned());
         }
     }
@@ -433,13 +441,12 @@ fn build_for_repo(start: &Path) -> Option<CorrelationIndex> {
     let (beads, project_name) = read_bead_facts(&root.join(".beads").join("issues.jsonl"));
     let project_prefix = project_name.map(|name| format!("{name}-"));
     let (bead_commit, commit_by_prefix) = read_git_links(&root, project_prefix.as_deref());
-    let lesson_by_source = build_lesson_source_index(&root);
 
     Some(CorrelationIndex {
         beads,
         bead_commit,
         commit_by_prefix,
-        lesson_by_source,
+        lesson_by_source: OnceLock::new(),
         project_prefix,
         repo_root: Some(root),
         release_cache: Mutex::new(HashMap::new()),
@@ -625,7 +632,7 @@ mod tests {
             beads,
             bead_commit,
             commit_by_prefix,
-            lesson_by_source: HashMap::new(),
+            lesson_by_source: OnceLock::new(),
             project_prefix: Some(project_prefix.to_string()),
             repo_root: None,
             release_cache: Mutex::new(HashMap::new()),
@@ -661,24 +668,28 @@ mod tests {
 
     #[test]
     fn lesson_refs_require_corroborated_source_provenance() {
-        let mut idx = index_with(
+        let idx = index_with(
             "proj-",
             &[("proj-q4pau", true), ("proj-other", true)],
             &[("proj-q4pau", SHA_A)],
             &[SHA_A],
         );
-        idx.lesson_by_source.insert(
-            "bead:proj-q4pau".to_string(),
-            vec!["lsn-1111111111111111".to_string()],
-        );
-        idx.lesson_by_source.insert(
-            "commit:ab0d12ef90abcdef1234567890abcdef12345678".to_string(),
-            vec!["lsn-2222222222222222".to_string()],
-        );
-        idx.lesson_by_source.insert(
-            "bead:proj-other".to_string(),
-            vec!["lsn-3333333333333333".to_string()],
-        );
+        idx.lesson_by_source
+            .set(HashMap::from([
+                (
+                    "bead:proj-q4pau".to_string(),
+                    vec!["lsn-1111111111111111".to_string()],
+                ),
+                (
+                    "commit:ab0d12ef90abcdef1234567890abcdef12345678".to_string(),
+                    vec!["lsn-2222222222222222".to_string()],
+                ),
+                (
+                    "bead:proj-other".to_string(),
+                    vec!["lsn-3333333333333333".to_string()],
+                ),
+            ]))
+            .expect("seed lesson citations");
 
         let linked = correlate(&idx, "fixed in proj-q4pau closeout");
         assert_eq!(
@@ -756,6 +767,10 @@ mod tests {
         );
         let link = correlate(&idx, "a totally unrelated conversation about cooking pasta");
         assert!(link.is_empty(), "no explicit id => no link");
+        assert!(
+            idx.lesson_by_source.get().is_none(),
+            "unrelated evidence must not trigger repository lesson extraction"
+        );
     }
 
     #[test]

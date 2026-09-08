@@ -264,6 +264,20 @@ fn setup_pack_archive_fixture(tracker: &PhaseTracker) -> PackArchiveFixture {
         )
         .expect("insert remote pack conversation");
 
+    drop(storage);
+    let command_env = tracker
+        .command_environment()
+        .with_home(home)
+        .with_codex_home(&home.join(".codex"));
+    // Structured pack is read-only. Publish the seeded archive's lexical
+    // assets explicitly before testing the handoff, just as its repair hint
+    // instructs an operator with an archive but no searchable generation.
+    base_cmd(&command_env)
+        .args(["index", "--full", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .assert()
+        .success();
+
     tracker.end(
         "seed_pack_archive",
         Some("Seed real archive DB plus source log files for cass pack"),
@@ -420,8 +434,11 @@ fn pack_handoff_journey_uses_real_archive_and_preserves_sources() {
     }
     assert!(
         output.status.success(),
-        "cass pack e2e failed; artifacts in {}",
-        fixture.artifact_dir.display()
+        "cass pack e2e failed; artifacts in {}; status: {}; stdout:\n{}\nstderr:\n{}",
+        fixture.artifact_dir.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);

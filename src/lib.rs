@@ -298,7 +298,7 @@ where
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "cass",
-    version = env!("CASS_VERSION_FULL"),
+    version = env!("CARGO_PKG_VERSION"),
     about = "Unified TUI search over coding agent histories"
 )]
 pub struct Cli {
@@ -27014,6 +27014,18 @@ fn search_lexical_self_heal_diagnosis(
     let current_storage_fingerprint = match cached_fingerprint {
         Ok(fingerprint) => fingerprint,
         Err(err) => {
+            // Historical duplicate rows for the derived FTS table can stop
+            // the strict reader before it reaches canonical conversations.
+            // Keep serving the published lexical generation; the indexer's
+            // writable opener owns the existing schema repair. A search-time
+            // fingerprint probe must not perform that repair itself.
+            if format!("{err:#}")
+                .contains("conflicting virtual-table entries for `fts_messages` and `fts_messages`")
+            {
+                return Ok(Some(SearchLexicalSelfHealDiagnosis::existing_index(
+                    "duplicate fallback FTS schema rows prevent archive validation; using the existing readable lexical index and deferring schema repair to cass index",
+                )));
+            }
             let dedicated = crate::search::storage_integrity::probe_dedicated_storage_state(
                 db_path,
                 crate::search::storage_integrity::dedicated_storage_probe_timeout(),
@@ -28937,6 +28949,7 @@ fn search_budget_retry_command(
     budget_ms: u64,
     data_dir: &Path,
     sessions_from: Option<&str>,
+    mode: Option<crate::search::query::SearchMode>,
 ) -> Option<String> {
     if sessions_from == Some("-") {
         return None;
@@ -28972,6 +28985,14 @@ fn search_budget_retry_command(
         command.push("--sessions-from".to_string());
         command.push(shell_quote_arg(sessions_from));
     }
+    if let Some(mode) = mode {
+        let mode = match mode {
+            crate::search::query::SearchMode::Lexical => "lexical",
+            crate::search::query::SearchMode::Semantic => "semantic",
+            crate::search::query::SearchMode::Hybrid => "hybrid",
+        };
+        command.extend(["--mode".to_string(), mode.to_string()]);
+    }
     command.push("--data-dir".to_string());
     command.push(shell_quote_arg(&data_dir.display().to_string()));
     Some(command.join(" "))
@@ -28984,9 +29005,17 @@ fn output_search_budget_partial(
     skipped_sections: Vec<String>,
     data_dir: &Path,
     sessions_from: Option<&str>,
+    mode_meta: (SearchModeMeta, bool),
 ) -> CliResult<()> {
-    let retry =
-        search_budget_retry_command(query, format, budget.total_ms(), data_dir, sessions_from);
+    let (mode_meta, include_meta) = mode_meta;
+    let retry = search_budget_retry_command(
+        query,
+        format,
+        budget.total_ms(),
+        data_dir,
+        sessions_from,
+        (!mode_meta.defaulted).then_some(mode_meta.requested),
+    );
     let mut budget_block = crate::robot_budget_envelope::BudgetBlock::from_budget(
         budget,
         skipped_sections,
@@ -29015,16 +29044,24 @@ fn output_search_budget_partial(
         });
     }
 
-    output_structured_value(
-        serde_json::json!({
-            "query": query,
-            "hits": [],
-            "total_matches": 0,
-            "has_more": false,
-            "budget": budget_block,
-        }),
-        format,
-    )
+    let mut payload = serde_json::json!({
+        "query": query,
+        "hits": [],
+        "total_matches": 0,
+        "has_more": false,
+        "budget": budget_block,
+    });
+    if include_meta {
+        payload["_meta"] = serde_json::json!({
+            "requested_search_mode": mode_meta.requested,
+            "search_mode": mode_meta.realized,
+            "mode_defaulted": mode_meta.defaulted,
+            "fallback_tier": null,
+            "fallback_reason": null,
+            "semantic_refinement": false,
+        });
+    }
+    output_structured_value(payload, format)
 }
 
 struct CliSearchSetup {
@@ -29658,16 +29695,22 @@ fn run_cli_search(
     // GH#414: resolve how many requested session paths the index has seen, so
     // "your filter selected zero sessions" is distinguishable from "your
     // query found zero hits". `matched: None` renders as unknown.
+    let matched_session_paths = if sessions_from.is_none() || filters.session_paths.is_empty() {
+        Some(0)
+    } else if let Some(budget) = search_budget.as_ref() {
+        let worker_db_path = db_path.clone();
+        let requested = filters.session_paths.clone();
+        run_read_only_search_worker(budget.remaining_ms().min(500), move || {
+            Ok(count_indexed_session_paths(&worker_db_path, &requested))
+        })?
+        .flatten()
+    } else {
+        count_indexed_session_paths(&db_path, &filters.session_paths)
+    };
     let sessions_filter_stats: Option<SessionsFilterStats> =
         sessions_from.as_ref().map(|_| SessionsFilterStats {
             requested: filters.session_paths.len(),
-            matched: if filters.session_paths.is_empty() {
-                Some(0)
-            } else if no_maintenance || effective_robot.is_some() {
-                None
-            } else {
-                count_indexed_session_paths(&db_path, &filters.session_paths)
-            },
+            matched: matched_session_paths,
         });
 
     // Apply cursor overrides (base64-encoded JSON { "offset": usize, "limit": usize })
@@ -29719,6 +29762,31 @@ fn run_cli_search(
         .unwrap_or_default();
     let has_aggregation = !agg_fields.is_empty();
 
+    let output_early_timeout = |mut skipped_sections: Vec<String>| {
+        for (requested, section) in [
+            (semantic_opts.rerank, "reranking"),
+            (explain, "explanation"),
+            (has_aggregation, "aggregations"),
+            (robot_meta, "state_meta"),
+        ] {
+            if requested {
+                skipped_sections.push(section.to_string());
+            }
+        }
+        output_search_budget_partial(
+            query,
+            effective_robot.expect("bounded search is robot-only"),
+            search_budget.as_ref().expect("robot search has a budget"),
+            skipped_sections,
+            &data_dir,
+            sessions_from.as_deref(),
+            (
+                SearchModeMeta::new(mode.unwrap_or_default(), mode.is_none()),
+                robot_meta,
+            ),
+        )
+    };
+
     // All fallible request parsing is complete before the opt-in human refresh
     // can mutate derived assets. Robot refresh remains a deferred, explicit
     // dataset-scoped recommendation.
@@ -29730,14 +29798,7 @@ fn run_cli_search(
 
     if session_paths_timed_out {
         skipped_sections.push("search".to_string());
-        return output_search_budget_partial(
-            query,
-            effective_robot.expect("bounded session reader is robot-only"),
-            search_budget.as_ref().expect("robot search has a budget"),
-            skipped_sections,
-            &data_dir,
-            sessions_from.as_deref(),
-        );
+        return output_early_timeout(skipped_sections);
     }
 
     // Handle dry-run mode before touching derived search assets. A dry run is
@@ -29813,14 +29874,7 @@ fn run_cli_search(
     }) = setup
     else {
         skipped_sections.extend(["search_setup".to_string(), "search".to_string()]);
-        return output_search_budget_partial(
-            query,
-            effective_robot.expect("bounded setup is robot-only"),
-            search_budget.as_ref().expect("robot search has a budget"),
-            skipped_sections,
-            &data_dir,
-            sessions_from.as_deref(),
-        );
+        return output_early_timeout(skipped_sections);
     };
     if search_self_heal.action != "skipped" {
         tracing::info!(
@@ -30957,6 +31011,7 @@ fn run_cli_search(
                     .total_ms(),
                 &data_dir,
                 sessions_from.as_deref(),
+                mode,
             )
         };
         let budget = crate::robot_budget_envelope::BudgetBlock::from_budget(
@@ -58607,6 +58662,9 @@ fn doctor_baseline_recommendations_from_parts(
 
 fn doctor_baseline_redact_paths(value: serde_json::Value, data_dir: &Path) -> serde_json::Value {
     match value {
+        serde_json::Value::String(text) => {
+            serde_json::Value::String(doctor_redacted_text(&text, data_dir))
+        }
         serde_json::Value::Array(items) => serde_json::Value::Array(
             items
                 .into_iter()
@@ -105627,12 +105685,12 @@ fn count_indexed_session_paths(
     if requested.is_empty() || !db_path.is_file() {
         return None;
     }
-    let conn = open_franken_cli_read_db(
-        db_path.to_path_buf(),
-        "sessions-from-resolution",
-        Duration::from_secs(2),
-    )
-    .ok()?;
+    let mut conn =
+        crate::storage::sqlite::open_franken_owner_strict_readonly_connection_with_timeout(
+            db_path,
+            Duration::from_secs(2),
+        )
+        .ok()?;
     let deadline = std::time::Instant::now() + Duration::from_millis(500);
     let mut matched = 0_usize;
     let mut complete = true;
@@ -105641,8 +105699,7 @@ fn count_indexed_session_paths(
             complete = false;
             break;
         }
-        let exists = franken_query_row_map_retry(
-            &conn,
+        let exists = conn.query_row_map(
             "SELECT EXISTS(SELECT 1 FROM conversations WHERE source_path = ?1)",
             &[crate::franken_sync::compat::ParamValue::from(path.as_str())],
             |row| row.get_typed::<i64>(0),
@@ -105656,7 +105713,7 @@ fn count_indexed_session_paths(
             }
         }
     }
-    let _ = close_franken_cli_read_db(conn, db_path, "sessions-from-resolution");
+    let _ = conn.close_without_checkpoint_sync();
     complete.then_some(matched)
 }
 

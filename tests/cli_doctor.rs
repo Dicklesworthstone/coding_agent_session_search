@@ -80,6 +80,18 @@ fn test_error_kind(payload: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+fn doctor_error_json(stderr: &[u8]) -> Value {
+    let text = std::str::from_utf8(stderr).expect("UTF-8 doctor diagnostic");
+    // Nested doctor commands are normalized to flags. The CLI documents one
+    // teaching note per correction before its otherwise complete JSON error.
+    let json = text
+        .lines()
+        .skip_while(|line| line.starts_with("note: auto-corrected: "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    serde_json::from_str(&json).expect("JSON error after documented correction notes")
+}
+
 fn write_raw_mirror_fixture(
     data_dir: &Path,
     provider: &str,
@@ -1688,7 +1700,7 @@ fn doctor_rejects_repeated_repair_override_without_fix_before_executor() {
         "doctor should reject repeated-repair override unless --fix is present"
     );
 
-    let payload: Value = serde_json::from_slice(&out.stderr).expect("valid JSON error envelope");
+    let payload = doctor_error_json(&out.stderr);
     assert_eq!(payload["error"]["code"].as_i64(), Some(2));
     assert_eq!(payload["error"]["kind"].as_str(), Some("usage"));
     assert!(
@@ -2119,8 +2131,7 @@ fn doctor_baseline_surfaces_reject_ignored_safety_controls() {
         diff_out.stdout.is_empty(),
         "usage rejection should not emit a partial success payload"
     );
-    let diff_error: Value =
-        serde_json::from_slice(&diff_out.stderr).expect("baseline diff usage error JSON");
+    let diff_error = doctor_error_json(&diff_out.stderr);
     assert_eq!(test_error_kind(&diff_error), Some("usage"));
     assert!(
         diff_error["error"]["message"]
@@ -2147,8 +2158,7 @@ fn doctor_baseline_surfaces_reject_ignored_safety_controls() {
         !save_out.status.success(),
         "baseline save --force-rebuild must fail closed"
     );
-    let save_error: Value =
-        serde_json::from_slice(&save_out.stderr).expect("baseline save usage error JSON");
+    let save_error = doctor_error_json(&save_out.stderr);
     assert_eq!(test_error_kind(&save_error), Some("usage"));
     assert!(
         !data_dir
@@ -2445,8 +2455,7 @@ fn doctor_support_bundle_sensitive_attachments_require_explicit_opt_in() {
         !no_opt_in.status.success(),
         "sensitive attachment without opt-in must fail closed"
     );
-    let no_opt_in_error: Value =
-        serde_json::from_slice(&no_opt_in.stderr).expect("no opt-in error JSON");
+    let no_opt_in_error = doctor_error_json(&no_opt_in.stderr);
     assert_eq!(test_error_kind(&no_opt_in_error), Some("usage"));
 
     let over_cap = cass_cmd(test_home.path())
@@ -2468,8 +2477,7 @@ fn doctor_support_bundle_sensitive_attachments_require_explicit_opt_in() {
         !over_cap.status.success(),
         "sensitive attachment over cap must fail closed"
     );
-    let over_cap_error: Value =
-        serde_json::from_slice(&over_cap.stderr).expect("over cap error JSON");
+    let over_cap_error = doctor_error_json(&over_cap.stderr);
     assert_eq!(test_error_kind(&over_cap_error), Some("usage"));
 
     let opted_in = cass_cmd(test_home.path())
@@ -2542,8 +2550,7 @@ fn doctor_baseline_diff_rejects_missing_duplicate_incompatible_and_drifted_basel
         missing_out.stdout.is_empty(),
         "missing baseline should not emit a partial success payload on stdout"
     );
-    let missing_error: Value =
-        serde_json::from_slice(&missing_out.stderr).expect("missing baseline error JSON");
+    let missing_error = doctor_error_json(&missing_out.stderr);
     assert_eq!(test_error_kind(&missing_error), Some("not-found"));
 
     let save_out = cass_cmd(test_home.path())
@@ -2601,8 +2608,7 @@ fn doctor_baseline_diff_rejects_missing_duplicate_incompatible_and_drifted_basel
             .any(|reason| reason.as_str() == Some("baseline-write-failed")),
         "duplicate save should explain the write blocker: {duplicate_payload:#}"
     );
-    let duplicate_error: Value =
-        serde_json::from_slice(&duplicate_out.stderr).expect("duplicate save stderr JSON");
+    let duplicate_error = doctor_error_json(&duplicate_out.stderr);
     assert_eq!(
         test_error_kind(&duplicate_error),
         Some("output-not-writable")
@@ -2636,8 +2642,7 @@ fn doctor_baseline_diff_rejects_missing_duplicate_incompatible_and_drifted_basel
         !bad_schema_out.status.success(),
         "incompatible baseline should fail"
     );
-    let bad_schema_error: Value =
-        serde_json::from_slice(&bad_schema_out.stderr).expect("bad schema error JSON");
+    let bad_schema_error = doctor_error_json(&bad_schema_out.stderr);
     assert_eq!(test_error_kind(&bad_schema_error), Some("config"));
     assert!(
         bad_schema_error["error"]["message"]
@@ -2673,8 +2678,7 @@ fn doctor_baseline_diff_rejects_missing_duplicate_incompatible_and_drifted_basel
         !drifted_out.status.success(),
         "checksum-drifted baseline should fail"
     );
-    let drifted_error: Value =
-        serde_json::from_slice(&drifted_out.stderr).expect("drifted checksum error JSON");
+    let drifted_error = doctor_error_json(&drifted_out.stderr);
     assert_eq!(test_error_kind(&drifted_error), Some("config"));
     assert!(
         drifted_error["error"]["message"]
@@ -3135,7 +3139,7 @@ fn doctor_check_rejects_mutating_or_rebuild_flags() {
         .output()
         .expect("run invalid mutating doctor check");
     assert!(!out.status.success(), "doctor check must reject --fix");
-    let payload: Value = serde_json::from_slice(&out.stderr).expect("valid JSON error envelope");
+    let payload = doctor_error_json(&out.stderr);
     assert_eq!(out.status.code(), Some(2));
     assert_eq!(payload["status"].as_str(), Some("error"));
     assert_eq!(payload["kind"].as_str(), Some("argument_parsing"));
@@ -3161,7 +3165,7 @@ fn doctor_check_rejects_mutating_or_rebuild_flags() {
         !out.status.success(),
         "doctor check must reject --force-rebuild"
     );
-    let payload: Value = serde_json::from_slice(&out.stderr).expect("valid JSON error envelope");
+    let payload = doctor_error_json(&out.stderr);
     assert_eq!(test_error_code(&payload), Some(2));
     assert!(
         payload["error"]["message"]
@@ -7217,7 +7221,7 @@ fn doctor_archive_export_refuses_unsafe_targets_and_bad_fingerprints() {
     } else {
         inside_out.stdout.as_slice()
     };
-    let inside_payload: Value = serde_json::from_slice(usage_json).expect("usage json");
+    let inside_payload = doctor_error_json(usage_json);
     assert_eq!(test_error_kind(&inside_payload), Some("usage"));
 
     let target_root = test_home.join("exports/bad-fingerprint");

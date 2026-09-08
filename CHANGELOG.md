@@ -78,6 +78,22 @@ Everything below is on `main`; nothing is in a released binary yet.
   40-segment generation is folded by a plain `cass index`).
 
 ### Fixed
+- Route every enabled connector through filesystem watching and quarantine
+  retries, including Prime Agent, Kiro, Devin, OpenHands, Goose, Crush, and Hermes.
+- Make the release formatting gate fail when rustfmt aborts or is killed.
+- Register the FTS shadow viability startup phase so watch indexing reaches the
+  scan instead of panicking during preflight.
+- Redact the archive directory inside doctor baseline explanations as well as
+  path fields.
+- Preserve requested search mode and report skipped optional sections when the
+  robot deadline expires during setup. Session-filter resolution now uses a
+  bounded, strictly read-only archive query in robot mode.
+- Keep `cass --version` parseable as a plain semantic version.
+- Extract repository lessons lazily when pack evidence actually references a
+  known commit or closed bead, avoiding that work for unrelated evidence.
+- Search keeps serving a readable lexical generation when duplicate fallback
+  FTS schema rows prevent archive fingerprinting. Schema repair remains on
+  the indexing path.
 - `cass doctor --recover-from-archive` quarantines a canonical row whose
   identity columns (`agent_slug`, `workspace`, `external_id`, `source_path`,
   `source_id`, `origin_host`) held a non-text value, or whose `source_path`
@@ -180,23 +196,19 @@ Everything below is on `main`; nothing is in a released binary yet.
 - Antigravity source presets recognize the IDE store (GH #454). The default
   source presets, `cass resume` agent detection, and the docs now cover the
   IDE store `~/.gemini/antigravity/` alongside the `agy` CLI store
-  `~/.gemini/antigravity-cli/`. Automatic IDE ingestion still awaits the
-  next `franken-agent-detection` release to probe both roots and key IDE
-  conversations as `ide/<uuid>`. A conversation re-keyed from the bare UUID
+  `~/.gemini/antigravity-cli/`. The published `franken-agent-detection` 0.2.3
+  probes both roots and keys IDE conversations as `ide/<uuid>`.
+  A conversation re-keyed from the bare UUID
   will reuse its existing canonical row by transcript path instead of
   duplicating it.
 
 ### Changed
-- `frankensearch` remains pinned to crates.io `=0.4.2`. The 0.4.3 line
-  (`frankensearch-quill 0.2.3`, whose receipt-clocked segment sweep is the
-  engine half of GH #453) is published but cannot be consumed from the
-  registry: its quill calls `asupersync::Cx::is_cancelled`, which exists only
-  on unreleased asupersync `main` (neither 0.4.9 nor 0.4.10 has it), so the
-  crate fails to compile against any registry asupersync (verified
-  2026-09-07 with cass's exact `=0.4.9` pin and by reading the published
-  0.4.10 source). Until a fixed engine publish exists, the `cass index --gc`
-  path reclaims folded inputs once 300 s have passed since the previous
-  publish (the engine's quiet-period rule).
+- `asupersync` is pinned to crates.io `=0.4.10`, which publishes the
+  `Cx::is_cancelled` API required by FrankenSearch 0.4.3. The registry archive
+  contains that API; the earlier claim that it was unpublished was incorrect.
+- `frankensearch` remains at `=0.4.2` while the runtime prerequisite is
+  validated. Its `cass index --gc` path reclaims folded inputs once 300 s
+  have passed since the previous publish (the engine's quiet-period rule).
 - `franken-agent-detection` pinned from crates.io `=0.2.2` to `=0.2.3`: the
   Antigravity connector probes the IDE store (`~/.gemini/antigravity`) as
   well as the `agy` CLI store, so IDE sessions index without
@@ -213,7 +225,7 @@ Everything below is on `main`; nothing is in a released binary yet.
   folding (GH#382), reserved lock-byte/freelist repair (GH#410), FTS metadata and foreign-write
   visibility fixes (GH#408), incremental FTS segment writes and savepoint undo
   logs, prefix-BM25 ranking fixes, and prepared-read schema-retry cleanup.
-  All 20 family crates share the exact pin; asupersync remains `0.4.9`.
+  All 20 family crates share the exact pin.
   These fixes do not establish repair of an already corrupted archive, and
   upstream GH#411 mixed-engine concurrent-WAL safety remains unresolved.
 - The index run's final `wal_checkpoint(TRUNCATE)` runs under a wall-clock

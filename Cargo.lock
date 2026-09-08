@@ -280,9 +280,9 @@ dependencies = [
 
 [[package]]
 name = "asupersync"
-version = "0.4.9"
+version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be81588a09a28a312b09d4af71e8aa8c6736e1d670a69a42e6779e874fbad1bd"
+checksum = "7e8b505d6aadb778c9c4b0ae174966641f11d578d253b7786f2407b17d5045ec"
 dependencies = [
  "aes-gcm",
  "asupersync-macros",

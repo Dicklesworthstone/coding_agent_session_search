@@ -3677,6 +3677,7 @@ const WATCH_STARTUP_SUB_PHASE_TAXONOMY: &[&str] = &[
     // Retired by GH #413's count-free authoritative restart. Keep the slot so
     // the stable IDs of any future appended phases cannot reuse it.
     "watch_startup:count_nonresumable_checkpoint_conversations",
+    "watch_startup:fts_shadow_viability",
 ];
 
 /// Lookup the taxonomy step index for a sub-phase string. Returns
@@ -26983,6 +26984,13 @@ impl ConnectorKind {
             "qwen" => Some(Self::Qwen),
             "grok" => Some(Self::Grok),
             "muse" => Some(Self::Muse),
+            "prime_agent" => Some(Self::PrimeAgent),
+            "kiro" => Some(Self::Kiro),
+            "devin" => Some(Self::Devin),
+            "openhands" => Some(Self::OpenHands),
+            "goose" => Some(Self::Goose),
+            "crush" => Some(Self::Crush),
+            "hermes" => Some(Self::Hermes),
             _ => None,
         }
     }
@@ -27011,6 +27019,13 @@ impl ConnectorKind {
             Self::Qwen => "qwen",
             Self::Grok => "grok",
             Self::Muse => "muse",
+            Self::PrimeAgent => "prime_agent",
+            Self::Kiro => "kiro",
+            Self::Devin => "devin",
+            Self::OpenHands => "openhands",
+            Self::Goose => "goose",
+            Self::Crush => "crush",
+            Self::Hermes => "hermes",
         }
     }
 
@@ -27040,6 +27055,13 @@ impl ConnectorKind {
             Self::Qwen => Box::new(QwenConnector::new()),
             Self::Grok => Box::new(GrokConnector::new()),
             Self::Muse => Box::new(MuseConnector::new()),
+            Self::PrimeAgent => Box::new(franken_agent_detection::PrimeAgentConnector::new()),
+            Self::Kiro => Box::new(franken_agent_detection::KiroConnector::new()),
+            Self::Devin => Box::new(franken_agent_detection::DevinConnector::new()),
+            Self::OpenHands => Box::new(franken_agent_detection::OpenHandsConnector::new()),
+            Self::Goose => Box::new(franken_agent_detection::GooseConnector::new()),
+            Self::Crush => Box::new(franken_agent_detection::CrushConnector::new()),
+            Self::Hermes => Box::new(franken_agent_detection::HermesConnector::new()),
         }
     }
 }
@@ -28130,6 +28152,20 @@ enum ConnectorKind {
     Grok,
     #[serde(rename = "mu", alias = "Muse")]
     Muse,
+    #[serde(rename = "pr", alias = "PrimeAgent")]
+    PrimeAgent,
+    #[serde(rename = "kr", alias = "Kiro")]
+    Kiro,
+    #[serde(rename = "dv", alias = "Devin")]
+    Devin,
+    #[serde(rename = "oh", alias = "OpenHands")]
+    OpenHands,
+    #[serde(rename = "gs", alias = "Goose")]
+    Goose,
+    #[serde(rename = "cr", alias = "Crush")]
+    Crush,
+    #[serde(rename = "hm", alias = "Hermes")]
+    Hermes,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
@@ -36368,6 +36404,7 @@ mod tests {
             "watch_startup:reclassify_legacy_omp",
             "watch_startup:classify_nonresumable_checkpoint",
             "watch_startup:count_nonresumable_checkpoint_conversations",
+            "watch_startup:fts_shadow_viability",
         ];
         for sub_phase in documented_sub_phases {
             assert!(
@@ -59251,6 +59288,31 @@ mod tests {
             configured.into_iter().zip(upstream)
         {
             assert_eq!(configured_name, upstream_name);
+            let kind = ConnectorKind::from_slug(configured_name)
+                .unwrap_or_else(|| panic!("{configured_name}: missing watch/quarantine route"));
+            assert_eq!(kind.slug(), configured_name);
+            let serialized = serde_json::to_string(&kind).expect("serialize connector kind");
+            assert_eq!(
+                serde_json::from_str::<ConnectorKind>(&serialized).expect("read connector kind"),
+                kind
+            );
+            let routed = kind.create_connector();
+            let expected = configured_factory();
+            let routed_detection = routed.detect();
+            let expected_detection = expected.detect();
+            assert_eq!(
+                (
+                    routed_detection.detected,
+                    routed_detection.root_paths,
+                    routed.supports_streaming_scan()
+                ),
+                (
+                    expected_detection.detected,
+                    expected_detection.root_paths,
+                    expected.supports_streaming_scan()
+                ),
+                "{configured_name}: watch/quarantine must use the configured connector"
+            );
             if matches!(configured_name, "codex" | "omp" | "pi_agent") {
                 assert!(
                     !std::ptr::fn_addr_eq(configured_factory, upstream_factory),

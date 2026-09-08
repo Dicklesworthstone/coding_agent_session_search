@@ -40,6 +40,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
+use coding_agent_search::franken_sync::compat::{ConnectionExt, OpenFlags, RowExt, open_with_flags};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -129,11 +130,16 @@ fn conversation_count(envelope: &Value) -> Result<i64, Box<dyn Error>> {
         })
 }
 
-fn message_count(envelope: &Value) -> Result<i64, Box<dyn Error>> {
-    envelope
-        .get("messages")
-        .and_then(Value::as_i64)
-        .ok_or_else(|| test_error(format!("envelope missing integer `messages`: {envelope}")))
+fn archive_totals(data_dir: &Path) -> Result<(usize, usize), Box<dyn Error>> {
+    let db_path = data_dir.join("agent_search.db");
+    let conn = open_with_flags(&db_path.to_string_lossy(), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let conversations: i64 = conn.query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+        row.get_typed(0)
+    })?;
+    let messages: i64 =
+        conn.query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))?;
+    conn.close_without_checkpoint()?;
+    Ok((usize::try_from(conversations)?, usize::try_from(messages)?))
 }
 
 #[test]
@@ -186,13 +192,13 @@ fn second_index_uses_incremental_inline_strategy_proving_idempotency() -> TestRe
 #[test]
 fn consecutive_indexes_produce_stable_conversation_and_message_totals() -> TestResult {
     let (tmp, project, data) = install_aider_fixture_project()?;
-    let envelope1 = run_index_in(&project, &data, tmp.path())?;
-    let envelope2 = run_index_in(&project, &data, tmp.path())?;
-
-    let conv1 = conversation_count(&envelope1)?;
-    let conv2 = conversation_count(&envelope2)?;
-    let msg1 = message_count(&envelope1)?;
-    let msg2 = message_count(&envelope2)?;
+    run_index_in(&project, &data, tmp.path())?;
+    // Index envelopes may report only the work observed during that run
+    // (#192). Idempotency concerns the archive, including unchanged rows.
+    let (conv1, msg1) = archive_totals(&data)?;
+    ensure(conv1 > 0 && msg1 > 0, "fixture must populate the archive")?;
+    run_index_in(&project, &data, tmp.path())?;
+    let (conv2, msg2) = archive_totals(&data)?;
 
     ensure(
         matches!(conv1.cmp(&conv2), Ordering::Equal),

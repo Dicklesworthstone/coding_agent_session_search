@@ -8,6 +8,7 @@
 //! - Edge cases (empty password, unicode, case sensitivity)
 
 use anyhow::Result;
+use coding_agent_search::pages::bundle::BundleBuilder;
 use coding_agent_search::pages::encrypt::{
     DecryptionEngine, EncryptionConfig, EncryptionEngine, load_config,
 };
@@ -21,15 +22,15 @@ use tempfile::TempDir;
 
 /// Create a test encrypted archive with a password slot
 fn setup_encrypted_archive(dir: &Path, password: &str) -> Result<EncryptionConfig> {
-    let test_file = dir.join("test_input.db");
+    let input = TempDir::new()?;
+    let test_file = input.path().join("test_input.db");
     fs::write(&test_file, b"test database content for recovery testing")?;
 
     let mut engine = EncryptionEngine::default();
     engine.add_password_slot(password)?;
-    let dir_buf = dir.to_path_buf();
-    let config = engine.encrypt_file(&test_file, &dir_buf, |_, _| {})?;
-
-    fs::remove_file(&test_file)?;
+    let encrypted_dir = input.path().join("encrypted");
+    let config = engine.encrypt_file(&test_file, &encrypted_dir, |_, _| {})?;
+    BundleBuilder::new().build(encrypted_dir.as_path(), dir, |_, _| {})?;
     Ok(config)
 }
 
@@ -38,17 +39,17 @@ fn setup_archive_with_recovery(
     dir: &Path,
     password: &str,
 ) -> Result<(EncryptionConfig, RecoverySecret)> {
-    let test_file = dir.join("test_input.db");
+    let input = TempDir::new()?;
+    let test_file = input.path().join("test_input.db");
     fs::write(&test_file, b"test database content for recovery testing")?;
 
     let mut engine = EncryptionEngine::default();
     engine.add_password_slot(password)?;
     let secret = RecoverySecret::generate();
     engine.add_recovery_slot(secret.as_bytes())?;
-    let dir_buf = dir.to_path_buf();
-    let config = engine.encrypt_file(&test_file, &dir_buf, |_, _| {})?;
-
-    fs::remove_file(&test_file)?;
+    let encrypted_dir = input.path().join("encrypted");
+    let config = engine.encrypt_file(&test_file, &encrypted_dir, |_, _| {})?;
+    BundleBuilder::new().build(encrypted_dir.as_path(), dir, |_, _| {})?;
     Ok((config, secret))
 }
 
