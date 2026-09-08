@@ -150,12 +150,14 @@ fn connector_factories_all_instantiate_and_detect() {
     }
 }
 
-/// Feature-gated connectors (chatgpt, cursor, opencode, crush, goose, hermes)
+/// Feature-gated connectors (chatgpt, cursor, opencode, crush, goose, hermes, devin)
 /// are available because cass enables those features in Cargo.toml.
 #[test]
 fn feature_gated_connectors_available() {
     let slugs = factory_fad_slugs();
-    for gated in ["chatgpt", "cursor", "opencode", "crush", "goose", "hermes"] {
+    for gated in [
+        "chatgpt", "cursor", "opencode", "crush", "goose", "hermes", "devin",
+    ] {
         assert!(
             slugs.contains(gated),
             "Feature-gated connector '{gated}' not found. \
@@ -476,4 +478,215 @@ fn new_agent_auto_discovery_documented() {
         report.summary.detected_count
     );
     eprintln!("  - Adding a connector to FAD auto-discovers in cass.");
+}
+
+/// GH449: the Devin factory exists even when its SQLite parser is compiled out.
+/// Exercise the persisted provider format through the factory and real CLI so
+/// slug enumeration alone cannot certify support again.
+mod devin_ingestion {
+    use super::*;
+    use coding_agent_search::connectors::{ScanContext, ScanRoot};
+    use coding_agent_search::franken_sync::compat::ConnectionExt;
+    use coding_agent_search::franken_sync::{Connection, params};
+    use serde_json::{Value, json};
+    use std::fs;
+    use std::time::Duration;
+
+    fn seed_store(path: &Path) {
+        let conn = Connection::open(path.to_string_lossy().as_ref()).expect("create Devin store");
+        // Schema and JSON shapes from the published FAD 0.2.3 Devin connector,
+        // independently populated here with branch, hidden and empty sessions.
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY, title TEXT, working_directory TEXT,
+                 model TEXT, agent_mode TEXT, created_at REAL,
+                 last_activity_at REAL, main_chain_id INTEGER, hidden INTEGER
+             );
+             CREATE TABLE message_nodes (
+                 session_id TEXT, node_id INTEGER, parent_node_id INTEGER,
+                 chat_message TEXT, created_at REAL,
+                 PRIMARY KEY (session_id, node_id)
+             );
+             INSERT INTO sessions VALUES
+                 ('kept', 'Devin branch repair', '/work/devin', 'model', 'agent',
+                  1700000000, 1700000060, 5, 0),
+                 ('hidden', 'Retired', NULL, NULL, NULL, 1700000000, 1700000060, 1, 1),
+                 ('empty', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0);
+             COMMIT;",
+        )
+        .expect("seed Devin schema");
+        for (session, id, parent, message) in [
+            (
+                "kept",
+                1,
+                None,
+                json!({"role":"system", "content":"excludedpolicy"}),
+            ),
+            (
+                "kept",
+                2,
+                Some(1),
+                json!({"role":"user", "content":"devinneedle fix the branch",
+                "images":[{"data":"excludedimagepayload", "mime_type":"image/png"}]}),
+            ),
+            (
+                "kept",
+                3,
+                Some(2),
+                json!({"role":"assistant", "content":"devinneedle inspect",
+                "thinking":{"thinking":"follow the parent chain", "signature":"signature"},
+                "tool_calls":[{"id":"call-1", "index":0, "kind":"function", "name":"shell",
+                    "arguments":{"command":"git status"}}]}),
+            ),
+            (
+                "kept",
+                4,
+                Some(3),
+                json!({"role":"tool", "content":"devinneedle clean tree", "tool_call_id":"call-1"}),
+            ),
+            (
+                "kept",
+                5,
+                Some(4),
+                json!({"role":"assistant", "content":"devinneedle repaired"}),
+            ),
+            (
+                "kept",
+                6,
+                Some(2),
+                json!({"role":"assistant", "content":"excludedabandonedbranch"}),
+            ),
+            (
+                "hidden",
+                1,
+                None,
+                json!({"role":"user", "content":"excludedhiddensession"}),
+            ),
+        ] {
+            conn.execute_compat(
+                "INSERT INTO message_nodes VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    session,
+                    id,
+                    parent,
+                    message.to_string(),
+                    1_700_000_000.0 + f64::from(id)
+                ],
+            )
+            .expect("insert Devin message node");
+        }
+    }
+
+    fn cass(home: &Path, data: &Path) -> assert_cmd::Command {
+        let mut cmd = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        cmd.env_clear()
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("PATH", "")
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("CASS_DEVIN_DATA_ROOT", home.join("sessions.db"))
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("RUST_MIN_STACK", "134217728")
+            .current_dir(home)
+            .arg("--data-dir")
+            .arg(data)
+            .timeout(Duration::from_secs(120));
+        if let Ok(system_root) = dotenvy::var("SystemRoot") {
+            cmd.env("SystemRoot", system_root);
+        }
+        cmd
+    }
+
+    #[test]
+    fn devin_factory_reads_main_chain_without_mutating_source() {
+        let home = tempfile::tempdir().expect("isolated home");
+        let db = home.path().join("sessions.db");
+        seed_store(&db);
+        let before = fs::read(&db).expect("source bytes");
+        let (_, factory) = get_connector_factories()
+            .into_iter()
+            .find(|(slug, _)| *slug == "devin")
+            .expect("Devin factory");
+        let ctx = ScanContext::with_roots(
+            home.path().to_path_buf(),
+            vec![ScanRoot::local(db.clone())],
+            None,
+        );
+        let conversations = factory().scan(&ctx).expect("real Devin scan");
+        assert_eq!(
+            conversations.len(),
+            1,
+            "disabled parser or wrong branch selection"
+        );
+        let conversation = &conversations[0];
+        assert_eq!(conversation.agent_slug, "devin");
+        assert_eq!(conversation.external_id.as_deref(), Some("kept"));
+        assert_eq!(
+            conversation.workspace.as_deref(),
+            Some(Path::new("/work/devin"))
+        );
+        assert_eq!(conversation.source_path, db.join("kept"));
+        assert_eq!(conversation.started_at, Some(1_700_000_000_000));
+        assert_eq!(conversation.metadata["off_chain_nodes"], 1);
+        assert_eq!(conversation.messages.len(), 4);
+        assert_eq!(
+            conversation
+                .messages
+                .iter()
+                .map(|m| m.role.as_str())
+                .collect::<Vec<_>>(),
+            ["user", "assistant", "tool", "assistant"]
+        );
+        for message in &conversation.messages {
+            assert!(!message.content.contains("excluded"));
+        }
+        assert_eq!(fs::read(&db).expect("source after scan"), before);
+    }
+
+    #[test]
+    fn devin_cli_indexes_searches_and_reopens_without_duplicates() {
+        let home = tempfile::tempdir().expect("isolated home");
+        let db = home.path().join("sessions.db");
+        let data = home.path().join("cass-data");
+        seed_store(&db);
+        let before = fs::read(&db).expect("source bytes");
+        for _ in 0..2 {
+            cass(home.path(), &data)
+                .args(["index", "--full", "--json"])
+                .assert()
+                .success();
+            let output = cass(home.path(), &data)
+                .args([
+                    "search",
+                    "devinneedle",
+                    "--mode",
+                    "lexical",
+                    "--agent",
+                    "devin",
+                    "--json",
+                    "--limit",
+                    "20",
+                ])
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            let result: Value = serde_json::from_slice(&output).expect("search JSON");
+            let hits = result["hits"].as_array().expect("search hits");
+            assert_eq!(hits.len(), 4, "{result}");
+            for hit in hits {
+                assert_eq!(hit["agent"], "devin");
+                assert_eq!(
+                    hit["source_path"],
+                    db.join("kept").to_string_lossy().as_ref()
+                );
+            }
+            assert_eq!(fs::read(&db).expect("source after indexing"), before);
+        }
+    }
 }
