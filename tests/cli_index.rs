@@ -2227,6 +2227,17 @@ fn gh413_paged_fts_shadow_repair_stops_at_its_page_budget_without_failing_the_ru
 /// marker.
 #[test]
 fn gh413_fts_shadow_over_its_corpus_bound_is_dropped_and_recreated_once_it_fits() {
+    assert_gh413_fts_shadow_bound(false);
+}
+
+#[test]
+fn gh413_legacy_readonly_resume_drops_oversized_shadow_before_opening_readers() {
+    assert_gh413_fts_shadow_bound(true);
+}
+
+fn assert_gh413_fts_shadow_bound(legacy_checkpoint: bool) {
+    use frankensqlite::compat::RowExt;
+
     let tmp = TempDir::new().unwrap();
     let home = tmp.path();
     let data_dir = home.join("cass_data");
@@ -2255,6 +2266,63 @@ fn gh413_fts_shadow_over_its_corpus_bound_is_dropped_and_recreated_once_it_fits(
         String::from_utf8_lossy(&seed.stderr)
     );
 
+    let db_path = data_dir.join("agent_search.db");
+    let canonical_rows = || {
+        let storage = SqliteStorage::open_readonly(&db_path).unwrap();
+        let rows = ["conversations", "messages"].map(|table| {
+            storage
+                .raw()
+                .query(&format!("SELECT * FROM {table} ORDER BY id"))
+                .unwrap()
+                .into_iter()
+                .map(|row| row.values().to_vec())
+                .collect::<Vec<_>>()
+        });
+        storage.close_without_checkpoint().unwrap();
+        rows
+    };
+    let canonical_before = canonical_rows();
+    assert_eq!(canonical_before[0].len(), 2);
+    assert!(canonical_before[1].len() > 1);
+    {
+        let storage = SqliteStorage::open_readonly(&db_path).unwrap();
+        let shadow_rows = storage
+            .raw()
+            .query("SELECT COUNT(*) FROM fts_messages")
+            .unwrap();
+        assert!(
+            shadow_rows[0].get_typed::<i64>(0).unwrap() > 1,
+            "the bounded run must start with a populated oversized shadow"
+        );
+        storage.close_without_checkpoint().unwrap();
+    }
+
+    let checkpoint_path = coding_agent_search::search::tantivy::expected_index_dir(&data_dir)
+        .join(".lexical-rebuild-state.json");
+    let initial_checkpoint: serde_json::Value =
+        serde_json::from_slice(&fs::read(&checkpoint_path).unwrap()).unwrap();
+    assert_eq!(initial_checkpoint["completed"], true);
+    if legacy_checkpoint {
+        // The original GH #413 archive had a matching-path v2 checkpoint
+        // without execution_mode. A copied checkpoint with the old path takes
+        // the ordinary writable route and cannot exercise this regression.
+        let mut legacy = initial_checkpoint.clone();
+        assert_eq!(legacy["version"], 2);
+        assert_eq!(
+            legacy["db"]["db_path"].as_str().unwrap(),
+            fs::canonicalize(&db_path).unwrap().to_str().unwrap()
+        );
+        legacy["completed"] = false.into();
+        legacy["committed_offset"] = 0.into();
+        legacy["processed_conversations"] = 0.into();
+        legacy["indexed_docs"] = 0.into();
+        legacy["committed_conversation_id"] = serde_json::Value::Null;
+        legacy["committed_meta_fingerprint"] = serde_json::Value::Null;
+        legacy["pending"] = serde_json::Value::Null;
+        legacy.as_object_mut().unwrap().remove("execution_mode");
+        fs::write(&checkpoint_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    }
+
     let bounded = base_cmd(home)
         .current_dir(home)
         .args(["index", "--json", "--no-progress-events", "--data-dir"])
@@ -2262,11 +2330,54 @@ fn gh413_fts_shadow_over_its_corpus_bound_is_dropped_and_recreated_once_it_fits(
         .env("CASS_AUTO_REFRESH", "0")
         .env("CASS_FTS_SHADOW_MAX_MESSAGES", "1")
         .output()
-        .expect("run an incremental index under a 1-byte shadow bound");
+        .expect("run an incremental index under a one-message shadow bound");
     assert!(
         bounded.status.success(),
         "dropping an oversized shadow must not fail the run: {}",
         String::from_utf8_lossy(&bounded.stderr)
+    );
+
+    let bounded_json: serde_json::Value =
+        serde_json::from_slice(&bounded.stdout).expect("bounded index output is JSON");
+    let strategy_reason = &bounded_json["indexing_stats"]["lexical_strategy_reason"];
+    if legacy_checkpoint {
+        assert_eq!(
+            strategy_reason, "readonly_fast_resume_incomplete_nonresumable_lexical_rebuild",
+            "the legacy fixture must exercise the readonly restart: {bounded_json}"
+        );
+    } else {
+        assert_ne!(
+            strategy_reason, "readonly_fast_resume_incomplete_nonresumable_lexical_rebuild",
+            "the original test must retain ordinary-path coverage: {bounded_json}"
+        );
+    }
+    // Inspect completion before search, which can repair a stale generation.
+    let checkpoint: serde_json::Value =
+        serde_json::from_slice(&fs::read(&checkpoint_path).unwrap()).unwrap();
+    assert_eq!(checkpoint["completed"], true, "{checkpoint}");
+    assert_eq!(
+        checkpoint["execution_mode"], "shared_writer",
+        "{checkpoint}"
+    );
+    for field in ["db_path", "total_conversations", "storage_fingerprint"] {
+        assert_eq!(
+            checkpoint["db"][field], initial_checkpoint["db"][field],
+            "the completed checkpoint must preserve canonical {field}: {checkpoint}"
+        );
+    }
+    assert_eq!(
+        checkpoint["db"]["total_messages"].as_u64().unwrap(),
+        canonical_before[1].len() as u64,
+        "the completed checkpoint must retain the exact canonical message count"
+    );
+    assert_eq!(
+        checkpoint["indexed_docs"],
+        initial_checkpoint["indexed_docs"]
+    );
+    assert_eq!(
+        canonical_rows(),
+        canonical_before,
+        "shadow preflight and lexical rebuild must preserve every canonical row and field"
     );
 
     let status = base_cmd(home)
@@ -2739,6 +2850,42 @@ fn gh440_plain_index_resumes_a_force_rebuild_killed_between_commit_and_checkpoin
          stdout={stdout}\nstderr={stderr}"
     );
 
+    // Search can heal a stale checkpoint. Check resume and the unchanged
+    // incremental pass first, so that repair cannot hide incomplete work.
+    for round in 0..2 {
+        let checkpoint: serde_json::Value =
+            serde_json::from_slice(&fs::read(&checkpoint_path).unwrap()).unwrap();
+        assert_eq!(checkpoint["completed"], true, "{checkpoint}");
+        assert_eq!(
+            checkpoint["db"], initial_checkpoint["db"],
+            "resume must replace its pending fingerprint and retain canonical counts: {checkpoint}"
+        );
+        let status = base_cmd(home)
+            .current_dir(home)
+            .args([
+                "status",
+                "--json",
+                "--stale-threshold",
+                "3600",
+                "--data-dir",
+            ])
+            .arg(&data_dir)
+            .output()
+            .expect("status after resume");
+        let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(status["healthy"], true, "{status}");
+        assert_eq!(status["index"]["status"], "ready", "{status}");
+        if round == 0 {
+            base_cmd(home)
+                .current_dir(home)
+                .args(["index", "--json", "--no-progress-events", "--data-dir"])
+                .arg(&data_dir)
+                .env("CASS_AUTO_REFRESH", "0")
+                .assert()
+                .success();
+        }
+    }
+
     let search = base_cmd(home)
         .current_dir(home)
         .args([
@@ -2791,39 +2938,6 @@ fn gh440_plain_index_resumes_a_force_rebuild_killed_between_commit_and_checkpoin
         sessions,
         "every seeded session must be found after resume: {search_json}"
     );
-    for round in 0..2 {
-        let checkpoint: serde_json::Value =
-            serde_json::from_slice(&fs::read(&checkpoint_path).unwrap()).unwrap();
-        assert_eq!(checkpoint["completed"], true, "{checkpoint}");
-        assert_eq!(
-            checkpoint["db"], initial_checkpoint["db"],
-            "resume must replace its pending fingerprint and retain canonical counts: {checkpoint}"
-        );
-        let status = base_cmd(home)
-            .current_dir(home)
-            .args([
-                "status",
-                "--json",
-                "--stale-threshold",
-                "3600",
-                "--data-dir",
-            ])
-            .arg(&data_dir)
-            .output()
-            .expect("status after resume");
-        let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
-        assert_eq!(status["healthy"], true, "{status}");
-        assert_eq!(status["index"]["status"], "ready", "{status}");
-        if round == 0 {
-            base_cmd(home)
-                .current_dir(home)
-                .args(["index", "--json", "--no-progress-events", "--data-dir"])
-                .arg(&data_dir)
-                .env("CASS_AUTO_REFRESH", "0")
-                .assert()
-                .success();
-        }
-    }
 }
 
 /// GH #441 / WS-B.1b: an archive that fragmented under v0.7.1 (one Quill

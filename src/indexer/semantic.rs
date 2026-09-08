@@ -222,6 +222,12 @@ pub struct SemanticBackfillStoragePlan {
     pub max_conversations: usize,
 }
 
+struct BackfillBatchProgress {
+    prior_checkpoint: Option<BuildCheckpoint>,
+    embedded_docs: u64,
+    last_message_id: Option<i64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SemanticBackfillBatchOutcome {
     pub tier: TierKind,
@@ -560,6 +566,21 @@ fn semantic_staging_index_path(
     ))
 }
 
+/// Content growth may reuse vectors, but identity migrations belong to a
+/// different archive identity generation even when row counts are unchanged.
+fn semantic_backfill_identity_matches(saved: &str, current: &str) -> bool {
+    fn identity(fingerprint: &str) -> Option<&str> {
+        if fingerprint.starts_with("content-v1:") {
+            Some("")
+        } else {
+            let rest = fingerprint.strip_prefix("identity-v1:")?;
+            let (generation, content) = rest.split_once(':')?;
+            (!generation.is_empty() && content.starts_with("content-v1:")).then_some(generation)
+        }
+    }
+    saved == current || matches!((identity(saved), identity(current)), (Some(a), Some(b)) if a == b)
+}
+
 /// Revoke shard-sidecar serving authority after a canonical identity rebuild.
 ///
 /// Query loading prefers a complete current-fingerprint shard generation over
@@ -664,6 +685,53 @@ fn semantic_doc_id_for_embedded(embedded: &EmbeddedMessage) -> String {
         content_hash: Some(embedded.content_hash),
     }
     .to_doc_id_string()
+}
+
+fn validated_semantic_index_ids(index: &FsVectorIndex) -> Result<HashSet<String>> {
+    if index.wal_record_count() != 0 || index.tombstone_count() != 0 {
+        bail!("semantic publication requires a compact index without WAL records or tombstones");
+    }
+    let mut ids = HashSet::with_capacity(index.record_count());
+    for record in 0..index.record_count() {
+        let id = index.doc_id_at(record)?;
+        if !ids.insert(id.to_owned()) {
+            bail!("semantic publication contains duplicate document {id}");
+        }
+        if index
+            .vector_at_f32(record)?
+            .iter()
+            .any(|value| !value.is_finite())
+        {
+            bail!("semantic publication contains a non-finite vector");
+        }
+    }
+    Ok(ids)
+}
+
+/// The destination WAL belongs to the prior live main file, not the staged
+/// candidate. Retain it outside the canonical path before the main-file swap
+/// rather than relying on unrelated source/destination generations differing.
+fn park_semantic_destination_wal(index_path: &Path) -> Result<Option<PathBuf>> {
+    let wal_path = fsvi_wal_path_for(index_path);
+    match fs::metadata(&wal_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("inspect semantic destination WAL"),
+    }
+    let parent = index_path
+        .parent()
+        .context("semantic index has no parent")?;
+    let retained_dir = tempfile::Builder::new()
+        .prefix(".quarantined-destination-wal-")
+        .tempdir_in(parent)?
+        .keep();
+    let retained_wal = retained_dir.join("destination.wal");
+    fs::rename(&wal_path, &retained_wal).context("retain prior semantic destination WAL")?;
+    sync_parent_directory(&wal_path)?;
+    sync_parent_directory(&retained_wal)?;
+    tracing::info!(wal = %wal_path.display(), retained = %retained_wal.display(),
+        "retained prior semantic destination WAL before publication");
+    Ok(Some(retained_wal))
 }
 
 pub(crate) fn semantic_doc_id_for_input(input: &EmbeddingInput) -> Option<String> {
@@ -2769,7 +2837,25 @@ impl SemanticIndexer {
         current_doc_ids: &HashSet<String>,
     ) -> Result<FsVectorIndex> {
         let index_path = vector_index_path(data_dir, self.embedder_id());
+        self.reconcile_index_at_paths(
+            embedded_messages,
+            &index_path,
+            &index_path,
+            tier,
+            db_fingerprint,
+            current_doc_ids,
+        )
+    }
 
+    fn reconcile_index_at_paths(
+        &self,
+        embedded_messages: Vec<EmbeddedMessage>,
+        index_path: &Path,
+        final_index_path: &Path,
+        tier: TierKind,
+        db_fingerprint: &str,
+        current_doc_ids: &HashSet<String>,
+    ) -> Result<FsVectorIndex> {
         let mut replacement_doc_ids = HashSet::with_capacity(embedded_messages.len());
         for embedded in &embedded_messages {
             if embedded.embedding.len() != self.embedder_dimension() {
@@ -2816,14 +2902,14 @@ impl SemanticIndexer {
                 )
             })?;
         let staging_path = staging_dir.path().join("candidate.fsvi");
-        fs::copy(&index_path, &staging_path).with_context(|| {
+        fs::copy(index_path, &staging_path).with_context(|| {
             format!(
                 "snapshot live semantic index {} at {}",
                 index_path.display(),
                 staging_path.display()
             )
         })?;
-        let live_wal_path = fsvi_wal_path_for(&index_path);
+        let live_wal_path = fsvi_wal_path_for(index_path);
         let live_wal_snapshot_path = staging_dir.path().join("live.wal.snapshot");
         if live_wal_path.exists() {
             fs::copy(&live_wal_path, &live_wal_snapshot_path).with_context(|| {
@@ -2967,8 +3053,8 @@ impl SemanticIndexer {
             drop(generation_probe);
         }
 
-        publish_reconciled_semantic_index(&staging_path, &index_path)?;
-        let published = FsVectorIndex::open(&index_path)
+        publish_reconciled_semantic_index(&staging_path, final_index_path)?;
+        let published = FsVectorIndex::open(final_index_path)
             .map_err(|err| anyhow::anyhow!("open reconciled semantic index: {err}"))?;
         if published.wal_record_count() > 0 {
             bail!("published reconciled semantic index accepted a stale live WAL");
@@ -3037,15 +3123,12 @@ impl SemanticIndexer {
             bail!("semantic backfill batch cannot process conversations when total is zero");
         }
 
-        let manifest_path = SemanticManifest::path(data_dir);
         let staging_path = semantic_staging_index_path(
             data_dir,
             plan.tier,
             self.embedder_id(),
             &plan.db_fingerprint,
         );
-        let final_path = vector_index_path(data_dir, self.embedder_id());
-
         let prior_checkpoint = manifest
             .checkpoint
             .as_ref()
@@ -3055,13 +3138,6 @@ impl SemanticIndexer {
                     && checkpoint.is_valid(&plan.db_fingerprint)
             })
             .cloned();
-        let prior_conversations = prior_checkpoint
-            .as_ref()
-            .map_or(0, |checkpoint| checkpoint.conversations_processed);
-        let prior_docs = prior_checkpoint
-            .as_ref()
-            .map_or(0, |checkpoint| checkpoint.docs_embedded);
-
         let embeddings = self.embed_messages_with_sink(messages, sink)?;
         let embedded_docs = u64::try_from(embeddings.len()).unwrap_or(u64::MAX);
         if sink.is_active() {
@@ -3074,7 +3150,7 @@ impl SemanticIndexer {
                 },
             );
         }
-        let mut staged_index = self.write_backfill_staging_index(
+        let staged_index = self.write_backfill_staging_index(
             embeddings,
             &staging_path,
             prior_checkpoint.is_some(),
@@ -3089,6 +3165,48 @@ impl SemanticIndexer {
                 },
             );
         }
+        self.finish_backfill_batch(
+            staged_index,
+            data_dir,
+            manifest,
+            plan,
+            BackfillBatchProgress {
+                prior_checkpoint,
+                embedded_docs,
+                last_message_id,
+            },
+            sink,
+        )
+    }
+
+    fn finish_backfill_batch(
+        &self,
+        mut staged_index: FsVectorIndex,
+        data_dir: &Path,
+        manifest: &mut SemanticManifest,
+        plan: SemanticBackfillBatchPlan,
+        progress: BackfillBatchProgress,
+        sink: &SemanticProgressSink,
+    ) -> Result<SemanticBackfillBatchOutcome> {
+        let BackfillBatchProgress {
+            prior_checkpoint,
+            embedded_docs,
+            last_message_id,
+        } = progress;
+        let manifest_path = SemanticManifest::path(data_dir);
+        let staging_path = semantic_staging_index_path(
+            data_dir,
+            plan.tier,
+            self.embedder_id(),
+            &plan.db_fingerprint,
+        );
+        let final_path = vector_index_path(data_dir, self.embedder_id());
+        let prior_conversations = prior_checkpoint
+            .as_ref()
+            .map_or(0, |checkpoint| checkpoint.conversations_processed);
+        let prior_docs = prior_checkpoint
+            .as_ref()
+            .map_or(0, |checkpoint| checkpoint.docs_embedded);
         let counted_conversations_processed =
             prior_conversations.saturating_add(plan.conversations_in_batch);
         let conversations_processed = if plan.cursor_exhausted {
@@ -3107,6 +3225,7 @@ impl SemanticIndexer {
                     anyhow::anyhow!("compact staged semantic index failed: {err}")
                 })?;
             }
+            let staged_doc_ids = validated_semantic_index_ids(&staged_index)?;
             drop(staged_index);
             if sink.is_active() {
                 sink.emit(
@@ -3121,16 +3240,17 @@ impl SemanticIndexer {
                     },
                 );
             }
-            fs::rename(&staging_path, &final_path).with_context(|| {
-                format!(
-                    "publishing staged semantic index {} to {}",
-                    staging_path.display(),
-                    final_path.display()
-                )
-            })?;
-            sync_parent_directory(&final_path)?;
+            // Keep the WAL parked even if publication fails: a failure may
+            // follow the rename (for example directory fsync), so restoring it
+            // could attach the old WAL to a new main file. Readiness stays
+            // revoked until a later exact reconciliation succeeds.
+            park_semantic_destination_wal(&final_path)?;
+            publish_reconciled_semantic_index(&staging_path, &final_path)?;
             let published_index = FsVectorIndex::open(&final_path)
                 .map_err(|err| anyhow::anyhow!("open published semantic index failed: {err}"))?;
+            if validated_semantic_index_ids(&published_index)? != staged_doc_ids {
+                bail!("published semantic identities differ from the validated candidate");
+            }
             let size_bytes = fs::metadata(&final_path)
                 .with_context(|| format!("stat published semantic index {}", final_path.display()))?
                 .len();
@@ -3301,6 +3421,292 @@ impl SemanticIndexer {
         )
     }
 
+    fn reusable_backfill_candidate(
+        &self,
+        data_dir: &Path,
+        manifest: &SemanticManifest,
+        plan: &SemanticBackfillStoragePlan,
+    ) -> Option<PathBuf> {
+        if let Some(checkpoint) = manifest.checkpoint.as_ref().filter(|checkpoint| {
+            checkpoint.tier == plan.tier
+                && checkpoint.embedder_id == self.embedder_id()
+                && checkpoint.schema_version == SEMANTIC_SCHEMA_VERSION
+                && checkpoint.chunking_version == CHUNKING_STRATEGY_VERSION
+                && semantic_backfill_identity_matches(
+                    &checkpoint.db_fingerprint,
+                    &plan.db_fingerprint,
+                )
+        }) {
+            let path = semantic_staging_index_path(
+                data_dir,
+                plan.tier,
+                self.embedder_id(),
+                &checkpoint.db_fingerprint,
+            );
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+        let artifact = match plan.tier {
+            TierKind::Fast => manifest.fast_tier.as_ref(),
+            TierKind::Quality => manifest.quality_tier.as_ref(),
+        }?;
+        let path = vector_index_path(data_dir, self.embedder_id());
+        let recorded_path = data_dir.join(&artifact.index_path);
+        (artifact.tier == plan.tier
+            && artifact.embedder_id == self.embedder_id()
+            && artifact.model_revision == plan.model_revision
+            && artifact.schema_version == SEMANTIC_SCHEMA_VERSION
+            && artifact.chunking_version == CHUNKING_STRATEGY_VERSION
+            && artifact.dimension == self.embedder_dimension()
+            && semantic_backfill_identity_matches(&artifact.db_fingerprint, &plan.db_fingerprint)
+            && recorded_path == path
+            && path.is_file())
+        .then_some(path)
+    }
+
+    fn revoke_backfill_serving(
+        &self,
+        data_dir: &Path,
+        manifest: &mut SemanticManifest,
+    ) -> Result<()> {
+        // Complete shard metadata can override an unready monolithic record.
+        // Revoke both authorities before scanning or changing any candidate.
+        invalidate_identity_stale_semantic_shards(data_dir, self.embedder_id())?;
+        for artifact in [&mut manifest.fast_tier, &mut manifest.quality_tier]
+            .into_iter()
+            .flatten()
+        {
+            if artifact.embedder_id == self.embedder_id() {
+                artifact.ready = false;
+            }
+        }
+        if let Some(hnsw) = manifest.hnsw.as_mut()
+            && hnsw.embedder_id == self.embedder_id()
+        {
+            hnsw.ready = false;
+        }
+        manifest.save(data_dir)?;
+        Ok(())
+    }
+
+    /// Reuse exact canonical identities, never a count or a conversation tail
+    /// as evidence that an older vector still describes the current row.
+    /// Only one replayed conversation and the capped embedding delta retain
+    /// message text. Covered prefixes consume no embedding batch budget.
+    fn reconcile_backfill_from_storage(
+        &self,
+        storage: &FrankenStorage,
+        data_dir: &Path,
+        manifest: &mut SemanticManifest,
+        plan: SemanticBackfillStoragePlan,
+        candidate: (&Path, SemanticCheckpointCaps),
+        sink: &SemanticProgressSink,
+    ) -> Result<SemanticBackfillBatchOutcome> {
+        let (candidate_path, caps) = candidate;
+        let snapshot_dir = tempfile::Builder::new()
+            .prefix(".backfill-reuse-")
+            .tempdir_in(data_dir.join(VECTOR_INDEX_DIR))?;
+        let snapshot_path = snapshot_dir.path().join("candidate.fsvi");
+        fs::copy(candidate_path, &snapshot_path).context("snapshot semantic backfill candidate")?;
+        let candidate_wal = fsvi_wal_path_for(candidate_path);
+        if candidate_wal.is_file() {
+            fs::copy(candidate_wal, fsvi_wal_path_for(&snapshot_path))
+                .context("snapshot semantic backfill candidate WAL")?;
+        }
+        let mut snapshot = FsVectorIndex::open(&snapshot_path)
+            .map_err(|err| anyhow::anyhow!("open semantic backfill candidate: {err}"))?;
+        if snapshot.embedder_id() != self.embedder_id()
+            || snapshot.dimension() != self.embedder_dimension()
+            || snapshot.embedder_revision() != self.vector_space_revision()?
+        {
+            bail!("semantic backfill candidate has an incompatible vector space");
+        }
+        self.revoke_backfill_serving(data_dir, manifest)?;
+        if snapshot.wal_record_count() > 0 {
+            snapshot.compact().map_err(|err| {
+                anyhow::anyhow!("compact semantic backfill candidate snapshot: {err}")
+            })?;
+        }
+        let mut existing_ids = HashSet::new();
+        for record in 0..snapshot.record_count() {
+            if !snapshot.is_deleted(record) {
+                let id = snapshot.doc_id_at(record).map_err(|err| {
+                    anyhow::anyhow!("read semantic backfill candidate identity: {err}")
+                })?;
+                if !existing_ids.insert(id.to_owned()) {
+                    bail!("semantic backfill candidate contains duplicate document {id}");
+                }
+            }
+        }
+        drop(snapshot);
+
+        let total_conversations = total_semantic_conversations(storage)?;
+        let mut current_ids = HashSet::new();
+        let mut selected_ids = HashSet::new();
+        let mut inputs = Vec::new();
+        let mut selected_conversations = 0usize;
+        let mut selected_bytes = 0u64;
+        let mut covered_conversations = 0u64;
+        let mut after_conversation_id = 0i64;
+        let mut last_covered_conversation = 0i64;
+        let mut last_message_id = None;
+        sink.emit(
+            SemanticProgressEvent::SelectionStart,
+            SemanticProgressFields {
+                rows_total: Some(total_conversations),
+                note: Some("reconcile exact canonical document identities".into()),
+                ..Default::default()
+            },
+        );
+        loop {
+            // Page actual parent IDs independently of append-tail metadata:
+            // deleting the last message must not strand this scan on a stale
+            // tail cache or make a deleted document count as covered.
+            let conversation_ids: Vec<i64> = storage.raw().query_map_collect(
+                "SELECT id FROM conversations WHERE id > ?1 ORDER BY id LIMIT ?2",
+                &[
+                    ParamValue::from(after_conversation_id),
+                    ParamValue::from(DEFAULT_SEMANTIC_RECONCILIATION_SCAN_CONVERSATIONS as i64),
+                ],
+                |row| row.get_typed(0),
+            )?;
+            if conversation_ids.is_empty() {
+                break;
+            }
+            for conversation_id in conversation_ids {
+                let (conversation_inputs, _) =
+                    packet_embedding_inputs_from_selected_canonical_messages(
+                        storage,
+                        &[conversation_id],
+                        |_| true,
+                    )?;
+                let mut missing = Vec::new();
+                let mut missing_ids = Vec::new();
+                for input in conversation_inputs {
+                    let Some(id) = semantic_doc_id_for_input(&input) else {
+                        continue;
+                    };
+                    if !current_ids.insert(id.clone()) {
+                        bail!("canonical semantic backfill produced duplicate document {id}");
+                    }
+                    if !existing_ids.contains(&id) {
+                        missing_ids.push(id);
+                        missing.push(input);
+                    }
+                }
+                let missing_bytes = missing.iter().fold(0u64, |bytes, input| {
+                    bytes.saturating_add(saturating_u64_from_usize(input.content.len()))
+                });
+                // Match the existing whole-conversation exception: the first
+                // missing conversation may exceed a message/byte cap by itself.
+                let select = !missing.is_empty()
+                    && selected_conversations < plan.max_conversations.max(1)
+                    && (selected_conversations == 0
+                        || ((!caps.message_limited()
+                            || inputs.len().saturating_add(missing.len()) <= caps.max_messages)
+                            && (!caps.byte_limited()
+                                || selected_bytes.saturating_add(missing_bytes)
+                                    <= caps.max_bytes)));
+                if missing.is_empty() || select {
+                    covered_conversations = covered_conversations.saturating_add(1);
+                    last_covered_conversation = conversation_id;
+                }
+                if select {
+                    selected_conversations = selected_conversations.saturating_add(1);
+                    selected_bytes = selected_bytes.saturating_add(missing_bytes);
+                    for input in &missing {
+                        let id = i64::try_from(input.message_id).unwrap_or(i64::MAX);
+                        last_message_id =
+                            Some(last_message_id.map_or(id, |prior: i64| prior.max(id)));
+                    }
+                    selected_ids.extend(missing_ids);
+                    inputs.extend(missing);
+                }
+                after_conversation_id = conversation_id;
+                sink.emit(
+                    SemanticProgressEvent::PacketReplayProgress,
+                    SemanticProgressFields {
+                        last_conversation_id: Some(conversation_id),
+                        rows_processed: Some(saturating_u64_from_usize(current_ids.len())),
+                        conversations_in_batch: Some(saturating_u64_from_usize(
+                            selected_conversations,
+                        )),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        let mut covered_ids: HashSet<String> =
+            existing_ids.intersection(&current_ids).cloned().collect();
+        covered_ids.extend(selected_ids);
+        let complete = covered_ids == current_ids;
+        sink.emit(
+            SemanticProgressEvent::SelectionDone,
+            SemanticProgressFields {
+                conversations_in_batch: Some(saturating_u64_from_usize(selected_conversations)),
+                rows_processed: Some(saturating_u64_from_usize(covered_ids.len())),
+                rows_total: Some(saturating_u64_from_usize(current_ids.len())),
+                ..Default::default()
+            },
+        );
+        let embeddings = self.embed_messages_with_sink(&inputs, sink)?;
+        let embedded_docs = saturating_u64_from_usize(embeddings.len());
+        let staging_path = semantic_staging_index_path(
+            data_dir,
+            plan.tier,
+            self.embedder_id(),
+            &plan.db_fingerprint,
+        );
+        let staged_index = self.reconcile_index_at_paths(
+            embeddings,
+            &snapshot_path,
+            &staging_path,
+            plan.tier,
+            &plan.db_fingerprint,
+            &covered_ids,
+        )?;
+        let outcome = self.finish_backfill_batch(
+            staged_index,
+            data_dir,
+            manifest,
+            SemanticBackfillBatchPlan {
+                tier: plan.tier,
+                db_fingerprint: plan.db_fingerprint,
+                model_revision: plan.model_revision,
+                total_conversations,
+                conversations_in_batch: covered_conversations,
+                last_offset: last_covered_conversation,
+                cursor_exhausted: complete,
+            },
+            BackfillBatchProgress {
+                prior_checkpoint: None,
+                embedded_docs,
+                last_message_id,
+            },
+            sink,
+        )?;
+        sink.emit(
+            SemanticProgressEvent::Complete,
+            SemanticProgressFields {
+                rows_processed: Some(outcome.conversations_processed),
+                rows_total: Some(outcome.total_conversations),
+                last_conversation_id: Some(outcome.last_offset),
+                last_message_id,
+                note: Some(
+                    if outcome.published {
+                        "published"
+                    } else {
+                        "checkpointed"
+                    }
+                    .into(),
+                ),
+                ..Default::default()
+            },
+        );
+        Ok(outcome)
+    }
+
     fn run_backfill_from_storage_with_caps_and_sink(
         &self,
         storage: &FrankenStorage,
@@ -3310,6 +3716,24 @@ impl SemanticIndexer {
         caps: SemanticCheckpointCaps,
         sink: &SemanticProgressSink,
     ) -> Result<SemanticBackfillBatchOutcome> {
+        if let Some(candidate) = self.reusable_backfill_candidate(data_dir, manifest, &plan) {
+            return self.reconcile_backfill_from_storage(
+                storage,
+                data_dir,
+                manifest,
+                plan,
+                (&candidate, caps),
+                sink,
+            );
+        }
+        // A cursor without its vectors proves no coverage. This includes a
+        // crash after moving staging to live but before saving the manifest.
+        if manifest.checkpoint.as_ref().is_some_and(|checkpoint| {
+            checkpoint.tier == plan.tier && checkpoint.embedder_id == self.embedder_id()
+        }) {
+            manifest.checkpoint = None;
+        }
+        self.revoke_backfill_serving(data_dir, manifest)?;
         let prior_checkpoint = manifest.checkpoint.as_ref().filter(|checkpoint| {
             checkpoint.tier == plan.tier
                 && checkpoint.embedder_id == self.embedder_id()
@@ -5037,6 +5461,604 @@ mod tests {
             manifest.fast_tier.as_ref().map(|record| record.doc_count),
             Some(2)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn gh458_backfill_reuses_vectors_across_ingest_and_prior_conversation_append() -> Result<()> {
+        let temp = tempdir()?;
+        let storage = FrankenStorage::open(&temp.path().join("agent_search.db"))?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let mut first_conversation = test_conversation("first", "retained original turn");
+        for conversation in [
+            first_conversation.clone(),
+            test_conversation("second", "second unprocessed conversation"),
+            test_conversation("third", "third unprocessed conversation"),
+        ] {
+            storage.insert_conversation_tree(agent_id, None, &conversation)?;
+        }
+        let indexer = SemanticIndexer::new("hash", None)?;
+        let mut manifest = SemanticManifest::default();
+        let run = |manifest: &mut SemanticManifest| {
+            indexer.run_backfill_from_storage_with_caps_and_sink(
+                &storage,
+                temp.path(),
+                manifest,
+                SemanticBackfillStoragePlan {
+                    tier: TierKind::Fast,
+                    db_fingerprint: crate::indexer::lexical_storage_fingerprint_for_storage(
+                        &storage,
+                    )?,
+                    model_revision: "hash".into(),
+                    max_conversations: 1,
+                },
+                SemanticCheckpointCaps {
+                    max_messages: 1,
+                    max_bytes: 256,
+                },
+                &SemanticProgressSink::disabled(),
+            )
+        };
+        let first = run(&mut manifest)?;
+        assert!(first.checkpoint_saved);
+        assert_eq!(first.embedded_docs, 1);
+        let first_index = FsVectorIndex::open(&first.index_path)?;
+        let retained_id = first_index.doc_id_at(0)?.to_owned();
+        let retained_vector = first_index.vector_at_f32(0)?;
+        drop(first_index);
+
+        let mut appended = first_conversation.messages[0].clone();
+        appended.idx = 1;
+        appended.content = "new tail in already processed conversation".into();
+        first_conversation.messages.push(appended);
+        storage.insert_conversation_tree(agent_id, None, &first_conversation)?;
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation("fourth", "newly ingested conversation"),
+        )?;
+        let second = run(&mut manifest)?;
+        assert!(!second.published);
+        assert_eq!(
+            second.embedded_docs, 1,
+            "covered prefix must not spend the cap"
+        );
+        assert_eq!(manifest.checkpoint.as_ref().unwrap().docs_embedded, 2);
+        assert_ne!(first.index_path, second.index_path);
+        let third = run(&mut manifest)?;
+        let fourth = run(&mut manifest)?;
+        let fifth = run(&mut manifest)?;
+        assert_eq!(
+            [
+                third.embedded_docs,
+                fourth.embedded_docs,
+                fifth.embedded_docs
+            ],
+            [1, 1, 1]
+        );
+        assert!(!third.published && !fourth.published && fifth.published);
+        let published = FsVectorIndex::open(&fifth.index_path)?;
+        let expected: HashSet<String> = packet_embedding_inputs_from_storage(&storage)?
+            .iter()
+            .filter_map(semantic_doc_id_for_input)
+            .collect();
+        let mut actual = HashSet::new();
+        for record in 0..published.record_count() {
+            let id = published.doc_id_at(record)?;
+            actual.insert(id.to_owned());
+            if id == retained_id {
+                assert_eq!(published.vector_at_f32(record)?, retained_vector);
+            }
+        }
+        assert!(actual.contains(&retained_id));
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 5);
+        drop(published);
+        let unchanged = run(&mut manifest)?;
+        assert!(unchanged.published);
+        assert_eq!(unchanged.embedded_docs, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn gh458_backfill_reconciles_same_id_edits_deletions_and_filter_identity() -> Result<()> {
+        let temp = tempdir()?;
+        let storage = FrankenStorage::open(&temp.path().join("agent_search.db"))?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        for (name, text) in [
+            ("edited", "old edited text"),
+            ("deleted", "removed text"),
+            ("identity", "same text with changed identity"),
+            ("retained", "unchanged vector"),
+        ] {
+            storage.insert_conversation_tree(agent_id, None, &test_conversation(name, text))?;
+        }
+        let indexer = SemanticIndexer::new("hash", None)?;
+        let mut manifest = SemanticManifest::default();
+        let run = |manifest: &mut SemanticManifest, max_conversations| {
+            indexer.run_backfill_from_storage_with_caps_and_sink(
+                &storage,
+                temp.path(),
+                manifest,
+                SemanticBackfillStoragePlan {
+                    tier: TierKind::Fast,
+                    db_fingerprint: crate::indexer::lexical_storage_fingerprint_for_storage(
+                        &storage,
+                    )?,
+                    model_revision: "hash".into(),
+                    max_conversations,
+                },
+                SemanticCheckpointCaps {
+                    max_messages: 1,
+                    max_bytes: 256,
+                },
+                &SemanticProgressSink::disabled(),
+            )
+        };
+        for _ in 0..4 {
+            run(&mut manifest, 1)?;
+        }
+        assert!(manifest.checkpoint.is_none());
+        let before_fingerprint = manifest.fast_tier.as_ref().unwrap().db_fingerprint.clone();
+        let before_ids: HashSet<String> = packet_embedding_inputs_from_storage(&storage)?
+            .iter()
+            .filter_map(semantic_doc_id_for_input)
+            .collect();
+        let other_agent = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "claude_code".into(),
+            name: "Claude Code".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        storage.raw().execute(
+            "UPDATE messages SET content = 'replacement text at same rowid' WHERE conversation_id = 1",
+        )?;
+        storage
+            .raw()
+            .execute("DELETE FROM messages WHERE conversation_id = 2")?;
+        storage.raw().execute_compat(
+            "UPDATE conversations SET agent_id = ?1 WHERE id = 3",
+            &[ParamValue::from(other_agent)],
+        )?;
+        assert_eq!(
+            crate::indexer::lexical_storage_fingerprint_for_storage(&storage)?,
+            before_fingerprint,
+            "the negative must evade count/max-ID fingerprint detection"
+        );
+        let changed = run(&mut manifest, 1)?;
+        assert!(!changed.published);
+        assert_eq!(changed.embedded_docs, 1);
+        let done = run(&mut manifest, 1)?;
+        assert!(done.published);
+        assert_eq!(done.embedded_docs, 1);
+        let mut expected = HashSet::new();
+        // The deleted conversation deliberately retains stale append metadata.
+        for id in [1, 3, 4] {
+            let (inputs, _) =
+                packet_embedding_inputs_from_selected_canonical_messages(&storage, &[id], |_| {
+                    true
+                })?;
+            expected.extend(inputs.iter().filter_map(semantic_doc_id_for_input));
+        }
+        let published = FsVectorIndex::open(&done.index_path)?;
+        let actual: HashSet<String> = (0..published.record_count())
+            .map(|record| published.doc_id_at(record).map(str::to_owned))
+            .collect::<std::result::Result<_, _>>()?;
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 3);
+        assert_eq!(
+            actual.intersection(&before_ids).count(),
+            1,
+            "only the unchanged content and filter identity may survive"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gh458_reconcile_revokes_live_and_shard_readiness_until_complete() -> Result<()> {
+        use crate::search::asset_state::{SemanticPreference, semantic_state_from_availability};
+        use crate::search::model_manager::SemanticAvailability;
+
+        let temp = tempdir()?;
+        let storage = FrankenStorage::open(&temp.path().join("agent_search.db"))?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        for name in ["first", "second", "third", "retained"] {
+            storage.insert_conversation_tree(agent_id, None, &test_conversation(name, name))?;
+        }
+        let fingerprint = crate::indexer::lexical_storage_fingerprint_for_storage(&storage)?;
+        let indexer = SemanticIndexer::new("hash", None)?;
+        let mut manifest = SemanticManifest::default();
+        let mut plan = SemanticBackfillStoragePlan {
+            tier: TierKind::Fast,
+            db_fingerprint: fingerprint.clone(),
+            model_revision: "hash".into(),
+            max_conversations: 4,
+        };
+        let initial = indexer.run_backfill_from_storage(
+            &storage,
+            temp.path(),
+            &mut manifest,
+            plan.clone(),
+        )?;
+        assert!(initial.published);
+        indexer.build_and_save_index_shards(
+            indexer.embed_messages(&packet_embedding_inputs_from_storage(&storage)?)?,
+            temp.path(),
+            SemanticShardBuildPlan {
+                tier: TierKind::Fast,
+                db_fingerprint: fingerprint.clone(),
+                model_revision: "hash".into(),
+                total_conversations: 4,
+                max_records_per_shard: 4,
+                build_ann: false,
+            },
+        )?;
+        let state = || {
+            semantic_state_from_availability(
+                temp.path(),
+                &SemanticAvailability::HashFallback,
+                SemanticPreference::HashFallback,
+                Some(&fingerprint),
+            )
+        };
+        assert!(state().can_search);
+        // Clearing only the monolithic flag is insufficient: the complete
+        // shard generation really can promote readiness on this fixture.
+        manifest.fast_tier.as_mut().unwrap().ready = false;
+        manifest.save(temp.path())?;
+        assert!(state().can_search);
+        assert!(
+            indexer
+                .reusable_backfill_candidate(temp.path(), &manifest, &plan)
+                .is_some(),
+            "unready vectors remain useful construction inputs after a crash"
+        );
+        manifest.fast_tier.as_mut().unwrap().ready = true;
+        manifest.save(temp.path())?;
+        let live_before = fs::read(&initial.index_path)?;
+        storage.raw().execute(
+            "UPDATE messages SET content = 'changed content under existing rowid' WHERE conversation_id <= 3",
+        )?;
+        assert_eq!(
+            crate::indexer::lexical_storage_fingerprint_for_storage(&storage)?,
+            fingerprint
+        );
+        plan.max_conversations = 1;
+        for _ in 0..2 {
+            let partial = indexer.run_backfill_from_storage(
+                &storage,
+                temp.path(),
+                &mut manifest,
+                plan.clone(),
+            )?;
+            assert!(!partial.published);
+            assert_eq!(partial.embedded_docs, 1);
+            assert_eq!(fs::read(&initial.index_path)?, live_before);
+            let observed = state();
+            assert_eq!(observed.fast_tier.current_db_matches, Some(true));
+            assert!(!observed.fast_tier.ready);
+            assert!(
+                !observed.can_search,
+                "matching fingerprints cannot certify stale live IDs"
+            );
+            assert_eq!(observed.fallback_mode, Some("lexical"));
+            assert!(
+                SemanticShardManifest::load(temp.path())?
+                    .unwrap()
+                    .shards
+                    .iter()
+                    .all(|record| !record.ready && !record.ann_ready)
+            );
+        }
+        let complete =
+            indexer.run_backfill_from_storage(&storage, temp.path(), &mut manifest, plan)?;
+        assert!(complete.published);
+        assert_eq!(complete.embedded_docs, 1);
+        assert!(state().can_search);
+        Ok(())
+    }
+
+    #[test]
+    fn gh458_missing_checkpoint_vectors_restart_full_coverage() -> Result<()> {
+        let temp = tempdir()?;
+        let storage = FrankenStorage::open(&temp.path().join("agent_search.db"))?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        for name in ["first", "second", "third"] {
+            storage.insert_conversation_tree(agent_id, None, &test_conversation(name, name))?;
+        }
+        let indexer = SemanticIndexer::new("hash", None)?;
+        let mut manifest = SemanticManifest::default();
+        let mut plan = SemanticBackfillStoragePlan {
+            tier: TierKind::Fast,
+            db_fingerprint: crate::indexer::lexical_storage_fingerprint_for_storage(&storage)?,
+            model_revision: "hash".into(),
+            max_conversations: 2,
+        };
+        let first = indexer.run_backfill_from_storage(
+            &storage,
+            temp.path(),
+            &mut manifest,
+            plan.clone(),
+        )?;
+        assert!(first.checkpoint_saved);
+        assert_eq!(first.embedded_docs, 2);
+        let parked = first.index_path.with_extension("parked.fsvi");
+        fs::rename(&first.index_path, &parked)?;
+        let parked_bytes = fs::read(&parked)?;
+        plan.max_conversations = 1;
+        let restarted = indexer.run_backfill_from_storage(
+            &storage,
+            temp.path(),
+            &mut manifest,
+            plan.clone(),
+        )?;
+        assert!(!restarted.published);
+        assert_eq!(restarted.conversations_processed, 1);
+        assert_eq!(manifest.checkpoint.as_ref().unwrap().docs_embedded, 1);
+        let second = indexer.run_backfill_from_storage(
+            &storage,
+            temp.path(),
+            &mut manifest,
+            plan.clone(),
+        )?;
+        assert!(!second.published);
+        let done = indexer.run_backfill_from_storage(&storage, temp.path(), &mut manifest, plan)?;
+        assert!(done.published);
+        let expected = packet_embedding_inputs_from_storage(&storage)?
+            .iter()
+            .filter_map(semantic_doc_id_for_input)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            validated_semantic_index_ids(&FsVectorIndex::open(&done.index_path)?)?,
+            expected
+        );
+        assert_eq!(fs::read(&parked)?, parked_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn gh458_publication_retains_and_excludes_nonempty_destination_wal() -> Result<()> {
+        let temp = tempdir()?;
+        let storage = FrankenStorage::open(&temp.path().join("agent_search.db"))?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        for name in ["first", "second", "third"] {
+            storage.insert_conversation_tree(agent_id, None, &test_conversation(name, name))?;
+        }
+        let indexer = SemanticIndexer::new("hash", None)?;
+        let mut manifest = SemanticManifest::default();
+        let mut plan = SemanticBackfillStoragePlan {
+            tier: TierKind::Fast,
+            db_fingerprint: crate::indexer::lexical_storage_fingerprint_for_storage(&storage)?,
+            model_revision: "hash".into(),
+            max_conversations: 2,
+        };
+        let partial = indexer.run_backfill_from_storage(
+            &storage,
+            temp.path(),
+            &mut manifest,
+            plan.clone(),
+        )?;
+        assert!(partial.checkpoint_saved);
+        let live_path = vector_index_path(temp.path(), indexer.embedder_id());
+        fs::copy(&partial.index_path, &live_path)?;
+        let poison_input =
+            EmbeddingInput::new(9999, "prior live WAL document absent from canonical DB");
+        let poison_id = semantic_doc_id_for_input(&poison_input).unwrap();
+        let poison = indexer.embed_messages(&[poison_input])?.pop().unwrap();
+        let mut live = FsVectorIndex::open(&live_path)?;
+        live.append_batch(&[(poison_id.clone(), poison.embedding)])?;
+        assert_eq!(live.wal_record_count(), 1);
+        drop(live);
+        let destination_wal = fsvi_wal_path_for(&live_path);
+        let wal_bytes = fs::read(&destination_wal)?;
+        assert!(!wal_bytes.is_empty());
+        plan.max_conversations = 1;
+        let done = indexer.run_backfill_from_storage(&storage, temp.path(), &mut manifest, plan)?;
+        assert!(done.published);
+        let expected = packet_embedding_inputs_from_storage(&storage)?
+            .iter()
+            .filter_map(semantic_doc_id_for_input)
+            .collect::<HashSet<_>>();
+        let actual = validated_semantic_index_ids(&FsVectorIndex::open(&done.index_path)?)?;
+        assert_eq!(actual, expected);
+        assert!(!actual.contains(&poison_id));
+        let mut retained = Vec::new();
+        for entry in fs::read_dir(temp.path().join(VECTOR_INDEX_DIR))? {
+            let entry = entry?;
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".quarantined-destination-wal-")
+            {
+                retained.push(fs::read(entry.path().join("destination.wal"))?);
+            }
+        }
+        assert!(
+            retained.contains(&wal_bytes),
+            "prior destination WAL must survive byte-for-byte"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gh458_reused_backfill_obeys_message_and_byte_caps() -> Result<()> {
+        for caps in [
+            SemanticCheckpointCaps {
+                max_messages: 1,
+                max_bytes: 0,
+            },
+            SemanticCheckpointCaps {
+                max_messages: 0,
+                max_bytes: 50,
+            },
+        ] {
+            let temp = tempdir()?;
+            let storage = FrankenStorage::open(&temp.path().join("agent_search.db"))?;
+            let agent_id = storage.ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })?;
+            for name in ["first", "second", "third", "fourth"] {
+                storage.insert_conversation_tree(
+                    agent_id,
+                    None,
+                    &test_conversation(name, "a canonical message longer than twenty five bytes"),
+                )?;
+            }
+            let indexer = SemanticIndexer::new("hash", None)?;
+            let mut manifest = SemanticManifest::default();
+            let mut plan = SemanticBackfillStoragePlan {
+                tier: TierKind::Fast,
+                db_fingerprint: crate::indexer::lexical_storage_fingerprint_for_storage(&storage)?,
+                model_revision: "hash".into(),
+                max_conversations: 2,
+            };
+            let first = indexer.run_backfill_from_storage(
+                &storage,
+                temp.path(),
+                &mut manifest,
+                plan.clone(),
+            )?;
+            assert_eq!(first.embedded_docs, 2);
+            plan.max_conversations = 8;
+            let capped = indexer.run_backfill_from_storage_with_caps_and_sink(
+                &storage,
+                temp.path(),
+                &mut manifest,
+                plan.clone(),
+                caps,
+                &SemanticProgressSink::disabled(),
+            )?;
+            assert_eq!(capped.embedded_docs, 1);
+            assert!(!capped.published);
+            assert_eq!(manifest.checkpoint.as_ref().unwrap().docs_embedded, 3);
+            let done = indexer.run_backfill_from_storage_with_caps_and_sink(
+                &storage,
+                temp.path(),
+                &mut manifest,
+                plan,
+                caps,
+                &SemanticProgressSink::disabled(),
+            )?;
+            assert_eq!(done.embedded_docs, 1);
+            assert!(done.published);
+            assert_eq!(FsVectorIndex::open(&done.index_path)?.record_count(), 4);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gh458_backfill_keeps_identity_generation_and_vector_space_fences() -> Result<()> {
+        let temp = tempdir()?;
+        let storage = FrankenStorage::open(&temp.path().join("agent_search.db"))?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        for name in ["first", "second", "third"] {
+            storage.insert_conversation_tree(agent_id, None, &test_conversation(name, name))?;
+        }
+        let indexer = SemanticIndexer::new("hash", None)?;
+        let mut manifest = SemanticManifest::default();
+        let fingerprint = crate::indexer::lexical_storage_fingerprint_for_storage(&storage)?;
+        let first = indexer.run_backfill_from_storage(
+            &storage,
+            temp.path(),
+            &mut manifest,
+            SemanticBackfillStoragePlan {
+                tier: TierKind::Fast,
+                db_fingerprint: fingerprint.clone(),
+                model_revision: "hash".into(),
+                max_conversations: 2,
+            },
+        )?;
+        assert_eq!(first.embedded_docs, 2);
+        assert!(first.checkpoint_saved);
+        let prior_bytes = fs::read(&first.index_path)?;
+        let migrated_plan = SemanticBackfillStoragePlan {
+            tier: TierKind::Fast,
+            db_fingerprint: format!("identity-v1:changed-generation:{fingerprint}"),
+            model_revision: "hash".into(),
+            max_conversations: 1,
+        };
+        assert!(
+            indexer
+                .reusable_backfill_candidate(temp.path(), &manifest, &migrated_plan)
+                .is_none()
+        );
+        let migrated = indexer.run_backfill_from_storage(
+            &storage,
+            temp.path(),
+            &mut manifest,
+            migrated_plan.clone(),
+        )?;
+        assert_eq!(migrated.embedded_docs, 1);
+        assert_eq!(manifest.checkpoint.as_ref().unwrap().docs_embedded, 1);
+        assert_eq!(fs::read(&first.index_path)?, prior_bytes);
+        let manifest_before = fs::read(SemanticManifest::path(temp.path()))?;
+        let index = FsVectorIndex::open(&migrated.index_path)?;
+        let id = index.doc_id_at(0)?.to_owned();
+        let vector = index.vector_at_f32(0)?;
+        drop(index);
+        // A real, readable FSVI with an incompatible vector space must not be
+        // mistaken for reusable progress merely because the manifest matches.
+        let mut writer = FsVectorIndex::create_with_revision(
+            &migrated.index_path,
+            indexer.embedder_id(),
+            "incompatible-model-revision",
+            indexer.embedder_dimension(),
+            FsQuantization::F16,
+        )?;
+        writer.write_record(&id, &vector)?;
+        writer.finish()?;
+        let incompatible_bytes = fs::read(&migrated.index_path)?;
+        let error = indexer
+            .run_backfill_from_storage(&storage, temp.path(), &mut manifest, migrated_plan)
+            .expect_err("an incompatible model must not reuse a checkpoint");
+        assert!(error.to_string().contains("incompatible vector space"));
+        assert_eq!(fs::read(&migrated.index_path)?, incompatible_bytes);
+        assert_eq!(
+            fs::read(SemanticManifest::path(temp.path()))?,
+            manifest_before
+        );
+        assert!(manifest.fast_tier.is_none());
         Ok(())
     }
 

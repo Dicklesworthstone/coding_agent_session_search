@@ -2747,6 +2747,43 @@ fn confirm_nonresumable_pending_lexical_rebuild_state_from_readonly_db(
     )))
 }
 
+/// Runs under the index writer lock, before spawning readonly rebuild workers.
+/// Only the optional fallback shadow and its repair markers may change here;
+/// canonical conversations and messages remain the rebuild authority.
+fn preflight_fts_shadow_before_lexical_readers(db_path: &Path) -> Result<()> {
+    let storage = FrankenStorage::open_deferred_fts5_for_repair(db_path)
+        .with_context(|| format!("opening deferred FTS5 preflight for {}", db_path.display()))?;
+    let result = (|| -> Result<()> {
+        if let crate::storage::sqlite::FtsShadowViability::NotViable {
+            corpus_messages,
+            bound_messages,
+        } = storage.fts_shadow_viability()?
+        {
+            let detail = crate::storage::sqlite::fts_shadow_not_viable_detail(
+                corpus_messages,
+                bound_messages,
+            );
+            tracing::warn!(
+                db_path = %db_path.display(),
+                corpus_messages,
+                bound_messages,
+                "dropping oversized fallback FTS shadow before lexical readers (GH #413); canonical rows and Quill search are preserved"
+            );
+            storage.drop_fts_shadow_as_not_viable(&detail)?;
+        }
+        Ok(())
+    })();
+    let close = storage
+        .close_without_checkpoint()
+        .with_context(|| format!("closing deferred FTS5 preflight for {}", db_path.display()));
+    if result.is_err()
+        && let Err(error) = &close
+    {
+        tracing::warn!(%error, "FTS shadow preflight also failed to close");
+    }
+    result.and(close)
+}
+
 fn should_try_readonly_nonresumable_lexical_resume(opts: &IndexOptions) -> bool {
     !opts.full
         && !opts.force_rebuild
@@ -14820,6 +14857,12 @@ fn run_index_inner(
                     &opts.data_dir,
                     &opts.db_path,
                 )?;
+                // The legacy restart skips the ordinary writable-open path.
+                // Apply its derived-shadow bound before any readonly reader
+                // can hydrate the oversized FTS index (GH #413).
+                preflight_phase!("watch_startup:fts_shadow_viability");
+                preflight_fts_shadow_before_lexical_readers(&opts.db_path)?;
+                complete_preflight_phase!();
                 let rebuild = rebuild_tantivy_from_db_deferred_startup_with_progress_bump(
                     &opts.db_path,
                     &opts.data_dir,
@@ -14925,41 +14968,9 @@ fn run_index_inner(
     // derived shadow may exist at all. The drop goes through a deferred-FTS5
     // connection so it never hydrates what it removes.
     match storage.fts_shadow_viability() {
-        Ok(crate::storage::sqlite::FtsShadowViability::NotViable {
-            corpus_messages,
-            bound_messages,
-        }) => {
-            let detail = crate::storage::sqlite::fts_shadow_not_viable_detail(
-                corpus_messages,
-                bound_messages,
-            );
-            tracing::warn!(
-                db_path = %opts.db_path.display(),
-                corpus_messages,
-                bound_messages,
-                "dropping the derived fallback FTS shadow before the first write: the engine \
-                 cannot materialize a corpus this large (GH #413); Quill lexical search is \
-                 unaffected"
-            );
+        Ok(crate::storage::sqlite::FtsShadowViability::NotViable { .. }) => {
             storage.close_best_effort_in_place();
-            let mut repair_storage =
-                crate::storage::sqlite::FrankenStorage::open_deferred_fts5_for_repair(
-                    &opts.db_path,
-                )
-                .with_context(|| {
-                    format!(
-                        "opening a deferred-FTS5 connection to drop the oversized shadow in {}",
-                        opts.db_path.display()
-                    )
-                })?;
-            let dropped = repair_storage.drop_fts_shadow_as_not_viable(&detail);
-            repair_storage.close_best_effort_in_place();
-            dropped.with_context(|| {
-                format!(
-                    "dropping the oversized fallback FTS shadow in {}",
-                    opts.db_path.display()
-                )
-            })?;
+            preflight_fts_shadow_before_lexical_readers(&opts.db_path)?;
             storage = crate::storage::sqlite::open_franken_storage_with_timeout(
                 &opts.db_path,
                 Duration::from_secs(10),
@@ -17252,7 +17263,7 @@ fn run_index_inner(
                         &detector_clone,
                         opts_clone.progress.as_ref(),
                         "watch rebuild reindex",
-                    )
+                    )?
                 } else if watch_once_mode {
                     let indexed = finalize_watch_once_reindex_result(
                         reindex_paths_with_semantic_delta(
@@ -17320,7 +17331,7 @@ fn run_index_inner(
                         &detector_clone,
                         opts_clone.progress.as_ref(),
                         "watch incremental reindex",
-                    );
+                    )?;
 
                     // Merge Tantivy segments if idle conditions are met.
                     // Without this, each reindex_paths() commit creates a new
@@ -26706,34 +26717,68 @@ pub fn plan_quarantine_retry(
     ))
 }
 
-/// Holds the authoritative data-dir maintenance lock while a quarantine
-/// command mutates quarantine metadata, SQLite, or derived lexical assets.
+/// Holds the authoritative data-dir maintenance lock while an operator
+/// command mutates canonical storage or derived search assets.
 ///
 /// The heartbeat is declared first so it stops before the underlying lock is
 /// released. Otherwise its worker could race the lock guard's final metadata
 /// cleanup during drop.
-pub(crate) struct QuarantineMutationGuard {
+pub(crate) struct SearchMaintenanceMutationGuard {
     _heartbeat: IndexRunLockHeartbeat,
     lock: IndexRunLockGuard,
 }
 
-impl QuarantineMutationGuard {
+impl SearchMaintenanceMutationGuard {
     fn mark_progress(&self) {
         bump_index_run_lock_progress_atomic(&self.lock.last_progress_at_ms_atomic);
     }
+
+    pub(crate) fn progress_atomic(&self) -> Arc<AtomicI64> {
+        Arc::clone(&self.lock.last_progress_at_ms_atomic)
+    }
 }
 
-pub(crate) fn acquire_quarantine_mutation_lock(data_dir: &Path) -> Result<QuarantineMutationGuard> {
+pub(crate) fn acquire_quarantine_mutation_lock(
+    data_dir: &Path,
+) -> Result<SearchMaintenanceMutationGuard> {
     let db_path = data_dir.join("agent_search.db");
-    let lock = acquire_index_run_lock(data_dir, &db_path, SearchMaintenanceMode::Index)
-        .context("acquiring quarantine mutation lock")?;
+    acquire_search_maintenance_mutation_lock(
+        data_dir,
+        &db_path,
+        maintenance_job_kind_for_mode(SearchMaintenanceMode::Index),
+    )
+    .context("acquiring quarantine mutation lock")
+}
+
+pub(crate) fn acquire_semantic_backfill_lock(
+    data_dir: &Path,
+    db_path: &Path,
+) -> Result<SearchMaintenanceMutationGuard> {
+    acquire_search_maintenance_mutation_lock(
+        data_dir,
+        db_path,
+        SearchMaintenanceJobKind::SemanticRebuild,
+    )
+}
+
+fn acquire_search_maintenance_mutation_lock(
+    data_dir: &Path,
+    db_path: &Path,
+    job_kind: SearchMaintenanceJobKind,
+) -> Result<SearchMaintenanceMutationGuard> {
+    let lock = acquire_index_run_lock_with_job_kind(
+        data_dir,
+        db_path,
+        SearchMaintenanceMode::Index,
+        job_kind,
+    )?;
     let heartbeat = IndexRunLockHeartbeat::start(
         data_dir.to_path_buf(),
         index_run_lock_heartbeat_interval(),
         Arc::clone(&lock.metadata_write_lock),
         Arc::clone(&lock.last_progress_at_ms_atomic),
     );
-    Ok(QuarantineMutationGuard {
+    Ok(SearchMaintenanceMutationGuard {
         _heartbeat: heartbeat,
         lock,
     })
@@ -27225,6 +27270,28 @@ fn dispatch_watch_callback<F>(
     }
 }
 
+fn is_devin_database_watch_root(kind: ConnectorKind, root: &ScanRoot) -> bool {
+    kind == ConnectorKind::Devin
+        && root
+            .path
+            .extension()
+            .is_some_and(|extension| extension == "db")
+        && root.path.is_file()
+}
+
+fn watch_scan_lower_bound(kind: ConnectorKind, since_ts: Option<i64>) -> Option<i64> {
+    if kind == ConnectorKind::Devin {
+        // Devin filters sessions by provider activity time, which can precede
+        // the WAL commit that triggered this scan. Filesystem event times cannot
+        // bound it, even after rounding to seconds. Re-read the changed store and
+        // let idempotent ingestion skip unchanged sessions; retain event
+        // watermarks separately for scheduling and provenance.
+        None
+    } else {
+        since_ts
+    }
+}
+
 fn watch_sources<F>(
     watch_once_paths: Option<Vec<PathBuf>>,
     roots: Vec<(ConnectorKind, ScanRoot)>,
@@ -27264,11 +27331,22 @@ where
     })?;
 
     // Watch all detected roots
-    for (_, root) in &roots {
-        if let Err(e) = watcher.watch(&root.path, RecursiveMode::Recursive) {
-            tracing::warn!("failed to watch {}: {}", root.path.display(), e);
+    for (kind, root) in &roots {
+        // Devin's explicit database override can be a file. SQLite commits
+        // may touch only a sibling WAL, including creating it after startup.
+        // Watch the parent, but retain the database root for classification.
+        let (watch_path, mode) = if is_devin_database_watch_root(*kind, root) {
+            (
+                root.path.parent().unwrap_or(&root.path),
+                RecursiveMode::NonRecursive,
+            )
         } else {
-            tracing::info!("watching {}", root.path.display());
+            (root.path.as_path(), RecursiveMode::Recursive)
+        };
+        if let Err(e) = watcher.watch(watch_path, mode) {
+            tracing::warn!("failed to watch {}: {}", watch_path.display(), e);
+        } else {
+            tracing::info!("watching {}", watch_path.display());
         }
     }
 
@@ -27559,6 +27637,8 @@ fn reindex_paths_with_semantic_delta(
                 (Some(prev), Some(batch_min)) => Some(prev.min(batch_min).saturating_sub(1)),
             }
         };
+
+        let since_ts = watch_scan_lower_bound(kind, since_ts);
 
         if root.path.is_file()
             && should_skip_active_session_source(active_source_filter, root.origin.kind, &root.path)
@@ -28497,12 +28577,12 @@ fn finalize_watch_reindex_result(
     detector: &StaleDetector,
     progress: Option<&Arc<IndexingProgress>>,
     context: &str,
-) -> usize {
+) -> Result<usize> {
     match result {
         Ok(indexed) => {
             set_progress_last_error(progress, None);
             detector.record_scan(indexed);
-            indexed
+            Ok(indexed)
         }
         Err(error) => {
             // ERROR (not WARN) with the full chain so watch-cycle failures are
@@ -28517,7 +28597,9 @@ fn finalize_watch_reindex_result(
             reset_progress_to_idle(progress);
             set_progress_last_error(progress, Some(format!("{context}: {error}")));
             detector.record_scan(0);
-            0
+            // Let the watch loop retain its pending sources. Reporting zero
+            // here would consume the only retry for a previously active file.
+            Err(error)
         }
     }
 }
@@ -28629,7 +28711,10 @@ fn classify_paths(
                 {
                     continue;
                 }
-                if p.starts_with(&root.path) {
+                if p.starts_with(&root.path)
+                    || (is_devin_database_watch_root(*kind, root)
+                        && database_sidecar_paths(&root.path).contains(&p))
+                {
                     if let Some(index) =
                         matching_roots
                             .iter()
@@ -28649,11 +28734,12 @@ fn classify_paths(
             }
             let matched_root = !matching_roots.is_empty();
             for (kind, root) in matching_roots {
-                let scan_path = if prefer_explicit_paths {
-                    explicit_watch_once_scan_path(kind, &p)
-                } else {
-                    root.path.clone()
-                };
+                let scan_path =
+                    if prefer_explicit_paths && !is_devin_database_watch_root(kind, root) {
+                        explicit_watch_once_scan_path(kind, &p)
+                    } else {
+                        root.path.clone()
+                    };
                 let mut scan_root = root.clone();
                 scan_root.path = scan_path.clone();
                 let key = (
@@ -53081,6 +53167,62 @@ mod tests {
     }
 
     #[test]
+    fn devin_watch_scan_lower_bound_does_not_filter_delayed_provider_commits() {
+        assert_eq!(watch_scan_lower_bound(ConnectorKind::Devin, None), None);
+        for input in [0, 1, 999, 1000, 1001, 1_700_000_000_999, i64::MAX] {
+            assert_eq!(
+                watch_scan_lower_bound(ConnectorKind::Devin, Some(input)),
+                None,
+                "a filesystem watermark must not exclude an older provider activity timestamp"
+            );
+            assert_eq!(
+                watch_scan_lower_bound(ConnectorKind::Codex, Some(input)),
+                Some(input),
+                "other connectors retain their existing millisecond scan bound"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_devin_database_sidecars_preserves_root_and_rejects_neighbors() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("sessions.db");
+        fs::write(&db, b"source database").unwrap();
+        let root = ScanRoot::remote(db.clone(), Origin::remote("devin-host"), None);
+        let roots = vec![(ConnectorKind::Devin, root.clone())];
+        for sidecar in database_sidecar_paths(&db) {
+            fs::write(&sidecar, b"sidecar event").unwrap();
+            for explicit in [false, true] {
+                let classified = classify_paths(vec![sidecar.clone()], &roots, explicit);
+                assert_eq!(classified.len(), 1);
+                assert_eq!(classified[0].0, ConnectorKind::Devin);
+                assert_eq!(classified[0].1.path, db);
+                assert_eq!(classified[0].1.origin, root.origin);
+                assert_eq!(classified[0].1.platform, root.platform);
+            }
+            assert!(
+                classify_paths(
+                    vec![sidecar],
+                    &[(ConnectorKind::Codex, root.clone())],
+                    false,
+                )
+                .is_empty(),
+                "SQLite sidecar routing must stay scoped to Devin"
+            );
+        }
+        for name in ["other.db-wal", "sessions.db-wal-extra", "sessions.db2-wal"] {
+            let neighbor = tmp.path().join(name);
+            fs::write(&neighbor, b"unrelated event").unwrap();
+            for explicit in [false, true] {
+                assert!(
+                    classify_paths(vec![neighbor.clone()], &roots, explicit).is_empty(),
+                    "unrelated neighbor must not trigger Devin: {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn classify_paths_uses_latest_mtime_per_connector() {
         let tmp = TempDir::new().unwrap();
         let codex = tmp.path().join(".codex/sessions/rollout-1.jsonl");
@@ -56741,8 +56883,10 @@ mod tests {
         );
 
         assert_eq!(
-            indexed, 0,
-            "failed watch reindex should report zero indexed"
+            indexed
+                .expect_err("failed watch reindex must remain retryable")
+                .to_string(),
+            "boom"
         );
         assert_eq!(
             detector.stats().consecutive_zero_scans,
@@ -56763,6 +56907,39 @@ mod tests {
             Some("watch incremental reindex: boom"),
             "failed watch reindex should surface the real error"
         );
+    }
+
+    #[test]
+    fn watch_retains_pending_sources_when_reindex_finalization_fails() {
+        let source = PathBuf::from("sessions/rollout-deferred.jsonl");
+        let root = ScanRoot::local(PathBuf::from("sessions"));
+        let roots = [(ConnectorKind::Codex, root)];
+        let detector = StaleDetector::new(StaleConfig::default());
+
+        for is_rebuild in [false, true] {
+            let mut pending = BTreeSet::from([source.clone()]);
+            dispatch_watch_callback(&mut pending, &roots, is_rebuild, &|paths, _, rebuilding| {
+                assert_eq!(rebuilding, is_rebuild);
+                if !rebuilding {
+                    assert_eq!(paths, vec![source.clone()]);
+                }
+                finalize_watch_reindex_result(
+                    Err(anyhow::anyhow!("retryable storage failure")),
+                    &detector,
+                    None,
+                    "watch reindex",
+                )?;
+                Ok(BTreeSet::new())
+            });
+            assert!(
+                pending.contains(&source),
+                "a failed scan must retain its source"
+            );
+            if is_rebuild {
+                assert!(pending.contains(&roots[0].1.path));
+            }
+        }
+        assert_eq!(detector.stats().consecutive_zero_scans, 2);
     }
 
     #[test]
@@ -60212,7 +60389,7 @@ mod tests {
             "watch incremental reindex",
         );
 
-        assert_eq!(indexed, 3);
+        assert_eq!(indexed.expect("successful watch reindex"), 3);
         assert_eq!(detector.stats().total_ingests, 1);
         assert_eq!(
             progress

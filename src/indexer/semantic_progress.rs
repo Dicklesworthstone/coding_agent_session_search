@@ -21,7 +21,8 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::AtomicI64;
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -278,6 +279,7 @@ fn resolve_path() -> Option<PathBuf> {
 /// not per row — even a 50ms batch wall-time dwarfs the lock cost.
 pub struct SemanticProgressSink {
     inner: Option<Mutex<SinkInner>>,
+    progress_atomic: Option<Arc<AtomicI64>>,
     tier: String,
     embedder_id: String,
     started: Instant,
@@ -318,6 +320,7 @@ impl SemanticProgressSink {
         };
         Self {
             inner,
+            progress_atomic: None,
             tier: tier.to_string(),
             embedder_id: embedder_id.to_string(),
             started: Instant::now(),
@@ -330,17 +333,24 @@ impl SemanticProgressSink {
     pub fn disabled() -> Self {
         Self {
             inner: None,
+            progress_atomic: None,
             tier: "unknown".to_string(),
             embedder_id: "unknown".to_string(),
             started: Instant::now(),
         }
     }
 
-    /// True if the sink is actively writing (env var set + file
-    /// opened). Callers can branch on this to skip building expensive
-    /// `SemanticProgressFields` when no one will read them.
+    /// Attach the maintenance owner's forward-progress counter. Actual
+    /// backfill events advance it even when JSONL diagnostics are disabled.
+    pub(crate) fn with_progress_atomic(mut self, progress: Arc<AtomicI64>) -> Self {
+        self.progress_atomic = Some(progress);
+        self
+    }
+
+    /// True if events are observed by JSONL diagnostics or the maintenance
+    /// progress counter. Callers may skip expensive fields otherwise.
     pub fn is_active(&self) -> bool {
-        self.inner.is_some()
+        self.inner.is_some() || self.progress_atomic.is_some()
     }
 
     fn open_file(path: &Path) -> std::io::Result<File> {
@@ -353,6 +363,12 @@ impl SemanticProgressSink {
     /// Emit one event. Best-effort: a write failure logs at debug and
     /// returns Ok — telemetry never bubbles errors into the backfill.
     pub fn emit(&self, event: SemanticProgressEvent, fields: SemanticProgressFields) {
+        if !matches!(
+            event,
+            SemanticProgressEvent::Error | SemanticProgressEvent::Cancelled
+        ) {
+            super::bump_index_run_lock_progress_if_present(self.progress_atomic.as_ref());
+        }
         let Some(mutex) = self.inner.as_ref() else {
             return;
         };
@@ -451,6 +467,22 @@ mod tests {
         assert!(!sink.is_active());
         sink.emit_bare(SemanticProgressEvent::SelectionStart);
         // No panic = pass.
+    }
+
+    #[test]
+    fn maintenance_progress_observes_real_events_without_jsonl() {
+        use std::sync::atomic::Ordering;
+
+        let progress = Arc::new(AtomicI64::new(0));
+        let sink = SemanticProgressSink::disabled().with_progress_atomic(Arc::clone(&progress));
+        assert!(sink.is_active());
+        assert_eq!(progress.load(Ordering::Relaxed), 0);
+        sink.emit_bare(SemanticProgressEvent::EmbedBatchDone);
+        let completed_batch_at = progress.load(Ordering::Relaxed);
+        assert!(completed_batch_at > 0);
+        sink.emit_bare(SemanticProgressEvent::Error);
+        sink.emit_bare(SemanticProgressEvent::Cancelled);
+        assert_eq!(progress.load(Ordering::Relaxed), completed_batch_at);
     }
 
     #[test]

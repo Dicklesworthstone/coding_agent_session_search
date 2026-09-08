@@ -77,8 +77,9 @@ fn seed_zero_doc_first_canonical_db(db_path: &Path) -> TestResult {
     Ok(())
 }
 
-fn run_robot_backfill(data_dir: &Path, db_path: &Path) -> TestResult<Value> {
-    let output = cargo_bin_cmd!("cass")
+fn robot_backfill_command(data_dir: &Path, db_path: &Path) -> assert_cmd::Command {
+    let mut command = cargo_bin_cmd!("cass");
+    command
         .args([
             "models",
             "backfill",
@@ -95,8 +96,13 @@ fn run_robot_backfill(data_dir: &Path, db_path: &Path) -> TestResult<Value> {
         .arg(db_path)
         .arg("--json")
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .timeout(Duration::from_secs(20))
-        .output()?;
+        .env("RUST_MIN_STACK", "134217728")
+        .timeout(Duration::from_secs(20));
+    command
+}
+
+fn run_robot_backfill(data_dir: &Path, db_path: &Path) -> TestResult<Value> {
+    let output = robot_backfill_command(data_dir, db_path).output()?;
 
     if !output.status.success() {
         return Err(format!(
@@ -109,6 +115,260 @@ fn run_robot_backfill(data_dir: &Path, db_path: &Path) -> TestResult<Value> {
 
     let stdout = String::from_utf8(output.stdout)?;
     Ok(serde_json::from_str(stdout.trim())?)
+}
+
+fn assert_backfill_busy(output: &std::process::Output) -> TestResult {
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let error: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(error["kind"], "index-busy");
+    assert_eq!(error["retryable"], true);
+    Ok(())
+}
+
+fn canonical_bundle_snapshot(db_path: &Path) -> TestResult<Vec<(PathBuf, Vec<u8>, SystemTime)>> {
+    let mut files = Vec::new();
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = db_path.as_os_str().to_os_string();
+        name.push(suffix);
+        let path = PathBuf::from(name);
+        if path.is_file() {
+            files.push((
+                path.clone(),
+                fs::read(&path)?,
+                fs::metadata(&path)?.modified()?,
+            ));
+        }
+    }
+    Ok(files)
+}
+
+fn vector_files_snapshot(
+    data_dir: &Path,
+) -> TestResult<std::collections::BTreeMap<PathBuf, Vec<u8>>> {
+    let root = data_dir.join("vector_index");
+    let mut files = std::collections::BTreeMap::new();
+    if root.exists() {
+        for entry in walkdir::WalkDir::new(&root) {
+            let entry = entry?;
+            if entry.file_type().is_file() {
+                files.insert(entry.path().to_path_buf(), fs::read(entry.path())?);
+            }
+        }
+    }
+    Ok(files)
+}
+
+#[test]
+fn robot_models_backfill_respects_index_lock_before_canonical_or_vector_writes() -> TestResult {
+    use fs2::FileExt;
+
+    let temp = tempfile::tempdir()?;
+    let data_dir = temp.path().join("cass-data");
+    let db_path = temp.path().join("agent_search.db");
+    seed_canonical_db(&db_path)?;
+    fs::create_dir_all(&data_dir)?;
+    // Exercise both an empty vector store and a real populated resumable
+    // checkpoint. The losing child must neither create nor mutate assets.
+    for expected_after_release in ["checkpointed", "published"] {
+        let canonical_before = canonical_bundle_snapshot(&db_path)?;
+        let vectors_before = vector_files_snapshot(&data_dir)?;
+        let vector_dir_existed = data_dir.join("vector_index").exists();
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(data_dir.join("index-run.lock"))?;
+        lock.lock_exclusive()?;
+        let rejected = robot_backfill_command(&data_dir, &db_path).output()?;
+        assert_backfill_busy(&rejected)?;
+        assert_eq!(canonical_bundle_snapshot(&db_path)?, canonical_before);
+        assert_eq!(vector_files_snapshot(&data_dir)?, vectors_before);
+        assert_eq!(data_dir.join("vector_index").exists(), vector_dir_existed);
+        FileExt::unlock(&lock)?;
+
+        let resumed = run_robot_backfill(&data_dir, &db_path)?;
+        assert_eq!(resumed["status"], expected_after_release);
+        assert_eq!(resumed["embedded_docs"], 1);
+    }
+    let manifest = SemanticManifest::load(&data_dir)?.ok_or("missing published manifest")?;
+    assert!(manifest.checkpoint.is_none());
+    assert_eq!(
+        manifest.fast_tier.as_ref().map(|tier| tier.doc_count),
+        Some(2)
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+struct BackfillChild(std::process::Child);
+
+#[cfg(unix)]
+impl Drop for BackfillChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_backfill_owner_heartbeat(
+    child: &mut std::process::Child,
+    lock_path: &Path,
+) -> TestResult {
+    use std::time::Instant;
+
+    let timestamp = |metadata: &str, key: &str| -> TestResult<i64> {
+        Ok(metadata
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .ok_or("missing lock timestamp")?
+            .parse()?)
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut initial = None;
+    loop {
+        let metadata = fs::read_to_string(lock_path).unwrap_or_default();
+        if metadata.contains("job_kind=semantic_rebuild")
+            && metadata
+                .lines()
+                .any(|line| line == format!("pid={}", child.id()))
+        {
+            let progress = timestamp(&metadata, "last_progress_at_ms=")?;
+            let updated = timestamp(&metadata, "updated_at_ms=")?;
+            if let Some((initial_progress, initial_updated)) = initial {
+                assert_eq!(
+                    progress, initial_progress,
+                    "heartbeat fabricated backfill progress"
+                );
+                if updated > initial_updated {
+                    return Ok(());
+                }
+            } else {
+                initial = Some((progress, updated));
+            }
+        }
+        assert!(
+            child.try_wait()?.is_none(),
+            "backfill exited before taking the lock"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "backfill never produced an owner heartbeat"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn drain_progress_pipe(reader: &mut fs::File, progress: &mut Vec<u8>) -> std::io::Result<()> {
+    use std::io::Read;
+
+    let mut buffer = [0u8; 8192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(count) => progress.extend_from_slice(&buffer[..count]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn robot_models_backfills_exclude_each_other_until_the_owner_finishes() -> TestResult {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    let temp = tempfile::tempdir()?;
+    let data_dir = temp.path().join("cass-data");
+    let db_path = temp.path().join("agent_search.db");
+    seed_canonical_db(&db_path)?;
+    let fifo = temp.path().join("backfill-progress.fifo");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()?
+            .success()
+    );
+    // Opening the real JSONL sink waits for its reader. This holds an actual
+    // backfill at a deterministic boundary, without an artificial sleep hook.
+    let mut command = robot_backfill_command(&data_dir, &db_path);
+    command
+        .env("CASS_SEMANTIC_PROGRESS_JSONL", &fifo)
+        .env("CASS_INDEX_RUN_LOCK_HEARTBEAT_EVERY_MS", "20");
+    let mut owner = BackfillChild(
+        command
+            .as_std_mut()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    );
+    let lock_path = data_dir.join("index-run.lock");
+    wait_for_backfill_owner_heartbeat(&mut owner.0, &lock_path)?;
+    let rejected = robot_backfill_command(&data_dir, &db_path).output()?;
+    assert_backfill_busy(&rejected)?;
+    assert!(
+        owner.0.try_wait()?.is_none(),
+        "the owner must still hold its lock"
+    );
+
+    // Release the actual sink and let this same owner checkpoint normally.
+    // RDWR prevents the test-side open from waiting if the owner fails first.
+    let mut reader = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo)?;
+    let mut progress = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        drain_progress_pipe(&mut reader, &mut progress)?;
+        if let Some(status) = owner.0.try_wait()? {
+            drain_progress_pipe(&mut reader, &mut progress)?;
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "backfill did not finish after sink release"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    owner
+        .0
+        .stdout
+        .take()
+        .ok_or("missing stdout")?
+        .read_to_string(&mut stdout)?;
+    owner
+        .0
+        .stderr
+        .take()
+        .ok_or("missing stderr")?
+        .read_to_string(&mut stderr)?;
+    assert!(status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    let first: Value = serde_json::from_str(stdout.trim())?;
+    assert_eq!(first["status"], "checkpointed");
+    // The first event proves the owner reached the actual semantic pipeline.
+    let progress = String::from_utf8(progress)?;
+    let event: Value = serde_json::from_str(progress.lines().next().ok_or("no semantic events")?)?;
+    assert_eq!(event["phase"], "selection");
+    assert_eq!(
+        run_robot_backfill(&data_dir, &db_path)?["status"],
+        "published"
+    );
+    Ok(())
 }
 
 fn run_robot_scheduled_backfill_paused(data_dir: &Path, db_path: &Path) -> TestResult<Value> {

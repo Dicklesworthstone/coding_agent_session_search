@@ -480,9 +480,6 @@ fn new_agent_auto_discovery_documented() {
     eprintln!("  - Adding a connector to FAD auto-discovers in cass.");
 }
 
-/// GH449: the Devin factory exists even when its SQLite parser is compiled out.
-/// Exercise the persisted provider format through the factory and real CLI so
-/// slug enumeration alone cannot certify support again.
 mod prime_ingestion {
     use super::*;
     use coding_agent_search::connectors::{ScanContext, ScanRoot};
@@ -624,6 +621,9 @@ mod prime_ingestion {
     }
 }
 
+/// GH449: the Devin factory exists even when its SQLite parser is compiled out.
+/// Exercise the persisted provider format through the factory and real CLI so
+/// slug enumeration alone cannot certify support again.
 mod devin_ingestion {
     use super::*;
     use coding_agent_search::connectors::{ScanContext, ScanRoot};
@@ -732,8 +732,8 @@ mod devin_ingestion {
             .collect()
     }
 
-    fn cass(home: &Path, data: &Path) -> assert_cmd::Command {
-        let mut cmd = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+    fn cass_command(home: &Path, data: &Path) -> std::process::Command {
+        let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
         cmd.env_clear()
             .env("HOME", home)
             .env("USERPROFILE", home)
@@ -747,11 +747,16 @@ mod devin_ingestion {
             .env("RUST_MIN_STACK", "134217728")
             .current_dir(home)
             .arg("--data-dir")
-            .arg(data)
-            .timeout(Duration::from_secs(120));
+            .arg(data);
         if let Ok(system_root) = dotenvy::var("SystemRoot") {
             cmd.env("SystemRoot", system_root);
         }
+        cmd
+    }
+
+    fn cass(home: &Path, data: &Path) -> assert_cmd::Command {
+        let mut cmd = assert_cmd::Command::from_std(cass_command(home, data));
+        cmd.timeout(Duration::from_secs(120));
         cmd
     }
 
@@ -879,6 +884,213 @@ mod devin_ingestion {
             );
         }
         drop(source_writer);
+    }
+
+    #[test]
+    fn devin_file_override_watch_ingests_wal_only_commit_without_touching_source() {
+        use std::process::{Child, Stdio};
+        use std::time::Instant;
+
+        struct WatchChild(Child);
+
+        impl Drop for WatchChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let home = tempfile::tempdir().expect("isolated Devin watch home");
+        let db = home.path().join("sessions.db");
+        let data = home.path().join("cass-data");
+        seed_store(&db);
+        // Keep the provider's writer open throughout startup, the commit, and
+        // reader verification. Closing it could checkpoint the DB and conceal
+        // a watcher that observes only the main database file.
+        let writer = Connection::open(db.to_string_lossy().as_ref()).expect("live Devin writer");
+        writer
+            .execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+            .expect("provider WAL mode before watcher startup");
+        let initial_bundle = source_bundle_bytes(&db);
+        let initial_modified = fs::metadata(&db).unwrap().modified().unwrap();
+        let stdout_path = home.path().join("devin-watch.stdout");
+        let stderr_path = home.path().join("devin-watch.stderr");
+        let watch_logs = || {
+            format!(
+                "stdout:\n{}\nstderr:\n{}",
+                fs::read_to_string(&stdout_path).unwrap_or_default(),
+                fs::read_to_string(&stderr_path).unwrap_or_default(),
+            )
+        };
+        let mut watch = WatchChild(
+            cass_command(home.path(), &data)
+                .args(["index", "--watch", "--watch-interval", "1", "--json"])
+                .env("RUST_LOG", "info")
+                .stdout(Stdio::from(fs::File::create(&stdout_path).unwrap()))
+                .stderr(Stdio::from(fs::File::create(&stderr_path).unwrap()))
+                .spawn()
+                .expect("start real Devin watcher"),
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let logs = watch_logs();
+            if logs.contains("watch mode: minimum interval between scan cycles") {
+                break;
+            }
+            assert!(
+                watch.0.try_wait().unwrap().is_none(),
+                "watch exited before installing notifications: {logs}"
+            );
+            assert!(Instant::now() < deadline, "watch startup timed out: {logs}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let search = |query: &str| {
+            let output = cass(home.path(), &data)
+                .args([
+                    "search",
+                    query,
+                    "--mode",
+                    "lexical",
+                    "--agent",
+                    "devin",
+                    "--json",
+                    "--no-maintenance",
+                    "--timeout",
+                    "3000",
+                    "--limit",
+                    "20",
+                ])
+                .timeout(Duration::from_secs(5))
+                .output()
+                .expect("read-only search while watching");
+            assert!(
+                output.status.success(),
+                "search failed: {}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                watch_logs(),
+            );
+            let result: Value = serde_json::from_slice(&output.stdout).expect("search JSON");
+            assert_ne!(
+                result.pointer("/budget/timed_out").and_then(Value::as_bool),
+                Some(true),
+                "a timed-out search cannot prove absence: {result}"
+            );
+            assert!(result["hits"].is_array(), "search hits missing: {result}");
+            result
+        };
+        assert_eq!(search("devinneedle")["hits"].as_array().unwrap().len(), 4);
+        assert_eq!(source_bundle_bytes(&db), initial_bundle);
+        assert_eq!(
+            fs::metadata(&db).unwrap().modified().unwrap(),
+            initial_modified
+        );
+
+        // Capture provider activity before a delayed commit. Its timestamp must
+        // precede the WAL event by more than a whole second, otherwise rounding
+        // the filesystem watermark could accidentally make this test pass.
+        let now = chrono::Utc::now().timestamp();
+        std::thread::sleep(Duration::from_millis(2100));
+        assert!(chrono::Utc::now().timestamp() > now + 1);
+        let mut committed_bundle = initial_bundle.clone();
+        // The second commit deliberately retains the older activity timestamp
+        // after the first callback has persisted its filesystem watermark.
+        for (node_id, parent_id, needle) in [
+            (8_i64, 5_i64, "devinwalneedle"),
+            (9, 8, "devindelayedwalneedle"),
+        ] {
+            writer
+                .execute_batch("BEGIN;")
+                .expect("begin provider append");
+            writer
+                .execute_compat(
+                    "INSERT INTO message_nodes VALUES (?1, 'kept', ?2, ?3, ?4)",
+                    params![
+                        node_id,
+                        parent_id,
+                        json!({"role":"user", "content":format!("{needle} new turn")}).to_string(),
+                        now
+                    ],
+                )
+                .expect("append provider node");
+            writer
+                .execute_compat(
+                    "UPDATE sessions SET main_chain_id = ?1, last_activity_at = ?2 WHERE id = 'kept'",
+                    params![node_id, now],
+                )
+                .expect("advance live main chain");
+            writer
+                .execute_batch("COMMIT;")
+                .expect("commit provider WAL");
+            let next_bundle = source_bundle_bytes(&db);
+            assert_eq!(next_bundle[0], initial_bundle[0], "commit touched main DB");
+            assert_eq!(
+                fs::metadata(&db).unwrap().modified().unwrap(),
+                initial_modified
+            );
+            assert_ne!(next_bundle[1], committed_bundle[1], "WAL did not change");
+            assert!(next_bundle[1].as_ref().is_some_and(|wal| wal.len() > 32));
+            committed_bundle = next_bundle;
+
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                assert!(
+                    watch.0.try_wait().unwrap().is_none(),
+                    "watch exited: {}",
+                    watch_logs(),
+                );
+                let result = search(needle);
+                assert_eq!(
+                    source_bundle_bytes(&db),
+                    committed_bundle,
+                    "reader mutated source"
+                );
+                assert_eq!(
+                    fs::metadata(&db).unwrap().modified().unwrap(),
+                    initial_modified
+                );
+                let hits = result["hits"].as_array().unwrap();
+                if !hits.is_empty() {
+                    assert_eq!(hits.len(), 1, "duplicate WAL ingestion: {result}");
+                    assert_eq!(hits[0]["agent"], "devin");
+                    assert_eq!(
+                        hits[0]["source_path"],
+                        db.join("kept").to_string_lossy().as_ref()
+                    );
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "WAL-only commit never became searchable: {result}\n{}",
+                    watch_logs(),
+                );
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            if node_id == 8 {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let watermark = fs::read(data.join("watch_state.json"))
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                        .and_then(|state| state.pointer("/m/dv").and_then(Value::as_i64));
+                    if watermark.is_some_and(|timestamp| timestamp > (now + 1) * 1000) {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "first watch callback did not persist its event watermark: {watermark:?}\n{}",
+                        watch_logs()
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+        drop(watch);
+        assert_eq!(source_bundle_bytes(&db), committed_bundle);
+        assert_eq!(
+            fs::metadata(&db).unwrap().modified().unwrap(),
+            initial_modified
+        );
+        drop(writer);
     }
 
     #[test]

@@ -239,6 +239,7 @@ const INPUT_AUTOCOMPLETE_AGENT_HINTS: &[&str] = &[
     "copilot_cli",
     "crush",
     "cursor",
+    "devin",
     "factory",
     "gemini",
     "goose",
@@ -247,6 +248,7 @@ const INPUT_AUTOCOMPLETE_AGENT_HINTS: &[&str] = &[
     "openclaw",
     "omp",
     "pi_agent",
+    "prime_agent",
     "qwen",
     "vibe",
 ];
@@ -3081,6 +3083,8 @@ fn legacy_agent_color(agent: &str) -> ftui::PackedRgba {
         "chatgpt" => ftui::PackedRgba::rgb(16, 163, 127), // chatgpt green
         "aider" => ftui::PackedRgba::rgb(255, 165, 0), // orange
         "pi_agent" => ftui::PackedRgba::rgb(255, 140, 0), // dark orange
+        "prime_agent" => ftui::PackedRgba::rgb(99, 102, 241), // indigo
+        "devin" => ftui::PackedRgba::rgb(56, 189, 248), // sky blue
         "factory" | "droid" => ftui::PackedRgba::rgb(230, 176, 60), // amber
         "clawdbot" => ftui::PackedRgba::rgb(140, 130, 240), // indigo
         "vibe" | "mistral" => ftui::PackedRgba::rgb(220, 100, 160), // rose

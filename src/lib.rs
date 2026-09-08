@@ -119255,6 +119255,28 @@ fn run_models_backfill(
             decision.scheduled_batch_conversations
         });
 
+    // GH458: own the canonical maintenance lock before any writable open,
+    // fingerprint or manifest read, and retain it through publish and the
+    // semantic identity marker completion below.
+    let maintenance_guard = crate::indexer::acquire_semantic_backfill_lock(&data_dir, &db_path)
+        .map_err(|error| {
+            let rendered = format!("{error:#}");
+            if error_chain_indicates_active_cass_index(&rendered) {
+                return active_index_run_details(&data_dir, &db_path)
+                    .map(|details| details.to_cli_error())
+                    .unwrap_or_else(|| index_storage_contention_cli_error(&rendered));
+            }
+            CliError {
+                code: 5,
+                kind: CliErrorKind::Storage.kind_str(),
+                message: format!(
+                    "Failed to acquire semantic backfill maintenance lock: {rendered}"
+                ),
+                hint: Some("Check permissions under the cass data directory".into()),
+                retryable: true,
+            }
+        })?;
+
     let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
         code: 5,
         kind: CliErrorKind::Storage.kind_str(),
@@ -119349,7 +119371,8 @@ fn run_models_backfill(
     let progress_sink = crate::indexer::semantic_progress::SemanticProgressSink::open(
         tier.as_str(),
         indexer.embedder_id(),
-    );
+    )
+    .with_progress_atomic(maintenance_guard.progress_atomic());
     let outcome = indexer
         .run_capped_backfill_from_storage_with_sink(
             &storage,
