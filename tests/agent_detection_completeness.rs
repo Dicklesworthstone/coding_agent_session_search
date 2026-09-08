@@ -924,6 +924,8 @@ mod devin_ingestion {
         };
         let mut watch = WatchChild(
             cass_command(home.path(), &data)
+                // JSON mode suppresses the INFO readiness signal unless requested.
+                .arg("--verbose")
                 .args(["index", "--watch", "--watch-interval", "1", "--json"])
                 .env("RUST_LOG", "info")
                 .stdout(Stdio::from(fs::File::create(&stdout_path).unwrap()))

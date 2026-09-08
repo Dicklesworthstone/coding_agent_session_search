@@ -75,6 +75,8 @@ mod deferred_watch_sources {
         let log = fs::File::create(&log_path).expect("watch log");
         let mut command = cass(home, data);
         command
+            // JSON mode suppresses the INFO readiness signal unless requested.
+            .arg("--verbose")
             .args(["index", "--watch", "--watch-interval", "1", "--json"])
             .env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "8")
             .env("CASS_STREAMING_INDEX", if streaming { "1" } else { "0" })
