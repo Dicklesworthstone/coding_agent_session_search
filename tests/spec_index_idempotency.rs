@@ -40,7 +40,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
-use coding_agent_search::franken_sync::compat::{ConnectionExt, OpenFlags, RowExt, open_with_flags};
+use coding_agent_search::franken_sync::compat::{
+    ConnectionExt, OpenFlags, RowExt, open_with_flags,
+};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -133,9 +135,10 @@ fn conversation_count(envelope: &Value) -> Result<i64, Box<dyn Error>> {
 fn archive_totals(data_dir: &Path) -> Result<(usize, usize), Box<dyn Error>> {
     let db_path = data_dir.join("agent_search.db");
     let conn = open_with_flags(&db_path.to_string_lossy(), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let conversations: i64 = conn.query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
-        row.get_typed(0)
-    })?;
+    let conversations: i64 =
+        conn.query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+            row.get_typed(0)
+        })?;
     let messages: i64 =
         conn.query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))?;
     conn.close_without_checkpoint()?;

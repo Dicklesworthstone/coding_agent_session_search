@@ -268,7 +268,7 @@ fn setup_pack_archive_fixture(tracker: &PhaseTracker) -> PackArchiveFixture {
     let command_env = tracker
         .command_environment()
         .with_home(home)
-        .with_codex_home(&home.join(".codex"));
+        .with_codex_home(home.join(".codex"));
     // Structured pack is read-only. Publish the seeded archive's lexical
     // assets explicitly before testing the handoff, just as its repair hint
     // instructs an operator with an archive but no searchable generation.
