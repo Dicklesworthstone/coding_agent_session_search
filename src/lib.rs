@@ -94282,6 +94282,8 @@ fn response_schema_index_state() -> serde_json::Value {
             "stalled": { "type": "boolean" },
             "activity_at": { "type": ["string", "null"] },
             "documents": { "type": ["integer", "null"] },
+            "live_documents": { "type": ["integer", "null"] },
+            "hollow": { "type": "boolean" },
             "segment_files": { "type": ["integer", "null"] },
             "empty_with_messages": { "type": "boolean" },
             "quarantined_conversations": { "type": "integer" },

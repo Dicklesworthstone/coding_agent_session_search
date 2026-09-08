@@ -12,16 +12,30 @@ use assert_cmd::Command;
 use serde_json::{Map, Value, json};
 use std::error::Error;
 use std::fs;
-use std::io;
-use std::path::{Component, Path, PathBuf};
-use walkdir::WalkDir;
+use std::path::{Path, PathBuf};
 
 #[allow(deprecated)]
 fn cass_cmd(test_home: &Path) -> Command {
     let mut cmd = Command::cargo_bin("cass").expect("cass binary");
     cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         .env("XDG_DATA_HOME", test_home)
+        .env("XDG_CONFIG_HOME", test_home.join(".config"))
         .env("HOME", test_home)
+        .env("CODEX_HOME", test_home.join(".codex"))
+        .env("CLAUDE_HOME", test_home.join(".claude"))
+        .env("GEMINI_HOME", test_home.join(".gemini"))
+        .env("OPENCODE_STORAGE_ROOT", test_home.join(".opencode"))
+        .env("CASS_AIDER_DATA_ROOT", test_home.join(".aider-missing"))
+        .env("PI_SESSIONS_DIR", test_home.join(".pi-sessions-missing"))
+        .env("PI_CODING_AGENT_DIR", test_home.join(".pi-agent-missing"))
+        .env(
+            "PI_CODING_AGENT_SESSION_DIR",
+            test_home.join(".pi-coding-agent-sessions-missing"),
+        )
+        .env_remove("PI_CONFIG_DIR")
+        .env_remove("PI_PROFILE")
+        .env("CASS_AUTO_REFRESH", "0")
+        .current_dir(test_home)
         .env("CASS_IGNORE_SOURCES_CONFIG", "1");
     cmd
 }
@@ -34,54 +48,24 @@ fn fixture_path(parts: &[&str]) -> PathBuf {
     path
 }
 
-fn safe_fixture_destination(dst_root: &Path, rel: &Path) -> io::Result<PathBuf> {
-    let mut dst = dst_root.to_path_buf();
-    for component in rel.components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(part) => dst.push(part),
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "fixture path escaped source root",
-                ));
-            }
-        }
-    }
-    Ok(dst)
-}
-
 fn isolated_search_demo_data(test_home: &Path) -> Result<PathBuf, Box<dyn Error>> {
-    let src = fixture_path(&["search_demo_data"]);
     let dst_root = test_home.join("search_demo_data");
-    for entry in WalkDir::new(&src) {
-        let entry = entry?;
-        // Machine-local frankensqlite namespace lock sidecars (created by
-        // any local run that opens the fixture DB) must not reach the
-        // clone: their foreign lock state fails the copied DB's open.
-        if entry
-            .path()
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| {
-                name.ends_with("-fsqlite-ns-gate") || name.ends_with("-fsqlite-ns-use")
-            })
-        {
-            continue;
-        }
-        let rel = entry.path().strip_prefix(&src)?;
-        let dst = safe_fixture_destination(&dst_root, rel)?;
-        if entry.file_type().is_dir() {
-            fs::create_dir_all(&dst)?;
-        } else {
-            if let Some(parent) = dst.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::copy(entry.path(), &dst)?;
-        }
-    }
-    // Structured pack is read-only and requires current lexical metadata.
-    // Publish the copied archive through the normal maintenance command first.
+    let sessions = test_home.join(".codex/sessions/2025/11/25");
+    fs::create_dir_all(&sessions)?;
+    fs::copy(
+        fixture_path(&[
+            "codex_real",
+            "sessions",
+            "2025",
+            "11",
+            "25",
+            "rollout-test.jsonl",
+        ]),
+        sessions.join("rollout-test.jsonl"),
+    )?;
+    // Exercise live response shapes from a current archive and publication.
+    // The frozen search_demo_data database is a legacy migration fixture with
+    // duplicate FTS schema rows; full indexing correctly refuses to replace it.
     cass_cmd(test_home)
         .args(["index", "--full", "--json", "--data-dir"])
         .arg(&dst_root)
@@ -333,7 +317,7 @@ fn surface_command(
             return Some((
                 vec![
                     "pack".to_string(),
-                    "hello".to_string(),
+                    "matrix".to_string(),
                     "--json".to_string(),
                     "--limit".to_string(),
                     "2".to_string(),
@@ -351,7 +335,7 @@ fn surface_command(
             return Some((
                 vec![
                     "search".to_string(),
-                    "hello".to_string(),
+                    "matrix".to_string(),
                     "--json".to_string(),
                     "--limit".to_string(),
                     "2".to_string(),
@@ -460,6 +444,19 @@ fn introspect_response_schemas_cover_runtime_json_shapes() -> Result<(), Box<dyn
             panic!("no runtime command sample mapped for introspect response schema {surface}");
         };
         let payload = run_json(test_home.path(), &args, expect_status);
+        let sampled_items = match surface.as_str() {
+            "search" => Some("hits"),
+            "pack" => Some("evidence"),
+            _ => None,
+        };
+        if let Some(field) = sampled_items {
+            assert!(
+                payload[field]
+                    .as_array()
+                    .is_some_and(|items| !items.is_empty()),
+                "{surface} must exercise nonempty {field} item schemas: {payload}"
+            );
+        }
         let runtime_schema = json_value_schema(&payload);
         collect_runtime_shape_gaps(surface, "$", &runtime_schema, advertised_schema, &mut gaps);
     }
