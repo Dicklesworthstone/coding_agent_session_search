@@ -521,6 +521,9 @@ pub fn agent_css_class(slug: &str) -> &'static str {
         "goose" => "agent-goose",
         "openhands" | "open_hands" => "agent-aider",
         "muse" | "muse_code" => "agent-amp",
+        "prime_agent" => "agent-codex",
+        "kiro" => "agent-gemini",
+        "devin" => "agent-cursor",
         _ => "agent-default",
     }
 }
@@ -562,6 +565,9 @@ pub fn agent_display_name(slug: &str) -> &'static str {
         "kimi" => "Kimi",
         "qwen" => "Qwen",
         "openhands" | "open_hands" => "OpenHands",
+        "prime_agent" => "Prime Agent",
+        "kiro" => "Kiro",
+        "devin" => "Devin",
         _ => "AI Assistant",
     }
 }
