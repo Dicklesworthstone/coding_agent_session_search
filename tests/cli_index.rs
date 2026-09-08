@@ -3157,9 +3157,7 @@ fn gh453_assert_reclamation_after_grace(publish_during_grace: bool) {
     } else {
         None
     };
-    std::thread::sleep(
-        std::time::Duration::from_secs(305).saturating_sub(grace_start.elapsed()),
-    );
+    std::thread::sleep(std::time::Duration::from_secs(305).saturating_sub(grace_start.elapsed()));
 
     let gc = base_cmd(home)
         .current_dir(home)
@@ -3214,11 +3212,13 @@ fn gh453_assert_reclamation_after_grace(publish_during_grace: bool) {
     );
     if publish_during_grace {
         assert!(
-            hits["hits"].as_array().is_some_and(|hits| hits.iter().any(|hit| {
-                hit["source_path"]
-                    .as_str()
-                    .is_some_and(|path| path.ends_with("rollout-453-during-grace.jsonl"))
-            })),
+            hits["hits"]
+                .as_array()
+                .is_some_and(|hits| hits.iter().any(|hit| {
+                    hit["source_path"]
+                        .as_str()
+                        .is_some_and(|path| path.ends_with("rollout-453-during-grace.jsonl"))
+                })),
             "the intervening publication must remain searchable after GC: {hits}"
         );
     }

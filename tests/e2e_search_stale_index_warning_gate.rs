@@ -197,14 +197,15 @@ fn check() -> Result<(), String> {
     // index. Reads below disable maintenance so this missing projection stays
     // observable and the archive/index mutation assertions remain meaningful.
     let storage = FrankenStorage::open(&db_path).map_err(|e| e.to_string())?;
-    let (conversation_id, next_idx): (i64, i64) = storage
+    let (conversation_id, last_idx): (i64, i64) = storage
         .raw()
         .query_row_map(
-            "SELECT conversation_id, MAX(idx) + 1 FROM messages GROUP BY conversation_id ORDER BY conversation_id LIMIT 1",
+            "SELECT conversation_id, idx FROM messages ORDER BY conversation_id, idx DESC LIMIT 1",
             &[] as &[ParamValue],
             |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
         )
         .map_err(|e| e.to_string())?;
+    let next_idx = last_idx.checked_add(1).ok_or("fixture message index overflow")?;
     storage
         .raw()
         .execute_compat(
