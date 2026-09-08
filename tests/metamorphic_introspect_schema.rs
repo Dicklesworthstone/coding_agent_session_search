@@ -297,6 +297,7 @@ fn surface_command(
             ));
         }
         "introspect" => vec!["introspect", "--json"],
+        "selftest" => vec!["selftest", "--json"],
         "models-build-hnsw" => {
             return Some((
                 vec![
