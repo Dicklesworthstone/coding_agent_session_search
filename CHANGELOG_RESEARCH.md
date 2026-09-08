@@ -136,8 +136,10 @@ has passed source transfer and formatting. Clippy failed because a watch-test
 helper used an undeclared dependency; the helper now uses standard FileTimes
 in the next candidate. All runtime stages then failed before test execution:
 the cached runtime build script rejected Devin using the old feature list,
-although the frozen build.rs contains Devin. That discrepancy is under
-investigation; no runtime result or chacha20 upgrade pass is claimed for F6.
+although the frozen build.rs contains Devin. Source timestamps and both build
+script executables confirmed stale Cargo reuse. The gate now refreshes verified
+input timestamps without changing bytes; its 45 shell checks were independently
+re-executed remotely. No runtime result or chacha20 upgrade pass is claimed for F6.
 
 The existing "Devin feature disabled" statements are obsolete and were
 corrected. Full integration remains narrower than registry activation:
@@ -168,6 +170,18 @@ and an unrelated destination WAL at final publication. Seven real semantic
 regressions and two competing-process CLI lock tests await remote execution.
 The algorithm scans canonical identities on each batch; it is not a constant-time
 append path or an archive-scale performance result. F7 source
-1b6796825c83f79c9d471f03c19ac49dceaddde4c7e02f55b5f285148e9f69ee is prepared.
+1b6796825c83f79c9d471f03c19ac49dceaddde4c7e02f55b5f285148e9f69ee passed
+source identity and formatting, but Clippy found an unavailable test helper API
+(`assert_cmd::Command::as_std_mut`). The correction uses an owned standard
+process command and preserves the existing assertion wrapper and deadlines;
+independent review checked the pinned dependency API. The library stage passed
+279 tests, including all seven new backfill cases, with one large-archive test
+ignored. The connector stage passed 14 tests and failed the new Devin watcher
+test because it waited for an INFO message suppressed by JSON mode. That test
+and the equivalent watch helper now explicitly request verbose logs; their
+deadlines and assertions are unchanged, and corrected execution is pending.
 The actual native MiniLM bundle was downloaded to isolated test storage and all
-five manifest sizes/checksums matched; model execution is still pending.
+five manifest sizes/checksums matched. An old-binary control first encountered
+a fleet refusal, then failed CLI argument parsing before model installation or
+inference. The corrected probe also blocks ancestor dotenv files and requires
+exact agreement on all six fixture documents. Model execution is still pending.
