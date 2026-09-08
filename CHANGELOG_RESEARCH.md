@@ -1,7 +1,7 @@
 # CASS 0.8.0 changelog research
 
 Scope window: `v0.7.1..6b2ab22d30892fe6f7762d851477feea0e6f80f8`, plus
-the local 0.8.0 version preparation. This is a release-window update, not a
+the local 0.8.0 preparation and the September 8 issue-fix follow-through below. This is a release-window update, not a
 reconstruction of older entries. Research date: 2026-09-08.
 
 Sources: local Git history and diffs, GitHub release/tag metadata, checked-in
@@ -31,6 +31,7 @@ status; they are not counted as product features.
 | C | remaining 73 non-merge commits through dbe940c7 | validated | pack output contracts, recovery quarantine, final dependency family, connector routing, backfill paths |
 | D | remote main 6b2ab22d, 2026-09-08 | validated | hollow lexical-generation detection, merge-memory bounds |
 | Merge reconciliation | five merges in the original range | validated | combined-diff review; dependency, pack, recovery and refresh changes retained |
+| E | local issue-fix commits through c865ebc4 and reviewed working-tree fixes, 2026-09-08 | distilled; runtime validation pending | Devin parser/WAL watch, Prime presets/probe, active-source watch retries, legacy FTS preflight, exact resume metadata, resumable semantic reconciliation, doctor truth, schema goldens |
 
 ## Publication follow-through
 
@@ -113,3 +114,60 @@ on GitHub, but this candidate has not yet executed their new regression tests.
 - Five merge commits were inspected separately so --no-merges inventory did
   not hide reconciliation changes. No additional independent feature wave was
   found beyond the dependency, refresh, recovery, and pack changes described.
+
+## Chunk E findings and current limits
+
+Read the post-research commit inventory and complete production/test diffs.
+Local Devin activation is in 6ec77cf7, with actual schema/WAL/nullable-store
+tests in 0217c2f2 and 776d4a0a. Prime presets/probe and its real CLI journey are
+in 6dba9756. Watch retries began in 58c7bc96; the working tree additionally
+propagates callback failures so pending sources survive. Doctor queryability
+wording is in e0e5603f. GH440 exact counts/fingerprints are in 32d27ab7, with
+the test ordering corrected to inspect metadata before search can heal it.
+GH413's newly reported legacy restart bypass has a reviewed working-tree
+preflight fix and exact-route regression. Local commit URLs are not added
+before the commits are published; the changelog uses live issue links meanwhile.
+
+Old-binary remote controls independently reproduce both the GH440 metadata
+defect and GH413's ordinary-versus-legacy shadow-drop discrepancy. These are
+small generated archives, not the reporters' large archives. Candidate F6
+at source SHA33904882b6d85056343395ffb8ab0e9b9db243abd088d6fe2360c8e35703205e
+has passed source transfer and formatting. Clippy failed because a watch-test
+helper used an undeclared dependency; the helper now uses standard FileTimes
+in the next candidate. All runtime stages then failed before test execution:
+the cached runtime build script rejected Devin using the old feature list,
+although the frozen build.rs contains Devin. That discrepancy is under
+investigation; no runtime result or chacha20 upgrade pass is claimed for F6.
+
+The existing "Devin feature disabled" statements are obsolete and were
+corrected. Full integration remains narrower than registry activation:
+Devin's database-file WAL routing is implemented with two actual held-writer
+commits awaiting F7 execution. Prime's upstream configured-directory/direct-file
+admission repair passed 18 real parser/root tests, check, Clippy and formatting
+remotely on the connectors feature set; it is not published or adopted by CASS.
+These stay in the original issues; no acceptance was moved out to manufacture
+closure. Devin's pre-existing swallowed transient scan errors remain unresolved.
+FAD's source-boundary seam for GH426 is now published, while CASS's exact
+per-source transactional ledger remains unimplemented. Historical release
+entries retain the state applicable to their original release.
+
+F5 verified60 hollow-generation regressions and68 golden checks (plus68
+regeneration executions); its runtime schema test failed on the missing
+selftest command mapping, now repaired for F6. The11 reviewed golden diffs
+contain only206 insertions for live_documents/hollow. Strict UBS remains red
+or incomplete in retained gates; scanner defects found by source review are
+not clearance. No0.8.0 release, tag, or cross-platform artifact exists yet.
+
+GH458 was independently traced to exact-fingerprint checkpoint rejection;
+retaining a cursor alone would skip appends to earlier conversations. The
+reviewed implementation reuses exact content/provenance identities and applies
+the existing batch caps only to missing embeddings. Independent source review
+found and the implementation corrected three additional holes: stale readiness
+through complete shard metadata, missing staging files with surviving cursors,
+and an unrelated destination WAL at final publication. Seven real semantic
+regressions and two competing-process CLI lock tests await remote execution.
+The algorithm scans canonical identities on each batch; it is not a constant-time
+append path or an archive-scale performance result. F7 source
+1b6796825c83f79c9d471f03c19ac49dceaddde4c7e02f55b5f285148e9f69ee is prepared.
+The actual native MiniLM bundle was downloaded to isolated test storage and all
+five manifest sizes/checksums matched; model execution is still pending.

@@ -114,6 +114,14 @@ mean that every acceptance row, platform, or reporter archive has been verified.
 
 ### Added
 - Muse AI sessions can be discovered and indexed through the connector registry.
+- Local Devin `sessions.db` ingestion is enabled through FAD's SQLite parser,
+  preserving the selected message chain and the `devin` identity. Cloud session
+  acquisition remains outside this integration. See [#449](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/449).
+- Prime Agent's default session directory is included in Linux/macOS source
+  presets and remote probe classification, with its own `prime_agent` identity
+  and documented environment overrides. Targeted and configured-root watch
+  support still requires the upstream root-admission repair tracked under
+  [#388](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/388).
 - A targeted, idempotent lexical reconciliation path replaces one conversation's
   search documents from its canonical archive rows without rebuilding the corpus.
 - `cass pack --field-mask` selects the existing field projection, including the
@@ -174,6 +182,30 @@ mean that every acceptance row, platform, or reporter archive has been verified.
   40-segment generation is folded by a plain `cass index`).
 
 ### Fixed
+- Semantic backfill reuses compatible vectors across intervening ingest and
+  compares current document content and provenance before retaining them.
+  Missing checkpoint files restart coverage safely; partial repairs revoke
+  stale readiness, and publication retains the prior WAL before validating the
+  replacement. Backfills share the indexing lock and report real progress.
+  The candidate's regression and native-model validation remain pending; this
+  does not establish large-archive throughput. See [#458](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/458).
+- Watches of an explicit Devin database follow its WAL/SHM events without
+  ingesting neighboring databases. Provider timestamps older than filesystem
+  events no longer hide later WAL commits. See [#449](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/449).
+- Watch mode retains files deferred as actively written and retries them after
+  the safety window even if no further filesystem event arrives. Reported
+  reindex failures keep those files queued for retry. See [#455](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/455).
+- Legacy incomplete lexical checkpoints apply the fallback FTS shadow's corpus
+  bound before opening readonly rebuild workers, matching the ordinary indexing
+  path. This addresses the restart-path bypass in [#413](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/413),
+  without claiming that every archive-scale memory or doctor-open problem is resolved.
+- Completed lexical resumes publish exact canonical message counts and replace
+  pending fingerprints before returning, including canonical messages omitted
+  from lexical search. An ordinary search is no longer needed to repair that
+  metadata. See the follow-up in [#440](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/440).
+- Doctor distinguishes a queryable FTS table from verified structural integrity;
+  a successful query no longer dismisses a structural checker failure as a
+  harmless engine difference. See [#438](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/438).
 - A hollow published Quill generation — one serving a handful of documents
   while its completed rebuild checkpoint, content fingerprint and generation
   manifest all still look right — no longer reads as healthy (GH #457).
@@ -202,8 +234,9 @@ mean that every acceptance row, platform, or reporter archive has been verified.
   RSS of indexing or every engine allocation.
 - Route every enabled connector through filesystem watching and quarantine
   retries, including Prime Agent, Kiro, Devin, OpenHands, Goose, Crush, and Hermes.
-  This completes CASS's dispatch adapters; it does not enable FAD's optional
-  `devin` feature, which remains outside the selected dependency features.
+  The candidate also enables FAD's optional `devin` parser. Dispatch registration
+  alone does not establish every provider's watch-root behavior; the remaining
+  Prime and Devin watch cases stay tracked in their original issues.
 - HTML export and robot diagnostics use specific Prime Agent, Kiro, and Devin
   identities instead of generic provider labels.
 - Make the release formatting gate fail when rustfmt aborts or is killed.
@@ -348,7 +381,7 @@ mean that every acceptance row, platform, or reporter archive has been verified.
   read from real rollouts; Claude tool results are kept as `role:"tool"`
   messages; Cursor/OpenCode mirrors are deduped; the 100 MB scan cap applies
   to every connector; Shelley discovery names the canonical database path
-  like scan. The new `devin` connector feature is not enabled here.
+  like scan. The optional `devin` feature is enabled for local store ingestion.
 - Upgraded the complete FrankenSQLite family from the `0.3.13` line in v0.7.1
   to registry `0.3.18`. This adds parameterized rowid seeks (GH#415/cass#382),
   read-only WAL byte/timestamp preservation, reader-registration error
