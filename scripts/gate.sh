@@ -103,6 +103,30 @@ SH
     return "$rc"
 }
 
+prepare_compile_inputs() (
+    set -o pipefail
+    local paths="$1" expected="$2" actual identity_rc=0 freshness_rc=0
+    actual="$(printf '%s' "$paths" | base64 -d | gzip -d | \
+        xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1)" || identity_rc=$?
+    [ "$actual" = "$expected" ] || identity_rc=1
+    echo "SOURCE_CONTENT_SHA256=${actual} EXPECTED=${expected}"
+    echo "STAGE=source-identity EXIT=${identity_rc}"
+    [ "$identity_rc" -eq 0 ] || return 1
+
+    # Transfers preserve mtimes, which can predate a warm Cargo fingerprint
+    # even when the input bytes changed. Refresh verified inputs before any
+    # compiler runs. Keep cache artifacts and source bytes intact; -c never
+    # recreates an input removed since verification. The second digest catches
+    # missing or changed inputs, including a concurrent edit during refresh.
+    printf '%s' "$paths" | base64 -d | gzip -d | \
+        xargs -0 -r touch -c -- || freshness_rc=$?
+    actual="$(printf '%s' "$paths" | base64 -d | gzip -d | \
+        xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1)" || freshness_rc=$?
+    [ "$actual" = "$expected" ] || freshness_rc=1
+    echo "STAGE=source-freshness EXIT=${freshness_rc}"
+    [ "$freshness_rc" -eq 0 ]
+)
+
 # Exercise the exact receipt parser without admitting a build or substituting
 # tools. The shell regression suite feeds it recorded terminal-output shapes.
 if [ "${1:-}" = --verify-receipt ]; then
@@ -116,6 +140,10 @@ if [ "${1:-}" = --verify-test-log ]; then
 fi
 if [ "${1:-}" = --verify-fmt ]; then
     run_fmt
+    exit $?
+fi
+if [ "${1:-}" = --verify-compile-inputs ]; then
+    prepare_compile_inputs "$2" "$3"
     exit $?
 fi
 
@@ -293,7 +321,7 @@ fi
 # Every stage the remote script will run, in order. The receipt check below
 # requires each one to report: a job cut short by the fleet's SSH ceiling
 # leaves later stages missing, and a missing stage is RED, never green.
-EXPECTED_STAGES=(source-identity fmt clippy)
+EXPECTED_STAGES=(source-identity source-freshness fmt clippy)
 [ "$RUN_LIB" = 1 ] && EXPECTED_STAGES+=(lib-tests)
 integration_stage=""
 if [ "$RUN_INTEGRATION" = 1 ]; then
@@ -345,14 +373,10 @@ fi;"
     EXPECTED_STAGES+=(docs-build docs-binary-identity docs-truth)
 fi
 
-REMOTE_SCRIPT="$(declare -f test_log_counts run_tests run_fmt run_ubs)
+REMOTE_SCRIPT="$(declare -f test_log_counts run_tests run_fmt run_ubs prepare_compile_inputs)
 set -o pipefail
-actual_content=\$(printf '%s' '${SOURCE_PATHS}' | base64 -d | gzip -d | xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1)
-identity_rc=\$?
-if [ \"\$actual_content\" != '${SOURCE_CONTENT}' ]; then identity_rc=1; fi
-echo SOURCE_HEAD=${SOURCE_HEAD} SOURCE_CONTENT_SHA256=\$actual_content EXPECTED=${SOURCE_CONTENT}
-echo STAGE=source-identity EXIT=\${identity_rc}
-if [ \"\$identity_rc\" -ne 0 ]; then exit 1; fi
+echo SOURCE_HEAD=${SOURCE_HEAD}
+prepare_compile_inputs '${SOURCE_PATHS}' '${SOURCE_CONTENT}' || exit 1
 run_fmt; echo STAGE=fmt EXIT=\$?; \
 cargo clippy --locked -j ${BUILD_JOBS} --all-targets -- -D warnings; echo STAGE=clippy EXIT=\$?; \
 ${lib_stage} ${integration_stage} ${golden_regen_stage} ${golden_stage} ${docs_truth_stage} \

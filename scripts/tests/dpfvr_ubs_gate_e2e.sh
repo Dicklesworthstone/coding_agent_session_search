@@ -74,6 +74,7 @@ SH
     receipt="$proof_dir/complete.txt"
     cat > "$receipt" <<'RECEIPT'
 STAGE=source-identity EXIT=0
+STAGE=source-freshness EXIT=0
 STAGE=fmt EXIT=0
 STAGE=clippy EXIT=0
 STAGE=ubs EXIT=0
@@ -85,11 +86,11 @@ TEST_COUNT=goldens PASSED=20 BINARIES=2
 STAGE=goldens EXIT=0
 STAGE=job-complete EXIT=0
 RECEIPT
-    expected=(source-identity fmt clippy ubs lib-tests test-e2e_lexical_fail_open goldens job-complete)
+    expected=(source-identity source-freshness fmt clippy ubs lib-tests test-e2e_lexical_fail_open goldens job-complete)
     check_exit digits-and-positive-counts 0 bash "$gate" --verify-receipt "$receipt" 0 "${expected[@]}"
     check_exit transport-refusal 1 bash "$gate" --verify-receipt "$receipt" 103 "${expected[@]}"
     check_exit transport-timeout 1 bash "$gate" --verify-receipt "$receipt" 124 "${expected[@]}"
-    for stage in source-identity fmt clippy ubs lib-tests test-e2e_lexical_fail_open goldens job-complete; do
+    for stage in source-identity source-freshness fmt clippy ubs lib-tests test-e2e_lexical_fail_open goldens job-complete; do
         awk -v stage="$stage" '$0 != "STAGE=" stage " EXIT=0"' "$receipt" > "$proof_dir/missing-$stage.txt"
         check_exit "missing-$stage" 1 bash "$gate" --verify-receipt "$proof_dir/missing-$stage.txt" 0 "${expected[@]}"
         awk -v stage="$stage" '{if ($0 == "STAGE=" stage " EXIT=0") print "STAGE=" stage " EXIT=1"; else print}' \
@@ -121,6 +122,40 @@ RECEIPT
     { cat "$proof_dir/tests-positive.txt"; echo 'test result: FAILED. 1 passed; 1 failed;'; } > "$proof_dir/tests-failed.txt"
     check_exit positive-and-failed-binary 1 bash "$gate" --verify-test-log "$proof_dir/tests-failed.txt"
     check_exit repeated-integration-target 2 bash "$gate" --integration 'e2e_lexical_fail_open:a,e2e_lexical_fail_open:b'
+
+    # Exercise actual source admission and filesystem timestamps, without
+    # invoking or substituting Cargo. An old build-script fingerprint must
+    # become older than its verified input while the input bytes stay exact.
+    mkdir -p "$proof_dir/inputs/src with spaces"
+    printf 'fn main() {}\n' > "$proof_dir/inputs/build.rs"
+    printf 'pub fn value() -> u8 { 1 }\n' > "$proof_dir/inputs/src with spaces/lib.rs"
+    input_paths="$(printf '%s\0' "$proof_dir/inputs/build.rs" \
+        "$proof_dir/inputs/src with spaces/lib.rs" | gzip -c | base64 -w0)"
+    input_digest="$(printf '%s' "$input_paths" | base64 -d | gzip -d | \
+        xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1)"
+    touch -t 200001010000 "$proof_dir/inputs/build.rs" "$proof_dir/inputs/src with spaces/lib.rs"
+    printf 'retained Cargo fingerprint\n' > "$proof_dir/old-fingerprint"
+    touch -t 200001020000 "$proof_dir/old-fingerprint"
+    check_exit old-inputs-refreshed 0 bash "$gate" --verify-compile-inputs "$input_paths" "$input_digest"
+    check_exit build-script-newer-than-cache 0 test "$proof_dir/inputs/build.rs" -nt "$proof_dir/old-fingerprint"
+    check_exit spaced-input-newer-than-cache 0 test "$proof_dir/inputs/src with spaces/lib.rs" -nt "$proof_dir/old-fingerprint"
+    refreshed_digest="$(printf '%s' "$input_paths" | base64 -d | gzip -d | \
+        xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1)"
+    check_exit refreshed-input-bytes-unchanged 0 test "$refreshed_digest" = "$input_digest"
+
+    printf 'fn main() { panic!("drift"); }\n' > "$proof_dir/inputs/build.rs"
+    touch -t 200001010000 "$proof_dir/inputs/build.rs"
+    check_exit changed-input-refused 1 bash "$gate" --verify-compile-inputs "$input_paths" "$input_digest"
+    check_exit changed-input-not-refreshed 0 test "$proof_dir/old-fingerprint" -nt "$proof_dir/inputs/build.rs"
+    check_exit changed-input-never-admitted 1 grep -q '^STAGE=source-freshness ' "$proof_dir/changed-input-refused.log"
+
+    # Preserve the fixture under another name; admission must not recreate it.
+    mv "$proof_dir/inputs/build.rs" "$proof_dir/inputs/build.rs.retained"
+    check_exit missing-input-refused 1 bash "$gate" --verify-compile-inputs "$input_paths" "$input_digest"
+    check_exit missing-input-not-created 1 test -e "$proof_dir/inputs/build.rs"
+    check_exit missing-input-never-admitted 1 grep -q '^STAGE=source-freshness ' "$proof_dir/missing-input-refused.log"
+    empty_digest="$(printf '' | sha256sum | cut -d' ' -f1)"
+    check_exit malformed-input-list-refused 1 bash "$gate" --verify-compile-inputs 'not-base64!' "$empty_digest"
     echo "Batched gate parser: PASS=$pass FAIL=$fail fixtures=$proof_dir"
     [ "$fail" -eq 0 ]
     exit $?
