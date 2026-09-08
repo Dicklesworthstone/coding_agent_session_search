@@ -585,7 +585,8 @@ mod devin_ingestion {
             .into_iter()
             .map(|suffix| {
                 let path = std::path::PathBuf::from(format!("{}{suffix}", db.display()));
-                path.exists().then(|| fs::read(path).expect("source bundle bytes"))
+                path.exists()
+                    .then(|| fs::read(path).expect("source bundle bytes"))
             })
             .collect()
     }
@@ -675,7 +676,10 @@ mod devin_ingestion {
                 let now = chrono::Utc::now().timestamp();
                 conn.execute_compat(
                     "INSERT INTO message_nodes VALUES (8, 'kept', 5, ?1, ?2)",
-                    params![json!({"role":"user", "content":"devinneedle followup"}).to_string(), now],
+                    params![
+                        json!({"role":"user", "content":"devinneedle followup"}).to_string(),
+                        now
+                    ],
                 )
                 .expect("append provider turn");
                 conn.execute_compat(
@@ -683,7 +687,12 @@ mod devin_ingestion {
                     params![now],
                 )
                 .expect("advance provider main chain");
-                assert!(fs::metadata(db.with_extension("db-wal")).expect("live WAL").len() > 32);
+                assert!(
+                    fs::metadata(db.with_extension("db-wal"))
+                        .expect("live WAL")
+                        .len()
+                        > 32
+                );
                 source_writer = Some(conn);
                 before = source_bundle_bytes(&db);
             }
@@ -722,7 +731,11 @@ mod devin_ingestion {
                     db.join("kept").to_string_lossy().as_ref()
                 );
             }
-            assert_eq!(source_bundle_bytes(&db), before, "source bundle changed in round {round}");
+            assert_eq!(
+                source_bundle_bytes(&db),
+                before,
+                "source bundle changed in round {round}"
+            );
         }
         drop(source_writer);
     }
@@ -760,10 +773,16 @@ mod devin_ingestion {
 
         let missing = home.path().join("missing.db");
         assert!(DevinConnector::extract_from_sqlite(&missing, None).is_err());
-        assert!(!missing.exists(), "read-only missing store must not be created");
+        assert!(
+            !missing.exists(),
+            "read-only missing store must not be created"
+        );
         let corrupt = home.path().join("corrupt.db");
         fs::write(&corrupt, b"invalid provider database").expect("corrupt fixture");
         assert!(DevinConnector::extract_from_sqlite(&corrupt, None).is_err());
-        assert_eq!(fs::read(corrupt).expect("corrupt source preserved"), b"invalid provider database");
+        assert_eq!(
+            fs::read(corrupt).expect("corrupt source preserved"),
+            b"invalid provider database"
+        );
     }
 }
