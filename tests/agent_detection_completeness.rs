@@ -500,18 +500,18 @@ mod devin_ingestion {
             "BEGIN;
              CREATE TABLE sessions (
                  id TEXT PRIMARY KEY, title TEXT, working_directory TEXT,
-                 model TEXT, agent_mode TEXT, created_at REAL,
-                 last_activity_at REAL, main_chain_id INTEGER, hidden INTEGER
+                 model TEXT, agent_mode TEXT, created_at INTEGER,
+                 last_activity_at INTEGER, main_chain_id INTEGER,
+                 hidden INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE message_nodes (
-                 session_id TEXT, node_id INTEGER, parent_node_id INTEGER,
-                 chat_message TEXT, created_at REAL,
-                 PRIMARY KEY (session_id, node_id)
+                 node_id INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
+                 parent_node_id INTEGER, chat_message TEXT, created_at INTEGER
              );
              INSERT INTO sessions VALUES
                  ('kept', 'Devin branch repair', '/work/devin', 'model', 'agent',
                   1700000000, 1700000060, 5, 0),
-                 ('hidden', 'Retired', NULL, NULL, NULL, 1700000000, 1700000060, 1, 1),
+                 ('hidden', 'Retired', NULL, NULL, NULL, 1700000000, 1700000060, 7, 1),
                  ('empty', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0);
              COMMIT;",
         )
@@ -559,23 +559,35 @@ mod devin_ingestion {
             ),
             (
                 "hidden",
-                1,
+                7,
                 None,
                 json!({"role":"user", "content":"excludedhiddensession"}),
             ),
         ] {
             conn.execute_compat(
-                "INSERT INTO message_nodes VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO message_nodes
+                 (session_id, node_id, parent_node_id, chat_message, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     session,
                     id,
                     parent,
                     message.to_string(),
-                    1_700_000_000.0 + f64::from(id)
+                    1_700_000_000_i64 + i64::from(id)
                 ],
             )
             .expect("insert Devin message node");
         }
+    }
+
+    fn source_bundle_bytes(db: &Path) -> Vec<Option<Vec<u8>>> {
+        ["", "-wal", "-shm"]
+            .into_iter()
+            .map(|suffix| {
+                let path = std::path::PathBuf::from(format!("{}{suffix}", db.display()));
+                path.exists().then(|| fs::read(path).expect("source bundle bytes"))
+            })
+            .collect()
     }
 
     fn cass(home: &Path, data: &Path) -> assert_cmd::Command {
@@ -653,10 +665,34 @@ mod devin_ingestion {
         let db = home.path().join("sessions.db");
         let data = home.path().join("cass-data");
         seed_store(&db);
-        let before = fs::read(&db).expect("source bytes");
-        for _ in 0..2 {
+        let mut before = source_bundle_bytes(&db);
+        let mut source_writer = None;
+        for round in 0..4 {
+            if round == 2 {
+                let conn = Connection::open(db.to_string_lossy().as_ref()).expect("Devin writer");
+                conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+                    .expect("live WAL store");
+                let now = chrono::Utc::now().timestamp();
+                conn.execute_compat(
+                    "INSERT INTO message_nodes VALUES (8, 'kept', 5, ?1, ?2)",
+                    params![json!({"role":"user", "content":"devinneedle followup"}).to_string(), now],
+                )
+                .expect("append provider turn");
+                conn.execute_compat(
+                    "UPDATE sessions SET main_chain_id = 8, last_activity_at = ?1 WHERE id = 'kept'",
+                    params![now],
+                )
+                .expect("advance provider main chain");
+                assert!(fs::metadata(db.with_extension("db-wal")).expect("live WAL").len() > 32);
+                source_writer = Some(conn);
+                before = source_bundle_bytes(&db);
+            }
             cass(home.path(), &data)
-                .args(["index", "--full", "--json"])
+                .args(if round < 2 {
+                    vec!["index", "--full", "--json"]
+                } else {
+                    vec!["index", "--json"]
+                })
                 .assert()
                 .success();
             let output = cass(home.path(), &data)
@@ -678,7 +714,7 @@ mod devin_ingestion {
                 .clone();
             let result: Value = serde_json::from_slice(&output).expect("search JSON");
             let hits = result["hits"].as_array().expect("search hits");
-            assert_eq!(hits.len(), 4, "{result}");
+            assert_eq!(hits.len(), if round < 2 { 4 } else { 5 }, "{result}");
             for hit in hits {
                 assert_eq!(hit["agent"], "devin");
                 assert_eq!(
@@ -686,7 +722,48 @@ mod devin_ingestion {
                     db.join("kept").to_string_lossy().as_ref()
                 );
             }
-            assert_eq!(fs::read(&db).expect("source after indexing"), before);
+            assert_eq!(source_bundle_bytes(&db), before, "source bundle changed in round {round}");
         }
+        drop(source_writer);
+    }
+
+    #[test]
+    fn devin_reads_older_nullable_schema_and_rejects_unreadable_stores() {
+        use franken_agent_detection::connectors::devin::DevinConnector;
+
+        let home = tempfile::tempdir().expect("isolated source stores");
+        let db = home.path().join("sessions.db");
+        let conn = Connection::open(db.to_string_lossy().as_ref()).expect("older Devin store");
+        conn.execute_batch(
+            r#"CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, title TEXT, working_directory TEXT,
+                model TEXT, agent_mode TEXT, created_at INTEGER,
+                last_activity_at INTEGER, main_chain_id INTEGER
+             );
+             CREATE TABLE message_nodes (
+                node_id INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
+                parent_node_id INTEGER, chat_message TEXT, created_at INTEGER
+             );
+             INSERT INTO sessions VALUES ('legacy', NULL, NULL, NULL, NULL, NULL, NULL, 1);
+             INSERT INTO message_nodes VALUES
+                (1, 'legacy', NULL, '{"role":"user","content":"older Devin turn"}', 1700000000);"#,
+        )
+        .expect("older schema without hidden column");
+        drop(conn);
+        let before = source_bundle_bytes(&db);
+        let conversations = DevinConnector::extract_from_sqlite(&db, None).expect("older scan");
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].title.as_deref(), Some("older Devin turn"));
+        assert_eq!(conversations[0].workspace, None);
+        assert_eq!(conversations[0].started_at, Some(1_700_000_000_000));
+        assert_eq!(source_bundle_bytes(&db), before);
+
+        let missing = home.path().join("missing.db");
+        assert!(DevinConnector::extract_from_sqlite(&missing, None).is_err());
+        assert!(!missing.exists(), "read-only missing store must not be created");
+        let corrupt = home.path().join("corrupt.db");
+        fs::write(&corrupt, b"invalid provider database").expect("corrupt fixture");
+        assert!(DevinConnector::extract_from_sqlite(&corrupt, None).is_err());
+        assert_eq!(fs::read(corrupt).expect("corrupt source preserved"), b"invalid provider database");
     }
 }
