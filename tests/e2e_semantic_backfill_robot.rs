@@ -77,8 +77,8 @@ fn seed_zero_doc_first_canonical_db(db_path: &Path) -> TestResult {
     Ok(())
 }
 
-fn robot_backfill_command(data_dir: &Path, db_path: &Path) -> assert_cmd::Command {
-    let mut command = cargo_bin_cmd!("cass");
+fn robot_backfill_process(data_dir: &Path, db_path: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
     command
         .args([
             "models",
@@ -96,8 +96,13 @@ fn robot_backfill_command(data_dir: &Path, db_path: &Path) -> assert_cmd::Comman
         .arg(db_path)
         .arg("--json")
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .env("RUST_MIN_STACK", "134217728")
-        .timeout(Duration::from_secs(20));
+        .env("RUST_MIN_STACK", "134217728");
+    command
+}
+
+fn robot_backfill_command(data_dir: &Path, db_path: &Path) -> assert_cmd::Command {
+    let mut command = assert_cmd::Command::from_std(robot_backfill_process(data_dir, db_path));
+    command.timeout(Duration::from_secs(20));
     command
 }
 
@@ -302,13 +307,12 @@ fn robot_models_backfills_exclude_each_other_until_the_owner_finishes() -> TestR
     );
     // Opening the real JSONL sink waits for its reader. This holds an actual
     // backfill at a deterministic boundary, without an artificial sleep hook.
-    let mut command = robot_backfill_command(&data_dir, &db_path);
+    let mut command = robot_backfill_process(&data_dir, &db_path);
     command
         .env("CASS_SEMANTIC_PROGRESS_JSONL", &fifo)
         .env("CASS_INDEX_RUN_LOCK_HEARTBEAT_EVERY_MS", "20");
     let mut owner = BackfillChild(
         command
-            .as_std_mut()
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?,
