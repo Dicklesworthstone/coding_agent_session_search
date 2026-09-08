@@ -394,14 +394,15 @@ Integration and E2E tests live in the `tests/` directory. Benchmarks live in `be
 
 ### Unit Tests
 
-> **Stack floor:** always run tests with `RUST_MIN_STACK=16777216`. fsqlite
-> 0.3.x's async engine builds deep debug-mode futures and the default 2 MiB
-> test-thread stack overflows in storage-touching unit tests (SIGABRT with
-> "has overflowed its stack"). CI sets this workflow-wide.
+> **Test stack:** use `RUST_MIN_STACK=134217728`, matching `.cargo/config.toml`
+> and `scripts/gate.sh`. fsqlite 0.3.x's deep debug-mode futures have exceeded
+> even a 16 MiB test-thread stack in storage tests. The 128 MiB setting reserves
+> virtual address space; pages are committed as needed. Do not override it with
+> the older 16 MiB value when running the full suite.
 
 ```bash
 # Run all tests
-rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-test-target RUST_MIN_STACK=16777216 cargo test
+rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-test-target RUST_MIN_STACK=134217728 cargo test
 
 # Run with output
 rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-test-target cargo test -- --nocapture

@@ -362,11 +362,13 @@ run_ubs ${UBS_FILES_ARG}; echo STAGE=ubs EXIT=\$?; echo STAGE=job-complete EXIT=
 EXPECTED_STAGES+=(ubs job-complete)
 
 run_once() {
+    # Match .cargo/config.toml: storage futures have exceeded a 16 MiB stack.
+    # This is virtual address reservation; pages are committed as needed.
     if [ "$LOCAL" = 1 ]; then
-        env CARGO_TARGET_DIR="$TARGET_DIR" RUST_MIN_STACK=16777216 UBS_MODULE_TIMEOUT="$UBS_TIMEOUT" bash -c "$REMOTE_SCRIPT"
+        env CARGO_TARGET_DIR="$TARGET_DIR" RUST_MIN_STACK=134217728 UBS_MODULE_TIMEOUT="$UBS_TIMEOUT" bash -c "$REMOTE_SCRIPT"
         return $?
     fi
-    RCH_REQUIRE_REMOTE=1 rch exec --job --result-dir tests/golden -- env CARGO_TARGET_DIR="$TARGET_DIR" RUST_MIN_STACK=16777216 UBS_MODULE_TIMEOUT="$UBS_TIMEOUT" bash -c "$REMOTE_SCRIPT"
+    RCH_REQUIRE_REMOTE=1 rch exec --job --result-dir tests/golden -- env CARGO_TARGET_DIR="$TARGET_DIR" RUST_MIN_STACK=134217728 UBS_MODULE_TIMEOUT="$UBS_TIMEOUT" bash -c "$REMOTE_SCRIPT"
 }
 
 # The receipt survives a RED run for post-mortem (GATE_RECEIPT_FILE overrides).
