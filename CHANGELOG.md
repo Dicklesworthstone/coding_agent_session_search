@@ -15,12 +15,107 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ---
 
+Scope window: this update covers the changes after the 2026-08-31 v0.7.1
+binary release, through the 0.8.0 release candidate. Earlier version entries
+retain their existing scope. Git commits, release metadata, and Beads supply
+the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
+
+## Release Timeline
+
+| Version | Date | Publication state |
+|---------|------|-------------------|
+| 0.8.0 | Pending | Release preparation; no tag or published binaries yet |
+| [v0.7.1](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.7.1) | 2026-08-31 | Published GitHub Release and binary baseline for the changes below |
+
 ## [Unreleased]
 
-Reality-check bridge work (see `docs/planning/REALITY_CHECK_AND_BRIDGE_PLAN_2026-09-01.md`).
-Everything below is on `main`; nothing is in a released binary yet.
+## [v0.8.0] -- Unreleased
+
+Indexing, archive diagnostics, answer packs, maintenance commands, and dependency
+updates from the reality-check bridge work. Existing archive corruption and
+mixed-engine concurrent-WAL safety remain outside this release's repair claims.
+
+### Delivered capability and evidence
+
+**Maintenance commands and indexing.** Bookmarks and encrypted Pages key
+management are reachable from the CLI. Targeted lexical reconciliation repairs
+one conversation, while resume reconciliation and maintenance heartbeats make
+interrupted indexing easier to recover and diagnose. Representative commits:
+[bookmarks](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/b4b792899803300f5202c83c03aa12b991384221),
+[single-conversation reconcile](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/20970d4d00bfb45a5f45d43b19978c49a9074b6c),
+[maintenance heartbeats](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/81ea0649c588972ece48c9a05584d9b4ddf7b837),
+and [Pages keys, diagnostics, and installer changes](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/5f05938484b7613cb531088453f43e94c4d4b9ec).
+
+**Connector and semantic reliability.** Muse sessions gain an adapter; remote
+probe/install commands use file-backed stdin; interrupted Pages publication
+recovery takes the output lock. ANN descriptors no longer depend on FSVI WAL
+identity, and zero-norm hash embeddings recover to usable vectors. Representative
+commits: [Muse](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/9a1da8e95008038a37aa5edb082ab820f238b2a1),
+[remote stdin](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/fb8d93a48b0cf83a98ea973b4c427878da831a38),
+[Pages recovery lock](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/b0e1f216b76704b88e7e3e49baead24e9a42cf0f),
+[ANN identity](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/59aab8926e9d0815360793fbe9864e47ab6c4b7b),
+and [hash-vector recovery](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/3375db2375d1966229d25a55adcb132a5f5c92e5).
+
+**Archive pressure and truthful readiness.** Background refresh backs off after
+failed attempts, derived FTS work has time/message limits, and final WAL
+checkpoints have deadlines. A matching archive fingerprint covers age-only
+staleness; missing proof remains unknown, and deferred integrity checks say so.
+These changes bound CASS's work and reporting; they do not certify recovery of
+an already damaged archive. Representative commits:
+[refresh backoff](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/2651e3631441bb06c9e77ad41f9069bc14bcf39c),
+[FTS budgets](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/f5625f734dfbd095054c1b8157c7beb26641e23a),
+[message-count limit](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/f5a7c0ec64f8535b36db0652d27cd702150365eb),
+[checkpoint deadline](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/b06ba9d0ec16eab6b559231d5210b3d1511fab64),
+[age-only staleness](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/6a3985356b4a4739230d469cb19c48f31ec034ee),
+and [deferred integrity status](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/63d472934856de7154680f3439b904852353029a).
+
+**Answer-pack contracts and path isolation.** Packs verify citations against
+ingested redacted text, bind IDs to verified spans, preserve literal excerpts
+in Markdown, and admit output against its serialized token budget. Explicit
+field/skill-content controls join those contracts. Full indexing ignores saved
+incremental cutoffs, and model backfill resolves archive and asset overrides
+together. Representative commits:
+[serialized budget](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/8ac7ee2b7018c08cc23f9999d3e37b62a0b542ad),
+[citation verification](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/73ad6e5a51352d78dab52c88b6934ec65404a99d),
+[pack controls](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ce2b00896470ce5982b855c56c62b32e1bbec9d6),
+[full-scan cutoffs](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/aba176bab4157d8b185ffe08b17f3dfb227f2b01),
+and [backfill paths](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/bcaaf31a0bf3412f2d2891783004e062382dbb1e).
+
+**Engine and connector adoption.** The complete FrankenSQLite family reaches
+0.3.18; FrankenSearch 0.4.3/Quill 0.2.3 uses receipt-aged segment collection;
+Asupersync 0.4.10 supplies its runtime API. Franken Agent Detection 0.2.3 expands
+Antigravity/Claude discovery, and CASS routes enabled adapters through watch and
+quarantine retry paths. Representative commits:
+[FrankenSQLite](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/3babc08bc550f3137041fd13e5db87f722cbd3a4),
+[FrankenSearch](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/6fb902063b56be2e9cbe9e29ef7b176ce7133a7e),
+[runtime and connector routing](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/257204c8d27d21fdca860bb6e79ad5d58cc29a69),
+and [recovery identity quarantine](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/b8e233735fd00fbcae05685d1d0752e6c2d6d280).
+
+**Incomplete search generations and merge memory.** The latest main change
+compares the live Quill document count with the completed checkpoint, reports
+a severely depleted generation as `hollow`, and refuses to certify it at the
+end of indexing. Merge planning charges both input bytes and the covered
+document-ID range against a 1 GiB default output estimate. This bounds planned
+merge outputs, not total process RSS. See the
+[implementation](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/6b2ab22d30892fe6f7762d851477feea0e6f80f8),
+[hollow-index report #457](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/457),
+and [memory report #456](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/456).
+
+### Workstreams and acceptance
+
+Closed workstreams include
+[targeted reconcile (`qhiv2`)](https://github.com/Dicklesworthstone/coding_agent_session_search/blob/dbe940c7d61d33d2f3ac4880e32d39d6fc4b620c/.beads/issues.jsonl#L1688),
+[Pages key CLI (`ctigq`)](https://github.com/Dicklesworthstone/coding_agent_session_search/blob/dbe940c7d61d33d2f3ac4880e32d39d6fc4b620c/.beads/issues.jsonl#L1124),
+and [persistent fingerprint caching (`nsleh`)](https://github.com/Dicklesworthstone/coding_agent_session_search/blob/dbe940c7d61d33d2f3ac4880e32d39d6fc4b620c/.beads/issues.jsonl#L1595).
+The [answer-pack conformance workstream](https://github.com/Dicklesworthstone/coding_agent_session_search/blob/dbe940c7d61d33d2f3ac4880e32d39d6fc4b620c/.beads/issues.jsonl#L369)
+and [release acceptance](https://github.com/Dicklesworthstone/coding_agent_session_search/blob/dbe940c7d61d33d2f3ac4880e32d39d6fc4b620c/.beads/issues.jsonl#L878)
+remain open at this research snapshot. Landed code and targeted tests do not
+mean that every acceptance row, platform, or reporter archive has been verified.
 
 ### Added
+- Muse AI sessions can be discovered and indexed through the connector registry.
+- A targeted, idempotent lexical reconciliation path replaces one conversation's
+  search documents from its canonical archive rows without rebuilding the corpus.
 - `cass pack --field-mask` selects the existing field projection, including the
   documented `standard` and `full` presets. `--fields` accepts the same presets.
 - `cass pack --include-skill-content` explicitly includes skill payload excerpts
@@ -41,7 +136,8 @@ Everything below is on `main`; nothing is in a released binary yet.
 - Robot/JSON mode prints every argument auto-correction as
   `note: auto-corrected: …` on stderr (stdout stays data-only).
 - `scripts/gate.sh`: the blocking quality gate batched into one rch admission with
-  per-stage receipts, until the GitHub workflows are re-enabled.
+  per-stage receipts, pinned UBS, and positive test-count requirements. Release
+  preparation runs these checks remotely; this release does not use GitHub Actions.
 - `cass pages key list|add-password|add-recovery|revoke|rotate --archive <bundle>`:
   key-slot management for exported encrypted bundles over the previously uncalled
   key-management engine; passwords via prompt or `--password-stdin`, never argv;
@@ -80,6 +176,10 @@ Everything below is on `main`; nothing is in a released binary yet.
 ### Fixed
 - Route every enabled connector through filesystem watching and quarantine
   retries, including Prime Agent, Kiro, Devin, OpenHands, Goose, Crush, and Hermes.
+  This completes CASS's dispatch adapters; it does not enable FAD's optional
+  `devin` feature, which remains outside the selected dependency features.
+- HTML export and robot diagnostics use specific Prime Agent, Kiro, and Devin
+  identities instead of generic provider labels.
 - Make the release formatting gate fail when rustfmt aborts or is killed.
 - Register the FTS shadow viability startup phase so watch indexing reaches the
   scan instead of panicking during preflight.
@@ -91,6 +191,14 @@ Everything below is on `main`; nothing is in a released binary yet.
 - Keep `cass --version` parseable as a plain semantic version.
 - Extract repository lessons lazily when pack evidence actually references a
   known commit or closed bead, avoiding that work for unrelated evidence.
+- Defer pack Git-history traversal until an explicit identifier needs it. The
+  deferred lookup uses the HEAD captured when the query's correlation index was
+  constructed, so a concurrent commit cannot change its view.
+- `cass models backfill` honors `--data-dir` and `--db` when choosing the archive
+  and publishing semantic assets, including separate archive/asset directories.
+- An old index with a matching archive fingerprint remains ready; age alone no
+  longer forces a refresh. Missing timestamps or fingerprint mismatches still
+  report the appropriate incomplete/stale state (GH #452).
 - Search keeps serving a readable lexical generation when duplicate fallback
   FTS schema rows prevent archive fingerprinting. Schema repair remains on
   the indexing path.
@@ -110,7 +218,8 @@ Everything below is on `main`; nothing is in a released binary yet.
   their connector-specific timestamps.
 - Search hydrates message IDs using validated integer literals, avoiding the
   FrankenSQLite parameterized-`IN` query shape that could return no message
-  bodies even when Quill found matching documents (`6057b8e4`).
+  bodies even when Quill found matching documents
+  ([hydration fix](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/6057b8e4ab8768052ae5321ede03413b4cac2e7e)).
 - Answer packs verify citations against ingested, redacted source messages,
   bind evidence IDs to the verified spans, and retain the same excerpts across
   JSON and Markdown projections. Whole-message skill and hook injections are
@@ -177,22 +286,18 @@ Everything below is on `main`; nothing is in a released binary yet.
   `degraded_reason_codes`) when the deep page-integrity probe was deferred, so
   an agent no longer reads a `healthy` status on a large archive as "the
   archive is verified"; `status`/`healthy` keep their fail-count contract.
-- Indexing a large archive no longer stalls "at a batch boundary" with one core
-  pegged and no I/O (GH #413): every `INSERT INTO fts_messages` statement was
+- Avoid a per-statement FTS savepoint clone in batch inserts (GH #413).
+  On the earlier engine, every `INSERT INTO fts_messages` statement was
   making frankensqlite deep-clone the whole in-memory FTS5 table for its
   per-statement savepoint (O(table) per statement, a ~35 GB transient at
   538k rows). The batch insert now skips the statement savepoint; the batch
-  transaction remains the rollback boundary. The per-transaction clone is an
-  engine issue (frankensqlite#405).
-- `cass doctor --recover-from-archive` no longer aborts at the first canonical
-  row whose stored type disagrees with the schema (GH #391: `listing
-  conversations at offset 0: type mismatch: expected text, got integer` on a
-  page-aliased archive). The export now pages by `id`, coerces numeric/blob
-  values found in `TEXT` columns (reported per session as `coercions`), records
-  a row whose `id` is unreadable instead of failing (`rows_unreadable`,
-  `rows_coerced` in the JSON envelope), and treats a failed total count as
-  reporting-only. Conversations whose message pages are themselves damaged are
-  still recorded as `reconstruct failed` and skipped.
+  transaction remains the rollback boundary. The adopted engine also includes
+  the upstream FTS savepoint undo-log fix. This is not a guarantee that every
+  reported large-archive stall is resolved.
+- Archive recovery pages by `id`, records unreadable IDs and failed message
+  reconstruction, and continues when a total-count query fails. Identity-column
+  type violations are quarantined as described above; recovery no longer
+  coerces those fields into apparently valid session identities (GH #391).
 - Antigravity source presets recognize the IDE store (GH #454). The default
   source presets, `cass resume` agent detection, and the docs now cover the
   IDE store `~/.gemini/antigravity/` alongside the `agy` CLI store
@@ -204,8 +309,7 @@ Everything below is on `main`; nothing is in a released binary yet.
 
 ### Changed
 - `asupersync` is pinned to crates.io `=0.4.10`, which publishes the
-  `Cx::is_cancelled` API required by FrankenSearch 0.4.3. The registry archive
-  contains that API; the earlier claim that it was unpublished was incorrect.
+  `Cx::is_cancelled` API required by FrankenSearch 0.4.3.
 - `frankensearch` is pinned to `=0.4.3` (Quill `0.2.3`). Segment collection
   clocks the 300 s grace period from each retirement receipt, allowing
   `cass index --gc` to reclaim old folded inputs while newer generations
@@ -234,7 +338,8 @@ Everything below is on `main`; nothing is in a released binary yet.
   whose frankensqlite writable path loops (GH #382) the run no longer hangs
   after a successful publish; the WAL is left for the next opener and a
   warning names the remedy. The loop itself is fixed upstream in frankensqlite
-  `8d012706a`, included in the `0.3.18` engine consumed here.
+  [the WAL-tail indexing fix](https://github.com/Dicklesworthstone/frankensqlite/commit/8d012706a),
+  included in the `0.3.18` engine consumed here.
 - The TUI analytics dashboard's load task is one production function with the
   detached-rebuild spawn injected (`load_chart_data_with_auto_rebuild`); the
   test-only stub that returned canned data is gone, and unit tests prove that
@@ -255,11 +360,13 @@ Everything below is on `main`; nothing is in a released binary yet.
 - The post-publish FTS shadow rebuild ticks the stall watchdog per page (GH #439).
 - `#![deny(unsafe_code)]` outside tests with scoped, commented allows on the
   audited FFI/env sites.
+- The Rust toolchain is pinned to `nightly-2026-08-31`.
 - README and AGENTS.md corrected against the code (schema v20, key bindings, dedup
   keys, `--timeout` semantics, swarm fixture-only status, export flags, installer and
   self-update reality, hidden subcommands documented).
 
-### Fixed
+### Validation and documentation
+
 - `main` compiled again after a stale renamed constant left by concurrent edits
   (`CASS_QUILL_QUERY_FUEL_BUDGET_ENV`).
 - Golden tests no longer absorb a host's real Pi Agent sessions. The writer was
@@ -276,6 +383,16 @@ Everything below is on `main`; nothing is in a released binary yet.
   HTML output that search does not have; only `**bold**` markers exist.
 - The unreachable `Alt+W => swarm cockpit` key arm (shadowed by the documented
   workspace-filter palette) was removed.
+- Connector/index fixtures use explicit roots and child-process environments,
+  reducing process-global environment leakage. The explicit Docker SFTP test
+  requires the native transport and exact transferred file bytes; unavailable
+  Docker or failed setup cannot count as a successful transfer.
+- Rust tests use the repository's 128 MiB stack reservation. The gate rejects
+  rustfmt termination, missing terminal receipts, and zero-test selections.
+- Release validation is still in progress. Existing targeted passes do not
+  constitute a full-suite or four-platform release verdict; strict UBS remains
+  blocking, and full-history pack latency has not met its unchanged SLO on the
+  retained loaded-host run. No performance improvement is certified here.
 
 ## [v0.7.1] -- 2026-08-31
 
@@ -2554,7 +2671,9 @@ Initial development. Project scaffolding, architecture design, and first impleme
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.7.1...main
+[v0.8.0]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.7.1...main
+[v0.7.1]: https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.7.1
 [v0.7.0]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.6.26...1f6cdcf9
 [v0.6.25]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.6.24...v0.6.25
 [v0.6.24]: https://github.com/Dicklesworthstone/coding_agent_session_search/compare/v0.6.23...v0.6.24
