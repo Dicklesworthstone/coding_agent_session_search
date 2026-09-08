@@ -435,7 +435,13 @@ fn robot_models_backfill_keeps_archive_and_assets_scoped_to_path_overrides() -> 
 
         let mut command = cargo_bin_cmd!("cass");
         command.args([
-            "models", "backfill", "--tier", "fast", "--embedder", "hash", "--json",
+            "models",
+            "backfill",
+            "--tier",
+            "fast",
+            "--embedder",
+            "hash",
+            "--json",
         ]);
         if explicit_data_dir {
             command.arg("--data-dir").arg(&data_dir);

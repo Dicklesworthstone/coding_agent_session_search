@@ -80,6 +80,13 @@ fn isolated_search_demo_data(test_home: &Path) -> Result<PathBuf, Box<dyn Error>
             fs::copy(entry.path(), &dst)?;
         }
     }
+    // Structured pack is read-only and requires current lexical metadata.
+    // Publish the copied archive through the normal maintenance command first.
+    cass_cmd(test_home)
+        .args(["index", "--full", "--json", "--data-dir"])
+        .arg(&dst_root)
+        .assert()
+        .success();
     // Exercise the same publication path that build-hnsw consumes, including
     // its semantic manifest. Legacy vector files alone are not a publication.
     cass_cmd(test_home)

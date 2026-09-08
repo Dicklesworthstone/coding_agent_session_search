@@ -205,7 +205,9 @@ fn check() -> Result<(), String> {
             |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
         )
         .map_err(|e| e.to_string())?;
-    let next_idx = last_idx.checked_add(1).ok_or("fixture message index overflow")?;
+    let next_idx = last_idx
+        .checked_add(1)
+        .ok_or("fixture message index overflow")?;
     storage
         .raw()
         .execute_compat(

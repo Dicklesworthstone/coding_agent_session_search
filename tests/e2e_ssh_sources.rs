@@ -92,7 +92,7 @@ impl DockerSshServer {
             .parent()
             .ok_or_else(|| "Invalid dockerfile path".to_string())?;
 
-        let build_status = Command::new("docker")
+        let build_output = Command::new("docker")
             .args([
                 "build",
                 "-t",
@@ -103,11 +103,14 @@ impl DockerSshServer {
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            .status()
+            .output()
             .map_err(|e| format!("Failed to run docker build: {e}"))?;
 
-        if !build_status.success() {
-            return Err("Docker build failed".to_string());
+        if !build_output.status.success() {
+            return Err(format!(
+                "Docker build failed: {}",
+                String::from_utf8_lossy(&build_output.stderr)
+            ));
         }
 
         // Find an available port
@@ -120,7 +123,7 @@ impl DockerSshServer {
                 "-d",
                 "--rm",
                 "-p",
-                &format!("{}:22", host_port),
+                &format!("127.0.0.1:{}:22", host_port),
                 "-e",
                 &format!("SSH_AUTHORIZED_KEY={}", pub_key.trim()),
                 "cass-ssh-test",
@@ -297,7 +300,7 @@ fn create_ssh_config(config_dir: &Path, host_alias: &str, port: u16, identity_fi
 
     let config_content = format!(
         r#"Host {host_alias}
-    HostName localhost
+    HostName 127.0.0.1
     User root
     Port {port}
     IdentityFile {identity_file}
@@ -547,22 +550,13 @@ fn ssh_sources_provenance_tracking() {
 #[test]
 #[ignore] // Requires Docker
 fn ssh_sources_sync_sftp_fallback() {
-    if !docker_available() {
-        eprintln!("Skipping test: Docker not available");
-        return;
-    }
+    assert!(docker_available(), "explicit SFTP test requires Docker");
 
     let tracker = tracker_for("ssh_sources_sync_sftp_fallback");
 
     // Start Docker SSH server
     let start = tracker.start("docker_start", Some("Start Docker SSH server"));
-    let server = match DockerSshServer::start() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Failed to start Docker SSH server: {e}");
-            return;
-        }
-    };
+    let server = DockerSshServer::start().expect("start real SSH server for SFTP");
     tracker.end("docker_start", Some("Start Docker SSH server"), start);
 
     // Set up temp directories
@@ -578,7 +572,7 @@ fn ssh_sources_sync_sftp_fallback() {
     create_ssh_sources_config(
         &config_dir,
         "sftp-test",
-        &server.ssh_host(),
+        "sftp-test",
         server.port(),
         server.key_path(),
         &["/root/.claude/projects"],
@@ -586,18 +580,11 @@ fn ssh_sources_sync_sftp_fallback() {
 
     create_ssh_config(&home_dir, "sftp-test", server.port(), server.key_path());
 
-    // Override PATH to hide rsync, forcing SFTP fallback
+    // An empty PATH makes every external transport unavailable. The absolute
+    // remote path and explicit SSH config let the real ssh2 SFTP path run
+    // without shell helpers; no substituted transport can make this test pass.
     let fixture_bin = tmp.path().join("fixture_bin");
     fs::create_dir_all(&fixture_bin).unwrap();
-    let original_path = std::env::var("PATH").unwrap_or_default();
-    // Create a fixture rsync that always fails (forces SFTP fallback)
-    let fixture_rsync = fixture_bin.join("rsync");
-    fs::write(&fixture_rsync, "#!/bin/bash\nexit 1\n").unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&fixture_rsync, fs::Permissions::from_mode(0o755)).unwrap();
-    }
     tracker.end("setup", Some("Create temp directories and config"), start);
 
     // Run sources sync - should fall back to SFTP
@@ -607,14 +594,13 @@ fn ssh_sources_sync_sftp_fallback() {
     );
     let mut command = tracker.cass_assert_command();
     let output = command
-        .args(["sources", "sync", "--verbose"])
+        .args(["sources", "sync", "--json", "--no-index"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("XDG_DATA_HOME", &data_dir)
+        .env("CASS_DATA_DIR", &data_dir)
+        .env("CASS_SSH_CONFIG", home_dir.join(".ssh/config"))
         .env("HOME", &home_dir)
-        .env(
-            "PATH",
-            format!("{}:{}", fixture_bin.display(), original_path),
-        )
+        .env("PATH", &fixture_bin)
         .timeout(Duration::from_secs(120))
         .output()
         .expect("sources sync command");
@@ -627,34 +613,45 @@ fn ssh_sources_sync_sftp_fallback() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // Verify SFTP was used or sync completed via alternative method
     let start = tracker.start("verify_sftp", Some("Verify SFTP fallback was used"));
-
-    // Check for SFTP usage indicator in output
-    let used_sftp = stdout.to_lowercase().contains("sftp")
-        || stderr.to_lowercase().contains("sftp")
-        || stdout.contains("fallback");
-
-    // Even if output doesn't mention SFTP, check that files were synced
-    let mirror_dir = data_dir
-        .join("coding-agent-search")
-        .join("remotes")
-        .join("sftp-test")
-        .join("mirror");
-
-    let files_synced = mirror_dir.exists() && {
-        fs::read_dir(&mirror_dir)
-            .map(|rd| rd.count() > 0)
-            .unwrap_or(false)
-    };
-
-    // Test passes if SFTP was used or files were synced anyway
     assert!(
-        used_sftp || files_synced || output.status.success(),
-        "Expected SFTP fallback or successful sync. stdout: {}, stderr: {}",
+        output.status.success(),
+        "SFTP sync failed. stdout: {}, stderr: {}",
         stdout,
         stderr
     );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("sync JSON");
+    assert_eq!(result["status"], "complete", "{result}");
+    assert_eq!(result["sources_attempted"], 1, "{result}");
+    let reports = result["sources"].as_array().expect("source reports");
+    assert_eq!(reports.len(), 1, "{result}");
+    assert_eq!(reports[0]["source"], "sftp-test");
+    assert_eq!(reports[0]["method"], "sftp");
+    assert_eq!(reports[0]["transport_decision"]["chosen_transport"], "sftp");
+    assert_eq!(reports[0]["status"], "success", "{result}");
+    assert_eq!(reports[0]["total_files"], 2, "{result}");
+    let mirror = data_dir.join("remotes/sftp-test/mirror");
+    let sessions: Vec<_> = walkdir::WalkDir::new(&mirror)
+        .into_iter()
+        .map(|entry| entry.expect("read mirrored files"))
+        .filter(|entry| entry.file_type().is_file() && entry.file_name() == "session.jsonl")
+        .map(|entry| fs::read(entry.path()).expect("read transferred session"))
+        .collect();
+    assert_eq!(sessions.len(), 2);
+    let hello = concat!(
+        r#"{"type":"user","message":{"content":"Write a hello world program"}}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"content":"Here is a hello world program..."}}"#,
+        "\n",
+    )
+    .as_bytes();
+    let second = concat!(
+        r#"{"type":"user","message":{"content":"Test message in second project"}}"#,
+        "\n",
+    )
+    .as_bytes();
+    assert!(sessions.iter().any(|bytes| bytes.as_slice() == hello));
+    assert!(sessions.iter().any(|bytes| bytes.as_slice() == second));
     tracker.end("verify_sftp", Some("Verify SFTP fallback was used"), start);
 
     tracker.complete();
