@@ -187,9 +187,10 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensearch",
         crate_package_name: "frankensearch",
         manifest_package_field: None,
-        // Registry pin (gh#429, gh#410). 0.4.3 (quill 0.2.3, cass#453)
-        // needs Cx::is_cancelled, published in asupersync 0.4.10. Its
-        // adoption follows validation of that runtime update.
+        // Registry pin (gh#453, gh#429, gh#410). 0.4.3 (quill 0.2.3)
+        // clocks segment collection from retirement receipts, preserving
+        // progress under continued publication. Cx::is_cancelled comes from
+        // the separately pinned asupersync 0.4.10.
         // 0.4.2 extends the native Windows Quill
         // publication line with the explicit multilingual MiniLM embedding
         // profile while preserving the first crates.io line carrying
@@ -198,12 +199,12 @@ const CONTRACTS: &[DependencyContract] = &[
         // access independent from FrankenSearch's swappable generic lexical
         // backend — cass #308, bd-8nqz.5). Registry 0.3.2 was a stale
         // same-version twin of an older tree (no quill/cass-compat/native);
-        // the exact `=0.4.2` pin exists so resolution can never reach it.
+        // the exact `=0.4.3` pin exists so resolution can never reach it.
         // Empty `expected_git` signals `validate_manifest_dependency_spec`
         // to skip git/rev checks.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.4.2",
+        expected_version: "0.4.3",
         // cass #308: the ort/ONNX `fastembed` stack was removed; semantic
         // embedding + reranking are now pure-Rust via frankensearch's `native`
         // feature, kept always-on here (no AVX/ONNX static-init hazard, so no

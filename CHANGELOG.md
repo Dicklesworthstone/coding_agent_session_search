@@ -206,9 +206,10 @@ Everything below is on `main`; nothing is in a released binary yet.
 - `asupersync` is pinned to crates.io `=0.4.10`, which publishes the
   `Cx::is_cancelled` API required by FrankenSearch 0.4.3. The registry archive
   contains that API; the earlier claim that it was unpublished was incorrect.
-- `frankensearch` remains at `=0.4.2` while the runtime prerequisite is
-  validated. Its `cass index --gc` path reclaims folded inputs once 300 s
-  have passed since the previous publish (the engine's quiet-period rule).
+- `frankensearch` is pinned to `=0.4.3` (Quill `0.2.3`). Segment collection
+  clocks the 300 s grace period from each retirement receipt, allowing
+  `cass index --gc` to reclaim old folded inputs while newer generations
+  continue publishing.
 - `franken-agent-detection` pinned from crates.io `=0.2.2` to `=0.2.3`: the
   Antigravity connector probes the IDE store (`~/.gemini/antigravity`) as
   well as the `agy` CLI store, so IDE sessions index without
