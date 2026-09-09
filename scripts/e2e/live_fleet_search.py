@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opt-in real SSH fleet test. Requires Python 3 on the runner and remotes.
+"""Opt-in real SSH fleet test. Requires a Unix runner and Python 3.9+.
 
 Usage: python3 scripts/e2e/live_fleet_search.py --inventory /private/fleet.json
        --cass-bin /path/to/cass
@@ -17,6 +17,7 @@ Every requested host must pass; unreachable hosts are failures, not skips.
 
 import argparse
 import concurrent.futures
+import fcntl
 import hashlib
 import json
 import os
@@ -49,7 +50,8 @@ else:
     path=root/'.codex'/'sessions'/'rollout-fleet.jsonl'
     with path.open() as stream:first=json.loads(stream.readline())
     assert first['payload']['id']==request['session']
-    event={'timestamp':'2026-09-01T00:00:03Z','type':'response_item','payload':{'type':'message','role':'user','content':[{'type':'input_text','text':request['marker']+' appended'}]}}
+    number=request.get('number',3)
+    event={'timestamp':f'2026-09-01T00:00:0{number}Z','type':'response_item','payload':{'type':'message','role':'user','content':[{'type':'input_text','text':request['marker']+' appended '+str(number)}]}}
     with path.open('a') as stream:stream.write(json.dumps(event)+'\n')
 print(json.dumps({'root':str(root),'path':str(path.parent)}))
 '''
@@ -89,6 +91,13 @@ class FleetRun:
         if self.root.is_relative_to(self.repo):
             raise ValueError("TMPDIR must be outside the repository")
         self.write("inventory.json", self.inventory)
+        self.write("harness.json", {"sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()})
+        supplied_config = self.ssh_config
+        self.ssh_config = self.root / "ssh_config"
+        with self.ssh_config.open("x") as stream:
+            stream.write("Host cass-live-unreachable\n    HostName 127.0.0.1\n    Port 1\n"
+                         "    ProxyCommand none\n    ProxyJump none\nHost *\nInclude "
+                         + json.dumps(str(supplied_config)) + "\n")
         self.write("binary.json", {"path": self.binary, "sha256": hashlib.sha256(Path(self.binary).read_bytes()).hexdigest()})
         self.home = self.root / "home"
         self.home.mkdir()
@@ -103,7 +112,8 @@ class FleetRun:
             if name in os.environ:
                 self.env[name] = os.environ[name]
         self.token = "cassfleet" + uuid.uuid4().hex
-        self.outcomes = []
+        self.outcomes = [{"host": f"node-{ordinal:02}", "phase": "discovery-pending", "passed": None}
+                         for ordinal in range(1, len(self.hosts) + 1)]
         self.ready = []
 
     def write(self, name, value):
@@ -112,7 +122,7 @@ class FleetRun:
             json.dump(value, stream, indent=2)
         path.chmod(0o600)
 
-    def command(self, label, argv, payload=None, env=None, timeout=120):
+    def command(self, label, argv, payload=None, env=None, timeout=120, expected_exit=0):
         started = time.monotonic()
         try:
             result = subprocess.run(argv, input=payload, capture_output=True, text=True,
@@ -123,12 +133,12 @@ class FleetRun:
                       "stderr": (error.stderr or b"").decode(errors="replace"), "timeout": True}
         record["elapsed_seconds"] = time.monotonic() - started
         self.write(label + ".json", record)
-        if record["exit"]:
+        if record["exit"] != expected_exit:
             raise RuntimeError("command failed; see private artifact " + label)
         return record["stdout"]
 
-    def cass(self, label, args, timeout=180):
-        return self.command(label, [self.binary, *args], env=self.env, timeout=timeout)
+    def cass(self, label, args, timeout=180, expected_exit=0):
+        return self.command(label, [self.binary, *args], env=self.env, timeout=timeout, expected_exit=expected_exit)
 
     def seed(self, ordinal_host):
         ordinal, host = ordinal_host
@@ -147,13 +157,24 @@ class FleetRun:
                             host["ssh"], "python3 -c " + shlex.quote(REMOTE_SESSION)],
                             payload=json.dumps(request), timeout=35)
 
-    def search(self, label, query, source="all"):
-        documents = json_documents(self.cass(label, ["search", query, "--robot", "--mode", "lexical",
+    def search(self, label, query, source="all", mode="lexical"):
+        mode_args = ["--mode", mode] if mode else []
+        documents = json_documents(self.cass(label, ["search", query, "--robot", *mode_args,
             "--no-maintenance", "--no-daemon", "--source", source, "--limit", "1000",
             "--fields", "source_path,line_number,agent,source_id,origin_host,content", "--timeout", "30000"]))
         if len(documents) != 1 or documents[0].get("budget", {}).get("timed_out"):
             raise AssertionError("search did not complete")
         return documents[0]["hits"]
+
+    def sync(self, label, expected_exit=0):
+        # --json promises one document, including the nested indexing result.
+        result = json.loads(self.cass(label, ["sources", "sync", "--all", "--json"],
+                                      timeout=600, expected_exit=expected_exit))
+        expected_status = {0: "complete", 7: "index_failed", 8: "partial"}[expected_exit]
+        assert result["status"] == expected_status, "sync status disagrees with exit"
+        if result["total_files"] and not expected_exit:
+            assert result["indexing"]["success"] is True, "sync omitted completed indexing"
+        return result
 
     def verify(self, phase, expected_per_host):
         hits = self.search(phase + "-all", self.token)
@@ -164,37 +185,71 @@ class FleetRun:
             label = host["label"]
             selected = self.search(phase + "-" + label, self.token, label)
             assert len(selected) == expected_per_host, "source-scoped hit count mismatch"
-            assert all(h["source_id"] == label and h.get("origin_host") and host["request"]["marker"] in h["content"] for h in selected), "source provenance mismatch"
+            assert all(h["source_id"] == label and h.get("origin_host") == host["target"] and host["request"]["marker"] in h["content"] for h in selected), "source provenance mismatch"
         assert not self.search(phase + "-local-negative", self.token, "local"), "remote sessions leaked into local scope"
         assert not self.search(phase + "-missing-negative", self.token, "nonexistent-source"), "unknown source broadened query"
+        hybrid = self.search(phase + "-default-hybrid", self.token, mode=None)
+        assert {(h["source_id"], h["source_path"], h["line_number"]) for h in hybrid} == identities, "default hybrid lost fleet evidence"
         return identities
 
     def run(self):
         self.cass("version", ["--version"])
+        discovery = json.loads(self.cass("discovery", ["sources", "discover", "--json"]))
+        aliases = {host["name"] for host in discovery.get("hosts", [])}
+        assert all(host["ssh"].rsplit("@", 1)[-1] in aliases for host in self.hosts), "SSH discovery omitted an inventory alias"
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             seeded = list(pool.map(self.seed, enumerate(self.hosts, 1)))
         self.write("remote-directories.json", seeded)
+        self.outcomes = [{"host": host["label"], "phase": "ssh-seed" if "failed" in host else "workflow-pending",
+                          "passed": False if "failed" in host else None} for host in seeded]
+        self.ready = [host for host in seeded if "failed" not in host]
         for host in seeded:
             if "failed" in host:
-                self.outcomes.append({"host": host["label"], "phase": "ssh-seed", "passed": False})
                 continue
-            self.cass(host["label"] + "-add", ["sources", "add", host["host"]["ssh"], "--name",
-                      host["label"], "--path", host["path"], "--no-test"])
-            self.ready.append(host)
+            alias = host["host"]["ssh"]
+            # sources add requires user@host in older releases. Resolve the
+            # same user OpenSSH would use; never substitute the runner's user.
+            config = self.command(host["label"] + "-ssh-config", ["ssh", "-G", "-F", str(self.ssh_config), alias])
+            user = next(line.split(" ", 1)[1] for line in config.splitlines() if line.startswith("user "))
+            target = alias if "@" in alias else user + "@" + alias
+            host["target"] = target
+            self.cass(host["label"] + "-add", ["sources", "add", target, "--name",
+                      host["label"], "--path", host["path"]])
         if not self.ready:
             raise RuntimeError("no reachable hosts")
-        self.cass("initial-sync", ["sources", "sync", "--all", "--json"], timeout=600)
+        self.sync("initial-sync")
         initial = self.verify("initial", 2)
-        self.cass("replay-sync", ["sources", "sync", "--all", "--json"], timeout=600)
+        self.sync("replay-sync")
         assert self.verify("replay", 2) == initial, "repeat sync changed identity"
         for host in self.ready:
             request = {**host["request"], "phase": "append", "root": host["root"]}
             self.remote(host["label"] + "-append", host["host"], request)
-        self.cass("append-sync", ["sources", "sync", "--all", "--json"], timeout=600)
-        appended = self.verify("append", 3)
-        assert initial <= appended, "append lost existing messages"
+        # Hold the real indexing lock: transfer must remain observable, and a
+        # refused ingest must not be advertised as completed indexing.
+        with (self.data / "index-run.lock").open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            busy = self.sync("index-busy-sync", expected_exit=7)
+            assert busy["indexing"].get("error"), "missing indexing failure detail"
+            assert self.verify("index-busy", 2) == initial, "failed ingest changed canonical evidence"
+        recovered = json.loads(self.cass("mirror-reingest", ["sources", "reingest", "--from-mirror", "--json"], timeout=600))
+        assert recovered["status"] == "complete" and recovered["indexing"]["success"], "mirror recovery did not complete"
+        self.verify("mirror-recovered", 3)
         for host in self.ready:
-            self.outcomes.append({"host": host["label"], "phase": "sync-search-replay-append", "passed": True})
+            request = {**host["request"], "phase": "append", "root": host["root"], "number": 4}
+            self.remote(host["label"] + "-second-append", host["host"], request)
+        self.sync("append-sync")
+        appended = self.verify("append", 4)
+        assert initial <= appended, "append lost existing messages"
+        # A real refused SSH connection must produce partial failure while the
+        # already-synced real machines remain queryable. Never spoof ssh/rsync.
+        self.cass("offline-add", ["sources", "add", "unreachable@cass-live-unreachable",
+                  "--name", "unavailable-source", "--path", "/cass-live-unused", "--no-test"])
+        partial = self.sync("offline-sync", expected_exit=8)
+        assert partial.get("sources_with_failures") == 1, "unexpected source failure count"
+        assert self.verify("offline", 4) == appended, "failed source changed searchable evidence"
+        for outcome in self.outcomes:
+            if outcome["passed"] is None:
+                outcome.update(phase="sync-search-replay-append", passed=True)
         return len(self.ready) == len(self.hosts)
 
 

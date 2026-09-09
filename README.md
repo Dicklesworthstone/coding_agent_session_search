@@ -475,7 +475,7 @@ cass sources setup
 cass sources setup
 
 # Configure specific hosts only
-cass sources setup --hosts css,csd,yto
+cass sources setup --hosts laptop,workstation,build-server
 
 # Preview without making changes
 cass sources setup --dry-run
@@ -488,6 +488,45 @@ cass sources setup --non-interactive --hosts myserver --skip-install
 ```
 
 **Resumable state:** If setup is interrupted (Ctrl+C, connection lost), state is saved to the cache directory (`~/.cache/cass/setup_state.json` on Linux). Resume with `--resume`.
+
+#### Testing your real fleet
+
+The local fixture and Docker tests do not prove that your machines can sync and
+search each other's sessions. The opt-in live harness uses actual SSH connections
+and `cass sources discover`, `sources add`, `sources sync`, and `search`. It creates isolated synthetic
+Codex sessions on each machine, checks source provenance and filters, repeats a
+sync to detect duplicates, and appends messages. It checks both lexical and default
+hybrid search, requires one JSON response per sync, holds the real indexing lock to
+test busy refusal, and recovers transferred sessions through `sources reingest`.
+A refused SSH connection must leave the other sources searchable.
+
+Keep the inventory and SSH configuration **outside this repository**. For example,
+create a mode-0600 JSON file containing:
+
+```json
+{
+  "ssh_config": "/private/path/to/ssh_config",
+  "hosts": [{"ssh": "workstation"}, {"ssh": "laptop"}]
+}
+```
+
+Then run with an explicit binary:
+
+```bash
+python3 scripts/e2e/live_fleet_search.py \
+  --inventory /private/path/to/fleet.json \
+  --cass-bin /path/to/cass
+```
+
+Python 3 and authenticated SSH access are required on the remote machines.
+The Unix runner needs Python 3.9+, rsync, and a CASS binary supporting the tested
+commands. Each inventory alias must appear in the supplied SSH configuration;
+included configuration files are supported. Host-key verification stays enabled.
+The harness retains fresh test directories and raw
+receipts privately outside git; it never changes existing session archives or
+deletes test data. Console results use ordinal labels. An unreachable machine
+keeps the overall result failed, even if the other machines pass. Do not attach
+raw receipts or inventories to public issues: they contain machine identities.
 
 #### Remote Installation Methods
 

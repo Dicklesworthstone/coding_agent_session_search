@@ -126,6 +126,161 @@ fn seed_archive_conversation(db_path: &Path, agent_slug: &str, marker: &str) {
 // sources list tests
 // =============================================================================
 
+/// Discovery must use the operator's override, including quoted Include files.
+#[test]
+fn sources_discover_uses_private_ssh_config_override_and_includes() {
+    let tracker = tracker_for("sources_discover_uses_private_ssh_config_override_and_includes");
+    let root = tempfile::tempdir().unwrap().keep();
+    let home = root.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let config = root.join("private-config");
+    let included = root.join("fleet hosts.conf");
+    fs::write(&config, format!("Include \"{}\"\n", included.display())).unwrap();
+    fs::write(
+        &included,
+        "Host workstation laptop\n HostName example.invalid\n",
+    )
+    .unwrap();
+    let output = tracker
+        .cass_std_command()
+        .args(["sources", "discover", "--json"])
+        .env("HOME", &home)
+        .env("CASS_SSH_CONFIG", &config)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .current_dir(&home)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let hosts = result["hosts"].as_array().expect("discovered host array");
+    assert_eq!(hosts.len(), 2, "{result}");
+    assert_eq!(hosts[0]["name"], "workstation");
+    assert_eq!(hosts[1]["name"], "laptop");
+    tracker.complete();
+}
+
+/// Real mirror ingestion must return one JSON document on success and lock refusal.
+#[test]
+fn sources_reingest_json_preserves_index_result_and_busy_exit() {
+    use coding_agent_search::sources::sync::path_to_safe_dirname;
+    use fs2::FileExt;
+
+    let tracker = tracker_for("sources_reingest_json_preserves_index_result_and_busy_exit");
+    let root = tempfile::tempdir().unwrap().keep();
+    let home = root.join("home");
+    let config = root.join("config");
+    let data = root.join("data");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join(".env"), "").unwrap();
+    let remote_path = "/synthetic/.codex/sessions";
+    let mirror = data
+        .join("remotes/workstation/mirror")
+        .join(path_to_safe_dirname(remote_path));
+    fs::create_dir_all(&mirror).unwrap();
+    create_sources_config(
+        &config,
+        r#"
+[[sources]]
+name = "workstation"
+type = "ssh"
+host = "operator@workstation.invalid"
+paths = ["/synthetic/.codex/sessions"]
+sync_schedule = "manual"
+"#,
+    );
+    fs::write(mirror.join("rollout-fleet.jsonl"), concat!(
+        "{\"timestamp\":\"2026-09-01T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"fleet-json-contract\",\"cwd\":\"/synthetic/project\",\"cli_version\":\"0.42.0\"}}\n",
+        "{\"timestamp\":\"2026-09-01T00:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"fleetjsoncontractmarker\"}]}}\n"
+    )).unwrap();
+    let command = || {
+        let mut command = tracker.cass_std_command();
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_DATA_HOME", root.join("xdg"))
+            .env("CASS_DATA_DIR", &data)
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("RUST_MIN_STACK", "134217728")
+            .current_dir(&home);
+        tracker.command_environment().apply_to_std(&mut command);
+        command
+    };
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(data.join("index-run.lock"))
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    let busy = command()
+        .args(["sources", "reingest", "--from-mirror", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        busy.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&busy.stderr)
+    );
+    let refused: Value =
+        serde_json::from_slice(&busy.stdout).expect("one JSON response on index refusal");
+    assert_eq!(refused["status"], "index_failed");
+    assert_eq!(refused["indexing"]["success"], false);
+    assert_eq!(refused["indexing"]["code"], 7);
+    assert!(
+        refused["indexing"]["error"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
+    );
+    FileExt::unlock(&lock).unwrap();
+
+    let ingested = command()
+        .args(["sources", "reingest", "--from-mirror", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        ingested.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ingested.stderr)
+    );
+    let result: Value =
+        serde_json::from_slice(&ingested.stdout).expect("one JSON response after indexing");
+    assert_eq!(result["status"], "complete");
+    assert_eq!(result["indexing"]["success"], true);
+    assert_eq!(result["indexing"]["messages"], 1);
+    let found = command()
+        .args([
+            "search",
+            "fleetjsoncontractmarker",
+            "--robot",
+            "--mode",
+            "lexical",
+            "--source",
+            "workstation",
+            "--no-maintenance",
+            "--no-daemon",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        found.status.success(),
+        "{}",
+        String::from_utf8_lossy(&found.stderr)
+    );
+    let searched: Value = serde_json::from_slice(&found.stdout).unwrap();
+    let hits = searched["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 1, "{searched}");
+    assert_eq!(hits[0]["source_id"], "workstation");
+    tracker.complete();
+}
+
 /// Test: sources list with no configured sources shows appropriate message.
 #[test]
 fn sources_list_empty() {

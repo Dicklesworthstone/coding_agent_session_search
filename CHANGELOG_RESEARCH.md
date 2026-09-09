@@ -1,5 +1,73 @@
 # CASS 0.8.0 changelog research
 
+Fleet investigation (2026-09-09, bead `av59c`): live SSH testing exposed two
+source defects. Discovery ignored the SSH configuration override used by
+transport and did not read Include files. Sync/reingest printed the nested
+indexing result as a separate JSON document. The fixes use the same configuration
+for discovery, enumerate included aliases with bounded recursion, and capture
+indexing output inside one final response with truthful failure status.
+
+The frozen remote gate passed formatting, all-target Clippy, six library tests,
+six sources CLI tests, six ordinary index JSON tests, and 68 goldens (86 total).
+The new CLI cases exercise real configuration files, an actual held indexing
+lock, real mirror ingestion, and a source-filtered search. The live SSH harness
+then ran with all ten entries in an external private inventory: nine machines
+passed, and one required human authentication. The overall result is failed,
+not an all-ten pass. No machine identities or raw receipts are included here.
+
+On the nine reachable machines: initial ingestion returned 18 hits; replay kept
+the same 18 identities; a busy-index sync returned exit 7 while search retained
+18; mirror recovery returned 27; a second append returned 36; a genuinely refused
+SSH connection produced exit 8/partial while all 36 remained searchable. Exact
+origin-host/source provenance and local/unknown-source negatives passed. Default
+hybrid matched lexical results without a model download; this does not validate
+neural semantic retrieval or archive-scale performance. Every sync/reingest
+response parsed as one JSON document. Existing user archives were untouched.
+
+Executable SHA256:
+`8e30a55278a9823f7cd292bf60d45e8e949f2a14eb713acf5d0c86ff4973d822`.
+Live harness SHA256:
+`467e7d340013f81815749aa2da887e709d12f70eece6a33aa55939b49688f36c`.
+Ordinal summary SHA256:
+`87d69215795f6ab8d3d52d843a5e64d121a6951c80ae3b18acce8daa61ee325a`.
+The initial harness missed the two-document bug because it checked exit codes
+and search results; strict parsing was added after inspecting that retained
+output. An earlier installed 0.7.1 run also rejected `sources sync --all`, an
+already-fixed unreleased CLI incompatibility rather than a new repair here.
+Setup still drops slow deep probes: the default timeout selected six of nine
+SSH-reachable machines, and 30 seconds selected eight. That separate problem,
+the authentication-blocked host, and strict release gates remain open.
+
+The fleet gate ended at 22:26 UTC with UBS `MODULE_TIMEOUT` after 300 seconds,
+zero completed files, and exit 1. All 1040 frozen CASS inputs and 77 FAD overlay
+inputs still matched after the gate; the final executable matches the live
+run's checksum above. Canonical differences are the declared dependency
+overlay config/lock and the subsequently edited README; the three changed Rust
+source/test files match the validated snapshot exactly. Gate-log SHA256:
+`ef8a51b751fa2db6d7e96e983af6726563b651e2f2f643f8d8e2b28d13b9a5c6`.
+No UBS waiver, parent push, or release was performed.
+
+Doctor multi-row diagnostics (2026-09-09, bead `9lz4y`): both the initial
+integrity probe and the post-promotion probe now use the same row collector.
+The old single-row API replaced real multiple findings with a row-count error.
+The collector inspects all rows, retains up to 20 diagnostics with an omitted
+count, and rejects empty or blank output. SQL-produced diagnostic rows test
+the response decoder; they do not purport to reproduce the owner's corrupt
+archive. An actual healthy PRAGMA and the existing damaged-archive CLI test
+cover real database behavior.
+
+The frozen remote gate passed formatting, all-target Clippy, 13 library tests,
+one damaged-archive CLI test, and 68 goldens (82 total). UBS timed out after
+300 seconds with zero completed files; its one critical marker denotes that
+timeout. The RCH transport ended with exit 143 before the outer receipt; the
+terminal gate log was recovered directly, and all 1040 CASS plus 77 frozen FAD
+inputs were checked before the worker was reused. Log SHA256:
+`b732f710d7ac79a1eaebcbf220275c81b03645594d1a8efa961dc34779c1fe7f`.
+Executable SHA256:
+`eee469a5de9063f7094213f0406e372869623410a8c0ae0fe2a80394530307de`.
+This validates diagnostic handling, not original-archive repair or release
+clearance. The strict gate and original bead remain open.
+
 GH422 scoped retry continuation (2026-09-09): the old helper copied only query,
 format, timeout, data-dir, session-file and explicit mode. Both timeout call
 sites now share a retry assembled from the parsed request, including explicit

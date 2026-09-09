@@ -7304,6 +7304,7 @@ async fn execute_cli(
                         no_progress_events,
                         robot_trace_ingest,
                         background,
+                        None,
                     )?;
                 }
                 Commands::Search {
@@ -37079,9 +37080,7 @@ impl DoctorArchiveReadConnection for crate::storage::sqlite::FrankenOwnerConnect
     }
 }
 
-fn doctor_quick_check_status(
-    rows: Vec<crate::franken_sync::Row>,
-) -> Result<String, String> {
+fn doctor_quick_check_status(rows: Vec<crate::franken_sync::Row>) -> Result<String, String> {
     use crate::franken_sync::compat::RowExt as _;
 
     if rows.is_empty() {
@@ -37115,9 +37114,7 @@ fn doctor_quick_check_status(
     Ok(diagnostics.join("; "))
 }
 
-fn doctor_database_quick_check<C: DoctorArchiveReadConnection>(
-    conn: &C,
-) -> Result<String, String> {
+fn doctor_database_quick_check<C: DoctorArchiveReadConnection>(conn: &C) -> Result<String, String> {
     // Some engine versions return multiple findings despite the requested
     // limit. Preserve those findings instead of replacing them with a row-count
     // error. Inspect every row before declaring health; bound only the output.
@@ -37133,14 +37130,28 @@ fn doctor_quick_check_preserves_multiple_findings_and_bounds_output() {
     assert_eq!(doctor_database_quick_check(&conn).unwrap(), "ok");
     // Actual engine rows exercise the diagnostic decoder; these SELECTs model
     // the response protocol, not a claim that this database is corrupt.
-    let rows = conn.query("SELECT 'ok' UNION ALL SELECT 'page 7 never used' UNION ALL SELECT 'page 9 never used'").unwrap();
-    assert_eq!(doctor_quick_check_status(rows).unwrap(), "page 7 never used; page 9 never used");
+    let rows = conn
+        .query(
+            "SELECT 'ok' UNION ALL SELECT 'page 7 never used' UNION ALL SELECT 'page 9 never used'",
+        )
+        .unwrap();
+    assert_eq!(
+        doctor_quick_check_status(rows).unwrap(),
+        "page 7 never used; page 9 never used"
+    );
     let mut terms = vec!["SELECT 'ok'"; DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT + 1];
     terms.push("SELECT 'late failure'");
-    assert_eq!(doctor_quick_check_status(conn.query(&terms.join(" UNION ALL ")).unwrap()).unwrap(), "late failure");
+    assert_eq!(
+        doctor_quick_check_status(conn.query(&terms.join(" UNION ALL ")).unwrap()).unwrap(),
+        "late failure"
+    );
     let terms = vec!["SELECT 'page failure'"; DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT + 2];
-    let status = doctor_quick_check_status(conn.query(&terms.join(" UNION ALL ")).unwrap()).unwrap();
-    assert_eq!(status.matches("page failure").count(), DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT);
+    let status =
+        doctor_quick_check_status(conn.query(&terms.join(" UNION ALL ")).unwrap()).unwrap();
+    assert_eq!(
+        status.matches("page failure").count(),
+        DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT
+    );
     assert!(status.ends_with("2 additional diagnostic row(s) omitted"));
     assert!(doctor_quick_check_status(conn.query("SELECT 'ok' WHERE 0").unwrap()).is_err());
     assert!(doctor_quick_check_status(conn.query("SELECT ''").unwrap()).is_err());
@@ -104773,6 +104784,7 @@ fn run_index_with_data(
     no_progress_events: bool,
     robot_trace_ingest: bool,
     background: bool,
+    mut captured_result: Option<&mut Option<serde_json::Value>>,
 ) -> CliResult<()> {
     use crate::franken_sync::compat::{ConnectionExt, RowExt};
     use std::time::Instant;
@@ -104800,6 +104812,15 @@ fn run_index_with_data(
         }
     });
     let structured_output = structured_format.is_some();
+    let capture_output = captured_result.is_some();
+    let mut emit_result = |payload: serde_json::Value, format: RobotFormat| {
+        if let Some(result) = captured_result.as_deref_mut() {
+            *result = Some(payload);
+            Ok(())
+        } else {
+            output_structured_value(payload, format)
+        }
+    };
     let indexing_exclusion_notice = active_indexing_exclusion_notice();
 
     // Generate params hash for idempotency validation
@@ -104860,7 +104881,7 @@ fn run_index_with_data(
                     if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&result_json) {
                         val["cached"] = serde_json::json!(true);
                         val["idempotency_key"] = serde_json::json!(key);
-                        output_structured_value(val, fmt)?;
+                        emit_result(val, fmt)?;
                         return Ok(());
                     }
                 } else {
@@ -104932,7 +104953,8 @@ fn run_index_with_data(
     // case the caller kills us next) so the agent can distinguish "wedged
     // indexer" from "slow command" before its deadline.
     let emit_robot_stall_event_on_stdout = |payload: &serde_json::Value| {
-        if structured_format.is_some()
+        if !capture_output
+            && structured_format.is_some()
             && let Ok(line) = serde_json::to_string(payload)
         {
             use std::io::Write as _;
@@ -104983,7 +105005,7 @@ fn run_index_with_data(
                 }
                 emit_event(event);
             }
-            output_structured_value(payload, fmt)?;
+            emit_result(payload, fmt)?;
             return Err(CliError::already_reported_from(&err));
         }
         return Err(err);
@@ -105479,7 +105501,7 @@ fn run_index_with_data(
                 }
                 emit_event(event);
             }
-            output_structured_value(payload, fmt)?;
+            emit_result(payload, fmt)?;
         }
     } else if let Some(fmt) = structured_format {
         // Derive result counts from the indexer's own progress tracking rather
@@ -105574,7 +105596,7 @@ fn run_index_with_data(
             emit_event(event);
         }
 
-        output_structured_value(payload, fmt)?;
+        emit_result(payload, fmt)?;
     }
 
     // gh359: `res.is_ok()` — the plain completion line used to print even
@@ -116651,23 +116673,7 @@ fn run_sources_sync(
         "complete"
     };
 
-    if let Some(_fmt) = structured_format {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "status": overall_status,
-                "dry_run": dry_run,
-                "sources": all_reports,
-                "sources_attempted": attempted_sources,
-                "sources_with_failures": sources_with_failures,
-                "sources_fully_failed": sources_fully_failed,
-                "total_files": total_files,
-                "total_bytes": total_bytes,
-                "will_reindex": !no_index && !dry_run,
-            }))
-            .unwrap_or_default()
-        );
-    } else if sources_with_failures > 0 {
+    if structured_format.is_none() && sources_with_failures > 0 {
         println!(
             "{} {} of {} synced source(s) had failures{}",
             "Warning:".yellow().bold(),
@@ -116681,8 +116687,10 @@ fn run_sources_sync(
         );
     }
 
-    // Trigger re-index if requested
-    if !no_index && !dry_run && total_files > 0 {
+    // Capture nested indexing so structured sync emits one final document,
+    // including failure, rather than a premature success plus a second JSON.
+    let mut indexing_result = None;
+    let indexing = if !no_index && !dry_run && total_files > 0 {
         if !is_robot {
             println!(
                 "{} {} new files...",
@@ -116718,8 +116726,32 @@ fn run_sources_sync(
             false, // no_progress_events
             false, // robot_trace_ingest
             false, // background
-        )?;
+            is_robot.then_some(&mut indexing_result),
+        )
+    } else {
+        Ok(())
+    };
+
+    if let Some(format) = structured_format {
+        let mut payload = serde_json::json!({
+            "status": if indexing.is_err() { "index_failed" } else { overall_status },
+            "dry_run": dry_run,
+            "sources": all_reports,
+            "sources_attempted": attempted_sources,
+            "sources_with_failures": sources_with_failures,
+            "sources_fully_failed": sources_fully_failed,
+            "total_files": total_files,
+            "total_bytes": total_bytes,
+            "will_reindex": !no_index && !dry_run,
+        });
+        if let Some(result) = indexing_result {
+            payload["indexing"] = result;
+        } else if let Err(error) = &indexing {
+            payload["indexing"] = cli_error_json_payload(error, 0);
+        }
+        output_structured_value(payload, format)?;
     }
+    indexing?;
 
     // #392: exit nonzero when the sync did not fully succeed. The summary JSON
     // above is the data surface (stdout); this error envelope is the
@@ -116889,7 +116921,8 @@ fn run_sources_reingest(
         ProgressResolved::Plain
     };
 
-    run_index_with_data(
+    let mut indexing_result = None;
+    let indexing = run_index_with_data(
         None,                   // db_override (uses data_dir default)
         full,                   // full rebuild if requested
         false,                  // force_rebuild
@@ -116907,14 +116940,16 @@ fn run_sources_reingest(
         false, // no_progress_events
         false, // robot_trace_ingest
         false, // background
-    )?;
+        is_robot.then_some(&mut indexing_result),
+    );
 
     if is_robot {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "status": "complete",
+                "status": if indexing.is_err() { "index_failed" } else { "complete" },
                 "kind": "sources_reingest",
+                "indexing": indexing_result.or_else(|| indexing.as_ref().err().map(|error| cli_error_json_payload(error, 0))),
                 "from_mirror": true,
                 "full": full,
                 "sources": selected.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
@@ -116927,7 +116962,7 @@ fn run_sources_reingest(
         );
     }
 
-    Ok(())
+    indexing
 }
 
 /// Auto-discover SSH hosts from ~/.ssh/config (P5.6)

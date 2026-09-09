@@ -113,6 +113,11 @@ remain open at this research snapshot. Landed code and targeted tests do not
 mean that every acceptance row, platform, or reporter archive has been verified.
 
 ### Added
+
+- An opt-in real-SSH fleet test harness accepts an external private inventory
+  and exercises discovery, sync, indexing, source-scoped search, replay,
+  incremental append, busy-index recovery, and an unavailable source. Raw
+  receipts stay outside git; unreachable hosts keep the overall result failed.
 - Muse AI sessions can be discovered and indexed through the connector registry.
 - Local Devin `sessions.db` ingestion is enabled through FAD's SQLite parser,
   preserving the selected message chain and the `devin` identity. Cloud session
@@ -183,6 +188,18 @@ mean that every acceptance row, platform, or reporter archive has been verified.
 
 ### Fixed
 
+- SSH host discovery uses `CASS_SSH_CONFIG`, matching the transport commands,
+  and follows included configuration files with bounded recursion and duplicate
+  alias handling. A private configuration no longer yields an empty discovery
+  result while direct connections through the same file work (bead `av59c`).
+- `sources sync --json` and `sources reingest --json` return one document with
+  the nested indexing result. Indexing failures report `status: "index_failed"`
+  and retain the nonzero exit code, rather than printing a premature sync
+  success and a second JSON document (bead `av59c`).
+- Doctor preserves multiple `quick_check` findings instead of replacing them
+  with a single-row query error. It inspects every returned row before declaring
+  health, bounds displayed diagnostics, and rejects empty or malformed results.
+  The same check runs after candidate promotion (bead `9lz4y`).
 - Search timeout retry commands retain the selected database, read-only policy,
   agent/workspace/source/session filters, resolved time bounds, pagination,
   semantic options and robot output limits. Both setup and metadata timeouts
