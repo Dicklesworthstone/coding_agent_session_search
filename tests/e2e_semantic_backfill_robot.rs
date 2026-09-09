@@ -80,6 +80,8 @@ fn seed_zero_doc_first_canonical_db(db_path: &Path) -> TestResult {
 fn robot_backfill_process(data_dir: &Path, db_path: &Path) -> std::process::Command {
     let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
     command
+        .arg("--db")
+        .arg(db_path)
         .args([
             "models",
             "backfill",
@@ -92,8 +94,6 @@ fn robot_backfill_process(data_dir: &Path, db_path: &Path) -> std::process::Comm
             "--data-dir",
         ])
         .arg(data_dir)
-        .arg("--db")
-        .arg(db_path)
         .arg("--json")
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         .env("RUST_MIN_STACK", "134217728");
