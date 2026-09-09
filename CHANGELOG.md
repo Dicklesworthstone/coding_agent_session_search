@@ -213,7 +213,13 @@ mean that every acceptance row, platform, or reporter archive has been verified.
   raw-blob counters. Triage schemas distinguish uninspected sections and unknown
   values when its budget expires, while ordinary status schemas retain their
   observed-value types. The real CLI contract regression includes a minimal
-  accepted triage budget; corrected runtime validation is pending.
+  accepted triage budget; the corrected schema test and all 68 contract goldens
+  pass on the remote candidate.
+- Swarm trace redaction covers temporary archive paths on Linux, macOS and
+  Windows, including configured temporary directories under the user's home.
+  It applies full-path redaction before home-prefix shortening. This corrects
+  a path leak found by the full suite; the unchanged CLI privacy regression
+  and new path cases are awaiting the combined validation run.
 - A hollow published Quill generation — one serving a handful of documents
   while its completed rebuild checkpoint, content fingerprint and generation
   manifest all still look right — no longer reads as healthy (GH #457).

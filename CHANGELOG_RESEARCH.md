@@ -1,8 +1,9 @@
 # CASS 0.8.0 changelog research
 
 Scope window: `v0.7.1..6b2ab22d30892fe6f7762d851477feea0e6f80f8`, plus
-the local 0.8.0 preparation and the September 8 issue-fix follow-through below. This is a release-window update, not a
-reconstruction of older entries. Research date: 2026-09-08.
+the local 0.8.0 preparation and issue-fix follow-through through e3c76fa7 on
+September 9. This is a release-window update, not a reconstruction of older
+entries. Research date: 2026-09-09.
 
 Sources: local Git history and diffs, GitHub release/tag metadata, checked-in
 Beads records, current implementation, and the prior changelog, in that order.
@@ -32,6 +33,7 @@ status; they are not counted as product features.
 | D | remote main 6b2ab22d, 2026-09-08 | validated | hollow lexical-generation detection, merge-memory bounds |
 | Merge reconciliation | five merges in the original range | validated | combined-diff review; dependency, pack, recovery and refresh changes retained |
 | E | local issue-fix commits through c865ebc4 and reviewed working-tree fixes, 2026-09-08 | distilled; runtime validation pending | Devin parser/WAL watch, Prime presets/probe, active-source watch retries, legacy FTS preflight, exact resume metadata, resumable semantic reconciliation, doctor truth, schema goldens |
+| F | reviewed changes through e3c76fa7, 2026-09-09 | full-suite failures diagnosed; corrected schema verified; remaining fixes under validation | Cursor canonical/search repair, temp-path trace privacy, connector fixtures, backfill process helper, exact connector enumeration |
 
 ## Publication follow-through
 
@@ -243,8 +245,58 @@ in both regeneration and verification. The three changed golden files were
 reviewed independently and applied only after their canonical base hashes
 matched: introspection schema, its shape, and generated schema documentation.
 They contain the diagnostic additions and triage-only unknown-value schema
-changes described above. Both corrected test files passed remote formatting;
-their runtime follow-up and the full Rust suite remain pending. Strict UBS
-again timed out after 300 seconds. The combined gate remains red, including
-its recorded source-stability change from intentional golden regeneration;
-reviewing that change does not retroactively make the original gate green.
+changes described above. Both corrected test files passed remote formatting.
+Strict UBS again timed out after 300 seconds. The combined gate remains red.
+Its recorded source-stability failure included changed golden files; growing
+untracked gate results inside the checkout also affected the digest, so golden
+regeneration alone does not explain that result. Reviewing the changes does
+not retroactively make the original gate green.
+
+## Full-suite result and September 9 follow-through
+
+F8 completed at 01:43:40 UTC with exit 1. The default non-browser Rust run
+executed 259 library/binary/integration targets: 15,125 passed, 39 failed and
+92 ignored. Two documentation batches added eight passes and 20 ignored tests,
+for 15,133 passed, 39 failed and 112 ignored overall. The count uses each parent
+target's terminal result; a nested child result is not counted twice. The full
+log SHA256 is 03df48e08ca6ae9dff66e7bc99186a5b54f84089eb3cce0ebf73c9bc8f38d453,
+retained in the F8 snapshot's `.gate-results/f8-combined/full-rust-suite.log`.
+This is not all-features, browser, or ignored live-archive validation.
+
+Eight targets failed. A real trace leaked temporary archive paths; the swarm
+redaction policy now handles standard and configured temporary roots before
+home-prefix shortening, including Windows and macOS paths. The existing
+failing CLI privacy assertion is unchanged. Aider, Copilot and Factory fixture
+corrections select their actual admitted roots/connectors; their payload and
+ordering assertions remain. Two stale test contracts now recognize the actual
+serialized gate formatter and the exact 29 enabled connectors, retaining their
+negative cases and strict equality. These changes are in 8f1560f8, 8d45cbc2,
+a0ee74b9 and 4e0f846f; their corrected runtime results are still pending.
+
+The two-test follow-up retained the original F8 source/results before editing.
+Formatting, targeted Clippy, the schema test (one pass) and all 68 goldens
+passed, with source and F8 executable unchanged. Backfill remained five passes,
+two failures and one ignored test: placing global `--db` after the subcommand
+caused an auto-correction note before the otherwise valid stderr JSON. Commit
+e3c76fa7 moves that argument before `models`; it does not strip stderr, relax
+the envelope, or change production CLI behavior. The entire backfill target
+is included in the next combined gate.
+
+GH459 exposed lossy Cursor workspace inference from hyphenated directory names.
+The upstream repair uses explicit `.workspace-trusted` metadata and preserves
+unresolved attribution when it is absent or malformed. CASS commit 7537be83
+repairs canonical workspace metadata on unchanged-source full scans, records
+lexical rebuild debt before the transaction, and invalidates both semantic
+workspace identities atomically. Canonical NULL workspace also overrides a
+stale legacy FTS value. Tests cover row conservation, replay, interruption,
+search filtering and semantic re-enrichment. The parser is unpublished;
+registry FAD 0.2.3 has not been replaced. Analytics workspace reassociation is
+a separate remaining part of the same issue, not a completed capability.
+
+F9 tests the exact CASS inputs with a declared frozen upstream source overlay.
+Two preparation attempts stopped before compilation: one missing tracked file
+in RCH transfer, then a targeted Cargo update that changed unrelated dependency
+edges. Both are retained failures. The corrected admission verifies all 1,040
+CASS inputs and 76 upstream files, changes only FAD's registry source/checksum
+in the lock, and retains the existing locked compiler/test/golden/UBS checks.
+No overlay result establishes registry adoption or release completion.
