@@ -24,8 +24,8 @@ use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 
-use super::config::{SourceConfigGenerator, SourcesConfig};
 use super::config::discover_fleet_hosts;
+use super::config::{SourceConfigGenerator, SourcesConfig};
 use super::index::{IndexProgress, RemoteIndexer};
 use super::install::{InstallProgress, RemoteInstaller};
 use super::interactive::{confirm_action, run_host_selection};
@@ -553,7 +553,10 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
             if opts.hosts.is_some() {
                 print_phase_done(&format!("Using {} specified host(s)", hosts.len()));
             } else {
-                print_phase_done(&format!("Found {} SSH hosts from enabled discovery providers", hosts.len()));
+                print_phase_done(&format!(
+                    "Found {} SSH hosts from enabled discovery providers",
+                    hosts.len()
+                ));
             }
         }
 

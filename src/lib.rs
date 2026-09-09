@@ -29817,12 +29817,18 @@ fn run_cli_search(
                 args.push(format!("--{flag}={value}"));
             }
         }
-        for (flag, values) in [("fields", fields.as_ref()), ("aggregate", aggregate.as_ref())] {
+        for (flag, values) in [
+            ("fields", fields.as_ref()),
+            ("aggregate", aggregate.as_ref()),
+        ] {
             if let Some(values) = values {
                 args.push(format!("--{flag}={}", values.join(",")));
             }
         }
-        for (flag, value) in [("max-content-length", max_content_length), ("max-tokens", max_tokens)] {
+        for (flag, value) in [
+            ("max-content-length", max_content_length),
+            ("max-tokens", max_tokens),
+        ] {
             if let Some(value) = value {
                 args.push(format!("--{flag}={value}"));
             }
@@ -117018,7 +117024,10 @@ fn run_sources_discover(
                 })
             );
         } else {
-            println!("{}", "No hosts found in the enabled discovery providers".yellow());
+            println!(
+                "{}",
+                "No hosts found in the enabled discovery providers".yellow()
+            );
         }
         return Ok(());
     }

@@ -785,17 +785,25 @@ pub fn discover_fleet_hosts(tailscale: bool) -> (Vec<DiscoveredHost>, Option<Str
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         super::configure_child_process_group(&mut command);
-        let child = command.spawn().context("could not start tailscale status")?;
-        let output = super::wait_for_child_output_with_timeout(
-            child,
-            std::time::Duration::from_secs(5),
-        )?
-        .context("tailscale status timed out after 5 seconds")?;
+        let child = command
+            .spawn()
+            .context("could not start tailscale status")?;
+        let output =
+            super::wait_for_child_output_with_timeout(child, std::time::Duration::from_secs(5))?
+                .context("tailscale status timed out after 5 seconds")?;
         // Do not echo raw status/stderr: it can contain tailnet account data.
-        anyhow::ensure!(output.status.success(), "tailscale status failed; check local Tailscale login and daemon status");
+        anyhow::ensure!(
+            output.status.success(),
+            "tailscale status failed; check local Tailscale login and daemon status"
+        );
         merge_tailscale_hosts(&mut hosts, &output.stdout)
     })();
-    (hosts, result.err().map(|error| format!("Tailscale discovery unavailable: {error}")))
+    (
+        hosts,
+        result
+            .err()
+            .map(|error| format!("Tailscale discovery unavailable: {error}")),
+    )
 }
 
 fn merge_tailscale_hosts(hosts: &mut Vec<DiscoveredHost>, bytes: &[u8]) -> anyhow::Result<()> {
@@ -818,14 +826,25 @@ fn merge_tailscale_hosts(hosts: &mut Vec<DiscoveredHost>, bytes: &[u8]) -> anyho
         #[serde(default)]
         sharee_node: bool,
     }
-    anyhow::ensure!(bytes.len() <= 8 * 1024 * 1024, "tailscale status exceeds 8 MiB");
+    anyhow::ensure!(
+        bytes.len() <= 8 * 1024 * 1024,
+        "tailscale status exceeds 8 MiB"
+    );
     let status: Status = serde_json::from_slice(bytes).context("invalid tailscale status JSON")?;
-    anyhow::ensure!(status.backend_state == "Running", "Tailscale is not running; check local login and daemon status");
+    anyhow::ensure!(
+        status.backend_state == "Running",
+        "Tailscale is not running; check local login and daemon status"
+    );
     for peer in status.peer.unwrap_or_default().into_values() {
         if !peer.online || peer.sharee_node {
             continue;
         }
-        let Some(address) = peer.addresses.iter().find(|ip| ip.is_ipv4()).or(peer.addresses.first()) else {
+        let Some(address) = peer
+            .addresses
+            .iter()
+            .find(|ip| ip.is_ipv4())
+            .or(peer.addresses.first())
+        else {
             continue;
         };
         let dns = peer.dns_name.trim_end_matches('.');
@@ -836,7 +855,9 @@ fn merge_tailscale_hosts(hosts: &mut Vec<DiscoveredHost>, bytes: &[u8]) -> anyho
                 .into_iter()
                 .any(|name| {
                     (!dns.is_empty() && name.trim_end_matches('.').eq_ignore_ascii_case(dns))
-                        || name.parse::<std::net::IpAddr>().is_ok_and(|ip| peer.addresses.contains(&ip))
+                        || name
+                            .parse::<std::net::IpAddr>()
+                            .is_ok_and(|ip| peer.addresses.contains(&ip))
                 })
         }) {
             continue;
@@ -2353,7 +2374,9 @@ paths = ["~/.claude/projects"]
 
     #[test]
     fn test_tailscale_discovery_preserves_aliases_and_uses_online_peer_addresses() {
-        let mut hosts = parse_ssh_config("Host workstation\n HostName 100.64.0.1\n User developer\n IdentityFile ~/.ssh/work\n");
+        let mut hosts = parse_ssh_config(
+            "Host workstation\n HostName 100.64.0.1\n User developer\n IdentityFile ~/.ssh/work\n",
+        );
         let status = serde_json::json!({
             "BackendState": "Running",
             "Self": {"Online": true, "TailscaleIPs": ["100.64.0.99"]},
@@ -2379,7 +2402,8 @@ paths = ["~/.claude/projects"]
 
     #[test]
     fn test_tailscale_discovery_rejects_bad_status_without_losing_ssh_hosts() {
-        let mut hosts = parse_ssh_config("Host workstation\n HostName workstation.example.ts.net\n");
+        let mut hosts =
+            parse_ssh_config("Host workstation\n HostName workstation.example.ts.net\n");
         for status in [
             br#"{"BackendState":"NeedsLogin"}"#.as_slice(),
             br#"{"BackendState":"Running","Peer":{"a":{"Online":true,"TailscaleIPs":["-oProxyCommand=bad"]}}}"#,
