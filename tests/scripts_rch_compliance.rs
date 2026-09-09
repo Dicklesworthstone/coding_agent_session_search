@@ -175,15 +175,25 @@ fn scan_for_bare_cargo(path: &Path) -> Vec<Finding> {
         Ok(b) => b,
         Err(_) => return Vec::new(),
     };
+    scan_shell_body_for_bare_cargo(path, &body)
+}
+
+fn scan_shell_body_for_bare_cargo(path: &Path, body: &str) -> Vec<Finding> {
     let cargo_subcmd_re =
         regex::Regex::new(r"\bcargo\s+(build|test|bench|clippy|run|check|fmt|update|install)\b")
             .expect("regex compiles");
     let mut findings = Vec::new();
     let mut quote_state = (false, false);
     let serialized_gate_formatter = path == project_root().join("scripts/gate.sh")
-        && body.contains("REMOTE_SCRIPT=\"$(declare -f test_log_counts run_tests run_fmt run_ubs)");
+        && body.lines().any(|line| {
+            line.strip_prefix("REMOTE_SCRIPT=\"$(declare -f ")
+                .and_then(|declaration| declaration.split_once(')'))
+                .is_some_and(|(functions, _)| {
+                    functions.split_whitespace().any(|name| name == "run_fmt")
+                })
+        });
     let mut in_gate_formatter = false;
-    for (start_line, logical) in logical_lines(&body) {
+    for (start_line, logical) in logical_lines(body) {
         let line = strip_trailing_comment(&logical);
         if serialized_gate_formatter && line.trim() == "run_fmt() {" {
             in_gate_formatter = true;
@@ -587,6 +597,32 @@ fn e2e_acceptance_is_exact_worker_run_scoped_and_publish_last() -> Result<(), St
 }
 
 // ---------------- Synthetic-fixture tests for scanner correctness ----------------
+
+#[test]
+fn scanner_exempts_only_the_serialized_gate_formatter() {
+    let gate = project_root().join("scripts/gate.sh");
+    let body = r#"run_fmt() {
+    CASS_GATE_RUSTFMT="$formatter" RUSTFMT="$wrapper" cargo fmt --check
+}
+REMOTE_SCRIPT="$(declare -f test_log_counts run_tests run_fmt run_ubs prepare_compile_inputs)
+run_fmt"
+cargo check
+"#;
+    let findings = scan_shell_body_for_bare_cargo(&gate, body);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].snippet.trim(), "cargo check");
+    assert_eq!(
+        scan_shell_body_for_bare_cargo(&project_root().join("scripts/other.sh"), body).len(),
+        2,
+        "another script must not inherit the gate callback exemption",
+    );
+    let unexported = body.replace("run_tests run_fmt run_ubs", "run_tests run_ubs");
+    assert_eq!(
+        scan_shell_body_for_bare_cargo(&gate, &unexported).len(),
+        2,
+        "a formatter omitted from the remote declaration is still bare Cargo",
+    );
+}
 
 #[test]
 fn scanner_flags_bare_cargo_in_synthetic_fixture() {
