@@ -175,7 +175,12 @@ fn sources_discover_uses_private_ssh_config_override_and_includes() {
     assert!(fallback.status.success());
     let fallback: Value = serde_json::from_slice(&fallback.stdout).unwrap();
     assert_eq!(fallback["hosts"], result["hosts"]);
-    assert!(fallback["discovery_warning"].as_str().unwrap().contains("could not start"));
+    assert!(
+        fallback["discovery_warning"]
+            .as_str()
+            .unwrap()
+            .contains("could not start")
+    );
     tracker.complete();
 }
 
