@@ -1,5 +1,58 @@
 # CASS 0.8.0 changelog research
 
+GH426 continuation: single-conversation NoMem deferral/quarantine previously
+returned `scan_had_errors=false` despite saving no canonical rows. Both paths
+now retain the deferred source and mark ingestion incomplete. Streaming maps
+those source paths to actual connector names across combined batch ranges;
+batch indexing also requires persistence completion before advancing its
+connector watermark. Existing global scan and mirror-fingerprint gates consume
+the incomplete outcome. Provider aliases are not used as connector identity.
+Original bead `fyepq` still carries the full per-source observation ledger and
+graceful-stop acceptance; this correction does not complete those requirements.
+
+The remote gate in `/data/projects/cass-gh426-qtehoevg/results/` passed 118
+selected tests: 11 library tests, 39 storage parity tests and 68 goldens, with
+zero failed or ignored tests. Formatting and all-target Clippy passed. The
+extended real storage tests cover retained watermarks during induced NoMem,
+unrelated completed-connector progress, successful retry, duplicate-free replay,
+and quarantine. Fault injection uses existing test hooks; this is controlled
+failure-path evidence, not a reporter-sized interrupted scan. The declared
+source digest is e9523fdaa95fde0c3ef27f79923fbade94ae15ee87c96fd6b5bf5c77cf11e6d1;
+the reviewed formatted indexer SHA256 is
+ce996e8a3dbcb86c946362605fb2feacfa58de0fb9008e0493e881d669e265ff.
+RCH job 30013452823036020 on vmi1264463 completed at 17:29 UTC. Final identity
+verification passed for all 1,040 CASS inputs and 77 declared connector-overlay
+files. UBS completed, rather than timing out: one file, 249 critical labels,
+8,581 warnings and 2,653 informational findings, exit 1. These classifications
+remain unresolved; no blanket false-positive disposition or suppression was
+applied. Gate log SHA256:
+1898aa8f2216cfd0255e9d244d3f6ba4f2fc9d377d41898410e9eaebfb8267e6.
+Tested executable SHA256:
+4c169b7d9f821e9c7808f5dd2ddf1d4a34f1dd53c243321b6fbc334001ecf654.
+No release clearance follows from the targeted passes. The original bead
+retains both the positive runtime result and the red gate.
+
+September 9 field-evidence update: the GH458 reporter confirmed quality
+backfill reuse and publication on the original roughly 547,000-message,
+4,054-conversation archive using commit
+000301c949df5180c0023ef7f6b19767a0cf9fbc (verified as a local ancestor).
+Offsets continued 64 to 96 to 128 across ingest; the completed quality tier
+contained 425,762 documents and reported current archive identity while
+serving semantic queries. This is reporter-provided evidence, not our own
+archive-scale benchmark. The reported approximately five-minute canonical
+walk per maintenance batch and lock-held serving interruption remain costs;
+the legacy fast-tier vector-space refusal remains a separate unresolved
+admission/rebuild problem. See the
+[reporter's full measurements](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/458#issuecomment-5604445676).
+
+The new GH390 report concerns a different 3.19 GB archive where both CASS
+and stock SQLite report orphan pages. It does not establish another checker
+false positive or resolve the older archive's disagreement. No compaction,
+integrity-grade downgrade, or normalization override was performed; original
+bead `rvbsf` retains the distinction and
+[the new report](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/390#issuecomment-5605127509)
+must be treated as reporter evidence until an unchanged bundle is reproduced.
+
 September 9 follow-up, original bead `coding_agent_session_search-igh4d`:
 the primary writer's catalog probe required `rootpage > 0`, excluding the
 actual FTS virtual table, whose root page is zero. The correction uses

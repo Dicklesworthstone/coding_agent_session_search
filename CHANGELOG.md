@@ -182,6 +182,17 @@ mean that every acceptance row, platform, or reporter archive has been verified.
   40-segment generation is folded by a plain `cass index`).
 
 ### Fixed
+
+- Incremental indexing no longer advances a connector's scan watermark after
+  a conversation is deferred or quarantined without being persisted. Unrelated
+  completed connectors can still advance; a later successful retry saves the
+  missing messages without duplicating them. Streaming and batch paths share
+  this rule (GH #426). The full per-source resume ledger remains unfinished.
+- The primary database writer recognizes the FTS virtual table by catalog
+  type instead of requiring a positive B-tree root page. New and appended
+  messages now reach an existing fallback search shadow without a rebuild;
+  replay remains deduplicated and shadow-size limits still apply
+  ([`ca621f9d`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ca621f9d2a3d48ffcc18447132ee4e15787ef61a), bead `igh4d`).
 - Semantic backfill reuses compatible vectors across intervening ingest and
   compares current document content and provenance before retaining them.
   Missing checkpoint files restart coverage safely; partial repairs revoke
@@ -190,7 +201,11 @@ mean that every acceptance row, platform, or reporter archive has been verified.
   Seven storage/vector regressions and a native MiniLM lifecycle pass. The
   native probe covers six documents across seven bounded quality batches,
   intervening ingest, and exact lexical/semantic source identity agreement.
-  Process-lock validation remains pending; large-archive throughput is unproven.
+  The reporter subsequently confirmed progress surviving ingest and publication
+  of 425,762 quality vectors on the original roughly 547,000-message archive.
+  Their maintenance batches still spend about five minutes walking canonical
+  identities; this is field-reported correctness evidence, not a throughput win.
+  See [the field results](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/458#issuecomment-5604445676).
   See [#458](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/458).
 - Watches of an explicit Devin database follow its WAL/SHM events without
   ingesting neighboring databases. Provider timestamps older than filesystem
@@ -545,12 +560,6 @@ mean that every acceptance row, platform, or reporter archive has been verified.
   [`ac49507d`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ac49507d)).
 
 ### Fixed
-
-- The primary database writer recognizes the FTS virtual table by catalog
-  type instead of requiring a positive B-tree root page. New and appended
-  messages now reach an existing fallback search shadow without a rebuild;
-  replay remains deduplicated and shadow-size limits still apply
-  ([`ca621f9d`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ca621f9d2a3d48ffcc18447132ee4e15787ef61a), bead `igh4d`).
 - Fixed the GH#413 index-wedge class: the lexical-rebuild sink now flushes on
   starvation so retained byte reservations cannot deadlock the pipeline
   ([`424765b3`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/424765b3)),
