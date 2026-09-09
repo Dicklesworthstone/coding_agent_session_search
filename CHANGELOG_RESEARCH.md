@@ -1,5 +1,25 @@
 # CASS 0.8.0 changelog research
 
+GH422 scoped retry continuation (2026-09-09): the old helper copied only query,
+format, timeout, data-dir, session-file and explicit mode. Both timeout call
+sites now share a retry assembled from the parsed request, including explicit
+non-default `--db` before the subcommand, strict read-only policy, scope,
+cursor-resolved pagination, semantic options and output budgets. Relative time
+bounds are emitted as absolute RFC3339 instants; options and query use existing
+shell quoting and the query follows `--`. Non-UTF8 dataset paths and stdin
+scope omit retry advice rather than advertising a different request.
+
+Validation pending: `/data/projects/cass-gh422-retry-corrected-20260909` runs
+the existing remote batched gate, including a new real-process retry journey
+with two matching sessions, a non-default DB, quoted paths, exact selected-hit
+and nonexistent-agent controls, and byte-stable archive checks. No runtime
+success is claimed yet. The initial payload `cass-gh422-retry-lld839u6`
+stopped before compilation/tests because the parent supplied space-separated
+UBS paths instead of the required comma-separated list; that failure is
+retained, not counted as test evidence. Peer commit `e77f5910` captured WIP
+before validation. Original `u3vho`, reporter-scale acceptance and release
+gates remain open; the exit-zero partial-response contract is unchanged.
+
 GH426 continuation: single-conversation NoMem deferral/quarantine previously
 returned `scan_had_errors=false` despite saving no canonical rows. Both paths
 now retain the deferred source and mark ingestion incomplete. Streaming maps

@@ -183,6 +183,11 @@ mean that every acceptance row, platform, or reporter archive has been verified.
 
 ### Fixed
 
+- Search timeout retry commands retain the selected database, read-only policy,
+  agent/workspace/source/session filters, resolved time bounds, pagination,
+  semantic options and robot output limits. Both setup and metadata timeouts
+  use the same scoped retry; stdin-scoped searches still omit replay advice
+  ([GH #422](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/422)).
 - Incremental indexing no longer advances a connector's scan watermark after
   a conversation is deferred or quarantined without being persisted. Unrelated
   completed connectors can still advance; a later successful retry saves the
