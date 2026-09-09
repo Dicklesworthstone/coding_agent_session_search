@@ -5440,7 +5440,7 @@ impl FrankenStorage {
             .query_row_map(
                 "SELECT COUNT(*) FROM sqlite_master
                  WHERE name = 'fts_messages'
-                   AND rootpage > 0",
+                   AND type = 'table'",
                 fparams![],
                 |row| row.get_typed::<i64>(0),
             )
@@ -21682,6 +21682,97 @@ mod tests {
                 .status,
             FtsShadowParityStatus::Healthy
         );
+    }
+
+    #[test]
+    fn primary_writer_discovers_virtual_fts_and_preserves_append_replay() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("primary-fts.db")).unwrap();
+        storage.ensure_search_fallback_fts_consistency().unwrap();
+        let rootpage: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT rootpage FROM sqlite_master WHERE name = 'fts_messages'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(rootpage, 0, "virtual tables have no ordinary B-tree root");
+        storage.invalidate_fts_messages_present_cache();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let mut conversation = frontier_test_conversation(&[(0, Some(1_700_000_000_000))]);
+        conversation.messages[0].content = "primaryshadowfirst".into();
+        storage
+            .insert_conversation_tree_with_analytics(agent_id, None, &conversation, false)
+            .unwrap();
+        let first_ids = storage
+            .raw()
+            .query("SELECT id FROM messages ORDER BY id")
+            .unwrap();
+        assert_eq!(first_ids.len(), 1);
+        let first_id: i64 = first_ids[0].get_typed(0).unwrap();
+        let hits = storage
+            .raw()
+            .query("SELECT rowid FROM fts_messages WHERE fts_messages MATCH 'primaryshadowfirst'")
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "the primary writer must populate the shadow without a rebuild"
+        );
+        assert_eq!(hits[0].get_typed::<i64>(0).unwrap(), first_id);
+
+        let mut appended = conversation.messages[0].clone();
+        appended.idx = 1;
+        appended.created_at = Some(1_700_000_000_001);
+        appended.content = "primaryshadowsecond".into();
+        conversation.messages.push(appended);
+        storage.invalidate_fts_messages_present_cache();
+        storage
+            .insert_conversation_tree_with_analytics(agent_id, None, &conversation, false)
+            .unwrap();
+        storage
+            .insert_conversation_tree_with_analytics(agent_id, None, &conversation, false)
+            .unwrap();
+        let canonical = storage
+            .raw()
+            .query("SELECT id FROM messages ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            canonical.len(),
+            2,
+            "replay must not duplicate canonical messages"
+        );
+        assert_eq!(canonical[0].get_typed::<i64>(0).unwrap(), first_id);
+        for (query, expected_id) in [
+            ("primaryshadowfirst", first_id),
+            (
+                "primaryshadowsecond",
+                canonical[1].get_typed::<i64>(0).unwrap(),
+            ),
+        ] {
+            let rows = storage
+                .raw()
+                .query_with_params(
+                    "SELECT rowid FROM fts_messages WHERE fts_messages MATCH ?1",
+                    &[SqliteValue::from(query)],
+                )
+                .unwrap();
+            assert_eq!(
+                rows.len(),
+                1,
+                "each message must be searchable exactly once"
+            );
+            assert_eq!(rows[0].get_typed::<i64>(0).unwrap(), expected_id);
+        }
     }
 
     fn reference_indexable_message_count(storage: &FrankenStorage) -> i64 {
