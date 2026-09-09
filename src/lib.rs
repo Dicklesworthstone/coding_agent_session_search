@@ -28982,11 +28982,12 @@ fn search_budget_retry_command(
         return None;
     }
     let (data_dir, db_path) = dataset;
-    let mut command = vec!["cass".to_string()];
-    if db_path != data_dir.join("agent_search.db") {
-        command.extend(["--db".to_string(), shell_quote_arg(db_path.to_str()?)]);
-    }
-    command.push("search".to_string());
+    let mut command = vec![
+        "cass".to_string(),
+        "--db".to_string(),
+        shell_quote_arg(db_path.to_str()?),
+        "search".to_string(),
+    ];
     match format {
         RobotFormat::Json => command.push("--robot".to_string()),
         RobotFormat::Jsonl => {
@@ -29809,18 +29810,12 @@ fn run_cli_search(
                 args.push(format!("--{flag}={value}"));
             }
         }
-        for (flag, values) in [
-            ("fields", fields.as_ref()),
-            ("aggregate", aggregate.as_ref()),
-        ] {
+        for (flag, values) in [("fields", fields.as_ref()), ("aggregate", aggregate.as_ref())] {
             if let Some(values) = values {
                 args.push(format!("--{flag}={}", values.join(",")));
             }
         }
-        for (flag, value) in [
-            ("max-content-length", max_content_length),
-            ("max-tokens", max_tokens),
-        ] {
+        for (flag, value) in [("max-content-length", max_content_length), ("max-tokens", max_tokens)] {
             if let Some(value) = value {
                 args.push(format!("--{flag}={value}"));
             }
