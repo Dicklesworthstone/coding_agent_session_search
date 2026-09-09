@@ -9,16 +9,37 @@ bounds are emitted as absolute RFC3339 instants; options and query use existing
 shell quoting and the query follows `--`. Non-UTF8 dataset paths and stdin
 scope omit retry advice rather than advertising a different request.
 
-Validation pending: `/data/projects/cass-gh422-retry-corrected-20260909` runs
-the existing remote batched gate, including a new real-process retry journey
-with two matching sessions, a non-default DB, quoted paths, exact selected-hit
-and nonexistent-agent controls, and byte-stable archive checks. No runtime
-success is claimed yet. The initial payload `cass-gh422-retry-lld839u6`
+Validation completed on vmi1264463 at 18:52 UTC:
+`/data/projects/cass-gh422-retry-fixture-20260909/results/` contains the passing
+real-process retry journey (1 passed, 0 failed/ignored, 13.61 seconds), actual
+formatter and all-target Clippy results. It exercises setup and metadata
+timeouts against two matching sessions, a non-default DB, quoted paths, exact
+selected-hit and nonexistent-agent controls, and byte-stable archive checks.
+The prior batched gate in `cass-gh422-retry-corrected-20260909/results/`
+passed 27 library controls, all 13 search-format contracts and 68 goldens:
+109 passing tests across the two runs. This is a small isolated archive,
+not reporter-scale performance or independent review.
+
+Both failed attempts remain in the record: `cass-gh422-retry-lld839u6`
 stopped before compilation/tests because the parent supplied space-separated
-UBS paths instead of the required comma-separated list; that failure is
-retained, not counted as test evidence. Peer commit `e77f5910` captured WIP
-before validation. Original `u3vho`, reporter-scale acceptance and release
-gates remain open; the exit-zero partial-response contract is unchanged.
+UBS paths instead of the required comma-separated list. The corrected full
+gate then exposed a test fixture error: filenames lacked Codex's required
+`rollout-` prefix, so discovery produced zero hits before retry assertions.
+Only those names were corrected; the original exact assertions still pass.
+The full gate's UBS module timed out at 300 seconds with zero completed files;
+its synthetic critical count of one is the timeout marker, not a completed
+source finding. No waiver, suppression or release clearance follows.
+
+Final production `src/lib.rs` SHA256 is
+`ea2941bb1958e5091f24b2fc05823cb8d08e16d69a11c9a4ea0a80bdf52da57b`;
+test SHA256 is `5dda6450c3d0268b2d9b58ad69b7c8083aaf0e7a5e6e6b16c791a39ff938ed52`.
+The same production ELF was used in both runtime runs:
+`62e27a5b3ff52940f62a59d1ec595e974328049fd4970078ea5d5312388c2367`.
+All 1040 CASS inputs and 77 frozen unpublished FAD inputs were checked before
+and after; only the declared overlay config/lock differ from canonical CASS.
+Peer commits `e77f5910`/`fb84420d` captured WIP before validation. Original
+`u3vho`, reporter-scale acceptance and release gates remain open; the exit-zero
+partial-response contract is unchanged.
 
 GH426 continuation: single-conversation NoMem deferral/quarantine previously
 returned `scan_had_errors=false` despite saving no canonical rows. Both paths
