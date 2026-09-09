@@ -13522,6 +13522,8 @@ fn run_streaming_consumer(
             }) => {
                 // Accumulators start with the first-received batch.
                 let mut combined_conversations: Vec<NormalizedConversation> = conversations;
+                let mut combined_connector_ranges =
+                    vec![(connector_name, 0..combined_conversations.len())];
                 let mut combined_message_count = message_count;
                 let mut combined_byte_reservation = byte_reservation;
                 let mut combined_batch_size = combined_conversations.len();
@@ -13605,7 +13607,10 @@ fn run_streaming_consumer(
                                     p.total.fetch_add(extra_size, Ordering::Relaxed);
                                     p.tick_activity();
                                 }
+                                let start = combined_conversations.len();
                                 combined_conversations.extend(extra_convs);
+                                combined_connector_ranges
+                                    .push((cname2, start..combined_conversations.len()));
                                 combined_message_count += extra_msg_count;
                                 combined_byte_reservation += extra_byte_reservation;
                                 combined_batch_size += extra_size;
@@ -13642,6 +13647,15 @@ fn run_streaming_consumer(
                 // trees. Drop them before waking blocked producers so the
                 // queue's byte counter never advertises memory that is still
                 // live in this consumer arm (#320).
+                if let Ok(outcome) = &batch_outcome {
+                    for (name, range) in combined_connector_ranges {
+                        if combined_conversations[range].iter().any(|conversation| {
+                            outcome.deferred_sources.contains(&conversation.source_path)
+                        }) {
+                            failed_scan_connectors.insert(name.to_string());
+                        }
+                    }
+                }
                 drop(combined_conversations);
                 flow_limiter.release(combined_byte_reservation);
                 ingest_outcome = ingest_outcome.accumulate(batch_outcome?);
@@ -14470,6 +14484,7 @@ fn run_batch_index_with_connector_factories(
             !opts.watch,
             progress_bump,
         )?;
+        let persistence_completed = !batch_outcome.scan_had_errors;
         ingest_outcome = ingest_outcome.accumulate(batch_outcome);
         // #426: this connector's complete scan has now been persisted. Advance
         // only its watermark at this transaction boundary. The former timed
@@ -14477,6 +14492,7 @@ fn run_batch_index_with_connector_factories(
         // still pending, so termination could permanently skip those rows.
         let connector_watermark_safe = pending.is_discovered
             && pending.scan_succeeded
+            && persistence_completed
             && !pending.active_source_skipped
             && !scan_path_exclusions_active();
         if connector_watermark_safe {
@@ -24966,8 +24982,8 @@ fn ingest_non_watch_oom_retry_or_quarantine(
             quarantined_conversations: 0,
             lexical_update_deferred: true,
             scanned_connectors: BTreeSet::new(),
-            scan_had_errors: false,
-            deferred_sources: BTreeSet::new(),
+            scan_had_errors: true,
+            deferred_sources: BTreeSet::from([conv.source_path.clone()]),
         });
     }
 
@@ -24998,8 +25014,8 @@ fn ingest_non_watch_oom_retry_or_quarantine(
         quarantined_conversations: 1,
         lexical_update_deferred: true,
         scanned_connectors: BTreeSet::new(),
-        scan_had_errors: false,
-        deferred_sources: BTreeSet::new(),
+        scan_had_errors: true,
+        deferred_sources: BTreeSet::from([conv.source_path.clone()]),
     })
 }
 
@@ -45123,7 +45139,7 @@ mod tests {
     #[test]
     #[serial]
     fn streaming_consumer_defers_small_non_watch_oom_without_quarantine() {
-        let _oom_guard = set_env("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS", "1");
+        let oom_guard = set_env("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS", "1");
         // Pin the pressure probe to "never real pressure" so the size gate is
         // what decides, deterministically, on any host.
         let _reserve_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
@@ -45137,34 +45153,62 @@ mod tests {
         let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
         let progress = Arc::new(IndexingProgress::default());
         let conv = norm_conv(Some("defer-single"), vec![norm_msg(0, 1_700_000_000_000)]);
+        let prior_watermark = 1_600_000_000_000;
+        let scan_watermark = 1_700_000_123_456;
+        storage.set_connector_last_scan_ts("codex", prior_watermark).unwrap();
 
         let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
-        send_conversation_batches(&tx, "codex", vec![conv], true);
+        send_conversation_batches(&tx, "codex", vec![conv.clone()], true);
         send_done(&tx, "codex", true);
+        send_done(&tx, "claude", true);
         drop(tx);
 
         let (_discovered, outcome) = run_streaming_consumer(
             rx,
-            1,
+            2,
             &storage,
             &data_dir,
             Some(&mut index),
             Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
             &Some(progress.clone()),
             LexicalPopulationStrategy::IncrementalInline,
-            Some(FrankenStorage::now_millis()),
+            Some(scan_watermark),
             None,
         )
         .expect("small-conversation NoMem without real pressure should defer, not fail");
 
         assert_eq!(outcome.quarantined_conversations, 0);
         assert!(outcome.lexical_update_deferred);
+        assert!(outcome.scan_had_errors);
+        assert_eq!(outcome.deferred_sources, BTreeSet::from([conv.source_path.clone()]));
+        assert_eq!(outcome.scanned_connectors, BTreeSet::from(["claude".to_string()]));
+        assert_eq!(storage.get_connector_last_scan_ts("codex").unwrap(), Some(prior_watermark));
+        assert_eq!(storage.get_connector_last_scan_ts("claude").unwrap(), Some(scan_watermark));
         assert!(
             !data_dir
                 .join("quarantine/index_ingest_poison.jsonl")
                 .exists(),
             "a small conversation with no real memory pressure must be deferred, not quarantined (#298)"
         );
+
+        drop(oom_guard);
+        for expected_inserted in [1, 0] {
+            let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
+            send_conversation_batches(&tx, "codex", vec![conv.clone()], true);
+            send_done(&tx, "codex", true);
+            drop(tx);
+            let (_, retried) = run_streaming_consumer(
+                rx, 1, &storage, &data_dir, Some(&mut index),
+                Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
+                &Some(progress.clone()), LexicalPopulationStrategy::IncrementalInline,
+                Some(scan_watermark), None,
+            ).unwrap();
+            assert!(!retried.scan_had_errors);
+            assert!(retried.deferred_sources.is_empty());
+            assert_eq!(retried.inserted_messages, expected_inserted);
+            assert_eq!(storage.get_connector_last_scan_ts("codex").unwrap(), Some(scan_watermark));
+            assert_eq!(storage.message_count().unwrap(), 1);
+        }
     }
 
     /// #290: a stable, already-triaged backlog of *same-version* irreducible
