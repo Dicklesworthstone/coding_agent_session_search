@@ -43,8 +43,8 @@ fn detect_does_not_panic() {
 #[test]
 fn scan_parses_basic_session() {
     let tmp = TempDir::new().unwrap();
-    // Path must contain "factory" and "sessions" to look like factory storage
-    let root = tmp.path().join("factory/sessions");
+    // Use Factory's real storage layout; substring lookalikes are not sources.
+    let root = tmp.path().join(".factory/sessions");
     fs::create_dir_all(&root).unwrap();
 
     write_jsonl(
@@ -76,7 +76,7 @@ fn scan_parses_basic_session() {
 #[test]
 fn scan_multiple_sessions() {
     let tmp = TempDir::new().unwrap();
-    let root = tmp.path().join("factory/sessions");
+    let root = tmp.path().join(".factory/sessions");
     fs::create_dir_all(&root).unwrap();
 
     write_jsonl(
@@ -116,7 +116,7 @@ fn scan_multiple_sessions() {
 #[test]
 fn scan_infers_title_from_first_user_message() {
     let tmp = TempDir::new().unwrap();
-    let root = tmp.path().join("factory/sessions");
+    let root = tmp.path().join(".factory/sessions");
     fs::create_dir_all(&root).unwrap();
 
     // No title in session_start, should be inferred from first user message
@@ -144,7 +144,7 @@ fn scan_infers_title_from_first_user_message() {
 #[test]
 fn scan_empty_dir_returns_empty() {
     let tmp = TempDir::new().unwrap();
-    let root = tmp.path().join("factory/sessions");
+    let root = tmp.path().join(".factory/sessions");
     fs::create_dir_all(&root).unwrap();
 
     let connector = FactoryConnector::new();
@@ -156,7 +156,7 @@ fn scan_empty_dir_returns_empty() {
 #[test]
 fn scan_skips_invalid_jsonl_lines() {
     let tmp = TempDir::new().unwrap();
-    let root = tmp.path().join("factory/sessions");
+    let root = tmp.path().join(".factory/sessions");
     fs::create_dir_all(&root).unwrap();
 
     write_jsonl(
@@ -182,7 +182,7 @@ fn scan_skips_invalid_jsonl_lines() {
 #[test]
 fn scan_skips_empty_content_messages() {
     let tmp = TempDir::new().unwrap();
-    let root = tmp.path().join("factory/sessions");
+    let root = tmp.path().join(".factory/sessions");
     fs::create_dir_all(&root).unwrap();
 
     write_jsonl(
@@ -208,7 +208,7 @@ fn scan_skips_empty_content_messages() {
 #[test]
 fn scan_skips_session_with_no_messages() {
     let tmp = TempDir::new().unwrap();
-    let root = tmp.path().join("factory/sessions");
+    let root = tmp.path().join(".factory/sessions");
     fs::create_dir_all(&root).unwrap();
 
     // Only session_start, no message entries
@@ -227,7 +227,7 @@ fn scan_skips_session_with_no_messages() {
 #[test]
 fn scan_skips_settings_json() {
     let tmp = TempDir::new().unwrap();
-    let root = tmp.path().join("factory/sessions");
+    let root = tmp.path().join(".factory/sessions");
     fs::create_dir_all(&root).unwrap();
 
     // Write a .settings.json file that should be ignored
@@ -261,7 +261,7 @@ fn scan_skips_settings_json() {
 #[test]
 fn scan_preserves_message_ordering() {
     let tmp = TempDir::new().unwrap();
-    let root = tmp.path().join("factory/sessions");
+    let root = tmp.path().join(".factory/sessions");
     fs::create_dir_all(&root).unwrap();
 
     write_jsonl(
@@ -294,7 +294,7 @@ fn scan_preserves_message_ordering() {
 #[test]
 fn scan_respects_since_ts() {
     let tmp = TempDir::new().unwrap();
-    let root = tmp.path().join("factory/sessions");
+    let root = tmp.path().join(".factory/sessions");
     fs::create_dir_all(&root).unwrap();
 
     write_jsonl(
@@ -320,7 +320,7 @@ fn scan_respects_since_ts() {
 #[test]
 fn scan_extracts_workspace_from_session_start() {
     let tmp = TempDir::new().unwrap();
-    let root = tmp.path().join("factory/sessions");
+    let root = tmp.path().join(".factory/sessions");
     fs::create_dir_all(&root).unwrap();
 
     write_jsonl(
@@ -353,7 +353,7 @@ fn scan_extracts_workspace_from_session_start() {
 #[test]
 fn scan_extracts_model_as_author() {
     let tmp = TempDir::new().unwrap();
-    let root = tmp.path().join("factory/sessions");
+    let root = tmp.path().join(".factory/sessions");
     fs::create_dir_all(&root).unwrap();
 
     write_jsonl(

@@ -1,4 +1,5 @@
 use coding_agent_search::connectors::copilot::CopilotConnector;
+use coding_agent_search::connectors::copilot_cli::CopilotCliConnector;
 use coding_agent_search::connectors::{Connector, ScanContext, ScanRoot};
 use std::fs;
 use std::path::Path;
@@ -237,12 +238,14 @@ fn scan_parses_cli_jsonl_prompt_output_unicode_fixture() {
         &load_fixture("cli_prompt_output_unicode.events.jsonl"),
     );
 
-    let connector = CopilotConnector::new();
+    // CLI history belongs to the CLI connector, separately from VS Code chat.
+    let connector = CopilotCliConnector::new();
     let ctx = ScanContext::local_default(root, None);
     let convs = connector.scan(&ctx).unwrap();
 
     assert_eq!(convs.len(), 1);
     let conv = &convs[0];
+    assert_eq!(conv.agent_slug, "copilot_cli");
     assert_eq!(conv.external_id.as_deref(), Some("cli-session-001"));
     assert_eq!(
         conv.workspace.as_deref(),
@@ -273,12 +276,13 @@ fn scan_cli_jsonl_skips_truncated_line_and_keeps_valid_messages() {
         &load_fixture("cli_truncated_resume.events.jsonl"),
     );
 
-    let connector = CopilotConnector::new();
+    let connector = CopilotCliConnector::new();
     let ctx = ScanContext::local_default(root, None);
     let convs = connector.scan(&ctx).unwrap();
 
     assert_eq!(convs.len(), 1);
     let conv = &convs[0];
+    assert_eq!(conv.agent_slug, "copilot_cli");
     assert_eq!(conv.external_id.as_deref(), Some("cli-session-truncated"));
     assert_eq!(conv.messages.len(), 2);
     assert_eq!(conv.messages[0].role, "user");
@@ -300,12 +304,13 @@ fn scan_parses_cli_history_json_with_human_role_and_file_stem_id() {
         &load_fixture("legacy_history_human.json"),
     );
 
-    let connector = CopilotConnector::new();
+    let connector = CopilotCliConnector::new();
     let ctx = ScanContext::local_default(root, None);
     let convs = connector.scan(&ctx).unwrap();
 
     assert_eq!(convs.len(), 1);
     let conv = &convs[0];
+    assert_eq!(conv.agent_slug, "copilot_cli");
     assert_eq!(conv.external_id.as_deref(), Some("legacy-human"));
     assert_eq!(
         conv.title.as_deref(),
