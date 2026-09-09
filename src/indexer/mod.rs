@@ -45098,6 +45098,9 @@ mod tests {
             assert_eq!(outcome.inserted_messages, 0);
             assert!(outcome.lexical_update_deferred);
             assert_eq!(outcome.quarantined_conversations, 1);
+            assert!(outcome.scan_had_errors);
+            assert!(outcome.scanned_connectors.is_empty());
+            assert_eq!(storage.get_connector_last_scan_ts("codex").unwrap(), None);
 
             let quarantine_path = data_dir.join("quarantine/index_ingest_poison.jsonl");
             let contents = std::fs::read_to_string(&quarantine_path).unwrap();
@@ -45155,7 +45158,9 @@ mod tests {
         let conv = norm_conv(Some("defer-single"), vec![norm_msg(0, 1_700_000_000_000)]);
         let prior_watermark = 1_600_000_000_000;
         let scan_watermark = 1_700_000_123_456;
-        storage.set_connector_last_scan_ts("codex", prior_watermark).unwrap();
+        storage
+            .set_connector_last_scan_ts("codex", prior_watermark)
+            .unwrap();
 
         let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
         send_conversation_batches(&tx, "codex", vec![conv.clone()], true);
@@ -45180,10 +45185,22 @@ mod tests {
         assert_eq!(outcome.quarantined_conversations, 0);
         assert!(outcome.lexical_update_deferred);
         assert!(outcome.scan_had_errors);
-        assert_eq!(outcome.deferred_sources, BTreeSet::from([conv.source_path.clone()]));
-        assert_eq!(outcome.scanned_connectors, BTreeSet::from(["claude".to_string()]));
-        assert_eq!(storage.get_connector_last_scan_ts("codex").unwrap(), Some(prior_watermark));
-        assert_eq!(storage.get_connector_last_scan_ts("claude").unwrap(), Some(scan_watermark));
+        assert_eq!(
+            outcome.deferred_sources,
+            BTreeSet::from([conv.source_path.clone()])
+        );
+        assert_eq!(
+            outcome.scanned_connectors,
+            BTreeSet::from(["claude".to_string()])
+        );
+        assert_eq!(
+            storage.get_connector_last_scan_ts("codex").unwrap(),
+            Some(prior_watermark)
+        );
+        assert_eq!(
+            storage.get_connector_last_scan_ts("claude").unwrap(),
+            Some(scan_watermark)
+        );
         assert!(
             !data_dir
                 .join("quarantine/index_ingest_poison.jsonl")
@@ -45198,16 +45215,26 @@ mod tests {
             send_done(&tx, "codex", true);
             drop(tx);
             let (_, retried) = run_streaming_consumer(
-                rx, 1, &storage, &data_dir, Some(&mut index),
+                rx,
+                1,
+                &storage,
+                &data_dir,
+                Some(&mut index),
                 Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
-                &Some(progress.clone()), LexicalPopulationStrategy::IncrementalInline,
-                Some(scan_watermark), None,
-            ).unwrap();
+                &Some(progress.clone()),
+                LexicalPopulationStrategy::IncrementalInline,
+                Some(scan_watermark),
+                None,
+            )
+            .unwrap();
             assert!(!retried.scan_had_errors);
             assert!(retried.deferred_sources.is_empty());
             assert_eq!(retried.inserted_messages, expected_inserted);
-            assert_eq!(storage.get_connector_last_scan_ts("codex").unwrap(), Some(scan_watermark));
-            assert_eq!(storage.message_count().unwrap(), 1);
+            assert_eq!(
+                storage.get_connector_last_scan_ts("codex").unwrap(),
+                Some(scan_watermark)
+            );
+            assert_eq!(storage.total_message_count().unwrap(), 1);
         }
     }
 
@@ -47378,6 +47405,51 @@ mod tests {
             Some(scan_start_ts),
             "batch mode must persist each safe connector watermark only after its rows commit"
         );
+        let oom_guard = set_env("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS", "1");
+        let _pressure_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
+        let next_scan_ts = scan_start_ts + 1;
+        let deferred = run_batch_index_with_connector_factories(
+            &storage,
+            None,
+            &opts,
+            None,
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            Vec::new(),
+            None,
+            vec![("codex", safe_batch_watermark_connector_factory)],
+            next_scan_ts,
+            None,
+        )?;
+        assert!(deferred.scan_had_errors);
+        assert!(deferred.scanned_connectors.is_empty());
+        assert_eq!(deferred.deferred_sources, BTreeSet::from([safe_path]));
+        assert_eq!(
+            storage.get_connector_last_scan_ts("codex")?,
+            Some(scan_start_ts)
+        );
+        drop(oom_guard);
+        let retried = run_batch_index_with_connector_factories(
+            &storage,
+            None,
+            &opts,
+            None,
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            Vec::new(),
+            None,
+            vec![("codex", safe_batch_watermark_connector_factory)],
+            next_scan_ts,
+            None,
+        )?;
+        assert!(!retried.scan_had_errors);
+        assert_eq!(
+            retried.scanned_connectors,
+            BTreeSet::from(["codex".to_string()])
+        );
+        assert_eq!(
+            storage.get_connector_last_scan_ts("codex")?,
+            Some(next_scan_ts)
+        );
+        assert_eq!(storage.total_message_count()?, 1);
         Ok(())
     }
 
