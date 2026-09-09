@@ -28973,17 +28973,20 @@ fn search_budget_retry_command(
     query: &str,
     format: RobotFormat,
     budget_ms: u64,
-    data_dir: &Path,
+    dataset: (&Path, &Path),
     sessions_from: Option<&str>,
     mode: Option<crate::search::query::SearchMode>,
+    request_args: &[String],
 ) -> Option<String> {
     if sessions_from == Some("-") {
         return None;
     }
+    let (data_dir, db_path) = dataset;
     let mut command = vec![
         "cass".to_string(),
+        "--db".to_string(),
+        shell_quote_arg(db_path.to_str()?),
         "search".to_string(),
-        shell_quote_arg(query),
     ];
     match format {
         RobotFormat::Json => command.push("--robot".to_string()),
@@ -29008,8 +29011,7 @@ fn search_budget_retry_command(
             .to_string(),
     ]);
     if let Some(sessions_from) = sessions_from {
-        command.push("--sessions-from".to_string());
-        command.push(shell_quote_arg(sessions_from));
+        command.push(shell_quote_arg(&format!("--sessions-from={sessions_from}")));
     }
     if let Some(mode) = mode {
         let mode = match mode {
@@ -29020,7 +29022,9 @@ fn search_budget_retry_command(
         command.extend(["--mode".to_string(), mode.to_string()]);
     }
     command.push("--data-dir".to_string());
-    command.push(shell_quote_arg(&data_dir.display().to_string()));
+    command.push(shell_quote_arg(data_dir.to_str()?));
+    command.extend(request_args.iter().map(|arg| shell_quote_arg(arg)));
+    command.extend(["--".to_string(), shell_quote_arg(query)]);
     Some(command.join(" "))
 }
 
@@ -29029,19 +29033,10 @@ fn output_search_budget_partial(
     format: RobotFormat,
     budget: &crate::robot_budget_envelope::RobotBudget,
     skipped_sections: Vec<String>,
-    data_dir: &Path,
-    sessions_from: Option<&str>,
+    retry: Option<String>,
     mode_meta: (SearchModeMeta, bool),
 ) -> CliResult<()> {
     let (mode_meta, include_meta) = mode_meta;
-    let retry = search_budget_retry_command(
-        query,
-        format,
-        budget.total_ms(),
-        data_dir,
-        sessions_from,
-        (!mode_meta.defaulted).then_some(mode_meta.requested),
-    );
     let mut budget_block = crate::robot_budget_envelope::BudgetBlock::from_budget(
         budget,
         skipped_sections,
@@ -29788,6 +29783,77 @@ fn run_cli_search(
         .unwrap_or_default();
     let has_aggregation = !agg_fields.is_empty();
 
+    // A timeout retry is the same parsed request with a larger budget, not a
+    // fresh unfiltered query. Freeze relative time bounds and cursor pagination
+    // so following the advice cannot silently broaden the original scope.
+    let search_retry = effective_robot.and_then(|format| {
+        let mut args = vec![
+            format!("--limit={limit_val}"),
+            format!("--offset={offset_val}"),
+        ];
+        for (flag, values) in [("agent", agents), ("workspace", workspaces)] {
+            args.extend(values.iter().map(|value| format!("--{flag}={value}")));
+        }
+        for (flag, bound) in [("since", time_filter.since), ("until", time_filter.until)] {
+            if let Some(bound) = bound {
+                let date = chrono::DateTime::from_timestamp_millis(bound)?;
+                args.push(format!("--{flag}={}", date.to_rfc3339()));
+            }
+        }
+        for (flag, value) in [
+            ("source", source.as_deref()),
+            ("request-id", request_id.as_deref()),
+            ("model", semantic_opts.model.as_deref()),
+            ("reranker", semantic_opts.reranker.as_deref()),
+        ] {
+            if let Some(value) = value {
+                args.push(format!("--{flag}={value}"));
+            }
+        }
+        for (flag, values) in [("fields", fields.as_ref()), ("aggregate", aggregate.as_ref())] {
+            if let Some(values) = values {
+                args.push(format!("--{flag}={}", values.join(",")));
+            }
+        }
+        for (flag, value) in [("max-content-length", max_content_length), ("max-tokens", max_tokens)] {
+            if let Some(value) = value {
+                args.push(format!("--{flag}={value}"));
+            }
+        }
+        for (flag, enabled) in [
+            ("no-maintenance", no_maintenance),
+            ("robot-meta", robot_meta),
+            ("explain", explain),
+            ("dry-run", dry_run),
+            ("highlight", highlight),
+            ("refresh", refresh),
+            ("approximate", semantic_opts.approximate),
+            ("rerank", semantic_opts.rerank),
+            ("daemon", semantic_opts.auto_spawn_daemon),
+            ("no-daemon", !semantic_opts.use_daemon),
+        ] {
+            if enabled {
+                args.push(format!("--{flag}"));
+            }
+        }
+        use crate::search::query::SemanticTierMode;
+        match semantic_opts.tier_mode {
+            SemanticTierMode::Single => {}
+            SemanticTierMode::Progressive => args.push("--two-tier".to_string()),
+            SemanticTierMode::FastOnly => args.push("--fast-only".to_string()),
+            SemanticTierMode::QualityOnly => args.push("--quality-only".to_string()),
+        }
+        search_budget_retry_command(
+            query,
+            format,
+            search_budget.as_ref()?.total_ms(),
+            (&data_dir, &db_path),
+            sessions_from.as_deref(),
+            mode,
+            &args,
+        )
+    });
+
     let output_early_timeout = |mut skipped_sections: Vec<String>| {
         for (requested, section) in [
             (semantic_opts.rerank, "reranking"),
@@ -29804,8 +29870,7 @@ fn run_cli_search(
             effective_robot.expect("bounded search is robot-only"),
             search_budget.as_ref().expect("robot search has a budget"),
             skipped_sections,
-            &data_dir,
-            sessions_from.as_deref(),
+            search_retry.clone(),
             (
                 SearchModeMeta::new(mode.unwrap_or_default(), mode.is_none()),
                 robot_meta,
@@ -31028,17 +31093,7 @@ fn run_cli_search(
                 &["index", "--json"],
             ))
         } else {
-            search_budget_retry_command(
-                query,
-                format,
-                search_budget
-                    .as_ref()
-                    .expect("robot output always establishes a search budget")
-                    .total_ms(),
-                &data_dir,
-                sessions_from.as_deref(),
-                mode,
-            )
+            search_retry.clone()
         };
         let budget = crate::robot_budget_envelope::BudgetBlock::from_budget(
             search_budget
