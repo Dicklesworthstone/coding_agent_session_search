@@ -1,5 +1,39 @@
 # CASS 0.8.0 changelog research
 
+September 9 follow-up, original bead `coding_agent_session_search-igh4d`:
+the primary writer's catalog probe required `rootpage > 0`, excluding the
+actual FTS virtual table, whose root page is zero. The correction uses
+`type = 'table'` and leaves all shadow admission/suspension limits unchanged.
+The real FrankenSQLite regression starts with an unknown presence cache,
+inserts and appends through the primary writer, and checks exact MATCH rowids
+and replay conservation without an intervening rebuild. Peer commit
+ca621f9d2a3d48ffcc18447132ee4e15787ef61a captured the same reviewed source.
+
+RCH job 30013452823035932 on vmi1264463 completed at 13:37 UTC. Formatting,
+all-target Clippy, both the new regression and existing shadow-bound control,
+and all 68 goldens passed (70 passing tests). The requested integration target
+`storage_parity` does not exist: that stage exited 101 and ran zero tests.
+The unchanged-source follow-up, RCH job 30013452823035944, ran the correct
+`storage_frankensqlite_parity` target: all 39 tests passed in 19.98 seconds at
+13:38 UTC. Both source and all 77 overlay inputs matched before and after;
+the production executable remained unchanged. Combined selected coverage is
+109 passing tests, with the original target-selection failure retained.
+Parity log `/data/projects/cass-igh4d-parity-eu_edv4n/results/parity.log` has
+SHA256 460deaa6b6be2cd05b6178f93986da13ba22abe24f620e73ea4bb4efacd6de1b.
+UBS completed with 28 critical
+labels, 6,851 warnings and 1,132 informational findings, exit 1. These are
+scanner classifications, not independently confirmed defects or clearance.
+
+Retained results: `/data/projects/cass-igh4d-9c4zdq75/results/`;
+gate log SHA256 8de31c4170e6455797475139d253c9fd43f5f6b200e61a145d5b35a421a410e7.
+All 1,040 CASS inputs were stable; the declared 77-file unpublished connector
+overlay was verified before execution. Formatted storage SHA256:
+dced71065c966c17828cb60a1e3a2e21c75b5f84df39b2566d98775d23bad88d.
+Actual executable SHA256:
+6c1519374d36301aeb0aec8ccb0818d22b68ec7fa7acd0c6dae3210315e86a90.
+This proves controlled storage behavior, not large-archive performance or
+release readiness; the required scanner gate remains red.
+
 Scope window: `v0.7.1..6b2ab22d30892fe6f7762d851477feea0e6f80f8`, plus
 the local 0.8.0 preparation through da1930c0 and reviewed working-tree repairs on
 September 9. This is a release-window update, not a reconstruction of older

@@ -546,6 +546,11 @@ mean that every acceptance row, platform, or reporter archive has been verified.
 
 ### Fixed
 
+- The primary database writer recognizes the FTS virtual table by catalog
+  type instead of requiring a positive B-tree root page. New and appended
+  messages now reach an existing fallback search shadow without a rebuild;
+  replay remains deduplicated and shadow-size limits still apply
+  ([`ca621f9d`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/ca621f9d2a3d48ffcc18447132ee4e15787ef61a), bead `igh4d`).
 - Fixed the GH#413 index-wedge class: the lexical-rebuild sink now flushes on
   starvation so retained byte reservations cannot deadlock the pipeline
   ([`424765b3`](https://github.com/Dicklesworthstone/coding_agent_session_search/commit/424765b3)),
