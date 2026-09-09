@@ -491,6 +491,17 @@ cass sources setup --non-interactive --hosts myserver --skip-install
 
 #### Testing your real fleet
 
+Tailscale discovery is optional: `cass sources discover --tailscale --json` adds
+online tailnet peers to SSH-config discovery, and `cass sources setup --tailscale`
+offers them in setup. It reads local `tailscale status --json` with a five-second
+deadline; a missing CLI, stopped daemon, or login failure produces a warning and
+leaves SSH-config discovery available. Explicit `setup --hosts` skips discovery.
+Connections use ordinary SSH over assigned Tailscale IPv4 addresses, so MagicDNS
+is not required. Matching SSH aliases retain their user/key configuration;
+otherwise SSH uses its normal defaults. IPv6-only peers are currently omitted.
+Tailscale ACLs, SSH authorization and host-key checks still apply; discovery does
+not log in, install Tailscale, or change either SSH or tailnet configuration.
+
 The local fixture and Docker tests do not prove that your machines can sync and
 search each other's sessions. The opt-in live harness uses actual SSH connections
 and `cass sources discover`, `sources add`, `sources sync`, and `search`. It creates isolated synthetic
@@ -522,6 +533,11 @@ Python 3 and authenticated SSH access are required on the remote machines.
 The Unix runner needs Python 3.9+, rsync, and a CASS binary supporting the tested
 commands. Each inventory alias must appear in the supplied SSH configuration;
 included configuration files are supported. Host-key verification stays enabled.
+To exercise actual tailnet discovery and transport, add `--tailscale` to the
+harness command and use tailnet IPv4 addresses as the private inventory targets.
+Keep any required SSH users, keys and trusted host-key aliases in the private SSH
+configuration. For a discovery test independent of explicit aliases, use SSH
+`Match originalhost` entries rather than literal `Host` entries for those addresses.
 The harness retains fresh test directories and raw
 receipts privately outside git; it never changes existing session archives or
 deletes test data. Console results use ordinal labels. An unreachable machine

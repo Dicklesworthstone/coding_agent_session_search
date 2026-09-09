@@ -825,7 +825,9 @@ fn merge_tailscale_hosts(hosts: &mut Vec<DiscoveredHost>, bytes: &[u8]) -> anyho
         if !peer.online || peer.sharee_node {
             continue;
         }
-        let Some(address) = peer.addresses.iter().find(|ip| ip.is_ipv4()).or(peer.addresses.first()) else {
+        // The existing SSH/rsync source contract accepts IPv4 and DNS names,
+        // not bare IPv6 literals. Do not advertise unusable source targets.
+        let Some(address) = peer.addresses.iter().find(|ip| ip.is_ipv4()) else {
             continue;
         };
         let dns = peer.dns_name.trim_end_matches('.');
@@ -2368,13 +2370,12 @@ paths = ["~/.claude/projects"]
         });
         let bytes = serde_json::to_vec(&status).unwrap();
         merge_tailscale_hosts(&mut hosts, &bytes).unwrap();
-        assert_eq!(hosts.len(), 3);
+        assert_eq!(hosts.len(), 2);
         assert_eq!(hosts[0].connection_string(), "developer@workstation");
         assert_eq!(hosts[0].identity_file.as_deref(), Some("~/.ssh/work"));
         assert_eq!(hosts[1].connection_string(), "100.64.0.2");
-        assert_eq!(hosts[2].connection_string(), "fd7a:115c:a1e0::6");
         merge_tailscale_hosts(&mut hosts, &bytes).unwrap();
-        assert_eq!(hosts.len(), 3);
+        assert_eq!(hosts.len(), 2);
     }
 
     #[test]
