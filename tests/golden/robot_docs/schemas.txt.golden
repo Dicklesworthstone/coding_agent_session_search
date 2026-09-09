@@ -509,6 +509,8 @@ schemas: (auto-generated from contract)
         - max_source_amplification_ratio_milli: ?
         - missing_blob_count: integer
         - omitted_healthy_manifest_count: integer
+        - orphan_blob_bytes: integer
+        - orphan_blob_count: integer
         - total_blob_bytes: integer
         - verified_blob_count: integer
       - warnings: array
@@ -1020,6 +1022,8 @@ schemas: (auto-generated from contract)
         - max_source_amplification_ratio_milli: ?
         - missing_blob_count: integer
         - omitted_healthy_manifest_count: integer
+        - orphan_blob_bytes: integer
+        - orphan_blob_count: integer
         - total_blob_bytes: integer
         - verified_blob_count: integer
       - warnings: array
@@ -3031,6 +3035,7 @@ schemas: (auto-generated from contract)
         - schema_version: string
       - rebuild: object
         - active: boolean
+        - engine_incompatible: boolean
         - indexed_docs: ?
         - job_id: ?
         - job_kind: ?
@@ -3533,6 +3538,7 @@ schemas: (auto-generated from contract)
     - quarantine: object
     - rebuild: object
       - active: boolean
+      - engine_incompatible: boolean
       - indexed_docs: ?
       - job_id: ?
       - job_kind: ?
@@ -3925,6 +3931,7 @@ schemas: (auto-generated from contract)
     - quarantine: object
     - rebuild: object
       - active: boolean
+      - engine_incompatible: boolean
       - indexed_docs: ?
       - job_id: ?
       - job_kind: ?
@@ -4134,7 +4141,8 @@ schemas: (auto-generated from contract)
         - conversations: ?
         - counts_skipped: boolean
         - db_bytes: integer
-        - exists: boolean
+        - exists: ?
+        - inspected: boolean
         - integrity: string
         - integrity_detail: ?
         - integrity_hint: ?
@@ -4152,10 +4160,11 @@ schemas: (auto-generated from contract)
         - documents: ?
         - empty_with_messages: boolean
         - engine_incompatible: boolean
-        - exists: boolean
+        - exists: ?
         - fingerprint: object
         - fresh: boolean
         - hollow: boolean
+        - inspected: boolean
         - last_indexed_at: ?
         - live_documents: ?
         - partial: boolean
@@ -4171,6 +4180,7 @@ schemas: (auto-generated from contract)
       - ingest_quarantine: object
         - circuit_breaker_active: boolean
         - circuit_breaker_limit: integer
+        - inspected: boolean
         - newest_last_attempt_at_ms: ?
         - quarantine_files: array
         - quarantined_conversations: integer
@@ -4180,12 +4190,15 @@ schemas: (auto-generated from contract)
         - schema_version: integer
         - status: string
       - pending: object
+        - inspected: boolean
         - orphaned: boolean
         - sessions: integer
         - watch_active: boolean
       - rebuild: object
         - active: boolean
+        - engine_incompatible: boolean
         - indexed_docs: ?
+        - inspected: boolean
         - job_id: ?
         - job_kind: ?
         - last_progress_age_ms: ?
@@ -4208,6 +4221,7 @@ schemas: (auto-generated from contract)
         - indexed_docs: ?
         - inflight_message_bytes: ?
         - inflight_message_bytes_headroom: ?
+        - inspected: boolean
         - last_progress_age_ms: ?
         - last_progress_at: ?
         - max_message_bytes_in_flight: ?
@@ -4237,6 +4251,7 @@ schemas: (auto-generated from contract)
         - hint: ?
         - hnsw_path: ?
         - hnsw_ready: boolean
+        - inspected: boolean
         - model_dir: ?
         - preferred_backend: string
         - progressive_ready: boolean
@@ -4253,19 +4268,21 @@ schemas: (auto-generated from contract)
       - confidence: string
       - evidence_refs: array
       - family: string
+      - inspected: boolean
       - locus: string
       - recommended_next_probe: ?
       - schema_version: integer
       - summary: string
     - schema_version: integer
     - search_completeness: object
-      - can_search: boolean
-      - complete: boolean
-      - coverage_suspect: boolean
+      - can_search: ?
+      - complete: ?
+      - coverage_suspect: ?
       - impact: string
+      - inspected: boolean
       - next_command: string
       - quarantine_status: string
-      - quarantined_conversations: integer
+      - quarantined_conversations: ?
     - starter_workflows: array
     - status: string
     - surface: string

@@ -462,7 +462,7 @@ fn introspect_response_schemas_cover_runtime_json_shapes() -> Result<(), Box<dyn
         collect_runtime_shape_gaps(surface, "$", &runtime_schema, advertised_schema, &mut gaps);
     }
 
-    collect_zero_budget_triage_schema_gaps(
+    collect_uninspected_triage_schema_gaps(
         test_home.path(),
         &demo_data,
         response_schemas,
@@ -476,27 +476,27 @@ fn introspect_response_schemas_cover_runtime_json_shapes() -> Result<(), Box<dyn
     Ok(())
 }
 
-fn collect_zero_budget_triage_schema_gaps(
+fn collect_uninspected_triage_schema_gaps(
     test_home: &Path,
     demo_data: &Path,
     response_schemas: &Map<String, Value>,
     gaps: &mut Vec<String>,
 ) {
-    // Zero is a real exhausted triage budget, so this deterministically
-    // exercises uninspected output without delaying or substituting probes.
+    // One millisecond is accepted by the CLI and below its 25 ms response
+    // reserve, so readiness probes are deterministically left uninspected.
     let uninspected = run_json(
         test_home,
         &[
             "triage".to_string(),
             "--json".to_string(),
             "--timeout".to_string(),
-            "0".to_string(),
+            "1".to_string(),
             "--data-dir".to_string(),
             demo_data.to_string_lossy().into_owned(),
         ],
         ExpectStatus::ExitOk,
     );
-    assert_eq!(uninspected["budget"]["budget_ms"], 0);
+    assert_eq!(uninspected["budget"]["budget_ms"], 1);
     assert_eq!(uninspected["budget"]["timed_out"], true);
     assert_eq!(uninspected["search_completeness"]["inspected"], false);
     assert_eq!(uninspected["root_cause"]["inspected"], false);
@@ -542,7 +542,7 @@ fn collect_zero_budget_triage_schema_gaps(
         .as_array().expect("triage quarantine enum")
         .contains(&uninspected["search_completeness"]["quarantine_status"]));
     collect_runtime_shape_gaps(
-        "triage-zero-budget",
+        "triage-uninspected-budget",
         "$",
         &json_value_schema(&uninspected),
         triage_schema,

@@ -187,8 +187,10 @@ mean that every acceptance row, platform, or reporter archive has been verified.
   Missing checkpoint files restart coverage safely; partial repairs revoke
   stale readiness, and publication retains the prior WAL before validating the
   replacement. Backfills share the indexing lock and report real progress.
-  Seven storage/vector regressions pass; process-lock and native-model
-  validation remain pending. This does not establish large-archive throughput.
+  Seven storage/vector regressions and a native MiniLM lifecycle pass. The
+  native probe covers six documents across seven bounded quality batches,
+  intervening ingest, and exact lexical/semantic source identity agreement.
+  Process-lock validation remains pending; large-archive throughput is unproven.
   See [#458](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/458).
 - Watches of an explicit Devin database follow its WAL/SHM events without
   ingesting neighboring databases. Provider timestamps older than filesystem
@@ -210,8 +212,8 @@ mean that every acceptance row, platform, or reporter archive has been verified.
 - Introspection describes the emitted rebuild engine-compatibility and orphan
   raw-blob counters. Triage schemas distinguish uninspected sections and unknown
   values when its budget expires, while ordinary status schemas retain their
-  observed-value types. The real CLI contract regression includes zero-budget
-  triage; corrected runtime validation is pending.
+  observed-value types. The real CLI contract regression includes a minimal
+  accepted triage budget; corrected runtime validation is pending.
 - A hollow published Quill generation — one serving a handful of documents
   while its completed rebuild checkpoint, content fingerprint and generation
   manifest all still look right — no longer reads as healthy (GH #457).

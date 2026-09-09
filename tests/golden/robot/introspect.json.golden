@@ -7296,6 +7296,14 @@
                 "total_blob_bytes": {
                   "type": "integer"
                 },
+                "orphan_blob_count": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "orphan_blob_bytes": {
+                  "type": "integer",
+                  "minimum": 0
+                },
                 "amplified_source_count": {
                   "type": "integer"
                 },
@@ -12345,6 +12353,14 @@
                 },
                 "total_blob_bytes": {
                   "type": "integer"
+                },
+                "orphan_blob_count": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "orphan_blob_bytes": {
+                  "type": "integer",
+                  "minimum": 0
                 },
                 "amplified_source_count": {
                   "type": "integer"
@@ -29684,6 +29700,9 @@
                 "orphaned": {
                   "type": "boolean"
                 },
+                "engine_incompatible": {
+                  "type": "boolean"
+                },
                 "pid": {
                   "type": [
                     "integer",
@@ -32208,6 +32227,9 @@
                     "orphaned": {
                       "type": "boolean"
                     },
+                    "engine_incompatible": {
+                      "type": "boolean"
+                    },
                     "pid": {
                       "type": [
                         "integer",
@@ -33442,6 +33464,9 @@
               "type": "boolean"
             },
             "orphaned": {
+              "type": "boolean"
+            },
+            "engine_incompatible": {
               "type": "boolean"
             },
             "pid": {
@@ -35530,6 +35555,9 @@
             "orphaned": {
               "type": "boolean"
             },
+            "engine_incompatible": {
+              "type": "boolean"
+            },
             "pid": {
               "type": [
                 "integer",
@@ -37266,26 +37294,42 @@
               "type": "string",
               "enum": [
                 "ok",
-                "degraded"
+                "degraded",
+                "not_inspected"
               ]
             },
             "quarantined_conversations": {
-              "type": "integer"
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "complete": {
-              "type": "boolean"
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "can_search": {
-              "type": "boolean"
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "coverage_suspect": {
-              "type": "boolean"
+              "type": [
+                "boolean",
+                "null"
+              ]
             },
             "impact": {
               "type": "string"
             },
             "next_command": {
               "type": "string"
+            },
+            "inspected": {
+              "type": "boolean"
             }
           },
           "required": [
@@ -37343,6 +37387,9 @@
                 "string",
                 "null"
               ]
+            },
+            "inspected": {
+              "type": "boolean"
             }
           },
           "required": [
@@ -37361,7 +37408,10 @@
               "type": "object",
               "properties": {
                 "exists": {
-                  "type": "boolean"
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
                 },
                 "status": {
                   "type": "string"
@@ -37504,6 +37554,9 @@
                       ]
                     }
                   }
+                },
+                "inspected": {
+                  "type": "boolean"
                 }
               }
             },
@@ -37511,7 +37564,10 @@
               "type": "object",
               "properties": {
                 "exists": {
-                  "type": "boolean"
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
                 },
                 "db_bytes": {
                   "type": "integer"
@@ -37566,6 +37622,9 @@
                     "string",
                     "null"
                   ]
+                },
+                "inspected": {
+                  "type": "boolean"
                 }
               }
             },
@@ -37580,6 +37639,9 @@
                 },
                 "orphaned": {
                   "type": "boolean"
+                },
+                "inspected": {
+                  "type": "boolean"
                 }
               }
             },
@@ -37590,6 +37652,9 @@
                   "type": "boolean"
                 },
                 "orphaned": {
+                  "type": "boolean"
+                },
+                "engine_incompatible": {
                   "type": "boolean"
                 },
                 "pid": {
@@ -37671,6 +37736,9 @@
                   "type": "object",
                   "description": "Lexical rebuild pipeline settings plus optional runtime telemetry.",
                   "additionalProperties": true
+                },
+                "inspected": {
+                  "type": "boolean"
                 }
               }
             },
@@ -37805,6 +37873,9 @@
                     "string",
                     "null"
                   ]
+                },
+                "inspected": {
+                  "type": "boolean"
                 }
               }
             },
@@ -38100,6 +38171,9 @@
                       ]
                     }
                   }
+                },
+                "inspected": {
+                  "type": "boolean"
                 }
               }
             },
@@ -38144,6 +38218,9 @@
                     "string",
                     "null"
                   ]
+                },
+                "inspected": {
+                  "type": "boolean"
                 }
               }
             }

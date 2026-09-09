@@ -7841,6 +7841,28 @@
                                     }
                                   }
                                 },
+                                "orphan_blob_count": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                },
+                                "orphan_blob_bytes": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                },
                                 "amplified_source_count": {
                                   "type": "object",
                                   "properties": {
@@ -19152,6 +19174,28 @@
                                   "properties": {
                                     "type": {
                                       "type": "string"
+                                    }
+                                  }
+                                },
+                                "orphan_blob_count": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                },
+                                "orphan_blob_bytes": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
                                     }
                                   }
                                 },
@@ -55121,6 +55165,14 @@
                                     }
                                   }
                                 },
+                                "engine_incompatible": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
                                 "pid": {
                                   "type": "object",
                                   "properties": {
@@ -60920,6 +60972,14 @@
                                             }
                                           }
                                         },
+                                        "engine_incompatible": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
                                         "pid": {
                                           "type": "object",
                                           "properties": {
@@ -63585,6 +63645,14 @@
                           }
                         },
                         "orphaned": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "engine_incompatible": {
                           "type": "object",
                           "properties": {
                             "type": {
@@ -68092,6 +68160,14 @@
                             }
                           }
                         },
+                        "engine_incompatible": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
                         "pid": {
                           "type": "object",
                           "properties": {
@@ -71800,7 +71876,10 @@
                           "type": "object",
                           "properties": {
                             "type": {
-                              "type": "string"
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
                             }
                           }
                         },
@@ -71808,7 +71887,10 @@
                           "type": "object",
                           "properties": {
                             "type": {
-                              "type": "string"
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
                             }
                           }
                         },
@@ -71816,7 +71898,10 @@
                           "type": "object",
                           "properties": {
                             "type": {
-                              "type": "string"
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
                             }
                           }
                         },
@@ -71824,7 +71909,10 @@
                           "type": "object",
                           "properties": {
                             "type": {
-                              "type": "string"
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
                             }
                           }
                         },
@@ -71837,6 +71925,14 @@
                           }
                         },
                         "next_command": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "inspected": {
                           "type": "object",
                           "properties": {
                             "type": {
@@ -71967,6 +72063,14 @@
                               }
                             }
                           }
+                        },
+                        "inspected": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
                         }
                       }
                     },
@@ -72000,7 +72104,10 @@
                                   "type": "object",
                                   "properties": {
                                     "type": {
-                                      "type": "string"
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
                                     }
                                   }
                                 },
@@ -72301,6 +72408,14 @@
                                       }
                                     }
                                   }
+                                },
+                                "inspected": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
                                 }
                               }
                             }
@@ -72319,7 +72434,10 @@
                                   "type": "object",
                                   "properties": {
                                     "type": {
-                                      "type": "string"
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
                                     }
                                   }
                                 },
@@ -72441,6 +72559,14 @@
                                       }
                                     }
                                   }
+                                },
+                                "inspected": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
                                 }
                               }
                             }
@@ -72478,6 +72604,14 @@
                                       "type": "string"
                                     }
                                   }
+                                },
+                                "inspected": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
                                 }
                               }
                             }
@@ -72501,6 +72635,14 @@
                                   }
                                 },
                                 "orphaned": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "engine_incompatible": {
                                   "type": "object",
                                   "properties": {
                                     "type": {
@@ -72659,6 +72801,14 @@
                                     },
                                     "additionalProperties": {
                                       "type": "boolean"
+                                    }
+                                  }
+                                },
+                                "inspected": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
                                     }
                                   }
                                 }
@@ -72916,6 +73066,14 @@
                                       "items": {
                                         "type": "string"
                                       }
+                                    }
+                                  }
+                                },
+                                "inspected": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
                                     }
                                   }
                                 }
@@ -73533,6 +73691,14 @@
                                       }
                                     }
                                   }
+                                },
+                                "inspected": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
                                 }
                               }
                             }
@@ -73638,6 +73804,14 @@
                                       "items": {
                                         "type": "string"
                                       }
+                                    }
+                                  }
+                                },
+                                "inspected": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
                                     }
                                   }
                                 }

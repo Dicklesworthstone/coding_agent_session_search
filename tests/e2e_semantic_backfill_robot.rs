@@ -130,9 +130,19 @@ fn assert_backfill_busy(output: &std::process::Output) -> TestResult {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let error: Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(error["kind"], "index-busy");
-    assert_eq!(error["retryable"], true);
+    assert!(
+        output.stdout.is_empty(),
+        "busy errors must not emit success data"
+    );
+    let envelope: Value = serde_json::from_slice(&output.stderr).map_err(|error| {
+        format!(
+            "invalid busy error JSON: {error}; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })?;
+    assert_eq!(envelope["error"]["code"], 7);
+    assert_eq!(envelope["error"]["kind"], "index-busy");
+    assert_eq!(envelope["error"]["retryable"], true);
     Ok(())
 }
 

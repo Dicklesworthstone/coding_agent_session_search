@@ -207,3 +207,44 @@ the nine real crypto tests and the explicitly selected Docker SFTP fallback
 test successfully on that exact lock. Those tests do not clear the unrelated
 F7 failures. Strict UBS actually timed out at 300 seconds, so it remains an
 incomplete blocking result. No release publication is implied.
+
+F8 passed all-target Clippy with `-D warnings` and formatting. The connector
+target passed all 15 tests, including the two held-writer Devin WAL updates;
+the watch target passed all 69 tests, including the four deferred-source
+journeys. The backfill target ran five passing tests and two failing lock tests
+(one live-archive test remained ignored). Both losing processes returned exit 7,
+but the new helper incorrectly read stdout and expected a flat envelope. The
+actual CLI emits `error.{code,kind,retryable}` on stderr. The helper now asserts
+empty stdout and that exact stderr contract; all downstream conservation and
+lock-lifetime assertions remain.
+
+The schema test reached its added budget-fallback invocation, which failed
+argument parsing because `--timeout 0` is prohibited by Clap. Internal support
+for a zero budget was not proof that the public command accepts it. The test
+now passes the valid 1 ms budget, below the production 25 ms response reserve,
+which deterministically leaves readiness probes uninspected. Production CLI
+bounds and schemas were not relaxed. These two corrected test files await a
+follow-up run; the frozen F8 failures and its native-prerequisite refusal remain
+part of the record.
+
+The independent native probe passed on omarchy (RCH 30012625538515271,
+2026-09-09 00:01 UTC). All 26 CLI commands exited zero. Seven real MiniLM
+quality batches added [1,1,1,1,1,1,0] documents; final lexical and semantic
+results agreed on all six source identities. Stale and partial quality assets
+remained unready. Source, executable and official model identities were
+unchanged before and after execution. The executable SHA256 was
+669424266abd67116e4ecb00684a14a689afc903b48b476363679e0f79a827e6.
+This proves the small native lifecycle, not archive-scale throughput or the
+separate process-lock tests. Results are retained under
+`/data/projects/cass-gh458-f8-native-independent-la2o7gjv/results/`.
+
+F8 also passed 96 CLI indexing tests (two ignored) and all 68 contract goldens
+in both regeneration and verification. The three changed golden files were
+reviewed independently and applied only after their canonical base hashes
+matched: introspection schema, its shape, and generated schema documentation.
+They contain the diagnostic additions and triage-only unknown-value schema
+changes described above. Both corrected test files passed remote formatting;
+their runtime follow-up and the full Rust suite remain pending. Strict UBS
+again timed out after 300 seconds. The combined gate remains red, including
+its recorded source-stability change from intentional golden regeneration;
+reviewing that change does not retroactively make the original gate green.
