@@ -1,7 +1,7 @@
 # CASS 0.8.0 changelog research
 
 Scope window: `v0.7.1..6b2ab22d30892fe6f7762d851477feea0e6f80f8`, plus
-the local 0.8.0 preparation and issue-fix follow-through through e3c76fa7 on
+the local 0.8.0 preparation through da1930c0 and reviewed working-tree repairs on
 September 9. This is a release-window update, not a reconstruction of older
 entries. Research date: 2026-09-09.
 
@@ -34,6 +34,7 @@ status; they are not counted as product features.
 | Merge reconciliation | five merges in the original range | validated | combined-diff review; dependency, pack, recovery and refresh changes retained |
 | E | local issue-fix commits through c865ebc4 and reviewed working-tree fixes, 2026-09-08 | distilled; runtime validation pending | Devin parser/WAL watch, Prime presets/probe, active-source watch retries, legacy FTS preflight, exact resume metadata, resumable semantic reconciliation, doctor truth, schema goldens |
 | F | reviewed changes through e3c76fa7, 2026-09-09 | full-suite failures diagnosed; corrected schema verified; remaining fixes under validation | Cursor canonical/search repair, temp-path trace privacy, connector fixtures, backfill process helper, exact connector enumeration |
+| G | working-tree analytics and upstream connector follow-through, 2026-09-09 | 127 targeted CASS tests passed; formatting and scanner gate still pending | stored workspace analytics conservation, replay and rollback; Copilot workspacePath alias |
 
 ## Publication follow-through
 
@@ -300,3 +301,66 @@ edges. Both are retained failures. The corrected admission verifies all 1,040
 CASS inputs and 76 upstream files, changes only FAD's registry source/checksum
 in the lock, and retains the existing locked compiler/test/golden/UBS checks.
 No overlay result establishes registry adoption or release completion.
+
+F9 completed at 03:18:08 UTC on September 9, with 308 passed, two failed and
+one ignored test across 11 binaries. Formatting and all-target Clippy passed;
+source identities remained stable. The real Cursor CLI journey passed,
+including unchanged-source workspace correction, lexical filtering, semantic
+identity invalidation/rebuilding, and replay without duplicate messages.
+The trace target passed all 64 tests, Aider 98, Factory 13, backfill seven
+(one ignored), scanner-contract tests 18, connector enumeration two, and
+contract goldens 68. UBS timed out after 300 seconds with zero completed files;
+this remains a blocking failure, not a completed scan with no findings.
+The complete gate log SHA256 is
+713d168fba8ab5f58e25f89bd11d47f6431d616cc780a9b340c71d5bb6756d51.
+Its invocation-built executable SHA256 is
+9190abcce479671deb01ad6113fdc526d09ebc6dc4dd2a286cf1c1e20c8e76c2;
+the original executable, results and affected inputs were retained before
+the next changes.
+
+The library failure was a new fixture precondition: the pinned contentless
+FTS implementation returns empty text where the assertion expected SQL NULL.
+The correction retains the content-bearing stale-workspace precondition and
+every actual search/filter assertion. Copilot passed 11 tests and failed one
+real legacy-history workspace assertion. Its parser omits the top-level
+`workspacePath` alias; a one-line upstream fallback and three real scan tests
+are prepared without changing the original CASS assertion. Both corrections
+still need execution. The earlier upstream Cursor gate separately completed
+79 parser tests and one registry test successfully; those results do not
+include the later Windows fixture escaping or Copilot change.
+
+CASS analytics reassociation is now implemented and reviewed, with runtime
+validation pending. It moves stored workspace contributions in the same
+transaction as canonical attribution, preserves measured token/cost values,
+repairs canonical no-op replays, and rolls back on missing or underfilled
+rollup buckets. Three storage regressions and the expanded real CLI journey
+cover shared buckets, trusted-to-unknown transitions, buffered appends, replay,
+and rollback. The new upstream overlay remains unpublished and the canonical
+registry dependency is unchanged. No release is ready for publication.
+
+The analytics follow-up subsequently passed all 127 selected tests: seven
+library regressions, the expanded real CLI workspace/analytics journey,
+39 storage parity tests, all 12 Copilot tests, and 68 contract goldens. All-target
+Clippy passed. The three analytics regressions positively exercise existing
+stored token/cost amounts, shared workspace buckets, canonical no-op repair,
+buffered appends/replay, and full rollback after a late model-rollup failure.
+The CLI test begins with populated metrics and ledger rows and checks amount
+conservation after trusted and unknown attribution, replay, and semantic repair.
+These are controlled fixture results, not execution on the reporter's archive.
+
+The new upstream snapshot also passed its focused parser checks. The first
+run passed 21 Copilot, 13 Cursor agent-transcript, and one registry test but
+failed Clippy on two timestamp literal spellings. After adding digit separators
+without changing their values, the corrected run passed formatting, locked
+all-target Clippy, and the three new Copilot tests with all 77 inputs unchanged.
+Its source equals the CASS follow-up's declared overlay. The upstream commit
+is held under the parent repository's mandatory UBS rule: its precommit scan
+reported findings on unchanged Cursor shell code and broad test warnings.
+No scanner waiver, dependency publication, or issue closure was made.
+
+The CASS follow-up's first formatting check reported one array/iterator layout
+in a new storage test. The earlier pinned formatter emitted source through stdin
+but did not run a subsequent Cargo formatting check; its successful process
+exit was insufficient. A formatting-only follow-up is prepared after runtime
+completion. The mandatory scanner is still running at this checkpoint, so the
+127 passing tests do not establish an overall green gate.

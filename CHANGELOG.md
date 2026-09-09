@@ -219,7 +219,14 @@ mean that every acceptance row, platform, or reporter archive has been verified.
   Windows, including configured temporary directories under the user's home.
   It applies full-path redaction before home-prefix shortening. This corrects
   a path leak found by the full suite; the unchanged CLI privacy regression
-  and new path cases are awaiting the combined validation run.
+  and new path cases pass remotely, along with all 64 trace CLI tests. The
+  mandatory scanner remains incomplete, so this is not release clearance.
+- Cursor workspace repair preserves session/message identity and stored token
+  and cost amounts while correcting canonical attribution and analytics totals.
+  Replay repairs stale analytics without inserting duplicate messages; inconsistent
+  rollups cause the transaction to roll back. Storage and real CLI regressions
+  pass with an upstream connector candidate whose trusted-workspace parsing is
+  not yet published. See [#459](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/459).
 - A hollow published Quill generation — one serving a handful of documents
   while its completed rebuild checkpoint, content fingerprint and generation
   manifest all still look right — no longer reads as healthy (GH #457).
