@@ -114,6 +114,10 @@ mean that every acceptance row, platform, or reporter archive has been verified.
 
 ### Added
 
+- `sources discover --tailscale` and `sources setup --tailscale` optionally add
+  online tailnet peers using their IPv4 addresses. Matching SSH aliases retain
+  their configuration; unavailable Tailscale produces a warning and falls back
+  to SSH-config discovery. SSH authentication and host-key checks still apply.
 - An opt-in real-SSH fleet test harness accepts an external private inventory
   and exercises discovery, sync, indexing, source-scoped search, replay,
   incremental append, busy-index recovery, and an unavailable source. Raw

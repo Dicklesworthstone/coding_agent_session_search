@@ -203,6 +203,10 @@ class FleetRun:
             assert not discovery.get("discovery_warning"), "Tailscale discovery unavailable"
         aliases = {host["name"] for host in discovery.get("hosts", [])}
         assert all(host["ssh"].rsplit("@", 1)[-1] in aliases for host in self.hosts), "SSH discovery omitted an inventory alias"
+        if self.tailscale:
+            baseline = json.loads(self.cass("ssh-only-discovery", ["sources", "discover", "--json"]))
+            configured = {host["name"] for host in baseline.get("hosts", [])}
+            assert any(host["ssh"].rsplit("@", 1)[-1] not in configured for host in self.hosts), "no inventory target required Tailscale discovery"
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             seeded = list(pool.map(self.seed, enumerate(self.hosts, 1)))
         self.write("remote-directories.json", seeded)

@@ -1,5 +1,15 @@
 # CASS 0.8.0 changelog research
 
+Optional Tailscale discovery (2026-09-09, original bead `av59c`): owner-requested
+`--tailscale` is wired through both discovery and setup. Local status is bounded
+to five seconds; online peer IPv4 addresses merge with configured SSH aliases,
+without changing authentication or host-key policy. Offline peers, the local
+node and IPv6-only peers are omitted. Parser and real missing-executable CLI
+tests are authored. The new frozen remote gate and private live tailnet test
+are pending; the earlier 86-test/nine-host evidence below does not validate this
+new capability. Source snapshot also retains a concurrent answer-pack command
+change to always include its database argument; it is not a Tailscale fix.
+
 Fleet investigation (2026-09-09, bead `av59c`): live SSH testing exposed two
 source defects. Discovery ignored the SSH configuration override used by
 transport and did not read Include files. Sync/reingest printed the nested
