@@ -8802,11 +8802,9 @@ impl SearchClient {
                         } else {
                             metadata_agent
                         },
-                        if metadata_workspace.is_empty() {
-                            fts_workspace.unwrap_or_default()
-                        } else {
-                            metadata_workspace
-                        },
+                        // Canonical NULL is authoritative too: a legacy
+                        // content-bearing FTS row can retain an old attribution.
+                        metadata_workspace,
                         if metadata_source_path.is_empty() {
                             fts_source_path.unwrap_or_default()
                         } else {
@@ -14810,8 +14808,18 @@ mod tests {
 
     #[test]
     fn sqlite_backend_workspace_filter_matches_null_workspace_as_empty_string() -> Result<()> {
+        assert_sqlite_null_workspace_overrides_shadow(true)
+    }
+
+    #[test]
+    fn gh459_sqlite_null_workspace_overrides_legacy_content_bearing_shadow() -> Result<()> {
+        assert_sqlite_null_workspace_overrides_shadow(false)
+    }
+
+    fn assert_sqlite_null_workspace_overrides_shadow(contentless: bool) -> Result<()> {
         let conn = SearchSqliteFixture::in_memory()?;
-        conn.execute_batch(
+        let content_option = if contentless { "content=''," } else { "" };
+        conn.execute_batch(&format!(
             "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);
              CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE);
              CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
@@ -14838,10 +14846,10 @@ mod tests {
                 workspace,
                 source_path,
                 created_at UNINDEXED,
-                content='',
+                {content_option}
                 tokenize='porter'
              );",
-        )?;
+        ))?;
         conn.execute("INSERT INTO sources(id, kind) VALUES('local', 'local')")?;
         conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
         conn.execute("INSERT INTO workspaces(id, path) VALUES(1, '/named')")?;
@@ -14857,7 +14865,7 @@ mod tests {
         conn.execute("INSERT INTO messages(id, conversation_id, idx, content, created_at) VALUES(2, 2, 0, 'auth token failure', 43)")?;
         conn.execute_compat(
             "INSERT INTO fts_messages(rowid, content, title, agent, workspace, source_path, created_at)
-             VALUES(?1, ?2, ?3, ?4, NULL, ?5, ?6)",
+             VALUES(?1, ?2, ?3, ?4, '/old-guessed-workspace', ?5, ?6)",
             params![
                 1_i64,
                 "auth token failure",
@@ -14880,6 +14888,20 @@ mod tests {
                 43_i64
             ],
         )?;
+        let stored_workspace: Option<String> = conn.connection().query_row_map(
+            "SELECT workspace FROM fts_messages WHERE rowid = 1",
+            &[],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(
+            stored_workspace.as_deref(),
+            if contentless {
+                None
+            } else {
+                Some("/old-guessed-workspace")
+            },
+            "the legacy shadow must actually retain the obsolete attribution",
+        );
 
         let client = SearchClient {
             reader: None,
@@ -14913,6 +14935,28 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].workspace, "");
         assert_eq!(hits[0].source_path, "/tmp/null-workspace.jsonl");
+
+        let stale_hits = client.search(
+            "auth",
+            SearchFilters {
+                workspaces: HashSet::from_iter(["/old-guessed-workspace".to_string()]),
+                ..SearchFilters::default()
+            },
+            5,
+            0,
+            FieldMask::FULL,
+        )?;
+        assert!(
+            stale_hits.is_empty(),
+            "canonical NULL must not resurrect the shadow workspace"
+        );
+        let all_hits = client.search("auth", SearchFilters::default(), 5, 0, FieldMask::FULL)?;
+        assert_eq!(
+            all_hits.len(),
+            2,
+            "workspace repair must retain both messages"
+        );
+        assert!(all_hits.iter().any(|hit| hit.workspace == "/named"));
 
         Ok(())
     }

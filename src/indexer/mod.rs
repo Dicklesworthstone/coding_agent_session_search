@@ -2668,7 +2668,9 @@ fn nonresumable_pending_lexical_rebuild_status_without_fingerprint(
     else {
         return Ok(None);
     };
-    if state.db.total_conversations != total_conversations {
+    if state.effective_execution_mode() != LexicalRebuildExecutionMode::CanonicalMetadataRepair
+        && state.db.total_conversations != total_conversations
+    {
         return Ok(None);
     }
 
@@ -2735,7 +2737,9 @@ fn confirm_nonresumable_pending_lexical_rebuild_state_from_readonly_db(
     let total_conversations = count_total_conversations_exact(&storage)?;
     storage.close_best_effort_in_place();
 
-    if state.db.total_conversations != total_conversations {
+    if state.effective_execution_mode() != LexicalRebuildExecutionMode::CanonicalMetadataRepair
+        && state.db.total_conversations != total_conversations
+    {
         return Ok(None);
     }
     Ok(Some((
@@ -6530,17 +6534,21 @@ enum LexicalRebuildExecutionMode {
     #[default]
     SharedWriter,
     StagedShardBuild,
+    /// Canonical workspace metadata is changing; all existing documents need
+    /// rehydration even though conversation/message counts may stay identical.
+    CanonicalMetadataRepair,
 }
 
 impl LexicalRebuildExecutionMode {
     fn requires_restart_from_zero_on_resume(self) -> bool {
-        matches!(self, Self::StagedShardBuild)
+        matches!(self, Self::StagedShardBuild | Self::CanonicalMetadataRepair)
     }
 
     fn as_str(self) -> &'static str {
         match self {
             Self::SharedWriter => "shared_writer",
             Self::StagedShardBuild => "staged_shard_build",
+            Self::CanonicalMetadataRepair => "canonical_metadata_repair",
         }
     }
 }
@@ -6592,7 +6600,14 @@ impl LexicalRebuildState {
     }
 
     fn matches_run(&self, db: &LexicalRebuildDbState, _page_size: i64) -> bool {
-        let db_matches = if self.db.storage_fingerprint.starts_with("content-v1:")
+        let db_matches = if self.is_incomplete()
+            && self.effective_execution_mode()
+                == LexicalRebuildExecutionMode::CanonicalMetadataRepair
+        {
+            // This pre-mutation marker deliberately survives additional inserts
+            // in the same interrupted batch. It never authorizes cursor reuse.
+            lexical_rebuild_db_paths_match(&self.db.db_path, &db.db_path)
+        } else if self.db.storage_fingerprint.starts_with("content-v1:")
             && db.storage_fingerprint.starts_with("content-v1:")
         {
             lexical_rebuild_db_state_matches(&self.db, db)
@@ -16819,9 +16834,8 @@ fn run_index_inner(
         // write must never fail a run whose indexing work already succeeded.
         if scan_lexical_update_deferred {
             if let Err(err) = storage.record_lexical_repair_deferred(
-                "inline lexical updates deferred during non-watch scan (streaming ingest \
-                 pressure on one or more conversations); full authoritative lexical rebuild \
-                 performed — recurs every run until the offending source is resolved",
+                "inline lexical publication deferred during non-watch scan; \
+                 authoritative canonical lexical rebuild performed",
             ) {
                 tracing::debug!(
                     error = %format!("{err:#}"),
@@ -24689,6 +24703,7 @@ fn ingest_batch_detailed(
     if batch_outcome.lexical_update_deferred {
         tracing::warn!(
             error = ?batch_outcome.lexical_update_error,
+            workspace_changes = batch_outcome.workspace_changes,
             "SQLite ingest succeeded but inline lexical update was deferred; scheduling authoritative lexical rebuild"
         );
     }
@@ -27779,6 +27794,28 @@ fn reindex_paths_with_semantic_delta(
             };
             let capture_semantic_delta = semantic_delta.is_some();
             for chunk in convs.chunks(ingest_chunk_size) {
+                if let Some(pending) = load_lexical_rebuild_state(index_path)?
+                    && pending.is_incomplete()
+                    && pending.version == LEXICAL_REBUILD_STATE_VERSION
+                    && pending.schema_hash == crate::search::tantivy::SCHEMA_HASH
+                    && lexical_rebuild_page_size_is_compatible(pending.page_size)
+                    && lexical_rebuild_db_paths_match(
+                        &pending.db.db_path,
+                        &crate::normalize_path_identity(&opts.db_path).to_string_lossy(),
+                    )
+                {
+                    // A previous metadata transaction may already have landed.
+                    // Its repeated packet then has zero mutations; the durable
+                    // debt, rather than this packet's counts, requires repair.
+                    *t_index_guard = None;
+                    rebuild_tantivy_from_db_deferred_startup_with_options(
+                        &opts.db_path,
+                        &opts.data_dir,
+                        count_total_conversations_exact(&storage)?,
+                        opts.progress.clone(),
+                        None,
+                    )?;
+                }
                 if t_index_guard.is_none() {
                     tracing::info!(
                         index_path = %index_path.display(),
@@ -27818,7 +27855,22 @@ fn reindex_paths_with_semantic_delta(
                 // Commit each successful chunk before advancing the partial
                 // watch watermark. A crash after this point replays at worst
                 // the next unfinished chunk, not the entire backlog.
-                let lexical_update_deferred = chunk_outcome.batch_outcome.lexical_update_deferred;
+                let mut lexical_update_deferred =
+                    chunk_outcome.batch_outcome.lexical_update_deferred;
+                if chunk_outcome.batch_outcome.workspace_changes > 0 {
+                    // Do not leave a live watcher serving old workspace filters.
+                    // The pre-mutation checkpoint remains pending if this fails.
+                    *t_index_guard = None;
+                    rebuild_tantivy_from_db_deferred_startup_with_options(
+                        &opts.db_path,
+                        &opts.data_dir,
+                        count_total_conversations_exact(&storage)?,
+                        opts.progress.clone(),
+                        None,
+                    )?;
+                    *t_index_guard = Some(TantivyIndex::open_or_create(index_path)?);
+                    lexical_update_deferred = false;
+                }
                 if lexical_update_deferred {
                     tracing::warn!(
                         error = ?chunk_outcome.batch_outcome.lexical_update_error,
@@ -29906,6 +29958,7 @@ pub mod persist {
     pub(super) struct PersistBatchOutcome {
         pub inserted_conversations: usize,
         pub inserted_messages: usize,
+        pub workspace_changes: usize,
         pub semantic_delta_max_message_id: Option<i64>,
         pub semantic_delta_inputs: Vec<EmbeddingInput>,
         pub lexical_update_deferred: bool,
@@ -29920,6 +29973,12 @@ pub mod persist {
             self.inserted_messages = self
                 .inserted_messages
                 .saturating_add(outcome.inserted_indices.len());
+            if outcome.workspace_changed {
+                self.workspace_changes = self.workspace_changes.saturating_add(1);
+                self.lexical_update_deferred = true;
+                self.lexical_update_error =
+                    Some("canonical Cursor workspace attribution changed".to_string());
+            }
         }
 
         fn extend_semantic_delta(
@@ -29944,6 +30003,9 @@ pub mod persist {
         }
 
         pub(super) fn merge(&mut self, other: Self) {
+            self.workspace_changes = self
+                .workspace_changes
+                .saturating_add(other.workspace_changes);
             self.inserted_conversations = self
                 .inserted_conversations
                 .saturating_add(other.inserted_conversations);
@@ -31348,11 +31410,13 @@ pub mod persist {
         conv: &NormalizedConversation,
     ) -> Result<()> {
         tracing::info!(agent = %conv.agent_slug, messages = conv.messages.len(), "persist_conversation");
+        prepare_cursor_workspace_repair(storage, None, std::slice::from_ref(conv))?;
         let internal_conv = map_to_internal(conv);
         let InsertOutcome {
             conversation_id,
             conversation_inserted: _conversation_inserted,
             inserted_indices,
+            workspace_changed: _,
         } = with_ephemeral_writer(storage, false, "persist_conversation", |writer| {
             let agent = Agent {
                 id: None,
@@ -31400,11 +31464,13 @@ pub mod persist {
     ) -> Result<()> {
         let total_started = Instant::now();
         let db_started = Instant::now();
+        prepare_cursor_workspace_repair(storage, None, std::slice::from_ref(conv))?;
         let internal_conv = map_to_internal(conv);
         let InsertOutcome {
             conversation_id,
             conversation_inserted: _conversation_inserted,
             inserted_indices,
+            workspace_changed: _,
         } = with_ephemeral_writer(storage, false, "persist_conversation", |writer| {
             let agent = Agent {
                 id: None,
@@ -31531,6 +31597,44 @@ pub mod persist {
         )
     }
 
+    pub(super) fn prepare_cursor_workspace_repair(
+        storage: &FrankenStorage,
+        data_dir: Option<&Path>,
+        convs: &[NormalizedConversation],
+    ) -> Result<()> {
+        for conv in convs {
+            if conv.agent_slug != "cursor" {
+                continue;
+            }
+            let (source_id, _) = extract_provenance(&conv.metadata);
+            if !storage.cursor_workspace_repair_needed(
+                &conv.agent_slug,
+                &source_id,
+                conv.external_id.as_deref(),
+                conv.workspace.as_deref(),
+                &conv.metadata,
+            )? {
+                continue;
+            }
+            let data_dir = data_dir
+                .context("Cursor workspace repair requires the canonical index data directory")?;
+            let index_path = crate::search::tantivy::index_dir(data_dir)?;
+            let db_path = storage.database_path()?;
+            let mut state = super::LexicalRebuildState::new(
+                super::deferred_lexical_rebuild_db_state(
+                    &db_path,
+                    super::count_total_conversations_exact(storage)?,
+                ),
+                super::LEXICAL_REBUILD_PAGE_SIZE,
+            );
+            state.set_execution_mode(super::LexicalRebuildExecutionMode::CanonicalMetadataRepair);
+            super::persist_lexical_rebuild_state(&index_path, &state)?;
+            super::sync_parent_directory(&super::lexical_rebuild_state_path(&index_path))?;
+            return Ok(());
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn persist_conversations_batched_inner(
         storage: &FrankenStorage,
@@ -31545,6 +31649,10 @@ pub mod persist {
         if convs.is_empty() {
             return Ok(PersistBatchOutcome::default());
         }
+        // GH459: revoke completed lexical authority durably BEFORE any writer
+        // transaction can change workspace associations. A crash or failed
+        // publication is then recovered by the existing full canonical rebuild.
+        prepare_cursor_workspace_repair(storage, raw_mirror_data_dir, convs)?;
         if lexical_population_strategy_requires_inline_tantivy(lexical_strategy)
             && t_index.is_none()
         {
@@ -37328,6 +37436,144 @@ mod tests {
             metadata: serde_json::json!({}),
             messages: msgs,
         }
+    }
+
+    #[test]
+    fn gh459_workspace_repair_checkpoint_precedes_mutation_and_survives_reopen() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "cursor".into(),
+                name: "Cursor".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let mut conv = norm_conv(Some("gh459-durable"), vec![norm_msg(0, 100)]);
+        conv.agent_slug = "cursor".into();
+        conv.workspace = Some(PathBuf::from("/workspace/my/app"));
+        conv.metadata = serde_json::json!({"cursor_format":"agent"});
+        let wrong_id = storage
+            .ensure_workspace(conv.workspace.as_ref().unwrap(), None)
+            .unwrap();
+        let original = storage
+            .insert_conversation_tree(agent_id, Some(wrong_id), &persist::map_to_internal(&conv))
+            .unwrap();
+        let messages =
+            serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap())
+                .unwrap();
+        rebuild_tantivy_from_db_deferred_startup(&db_path, &data_dir, 1, None).unwrap();
+        let index_path = crate::search::tantivy::index_dir(&data_dir).unwrap();
+        let published = index_meta_fingerprint(&index_path).unwrap();
+        conv.workspace = Some(PathBuf::from("/workspace/my-app"));
+        conv.metadata["cursor_workspace_attribution"] = serde_json::json!("workspace_trusted");
+        persist::prepare_cursor_workspace_repair(
+            &storage,
+            Some(&data_dir),
+            std::slice::from_ref(&conv),
+        )
+        .unwrap();
+        let pending = load_lexical_rebuild_state(&index_path).unwrap().unwrap();
+        assert!(!pending.completed);
+        assert_eq!(
+            pending.effective_execution_mode(),
+            LexicalRebuildExecutionMode::CanonicalMetadataRepair
+        );
+        assert!(pending.requires_restart_from_zero_on_resume());
+        assert_eq!(
+            storage.list_conversations(10, 0).unwrap()[0].workspace,
+            Some(PathBuf::from("/workspace/my/app")),
+            "pending state must precede the canonical mutation"
+        );
+        let outcome = persist::persist_conversations_batched_with_raw_mirror_links(
+            &storage,
+            None,
+            &data_dir,
+            std::slice::from_ref(&conv),
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            false,
+            persist::PersistHeartbeat::NONE,
+        )
+        .unwrap();
+        assert_eq!(outcome.workspace_changes, 1);
+        assert_eq!(outcome.inserted_conversations, 0);
+        assert_eq!(outcome.inserted_messages, 0);
+        assert!(outcome.lexical_update_deferred);
+        storage.close().unwrap();
+        // Stop before publication and reopen the real database and sidecar.
+        assert_eq!(index_meta_fingerprint(&index_path).unwrap(), published);
+        assert!(
+            !load_lexical_rebuild_state(&index_path)
+                .unwrap()
+                .unwrap()
+                .completed
+        );
+        assert!(
+            nonresumable_pending_lexical_rebuild_status_without_fingerprint(
+                &index_path,
+                &db_path,
+                2
+            )
+            .unwrap()
+            .unwrap()
+            .has_pending_resume,
+            "intervening inserts cannot erase metadata repair debt"
+        );
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        assert_eq!(
+            storage.list_conversations(10, 0).unwrap()[0].workspace,
+            conv.workspace
+        );
+        assert_eq!(
+            serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap())
+                .unwrap(),
+            messages
+        );
+        rebuild_tantivy_from_db_deferred_startup(&db_path, &data_dir, 1, None).unwrap();
+        assert!(
+            load_lexical_rebuild_state(&index_path)
+                .unwrap()
+                .unwrap()
+                .completed
+        );
+        assert_ne!(index_meta_fingerprint(&index_path).unwrap(), published);
+
+        // A real checkpoint write failure must reject the batch before UPDATE.
+        let checkpoint_path = lexical_rebuild_state_path(&index_path);
+        fs::rename(
+            &checkpoint_path,
+            index_path.join("retained-gh459-checkpoint.json"),
+        )
+        .unwrap();
+        fs::create_dir(&checkpoint_path).unwrap();
+        conv.metadata["cursor_workspace_attribution"] = serde_json::json!("unresolved");
+        conv.workspace = None;
+        assert!(
+            persist::persist_conversations_batched_with_raw_mirror_links(
+                &storage,
+                None,
+                &data_dir,
+                &[conv],
+                LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                false,
+                persist::PersistHeartbeat::NONE,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            storage.list_conversations(10, 0).unwrap()[0].workspace,
+            Some(PathBuf::from("/workspace/my-app"))
+        );
+        assert_eq!(
+            serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap())
+                .unwrap(),
+            messages
+        );
     }
 
     fn seed_lexical_rebuild_fixture(storage: &FrankenStorage) {

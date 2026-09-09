@@ -7628,6 +7628,99 @@ pub struct InsertOutcome {
     pub conversation_id: i64,
     pub conversation_inserted: bool,
     pub inserted_indices: Vec<i64>,
+    /// Existing messages need new derived workspace associations, not reinsertion.
+    pub workspace_changed: bool,
+}
+
+fn cursor_workspace_attribution_is_authoritative(
+    agent_slug: &str,
+    workspace: Option<&Path>,
+    metadata: &serde_json::Value,
+) -> bool {
+    agent_slug == "cursor"
+        && metadata["cursor_format"] == "agent"
+        && match metadata["cursor_workspace_attribution"].as_str() {
+            Some("workspace_trusted") => workspace.is_some_and(|path| !path.as_os_str().is_empty()),
+            Some("unresolved") => workspace.is_none(),
+            _ => false,
+        }
+}
+
+/// Reconcile only the provider-owned attribution fields. A missing workspace
+/// in an ordinary partial packet must never erase a known association.
+fn franken_reconcile_cursor_workspace(
+    tx: &FrankenTransaction<'_>,
+    agent_id: i64,
+    conversation_id: i64,
+    workspace_id: Option<i64>,
+    conv: &Conversation,
+) -> Result<bool> {
+    if conv.external_id.is_none()
+        || !cursor_workspace_attribution_is_authoritative(
+            &conv.agent_slug,
+            conv.workspace.as_deref(),
+            &conv.metadata_json,
+        )
+    {
+        return Ok(false);
+    }
+    let (previous_workspace, mut metadata): (Option<i64>, serde_json::Value) = tx.query_row_map(
+        "SELECT workspace_id, metadata_json, metadata_bin FROM conversations WHERE id = ?1",
+        fparams![conversation_id],
+        |row| Ok((row.get_typed(0)?, franken_read_metadata_compat(row, 1, 2))),
+    )?;
+    let mut changed = previous_workspace != workspace_id;
+    if !metadata.is_object() {
+        // Preserve non-object legacy metadata rather than replacing it blindly.
+        anyhow::bail!(
+            "cannot reconcile Cursor workspace for conversation {conversation_id}: canonical metadata is not an object"
+        );
+    }
+    for field in ["cursor_workspace_attribution", "cursor_project_dir"] {
+        if let Some(value) = conv.metadata_json.get(field)
+            && metadata.get(field) != Some(value)
+        {
+            metadata[field] = value.clone();
+            changed = true;
+        }
+    }
+    if let Some(original) = conv.metadata_json.pointer("/cass/workspace_original") {
+        let cass = metadata
+            .as_object_mut()
+            .expect("checked object")
+            .entry("cass")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(cass) = cass.as_object_mut()
+            && cass.get("workspace_original") != Some(original)
+        {
+            cass.insert("workspace_original".to_string(), original.clone());
+            changed = true;
+        }
+    }
+    if changed {
+        if previous_workspace != workspace_id {
+            ensure_workspaces_in_tx(tx, &[(agent_id, workspace_id, conv)])?;
+        }
+        let (json, binary) = franken_metadata_insert_payload(&metadata)?;
+        tx.execute_compat(
+            "UPDATE conversations SET workspace_id = ?1, metadata_json = ?2, metadata_bin = ?3 WHERE id = ?4",
+            fparams![workspace_id, json.as_deref(), binary.as_deref(), conversation_id],
+        )?;
+        if previous_workspace != workspace_id {
+            // Vector doc IDs embed workspace_id. Counts and rowid watermarks
+            // cannot detect this change. A fresh generation also prevents an
+            // interrupted checkpoint from being reused after a change-back.
+            let generation = format!("workspace:{:032x}", rand::random::<u128>());
+            for tier in [SemanticIdentityTier::Fast, SemanticIdentityTier::Quality] {
+                tx.execute_compat(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                    fparams![tier.meta_key(), generation.as_str()],
+                )?;
+            }
+            tx.execute("DELETE FROM meta WHERE key = 'last_embedded_message_id'")?;
+        }
+    }
+    Ok(previous_workspace != workspace_id)
 }
 
 #[cfg(test)]
@@ -8644,6 +8737,36 @@ pub struct MessageForEmbedding {
 // =========================================================================
 
 impl FrankenStorage {
+    /// Read-only admission for the indexer's durable pre-mutation checkpoint.
+    /// Cursor Agent external IDs are stable across workspace attribution changes.
+    pub(crate) fn cursor_workspace_repair_needed(
+        &self,
+        agent_slug: &str,
+        source_id: &str,
+        external_id: Option<&str>,
+        workspace: Option<&Path>,
+        metadata: &serde_json::Value,
+    ) -> Result<bool> {
+        if !cursor_workspace_attribution_is_authoritative(agent_slug, workspace, metadata) {
+            return Ok(false);
+        }
+        let Some(external_id) = external_id else {
+            return Ok(false);
+        };
+        let existing: Option<Option<String>> = self
+            .conn
+            .query_row_map(
+                "SELECT (SELECT w.path FROM workspaces w WHERE w.id = c.workspace_id)
+             FROM conversations c WHERE c.source_id = ?1 AND c.external_id = ?2
+             AND c.agent_id = (SELECT id FROM agents WHERE slug = 'cursor')",
+                fparams![source_id, external_id],
+                |row| row.get_typed(0),
+            )
+            .optional()?;
+        Ok(existing
+            .is_some_and(|current| current.as_deref() != workspace.map(path_to_string).as_deref()))
+    }
+
     /// Ensure an agent exists in the database, returning its ID.
     pub fn ensure_agent(&self, agent: &Agent) -> Result<i64> {
         let cache_key = EnsuredAgentKey::from_agent(agent);
@@ -12095,7 +12218,7 @@ impl FrankenStorage {
             Some(conv),
         )?;
         if let Some(existing) = existing {
-            let outcome = self.franken_append_messages_with_tail_in_tx(
+            let mut outcome = self.franken_append_messages_with_tail_in_tx(
                 &tx,
                 agent_id,
                 existing.id,
@@ -12104,6 +12227,8 @@ impl FrankenStorage {
                 defer_lexical_updates,
                 defer_analytics_updates,
             )?;
+            outcome.workspace_changed =
+                franken_reconcile_cursor_workspace(&tx, agent_id, existing.id, workspace_id, conv)?;
             tx.commit()?;
             return Ok(outcome);
         }
@@ -12219,11 +12344,19 @@ impl FrankenStorage {
                     )?;
                 }
 
+                let workspace_changed = franken_reconcile_cursor_workspace(
+                    &tx,
+                    agent_id,
+                    existing_id,
+                    workspace_id,
+                    conv,
+                )?;
                 tx.commit()?;
                 return Ok(InsertOutcome {
                     conversation_id: existing_id,
                     conversation_inserted: false,
                     inserted_indices,
+                    workspace_changed,
                 });
             }
         };
@@ -12320,6 +12453,7 @@ impl FrankenStorage {
             conversation_id: conv_id,
             conversation_inserted: true,
             inserted_indices,
+            workspace_changed: false,
         })
     }
 
@@ -12500,6 +12634,7 @@ impl FrankenStorage {
             conversation_id: conv_id,
             conversation_inserted: true,
             inserted_indices,
+            workspace_changed: false,
         })
     }
 
@@ -12716,6 +12851,7 @@ impl FrankenStorage {
             conversation_id: existing_id,
             conversation_inserted: false,
             inserted_indices,
+            workspace_changed: false,
         })
     }
 
@@ -12877,6 +13013,7 @@ impl FrankenStorage {
             conversation_id,
             conversation_inserted: false,
             inserted_indices,
+            workspace_changed: false,
         })
     }
 
@@ -15436,6 +15573,13 @@ impl FrankenStorage {
                 conversation_id: conv_id,
                 conversation_inserted: session_count_delta > 0,
                 inserted_indices,
+                workspace_changed: franken_reconcile_cursor_workspace(
+                    &tx,
+                    agent_id,
+                    conv_id,
+                    workspace_id,
+                    conv,
+                )?,
             });
         }
 
@@ -31658,6 +31802,217 @@ mod tests {
 
         let id = storage.ensure_agent(&agent).unwrap();
         assert!(id > 0);
+    }
+
+    #[test]
+    fn gh459_cursor_workspace_repair_preserves_rows_and_requires_explicit_authority() {
+        for batched in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let storage = FrankenStorage::open(&dir.path().join("cursor.db")).unwrap();
+            let agent = storage
+                .ensure_agent(&Agent {
+                    id: None,
+                    slug: "cursor".into(),
+                    name: "Cursor".into(),
+                    version: None,
+                    kind: AgentKind::Cli,
+                })
+                .unwrap();
+            let wrong = PathBuf::from("/parent/project/my/app");
+            let correct = PathBuf::from("/parent-project/my-app");
+            let wrong_id = storage.ensure_workspace(&wrong, None).unwrap();
+            let correct_id = storage.ensure_workspace(&correct, None).unwrap();
+            let mut conv = Conversation {
+                id: None,
+                agent_slug: "cursor".into(),
+                workspace: Some(wrong),
+                external_id: Some("cursor-agent-stable-id".into()),
+                title: Some("unchanged title".into()),
+                source_path: PathBuf::from("/cursor/transcript.jsonl"),
+                started_at: Some(100),
+                ended_at: Some(100),
+                approx_tokens: None,
+                metadata_json: serde_json::json!({"cursor_format":"agent", "keep":{"nested":7}, "cass":{"retained":true}}),
+                messages: vec![Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(100),
+                    content: "unchanged workspace message".into(),
+                    extra_json: serde_json::json!({"retained":true}),
+                    snippets: Vec::new(),
+                }],
+                source_id: "local".into(),
+                origin_host: None,
+            };
+            let original = storage
+                .insert_conversation_tree(agent, Some(wrong_id), &conv)
+                .unwrap();
+            let messages =
+                serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap())
+                    .unwrap();
+            storage
+                .set_last_embedded_message_id(storage.max_message_id().unwrap().unwrap())
+                .unwrap();
+            let mut repair_generation = None;
+            conv.workspace = Some(correct.clone());
+            conv.metadata_json = serde_json::json!({"cursor_format":"agent", "cursor_workspace_attribution":"workspace_trusted", "cursor_project_dir":"parent-project-my-app", "cass":{"workspace_original":"/remote/my-app"}});
+            for expected_change in [true, false] {
+                let outcome = if batched {
+                    storage
+                        .insert_conversations_batched(&[(agent, Some(correct_id), &conv)])
+                        .unwrap()
+                        .pop()
+                        .unwrap()
+                } else {
+                    storage
+                        .insert_conversation_tree(agent, Some(correct_id), &conv)
+                        .unwrap()
+                };
+                assert_eq!(outcome.conversation_id, original.conversation_id);
+                assert!(!outcome.conversation_inserted);
+                assert!(outcome.inserted_indices.is_empty());
+                assert_eq!(outcome.workspace_changed, expected_change);
+                assert_eq!(storage.get_last_embedded_message_id().unwrap(), None);
+                let generation = storage
+                    .semantic_identity_rebuild_generation(SemanticIdentityTier::Fast)
+                    .unwrap()
+                    .expect("fast identity debt");
+                assert_eq!(
+                    storage
+                        .semantic_identity_rebuild_generation(SemanticIdentityTier::Quality)
+                        .unwrap()
+                        .as_ref(),
+                    Some(&generation)
+                );
+                if expected_change {
+                    repair_generation = Some(generation);
+                } else {
+                    assert_eq!(
+                        Some(generation),
+                        repair_generation,
+                        "idempotent replay must retain pending semantic generation"
+                    );
+                }
+                let rows = storage.list_conversations(10, 0).unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].workspace.as_ref(), Some(&correct));
+                assert_eq!(rows[0].metadata_json["keep"]["nested"], 7);
+                assert_eq!(rows[0].metadata_json["cass"]["retained"], true);
+                assert_eq!(
+                    rows[0].metadata_json["cass"]["workspace_original"],
+                    "/remote/my-app"
+                );
+                assert_eq!(
+                    serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap())
+                        .unwrap(),
+                    messages
+                );
+            }
+            storage.close().unwrap();
+            let storage = FrankenStorage::open(&dir.path().join("cursor.db")).unwrap();
+            for tier in [SemanticIdentityTier::Fast, SemanticIdentityTier::Quality] {
+                assert_eq!(
+                    storage.semantic_identity_rebuild_generation(tier).unwrap(),
+                    repair_generation,
+                    "identity debt must survive reopen"
+                );
+            }
+            conv.workspace = None;
+            for metadata in [
+                serde_json::json!({"cursor_format":"agent"}),
+                serde_json::json!({"cursor_format":"agent", "cursor_workspace_attribution":"workspace_trusted"}),
+                serde_json::json!({"cursor_format":"ide", "cursor_workspace_attribution":"unresolved"}),
+            ] {
+                conv.metadata_json = metadata;
+                let outcome = storage
+                    .insert_conversation_tree(agent, None, &conv)
+                    .unwrap();
+                assert!(!outcome.workspace_changed);
+                assert_eq!(
+                    storage.list_conversations(10, 0).unwrap()[0]
+                        .workspace
+                        .as_ref(),
+                    Some(&correct)
+                );
+            }
+            conv.metadata_json = serde_json::json!({"cursor_format":"agent", "cursor_workspace_attribution":"unresolved"});
+            assert!(!cursor_workspace_attribution_is_authoritative(
+                "codex",
+                None,
+                &conv.metadata_json
+            ));
+            let cleared = storage
+                .insert_conversations_batched(&[(agent, None, &conv)])
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert!(cleared.workspace_changed);
+            assert_eq!(cleared.conversation_id, original.conversation_id);
+            assert!(cleared.inserted_indices.is_empty());
+            assert_eq!(
+                storage.list_conversations(10, 0).unwrap()[0].workspace,
+                None
+            );
+            assert_eq!(
+                serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap())
+                    .unwrap(),
+                messages
+            );
+            let cleared_generation = storage
+                .semantic_identity_rebuild_generation(SemanticIdentityTier::Fast)
+                .unwrap();
+            assert_ne!(
+                cleared_generation, repair_generation,
+                "a second change needs a new semantic generation"
+            );
+            conv.workspace = Some(correct.clone());
+            conv.metadata_json["cursor_workspace_attribution"] =
+                serde_json::json!("workspace_trusted");
+            {
+                let mut tx = storage.conn.transaction().unwrap();
+                assert!(
+                    franken_reconcile_cursor_workspace(
+                        &tx,
+                        agent,
+                        original.conversation_id,
+                        Some(correct_id),
+                        &conv
+                    )
+                    .unwrap()
+                );
+                tx.rollback().unwrap();
+            }
+            assert_eq!(
+                storage.list_conversations(10, 0).unwrap()[0].workspace,
+                None
+            );
+            for tier in [SemanticIdentityTier::Fast, SemanticIdentityTier::Quality] {
+                assert_eq!(
+                    storage.semantic_identity_rebuild_generation(tier).unwrap(),
+                    cleared_generation,
+                    "workspace and both debts must roll back together"
+                );
+            }
+            let changed_back = storage
+                .insert_conversation_tree(agent, Some(correct_id), &conv)
+                .unwrap();
+            assert!(changed_back.workspace_changed);
+            let returned_generation = storage
+                .semantic_identity_rebuild_generation(SemanticIdentityTier::Fast)
+                .unwrap();
+            assert_ne!(
+                returned_generation, repair_generation,
+                "returning to an earlier workspace must not revive an old checkpoint"
+            );
+            assert_ne!(returned_generation, cleared_generation);
+            assert_eq!(
+                serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap())
+                    .unwrap(),
+                messages
+            );
+        }
     }
 
     #[test]

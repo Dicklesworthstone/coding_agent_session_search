@@ -106,6 +106,350 @@ fn index_creates_db_and_index() {
     assert!(index_path.exists(), "index dir created");
 }
 
+/// Requires the GH459 FAD parser revision. A registry-0.2.3 run must fail this
+/// acceptance check; an unpublished dependency overlay is not release proof.
+#[test]
+fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
+    use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use coding_agent_search::search::model_manager::load_hash_semantic_context_strict;
+    use frankensqlite::compat::RowExt;
+    use serde_json::{Value, json};
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    let data_dir = home.join("cass-data");
+    fs::create_dir_all(&data_dir).unwrap();
+    let correct = home.join("parent-project/my-app");
+    let wrong = home.join("parent/project/my/app");
+    // Existence cannot resolve this ambiguity: both candidates exist.
+    fs::create_dir_all(&correct).unwrap();
+    fs::create_dir_all(&wrong).unwrap();
+    let encoded_project = correct
+        .to_string_lossy()
+        .trim_start_matches(['/', '\\'])
+        .replace(['/', '\\'], "-");
+    assert_eq!(
+        encoded_project,
+        wrong
+            .to_string_lossy()
+            .trim_start_matches(['/', '\\'])
+            .replace(['/', '\\'], "-")
+    );
+    let project = home.join(".cursor/projects").join(&encoded_project);
+    let transcript_dir = project.join("agent-transcripts/gh459-session");
+    fs::create_dir_all(&transcript_dir).unwrap();
+    let transcript = transcript_dir.join("gh459-session.jsonl");
+    fs::write(&transcript, "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"gh459needle retained chat\"}]}}\n").unwrap();
+    fs::File::open(&transcript)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(100)))
+        .unwrap();
+    let source_bytes = fs::read(&transcript).unwrap();
+    let source_mtime = fs::metadata(&transcript).unwrap().modified().unwrap();
+    let db_path = data_dir.join("agent_search.db");
+    let storage = SqliteStorage::open(&db_path).unwrap();
+    let agent_id = storage
+        .ensure_agent(&Agent {
+            id: None,
+            slug: "cursor".into(),
+            name: "Cursor".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })
+        .unwrap();
+    let workspace_id = storage.ensure_workspace(&wrong, None).unwrap();
+    let canonical = Conversation {
+        id: None,
+        agent_slug: "cursor".into(),
+        workspace: Some(wrong.clone()),
+        external_id: Some("gh459-session".into()),
+        title: Some("retained title".into()),
+        source_path: transcript.clone(),
+        started_at: Some(100_000),
+        ended_at: Some(100_000),
+        approx_tokens: None,
+        metadata_json: json!({"source":"cursor", "cursor_format":"agent", "retained":{"canonical":true}}),
+        messages: vec![Message {
+            id: None,
+            idx: 0,
+            role: MessageRole::User,
+            author: None,
+            created_at: None,
+            content: "gh459needle retained chat".into(),
+            extra_json: json!({"retained":true}),
+            snippets: vec![],
+        }],
+        source_id: "local".into(),
+        origin_host: None,
+    };
+    let original = storage
+        .insert_conversation_tree(agent_id, Some(workspace_id), &canonical)
+        .unwrap();
+    let messages =
+        serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap()).unwrap();
+    storage.close().unwrap();
+
+    let run_index = |canonical_only: bool, semantic: bool| {
+        let mut cmd = base_cmd(home);
+        cmd.env("CASS_AUTO_REFRESH", "0")
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .args(["index", "--full", "--json", "--data-dir"])
+            .arg(&data_dir)
+            .timeout(Duration::from_secs(180));
+        if canonical_only {
+            cmd.arg("--force-rebuild");
+        }
+        if semantic {
+            cmd.args(["--semantic", "--embedder", "hash"]);
+        }
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "index failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let search_payload = |mode: &str, workspace: Option<&std::path::Path>| {
+        let mut cmd = base_cmd(home);
+        cmd.env("CASS_AUTO_REFRESH", "0")
+            .env("CASS_SEMANTIC_EMBEDDER", "hash")
+            .args([
+                "search",
+                "gh459needle",
+                "--agent",
+                "cursor",
+                "--mode",
+                mode,
+                "--no-maintenance",
+                "--json",
+                "--robot-meta",
+                "--data-dir",
+            ])
+            .arg(&data_dir)
+            .timeout(Duration::from_secs(30));
+        if let Some(workspace) = workspace {
+            cmd.arg("--workspace").arg(workspace);
+        }
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "search failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let search_count = |workspace: Option<&std::path::Path>| {
+        search_payload("lexical", workspace)["hits"]
+            .as_array()
+            .expect("search hits")
+            .len()
+    };
+    let semantic_debts = || {
+        let storage = SqliteStorage::open_readonly(&db_path).unwrap();
+        let rows = storage.raw().query("SELECT value FROM meta WHERE key IN ('semantic_fast_identity_rebuild_v1', 'semantic_quality_identity_rebuild_v1') ORDER BY key").unwrap();
+        let debts: Vec<String> = rows.iter().map(|row| row.get_typed(0).unwrap()).collect();
+        storage.close().unwrap();
+        debts
+    };
+    let assert_hash_ready = || {
+        let setup = load_hash_semantic_context_strict(&data_dir, &db_path);
+        assert!(
+            setup.availability.can_search(),
+            "hash vector admission: {:?}",
+            setup.availability
+        );
+        let context = setup.context.expect("actual hash vector context");
+        assert_eq!(
+            context
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.index().record_count())
+                .sum::<usize>(),
+            1
+        );
+    };
+    run_index(true, true);
+    assert_hash_ready();
+    assert_eq!(
+        search_payload("semantic", Some(&wrong))["hits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        search_count(Some(&wrong)),
+        1,
+        "legacy association must really be published"
+    );
+    assert_eq!(search_count(Some(&correct)), 0);
+    let sidecar = project.join(".workspace-trusted");
+    fs::write(&sidecar, json!({"workspacePath":correct}).to_string()).unwrap();
+    fs::File::open(&sidecar)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(100)))
+        .unwrap();
+    let mut trusted_debts = Vec::new();
+    for replay in 0..2 {
+        run_index(false, false);
+        let storage = SqliteStorage::open_readonly(&db_path).unwrap();
+        let rows = storage.list_conversations(10, 0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, Some(original.conversation_id));
+        assert_eq!(rows[0].workspace.as_ref(), Some(&correct));
+        assert_eq!(rows[0].metadata_json["retained"]["canonical"], true);
+        assert_eq!(
+            rows[0].metadata_json["cursor_workspace_attribution"],
+            "workspace_trusted"
+        );
+        assert_eq!(
+            serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap())
+                .unwrap(),
+            messages
+        );
+        storage.close().unwrap();
+        assert_eq!(search_count(Some(&correct)), 1);
+        assert_eq!(search_count(Some(&wrong)), 0);
+        assert_eq!(fs::read(&transcript).unwrap(), source_bytes);
+        assert_eq!(
+            fs::metadata(&transcript).unwrap().modified().unwrap(),
+            source_mtime
+        );
+        let debts = semantic_debts();
+        assert_eq!(debts.len(), 2);
+        assert_ne!(debts[0], "complete");
+        assert_eq!(debts[0], debts[1]);
+        if replay == 0 {
+            trusted_debts = debts;
+        } else {
+            assert_eq!(debts, trusted_debts);
+        }
+        let setup = load_hash_semantic_context_strict(&data_dir, &db_path);
+        assert!(setup.context.is_none());
+        assert!(
+            setup.availability.is_index_stale(),
+            "old workspace vectors must not remain admitted: {:?}",
+            setup.availability
+        );
+        let fallback = search_payload("hybrid", Some(&correct));
+        assert_eq!(fallback["hits"].as_array().unwrap().len(), 1);
+        assert_eq!(fallback["_meta"]["search_mode"], "lexical");
+        assert_eq!(fallback["_meta"]["semantic_refinement"], false);
+    }
+    run_index(false, true);
+    assert_hash_ready();
+    assert_eq!(
+        semantic_debts(),
+        vec!["complete".to_string(), trusted_debts[1].clone()],
+        "fast publication must retain quality-tier debt"
+    );
+    assert_eq!(
+        search_payload("semantic", Some(&correct))["hits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        search_payload("semantic", Some(&wrong))["hits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    fs::write(&sidecar, "{malformed").unwrap();
+    fs::File::open(&sidecar)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(100)))
+        .unwrap();
+    let mut unresolved_debts = Vec::new();
+    for replay in 0..2 {
+        run_index(false, false);
+        let storage = SqliteStorage::open_readonly(&db_path).unwrap();
+        let rows = storage.list_conversations(10, 0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, Some(original.conversation_id));
+        assert_eq!(rows[0].workspace, None);
+        assert_eq!(
+            rows[0].metadata_json["cursor_workspace_attribution"],
+            "unresolved"
+        );
+        assert_eq!(rows[0].metadata_json["retained"]["canonical"], true);
+        assert_eq!(
+            serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap())
+                .unwrap(),
+            messages
+        );
+        storage.close().unwrap();
+        assert_eq!(search_count(Some(&correct)), 0);
+        assert_eq!(search_count(Some(&wrong)), 0);
+        assert_eq!(search_count(None), 1);
+        assert_eq!(fs::read(&transcript).unwrap(), source_bytes);
+        assert_eq!(
+            fs::metadata(&transcript).unwrap().modified().unwrap(),
+            source_mtime
+        );
+        let debts = semantic_debts();
+        assert_eq!(debts.len(), 2);
+        assert_eq!(debts[0], debts[1]);
+        assert_ne!(debts[0], "complete");
+        assert_ne!(debts, trusted_debts);
+        if replay == 0 {
+            unresolved_debts = debts;
+        } else {
+            assert_eq!(debts, unresolved_debts);
+        }
+        let setup = load_hash_semantic_context_strict(&data_dir, &db_path);
+        assert!(setup.context.is_none());
+        assert!(setup.availability.is_index_stale());
+    }
+    run_index(false, true);
+    assert_hash_ready();
+    assert_eq!(
+        semantic_debts(),
+        vec!["complete".to_string(), unresolved_debts[1].clone()]
+    );
+    assert_eq!(
+        search_payload("semantic", Some(&correct))["hits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        search_payload("semantic", Some(&wrong))["hits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        search_payload("semantic", None)["hits"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let storage = SqliteStorage::open_readonly(&db_path).unwrap();
+    assert_eq!(
+        storage.list_conversations(10, 0).unwrap()[0].id,
+        Some(original.conversation_id)
+    );
+    assert_eq!(
+        serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap()).unwrap(),
+        messages
+    );
+    storage.close().unwrap();
+    assert_eq!(fs::read(&transcript).unwrap(), source_bytes);
+    assert_eq!(
+        fs::metadata(&transcript).unwrap().modified().unwrap(),
+        source_mtime
+    );
+}
+
 #[test]
 fn full_index_worker_overrides_the_linux_default_stack_for_franken_open()
 -> Result<(), Box<dyn std::error::Error>> {
