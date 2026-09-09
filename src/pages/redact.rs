@@ -2,7 +2,7 @@ use regex::Regex;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -18,6 +18,8 @@ pub struct RedactionConfig {
     pub path_replacements: Vec<(String, String)>,
     /// Custom regex patterns.
     pub custom_patterns: Vec<CustomPattern>,
+    /// Apply custom patterns before home and username rewriting.
+    pub custom_patterns_first: bool,
     /// Preserve structure but anonymize project directory names.
     pub anonymize_project_names: bool,
     /// Redact hostnames (e.g., internal server names).
@@ -36,6 +38,7 @@ impl Default for RedactionConfig {
             username_map: HashMap::new(),
             path_replacements: Vec::new(),
             custom_patterns: Vec::new(),
+            custom_patterns_first: false,
             anonymize_project_names: false,
             redact_hostnames: false,
             redact_emails: true,
@@ -294,6 +297,10 @@ impl RedactionEngine {
         let mut output = input.to_string();
         let mut changes = Vec::new();
 
+        if self.config.custom_patterns_first {
+            self.apply_custom_patterns(&mut output, &mut changes);
+        }
+
         if self.config.redact_home_paths
             && let Some(home_str) = &self.home_str
             && let Some(redacted) = replace_home_path_prefixes(&output, home_str)
@@ -354,16 +361,8 @@ impl RedactionEngine {
             });
         }
 
-        for pattern in &self.config.custom_patterns {
-            if pattern.enabled && pattern.pattern.is_match(&output) {
-                output = pattern
-                    .pattern
-                    .replace_all(&output, pattern.replacement.as_str())
-                    .to_string();
-                changes.push(RedactionChange {
-                    kind: RedactionKind::CustomPattern,
-                });
-            }
+        if !self.config.custom_patterns_first {
+            self.apply_custom_patterns(&mut output, &mut changes);
         }
 
         if anonymize_project
@@ -379,6 +378,20 @@ impl RedactionEngine {
         }
 
         RedactedString { output, changes }
+    }
+
+    fn apply_custom_patterns(&self, output: &mut String, changes: &mut Vec<RedactionChange>) {
+        for pattern in &self.config.custom_patterns {
+            if pattern.enabled && pattern.pattern.is_match(output) {
+                *output = pattern
+                    .pattern
+                    .replace_all(output, pattern.replacement.as_str())
+                    .to_string();
+                changes.push(RedactionChange {
+                    kind: RedactionKind::CustomPattern,
+                });
+            }
+        }
     }
 
     fn map_project_name(&self, name: &str) -> String {
@@ -398,26 +411,42 @@ impl RedactionEngine {
 }
 
 pub fn swarm_evidence_redaction_config() -> RedactionConfig {
+    swarm_evidence_redaction_config_for_temp_root(&std::env::temp_dir())
+}
+
+fn swarm_evidence_redaction_config_for_temp_root(temp_dir: &Path) -> RedactionConfig {
     let mut config = RedactionConfig {
         anonymize_project_names: true,
         redact_hostnames: true,
+        // Match the original absolute path: shortening a home prefix to `~`
+        // first would expose its private project and session-name suffix.
+        custom_patterns_first: true,
         ..Default::default()
     };
+    // Temporary archives can contain the same private paths as home-based
+    // archives, including an operator's nonstandard TMPDIR. Match the whole
+    // path so replacing only its root does not expose project/session names.
+    let temp_dir = temp_dir.to_string_lossy();
+    let temp_root = temp_dir.trim_end_matches(['/', '\\']);
+    let configured_temp_prefix = if temp_root.is_empty() {
+        String::new()
+    } else {
+        format!(r"|{}[/\\]", regex::escape(temp_root))
+    };
+    let private_path_prefix = format!(
+        r"(?i)(?:/home/|/Users/|[A-Z]:\\Users\\|/data/projects/|/(?:private/)?tmp/|/(?:private/)?var/(?:tmp|folders)/|[A-Z]:\\Windows\\Temp\\{configured_temp_prefix})"
+    );
     config.custom_patterns.push(CustomPattern {
         name: "absolute_path_with_spaces".to_string(),
-        pattern: Regex::new(
-            r#"(?i)(?:/home/|/Users/|[A-Z]:\\Users\\|/data/projects/)[^"'<>;,)#\r\n]+"#,
-        )
-        .expect("swarm absolute path redaction regex must compile"),
+        pattern: Regex::new(&format!(r#"{private_path_prefix}[^"'<>;,)#\r\n]+"#))
+            .expect("swarm absolute path redaction regex must compile"),
         replacement: "[REDACTED_PATH]".to_string(),
         enabled: true,
     });
     config.custom_patterns.push(CustomPattern {
         name: "absolute_path".to_string(),
-        pattern: Regex::new(
-            r#"(?i)(?:/home/|/Users/|[A-Z]:\\Users\\|/data/projects/)[^\s"'<>;,)#]+"#,
-        )
-        .expect("swarm absolute path redaction regex must compile"),
+        pattern: Regex::new(&format!(r#"{private_path_prefix}[^\s"'<>;,)#]+"#))
+            .expect("swarm absolute path redaction regex must compile"),
         replacement: "[REDACTED_PATH]".to_string(),
         enabled: true,
     });
@@ -1056,17 +1085,76 @@ mod tests {
 
     #[test]
     fn swarm_redaction_scrubs_absolute_paths_with_spaces() {
+        let configured_temp_path = std::env::temp_dir()
+            .join("Secret Project")
+            .join("session.jsonl");
+        let configured_temp_path = configured_temp_path.to_string_lossy();
         for path in [
             "/home/alice/Secret Project",
             "/Users/alice/Secret Project",
             "C:\\Users\\alice\\Secret Project",
             "/data/projects/Secret Project",
+            "/tmp/Secret Project/session.jsonl",
+            "/private/tmp/Secret Project/session.jsonl",
+            "/var/tmp/Secret Project/session.jsonl",
+            "/var/folders/ab/Secret Project/session.jsonl",
+            "/private/var/folders/ab/Secret Project/session.jsonl",
+            "C:\\Windows\\Temp\\Secret Project\\session.jsonl",
+            configured_temp_path.as_ref(),
         ] {
             let redacted = redact_swarm_text(&format!("Blocked on {path}"));
 
             assert_eq!(redacted, "Blocked on [REDACTED_PATH]");
             assert!(!redacted.contains(path));
             assert!(!redacted.contains("Secret Project"));
+        }
+    }
+
+    #[test]
+    fn swarm_redaction_scrubs_configured_temp_roots_literally() {
+        for root in ["/scratch/private [run]", r"D:\agent temp\[run]"] {
+            let engine = RedactionEngine::new(swarm_evidence_redaction_config_for_temp_root(
+                Path::new(root),
+            ));
+            let separator = if root.starts_with('/') { "/" } else { "\\" };
+            let path = format!("{root}{separator}Secret Project{separator}session.jsonl");
+            assert_eq!(
+                engine
+                    .redact_text(&format!("Missing source: {path}"))
+                    .output,
+                "Missing source: [REDACTED_PATH]"
+            );
+            // The configured root is a literal prefix with a segment boundary,
+            // not a regular expression or a prefix of a neighboring directory.
+            let neighbor = format!("{root}-public/session.jsonl");
+            assert_eq!(engine.redact_text(&neighbor).output, neighbor);
+        }
+    }
+
+    #[test]
+    fn swarm_redaction_scrubs_temp_paths_before_home_rewriting() {
+        for (home, root, separator) in [
+            ("/scratch/alice", "/scratch/alice/private [run]", "/"),
+            (
+                r"C:\Users\alice",
+                r"C:\Users\alice\AppData\Local\Temp",
+                "\\",
+            ),
+        ] {
+            let mut engine = RedactionEngine::new(swarm_evidence_redaction_config_for_temp_root(
+                Path::new(root),
+            ));
+            engine.home_str = Some(home.to_string());
+            let path = format!("{root}{separator}Secret Project{separator}session.jsonl");
+            let input = format!("Missing source: {path}");
+            assert_eq!(
+                engine.redact_text(&input).output,
+                "Missing source: [REDACTED_PATH]"
+            );
+            assert_eq!(
+                redact_swarm_scalar_with_engine(&engine, &input).output,
+                "Missing source: [REDACTED_PATH]"
+            );
         }
     }
 
