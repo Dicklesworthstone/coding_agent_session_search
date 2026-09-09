@@ -32290,14 +32290,11 @@ mod tests {
         let track_b = gh459_analytics_rows_without_workspace(&storage, "token_daily_stats");
         let amounts = gh459_rollup_amounts(&storage);
         let messages = serde_json::to_value(storage.fetch_messages(id).unwrap()).unwrap();
-        let timestamps: Vec<Vec<Vec<SqliteValue>>> = [
-            "usage_hourly",
-            "usage_daily",
-            "usage_models_daily",
-        ]
-        .into_iter()
-        .map(|table| {
-            storage
+        let timestamps: Vec<Vec<Vec<SqliteValue>>> =
+            ["usage_hourly", "usage_daily", "usage_models_daily"]
+                .into_iter()
+                .map(|table| {
+                    storage
                 .raw()
                 .query(&format!(
                     "SELECT workspace_id, last_updated FROM {table} ORDER BY workspace_id, 2"
@@ -32306,8 +32303,8 @@ mod tests {
                 .into_iter()
                 .map(|row| row.values().to_vec())
                 .collect()
-        })
-        .collect();
+                })
+                .collect();
         conv.workspace = Some(PathBuf::from("/new"));
         conv.metadata_json["cursor_workspace_attribution"] = serde_json::json!("workspace_trusted");
         for replay in 0..2 {

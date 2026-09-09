@@ -34,7 +34,8 @@ status; they are not counted as product features.
 | Merge reconciliation | five merges in the original range | validated | combined-diff review; dependency, pack, recovery and refresh changes retained |
 | E | local issue-fix commits through c865ebc4 and reviewed working-tree fixes, 2026-09-08 | distilled; runtime validation pending | Devin parser/WAL watch, Prime presets/probe, active-source watch retries, legacy FTS preflight, exact resume metadata, resumable semantic reconciliation, doctor truth, schema goldens |
 | F | reviewed changes through e3c76fa7, 2026-09-09 | full-suite failures diagnosed; corrected schema verified; remaining fixes under validation | Cursor canonical/search repair, temp-path trace privacy, connector fixtures, backfill process helper, exact connector enumeration |
-| G | working-tree analytics and upstream connector follow-through, 2026-09-09 | 127 targeted CASS tests passed; formatting and scanner gate still pending | stored workspace analytics conservation, replay and rollback; Copilot workspacePath alias |
+| G | analytics through e93659e3 plus reviewed formatter follow-up and unpublished upstream connector source, 2026-09-09 | 127 targeted CASS tests passed; Clippy and subsequent formatting passed; completed UBS scan remains red | stored workspace analytics conservation, replay and rollback; Copilot workspacePath alias |
+| H | reviewed GH422 process regression on c74277eb and the same connector overlay, 2026-09-09 | corrected regression passed in 22.93 seconds; formatting and all-target Clippy passed; prior UBS failure retained | search-triggered stall containment, lock release, durable checkpoint and cold lexical recovery |
 
 ## Publication follow-through
 
@@ -324,13 +325,13 @@ The correction retains the content-bearing stale-workspace precondition and
 every actual search/filter assertion. Copilot passed 11 tests and failed one
 real legacy-history workspace assertion. Its parser omits the top-level
 `workspacePath` alias; a one-line upstream fallback and three real scan tests
-are prepared without changing the original CASS assertion. Both corrections
-still need execution. The earlier upstream Cursor gate separately completed
-79 parser tests and one registry test successfully; those results do not
+were prepared without changing the original CASS assertion. Both corrections
+passed in the subsequent 127-test run below. The earlier upstream Cursor gate
+separately completed 79 parser tests and one registry test successfully; those results do not
 include the later Windows fixture escaping or Copilot change.
 
-CASS analytics reassociation is now implemented and reviewed, with runtime
-validation pending. It moves stored workspace contributions in the same
+CASS analytics reassociation is implemented and reviewed, with runtime
+validation recorded below. It moves stored workspace contributions in the same
 transaction as canonical attribution, preserves measured token/cost values,
 repairs canonical no-op replays, and rolls back on missing or underfilled
 rollup buckets. Three storage regressions and the expanded real CLI journey
@@ -361,6 +362,76 @@ No scanner waiver, dependency publication, or issue closure was made.
 The CASS follow-up's first formatting check reported one array/iterator layout
 in a new storage test. The earlier pinned formatter emitted source through stdin
 but did not run a subsequent Cargo formatting check; its successful process
-exit was insufficient. A formatting-only follow-up is prepared after runtime
-completion. The mandatory scanner is still running at this checkpoint, so the
-127 passing tests do not establish an overall green gate.
+exit was insufficient. After preserving the completed runtime receipt, remote
+formatting-only job 30012625538515432 passed at 04:20 UTC. The complete returned
+patch changes only that test's layout and trailing comma; it was reviewed and
+applied to the identical canonical input. All 1,039 other source inputs and the
+tested executable remained unchanged. Formatted storage SHA256 is
+3ac735a21b84fb85a88dd9ef8ea93db62e22055d308fcc731b361cea2556a459;
+the runtime used the pre-format storage source
+7b1084f03bcd9771560c5ca0174c9956b90db08f71fe81f60e0f24791cddb8d2.
+
+The analytics gate, job 30012625538515403, completed at 04:12 UTC. Unlike F9's
+timeout, its strict UBS scan finished: three files, 108 critical findings,
+9,591 warnings and 1,818 informational findings, exit 1. Independent review
+of every displayed critical location found test assertions, fixed executable
+paths, query syntax, cache hashes, and internal table/metadata names. The report
+only displays capped samples; unshown findings remain unclassified. No blanket
+suppression or scanner clearance follows from that review. Source inspection
+also found an unquoted argument-array expansion in the scanner's Cargo wrapper
+that explains its misleading build-clean labels; the separately executed
+Clippy and formatting receipts remain the actual compiler evidence.
+
+The retained gate and formatter results live under
+`/data/projects/cass-gh459-analytics-followup-e4o6via2/results/` and
+`/data/projects/cass-gh459-final-format-ktnc0se0/results/`. The tested executable
+SHA256 is 1fe22d59a1c4e21a315253c1ec6e377f59a6a68449422672701c4ba6936e10ea.
+Peer commits e93659e3 and c74277eb captured the existing source and documentation;
+their presence is not a green gate. UBS remains blocking, the upstream connector
+candidate remains unpublished, and the issues and release remain open.
+
+## GH422 search-triggered watchdog verification
+
+The new Unix regression in `tests/e2e_lexical_fail_open.rs` exercises the
+ordinary search process's supervised, in-process lexical refresh. It reuses
+the existing post-commit pause hook; no production code or new hook was added.
+After a real scratch-index commit, it checks the same search PID holds the
+index lock, durable checkpoint progress remains incomplete, and metadata
+heartbeats advance while forward progress stays frozen. The process must
+itself exit 70 with the structured `index-stalled` error before the artificial
+pause finishes. A harness timeout or cleanup kill cannot satisfy that assertion.
+The next cold query must publish complete lexical assets, return both expected
+message identities exactly once, and preserve canonical IDs and message data.
+
+The first remote gate, job 30012625538515443, completed at 04:52 UTC with
+84 tests passing and this new test failing before its watchdog assertions.
+The parent-added sentinel precondition incorrectly expected a checkpoint file
+path where the hook records the index directory. The child guard reaped the
+process; that run proves neither watchdog exit nor recovery. Formatting,
+all-target Clippy, 13 library controls, three other CLI controls, and 68 goldens
+passed. UBS completed with 98 critical findings, 859 warnings and 121
+informational findings, exit 1. Its failure remains blocking.
+
+Only the mistaken path assertion was corrected. Follow-up job
+30012625538515448 completed at 04:59 UTC with formatting, all-target Clippy,
+and the exact new regression passing: one passed, zero failed, zero ignored,
+22.93 seconds. All checkpoint, heartbeat, exit, lock, deadline, asset and
+conservation assertions remained intact. The formatter's complete returned
+diff was reviewed and applied manually. Final test SHA256 is
+3497dea3230c3be4a5313a61eaf45d471fc518f20bd18047b5caf686e3ea9774.
+All 1,040 CASS inputs and 77 declared connector-overlay inputs were verified
+before and after execution. Against the canonical checkout, only the declared
+connector-overlay Cargo configuration and lock differ; production executable
+SHA256 remains 1fe22d59a1c4e21a315253c1ec6e377f59a6a68449422672701c4ba6936e10ea.
+
+Both runs are retained under
+`/data/projects/cass-gh422-inline-watchdog-39_y0xyi/results/` and
+`/data/projects/cass-gh422-sentinel-fix-bnxlkyrs/results/`.
+The corrected `gh422-runtime.log` SHA256 is
+960da60a1e6803b5e3d2d5818b1ebc97e8a089c3bcb78ec64073bce2d345d2ba.
+The original bead `coding_agent_session_search-u3vho` and
+[GH422 progress comment](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/422#issuecomment-5596078395)
+record the positive result and its limits. This is controlled-fixture evidence
+for existing containment behavior, not reporter-sized archive acceptance or
+a change to the separately reported empty-success `--timeout` response.
+The issue and release remain open; the focused follow-up does not clear UBS.

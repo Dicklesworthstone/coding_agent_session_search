@@ -220,7 +220,7 @@ mean that every acceptance row, platform, or reporter archive has been verified.
   It applies full-path redaction before home-prefix shortening. This corrects
   a path leak found by the full suite; the unchanged CLI privacy regression
   and new path cases pass remotely, along with all 64 trace CLI tests. The
-  mandatory scanner remains incomplete, so this is not release clearance.
+  mandatory scanner gate remains unresolved, so this is not release clearance.
 - Cursor workspace repair preserves session/message identity and stored token
   and cost amounts while correcting canonical attribution and analytics totals.
   Replay repairs stale analytics without inserting duplicate messages; inconsistent
@@ -472,6 +472,12 @@ mean that every acceptance row, platform, or reporter archive has been verified.
   Docker or failed setup cannot count as a successful transfer.
 - Rust tests use the repository's 128 MiB stack reservation. The gate rejects
   rustfmt termination, missing terminal receipts, and zero-test selections.
+- A real-process regression covers a search-triggered lexical refresh that
+  stalls after committing a batch while its heartbeat continues (GH #422).
+  It verifies exit 70, lock release, and a subsequent cold query rebuilding
+  complete search assets without losing or duplicating canonical messages.
+  This validates the existing watchdog on a controlled fixture; acceptance
+  on the reporter's large archive remains open.
 - Release validation is still in progress. Existing targeted passes do not
   constitute a full-suite or four-platform release verdict; strict UBS remains
   blocking, and full-history pack latency has not met its unchanged SLO on the
