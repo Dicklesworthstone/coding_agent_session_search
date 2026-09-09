@@ -37084,6 +37084,73 @@ impl DoctorArchiveReadConnection for crate::storage::sqlite::FrankenOwnerConnect
     }
 }
 
+fn doctor_quick_check_status(
+    rows: Vec<crate::franken_sync::Row>,
+) -> Result<String, String> {
+    use crate::franken_sync::compat::RowExt as _;
+
+    if rows.is_empty() {
+        return Err("PRAGMA quick_check(1) returned no diagnostic rows".to_string());
+    }
+    let mut diagnostics = Vec::new();
+    let mut omitted = 0;
+    for row in rows {
+        let detail: String = row
+            .get_typed(0)
+            .map_err(|err| format!("reading PRAGMA quick_check output: {err}"))?;
+        let detail = detail.trim();
+        if detail.is_empty() {
+            return Err("PRAGMA quick_check(1) returned an empty diagnostic".to_string());
+        }
+        if detail.eq_ignore_ascii_case("ok") {
+            continue;
+        }
+        if diagnostics.len() < DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT {
+            diagnostics.push(detail.to_string());
+        } else {
+            omitted += 1;
+        }
+    }
+    if diagnostics.is_empty() {
+        return Ok("ok".to_string());
+    }
+    if omitted > 0 {
+        diagnostics.push(format!("{omitted} additional diagnostic row(s) omitted"));
+    }
+    Ok(diagnostics.join("; "))
+}
+
+fn doctor_database_quick_check<C: DoctorArchiveReadConnection>(
+    conn: &C,
+) -> Result<String, String> {
+    // Some engine versions return multiple findings despite the requested
+    // limit. Preserve those findings instead of replacing them with a row-count
+    // error. Inspect every row before declaring health; bound only the output.
+    let rows = conn
+        .doctor_query("PRAGMA quick_check(1)")
+        .map_err(|err| format!("running PRAGMA quick_check(1): {err}"))?;
+    doctor_quick_check_status(rows)
+}
+
+#[test]
+fn doctor_quick_check_preserves_multiple_findings_and_bounds_output() {
+    let conn = crate::franken_sync::Connection::open(":memory:").unwrap();
+    assert_eq!(doctor_database_quick_check(&conn).unwrap(), "ok");
+    // Actual engine rows exercise the diagnostic decoder; these SELECTs model
+    // the response protocol, not a claim that this database is corrupt.
+    let rows = conn.query("SELECT 'ok' UNION ALL SELECT 'page 7 never used' UNION ALL SELECT 'page 9 never used'").unwrap();
+    assert_eq!(doctor_quick_check_status(rows).unwrap(), "page 7 never used; page 9 never used");
+    let mut terms = vec!["SELECT 'ok'"; DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT + 1];
+    terms.push("SELECT 'late failure'");
+    assert_eq!(doctor_quick_check_status(conn.query(&terms.join(" UNION ALL ")).unwrap()).unwrap(), "late failure");
+    let terms = vec!["SELECT 'page failure'"; DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT + 2];
+    let status = doctor_quick_check_status(conn.query(&terms.join(" UNION ALL ")).unwrap()).unwrap();
+    assert_eq!(status.matches("page failure").count(), DOCTOR_DATABASE_INTEGRITY_DIAGNOSTIC_LIMIT);
+    assert!(status.ends_with("2 additional diagnostic row(s) omitted"));
+    assert!(doctor_quick_check_status(conn.query("SELECT 'ok' WHERE 0").unwrap()).is_err());
+    assert!(doctor_quick_check_status(conn.query("SELECT ''").unwrap()).is_err());
+}
+
 fn doctor_database_integrity_probe<C: DoctorArchiveReadConnection>(
     conn: &C,
     set_phase: impl Fn(&'static str),
@@ -37091,13 +37158,7 @@ fn doctor_database_integrity_probe<C: DoctorArchiveReadConnection>(
     use crate::franken_sync::compat::RowExt as _;
 
     set_phase("quick_check");
-    let quick_check_status: String = conn
-        .doctor_query_row_map(
-            "PRAGMA quick_check(1)",
-            &[],
-            |row: &crate::franken_sync::Row| row.get_typed(0),
-        )
-        .map_err(|err| format!("running PRAGMA quick_check(1): {err}"))?;
+    let quick_check_status = doctor_database_quick_check(conn)?;
 
     let quick_check_ok = quick_check_status.trim().eq_ignore_ascii_case("ok");
     let integrity_check_diagnostics = if quick_check_ok {
@@ -89981,13 +90042,7 @@ pub(crate) fn run_doctor_impl(
                                     |r: &crate::franken_sync::Row| r.get_typed(0),
                                 )
                                 .ok();
-                            let quick_check_status: Option<String> = conn
-                                .query_row_map(
-                                    "PRAGMA quick_check(1)",
-                                    &[],
-                                    |r: &crate::franken_sync::Row| r.get_typed(0),
-                                )
-                                .ok();
+                            let quick_check_status = doctor_database_quick_check(&conn).ok();
 
                             if let (Some(conv_count), Some(msg_count), Some(status)) =
                                 (conv_count, msg_count, quick_check_status)
