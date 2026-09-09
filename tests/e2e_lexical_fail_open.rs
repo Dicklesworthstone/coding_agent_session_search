@@ -922,6 +922,193 @@ fn no_maintenance_lexical_search_is_byte_stable_across_the_real_cli_path() {
 }
 
 #[test]
+fn gh422_timeout_retry_preserves_scoped_read_only_search() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("retry's isolated home");
+    fs::create_dir(&home).unwrap();
+    fs::write(home.join(".env"), "").unwrap();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("archive");
+    fs::create_dir(&data_dir).unwrap();
+    let db = data_dir.join("non-default archive.db");
+    for name in ["rollout-selected.jsonl", "rollout-excluded.jsonl"] {
+        seed_codex_session(&codex_home, name, "scopedretryneedle");
+    }
+    let selected = codex_home.join("sessions/2026/04/23/rollout-selected.jsonl");
+    let scope = home.join("selected sessions.txt");
+    fs::write(&scope, format!("{}\n", selected.display())).unwrap();
+    let indexed = cass_cmd(&home)
+        .arg("--db")
+        .arg(&db)
+        .args(["index", "--full", "--force-rebuild", "--json", "--data-dir"])
+        .arg(&data_dir)
+        .timeout(Duration::from_secs(120))
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    assert!(!data_dir.join("agent_search.db").exists());
+
+    // The excluded session really matches the query without the session scope.
+    let unscoped = cass_cmd(&home)
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "search",
+            "scopedretryneedle",
+            "--robot",
+            "--mode",
+            "lexical",
+            "--no-maintenance",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .timeout(Duration::from_secs(20))
+        .output()
+        .unwrap();
+    assert!(
+        unscoped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unscoped.stderr)
+    );
+    let unscoped: Value = serde_json::from_slice(&unscoped.stdout).unwrap();
+    assert_eq!(unscoped["hits"].as_array().unwrap().len(), 4, "{unscoped}");
+    let before = data_tree_snapshot(&data_dir);
+
+    for (delay, agent, expected_hits) in [
+        ("CASS_TEST_SEARCH_SETUP_SLOW_MS", "codex", 1),
+        ("CASS_TEST_SEARCH_META_SLOW_MS", "codex", 1),
+        ("CASS_TEST_SEARCH_SETUP_SLOW_MS", "not-a-real-agent", 0),
+    ] {
+        let output = cass_cmd(&home)
+            .env(delay, "6000")
+            .arg("--db")
+            .arg(&db)
+            .args([
+                "search",
+                "scopedretryneedle",
+                "--robot",
+                "--robot-meta",
+                "--mode",
+                "lexical",
+                "--no-maintenance",
+                "--no-daemon",
+                "--timeout",
+                "3000",
+                "--agent",
+                agent,
+                "--workspace",
+            ])
+            .arg(&codex_home)
+            .args(["--sessions-from"])
+            .arg(&scope)
+            .args([
+                "--source",
+                "local",
+                "--since",
+                "2024-01-01T00:00:00+00:00",
+                "--until",
+                "2025-01-01T00:00:00+00:00",
+                "--cursor",
+                "eyJvZmZzZXQiOjEsImxpbWl0IjoxfQ==",
+                "--fields",
+                "source_path,line_number,agent",
+                "--max-content-length",
+                "40",
+                "--max-tokens",
+                "512",
+                "--request-id",
+                "retry's request $(literal)",
+                "--data-dir",
+            ])
+            .arg(&data_dir)
+            .timeout(Duration::from_secs(15))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(payload["budget"]["timed_out"], true, "{payload}");
+        let retry = payload["budget"]["recommended_next_probe"]
+            .as_str()
+            .unwrap();
+        let args = shell_words::split(retry).unwrap();
+        assert_eq!(args.first().map(String::as_str), Some("cass"));
+        assert_eq!(&args[1..4], &["--db", db.to_str().unwrap(), "search"]);
+        for arg in [
+            "--no-maintenance",
+            "--no-daemon",
+            "--robot-meta",
+            "--limit=1",
+            "--offset=1",
+            "--source=local",
+            "--fields=source_path,line_number,agent",
+            "--max-content-length=40",
+            "--max-tokens=512",
+            "--request-id=retry's request $(literal)",
+        ] {
+            assert!(
+                args.iter().any(|actual| actual == arg),
+                "missing {arg}: {retry}"
+            );
+        }
+        assert!(
+            args.iter().any(|arg| arg == &format!("--agent={agent}")),
+            "{retry}"
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg == &format!("--workspace={}", codex_home.display())),
+            "{retry}"
+        );
+        for (flag, expected) in [
+            ("--since=", 1_704_067_200_000_i64),
+            ("--until=", 1_735_689_600_000_i64),
+        ] {
+            let bound = args.iter().find_map(|arg| arg.strip_prefix(flag)).unwrap();
+            assert_eq!(
+                chrono::DateTime::parse_from_rfc3339(bound)
+                    .unwrap()
+                    .timestamp_millis(),
+                expected
+            );
+        }
+        // Parse the advertised shell command, but execute cass directly: quoted
+        // paths/request IDs must round-trip without invoking a shell.
+        let retried = cass_cmd(&home)
+            .args(&args[1..])
+            .timeout(Duration::from_secs(15))
+            .output()
+            .unwrap();
+        assert!(
+            retried.status.success(),
+            "retry {retry}: {}",
+            String::from_utf8_lossy(&retried.stderr)
+        );
+        let result: Value = serde_json::from_slice(&retried.stdout).unwrap();
+        assert_eq!(result["budget"]["timed_out"], false, "{result}");
+        let hits = result["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), expected_hits, "{result}");
+        for hit in hits {
+            assert_eq!(hit["source_path"].as_str(), selected.to_str(), "{result}");
+            assert_eq!(hit["agent"], "codex", "{result}");
+        }
+        assert_eq!(
+            before,
+            data_tree_snapshot(&data_dir),
+            "retry changed archive: {retry}"
+        );
+        assert!(!data_dir.join("agent_search.db").exists());
+    }
+}
+
+#[test]
 fn no_maintenance_hybrid_search_with_semantic_assets_is_byte_stable() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path();
