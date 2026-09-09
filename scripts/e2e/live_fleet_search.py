@@ -68,7 +68,8 @@ def json_documents(text):
 
 
 class FleetRun:
-    def __init__(self, inventory, binary):
+    def __init__(self, inventory, binary, tailscale=False):
+        self.tailscale = tailscale
         self.repo = Path(__file__).resolve().parents[2]
         inventory = Path(inventory).resolve(strict=True)
         if inventory.is_relative_to(self.repo):
@@ -194,7 +195,12 @@ class FleetRun:
 
     def run(self):
         self.cass("version", ["--version"])
-        discovery = json.loads(self.cass("discovery", ["sources", "discover", "--json"]))
+        discovery_args = ["sources", "discover", "--json"]
+        if self.tailscale:
+            discovery_args.append("--tailscale")
+        discovery = json.loads(self.cass("discovery", discovery_args))
+        if self.tailscale:
+            assert not discovery.get("discovery_warning"), "Tailscale discovery unavailable"
         aliases = {host["name"] for host in discovery.get("hosts", [])}
         assert all(host["ssh"].rsplit("@", 1)[-1] in aliases for host in self.hosts), "SSH discovery omitted an inventory alias"
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
@@ -257,9 +263,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inventory", required=True)
     parser.add_argument("--cass-bin", required=True)
+    parser.add_argument("--tailscale", action="store_true",
+                        help="Require live Tailscale discovery; inventory SSH targets should be tailnet IPs")
     options = parser.parse_args()
     os.umask(0o077)
-    run = FleetRun(options.inventory, options.cass_bin)
+    run = FleetRun(options.inventory, options.cass_bin, options.tailscale)
     passed = False
     try:
         passed = run.run()

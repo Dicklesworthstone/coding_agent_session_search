@@ -160,6 +160,22 @@ fn sources_discover_uses_private_ssh_config_override_and_includes() {
     assert_eq!(hosts.len(), 2, "{result}");
     assert_eq!(hosts[0]["name"], "workstation");
     assert_eq!(hosts[1]["name"], "laptop");
+    // A missing optional CLI must retain configured hosts and report fallback.
+    // This uses a genuinely empty executable search path, not a fake tailscale.
+    let fallback = tracker
+        .cass_std_command()
+        .args(["sources", "discover", "--tailscale", "--json"])
+        .env("HOME", &home)
+        .env("PATH", root.join("no-executables"))
+        .env("CASS_SSH_CONFIG", &config)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .current_dir(&home)
+        .output()
+        .unwrap();
+    assert!(fallback.status.success());
+    let fallback: Value = serde_json::from_slice(&fallback.stdout).unwrap();
+    assert_eq!(fallback["hosts"], result["hosts"]);
+    assert!(fallback["discovery_warning"].as_str().unwrap().contains("could not start"));
     tracker.complete();
 }
 
