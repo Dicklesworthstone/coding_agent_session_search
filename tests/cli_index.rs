@@ -128,13 +128,13 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
     let encoded_project = correct
         .to_string_lossy()
         .trim_start_matches(['/', '\\'])
-        .replace(['/', '\\'], "-");
+        .replace(['/', '\\', ':'], "-");
     assert_eq!(
         encoded_project,
         wrong
             .to_string_lossy()
             .trim_start_matches(['/', '\\'])
-            .replace(['/', '\\'], "-")
+            .replace(['/', '\\', ':'], "-")
     );
     let project = home.join(".cursor/projects").join(&encoded_project);
     let transcript_dir = project.join("agent-transcripts/gh459-session");
@@ -159,6 +159,7 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
         })
         .unwrap();
     let workspace_id = storage.ensure_workspace(&wrong, None).unwrap();
+    let correct_workspace_id = storage.ensure_workspace(&correct, None).unwrap();
     let canonical = Conversation {
         id: None,
         agent_slug: "cursor".into(),
@@ -183,12 +184,73 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
         source_id: "local".into(),
         origin_host: None,
     };
-    let original = storage
-        .insert_conversation_tree(agent_id, Some(workspace_id), &canonical)
+    let seeded = storage
+        .insert_conversations_batched(&[(agent_id, Some(workspace_id), &canonical)])
         .unwrap();
+    assert_eq!(seeded.len(), 1);
+    let original = &seeded[0];
     let messages =
         serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap()).unwrap();
     storage.close().unwrap();
+
+    // Observe stored measurements after the real CLI repair. Comparing every
+    // non-workspace column catches accidental re-extraction or token/cost loss.
+    let analytics_snapshot = |expected_workspace: Option<i64>| {
+        let storage = SqliteStorage::open_readonly(&db_path).unwrap();
+        let measurements =
+            [("message_metrics", 5), ("token_usage", 4)].map(|(table, workspace_column)| {
+                let rows = storage
+                    .raw()
+                    .query(&format!("SELECT * FROM {table}"))
+                    .unwrap();
+                assert_eq!(rows.len(), 1, "the seeded {table} row must survive");
+                let workspace: Option<i64> = rows[0].get_typed(workspace_column).unwrap();
+                assert_eq!(
+                    workspace,
+                    if table == "message_metrics" {
+                        Some(expected_workspace.unwrap_or(0))
+                    } else {
+                        expected_workspace
+                    },
+                    "{table} attribution after CLI indexing"
+                );
+                rows[0]
+                    .values()
+                    .iter()
+                    .enumerate()
+                    .filter(|(column, _)| *column != workspace_column)
+                    .map(|(_, value)| value.clone())
+                    .collect::<Vec<_>>()
+            });
+        let rollups = ["usage_hourly", "usage_daily", "usage_models_daily"].map(|table| {
+            let rows = storage.raw().query(&format!(
+                "SELECT workspace_id, message_count, content_tokens_est_total, api_tokens_total FROM {table}"
+            )).unwrap();
+            let mut total = [0_i64; 3];
+            for row in rows {
+                let amounts = [1, 2, 3].map(|column| row.get_typed::<i64>(column).unwrap());
+                assert!(
+                    amounts.iter().all(|amount| *amount >= 0),
+                    "{table} must not contain negative measurements"
+                );
+                if amounts.iter().any(|amount| *amount > 0) {
+                    assert_eq!(
+                        row.get_typed::<i64>(0).unwrap(),
+                        expected_workspace.unwrap_or(0),
+                        "{table} must attribute activity to the current workspace"
+                    );
+                }
+                for (sum, amount) in total.iter_mut().zip(amounts) {
+                    *sum += amount;
+                }
+            }
+            assert_eq!(total[0], 1, "{table} must preserve the one actual message");
+            total
+        });
+        storage.close().unwrap();
+        (measurements, rollups)
+    };
+    let original_analytics = analytics_snapshot(Some(workspace_id));
 
     let run_index = |canonical_only: bool, semantic: bool| {
         let mut cmd = base_cmd(home);
@@ -272,6 +334,7 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
         );
     };
     run_index(true, true);
+    assert_eq!(analytics_snapshot(Some(workspace_id)), original_analytics);
     assert_hash_ready();
     assert_eq!(
         search_payload("semantic", Some(&wrong))["hits"]
@@ -300,6 +363,13 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, Some(original.conversation_id));
         assert_eq!(rows[0].workspace.as_ref(), Some(&correct));
+        let current_workspace: i64 = storage
+            .raw()
+            .query("SELECT workspace_id FROM conversations")
+            .unwrap()[0]
+            .get_typed(0)
+            .unwrap();
+        assert_eq!(current_workspace, correct_workspace_id);
         assert_eq!(rows[0].metadata_json["retained"]["canonical"], true);
         assert_eq!(
             rows[0].metadata_json["cursor_workspace_attribution"],
@@ -311,6 +381,10 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
             messages
         );
         storage.close().unwrap();
+        assert_eq!(
+            analytics_snapshot(Some(current_workspace)),
+            original_analytics
+        );
         assert_eq!(search_count(Some(&correct)), 1);
         assert_eq!(search_count(Some(&wrong)), 0);
         assert_eq!(fs::read(&transcript).unwrap(), source_bytes);
@@ -341,6 +415,10 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
     }
     run_index(false, true);
     assert_hash_ready();
+    assert_eq!(
+        analytics_snapshot(Some(correct_workspace_id)),
+        original_analytics
+    );
     assert_eq!(
         semantic_debts(),
         vec!["complete".to_string(), trusted_debts[1].clone()],
@@ -384,6 +462,7 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
             messages
         );
         storage.close().unwrap();
+        assert_eq!(analytics_snapshot(None), original_analytics);
         assert_eq!(search_count(Some(&correct)), 0);
         assert_eq!(search_count(Some(&wrong)), 0);
         assert_eq!(search_count(None), 1);
@@ -443,6 +522,7 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
         messages
     );
     storage.close().unwrap();
+    assert_eq!(analytics_snapshot(None), original_analytics);
     assert_eq!(fs::read(&transcript).unwrap(), source_bytes);
     assert_eq!(
         fs::metadata(&transcript).unwrap().modified().unwrap(),

@@ -14896,11 +14896,11 @@ mod tests {
         assert_eq!(
             stored_workspace.as_deref(),
             if contentless {
-                None
+                Some("")
             } else {
                 Some("/old-guessed-workspace")
             },
-            "the legacy shadow must actually retain the obsolete attribution",
+            "the shadow must retain obsolete attribution only when it stores content",
         );
 
         let client = SearchClient {

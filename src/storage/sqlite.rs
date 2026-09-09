@@ -12229,6 +12229,7 @@ impl FrankenStorage {
             )?;
             outcome.workspace_changed =
                 franken_reconcile_cursor_workspace(&tx, agent_id, existing.id, workspace_id, conv)?;
+            franken_reassociate_cursor_analytics_workspace(&tx, existing.id, conv)?;
             tx.commit()?;
             return Ok(outcome);
         }
@@ -12351,6 +12352,7 @@ impl FrankenStorage {
                     workspace_id,
                     conv,
                 )?;
+                franken_reassociate_cursor_analytics_workspace(&tx, existing_id, conv)?;
                 tx.commit()?;
                 return Ok(InsertOutcome {
                     conversation_id: existing_id,
@@ -15676,6 +15678,23 @@ impl FrankenStorage {
             }
         }
 
+        // Repeated packets can change a conversation's workspace more than
+        // once while its new analytics rows are still buffered. Relocate only
+        // after those buffers are flushed, using the final canonical identity.
+        let mut reassociated = HashSet::new();
+        for ((_, _, conv), outcome) in conversations.iter().zip(&outcomes) {
+            if conv.external_id.is_some()
+                && cursor_workspace_attribution_is_authoritative(
+                    &conv.agent_slug,
+                    conv.workspace.as_deref(),
+                    &conv.metadata_json,
+                )
+                && reassociated.insert(outcome.conversation_id)
+            {
+                franken_reassociate_cursor_analytics_workspace(&tx, outcome.conversation_id, conv)?;
+            }
+        }
+
         tx.commit()?;
 
         pricing_diag.log_summary();
@@ -18327,6 +18346,265 @@ fn franken_flush_analytics_rollups_in_tx(
     let models_daily_affected = franken_flush_model_daily_rollup_table(tx, &agg.models_daily, now)?;
 
     Ok((hourly_affected, daily_affected, models_daily_affected))
+}
+
+/// Relocate existing analytics without re-estimating tokens or creating missing
+/// metrics. This also repairs authoritative replays whose canonical workspace
+/// was corrected earlier, while their analytics still use the former workspace.
+fn franken_reassociate_cursor_analytics_workspace(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    conv: &Conversation,
+) -> Result<()> {
+    if conv.external_id.is_none()
+        || !cursor_workspace_attribution_is_authoritative(
+            &conv.agent_slug,
+            conv.workspace.as_deref(),
+            &conv.metadata_json,
+        )
+    {
+        return Ok(());
+    }
+    let workspace_id: Option<i64> = tx.query_row_map(
+        "SELECT workspace_id FROM conversations WHERE id = ?1",
+        fparams![conversation_id],
+        |row| row.get_typed(0),
+    )?;
+    let metrics_workspace = workspace_id.unwrap_or(0);
+    let message_ids: Vec<i64> = tx.query_map_collect(
+        "SELECT id FROM messages WHERE conversation_id = ?1",
+        fparams![conversation_id],
+        |row| row.get_typed(0),
+    )?;
+    let mut old = AnalyticsRollupAggregator::new();
+    // Primary-key IN lists keep the read scoped to this conversation. Never
+    // hydrate message text or walk the archive to change one dimension.
+    for ids in message_ids.chunks(128) {
+        let mut params: Vec<ParamValue> = ids.iter().copied().map(ParamValue::from).collect();
+        params.push(ParamValue::from(metrics_workspace));
+        let entries = tx.query_map_collect(
+            &format!(
+                "SELECT message_id, created_at_ms, hour_id, day_id,
+                agent_slug, workspace_id, source_id, role, content_chars, content_tokens_est,
+                model_name, model_family, model_tier, provider,
+                api_input_tokens, api_output_tokens, api_cache_read_tokens,
+                api_cache_creation_tokens, api_thinking_tokens, api_service_tier,
+                api_data_source, tool_call_count, has_tool_calls, has_plan
+                FROM message_metrics WHERE message_id IN ({}) AND workspace_id != ?{}",
+                sql_placeholders(ids.len()),
+                params.len()
+            ),
+            &params,
+            |row| {
+                Ok(MessageMetricsEntry {
+                    message_id: row.get_typed(0)?,
+                    created_at_ms: row.get_typed(1)?,
+                    hour_id: row.get_typed(2)?,
+                    day_id: row.get_typed(3)?,
+                    agent_slug: row.get_typed(4)?,
+                    workspace_id: row.get_typed(5)?,
+                    source_id: row.get_typed(6)?,
+                    role: row.get_typed(7)?,
+                    content_chars: row.get_typed(8)?,
+                    content_tokens_est: row.get_typed(9)?,
+                    model_name: row.get_typed(10)?,
+                    model_family: row.get_typed(11)?,
+                    model_tier: row.get_typed(12)?,
+                    provider: row.get_typed(13)?,
+                    api_input_tokens: row.get_typed(14)?,
+                    api_output_tokens: row.get_typed(15)?,
+                    api_cache_read_tokens: row.get_typed(16)?,
+                    api_cache_creation_tokens: row.get_typed(17)?,
+                    api_thinking_tokens: row.get_typed(18)?,
+                    api_service_tier: row.get_typed(19)?,
+                    api_data_source: row.get_typed(20)?,
+                    tool_call_count: row.get_typed(21)?,
+                    has_tool_calls: row.get_typed::<i64>(22)? != 0,
+                    has_plan: row.get_typed::<i64>(23)? != 0,
+                })
+            },
+        )?;
+        for entry in entries {
+            old.record(&entry);
+        }
+    }
+
+    for (table, bucket_col, deltas) in [
+        ("usage_hourly", "hour_id", &old.hourly),
+        ("usage_daily", "day_id", &old.daily),
+    ] {
+        for ((bucket, agent, previous_workspace, source), delta) in deltas {
+            let key = vec![
+                (bucket_col, ParamValue::from(*bucket)),
+                ("agent_slug", ParamValue::from(agent.as_str())),
+                ("workspace_id", ParamValue::from(*previous_workspace)),
+                ("source_id", ParamValue::from(source.as_str())),
+            ];
+            let destination_updated =
+                franken_relocate_rollup_subtract(tx, table, key, metrics_workspace, delta)?;
+            franken_flush_rollup_table(
+                tx,
+                table,
+                bucket_col,
+                &HashMap::from([(
+                    (*bucket, agent.clone(), metrics_workspace, source.clone()),
+                    delta.clone(),
+                )]),
+                destination_updated,
+            )?;
+        }
+    }
+    for ((day, agent, previous_workspace, source, family, tier), delta) in &old.models_daily {
+        let key = vec![
+            ("day_id", ParamValue::from(*day)),
+            ("agent_slug", ParamValue::from(agent.as_str())),
+            ("workspace_id", ParamValue::from(*previous_workspace)),
+            ("source_id", ParamValue::from(source.as_str())),
+            ("model_family", ParamValue::from(family.as_str())),
+            ("model_tier", ParamValue::from(tier.as_str())),
+        ];
+        let destination_updated = franken_relocate_rollup_subtract(
+            tx,
+            "usage_models_daily",
+            key,
+            metrics_workspace,
+            delta,
+        )?;
+        franken_flush_model_daily_rollup_table(
+            tx,
+            &HashMap::from([(
+                (
+                    *day,
+                    agent.clone(),
+                    metrics_workspace,
+                    source.clone(),
+                    family.clone(),
+                    tier.clone(),
+                ),
+                delta.clone(),
+            )]),
+            destination_updated,
+        )?;
+    }
+    for ids in message_ids.chunks(128) {
+        let mut params: Vec<ParamValue> = ids.iter().copied().map(ParamValue::from).collect();
+        params.push(ParamValue::from(metrics_workspace));
+        let id_slots = (1..=ids.len())
+            .map(|idx| format!("?{idx}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        tx.execute_compat(
+            &format!("UPDATE message_metrics SET workspace_id = ?{} WHERE message_id IN ({}) AND workspace_id != ?{}",
+                params.len(), id_slots, params.len()),
+            &params,
+        )?;
+    }
+    tx.execute_compat(
+        "UPDATE token_usage SET workspace_id = ?2 WHERE conversation_id = ?1 AND workspace_id IS NOT ?2",
+        fparams![conversation_id, workspace_id],
+    )?;
+    Ok(())
+}
+
+/// Subtract only a contribution actually present in the old rollup. Ordinary
+/// deferred analytics has neither metrics nor rollups; a missing/underfilled
+/// bucket for existing metrics is drift and must roll back, never go negative.
+/// Existing destination timestamps are retained; new buckets inherit the old
+/// bucket's timestamp rather than rewriting stored measurement provenance.
+fn franken_relocate_rollup_subtract(
+    tx: &FrankenTransaction<'_>,
+    table: &str,
+    key: Vec<(&str, ParamValue)>,
+    workspace_id: i64,
+    delta: &UsageRollupDelta,
+) -> Result<i64> {
+    let predicate = key
+        .iter()
+        .enumerate()
+        .map(|(idx, (name, _))| format!("{name} = ?{}", idx + 1))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let mut params: Vec<ParamValue> = key.iter().map(|(_, value)| value.clone()).collect();
+    let old_updated: i64 = tx
+        .query_row_map(
+            &format!("SELECT last_updated FROM {table} WHERE {predicate}"),
+            &params,
+            |row| row.get_typed(0),
+        )
+        .with_context(|| {
+            format!("Cursor workspace analytics drift: missing {table} source bucket")
+        })?;
+    let mut destination = params.clone();
+    destination[2] = ParamValue::from(workspace_id);
+    let destination_updated: Option<i64> = tx
+        .query_row_map(
+            &format!("SELECT last_updated FROM {table} WHERE {predicate}"),
+            &destination,
+            |row| row.get_typed(0),
+        )
+        .optional()?;
+    let mut counters = vec![
+        ("message_count", delta.message_count),
+        ("user_message_count", delta.user_message_count),
+        ("assistant_message_count", delta.assistant_message_count),
+        ("tool_call_count", delta.tool_call_count),
+        ("plan_message_count", delta.plan_message_count),
+        (
+            "api_coverage_message_count",
+            delta.api_coverage_message_count,
+        ),
+        ("content_tokens_est_total", delta.content_tokens_est_total),
+        ("content_tokens_est_user", delta.content_tokens_est_user),
+        (
+            "content_tokens_est_assistant",
+            delta.content_tokens_est_assistant,
+        ),
+        ("api_tokens_total", delta.api_tokens_total),
+        ("api_input_tokens_total", delta.api_input_tokens_total),
+        ("api_output_tokens_total", delta.api_output_tokens_total),
+        (
+            "api_cache_read_tokens_total",
+            delta.api_cache_read_tokens_total,
+        ),
+        (
+            "api_cache_creation_tokens_total",
+            delta.api_cache_creation_tokens_total,
+        ),
+        ("api_thinking_tokens_total", delta.api_thinking_tokens_total),
+    ];
+    if table != "usage_models_daily" {
+        counters.extend([
+            (
+                "plan_content_tokens_est_total",
+                delta.plan_content_tokens_est_total,
+            ),
+            ("plan_api_tokens_total", delta.plan_api_tokens_total),
+        ]);
+    }
+    let mut assignments = Vec::with_capacity(counters.len());
+    let mut guards = Vec::with_capacity(counters.len());
+    for (column, amount) in counters {
+        anyhow::ensure!(
+            amount >= 0,
+            "Cursor workspace analytics drift: negative {column} contribution"
+        );
+        params.push(ParamValue::from(amount));
+        assignments.push(format!("{column} = {column} - ?{}", params.len()));
+        guards.push(format!("{column} >= ?{}", params.len()));
+    }
+    let changed = tx.execute_compat(
+        &format!(
+            "UPDATE {table} SET {} WHERE {predicate} AND {}",
+            assignments.join(", "),
+            guards.join(" AND ")
+        ),
+        &params,
+    )?;
+    anyhow::ensure!(
+        changed == 1,
+        "Cursor workspace analytics drift: underfilled {table} source bucket"
+    );
+    Ok(destination_updated.unwrap_or(old_updated))
 }
 
 /// Update conversation-level token summary columns via frankensqlite transaction.
@@ -31802,6 +32080,548 @@ mod tests {
 
         let id = storage.ensure_agent(&agent).unwrap();
         assert!(id > 0);
+    }
+
+    fn gh459_seed_workspace_analytics(
+        storage: &FrankenStorage,
+        label: &str,
+        workspace: &Path,
+    ) -> (i64, i64, i64, Conversation) {
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "cursor".into(),
+                name: "Cursor".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let workspace_id = storage.ensure_workspace(workspace, None).unwrap();
+        let conv = Conversation {
+            id: None,
+            agent_slug: "cursor".into(),
+            workspace: Some(workspace.to_path_buf()),
+            external_id: Some(label.into()),
+            title: Some(label.into()),
+            source_path: PathBuf::from(format!("/cursor/{label}.jsonl")),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_090_000_000),
+            approx_tokens: None,
+            metadata_json: serde_json::json!({"cursor_format":"agent"}),
+            messages: (0..2)
+                .map(|idx| Message {
+                    id: None,
+                    idx,
+                    role: if idx == 0 {
+                        MessageRole::User
+                    } else {
+                        MessageRole::Agent
+                    },
+                    author: None,
+                    created_at: Some(1_700_000_000_000 + idx * 90_000_000),
+                    content: format!("{label} retained message {idx}"),
+                    extra_json: serde_json::json!({"keep":idx}),
+                    snippets: vec![],
+                })
+                .collect(),
+            source_id: "local".into(),
+            origin_host: None,
+        };
+        let id = storage
+            .insert_conversations_batched_with_analytics(
+                &[(agent_id, Some(workspace_id), &conv)],
+                true,
+            )
+            .unwrap()[0]
+            .conversation_id;
+        let messages = storage.fetch_messages(id).unwrap();
+        let mut tx = storage.conn.transaction().unwrap();
+        let mut metrics = Vec::new();
+        let mut tokens = Vec::new();
+        let mut rollups = AnalyticsRollupAggregator::new();
+        for message in messages {
+            let api = message.idx == 1;
+            let timestamp = message.created_at.unwrap();
+            let entry = MessageMetricsEntry {
+                message_id: message.id.unwrap(),
+                created_at_ms: timestamp,
+                hour_id: FrankenStorage::hour_id_from_millis(timestamp),
+                day_id: FrankenStorage::day_id_from_millis(timestamp),
+                agent_slug: "cursor".into(),
+                workspace_id,
+                source_id: "local".into(),
+                role: if api { "assistant" } else { "user" }.into(),
+                content_chars: message.content.len() as i64,
+                // Deliberately different from content length / 4. A dimension
+                // move must retain stored measurements, not re-extract them.
+                content_tokens_est: if api { 251 } else { 117 },
+                model_name: api.then(|| "claude-opus-4".into()),
+                model_family: if api { "claude" } else { "unknown" }.into(),
+                model_tier: if api { "opus" } else { "unknown" }.into(),
+                provider: if api { "anthropic" } else { "unknown" }.into(),
+                api_input_tokens: api.then_some(131),
+                api_output_tokens: api.then_some(59),
+                api_cache_read_tokens: api.then_some(17),
+                api_cache_creation_tokens: api.then_some(7),
+                api_thinking_tokens: api.then_some(23),
+                api_service_tier: api.then(|| "standard".into()),
+                api_data_source: if api { "api" } else { "estimated" }.into(),
+                tool_call_count: i64::from(api) * 2,
+                has_tool_calls: api,
+                has_plan: api,
+            };
+            tokens.push(TokenUsageEntry {
+                message_id: entry.message_id,
+                conversation_id: id,
+                agent_id,
+                workspace_id: Some(workspace_id),
+                source_id: entry.source_id.clone(),
+                timestamp_ms: timestamp,
+                day_id: entry.day_id,
+                model_name: entry.model_name.clone(),
+                model_family: Some(entry.model_family.clone()),
+                model_tier: Some(entry.model_tier.clone()),
+                service_tier: entry.api_service_tier.clone(),
+                provider: Some(entry.provider.clone()),
+                input_tokens: entry.api_input_tokens,
+                output_tokens: entry.api_output_tokens,
+                cache_read_tokens: entry.api_cache_read_tokens,
+                cache_creation_tokens: entry.api_cache_creation_tokens,
+                thinking_tokens: entry.api_thinking_tokens,
+                total_tokens: api.then_some(237),
+                estimated_cost_usd: api.then_some(0.125),
+                role: entry.role.clone(),
+                content_chars: entry.content_chars,
+                has_tool_calls: api,
+                tool_call_count: u32::from(api) * 2,
+                data_source: entry.api_data_source.clone(),
+            });
+            rollups.record(&entry);
+            metrics.push(entry);
+        }
+        franken_insert_token_usage_batched_in_tx(&tx, &tokens).unwrap();
+        franken_insert_message_metrics_batched_in_tx(&tx, &metrics).unwrap();
+        franken_flush_analytics_rollups_in_tx(&tx, &rollups).unwrap();
+        franken_update_conversation_token_summaries_in_tx(&tx, id).unwrap();
+        tx.commit().unwrap();
+        (agent_id, workspace_id, id, conv)
+    }
+
+    fn gh459_analytics_rows_without_workspace(
+        storage: &FrankenStorage,
+        table: &str,
+    ) -> Vec<Vec<SqliteValue>> {
+        let columns: Vec<String> = storage
+            .raw()
+            .query_map_collect(&format!("PRAGMA table_info({table})"), fparams![], |row| {
+                row.get_typed(1)
+            })
+            .unwrap()
+            .into_iter()
+            .filter(|column: &String| column != "workspace_id")
+            .collect();
+        storage
+            .raw()
+            .query(&format!(
+                "SELECT {} FROM {table} ORDER BY 1",
+                columns.join(",")
+            ))
+            .unwrap()
+            .into_iter()
+            .map(|row| row.values().to_vec())
+            .collect()
+    }
+
+    fn gh459_rollup_amounts(storage: &FrankenStorage) -> Vec<Vec<SqliteValue>> {
+        ["usage_hourly", "usage_daily", "usage_models_daily"]
+            .into_iter()
+            .map(|table| {
+                let columns: Vec<String> = storage
+                    .raw()
+                    .query_map_collect(&format!("PRAGMA table_info({table})"), fparams![], |row| {
+                        Ok((row.get_typed::<String>(1)?, row.get_typed::<String>(2)?))
+                    })
+                    .unwrap()
+                    .into_iter()
+                    .filter(|(column, kind)| {
+                        kind == "INTEGER"
+                            && !matches!(
+                                column.as_str(),
+                                "hour_id" | "day_id" | "workspace_id" | "last_updated"
+                            )
+                    })
+                    .map(|(column, _)| format!("SUM({column})"))
+                    .collect();
+                storage
+                    .raw()
+                    .query(&format!("SELECT {} FROM {table}", columns.join(",")))
+                    .unwrap()[0]
+                    .values()
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn gh459_analytics_workspace_move_conserves_shared_buckets_and_stored_amounts() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("analytics.db")).unwrap();
+        let (agent, old, id, mut conv) =
+            gh459_seed_workspace_analytics(&storage, "moving", Path::new("/old"));
+        let (_, _, sibling, _) =
+            gh459_seed_workspace_analytics(&storage, "staying", Path::new("/old"));
+        let (_, new, _, _) =
+            gh459_seed_workspace_analytics(&storage, "destination", Path::new("/new"));
+        storage.rebuild_token_daily_stats().unwrap();
+        let metrics = gh459_analytics_rows_without_workspace(&storage, "message_metrics");
+        let tokens = gh459_analytics_rows_without_workspace(&storage, "token_usage");
+        assert_eq!(metrics.len(), 6);
+        assert_eq!(tokens.len(), 6);
+        let (api_input, cost): (i64, f64) = storage
+            .raw()
+            .query_row_map(
+                "SELECT SUM(input_tokens), SUM(estimated_cost_usd) FROM token_usage",
+                fparams![],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        assert_eq!(api_input, 393);
+        assert_eq!(cost, 0.375);
+        let track_b = gh459_analytics_rows_without_workspace(&storage, "token_daily_stats");
+        let amounts = gh459_rollup_amounts(&storage);
+        let messages = serde_json::to_value(storage.fetch_messages(id).unwrap()).unwrap();
+        let timestamps: Vec<Vec<Vec<SqliteValue>>> = [
+            "usage_hourly",
+            "usage_daily",
+            "usage_models_daily",
+        ]
+        .into_iter()
+        .map(|table| {
+            storage
+                .raw()
+                .query(&format!(
+                    "SELECT workspace_id, last_updated FROM {table} ORDER BY workspace_id, 2"
+                ))
+                .unwrap()
+                .into_iter()
+                .map(|row| row.values().to_vec())
+                .collect()
+        })
+        .collect();
+        conv.workspace = Some(PathBuf::from("/new"));
+        conv.metadata_json["cursor_workspace_attribution"] = serde_json::json!("workspace_trusted");
+        for replay in 0..2 {
+            // Even explicit deferred creation must correct existing attribution.
+            let outcome = storage
+                .insert_conversations_batched_with_analytics(&[(agent, Some(new), &conv)], true)
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(outcome.workspace_changed, replay == 0);
+            assert!(outcome.inserted_indices.is_empty());
+            assert_eq!(outcome.conversation_id, id);
+            assert_eq!(
+                gh459_analytics_rows_without_workspace(&storage, "message_metrics"),
+                metrics
+            );
+            assert_eq!(
+                gh459_analytics_rows_without_workspace(&storage, "token_usage"),
+                tokens
+            );
+            assert_eq!(
+                gh459_analytics_rows_without_workspace(&storage, "token_daily_stats"),
+                track_b
+            );
+            assert_eq!(gh459_rollup_amounts(&storage), amounts);
+            for (index, table) in ["usage_hourly", "usage_daily", "usage_models_daily"]
+                .into_iter()
+                .enumerate()
+            {
+                let counts: Vec<(i64, i64)> = storage.raw().query_map_collect(
+                    &format!("SELECT workspace_id, SUM(message_count) FROM {table} GROUP BY workspace_id ORDER BY workspace_id"), fparams![],
+                    |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+                ).unwrap();
+                assert_eq!(counts, vec![(old, 2), (new, 4)]);
+                let after: Vec<Vec<SqliteValue>> = storage
+                    .raw()
+                    .query(&format!(
+                        "SELECT workspace_id, last_updated FROM {table} ORDER BY workspace_id, 2"
+                    ))
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| row.values().to_vec())
+                    .collect();
+                assert_eq!(after, timestamps[index]);
+            }
+            let sibling_workspace: Option<i64> = storage
+                .raw()
+                .query_row_map(
+                    "SELECT workspace_id FROM token_usage WHERE conversation_id = ?1 LIMIT 1",
+                    fparams![sibling],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(sibling_workspace, Some(old));
+            let moved_token_workspaces: Vec<i64> = storage
+                .raw()
+                .query_map_collect(
+                    "SELECT workspace_id FROM token_usage WHERE conversation_id = ?1",
+                    fparams![id],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(moved_token_workspaces, vec![new, new]);
+            let moved_metrics: i64 = storage
+                .raw()
+                .query_row_map(
+                    "SELECT COUNT(*) FROM message_metrics WHERE workspace_id = ?1",
+                    fparams![new],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(moved_metrics, 4);
+            assert_eq!(
+                serde_json::to_value(storage.fetch_messages(id).unwrap()).unwrap(),
+                messages
+            );
+        }
+        let new_bucket_timestamps: Vec<Vec<i64>> = ["usage_hourly", "usage_daily", "usage_models_daily"].into_iter().map(|table| {
+            storage.raw().query_map_collect(&format!("SELECT last_updated FROM {table} WHERE workspace_id = ?1 ORDER BY last_updated"), fparams![new], |row| row.get_typed(0)).unwrap()
+        }).collect();
+        conv.workspace = None;
+        conv.metadata_json["cursor_workspace_attribution"] = serde_json::json!("unresolved");
+        for replay in 0..2 {
+            let outcome = storage
+                .insert_conversation_tree(agent, None, &conv)
+                .unwrap();
+            assert_eq!(outcome.workspace_changed, replay == 0);
+            assert!(outcome.inserted_indices.is_empty());
+            let workspaces: Vec<Option<i64>> = storage
+                .raw()
+                .query_map_collect(
+                    "SELECT workspace_id FROM token_usage WHERE conversation_id = ?1",
+                    fparams![id],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(workspaces, vec![None, None]);
+            let metric_workspaces: Vec<i64> = storage.raw().query_map_collect("SELECT workspace_id FROM message_metrics WHERE message_id IN (SELECT id FROM messages WHERE conversation_id = ?1)", fparams![id], |row| row.get_typed(0)).unwrap();
+            assert_eq!(metric_workspaces, vec![0, 0]);
+            assert_eq!(gh459_rollup_amounts(&storage), amounts);
+            assert_eq!(
+                gh459_analytics_rows_without_workspace(&storage, "message_metrics"),
+                metrics
+            );
+            assert_eq!(
+                gh459_analytics_rows_without_workspace(&storage, "token_usage"),
+                tokens
+            );
+            for (index, table) in ["usage_hourly", "usage_daily", "usage_models_daily"]
+                .into_iter()
+                .enumerate()
+            {
+                let timestamps: Vec<i64> = storage.raw().query_map_collect(&format!("SELECT last_updated FROM {table} WHERE workspace_id = 0 ORDER BY last_updated"), fparams![], |row| row.get_typed(0)).unwrap();
+                assert_eq!(
+                    timestamps, new_bucket_timestamps[index],
+                    "new unknown-workspace buckets inherit the stored source timestamps"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gh459_analytics_replay_repairs_stale_rows_after_buffered_append_and_canonical_noop() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("analytics.db")).unwrap();
+        let (agent, old, id, mut conv) =
+            gh459_seed_workspace_analytics(&storage, "moving", Path::new("/old"));
+        let new = storage.ensure_workspace(Path::new("/new"), None).unwrap();
+        // Simulate an archive whose canonical identity was already repaired by
+        // an older build, while both existing analytics rows stayed behind.
+        storage
+            .raw()
+            .execute_compat(
+                "UPDATE conversations SET workspace_id = ?1 WHERE id = ?2",
+                fparams![new, id],
+            )
+            .unwrap();
+        conv.workspace = Some(PathBuf::from("/new"));
+        conv.metadata_json["cursor_workspace_attribution"] = serde_json::json!("workspace_trusted");
+        let no_change = storage
+            .insert_conversations_batched_with_analytics(&[(agent, Some(new), &conv)], false)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(!no_change.workspace_changed);
+        assert!(no_change.inserted_indices.is_empty());
+        let old_count: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM message_metrics WHERE workspace_id = ?1",
+                fparams![old],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(old_count, 0);
+        let before_messages = storage.fetch_messages(id).unwrap();
+        let before_amounts = gh459_rollup_amounts(&storage);
+        let mut appended = conv.clone();
+        appended.workspace = Some(PathBuf::from("/old"));
+        appended.messages.push(Message {
+            id: None,
+            idx: 2,
+            role: MessageRole::User,
+            author: None,
+            created_at: Some(1_700_090_001_000),
+            content: "one truly new appended message".into(),
+            extra_json: serde_json::json!({}),
+            snippets: vec![],
+        });
+        // First packet buffers new metrics for /old; second packet returns
+        // canonical identity to /new before that buffer has reached storage.
+        let outcomes = storage
+            .insert_conversations_batched_with_analytics(
+                &[(agent, Some(old), &appended), (agent, Some(new), &conv)],
+                false,
+            )
+            .unwrap();
+        assert_eq!(outcomes[0].inserted_indices, vec![2]);
+        assert!(outcomes[1].inserted_indices.is_empty());
+        let rows = storage.fetch_messages(id).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            serde_json::to_value(&rows[..2]).unwrap(),
+            serde_json::to_value(before_messages).unwrap()
+        );
+        for table in ["message_metrics", "token_usage"] {
+            let workspaces: Vec<i64> = storage
+                .raw()
+                .query_map_collect(
+                    &format!("SELECT workspace_id FROM {table}"),
+                    fparams![],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(workspaces, vec![new, new, new]);
+        }
+        let after_amounts = gh459_rollup_amounts(&storage);
+        assert_ne!(after_amounts, before_amounts);
+        for table in ["usage_hourly", "usage_daily", "usage_models_daily"] {
+            let total: i64 = storage
+                .raw()
+                .query_row_map(
+                    &format!("SELECT SUM(message_count) FROM {table}"),
+                    fparams![],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(total, 3, "append must be counted once in {table}");
+        }
+        let replay = storage
+            .insert_conversations_batched_with_analytics(&[(agent, Some(new), &conv)], false)
+            .unwrap();
+        assert!(replay[0].inserted_indices.is_empty());
+        assert_eq!(gh459_rollup_amounts(&storage), after_amounts);
+    }
+
+    #[test]
+    fn gh459_analytics_relocation_rejects_drift_and_rolls_back_with_identity() {
+        for drift in ["missing", "underfilled"] {
+            let dir = TempDir::new().unwrap();
+            let storage = FrankenStorage::open(&dir.path().join("analytics.db")).unwrap();
+            let (agent, old, id, mut conv) =
+                gh459_seed_workspace_analytics(&storage, "moving", Path::new("/old"));
+            let new = storage.ensure_workspace(Path::new("/new"), None).unwrap();
+            conv.workspace = Some(PathBuf::from("/new"));
+            conv.metadata_json["cursor_workspace_attribution"] =
+                serde_json::json!("workspace_trusted");
+            let before = gh459_analytics_rows_without_workspace(&storage, "token_usage");
+            if drift == "missing" {
+                storage
+                    .raw()
+                    .execute("DELETE FROM usage_models_daily")
+                    .unwrap();
+            } else {
+                storage
+                    .raw()
+                    .execute("UPDATE usage_models_daily SET content_tokens_est_total = 0")
+                    .unwrap();
+            }
+            let tables = [
+                "conversations",
+                "messages",
+                "message_metrics",
+                "token_usage",
+                "usage_hourly",
+                "usage_daily",
+                "usage_models_daily",
+                "meta",
+            ];
+            let snapshot = || {
+                tables
+                    .iter()
+                    .map(|table| {
+                        storage
+                            .raw()
+                            .query(&format!("SELECT * FROM {table} ORDER BY 1"))
+                            .unwrap()
+                            .into_iter()
+                            .map(|row| row.values().to_vec())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let original = snapshot();
+            let error = storage
+                .insert_conversations_batched_with_analytics(&[(agent, Some(new), &conv)], false)
+                .err()
+                .expect("damaged source rollup must reject relocation");
+            assert!(format!("{error:#}").contains("Cursor workspace analytics drift"));
+            assert_eq!(
+                snapshot(),
+                original,
+                "late model-rollup failure must roll back earlier hourly/daily moves and canonical/semantic changes"
+            );
+            assert_eq!(
+                gh459_analytics_rows_without_workspace(&storage, "token_usage"),
+                before
+            );
+            assert_eq!(
+                storage.list_conversations(10, 0).unwrap()[0].workspace,
+                Some(PathBuf::from("/old"))
+            );
+            let metric_workspace: i64 = storage
+                .raw()
+                .query_row_map(
+                    "SELECT workspace_id FROM message_metrics LIMIT 1",
+                    fparams![],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(metric_workspace, old);
+            // Neither a generic partial packet nor another provider may move
+            // rows, even when the private helper is called directly.
+            for metadata in [
+                serde_json::json!({}),
+                serde_json::json!({"cursor_format":"ide", "cursor_workspace_attribution":"workspace_trusted"}),
+            ] {
+                conv.metadata_json = metadata;
+                let outcome = storage
+                    .insert_conversations_batched_with_analytics(
+                        &[(agent, Some(new), &conv)],
+                        false,
+                    )
+                    .unwrap();
+                assert!(!outcome[0].workspace_changed);
+                assert_eq!(snapshot(), original);
+            }
+            conv.agent_slug = "codex".into();
+            conv.metadata_json = serde_json::json!({"cursor_format":"agent", "cursor_workspace_attribution":"workspace_trusted"});
+            let mut tx = storage.conn.transaction().unwrap();
+            franken_reassociate_cursor_analytics_workspace(&tx, id, &conv).unwrap();
+            tx.commit().unwrap();
+            assert_eq!(snapshot(), original);
+        }
     }
 
     #[test]
