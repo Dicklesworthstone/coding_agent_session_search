@@ -50,6 +50,7 @@ fn setup_options_custom_values() {
         dry_run: true,
         non_interactive: true,
         hosts: Some(vec!["host1".to_string(), "host2".to_string()]),
+        tailscale: true,
         skip_install: true,
         skip_index: true,
         skip_sync: true,

@@ -2368,6 +2368,9 @@ pub enum SourcesCommand {
         /// Skip hosts that are already configured as sources
         #[arg(long)]
         skip_existing: bool,
+        /// Also discover online peers using local `tailscale status --json`
+        #[arg(long)]
+        tailscale: bool,
         /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
@@ -2435,6 +2438,9 @@ pub enum SourcesCommand {
         /// Configure only these hosts (comma-separated SSH aliases, skips discovery/selection)
         #[arg(long, value_delimiter = ',')]
         hosts: Option<Vec<String>>,
+        /// Also discover online Tailscale peers (explicit --hosts skips discovery)
+        #[arg(long)]
+        tailscale: bool,
         /// Skip cass installation on remotes that don't have it
         #[arg(long)]
         skip_install: bool,
@@ -114275,15 +114281,17 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
         SourcesCommand::Discover {
             preset,
             skip_existing,
+            tailscale,
             json,
         } => {
             let structured_format = resolve_subcommand_structured_format(cli, json);
-            run_sources_discover(&preset, skip_existing, structured_format)
+            run_sources_discover(&preset, skip_existing, tailscale, structured_format)
         }
         SourcesCommand::Setup {
             dry_run,
             non_interactive,
             hosts,
+            tailscale,
             skip_install,
             skip_index,
             skip_sync,
@@ -114298,6 +114306,7 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
                 dry_run,
                 non_interactive: non_interactive || is_robot,
                 hosts,
+                tailscale,
                 skip_install,
                 skip_index,
                 skip_sync,
@@ -116969,9 +116978,10 @@ fn run_sources_reingest(
 fn run_sources_discover(
     preset: &str,
     skip_existing: bool,
+    tailscale: bool,
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
-    use crate::sources::config::{SourcesConfig, discover_ssh_hosts, get_preset_paths};
+    use crate::sources::config::{SourcesConfig, discover_fleet_hosts, get_preset_paths};
     use colored::Colorize;
 
     // Get preset paths
@@ -116984,7 +116994,10 @@ fn run_sources_discover(
     })?;
 
     // Discover SSH hosts
-    let discovered = discover_ssh_hosts();
+    let (discovered, discovery_warning) = discover_fleet_hosts(tailscale);
+    if let Some(warning) = &discovery_warning {
+        eprintln!("{warning}");
+    }
 
     if discovered.is_empty() {
         let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
@@ -117000,11 +117013,12 @@ fn run_sources_discover(
                 "{}",
                 serde_json::json!({
                     "status": "no_hosts",
-                    "message": "No SSH hosts found in ~/.ssh/config"
+                    "message": "No hosts found in the enabled discovery providers",
+                    "discovery_warning": discovery_warning,
                 })
             );
         } else {
-            println!("{}", "No SSH hosts found in ~/.ssh/config".yellow());
+            println!("{}", "No hosts found in the enabled discovery providers".yellow());
         }
         return Ok(());
     }
@@ -117040,7 +117054,8 @@ fn run_sources_discover(
                 "{}",
                 serde_json::json!({
                     "status": "all_existing",
-                    "message": "All discovered hosts are already configured"
+                    "message": "All discovered hosts are already configured",
+                    "discovery_warning": discovery_warning,
                 })
             );
         } else {
@@ -117084,12 +117099,13 @@ fn run_sources_discover(
                 "preset_paths": preset_paths,
                 "hosts": hosts_json,
                 "count": hosts_to_add.len(),
+                "discovery_warning": discovery_warning,
             }))
             .unwrap_or_default()
         );
     } else {
         println!(
-            "{} {} SSH hosts from ~/.ssh/config:\n",
+            "{} {} SSH hosts from enabled discovery providers:\n",
             "Discovered".cyan().bold(),
             hosts_to_add.len()
         );

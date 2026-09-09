@@ -25,7 +25,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 
 use super::config::{SourceConfigGenerator, SourcesConfig};
-use super::discover_ssh_hosts;
+use super::config::discover_fleet_hosts;
 use super::index::{IndexProgress, RemoteIndexer};
 use super::install::{InstallProgress, RemoteInstaller};
 use super::interactive::{confirm_action, run_host_selection};
@@ -40,6 +40,8 @@ pub struct SetupOptions {
     pub non_interactive: bool,
     /// Specific hosts to configure (skips discovery/selection).
     pub hosts: Option<Vec<String>>,
+    /// Include online peers from local Tailscale status during discovery.
+    pub tailscale: bool,
     /// Skip cass installation on remotes.
     pub skip_install: bool,
     /// Skip indexing on remotes.
@@ -62,6 +64,7 @@ impl Default for SetupOptions {
             dry_run: false,
             non_interactive: false,
             hosts: None,
+            tailscale: false,
             skip_install: false,
             skip_index: false,
             skip_sync: false,
@@ -534,8 +537,11 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
                 })
                 .collect()
         } else {
-            // Auto-discover from SSH config
-            discover_ssh_hosts()
+            let (hosts, warning) = discover_fleet_hosts(opts.tailscale);
+            if let Some(warning) = warning {
+                eprintln!("{warning}");
+            }
+            hosts
         };
 
         state.discovered_hosts = hosts.len();
@@ -547,7 +553,7 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
             if opts.hosts.is_some() {
                 print_phase_done(&format!("Using {} specified host(s)", hosts.len()));
             } else {
-                print_phase_done(&format!("Found {} SSH hosts in ~/.ssh/config", hosts.len()));
+                print_phase_done(&format!("Found {} SSH hosts from enabled discovery providers", hosts.len()));
             }
         }
 

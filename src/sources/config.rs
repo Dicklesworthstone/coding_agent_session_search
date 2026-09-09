@@ -36,6 +36,7 @@
 //! disabled_agents = ["openclaw"]
 //! ```
 
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
@@ -803,7 +804,7 @@ fn merge_tailscale_hosts(hosts: &mut Vec<DiscoveredHost>, bytes: &[u8]) -> anyho
     struct Status {
         backend_state: String,
         #[serde(default)]
-        peer: std::collections::BTreeMap<String, Peer>,
+        peer: Option<std::collections::BTreeMap<String, Peer>>,
     }
     #[derive(Deserialize)]
     #[serde(rename_all = "PascalCase")]
@@ -820,7 +821,7 @@ fn merge_tailscale_hosts(hosts: &mut Vec<DiscoveredHost>, bytes: &[u8]) -> anyho
     anyhow::ensure!(bytes.len() <= 8 * 1024 * 1024, "tailscale status exceeds 8 MiB");
     let status: Status = serde_json::from_slice(bytes).context("invalid tailscale status JSON")?;
     anyhow::ensure!(status.backend_state == "Running", "Tailscale is not running; check local login and daemon status");
-    for peer in status.peer.into_values() {
+    for peer in status.peer.unwrap_or_default().into_values() {
         if !peer.online || peer.sharee_node {
             continue;
         }
@@ -2348,6 +2349,48 @@ paths = ["~/.claude/projects"]
         for host in hosts {
             assert!(!host.name.is_empty());
         }
+    }
+
+    #[test]
+    fn test_tailscale_discovery_preserves_aliases_and_uses_online_peer_addresses() {
+        let mut hosts = parse_ssh_config("Host workstation\n HostName 100.64.0.1\n User developer\n IdentityFile ~/.ssh/work\n");
+        let status = serde_json::json!({
+            "BackendState": "Running",
+            "Self": {"Online": true, "TailscaleIPs": ["100.64.0.99"]},
+            "Peer": {
+                "a": {"Online": true, "DNSName": "workstation.example.ts.net.", "TailscaleIPs": ["100.64.0.1"]},
+                "b": {"Online": true, "DNSName": "other.example.ts.net.", "TailscaleIPs": ["fd7a:115c:a1e0::2", "100.64.0.2"]},
+                "c": {"Online": false, "TailscaleIPs": ["100.64.0.3"]},
+                "d": {"Online": true, "ShareeNode": true, "TailscaleIPs": ["100.64.0.4"]},
+                "e": {"Online": true, "TailscaleIPs": []},
+                "f": {"Online": true, "TailscaleIPs": ["fd7a:115c:a1e0::6"]}
+            }
+        });
+        let bytes = serde_json::to_vec(&status).unwrap();
+        merge_tailscale_hosts(&mut hosts, &bytes).unwrap();
+        assert_eq!(hosts.len(), 3);
+        assert_eq!(hosts[0].connection_string(), "developer@workstation");
+        assert_eq!(hosts[0].identity_file.as_deref(), Some("~/.ssh/work"));
+        assert_eq!(hosts[1].connection_string(), "100.64.0.2");
+        assert_eq!(hosts[2].connection_string(), "fd7a:115c:a1e0::6");
+        merge_tailscale_hosts(&mut hosts, &bytes).unwrap();
+        assert_eq!(hosts.len(), 3);
+    }
+
+    #[test]
+    fn test_tailscale_discovery_rejects_bad_status_without_losing_ssh_hosts() {
+        let mut hosts = parse_ssh_config("Host workstation\n HostName workstation.example.ts.net\n");
+        for status in [
+            br#"{"BackendState":"NeedsLogin"}"#.as_slice(),
+            br#"{"BackendState":"Running","Peer":{"a":{"Online":true,"TailscaleIPs":["-oProxyCommand=bad"]}}}"#,
+            b"not JSON",
+        ] {
+            assert!(merge_tailscale_hosts(&mut hosts, status).is_err());
+            assert_eq!(hosts.len(), 1);
+        }
+        merge_tailscale_hosts(&mut hosts, br#"{"BackendState":"Running","Peer":null}"#).unwrap();
+        merge_tailscale_hosts(&mut hosts, br#"{"BackendState":"Running","Peer":{"a":{"Online":true,"DNSName":"WORKSTATION.example.ts.net.","TailscaleIPs":["100.64.0.1"]}}}"#).unwrap();
+        assert_eq!(hosts.len(), 1);
     }
 
     #[test]
