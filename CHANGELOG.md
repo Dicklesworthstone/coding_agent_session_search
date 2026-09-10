@@ -16,20 +16,32 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 ---
 
 Scope window: this update covers the changes after the 2026-08-31 v0.7.1
-binary release, through the 2026-09-10 v0.8.0 binary release. Earlier version
-entries retain their existing scope. Git commits, release metadata, and Beads supply
+binary release, through the 0.8.0 release candidate. Earlier version entries
+retain their existing scope. Git commits, release metadata, and Beads supply
 the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ## Release Timeline
 
 | Version | Date | Publication state |
 |---------|------|-------------------|
-| [v0.8.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.8.0) | 2026-09-10 | Published GitHub Release: Linux x86_64/arm64, macOS arm64, Windows x86_64 |
+| 0.8.0 | Pending | Release gate green and artifacts building; publication blocked on the Linux glibc floor (see below) |
 | [v0.7.1](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.7.1) | 2026-08-31 | Published GitHub Release and binary baseline for the changes below |
 
 ## [Unreleased]
 
-## [v0.8.0] -- 2026-09-10
+## [v0.8.0] -- Unreleased
+
+> **Publication blocked (2026-09-10).** The release gate is green and the
+> Linux artifacts build, but a `cass` built on the current Linux release host
+> (glibc 2.43) requires `GLIBC_2.43` -- `acosf`, `asinf`, `coshf`, `log10f`
+> and `sinhf` pick up glibc 2.43's new single-precision libm symbol version.
+> v0.7.1 topped out at `GLIBC_2.39` only because it was built on an older
+> host. `install.sh` admits any host at `MIN_GLIBC=2.38`, so such a binary
+> would install cleanly on Ubuntu 24.04 LTS (glibc 2.39), 25.04 (2.41) and
+> 25.10 (2.42) and then fail at load. Publishing waits on pinning the ABI
+> floor at build time (`cargo zigbuild --target x86_64-unknown-linux-gnu.2.28`;
+> zig is present on the release host) rather than inheriting the host's glibc.
+> macOS and Windows artifacts are unaffected.
 
 Indexing, archive diagnostics, answer packs, maintenance commands, and dependency
 updates from the reality-check bridge work. Existing archive corruption and
