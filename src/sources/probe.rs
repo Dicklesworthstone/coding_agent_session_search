@@ -139,9 +139,7 @@ impl CassStatus {
         match self {
             CassStatus::Indexed { version, .. }
             | CassStatus::InstalledNotIndexed { version }
-            | CassStatus::InstalledUnknown { version } => {
-                Some(version)
-            }
+            | CassStatus::InstalledUnknown { version } => Some(version),
             _ => None,
         }
     }
@@ -1115,16 +1113,26 @@ MEM_AVAIL_KB=4194304
         assert!(result.reachable);
         assert!(result.has_cass());
         assert_eq!(result.cass_status.version(), Some("0.7.1"));
-        assert!(matches!(result.cass_status, CassStatus::InstalledUnknown { .. }));
+        assert!(matches!(
+            result.cass_status,
+            CassStatus::InstalledUnknown { .. }
+        ));
         assert!(result.has_agent_data());
         assert_eq!(result.detected_agents[0].estimated_sessions, None);
         assert_eq!(result.detected_agents[0].estimated_size_mb, None);
         assert_eq!(result.detected_agents[1].estimated_sessions, Some(0));
         assert_eq!(result.detected_agents[1].estimated_size_mb, Some(0));
         assert!(!super::super::index::RemoteIndexer::needs_indexing(&result));
-        let display = super::super::interactive::probe_to_display_info(&result, &Default::default());
-        assert!(matches!(display.state, super::super::interactive::HostState::ReadyToSync));
-        assert!(matches!(display.cass_status, super::super::interactive::CassStatusDisplay::InstalledUnknown { .. }));
+        let display =
+            super::super::interactive::probe_to_display_info(&result, &Default::default());
+        assert!(matches!(
+            display.state,
+            super::super::interactive::HostState::ReadyToSync
+        ));
+        assert!(matches!(
+            display.cass_status,
+            super::super::interactive::CassStatusDisplay::InstalledUnknown { .. }
+        ));
     }
 
     #[test]
@@ -1268,7 +1276,10 @@ CASS_VERSION=0.4.2
     #[cfg(not(windows))]
     fn probe_optional_commands_share_deadline_and_skip_without_timeout() {
         let script = build_probe_script_for_dirs(&[]);
-        let helper = script.split("# System info").next().expect("probe preamble");
+        let helper = script
+            .split("# System info")
+            .next()
+            .expect("probe preamble");
         let exercise = format!(
             "{helper}\n\
              [ -n \"$PROBE_TIMEOUT_BIN\" ] || exit 1\n\

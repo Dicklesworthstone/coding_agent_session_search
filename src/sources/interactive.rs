@@ -238,7 +238,11 @@ impl HostSelector {
                 )
             }
             CassStatusDisplay::InstalledUnknown { version } => {
-                format!("    {} cass v{} • index status unknown", "?".yellow(), version)
+                format!(
+                    "    {} cass v{} • index status unknown",
+                    "?".yellow(),
+                    version
+                )
             }
             CassStatusDisplay::Unknown => {
                 format!("    {} status unknown", "?".dimmed())

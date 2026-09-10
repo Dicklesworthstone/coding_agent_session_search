@@ -192,6 +192,18 @@ mean that every acceptance row, platform, or reporter archive has been verified.
 
 ### Fixed
 
+- The operations dashboard's "next proof" command is runnable again. Every
+  dynamic field on that surface went through the swarm path redactor, so the
+  one field whose entire purpose is to be copied and executed came out as
+  `CARGO_TARGET_DIR=[REDACTED_PATH]` on any host with a matching path root --
+  and looked correct on a developer machine that had none. The command is
+  rendered verbatim now. It is not a redaction hole: it is only rendered at all
+  after clearing an allow-list that rejects every shell metacharacter and then
+  admits exactly two shapes, a pinned read-only `cass` subcommand carrying
+  `--json`/`--robot` with no mutating flag, or `rch exec -- env
+  CARGO_TARGET_DIR=/data/tmp/cass-<suffix> cargo test|check|clippy|bench|fmt`
+  -- a path prefix the validator itself hard-codes. Neighbouring free-text
+  fields keep the redactor, and HTML escaping is unchanged.
 - Fleet discovery keeps `Match` options out of preceding SSH host metadata,
   handles quoted aliases and comments, and retains first-value precedence.
   `--skip-existing` compares connection targets instead of source labels; the

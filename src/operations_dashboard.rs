@@ -368,10 +368,38 @@ fn render_next_proof(source: Option<&Value>, guide: Option<&Value>) -> Value {
         .and_then(Value::as_str)
         .map(safe_text);
     json!({
-        "command": requested.map(safe_text).unwrap_or_else(|| "cass swarm evidence --json".to_string()),
+        "command": requested
+            .map(allowlisted_command_text)
+            .unwrap_or_else(|| "cass swarm evidence --json".to_string()),
         "proof_gate": guide_gate,
         "reason": if requested.is_some() { "fixture-selected robot proof surface" } else { "conservative read-only evidence check" }
     })
+}
+
+/// Render a command that has already cleared [`is_robot_safe_command`].
+///
+/// This deliberately does NOT go through [`safe_text`]. `safe_text` is path
+/// redaction, and redacting this field destroys the only thing it is for: the
+/// card exists so an operator can copy the command and run it, and
+/// `CARGO_TARGET_DIR=[REDACTED_PATH]` is not runnable. The value is also not a
+/// place a secret can reach. `is_robot_safe_command` admits exactly two
+/// shapes -- a pinned read-only `cass` subcommand carrying `--json`/`--robot`
+/// and no mutating flag, or `rch exec -- env
+/// CARGO_TARGET_DIR=/data/tmp/cass-<suffix> cargo test|check|clippy|bench|fmt`
+/// -- and it rejects every shell metacharacter first. The one free-form span
+/// left is the suffix after a path prefix the validator itself hard-codes, so
+/// there is nothing host-specific to disclose that the validator did not
+/// already require.
+///
+/// Escaping is unaffected: the HTML renderer runs `html_escape` over this
+/// value like every other dynamic field, and the JSON surface is serialized
+/// normally.
+fn allowlisted_command_text(command: &str) -> String {
+    debug_assert!(
+        is_robot_safe_command(command),
+        "allowlisted_command_text called on a command that did not pass is_robot_safe_command"
+    );
+    command.trim().to_string()
 }
 
 fn is_robot_safe_command(command: &str) -> bool {
@@ -896,6 +924,38 @@ mod tests {
                 "unsafe command was accepted: {unsafe_command}"
             );
         }
+        Ok(())
+    }
+
+    /// The proof card exists so an operator can copy the command and run it.
+    /// Routing it through the swarm path redactor rewrote the target directory
+    /// to `[REDACTED_PATH]` on any host with a matching path root, which made
+    /// the command unrunnable while looking fine on a developer laptop that
+    /// had no such root. Pin the surviving path explicitly, and keep the
+    /// redactor on the neighbouring free-text field so this does not turn into
+    /// a blanket opt-out.
+    #[test]
+    fn proof_command_keeps_its_runnable_target_dir_but_free_text_stays_redacted() -> TestResult {
+        let command =
+            "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-proof cargo test --all-targets";
+        let fixture = json!({"next_proof_command": command});
+        let dashboard = render_operations_dashboard_fixture("runnable-proof", Some(&fixture));
+        verify_eq!(
+            dashboard["cards"]["next_proof"]["command"],
+            command,
+            "the allow-listed proof command must stay runnable"
+        );
+        let rendered = dashboard["cards"]["next_proof"]["command"]
+            .as_str()
+            .unwrap_or_default();
+        verify!(
+            !rendered.contains("REDACTED"),
+            "proof command must not be path-redacted: {rendered}"
+        );
+        verify!(
+            rendered.contains("/data/tmp/cass-proof"),
+            "the target directory must survive verbatim: {rendered}"
+        );
         Ok(())
     }
 

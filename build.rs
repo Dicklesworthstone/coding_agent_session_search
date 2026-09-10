@@ -137,10 +137,18 @@ const CONTRACTS: &[DependencyContract] = &[
         // aider/copilot-cli/amp/opencode/clawdbot/muse session-loss fixes.
         // The Shelley connector, FAD#22 source-boundary seam, and the
         // chatgpt/omp injection seams are published in 0.2.3.
+        // 0.2.4 (2026-09-10) restores the legacy Copilot CLI
+        // `history.json` `workspacePath` alias that 0.2.3 dropped when CLI
+        // parsing moved out of copilot.rs -- those sessions were coming back
+        // with no workspace at all -- and reads Cursor Agent workspaces from
+        // the `.workspace-trusted` sidecar instead of guessing them from the
+        // hyphenated project slug (cass#459), which no decoder can do
+        // correctly because `parent-project/my-app` and `parent/project/my/app`
+        // encode identically.
         // crates.io refuses git dependencies, hence version-only.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.2.3",
+        expected_version: "0.2.4",
         expected_features: &[
             "chatgpt",
             "connectors",
