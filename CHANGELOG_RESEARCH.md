@@ -1,5 +1,40 @@
 # CASS 0.8.0 changelog research
 
+Bounded setup probe follow-up (2026-09-10, original `av59c`): commit `7459cdeb`
+limits optional health/stats/du/find measurements to a shared two-second budget.
+Directory presence remains useful when measurements are unavailable; estimates
+remain null rather than becoming false zeros. `InstalledUnknown` retains the
+installed version, remains selectable for sync, and does not request indexing
+solely because the optional check failed. A real ten-machine baseline at the
+same 10-second deadline found eight reachable; both Mac probes timed out.
+The remote gate passed formatting, all-target Clippy and 146 tests (76 library,
+two setup CLI, 68 unchanged goldens; zero failed or ignored). UBS completed with
+three critical and 320 warning findings, so `STAGE=ubs EXIT=1` remains red.
+The three critical findings are pre-existing: two panics in the test-fixture
+loader and an integer session-count comparison misidentified as a secret
+comparison. The warning inventory is not waived or claimed fully resolved.
+All 1040 CASS and 77 FAD inputs were unchanged after the gate, and the three
+canonical files match its manifest. Gate log SHA256:
+`665898d6e40e200dd8fb5cc09b2ec9d69c95150961466e35b75b453698661b08`.
+The matched live comparison improved reachability from eight to nine of the
+same ten machines at the same 10-second deadline. The previously failing newer
+Mac completed in 2548 ms and exposed 27 session roots. Every previously reachable
+host remained reachable and retained all previously detected paths. The older
+Mac still timed out; the CLI's exit 0 for partial setup is not an all-ten pass.
+Executable SHA256: `8a7b8db232cddd048733cba950ba4f72fe1d04f387b7a3eeb943d4267cae3197`.
+Private ordinal summary SHA256: `7ac5fa4b436ec022ea51203f9b1c214e6572925321c4c98b3f893623dd2ce861`.
+This is setup-probe validation; the full sync/search lifecycle was tested in the
+preceding fleet run below, not repeated for this executable.
+Separately, an isolated two-mirror CLI reproducer confirms that
+`sources reingest --source alpha` also ingests beta while reporting only alpha;
+the original bead retains that unresolved scope defect.
+The gate's first
+payload failed before compilation because a concurrent commit made the exported
+HEAD diff empty; the replacement patch uses verified baseline hashes. No result
+is credited to that failed attempt. GitHub metadata reports v0.8.0 published at
+16:11:54 UTC targeting `96510ff5`, which contains the runtime change; this later
+verification is not evidence that its published binaries passed this gate.
+
 Fresh-eye fleet review (2026-09-10, `av59c`): the previous executable reproduced
 three discovery defects with isolated generic configuration: `Match` overwrote
 the preceding host's address, a reused source label falsely marked a different

@@ -241,6 +241,11 @@ mean that every acceptance row, platform, or reporter archive has been verified.
   handles quoted aliases and comments, and retains first-value precedence.
   `--skip-existing` compares connection targets instead of source labels; the
   displayed add-source command uses valid positional and option syntax.
+- Setup probes share a bounded budget for optional health, statistics and
+  directory measurements, so large archives do not consume the whole SSH
+  deadline. Missing measurements remain unknown, and an incomplete index
+  inspection does not trigger remote reindexing. On hosts without `timeout`
+  or `gtimeout`, setup retains detected paths and skips these measurements.
 - Tailscale status output is bounded during pipe collection, with child cleanup
   on collection errors. Null or missing peer address lists are treated as empty,
   so a peer without addresses does not disable discovery. The live fleet harness
