@@ -117036,15 +117036,19 @@ fn run_sources_discover(
     let existing_config = SourcesConfig::load().ok();
     let already_configured = |host: &crate::sources::config::DiscoveredHost| {
         existing_config.as_ref().is_some_and(|config| {
-                config.remote_sources().any(|source| {
-                    source.host.as_deref().is_some_and(|target| {
-                        let target = target.rsplit('@').next().unwrap_or(target).trim_end_matches('.');
-                        [&host.name, host.hostname.as_ref().unwrap_or(&host.name)]
-                            .into_iter()
-                            .any(|name| name.trim_end_matches('.').eq_ignore_ascii_case(target))
-                    })
+            config.remote_sources().any(|source| {
+                source.host.as_deref().is_some_and(|target| {
+                    let target = target
+                        .rsplit('@')
+                        .next()
+                        .unwrap_or(target)
+                        .trim_end_matches('.');
+                    [&host.name, host.hostname.as_ref().unwrap_or(&host.name)]
+                        .into_iter()
+                        .any(|name| name.trim_end_matches('.').eq_ignore_ascii_case(target))
                 })
             })
+        })
     };
 
     // Filter hosts

@@ -270,8 +270,14 @@ pub(crate) fn wait_for_child_output_with_limit(
     let start = Instant::now();
     let deadline = start.checked_add(timeout).unwrap_or(start);
     let child_pid = child.id();
-    let stdout_reader = child.stdout.take().map(|pipe| drain_child_pipe(pipe, max_bytes));
-    let stderr_reader = child.stderr.take().map(|pipe| drain_child_pipe(pipe, max_bytes));
+    let stdout_reader = child
+        .stdout
+        .take()
+        .map(|pipe| drain_child_pipe(pipe, max_bytes));
+    let stderr_reader = child
+        .stderr
+        .take()
+        .map(|pipe| drain_child_pipe(pipe, max_bytes));
 
     match child.wait_timeout(timeout) {
         Ok(Some(status)) => {
@@ -440,9 +446,16 @@ mod tests {
             ("printf 12345 >&2", true),
         ] {
             let mut command = Command::new("sh");
-            command.args(["-c", script]).stdout(Stdio::piped()).stderr(Stdio::piped());
+            command
+                .args(["-c", script])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
             configure_child_process_group(&mut command);
-            let result = wait_for_child_output_with_limit(command.spawn().unwrap(), Duration::from_secs(5), Some(4));
+            let result = wait_for_child_output_with_limit(
+                command.spawn().unwrap(),
+                Duration::from_secs(5),
+                Some(4),
+            );
             if overflow {
                 assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
             } else {
@@ -458,9 +471,17 @@ mod tests {
     #[test]
     fn bounded_child_output_still_times_out_after_overflow() {
         let mut command = Command::new("sh");
-        command.args(["-c", "printf 12345; sleep 30"]).stdout(Stdio::piped()).stderr(Stdio::piped());
+        command
+            .args(["-c", "printf 12345; sleep 30"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         configure_child_process_group(&mut command);
-        let output = wait_for_child_output_with_limit(command.spawn().unwrap(), Duration::from_secs(1), Some(4)).unwrap();
+        let output = wait_for_child_output_with_limit(
+            command.spawn().unwrap(),
+            Duration::from_secs(1),
+            Some(4),
+        )
+        .unwrap();
         assert!(output.is_none());
     }
 

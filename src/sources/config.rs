@@ -997,7 +997,9 @@ fn parse_ssh_config(content: &str) -> Vec<DiscoveredHost> {
                     .into_iter()
                     .take_while(|name| !name.starts_with('#'))
                     .filter(|name| {
-                        !name.starts_with('!') && !name.contains('*') && !name.contains('?')
+                        !name.starts_with('!')
+                            && !name.contains('*')
+                            && !name.contains('?')
                             && ssh_host_has_safe_token_chars(name)
                             && !name.starts_with('-')
                     })
@@ -1013,14 +1015,18 @@ fn parse_ssh_config(content: &str) -> Vec<DiscoveredHost> {
             "hostname" => {
                 for host in &mut current_hosts {
                     if host.hostname.is_none() {
-                        host.hostname = shell_words::split(value).ok().and_then(|v| v.into_iter().next());
+                        host.hostname = shell_words::split(value)
+                            .ok()
+                            .and_then(|v| v.into_iter().next());
                     }
                 }
             }
             "user" => {
                 for host in &mut current_hosts {
                     if host.user.is_none() {
-                        host.user = shell_words::split(value).ok().and_then(|v| v.into_iter().next());
+                        host.user = shell_words::split(value)
+                            .ok()
+                            .and_then(|v| v.into_iter().next());
                     }
                 }
             }
@@ -1034,7 +1040,9 @@ fn parse_ssh_config(content: &str) -> Vec<DiscoveredHost> {
             "identityfile" => {
                 for host in &mut current_hosts {
                     if host.identity_file.is_none() {
-                        host.identity_file = shell_words::split(value).ok().and_then(|v| v.into_iter().next());
+                        host.identity_file = shell_words::split(value)
+                            .ok()
+                            .and_then(|v| v.into_iter().next());
                     }
                 }
             }
