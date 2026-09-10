@@ -484,6 +484,8 @@ impl RemoteIndexer {
             CassStatus::NotFound => false,
             // Explicitly not indexed - needs indexing
             CassStatus::InstalledNotIndexed { .. } => true,
+            // Incomplete optional inspection is not evidence that indexing is needed.
+            CassStatus::InstalledUnknown { .. } => false,
             // Indexed but empty - try indexing again
             CassStatus::Indexed { session_count, .. } => *session_count == 0,
             // Unknown status - assume we should try

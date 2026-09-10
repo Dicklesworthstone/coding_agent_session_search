@@ -136,6 +136,8 @@ pub enum CassStatusDisplay {
     Installed { version: String, sessions: u64 },
     /// cass is installed but not indexed
     InstalledNotIndexed { version: String },
+    /// cass is installed but its index inspection did not complete.
+    InstalledUnknown { version: String },
     /// cass is not installed but agent data was detected
     NotInstalled,
     /// Could not determine status (e.g., probe failed)
@@ -234,6 +236,9 @@ impl HostSelector {
                     "    {} cass not installed (will install via cargo)",
                     "✗".yellow()
                 )
+            }
+            CassStatusDisplay::InstalledUnknown { version } => {
+                format!("    {} cass v{} • index status unknown", "?".yellow(), version)
             }
             CassStatusDisplay::Unknown => {
                 format!("    {} status unknown", "?".dimmed())
@@ -425,6 +430,7 @@ pub fn probe_to_display_info(
             }
             CassStatus::Indexed { .. } => HostState::NeedsIndexing, // 0 sessions
             CassStatus::InstalledNotIndexed { .. } => HostState::NeedsIndexing,
+            CassStatus::InstalledUnknown { .. } => HostState::ReadyToSync,
             CassStatus::NotFound | CassStatus::Unknown => HostState::NeedsInstall,
         }
     };
@@ -443,6 +449,9 @@ pub fn probe_to_display_info(
             version: version.clone(),
         },
         CassStatus::NotFound => CassStatusDisplay::NotInstalled,
+        CassStatus::InstalledUnknown { version } => CassStatusDisplay::InstalledUnknown {
+            version: version.clone(),
+        },
         CassStatus::Unknown => CassStatusDisplay::Unknown,
     };
 
