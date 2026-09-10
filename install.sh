@@ -14,9 +14,21 @@ QUIET=0
 VERIFY=0
 QUICKSTART=0
 FROM_SOURCE=0
-# Linux prebuilt binaries are built on ubuntu-24.04 (frankensqlite needs the
-# newer kernel/libc surface); older glibc cannot load them. Probed below.
-MIN_GLIBC="2.38"
+# Linux prebuilt binaries are cross-built with `cargo zigbuild --target
+# <arch>-unknown-linux-gnu.2.28`, so their glibc ABI floor is PINNED at 2.28
+# rather than inherited from whatever the build host happens to run. This value
+# must track the floor actually measured on the shipped artifacts:
+#
+#   objdump -p cass | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1
+#
+# v0.8.0 measures GLIBC_2.28 on both linux/amd64 and linux/arm64. It was 2.38
+# here while the binaries were built natively, which was both too high (it
+# refused Debian 12 / Ubuntu 22.04 / RHEL 9 / Amazon Linux 2023, whose glibc
+# runs 2.34-2.36 and which the artifacts actually support) and too low (a
+# native build on the current 2.43 hosts needs GLIBC_2.43 for acosf/asinf/
+# coshf/log10f/sinhf, so 2.38-2.42 hosts passed this probe and then failed at
+# load). Probed below.
+MIN_GLIBC="2.28"
 CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
 ARTIFACT_URL="${ARTIFACT_URL:-}"
