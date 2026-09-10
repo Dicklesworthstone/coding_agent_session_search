@@ -117034,13 +117034,8 @@ fn run_sources_discover(
 
     // Load existing config to check for duplicates
     let existing_config = SourcesConfig::load().ok();
-    let existing_names: std::collections::HashSet<String> = existing_config
-        .as_ref()
-        .map(|c| c.remote_sources().map(|s| s.name.clone()).collect())
-        .unwrap_or_default();
     let already_configured = |host: &crate::sources::config::DiscoveredHost| {
-        existing_names.iter().any(|name| crate::sources::config::source_names_equal(name, &host.name))
-            || existing_config.as_ref().is_some_and(|config| {
+        existing_config.as_ref().is_some_and(|config| {
                 config.remote_sources().any(|source| {
                     source.host.as_deref().is_some_and(|target| {
                         let target = target.rsplit('@').next().unwrap_or(target).trim_end_matches('.');
