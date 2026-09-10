@@ -3033,12 +3033,16 @@ fn should_skip_noop_final_lexical_checkpoint_refresh(
 /// incremental source scan. That ordering is unique to this path: the
 /// canonical-only full rebuild performs no scan, and the post-scan rebuilds
 /// run after ingest. So the checkpoint written by the repair is the only one a
-/// run can invalidate itself — and only when the follow-up scan actually
+/// run can invalidate by itself — and only when the follow-up scan actually
 /// ingested canonical rows, which is what moves the `COUNT`/`MAX(id)` content
 /// fingerprint the checkpoint carries.
 ///
-/// No canonical mutation means the fingerprint the rebuild certified is still
-/// exactly the database's, and the cheaper skip stays correct.
+/// The resume-an-interrupted-rebuild arm also rebuilds before anything else,
+/// but it returns without ever entering the scan, so its `scan_canonical_mutations`
+/// stay zero. The mutation term is what makes that safe without the caller
+/// having to know it: any path whose scan changed nothing is left on the
+/// cheaper skip, because the fingerprint the rebuild certified is still exactly
+/// the database's.
 fn should_redrive_final_lexical_checkpoint_refresh_after_pre_scan_repair(
     exact_completed_checkpoint_predates_scan: bool,
     scan_canonical_mutations: CanonicalMutationCounts,
@@ -16943,6 +16947,12 @@ fn run_index_inner(
             post_scan_conversations,
             post_scan_messages,
         );
+        // Narrow, deliberate: the rebuild really did persist exact completed
+        // state, it is just no longer current. The skip immediately below is
+        // this flag's only remaining reader (the legacy-OMP publication gate
+        // has already run), so clearing it here means exactly "do not take the
+        // already-exact shortcut". A new reader added after this point must not
+        // assume the flag still describes what the rebuild did.
         exact_completed_lexical_checkpoint = false;
     }
     let exact_total_counts = exact_total_counts_from_progress(opts.progress.as_ref());
