@@ -825,7 +825,7 @@ fn merge_tailscale_hosts(hosts: &mut Vec<DiscoveredHost>, bytes: &[u8]) -> anyho
         #[serde(default, rename = "DNSName")]
         dns_name: String,
         #[serde(default, rename = "TailscaleIPs")]
-        addresses: Vec<std::net::IpAddr>,
+        addresses: Option<Vec<std::net::IpAddr>>,
         #[serde(default)]
         sharee_node: bool,
     }
@@ -844,7 +844,8 @@ fn merge_tailscale_hosts(hosts: &mut Vec<DiscoveredHost>, bytes: &[u8]) -> anyho
         }
         // The existing SSH/rsync source contract accepts IPv4 and DNS names,
         // not bare IPv6 literals. Do not advertise unusable source targets.
-        let Some(address) = peer.addresses.iter().find(|ip| ip.is_ipv4()) else {
+        let addresses = peer.addresses.unwrap_or_default();
+        let Some(address) = addresses.iter().find(|ip| ip.is_ipv4()) else {
             continue;
         };
         let dns = peer.dns_name.trim_end_matches('.');
@@ -857,7 +858,7 @@ fn merge_tailscale_hosts(hosts: &mut Vec<DiscoveredHost>, bytes: &[u8]) -> anyho
                     (!dns.is_empty() && name.trim_end_matches('.').eq_ignore_ascii_case(dns))
                         || name
                             .parse::<std::net::IpAddr>()
-                            .is_ok_and(|ip| peer.addresses.contains(&ip))
+                            .is_ok_and(|ip| addresses.contains(&ip))
                 })
         }) {
             continue;
@@ -2411,7 +2412,8 @@ paths = ["~/.claude/projects"]
                 "c": {"Online": false, "TailscaleIPs": ["100.64.0.3"]},
                 "d": {"Online": true, "ShareeNode": true, "TailscaleIPs": ["100.64.0.4"]},
                 "e": {"Online": true, "TailscaleIPs": []},
-                "f": {"Online": true, "TailscaleIPs": ["fd7a:115c:a1e0::6"]}
+                "f": {"Online": true, "TailscaleIPs": ["fd7a:115c:a1e0::6"]},
+                "g": {"Online": true, "TailscaleIPs": null}
             }
         });
         let bytes = serde_json::to_vec(&status).unwrap();

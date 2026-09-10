@@ -183,17 +183,24 @@ class FleetRun:
         identities = {(h["source_id"], h["source_path"], h["line_number"]) for h in hits}
         assert len(identities) == len(hits), "duplicate search identities"
         scoped_identities = set()
+        def evidence(hit):
+            return (hit["source_id"], hit["source_path"], hit["line_number"], hit.get("origin_host"), hit["content"])
+        global_evidence = {evidence(hit) for hit in hits}
+        scoped_evidence = set()
         for host in self.ready:
             label = host["label"]
             selected = self.search(phase + "-" + label, self.token, label)
             assert len(selected) == expected_per_host, "source-scoped hit count mismatch"
             assert all(h["source_id"] == label and h.get("origin_host") == host["target"] and host["request"]["marker"] in h["content"] for h in selected), "source provenance mismatch"
             scoped_identities.update((h["source_id"], h["source_path"], h["line_number"]) for h in selected)
+            scoped_evidence.update(evidence(hit) for hit in selected)
         assert scoped_identities == identities, "global search disagrees with source-scoped results"
+        assert scoped_evidence == global_evidence, "global search changed content or provenance"
         assert not self.search(phase + "-local-negative", self.token, "local"), "remote sessions leaked into local scope"
         assert not self.search(phase + "-missing-negative", self.token, "nonexistent-source"), "unknown source broadened query"
         hybrid = self.search(phase + "-default-hybrid", self.token, mode=None)
         assert {(h["source_id"], h["source_path"], h["line_number"]) for h in hybrid} == identities, "default hybrid lost fleet evidence"
+        assert {evidence(hit) for hit in hybrid} == global_evidence, "default hybrid changed content or provenance"
         return identities
 
     def run(self):

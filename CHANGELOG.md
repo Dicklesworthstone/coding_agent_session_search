@@ -192,6 +192,17 @@ mean that every acceptance row, platform, or reporter archive has been verified.
 
 ### Fixed
 
+- Fleet discovery keeps `Match` options out of preceding SSH host metadata,
+  handles quoted aliases and comments, and retains first-value precedence.
+  `--skip-existing` compares connection targets instead of source labels; the
+  displayed add-source command uses valid positional and option syntax.
+- Tailscale status output is bounded during pipe collection, with child cleanup
+  on collection errors. Null or missing peer address lists are treated as empty,
+  so a peer without addresses does not disable discovery. The live fleet harness
+  refuses optimized Python runs
+  that would disable its checks, protects private initialization errors, and
+  compares global and source-filtered content and provenance.
+
 - A pre-scan authoritative lexical repair no longer strands its own run's
   checkpoint. The repair rebuilds the lexical index from the canonical database
   and persists an *exact* completed checkpoint, and the run then continues into

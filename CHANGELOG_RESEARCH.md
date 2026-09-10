@@ -1,5 +1,51 @@
 # CASS 0.8.0 changelog research
 
+Fresh-eye fleet review (2026-09-10, `av59c`): the previous executable reproduced
+three discovery defects with isolated generic configuration: `Match` overwrote
+the preceding host's address, a reused source label falsely marked a different
+target configured, and an existing target under a different label was not skipped.
+The patch fixes these, quoted/commented aliases, first-value precedence, the
+invalid printed add command, and zero-transfer `will_reindex` metadata. It also
+bounds child output during collection and keeps timeout/error cleanup, rather
+than checking size only after allocating the entire Tailscale response.
+
+The final schema pass additionally found that JSON `null` for an empty Tailscale
+address slice rejected the entire provider response. The amended parser treats
+null/missing addresses as empty and skips that peer; the existing mixed-peer test
+now covers this case. The final amendment passed formatting, all-target Clippy,
+and all 91 selected tests, with no failures or ignored tests. The rebuilt binary
+repeated the complete live workflow successfully on nine authenticated machines;
+the tenth still requires authentication, so the overall harness exits 1.
+The final gate ended at 02:45 UTC with `STAGE=ubs EXIT=1` after a 300-second
+`MODULE_TIMEOUT`. All 1040 CASS and 77 FAD source inputs were unchanged after
+execution; the four reviewed Rust files match the build manifest and the live
+binary matches the executable receipt. This does not clear the release gate.
+Final executable SHA256: `7241298dc93353fe3aef6456c092bef5ac87c36831e43a84b9c6f990551268d4`.
+Final private ordinal summary SHA256: `0d3f4478760e1a4d8825196c952772e48ba483391bc9a441df1eed02234b5cdd`.
+Final gate log SHA256: `fb3b916cc07a1e12ad36b73102b509a7b7a409782e7232f3e74ba974a4193b43`.
+The following comparison receipts describe the preceding review build, retained
+separately from this final amendment.
+
+The harness now rejects Python `-O` (observed exit 2), avoids private-path
+tracebacks for invalid input (observed exit 2), and compares content and host
+provenance across global, source-scoped and default-hybrid results. Formatting,
+all-target Clippy and 91 tests passed (nine library, six sources CLI, two setup,
+six index JSON, 68 unchanged goldens). Three same-invocation before/after CLI
+comparisons confirm the discovery defects fail on the previous binary and pass
+on this one. Three additional malformed/private-input cases exit 2 without
+tracebacks or path leakage.
+
+The strengthened live harness passed all workflow checks on nine authenticated
+machines: initial/replay/busy counts 18, mirror recovery 27, appended/offline
+counts 36. Content and host provenance agree across all query scopes. A zero-file
+replay now reports `will_reindex=false` (previous binary reported true). The tenth
+host still requires authentication, so the overall live result is failed. That
+gate ended with a 300-second UBS timeout and unchanged source inputs; this is
+not release clearance.
+Reviewed executable SHA256: `2a861819bb08f8caf51496a67a31b5fdb9a688736028c16e4e192496b806cd0a`.
+Reviewed harness SHA256: `9aec231f6d19fd24f07df46471c7f5b65b6a57c5ebd32e8eeca406c9e4526dc4`.
+Private ordinal summary SHA256: `7f27406adf5966f6b7ca0fa3c0786445ce82c4222ca488d5fa5a322ee7264c97`.
+
 Optional Tailscale discovery (2026-09-09, original bead `av59c`): owner-requested
 `--tailscale` is wired through both discovery and setup. Local status is bounded
 to five seconds; online peer IPv4 addresses merge with configured SSH aliases,
