@@ -181,6 +181,22 @@ fn sources_discover_uses_private_ssh_config_override_and_includes() {
             .unwrap()
             .contains("could not start")
     );
+    create_sources_config(
+        &root.join("config"),
+        "[[sources]]\nname = \"my-archive\"\ntype = \"ssh\"\nhost = \"operator@example.invalid\"\npaths = [\"~/.codex/sessions\"]\n",
+    );
+    let skipped = tracker
+        .cass_std_command()
+        .args(["sources", "discover", "--skip-existing", "--json"])
+        .env("HOME", &home)
+        .env("CASS_SSH_CONFIG", &config)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .current_dir(&home)
+        .output()
+        .unwrap();
+    assert!(skipped.status.success());
+    let skipped: Value = serde_json::from_slice(&skipped.stdout).unwrap();
+    assert_eq!(skipped["status"], "all_existing");
     tracker.complete();
 }
 

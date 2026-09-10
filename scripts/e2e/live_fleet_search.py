@@ -182,11 +182,14 @@ class FleetRun:
         assert len(hits) == len(self.ready) * expected_per_host, "fleet hit count mismatch"
         identities = {(h["source_id"], h["source_path"], h["line_number"]) for h in hits}
         assert len(identities) == len(hits), "duplicate search identities"
+        scoped_identities = set()
         for host in self.ready:
             label = host["label"]
             selected = self.search(phase + "-" + label, self.token, label)
             assert len(selected) == expected_per_host, "source-scoped hit count mismatch"
             assert all(h["source_id"] == label and h.get("origin_host") == host["target"] and host["request"]["marker"] in h["content"] for h in selected), "source provenance mismatch"
+            scoped_identities.update((h["source_id"], h["source_path"], h["line_number"]) for h in selected)
+        assert scoped_identities == identities, "global search disagrees with source-scoped results"
         assert not self.search(phase + "-local-negative", self.token, "local"), "remote sessions leaked into local scope"
         assert not self.search(phase + "-missing-negative", self.token, "nonexistent-source"), "unknown source broadened query"
         hybrid = self.search(phase + "-default-hybrid", self.token, mode=None)
@@ -270,8 +273,14 @@ def main():
     parser.add_argument("--tailscale", action="store_true",
                         help="Require live Tailscale discovery; inventory SSH targets should be tailnet IPs")
     options = parser.parse_args()
+    if not __debug__:
+        parser.error("assertions are required; run without -O or PYTHONOPTIMIZE")
     os.umask(0o077)
-    run = FleetRun(options.inventory, options.cass_bin, options.tailscale)
+    try:
+        run = FleetRun(options.inventory, options.cass_bin, options.tailscale)
+    except (ValueError, OSError, KeyError, TypeError):
+        # Invalid input can contain private paths; never print a traceback.
+        parser.error("invalid private inventory, SSH configuration, binary, or artifact directory")
     passed = False
     try:
         passed = run.run()

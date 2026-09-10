@@ -116757,7 +116757,7 @@ fn run_sources_sync(
             "sources_fully_failed": sources_fully_failed,
             "total_files": total_files,
             "total_bytes": total_bytes,
-            "will_reindex": !no_index && !dry_run,
+            "will_reindex": !no_index && !dry_run && total_files > 0,
         });
         if let Some(result) = indexing_result {
             payload["indexing"] = result;
@@ -117038,12 +117038,25 @@ fn run_sources_discover(
         .as_ref()
         .map(|c| c.remote_sources().map(|s| s.name.clone()).collect())
         .unwrap_or_default();
+    let already_configured = |host: &crate::sources::config::DiscoveredHost| {
+        existing_names.iter().any(|name| crate::sources::config::source_names_equal(name, &host.name))
+            || existing_config.as_ref().is_some_and(|config| {
+                config.remote_sources().any(|source| {
+                    source.host.as_deref().is_some_and(|target| {
+                        let target = target.rsplit('@').next().unwrap_or(target).trim_end_matches('.');
+                        [&host.name, host.hostname.as_ref().unwrap_or(&host.name)]
+                            .into_iter()
+                            .any(|name| name.trim_end_matches('.').eq_ignore_ascii_case(target))
+                    })
+                })
+            })
+    };
 
     // Filter hosts
     let hosts_to_add: Vec<_> = if skip_existing {
         discovered
             .into_iter()
-            .filter(|h| !existing_names.contains(&h.name))
+            .filter(|h| !already_configured(h))
             .collect()
     } else {
         discovered
@@ -117095,7 +117108,7 @@ fn run_sources_discover(
                     "user": h.user,
                     "port": h.port,
                     "identity_file": h.identity_file,
-                    "already_configured": existing_names.contains(&h.name),
+                    "already_configured": already_configured(h),
                 })
             })
             .collect();
@@ -117120,7 +117133,7 @@ fn run_sources_discover(
         );
 
         for host in &hosts_to_add {
-            let status = if existing_names.contains(&host.name) {
+            let status = if already_configured(host) {
                 " (already configured)".yellow().to_string()
             } else {
                 String::new()
@@ -117152,7 +117165,7 @@ fn run_sources_discover(
         println!("{} To add a host as a source, use:", "Next step:".yellow());
         println!(
             "  {}",
-            "cass sources add --name <host> --host <host> --paths '~/.claude/projects'".dimmed()
+            "cass sources add <user>@<host> --name <name> --path '~/.claude/projects'".dimmed()
         );
     }
 

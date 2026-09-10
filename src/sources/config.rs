@@ -788,9 +788,12 @@ pub fn discover_fleet_hosts(tailscale: bool) -> (Vec<DiscoveredHost>, Option<Str
         let child = command
             .spawn()
             .context("could not start tailscale status")?;
-        let output =
-            super::wait_for_child_output_with_timeout(child, std::time::Duration::from_secs(5))?
-                .context("tailscale status timed out after 5 seconds")?;
+        let output = super::wait_for_child_output_with_limit(
+            child,
+            std::time::Duration::from_secs(5),
+            Some(8 * 1024 * 1024),
+        )?
+        .context("tailscale status timed out after 5 seconds")?;
         // Do not echo raw status/stderr: it can contain tailnet account data.
         anyhow::ensure!(
             output.status.success(),
@@ -982,12 +985,21 @@ fn parse_ssh_config(content: &str) -> Vec<DiscoveredHost> {
         };
 
         match key.as_str() {
+            "match" => {
+                // Match starts a new conditional block. Its options must not
+                // become metadata for the preceding literal Host declaration.
+                hosts.append(&mut current_hosts);
+            }
             "host" => {
                 hosts.append(&mut current_hosts);
-                current_hosts = value
-                    .split_whitespace()
+                current_hosts = shell_words::split(value)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .take_while(|name| !name.starts_with('#'))
                     .filter(|name| {
                         !name.starts_with('!') && !name.contains('*') && !name.contains('?')
+                            && ssh_host_has_safe_token_chars(name)
+                            && !name.starts_with('-')
                     })
                     .map(|name| DiscoveredHost {
                         name: name.to_string(),
@@ -1000,22 +1012,30 @@ fn parse_ssh_config(content: &str) -> Vec<DiscoveredHost> {
             }
             "hostname" => {
                 for host in &mut current_hosts {
-                    host.hostname = Some(value.to_string());
+                    if host.hostname.is_none() {
+                        host.hostname = shell_words::split(value).ok().and_then(|v| v.into_iter().next());
+                    }
                 }
             }
             "user" => {
                 for host in &mut current_hosts {
-                    host.user = Some(value.to_string());
+                    if host.user.is_none() {
+                        host.user = shell_words::split(value).ok().and_then(|v| v.into_iter().next());
+                    }
                 }
             }
             "port" => {
                 for host in &mut current_hosts {
-                    host.port = value.parse().ok();
+                    if host.port.is_none() {
+                        host.port = value.split_whitespace().next().and_then(|v| v.parse().ok());
+                    }
                 }
             }
             "identityfile" => {
                 for host in &mut current_hosts {
-                    host.identity_file = Some(value.to_string());
+                    if host.identity_file.is_none() {
+                        host.identity_file = shell_words::split(value).ok().and_then(|v| v.into_iter().next());
+                    }
                 }
             }
             _ => {}
@@ -2446,6 +2466,20 @@ paths = ["~/.claude/projects"]
         assert_eq!(hosts[0].hostname.as_deref(), Some("workstation.invalid"));
         assert_eq!(hosts[1].user.as_deref(), Some("operator"));
         assert!(super::discover_ssh_hosts_from_path(&root.join("missing"), &home).is_empty());
+    }
+
+    #[test]
+    fn test_parse_ssh_config_match_does_not_hide_a_tailnet_peer() {
+        let mut hosts = parse_ssh_config(
+            "Host \"workstation\" # not another alias\n HostName \"100.64.0.1\"\n HostName 100.64.0.2\n User developer\n User wrong\nMatch host other\n HostName 100.64.0.2\n User conditional\n",
+        );
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].name, "workstation");
+        assert_eq!(hosts[0].hostname.as_deref(), Some("100.64.0.1"));
+        assert_eq!(hosts[0].user.as_deref(), Some("developer"));
+        merge_tailscale_hosts(&mut hosts, br#"{"BackendState":"Running","Peer":{"a":{"Online":true,"TailscaleIPs":["100.64.0.2"]}}}"#).unwrap();
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts[1].name, "100.64.0.2");
     }
 
     #[test]
