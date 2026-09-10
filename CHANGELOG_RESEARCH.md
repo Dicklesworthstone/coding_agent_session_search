@@ -4,11 +4,31 @@ Optional Tailscale discovery (2026-09-09, original bead `av59c`): owner-requeste
 `--tailscale` is wired through both discovery and setup. Local status is bounded
 to five seconds; online peer IPv4 addresses merge with configured SSH aliases,
 without changing authentication or host-key policy. Offline peers, the local
-node and IPv6-only peers are omitted. Parser and real missing-executable CLI
-tests are authored. The new frozen remote gate and private live tailnet test
-are pending; the earlier 86-test/nine-host evidence below does not validate this
-new capability. Source snapshot also retains a concurrent answer-pack command
-change to always include its database argument; it is not a Tailscale fix.
+node and IPv6-only peers are omitted. The new frozen remote gate passed formatting,
+all-target Clippy and 88 tests: six library, six sources CLI, two setup-option,
+six index JSON, and 68 unchanged goldens. The missing-executable CLI test verifies
+that optional discovery failure retains SSH aliases and reports a warning.
+
+The new executable then ran the actual Tailscale lane of the private fleet harness.
+Discovery added 15 online peer candidates to the two explicit test configuration
+entries; all requested peer addresses were found without being declared as SSH
+aliases. Nine authenticated machines passed initial sync/search (18 messages),
+unchanged replay, index-lock refusal (exit 7), mirror recovery (27 messages), a
+second append (36 messages), and refused-source partial failure (exit 8, existing
+36 messages preserved). Exact source/host provenance, negative source filters and
+default-hybrid lexical fallback passed each phase. One requested machine still
+requires human authentication, so the ten-machine harness correctly exits 1.
+
+Executable SHA256: `a28c5028842655c86c8d79f23dc0edb8c7a9d9a3f014fb26c6afe6c6feb74a14`.
+Harness SHA256: `736800dd4b73d8fd679ffb97b4de02b7dc5c58059bdd25ab4e31ff7d1322b655`.
+Private ordinal summary SHA256: `fd65284b3367cfad0f965e7f228fadb9aa0013073d3f65103a94fbb46f52091f`.
+The gate finished at 23:06 UTC: UBS timed out after 300 seconds (`MODULE_TIMEOUT`),
+so `STAGE=ubs EXIT=1` keeps the release gate red. All other stages passed. The
+post-run check verified all 1040 CASS and 77 FAD inputs unchanged, and the final
+binary matches the live-run SHA above. Gate log SHA256:
+`2ec0efa5276467e29b8d3c09b6a17919ba27a7de63cfcea469fc4ce3905d07b1`.
+This is neither an all-ten pass nor a release clearance. Source snapshot also retains a concurrent answer-pack
+command change to always include its database argument; it is not a Tailscale fix.
 
 Fleet investigation (2026-09-09, bead `av59c`): live SSH testing exposed two
 source defects. Discovery ignored the SSH configuration override used by
