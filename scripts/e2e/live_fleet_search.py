@@ -284,7 +284,7 @@ def main():
     passed = False
     try:
         passed = run.run()
-    except (RuntimeError, AssertionError, ValueError, OSError) as error:
+    except Exception as error:
         # Exception details can include private paths; retain them privately.
         run.write("failure.json", {"type": type(error).__name__, "message": str(error)})
     report = {"passed": passed, "requested_hosts": len(run.hosts), "reachable_hosts": len(run.ready),

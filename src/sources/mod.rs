@@ -154,14 +154,32 @@ struct ChildPipeReader {
     handle: JoinHandle<()>,
 }
 
-fn drain_child_pipe<R>(mut pipe: R) -> ChildPipeReader
+fn drain_child_pipe<R>(mut pipe: R, max_bytes: Option<usize>) -> ChildPipeReader
 where
     R: IoRead + Send + 'static,
 {
     let (sender, receiver) = mpsc::channel();
     let handle = std::thread::spawn(move || {
         let mut output = Vec::new();
-        let result = pipe.read_to_end(&mut output).map(|_| output);
+        let result = (|| {
+            if let Some(limit) = max_bytes {
+                pipe.by_ref()
+                    .take((limit as u64).saturating_add(1))
+                    .read_to_end(&mut output)?;
+                if output.len() > limit {
+                    // Keep draining so a writer cannot deadlock on a full pipe.
+                    // The caller's deadline still terminates a non-exiting child.
+                    std::io::copy(&mut pipe, &mut std::io::sink())?;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "child output exceeded the configured byte limit",
+                    ));
+                }
+            } else {
+                pipe.read_to_end(&mut output)?;
+            }
+            Ok(output)
+        })();
         let _ = sender.send(result);
     });
     ChildPipeReader { receiver, handle }
@@ -232,8 +250,17 @@ fn kill_child_process_group(_pid: u32) {}
 /// child can be killed but shell grandchildren may keep inherited pipe FDs open
 /// until they exit naturally.
 pub(crate) fn wait_for_child_output_with_timeout(
+    child: Child,
+    timeout: Duration,
+) -> std::io::Result<Option<Output>> {
+    wait_for_child_output_with_limit(child, timeout, None)
+}
+
+/// Limit each captured stream while retaining the same process deadline.
+pub(crate) fn wait_for_child_output_with_limit(
     mut child: Child,
     timeout: Duration,
+    max_bytes: Option<usize>,
 ) -> std::io::Result<Option<Output>> {
     let timeout = if timeout.is_zero() {
         Duration::from_secs(1)
@@ -243,30 +270,40 @@ pub(crate) fn wait_for_child_output_with_timeout(
     let start = Instant::now();
     let deadline = start.checked_add(timeout).unwrap_or(start);
     let child_pid = child.id();
-    let stdout_reader = child.stdout.take().map(drain_child_pipe);
-    let stderr_reader = child.stderr.take().map(drain_child_pipe);
+    let stdout_reader = child.stdout.take().map(|pipe| drain_child_pipe(pipe, max_bytes));
+    let stderr_reader = child.stderr.take().map(|pipe| drain_child_pipe(pipe, max_bytes));
 
-    match child.wait_timeout(timeout)? {
-        Some(status) => {
-            let Some(stdout) = finish_child_pipe(stdout_reader, deadline)? else {
+    match child.wait_timeout(timeout) {
+        Ok(Some(status)) => {
+            let result = (|| {
+                let Some(stdout) = finish_child_pipe(stdout_reader, deadline)? else {
+                    return Ok(None);
+                };
+                let Some(stderr) = finish_child_pipe(stderr_reader, deadline)? else {
+                    return Ok(None);
+                };
+                Ok(Some(Output {
+                    status,
+                    stdout,
+                    stderr,
+                }))
+            })();
+            if !matches!(&result, Ok(Some(_))) {
                 kill_child_process_group(child_pid);
-                return Ok(None);
-            };
-            let Some(stderr) = finish_child_pipe(stderr_reader, deadline)? else {
-                kill_child_process_group(child_pid);
-                return Ok(None);
-            };
-            Ok(Some(Output {
-                status,
-                stdout,
-                stderr,
-            }))
+            }
+            result
         }
-        None => {
+        Ok(None) => {
             kill_child_process_group(child_pid);
             let _ = child.kill();
             let _ = child.wait();
             Ok(None)
+        }
+        Err(error) => {
+            kill_child_process_group(child_pid);
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(error)
         }
     }
 }
@@ -392,6 +429,39 @@ mod tests {
 
         assert!(!tokens.contains(&"-F".to_string()));
         assert!(!command.contains(" -F "));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_child_output_preserves_small_output_and_rejects_overflow() {
+        for (script, overflow) in [
+            ("printf 1234; printf abcd >&2", false),
+            ("printf 12345", true),
+            ("printf 12345 >&2", true),
+        ] {
+            let mut command = Command::new("sh");
+            command.args(["-c", script]).stdout(Stdio::piped()).stderr(Stdio::piped());
+            configure_child_process_group(&mut command);
+            let result = wait_for_child_output_with_limit(command.spawn().unwrap(), Duration::from_secs(5), Some(4));
+            if overflow {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+            } else {
+                let output = result.unwrap().unwrap();
+                assert!(output.status.success());
+                assert_eq!(output.stdout, b"1234");
+                assert_eq!(output.stderr, b"abcd");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_child_output_still_times_out_after_overflow() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf 12345; sleep 30"]).stdout(Stdio::piped()).stderr(Stdio::piped());
+        configure_child_process_group(&mut command);
+        let output = wait_for_child_output_with_limit(command.spawn().unwrap(), Duration::from_secs(1), Some(4)).unwrap();
+        assert!(output.is_none());
     }
 
     #[cfg(unix)]
