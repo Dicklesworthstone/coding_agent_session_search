@@ -16,20 +16,20 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 ---
 
 Scope window: this update covers the changes after the 2026-08-31 v0.7.1
-binary release, through the 0.8.0 release candidate. Earlier version entries
-retain their existing scope. Git commits, release metadata, and Beads supply
+binary release, through the 2026-09-10 v0.8.0 binary release. Earlier version
+entries retain their existing scope. Git commits, release metadata, and Beads supply
 the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ## Release Timeline
 
 | Version | Date | Publication state |
 |---------|------|-------------------|
-| 0.8.0 | Pending | Release preparation; no tag or published binaries yet |
+| [v0.8.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.8.0) | 2026-09-10 | Published GitHub Release: Linux x86_64/arm64, macOS arm64, Windows x86_64 |
 | [v0.7.1](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.7.1) | 2026-08-31 | Published GitHub Release and binary baseline for the changes below |
 
 ## [Unreleased]
 
-## [v0.8.0] -- Unreleased
+## [v0.8.0] -- 2026-09-10
 
 Indexing, archive diagnostics, answer packs, maintenance commands, and dependency
 updates from the reality-check bridge work. Existing archive corruption and
