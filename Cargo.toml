@@ -133,6 +133,24 @@ bytemuck = "1.25.0"
 # Quill 0.2.3 uses Cx::is_cancelled from asupersync 0.4.10. It preserves
 # 0.4.2's opt-in multilingual space and the Windows Quill publication line;
 # registry 0.3.2 was a stale same-version twin and must never be resolved.
+#
+# HELD at 0.4.3 for the 0.8.0 release, with frankensearch 0.5.0 /
+# frankensearch-quill 0.2.4 already published (2026-09-08). Reasons, in order:
+#   1. The gh#453 engine GC fix this crate's doctor text promises
+#      (`cass index --gc`, receipt-clocked reclamation of merge-retired
+#      segments) shipped IN 0.4.3. Bumping buys none of it.
+#   2. Published 0.5.0 still declares `asupersync >= 0.4.4, < 0.5` while
+#      frankensearch-quill 0.2.4 calls `Cx::is_cancelled` — the defect
+#      frankensearch#44 describes. cass's exact `=0.4.10` pin masks it here,
+#      but the declaration is still wrong upstream.
+#   3. frankensearch#45 (live-document publication floor; discard a failed
+#      replacement ingest instead of committing a tombstone-only MANIFEST) is
+#      the ENGINE half of cass gh#457. It is on frankensearch `main`, not in
+#      0.5.0. cass carries its own consumer-side hollow-generation detection,
+#      so 0.4.3 is not less safe than 0.5.0 here — but 0.5.0 is not more safe
+#      either, and it would cost the frankensearch-rerank 0.3.0 semver-major
+#      plus a new engine-version stamp (quill 0.2.4) in every fresh MANIFEST.
+# Revisit when a frankensearch crate release contains both fixes.
 frankensearch = { version = "=0.4.3", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
 franken-agent-detection = { version = "=0.2.3", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes", "devin"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product

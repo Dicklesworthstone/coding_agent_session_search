@@ -192,6 +192,20 @@ mean that every acceptance row, platform, or reporter archive has been verified.
 
 ### Fixed
 
+- A pre-scan authoritative lexical repair no longer strands its own run's
+  checkpoint. The repair rebuilds the lexical index from the canonical database
+  and persists an *exact* completed checkpoint, and the run then continues into
+  the incremental source scan --- an ordering unique to this path, since the
+  canonical-only full rebuild runs no scan and the post-scan rebuilds run after
+  ingest. When that follow-up scan ingested new rows the end-of-run refresh was
+  skipped as already-exact, so the checkpoint kept the pre-scan
+  `COUNT`/`MAX(id)` content fingerprint: search's fingerprint check reported
+  "storage fingerprint no longer matches" and `cass status` reported the lexical
+  assets stale until some later run happened to rewrite the checkpoint. The run
+  now re-derives its exact canonical totals from the post-scan database and
+  refreshes the checkpoint before exiting; the totals matter as much as the
+  refresh, because the final refresh consumes them verbatim. Follow-on to
+  [GH #457](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/457).
 - SSH host discovery uses `CASS_SSH_CONFIG`, matching the transport commands,
   and follows included configuration files with bounded recursion and duplicate
   alias handling. A private configuration no longer yields an empty discovery
@@ -437,7 +451,17 @@ mean that every acceptance row, platform, or reporter archive has been verified.
 - `frankensearch` is pinned to `=0.4.3` (Quill `0.2.3`). Segment collection
   clocks the 300 s grace period from each retirement receipt, allowing
   `cass index --gc` to reclaim old folded inputs while newer generations
-  continue publishing.
+  continue publishing. This release deliberately **holds** that pin rather
+  than taking the newer published `0.5.0` / Quill `0.2.4`: the GC fix
+  `cass index --gc` depends on shipped in `0.4.3`, so `0.5.0` adds nothing
+  for it, while the two upstream fixes that would justify moving --- the
+  corrected `asupersync >= 0.4.10` floor declaration and the live-document
+  publication floor that discards a failed replacement ingest instead of
+  committing a tombstone-only MANIFEST (the engine half of GH #457) --- are
+  on frankensearch `main` and are *not* in `0.5.0`. Taking `0.5.0` today
+  would also pull the `frankensearch-rerank` `0.3.0` semver-major and stamp a
+  new engine version into every fresh MANIFEST for no correctness gain. cass
+  carries its own consumer-side hollow-generation detection either way.
 - `franken-agent-detection` pinned from crates.io `=0.2.2` to `=0.2.3`: the
   Antigravity connector probes the IDE store (`~/.gemini/antigravity`) as
   well as the `agy` CLI store, so IDE sessions index without
