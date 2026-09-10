@@ -31,6 +31,39 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ## [v0.8.0] -- 2026-09-10
 
+### Known open at release
+
+Two tests are red on this tree and are shipped knowingly; both are reporting
+defects, not indexing or search defects.
+
+- `swarm_proof_debt_cli_prioritizes_and_suppresses_debt`. The swarm evidence
+  redactor's `absolute_path_with_spaces` rule excludes quotes and newlines from
+  its character class but not spaces, so once it matches a private path it
+  consumes the rest of the line. On a proof whose recorded shape is
+  `rch exec -- env CARGO_TARGET_DIR=/data/tmp/cass-proof cargo clippy
+  --all-targets -- -D warnings` the output is
+  `rch exec -- env CARGO_TARGET_DIR=/data[REDACTED_PATH]` -- the path is hidden
+  and so is the command. The proof-debt classifier keys on `cargo clippy`
+  without `cargo test`/`cargo check`, so it can no longer see the shape it is
+  meant to flag and the `incomplete-proof-command-set` debt goes unreported.
+  This is over-redaction with information loss rather than a privacy hole. The
+  fix is a redaction-engine change, not a pattern tweak: a space may only
+  continue a path when the following token still looks like a path, and Rust's
+  `regex` has no lookahead to express that, so it has to move out of the
+  pattern. Left for a change that can be reviewed on its own. The operations
+  dashboard hit the same rule and is fixed below, because there the command had
+  already cleared a strict allow-list.
+- `timed_out_search_returns_before_slow_operation_and_names_shed_sections`. The
+  scoped search-timeout retry advice is mid-flight work whose own tracker entry
+  is still open; the surrounding behavior -- the retry preserving database,
+  filters, time bounds and pagination -- is in this release.
+
+Two further tests are order-dependent rather than broken --
+`search_cursor_manifest_marks_rebuilding_generation_best_effort` (a concurrent
+index run makes a parallel search exit `index-busy`) and
+`devin_cli_indexes_searches_and_reopens_without_duplicates`. Both pass when run
+alone; neither indicates a product defect.
+
 Indexing, archive diagnostics, answer packs, maintenance commands, and dependency
 updates from the reality-check bridge work. Existing archive corruption and
 mixed-engine concurrent-WAL safety remain outside this release's repair claims.
