@@ -1273,7 +1273,7 @@ CASS_VERSION=0.4.2
     }
 
     #[test]
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     fn probe_optional_commands_share_deadline_and_skip_without_timeout() {
         let script = build_probe_script_for_dirs(&[]);
         let helper = script
