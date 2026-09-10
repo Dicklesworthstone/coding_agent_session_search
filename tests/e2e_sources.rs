@@ -141,6 +141,10 @@ fn sources_discover_uses_private_ssh_config_override_and_includes() {
         "Host workstation laptop\n HostName example.invalid\n",
     )
     .unwrap();
+    create_sources_config(
+        &root.join("config"),
+        "[[sources]]\nname = \"workstation\"\ntype = \"ssh\"\nhost = \"operator@different.invalid\"\npaths = [\"~/.codex/sessions\"]\n",
+    );
     let output = tracker
         .cass_std_command()
         .args(["sources", "discover", "--json"])
@@ -160,6 +164,7 @@ fn sources_discover_uses_private_ssh_config_override_and_includes() {
     assert_eq!(hosts.len(), 2, "{result}");
     assert_eq!(hosts[0]["name"], "workstation");
     assert_eq!(hosts[1]["name"], "laptop");
+    assert_eq!(hosts[0]["already_configured"], false);
     // A missing optional CLI must retain configured hosts and report fallback.
     // This uses a genuinely empty executable search path, not a fake tailscale.
     let fallback = tracker
