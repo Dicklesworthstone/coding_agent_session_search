@@ -12313,6 +12313,14 @@ fn should_repair_daily_stats_after_historical_salvage(
 /// Producers (connector scan threads) send batches of conversations through
 /// the channel. The consumer (main indexing thread) receives and ingests them.
 pub enum IndexMessage {
+    /// The final bounded batch for an observed source. Earlier batches from
+    /// this producer must succeed before its completion can become durable.
+    SourceComplete {
+        connector_name: &'static str,
+        conversations: Vec<NormalizedConversation>,
+        completion: crate::storage::sqlite::SourceIngestLedgerEntry,
+        byte_reservation: usize,
+    },
     /// A batch of conversations from a connector scan.
     Batch {
         /// Connector name (e.g., "claude", "codex")
@@ -13094,6 +13102,7 @@ fn is_streaming_consumer_disconnected(error: &anyhow::Error) -> bool {
 
 #[derive(Clone)]
 struct StreamingProducerConfig {
+    source_ledger: Arc<HashMap<String, String>>,
     flow_limiter: Arc<StreamingByteLimiter>,
     data_dir: PathBuf,
     additional_scan_roots: Vec<ScanRoot>,
@@ -14043,6 +14052,7 @@ fn run_streaming_index_with_connector_factories(
     // Create bounded channel for backpressure
     let (tx, rx) = bounded::<IndexMessage>(STREAMING_CHANNEL_SIZE);
     let producer_config = StreamingProducerConfig {
+        source_ledger: Arc::new(storage.source_ingest_ledger_entries()?),
         flow_limiter: Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
         data_dir: opts.data_dir.clone(),
         additional_scan_roots: additional_scan_roots.clone(),

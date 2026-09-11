@@ -119600,27 +119600,6 @@ fn run_models_backfill(
         hint: Some("Run 'cass health --json' to inspect the archive database".into()),
         retryable: true,
     })?;
-    // povuc / PR#384 "fingerprint reuse": this bounded backfill owns an open
-    // handle for its whole run, so fingerprint through it (GH#404 helper)
-    // instead of paying a second FrankenSQLite open + archive scan solely to
-    // stamp the checkpoint. The fingerprint is content-derived (ids/counts),
-    // so computing it after the writer open is equivalent.
-    let canonical_db_fingerprint = crate::indexer::lexical_storage_fingerprint_for_storage(
-        &storage,
-    )
-    .map_err(|e| CliError {
-        code: 5,
-        kind: CliErrorKind::StorageFingerprint.kind_str(),
-        message: format!(
-            "Failed to fingerprint cass database {}: {e:#}",
-            db_path.display()
-        ),
-        hint: Some(
-            "Run 'cass doctor check --json' if the archive is corrupt; index --force-rebuild only rebuilds derived assets from a healthy canonical archive."
-                .into(),
-        ),
-        retryable: true,
-    })?;
     let mut manifest = SemanticManifest::load_or_default(&data_dir).map_err(|e| CliError {
         code: 5,
         kind: CliErrorKind::SemanticManifest.kind_str(),
@@ -119648,6 +119627,26 @@ fn run_models_backfill(
         }),
         retryable: embedder_type != "hash",
     })?;
+    // GH458: a fully unchanged archive must not pay a canonical count scan
+    // just to discover that no backfill work is needed. The completed cache
+    // binds the open descriptor, real WAL, artifact and producer; any mismatch
+    // falls back to a strict fingerprint on this already-open handle.
+    let canonical_db_fingerprint = indexer
+        .completed_backfill_fingerprint(&storage, &data_dir, &manifest, tier, &model_revision)
+        .and_then(|cached| match cached {
+            Some(fingerprint) => Ok(fingerprint),
+            None => crate::indexer::lexical_storage_fingerprint_for_storage(&storage),
+        })
+        .map_err(|e| CliError {
+            code: 5,
+            kind: CliErrorKind::StorageFingerprint.kind_str(),
+            message: format!("Failed to fingerprint cass database {}: {e:#}", db_path.display()),
+            hint: Some(
+                "Run 'cass doctor check --json' if the archive is corrupt; index --force-rebuild only rebuilds derived assets from a healthy canonical archive."
+                    .into(),
+            ),
+            retryable: true,
+        })?;
     // Identity invalidation follows the physical vector space that query
     // serving selects, not the user-facing manifest tier. Tests and operators
     // may deliberately backfill the quality tier with the hash embedder.

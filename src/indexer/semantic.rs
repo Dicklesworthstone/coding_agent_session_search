@@ -6348,6 +6348,11 @@ mod tests {
         };
         let first = run(&mut manifest)?;
         assert!(first.published && !first.unchanged);
+        let fingerprint = manifest.fast_tier.as_ref().unwrap().db_fingerprint.clone();
+        assert_eq!(indexer.completed_backfill_fingerprint(&storage, temp.path(), &manifest,
+            TierKind::Fast, "hash")?, Some(fingerprint.clone()));
+        assert_eq!(indexer.completed_backfill_fingerprint(&storage, temp.path(), &manifest,
+            TierKind::Fast, "foreign-model")?, None);
         let vectors_before = fs::read(&first.index_path)?;
         let manifest_before = fs::read(SemanticManifest::path(temp.path()))?;
         let vector_stamp =
@@ -6367,10 +6372,11 @@ mod tests {
         );
 
         // Same row count and tail fingerprint; an old row's content changed.
-        let fingerprint = manifest.fast_tier.as_ref().unwrap().db_fingerprint.clone();
         storage.raw().execute(
             "UPDATE messages SET content = 'changed earlier content' WHERE conversation_id = 1",
         )?;
+        assert_eq!(indexer.completed_backfill_fingerprint(&storage, temp.path(), &manifest,
+            TierKind::Fast, "hash")?, None);
         assert_eq!(
             crate::indexer::lexical_storage_fingerprint_for_storage(&storage)?,
             fingerprint
@@ -6386,6 +6392,8 @@ mod tests {
             .join(VECTOR_INDEX_DIR)
             .join(".completed-backfill-fast-fnv1a-384.json");
         fs::write(&cache_path, b"incomplete cache")?;
+        assert_eq!(indexer.completed_backfill_fingerprint(&storage, temp.path(), &manifest,
+            TierKind::Fast, "hash")?, None);
         let recovered = run(&mut manifest)?;
         assert!(!recovered.unchanged && recovered.published);
         assert_eq!(recovered.embedded_docs, 0);
@@ -6439,8 +6447,11 @@ mod tests {
         )?;
         // Same canonical IDs with deliberately wrong old-space values catch
         // relabeling or reuse without recomputing the embeddings.
-        for (id, _) in &expected {
-            legacy.write_record(id, &vec![0.0; indexer.embedder_dimension()])?;
+        let mut old_vector = vec![0.0; indexer.embedder_dimension()];
+        old_vector[0] = 1.0;
+        for (id, expected_vector) in &expected {
+            assert_ne!(&old_vector, expected_vector);
+            legacy.write_record(id, &old_vector)?;
         }
         legacy.finish()?;
         let prior_bytes = fs::read(&published.index_path)?;
