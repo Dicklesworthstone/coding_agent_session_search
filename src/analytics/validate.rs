@@ -283,6 +283,22 @@ pub fn run_validation(conn: &Connection, config: &ValidateConfig) -> ValidationR
     let mut buckets_checked: usize = 0;
     let mut buckets_total: usize = 0;
 
+    match crate::storage::sqlite::legacy_omp_analytics_pending(conn) {
+        Ok(false) => {}
+        Ok(true) => checks.push(Check {
+            id: "migration.legacy_omp_analytics_pending".into(),
+            ok: false,
+            severity: Severity::Error,
+            details: "Canonical OMP identity changed; analytics completion is still pending, regardless of rollup parity.".into(),
+            suggested_action: Some("Complete the full, unscoped analytics rebuild for this archive.".into()),
+        }),
+        Err(error) => checks.push(query_exec_error_check(
+            "migration.legacy_omp_authority",
+            format!("Cannot read legacy OMP analytics authority: {error:#}"),
+            "Inspect this archive's migration authority with a read-only doctor check.",
+        )),
+    }
+
     // --- Track A ---
     let (a_checks, a_checked, a_total) = validate_track_a(conn, config);
     checks.extend(a_checks);

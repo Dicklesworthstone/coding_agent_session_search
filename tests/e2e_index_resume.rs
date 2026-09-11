@@ -9,13 +9,20 @@ use std::{
     time::{Duration, Instant},
 };
 
+fn source_term(source: usize) -> String {
+    // Unquoted CASS queries also search edge n-grams: resumeproof1 matches
+    // resumeproof10. A terminated source ID cannot prefix another source ID.
+    format!("resumeproof{source:03}z")
+}
+
 fn seed(home: &Path, count: usize) {
     let root = home.join(".claude/projects/resume");
     fs::create_dir_all(&root).unwrap();
     for source in 0..count {
+        let term = source_term(source);
         let rows=(0..32).map(|message|json!({"type":"user","sessionId":format!("resume-{source}"),
             "uuid":format!("resume-{source}-{message}"),"timestamp":"2026-08-01T10:00:00Z","cwd":"/work/resume",
-            "message":{"role":"user","content":format!("resumeproof{source} exactresume{source}message{message} message {message}")}}).to_string())
+            "message":{"role":"user","content":format!("{term} exactresume{source}message{message} message {message}")}}).to_string())
             .collect::<Vec<_>>().join("\n");
         fs::write(
             root.join(format!("session-{source}.jsonl")),
@@ -79,6 +86,26 @@ fn source_observations(log: &str) -> Vec<bool> {
         .collect()
 }
 
+fn verify_completed_summary(output: &[u8], conversations: usize) {
+    let summary: Value = serde_json::from_slice(output).expect("completed index JSON");
+    assert_eq!(summary["success"], true, "{summary}");
+    assert_eq!(summary["conversations"], conversations, "{summary}");
+    assert_eq!(summary["messages"], conversations * 32, "{summary}");
+    assert_eq!(
+        summary["indexing_stats"]["total_conversations"], conversations,
+        "{summary}"
+    );
+    assert_eq!(
+        summary["indexing_stats"]["total_messages"],
+        conversations * 32,
+        "{summary}"
+    );
+    assert_eq!(
+        summary["indexing_stats"]["connector_summary"]["claude"]["indexed"], conversations,
+        "{summary}"
+    );
+}
+
 fn verify_archive(home: &Path, count: usize) {
     let storage = SqliteStorage::open_readonly(&home.join("data/agent_search.db")).unwrap();
     let conversations = storage.list_conversations(1000, 0).unwrap();
@@ -97,7 +124,7 @@ fn verify_archive(home: &Path, count: usize) {
         let output = assert_cmd::Command::from_std(command(home, "1"))
             .args([
                 "search",
-                &format!("resumeproof{source}"),
+                &source_term(source),
                 "--mode",
                 "lexical",
                 "--json",
@@ -161,10 +188,15 @@ fn gh426_bounded_stop_resumes_only_uncommitted_sources_in_both_modes() {
         assert_eq!(storage.list_conversations(100, 0).unwrap().len(), 2);
         drop(storage);
         let resumed_trace = home.path().join("resumed-trace.jsonl");
-        assert_cmd::Command::from_std(index_command(home.path(), streaming, &resumed_trace))
-            .timeout(Duration::from_secs(180))
-            .assert()
-            .success();
+        let resumed =
+            assert_cmd::Command::from_std(index_command(home.path(), streaming, &resumed_trace))
+                .timeout(Duration::from_secs(180))
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+        verify_completed_summary(&resumed, if reusable { 6 } else { 8 });
         let log = fs::read_to_string(&resumed_trace).unwrap();
         let observations = source_observations(&log);
         assert_eq!(
@@ -227,10 +259,15 @@ fn gh426_bounded_stop_resumes_only_uncommitted_sources_in_both_modes() {
         }
         drop(storage);
         let upgraded_trace = home.path().join("upgraded-trace.jsonl");
-        assert_cmd::Command::from_std(index_command(home.path(), streaming, &upgraded_trace))
-            .timeout(Duration::from_secs(180))
-            .assert()
-            .success();
+        let upgraded =
+            assert_cmd::Command::from_std(index_command(home.path(), streaming, &upgraded_trace))
+                .timeout(Duration::from_secs(180))
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+        verify_completed_summary(&upgraded, if reusable { 2 } else { 8 });
         let log = fs::read_to_string(&upgraded_trace).unwrap();
         let observations = source_observations(&log);
         for (skipped, expected) in [
@@ -259,10 +296,15 @@ fn gh426_bounded_stop_resumes_only_uncommitted_sources_in_both_modes() {
         rows.push('\n');
         fs::write(&changed, rows).unwrap();
         let replay_trace = home.path().join("replay-trace.jsonl");
-        assert_cmd::Command::from_std(index_command(home.path(), streaming, &replay_trace))
-            .timeout(Duration::from_secs(180))
-            .assert()
-            .success();
+        let replay =
+            assert_cmd::Command::from_std(index_command(home.path(), streaming, &replay_trace))
+                .timeout(Duration::from_secs(180))
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+        verify_completed_summary(&replay, if reusable { 1 } else { 8 });
         let log = fs::read_to_string(&replay_trace).unwrap();
         let observations = source_observations(&log);
         assert_eq!(
@@ -345,5 +387,151 @@ fn gh426_sigterm_and_sigint_stop_at_commit_boundary_and_resume() {
             .assert()
             .success();
         verify_archive(home.path(), 80);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn gh426_batch_fallback_sigterm_and_sigint_preserve_committed_prefix() {
+    struct Guard(Child);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    for (signal, exit) in [("-TERM", 143), ("-INT", 130)] {
+        let home = tempfile::tempdir().unwrap();
+        // Claude completes through the boundary producer first. Aider then
+        // exercises the real non-streaming fallback, one durable batch at a
+        // time. Alternating prompt/answer blocks produce 32 native messages.
+        seed(home.path(), 1);
+        for source in 1..81 {
+            let term = source_term(source);
+            let root = if source == 1 {
+                home.path().to_path_buf()
+            } else {
+                home.path().join(format!("aider/project-{source}"))
+            };
+            fs::create_dir_all(&root).unwrap();
+            let history = (0..32)
+                .map(|message| {
+                    format!(
+                        "{}{term} exactresume{source}message{message} message {message}\n\n",
+                        if message % 2 == 0 { "> " } else { "" },
+                    )
+                })
+                .collect::<String>();
+            fs::write(root.join(".aider.chat.history.md"), history).unwrap();
+        }
+        let trace = home.path().join("fallback-signal-trace.jsonl");
+        let stderr = home.path().join("fallback-stderr");
+        let stdout = home.path().join("fallback-stdout");
+        let mut child = Guard(
+            index_command(home.path(), "0", &trace)
+                .env("CASS_AIDER_DATA_ROOT", home.path())
+                .env("CASS_NON_WATCH_INGEST_CHUNK_SIZE", "1")
+                .arg("--robot-trace-ingest")
+                .stdout(Stdio::from(fs::File::create(&stdout).unwrap()))
+                .stderr(Stdio::from(fs::File::create(&stderr).unwrap()))
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let log = fs::read_to_string(&stderr).unwrap();
+            let commits = log
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|event| {
+                    event["event"] == "ingest_batch"
+                        && event["status"] == "ok"
+                        && event["inserted_conversations"]
+                            .as_u64()
+                            .is_some_and(|count| count > 0)
+                })
+                .count();
+            if commits >= 2 {
+                break;
+            }
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "index exited before fallback signal: {log}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "no committed fallback batch before signal: {log}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            Command::new("kill")
+                .args([signal, &child.0.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fallback graceful stop timed out: {}",
+                fs::read_to_string(&stderr).unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(
+            status.code(),
+            Some(exit),
+            "{}",
+            fs::read_to_string(&stderr).unwrap()
+        );
+        let storage =
+            SqliteStorage::open_readonly(&home.path().join("data/agent_search.db")).unwrap();
+        let before = storage.list_conversations(1000, 0).unwrap();
+        assert!(
+            before.len() >= 2 && before.len() < 81,
+            "signal must leave a real committed prefix"
+        );
+        let prefix: Vec<_> = before
+            .into_iter()
+            .map(|conversation| {
+                let id = conversation.id.unwrap();
+                let messages = storage.fetch_messages(id).unwrap();
+                assert_eq!(messages.len(), 32);
+                (
+                    id,
+                    messages
+                        .into_iter()
+                        .map(|message| message.id)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        drop(storage);
+        let resumed_trace = home.path().join("fallback-resumed-trace.jsonl");
+        assert_cmd::Command::from_std(index_command(home.path(), "0", &resumed_trace))
+            .env("CASS_AIDER_DATA_ROOT", home.path())
+            .env("CASS_NON_WATCH_INGEST_CHUNK_SIZE", "1")
+            .timeout(Duration::from_secs(240))
+            .assert()
+            .success();
+        verify_archive(home.path(), 81);
+        let storage =
+            SqliteStorage::open_readonly(&home.path().join("data/agent_search.db")).unwrap();
+        for (id, expected_ids) in prefix {
+            let ids = storage
+                .fetch_messages(id)
+                .unwrap()
+                .into_iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                ids, expected_ids,
+                "fallback replay must preserve committed canonical IDs"
+            );
+        }
     }
 }

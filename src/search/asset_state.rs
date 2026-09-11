@@ -83,6 +83,7 @@ pub(crate) enum SearchMaintenanceJobKind {
     LexicalRefresh,
     SemanticAcquire,
     SemanticRebuild,
+    AnalyticsRebuild,
 }
 
 impl SearchMaintenanceJobKind {
@@ -91,6 +92,7 @@ impl SearchMaintenanceJobKind {
             Self::LexicalRefresh => "lexical_refresh",
             Self::SemanticAcquire => "semantic_acquire",
             Self::SemanticRebuild => "semantic_rebuild",
+            Self::AnalyticsRebuild => "analytics_rebuild",
         }
     }
 
@@ -99,6 +101,7 @@ impl SearchMaintenanceJobKind {
             "lexical_refresh" => Some(Self::LexicalRefresh),
             "semantic_acquire" => Some(Self::SemanticAcquire),
             "semantic_rebuild" => Some(Self::SemanticRebuild),
+            "analytics_rebuild" => Some(Self::AnalyticsRebuild),
             _ => None,
         }
     }
@@ -2501,6 +2504,7 @@ mod tests {
             SearchMaintenanceJobKind::LexicalRefresh,
             SearchMaintenanceJobKind::SemanticAcquire,
             SearchMaintenanceJobKind::SemanticRebuild,
+            SearchMaintenanceJobKind::AnalyticsRebuild,
         ] {
             assert_eq!(
                 SearchMaintenanceJobKind::parse_lock_value(kind.as_lock_value()),

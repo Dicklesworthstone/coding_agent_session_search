@@ -1233,6 +1233,13 @@ impl IndexingProgress {
     pub fn stop_requested(&self) -> bool {
         self.stop_requested.load(Ordering::Acquire)
     }
+
+    fn check_stop(&self) -> Result<()> {
+        if self.stop_requested() {
+            return Err(anyhow::Error::new(IndexInterrupted));
+        }
+        Ok(())
+    }
     pub(crate) fn phase_label_for(phase: usize) -> &'static str {
         match phase {
             INDEX_PHASE_PREPARING => "preparing",
@@ -14639,7 +14646,22 @@ fn run_batch_index_with_connector_factories(
         if fallback.is_empty() {
             return Ok(completed);
         }
-        return run_batch_index_with_connector_factories(
+        // The fallback pass replaces its phase-local progress statistics.
+        // Retain only the fields it replaces: source outcomes, diagnostics,
+        // quarantine counts and deferred flags already accumulate in place.
+        let boundary_stats = opts.progress.as_ref().and_then(|progress| {
+            let stats = progress.stats.lock().ok()?;
+            Some((
+                stats.scan_ms,
+                stats.index_ms,
+                stats.total_conversations,
+                stats.total_messages,
+                stats.connectors.clone(),
+                stats.agents_discovered.clone(),
+                progress.current.load(Ordering::Relaxed),
+            ))
+        });
+        let remaining = run_batch_index_with_connector_factories(
             storage,
             t_index,
             opts,
@@ -14650,8 +14672,78 @@ fn run_batch_index_with_connector_factories(
             fallback,
             scan_start_ts,
             progress_bump,
-        )
-        .map(|remaining| completed.accumulate(remaining));
+        );
+        if let (
+            Some(progress),
+            Some((
+                scan_ms,
+                index_ms,
+                conversations,
+                messages,
+                connectors,
+                agents,
+                completed_current,
+            )),
+        ) = (opts.progress.as_ref(), boundary_stats)
+        {
+            let merged_names = if let Ok(mut stats) = progress.stats.lock() {
+                // On error the fallback has not published its final stats;
+                // these fields still contain the boundary pass. Adding them
+                // again would double-count already committed work.
+                if remaining.is_ok() {
+                    stats.scan_ms = stats.scan_ms.saturating_add(scan_ms);
+                    stats.index_ms = stats.index_ms.saturating_add(index_ms);
+                    stats.total_conversations =
+                        stats.total_conversations.saturating_add(conversations);
+                    stats.total_messages = stats.total_messages.saturating_add(messages);
+                    stats.connectors.extend(connectors);
+                    stats
+                        .connectors
+                        .sort_by(|left, right| left.name.cmp(&right.name));
+                    stats.agents_discovered.extend(agents);
+                    stats.agents_discovered.sort();
+                    stats.agents_discovered.dedup();
+                }
+                Some((stats.agents_discovered.clone(), stats.total_conversations))
+            } else {
+                None
+            };
+            if let Some((names, total)) = merged_names {
+                if let Ok(mut discovered) = progress.discovered_agent_names.lock() {
+                    if remaining.is_ok() {
+                        *discovered = names;
+                    } else {
+                        discovered.extend(names);
+                        discovered.sort();
+                        discovered.dedup();
+                    }
+                    progress
+                        .discovered_agents
+                        .store(discovered.len(), Ordering::Relaxed);
+                }
+                if remaining.is_ok() {
+                    progress
+                        .phase
+                        .store(INDEX_PHASE_LEXICAL_INDEXING, Ordering::Relaxed);
+                    progress.total.store(total, Ordering::Relaxed);
+                    progress
+                        .current
+                        .fetch_add(completed_current, Ordering::Relaxed);
+                    progress.total_is_final.store(true, Ordering::Relaxed);
+                } else {
+                    // Keep a failing scan phase in connector units. Only an
+                    // ingest-phase counter can include prior conversations.
+                    if progress.phase.load(Ordering::Relaxed) == INDEX_PHASE_LEXICAL_INDEXING {
+                        progress.total.fetch_add(conversations, Ordering::Relaxed);
+                        progress
+                            .current
+                            .fetch_add(completed_current, Ordering::Relaxed);
+                    }
+                    progress.total_is_final.store(false, Ordering::Relaxed);
+                }
+            }
+        }
+        return remaining.map(|remaining| completed.accumulate(remaining));
     }
     let connector_factories = fallback;
     let scan_start = std::time::Instant::now();
@@ -14686,6 +14778,9 @@ fn run_batch_index_with_connector_factories(
     }
 
     let progress_ref = opts.progress.as_ref();
+    if let Some(progress) = progress_ref {
+        progress.check_stop()?;
+    }
     let data_dir = opts.data_dir.clone();
     let active_source_filter = Arc::new(ActiveSessionSourceFilter::new(
         opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
@@ -14707,6 +14802,9 @@ fn run_batch_index_with_connector_factories(
         connector_factories
             .into_par_iter()
             .filter_map(|(name, factory)| {
+                if progress_ref.is_some_and(|progress| progress.stop_requested()) {
+                    return None;
+                }
                 let conn = factory();
                 let detect = detect_for_local_scan(&local_connector_roots, || conn.detect());
                 let was_detected = detect.as_ref().is_some_and(|result| result.detected);
@@ -14945,6 +15043,11 @@ fn run_batch_index_with_connector_factories(
             })
             .collect();
 
+    // A non-streaming connector may not expose cancellation while parsing.
+    // Honor a signal before any of its collected conversations are persisted.
+    if let Some(progress) = &opts.progress {
+        progress.check_stop()?;
+    }
     // Post-parallel phase: collect discovered agent names with single mutex lock
     // This eliminates O(connectors) mutex acquisitions during parallel execution
     let scan_ms = scan_start.elapsed().as_millis() as u64;
@@ -15003,6 +15106,9 @@ fn run_batch_index_with_connector_factories(
     let mut ingest_outcome = NonWatchIngestOutcome::default();
     let mut scanned_connectors = BTreeSet::new();
     for pending in pending_batches {
+        if let Some(progress) = &opts.progress {
+            progress.check_stop()?;
+        }
         let batch_outcome = ingest_non_watch_batch_with_oom_split(
             storage,
             t_index.as_deref_mut(),
@@ -15110,6 +15216,18 @@ fn connector_local_scan_since_ts_from_state(
     }
 }
 
+fn connector_activity_time_lower_bound(name: &str, since_ts: Option<i64>) -> Option<i64> {
+    if name == "devin" {
+        // Devin persists activity in whole seconds. A commit in the watermark's
+        // second must remain eligible after the existing millisecond overlap.
+        // Keep this separate from watch scheduling, where delayed commits need
+        // an unrestricted provider scan.
+        since_ts.map(|ts| ts.div_euclid(1000).saturating_mul(1000))
+    } else {
+        since_ts
+    }
+}
+
 fn connector_local_scan_since_ts_map(
     storage: &FrankenStorage,
     fallback_since_ts: Option<i64>,
@@ -15142,7 +15260,10 @@ fn connector_local_scan_since_ts_map(
                     connector_has_conversations,
                 )
             };
-            Ok((*name, local_since_ts))
+            Ok((
+                *name,
+                connector_activity_time_lower_bound(name, local_since_ts),
+            ))
         })
         .collect()
 }
@@ -16952,7 +17073,7 @@ fn run_index_inner(
                 report_analytics_heartbeat();
             };
             let check_analytics_stop = || check_legacy_omp_analytics_stop(opts.progress.as_ref());
-            storage
+            let _ = storage
                 .rebuild_legacy_omp_analytics_with_progress(
                     Some(&report_analytics_progress),
                     Some(&report_analytics_heartbeat),
@@ -25450,6 +25571,9 @@ fn ingest_non_watch_batch_with_oom_split(
     defer_checkpoints: bool,
     progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
+    if let Some(progress) = progress {
+        progress.check_stop()?;
+    }
     if convs.is_empty() {
         return Ok(NonWatchIngestOutcome::default());
     }
@@ -25489,7 +25613,7 @@ fn ingest_non_watch_batch_with_oom_split(
         progress_bump,
     );
 
-    match first_attempt {
+    let outcome = match first_attempt {
         Ok(outcome) => Ok(outcome),
         Err(error) if error_is_out_of_memory(&error) => ingest_non_watch_oom_retry_or_quarantine(
             storage,
@@ -25502,7 +25626,11 @@ fn ingest_non_watch_batch_with_oom_split(
             error,
         ),
         Err(error) => Err(error),
+    }?;
+    if let Some(progress) = progress {
+        progress.check_stop()?;
     }
+    Ok(outcome)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -27471,7 +27599,7 @@ pub(crate) fn acquire_semantic_backfill_lock(
     )
 }
 
-fn acquire_search_maintenance_mutation_lock(
+pub(crate) fn acquire_search_maintenance_mutation_lock(
     data_dir: &Path,
     db_path: &Path,
     job_kind: SearchMaintenanceJobKind,
@@ -37648,6 +37776,42 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn gh424_analytics_maintenance_lock_reports_kind_and_excludes_other_writers() -> Result<()> {
+        use crate::search::asset_state::read_search_maintenance_snapshot;
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("agent_search.db");
+        let guard = acquire_search_maintenance_mutation_lock(
+            tmp.path(),
+            &db_path,
+            SearchMaintenanceJobKind::AnalyticsRebuild,
+        )?;
+        let snapshot = read_search_maintenance_snapshot(tmp.path());
+        assert!(snapshot.active);
+        assert_eq!(
+            snapshot.job_kind,
+            Some(SearchMaintenanceJobKind::AnalyticsRebuild)
+        );
+        assert!(
+            snapshot
+                .job_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("analytics_rebuild-"))
+        );
+        let Err(conflict) = acquire_semantic_backfill_lock(tmp.path(), &db_path) else {
+            anyhow::bail!("analytics did not exclude semantic/canonical maintenance");
+        };
+        assert!(format!("{conflict:#}").contains("already holds"));
+        drop(guard);
+        let retry = acquire_semantic_backfill_lock(tmp.path(), &db_path)?;
+        assert_eq!(
+            read_search_maintenance_snapshot(tmp.path()).job_kind,
+            Some(SearchMaintenanceJobKind::SemanticRebuild)
+        );
+        drop(retry);
+        Ok(())
+    }
+
     /// Regression for cass#265.
     ///
     /// Before this fix, every preflight step inside `run_index`'s
@@ -47385,6 +47549,45 @@ mod tests {
     }
 
     #[test]
+    fn devin_connector_watermark_includes_its_native_boundary_second() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let storage = FrankenStorage::open(&tmp.path().join("precision.sqlite"))?;
+        let watermark = 1_700_001_000_500;
+        for name in ["devin", "claude"] {
+            storage.set_connector_last_scan_ts(name, watermark)?;
+        }
+        let factories = get_connector_factories()
+            .into_iter()
+            .filter(|(name, _)| matches!(*name, "devin" | "claude"))
+            .collect::<Vec<_>>();
+        assert_eq!(factories.len(), 2);
+        let cutoffs = connector_local_scan_since_ts_map(&storage, Some(watermark), &factories)?;
+        assert_eq!(cutoffs["devin"], Some(1_700_001_000_000));
+        assert_eq!(cutoffs["claude"], Some(watermark - 1));
+        let full = connector_local_scan_since_ts_map(&storage, None, &factories)?;
+        assert!(full.values().all(Option::is_none));
+        for (input, expected) in [
+            (0, 0),
+            (999, 0),
+            (1000, 1000),
+            (-1, -1000),
+            (-1000, -1000),
+            (i64::MIN, i64::MIN),
+            (i64::MAX, i64::MAX - i64::MAX.rem_euclid(1000)),
+        ] {
+            assert_eq!(
+                connector_activity_time_lower_bound("devin", Some(input)),
+                Some(expected)
+            );
+            assert_eq!(
+                connector_activity_time_lower_bound("claude", Some(input)),
+                Some(input)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn configured_scan_root_watermark_policy_matches_source_kind() -> Result<()> {
         ensure_since_ts_matches(
             explicit_scan_root_since_ts(
@@ -48397,6 +48600,193 @@ mod tests {
             Some(message.as_str()),
             "progress tracker should expose the real panic instead of pretending indexing succeeded"
         );
+    }
+
+    #[test]
+    fn gh426_batch_boundary_stats_survive_undiscovered_fallback() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = temp.path().join("claude/projects/resume");
+        fs::create_dir_all(&root)?;
+        let source = root.join("summary.jsonl");
+        let messages = (0..2)
+            .map(|idx| {
+                serde_json::json!({
+                    "type":"user", "sessionId":"boundary-summary", "uuid":format!("summary-{idx}"),
+                    "timestamp":"2026-08-01T10:00:00Z", "cwd":"/work/resume",
+                    "message":{"role":"user", "content":format!("boundary summary message {idx}")}
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&source, format!("{messages}\n"))?;
+        let factories: Vec<_> = configured_connector_factories()
+            .into_iter()
+            .filter(|(name, _)| matches!(*name, "claude" | "aider"))
+            .collect();
+        assert_eq!(factories.len(), 2);
+        for (name, factory) in &factories {
+            assert_eq!(factory().supports_source_boundaries(), *name == "claude");
+        }
+        let data_dir = temp.path().join("data");
+        fs::create_dir_all(&data_dir)?;
+        let db_path = data_dir.join("archive.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let progress = Arc::new(IndexingProgress::default());
+        let opts = IndexOptions {
+            full: false,
+            force_rebuild: false,
+            watch: false,
+            watch_once_paths: None,
+            db_path,
+            data_dir,
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".into(),
+            progress: Some(Arc::clone(&progress)),
+            watch_interval_secs: 30,
+        };
+        // Real Claude parsing and SourceComplete ingestion, followed by a
+        // real Aider factory with no roots in the closed scan universe.
+        let outcome = run_batch_index_with_connector_factories(
+            &storage,
+            None,
+            &opts,
+            None,
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            Vec::new(),
+            Some(Arc::new(HashMap::from([
+                ("claude".to_string(), vec![source]),
+                ("aider".to_string(), Vec::new()),
+            ]))),
+            factories,
+            None,
+            None,
+        )?;
+        assert_eq!(outcome.inserted_conversations, 1);
+        assert_eq!(outcome.inserted_messages, 2);
+        assert_eq!(storage.source_ingest_ledger_entries()?.len(), 1);
+        assert_eq!(count_total_conversations_exact(&storage)?, 1);
+        assert_eq!(count_total_messages_exact(&storage)?, 2);
+        let stats = progress.stats.lock().unwrap();
+        assert_eq!((stats.total_conversations, stats.total_messages), (1, 2));
+        assert_eq!(stats.agents_discovered, vec!["claude"]);
+        assert_eq!(stats.connectors.len(), 1);
+        assert_eq!(stats.connectors[0].name, "claude");
+        assert_eq!(
+            (
+                stats.connectors[0].conversations,
+                stats.connectors[0].messages
+            ),
+            (1, 2)
+        );
+        assert!(stats.scan_ms >= stats.connectors[0].scan_ms);
+        assert_eq!(stats.connector_summary["claude"].indexed, 1);
+        drop(stats);
+        assert_eq!(progress.discovered_agents.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *progress.discovered_agent_names.lock().unwrap(),
+            vec!["claude"]
+        );
+        assert_eq!(
+            progress.phase.load(Ordering::Relaxed),
+            INDEX_PHASE_LEXICAL_INDEXING
+        );
+        assert_eq!(progress.total.load(Ordering::Relaxed), 1);
+        assert_eq!(progress.current.load(Ordering::Relaxed), 1);
+        assert!(progress.total_is_final.load(Ordering::Relaxed));
+        Ok(())
+    }
+
+    #[test]
+    fn gh426_non_watch_batch_stop_preserves_committed_prefix_and_resumes() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = temp.path().join("aider");
+        for source in 0..3 {
+            let project = root.join(format!("project-{source}"));
+            fs::create_dir_all(&project)?;
+            fs::write(
+                project.join(".aider.chat.history.md"),
+                format!(
+                    "> retained fallback prompt {source}\n\nretained fallback answer {source}\n"
+                ),
+            )?;
+        }
+        let data_dir = temp.path().join("data");
+        fs::create_dir_all(&data_dir)?;
+        let storage = FrankenStorage::open(&data_dir.join("archive.db"))?;
+        let context = ScanContext::with_roots(data_dir.clone(), vec![ScanRoot::local(root)], None);
+        let conversations = AiderConnector::new().scan(&context)?;
+        assert_eq!(conversations.len(), 3);
+        assert!(
+            conversations
+                .iter()
+                .all(|conversation| conversation.messages.len() == 2)
+        );
+        let progress = Some(Arc::new(IndexingProgress::default()));
+        let first = ingest_non_watch_batch_with_oom_split(
+            &storage,
+            None,
+            &data_dir,
+            &conversations[..1],
+            &progress,
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            true,
+            None,
+        )?;
+        assert_eq!(
+            (first.inserted_conversations, first.inserted_messages),
+            (1, 2)
+        );
+        let saved = storage.list_conversations(10, 0)?;
+        let id = saved[0].id.unwrap();
+        let before: Vec<_> = storage
+            .fetch_messages(id)?
+            .iter()
+            .map(|message| message.id)
+            .collect();
+        progress.as_ref().unwrap().request_stop();
+        let error = ingest_non_watch_batch_with_oom_split(
+            &storage,
+            None,
+            &data_dir,
+            &conversations[1..],
+            &progress,
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            true,
+            None,
+        )
+        .expect_err("stop at the next fallback batch must preserve the committed prefix");
+        assert!(error.downcast_ref::<IndexInterrupted>().is_some());
+        assert_eq!(count_total_conversations_exact(&storage)?, 1);
+        assert_eq!(count_total_messages_exact(&storage)?, 2);
+        assert_eq!(
+            progress.as_ref().unwrap().current.load(Ordering::Relaxed),
+            1
+        );
+        let resumed = ingest_non_watch_batch_with_oom_split(
+            &storage,
+            None,
+            &data_dir,
+            &conversations,
+            &Some(Arc::new(IndexingProgress::default())),
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            true,
+            None,
+        )?;
+        assert_eq!(
+            (resumed.inserted_conversations, resumed.inserted_messages),
+            (2, 4)
+        );
+        assert_eq!(count_total_conversations_exact(&storage)?, 3);
+        assert_eq!(count_total_messages_exact(&storage)?, 6);
+        let after: Vec<_> = storage
+            .fetch_messages(id)?
+            .iter()
+            .map(|message| message.id)
+            .collect();
+        assert_eq!(after, before);
+        Ok(())
     }
 
     #[test]

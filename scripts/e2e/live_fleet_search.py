@@ -69,7 +69,7 @@ def json_documents(text):
 
 def json_document(text):
     try:
-        return json.loads(text)
+        return json.loads(text)  # ubs:ignore -- UBS 5.3.13 misses the enclosing JSONDecodeError handler.
     except json.JSONDecodeError as error:
         # Keep malformed private command output in its existing receipt. An
         # exception should identify the location without echoing that content.

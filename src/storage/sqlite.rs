@@ -3970,6 +3970,49 @@ const LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY: &str =
 const SEMANTIC_FAST_IDENTITY_REBUILD_META_KEY: &str = "semantic_fast_identity_rebuild_v1";
 const SEMANTIC_QUALITY_IDENTITY_REBUILD_META_KEY: &str = "semantic_quality_identity_rebuild_v1";
 
+/// Read the durable analytics phase authority without opening a writer or
+/// changing migration state. Row parity cannot certify an identity rewrite.
+pub(crate) fn legacy_omp_analytics_pending(conn: &FrankenConnection) -> Result<bool> {
+    legacy_omp_analytics_pending_with_query(|sql| conn.query(sql))
+}
+
+pub(crate) fn legacy_omp_analytics_pending_with_query(
+    query: impl Fn(&str) -> std::result::Result<Vec<FrankenRow>, crate::franken_sync::FrankenError>,
+) -> Result<bool> {
+    if query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta' LIMIT 1")?
+        .is_empty()
+    {
+        return Ok(false);
+    }
+    let rows = query(
+        "SELECT key, value FROM meta WHERE key IN ('legacy_omp_reclassification_v2', 'legacy_omp_reclassification_v1', 'legacy_omp_reclassification_analytics_rebuilt_v1')",
+    )?;
+    let values = rows
+        .iter()
+        .map(|row| Ok((row.get_typed::<String>(0)?, row.get_typed::<String>(1)?)))
+        .collect::<Result<HashMap<_, _>>>()?;
+    let state = values
+        .get(LEGACY_OMP_RECLASSIFICATION_META_KEY)
+        .or_else(|| values.get(PREVIOUS_LEGACY_OMP_RECLASSIFICATION_META_KEY));
+    let Some(state) = state else { return Ok(false) };
+    if state.starts_with("complete:") || state == "complete" {
+        return Ok(false);
+    }
+    if state == "analytics_pending" {
+        return Ok(true);
+    }
+    let Some(context) = state
+        .strip_prefix("analytics_pending:")
+        .filter(|s| !s.is_empty())
+    else {
+        bail!("unexpected legacy OMP migration authority {state:?}");
+    };
+    Ok(values
+        .get(LEGACY_OMP_ANALYTICS_REBUILT_META_KEY)
+        .map(String::as_str)
+        != Some(context))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SemanticIdentityTier {
     Fast,
@@ -10490,39 +10533,44 @@ impl FrankenStorage {
     /// Rebuild every analytics derivative invalidated by the legacy OMP
     /// identity rewrite, reporting message-keyset progress to the owning
     /// indexer watchdog. The durable completion marker is written only after
-    /// all three derived tables finish successfully.
+    /// all three derived phases finish successfully. Returned values describe
+    /// actual Track A work, Track B rows, and Track B elapsed milliseconds.
     pub(crate) fn rebuild_legacy_omp_analytics_with_progress(
         &self,
         progress: Option<&dyn Fn(i64, i64)>,
         heartbeat: Option<&dyn Fn()>,
         control: Option<&dyn Fn() -> Result<()>>,
-    ) -> Result<()> {
+    ) -> Result<Option<(AnalyticsRebuildResult, usize, u64)>> {
         if let Some(control) = control {
             control()?;
         }
         let Some(context) = self.legacy_omp_pending_context()? else {
-            return Ok(());
+            return Ok(None);
         };
         if let Some(heartbeat) = heartbeat {
             heartbeat();
         }
-        self.rebuild_analytics_since_with_chunk_size_and_progress(
-            None,
-            LEGACY_OMP_ANALYTICS_CHUNK_SIZE,
-            progress,
-            heartbeat,
-            Some(context.as_str()),
-            control,
-        )
-        .with_context(|| "rebuilding analytics after legacy OMP identity upgrade")?;
+        let track_a = self
+            .rebuild_analytics_since_with_chunk_size_and_progress(
+                None,
+                LEGACY_OMP_ANALYTICS_CHUNK_SIZE,
+                progress,
+                heartbeat,
+                Some(context.as_str()),
+                control,
+            )
+            .with_context(|| "rebuilding analytics after legacy OMP identity upgrade")?;
         if let Some(progress) = progress {
             progress(0, 0);
         }
         if let Some(heartbeat) = heartbeat {
             heartbeat();
         }
-        self.rebuild_token_daily_stats_with_progress(heartbeat, control)
+        let track_b_start = std::time::Instant::now();
+        let track_b_rows = self
+            .rebuild_token_daily_stats_with_progress(heartbeat, control)
             .with_context(|| "rebuilding token rollups after legacy OMP identity upgrade")?;
+        let track_b_elapsed_ms = track_b_start.elapsed().as_millis() as u64;
         if let Some(progress) = progress {
             progress(0, 0);
         }
@@ -10535,7 +10583,7 @@ impl FrankenStorage {
             control()?;
         }
         self.record_legacy_omp_phase_complete(LEGACY_OMP_ANALYTICS_REBUILT_META_KEY)?;
-        Ok(())
+        Ok(Some((track_a, track_b_rows, track_b_elapsed_ms)))
     }
 
     /// Get the timestamp of the last successful index completion.
@@ -16731,11 +16779,12 @@ impl FrankenStorage {
         let mut reassociated = HashSet::new();
         for ((_, _, conv), outcome) in conversations.iter().zip(&outcomes) {
             if conv.external_id.is_some()
-                && cursor_workspace_attribution_is_authoritative(
-                    &conv.agent_slug,
-                    conv.workspace.as_deref(),
-                    &conv.metadata_json,
-                )
+                && (shelley_metadata_is_authoritative(conv)
+                    || cursor_workspace_attribution_is_authoritative(
+                        &conv.agent_slug,
+                        conv.workspace.as_deref(),
+                        &conv.metadata_json,
+                    ))
                 && reassociated.insert(outcome.conversation_id)
             {
                 franken_reassociate_cursor_analytics_workspace(&tx, outcome.conversation_id, conv)?;
@@ -20522,6 +20571,46 @@ impl FrankenStorage {
                     _ => None,
                 };
                 match candidate {
+                    Some((None, 0)) => {
+                        // The initial cursor certifies an empty derivative set.
+                        // A stale cursor over existing rows would replay additive
+                        // rollups even when metric INSERT OR IGNORE skips them.
+                        let mut empty = true;
+                        for table in [
+                            "message_metrics",
+                            "usage_hourly",
+                            "usage_daily",
+                            "usage_models_daily",
+                        ] {
+                            if let Some(control) = control {
+                                control()?;
+                            }
+                            let row: Option<i64> = self
+                                .conn
+                                .query_row_map(
+                                    &format!("SELECT 1 FROM {table} LIMIT 1"),
+                                    fparams![],
+                                    |row| row.get_typed(0),
+                                )
+                                .optional()
+                                .with_context(|| {
+                                    format!("validating initial analytics cursor against {table}")
+                                })?;
+                            if row.is_some() {
+                                empty = false;
+                                break;
+                            }
+                        }
+                        if empty {
+                            Some((None, 0))
+                        } else {
+                            tracing::warn!(
+                                target: "cass::analytics",
+                                "legacy OMP initial analytics cursor has nonempty derivatives; restarting from zero"
+                            );
+                            None
+                        }
+                    }
                     Some((Some(last_id), processed)) => {
                         // The cursor counts every fetched message row, including
                         // orphaned and out-of-window rows. Verify that its exact
@@ -27957,6 +28046,112 @@ mod tests {
             retained_schema, alternate_schema,
             "reset must preserve the alternate schema"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn gh424_stale_initial_analytics_cursor_rebuilds_without_double_counting() -> anyhow::Result<()>
+    {
+        const TABLES: [&str; 4] = [
+            "message_metrics",
+            "usage_hourly",
+            "usage_daily",
+            "usage_models_daily",
+        ];
+        fn snapshot(storage: &FrankenStorage, table: &str) -> Result<Vec<Vec<SqliteValue>>> {
+            // Compare every stored value except the rebuild's wall-clock stamp.
+            let columns: Vec<String> = storage.raw().query_map_collect(
+                &format!("PRAGMA table_info({table})"),
+                fparams![],
+                |row| row.get_typed(1),
+            )?;
+            let projection = columns
+                .into_iter()
+                .filter(|column| column != "last_updated")
+                .collect::<Vec<_>>()
+                .join(", ");
+            Ok(storage
+                .raw()
+                .query(&format!("SELECT {projection} FROM {table} ORDER BY rowid"))?
+                .iter()
+                .map(|row| row.values().to_vec())
+                .collect())
+        }
+
+        let dir = TempDir::new()?;
+        let storage = FrankenStorage::open(&dir.path().join("stale-start.db"))?;
+        let agent = gh423_agent(&storage);
+        let conversation = gh423_storage_snapshot();
+        storage
+            .insert_conversations_batched_with_analytics(&[(agent, None, &conversation)], false)?;
+        storage.rebuild_analytics_since_with_chunk_size(None, 128)?;
+        let canonical = snapshot(&storage, "messages")?;
+        assert!(!canonical.is_empty());
+        let expected = TABLES
+            .iter()
+            .map(|table| snapshot(&storage, table))
+            .collect::<Result<Vec<_>>>()?;
+        assert!(expected.iter().all(|rows| !rows.is_empty()));
+
+        // Each table alone must invalidate a stale start cursor, including
+        // rollup-only states with no metrics. The final case is a genuine
+        // empty start cursor and must resume without resetting again.
+        for retained in TABLES.into_iter().map(Some).chain([None]) {
+            storage.rebuild_analytics_since_with_chunk_size(None, 128)?;
+            let context = "gh424-stale-initial-cursor";
+            let mut tx = storage.raw().transaction()?;
+            for table in TABLES {
+                if retained != Some(table) {
+                    tx.execute(&format!("DELETE FROM {table}"))?;
+                }
+            }
+            for (key, value) in [
+                (LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY, context),
+                (LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY, "start"),
+                (LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY, "0"),
+            ] {
+                tx.execute_compat(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                    fparams![key, value],
+                )?;
+            }
+            tx.commit()?;
+            let reset_observed = std::cell::Cell::new(false);
+            let progress = |current, total| {
+                if current == 0 && total == 0 {
+                    reset_observed.set(true);
+                }
+            };
+            storage.rebuild_analytics_since_with_chunk_size_and_progress(
+                None,
+                128,
+                Some(&progress),
+                None,
+                Some(context),
+                None,
+            )?;
+            assert_eq!(reset_observed.get(), retained.is_some());
+            for replay in 0..2 {
+                if replay != 0 {
+                    storage.rebuild_analytics_since_with_chunk_size_and_progress(
+                        None,
+                        128,
+                        None,
+                        None,
+                        Some(context),
+                        None,
+                    )?;
+                }
+                for (table, expected_rows) in TABLES.iter().zip(&expected) {
+                    assert_eq!(
+                        snapshot(&storage, table)?,
+                        *expected_rows,
+                        "retained {retained:?}, replay {replay}, table {table}"
+                    );
+                }
+                assert_eq!(snapshot(&storage, "messages")?, canonical);
+            }
+        }
         Ok(())
     }
 
@@ -37432,6 +37627,60 @@ mod tests {
     }
 
     #[test]
+    fn gh424_legacy_omp_pending_authority_requires_matching_completion() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let storage = SqliteStorage::open(&dir.path().join("authority.db"))?;
+        assert!(!legacy_omp_analytics_pending(storage.raw())?);
+        storage.raw().execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams![
+                LEGACY_OMP_RECLASSIFICATION_META_KEY,
+                "analytics_pending:context-a"
+            ],
+        )?;
+        assert!(legacy_omp_analytics_pending(storage.raw())?);
+        storage.raw().execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams![LEGACY_OMP_ANALYTICS_REBUILT_META_KEY, "context-b"],
+        )?;
+        assert!(legacy_omp_analytics_pending(storage.raw())?);
+        storage.raw().execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams![LEGACY_OMP_ANALYTICS_REBUILT_META_KEY, "context-a"],
+        )?;
+        assert!(!legacy_omp_analytics_pending(storage.raw())?);
+        storage.raw().execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY, "analytics_pending"],
+        )?;
+        assert!(legacy_omp_analytics_pending(storage.raw())?);
+        let error = storage
+            .rebuild_legacy_omp_analytics_with_progress(None, None, None)
+            .expect_err("unbound legacy authority requires canonical indexing first");
+        assert!(format!("{error:#}").contains("unexpected marker state"));
+        let metrics: i64 = storage.raw().query_row_map(
+            "SELECT COUNT(*) FROM message_metrics",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(metrics, 0);
+        storage.raw().execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY, "broken-authority"],
+        )?;
+        assert!(legacy_omp_analytics_pending(storage.raw()).is_err());
+        let report = crate::analytics::validate::run_validation(storage.raw(), &Default::default());
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.id == "migration.legacy_omp_authority" && !check.ok)
+        );
+        assert!(crate::analytics::query::query_status(storage.raw(), &Default::default()).is_err());
+        Ok(())
+    }
+
+    #[test]
     #[serial]
     fn legacy_omp_reclassification_preserves_one_canonical_conversation() -> anyhow::Result<()> {
         let dir = TempDir::new()?;
@@ -37561,7 +37810,20 @@ mod tests {
         // analytics. A retry must retain only the analytics work; otherwise
         // every startup would repeat the expensive authoritative lexical
         // rebuild that already published successfully.
+        let mut canonical = storage.list_conversations(10, 0)?.remove(0);
+        canonical.messages = storage.fetch_messages(canonical.id.unwrap())?;
+        let lexical_path = dir.path().join("omp-lexical");
+        let mut lexical = crate::search::tantivy::TantivyIndex::open_or_create(&lexical_path)?;
+        let packet = crate::model::conversation_packet::ConversationPacket::from_canonical_replay(
+            &canonical,
+            crate::model::conversation_packet::ConversationPacketProvenance::local(),
+        );
+        lexical.add_messages_from_packet(&packet, None, canonical.id, |_| Ok(()))?;
+        lexical.commit()?;
+        drop(lexical);
+        let published_manifest = fs::read(lexical_path.join("MANIFEST"))?;
         storage.mark_legacy_omp_lexical_publish_complete()?;
+        assert!(legacy_omp_analytics_pending(storage.raw())?);
         assert_eq!(
             storage.reclassify_legacy_omp_conversations()?,
             LegacyOmpReclassificationResult {
@@ -37602,6 +37864,23 @@ mod tests {
         let pending = storage.reclassify_legacy_omp_conversations()?;
         assert!(!pending.lexical_rebuild_required);
         assert!(pending.analytics_rebuild_required);
+        assert!(legacy_omp_analytics_pending(storage.raw())?);
+        assert_eq!(fs::read(lexical_path.join("MANIFEST"))?, published_manifest);
+        let status = crate::analytics::query::query_status(storage.raw(), &Default::default())?;
+        assert!(
+            status
+                .drift
+                .signals
+                .iter()
+                .any(|signal| signal.signal == "legacy_omp_analytics_pending")
+        );
+        let report = crate::analytics::validate::run_validation(storage.raw(), &Default::default());
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.id == "migration.legacy_omp_analytics_pending" && !check.ok)
+        );
         let unknown_phases = std::cell::Cell::new(0_usize);
         let resumed_progress = |processed: i64, total: i64| {
             record_progress(processed, total);
@@ -37609,7 +37888,7 @@ mod tests {
                 unknown_phases.set(unknown_phases.get() + 1);
             }
         };
-        storage.rebuild_legacy_omp_analytics_with_progress(
+        let _ = storage.rebuild_legacy_omp_analytics_with_progress(
             Some(&resumed_progress),
             Some(&record_heartbeat),
             None,
@@ -37633,6 +37912,8 @@ mod tests {
             |row| row.get_typed(0),
         )?;
         assert_eq!(rebuilt_metrics_slug, "omp");
+        assert!(!legacy_omp_analytics_pending(storage.raw())?);
+        assert_eq!(fs::read(lexical_path.join("MANIFEST"))?, published_manifest);
         for cursor_key in [
             LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY,
             LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY,
@@ -38981,7 +39262,7 @@ mod tests {
         // The current-XDG guard has restored the pre-scan empty value.
         // Completion must promote the stored scan context, not hash this
         // changed environment after the lexical publish.
-        storage.rebuild_legacy_omp_analytics_with_progress(None, None, None)?;
+        let _ = storage.rebuild_legacy_omp_analytics_with_progress(None, None, None)?;
         storage.mark_legacy_omp_lexical_publish_complete()?;
         let completed_state: String = storage.conn.query_row_map(
             "SELECT value FROM meta WHERE key = ?1",

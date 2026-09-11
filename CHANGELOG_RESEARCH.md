@@ -1,5 +1,104 @@
 # CASS 0.8.0 changelog research
 
+Subsequent validation (2026-09-11 UTC, unreleased): v7 passed formatting,
+all-target Clippy, 178 library tests, 68 integration tests and 68 goldens.
+Two integration failures remain recorded: a Devin WAL append returned four
+instead of five messages, and the rebuilding-generation CLI test took its
+lock before its copied legacy fixture had a usable Quill generation. The
+source-resume SIGINT, SIGTERM and bounded-stop journeys all passed. Strict
+UBS remained red: the Rust module exceeded 300 seconds and Python reported
+one warning. Frozen development CLI SHA256:
+`802aa06f83454f1aeba732aff74f32309ab390711cbc579fe1d8ec0f6820ffc3`.
+The next frozen candidate includes the Devin whole-second cutoff correction,
+real fixture admission before the rebuild lock, one-pass conversation
+statistics, and explicit pending-analytics completion with maintenance
+exclusion. Its selected runtime checks are recorded below. A later comment-only
+Python change documents a narrow UBS 5.3.13 false positive: `json.loads` already has an
+enclosing `JSONDecodeError` handler. It is outside that frozen candidate and
+passed a separate strict pinned scan: one file, zero critical findings, zero
+warnings, and 49 informational findings. Sixteen JSON/error-path controls also
+passed. The same-line pragma applies to every finding on that line, not one
+rule. It does not resolve the Rust scanner timeout.
+
+The v8c gate finished on September 11 at 08:09 UTC: formatting and all-target
+Clippy passed, with 225 library, 86 integration and 68 golden passes. One OMP
+integration failed and one semantic test remained ignored. The new Devin
+same-second WAL append/replay test passed, as did all four deferred-watch
+journeys, five Shelley tests and three interrupted-resume journeys. The OMP
+failure occurred in a new test helper that parsed empty stdout after an
+expected failure; production fatal robot JSON is emitted on stderr. That
+helper also lost the child's stderr, so the original exact envelope cannot
+be recovered. A test-only correction preserves all existing assertions and
+adds exact error-code/stream checks. Its separate focused remote rerun passed:
+one test, zero failures, 11.00 seconds, with formatting and scoped Clippy also
+passing. The actual journey covers deferred search, full analytics completion,
+replay conservation, missing-marker refusal and all five held-lock conflicts.
+All other 3,751 frozen inputs, the original private Git HEAD, the broad-run
+receipts and the application binary stayed unchanged. The formatter-only
+patch was reviewed and applied to the canonical test; its SHA256 is
+`d42edfbd1bb44f6f67509c06acb135f0e80e07501ae3cfe63c7b6bf0f07a5051`.
+Focused receipt SHA256:
+`f51bc7bb92563b1f574779024377f939be13f0e4ee9c4592ffe33a0c758f2135`.
+The original frozen source stayed unchanged through the broad run. Receipt
+SHA256: `d9552cf8bd1bf7b31766b141594513c19212c7fd575cc8ebc1a9c149117014ef`.
+The full gate remains red: strict UBS timed out its Rust module at 300 seconds
+and reported the Python warning predating the separate comment-only fix.
+
+The v8c development executable
+`1182c93d1ba643a1988cb628796d6e33a29c2fed6fd81ca16d5f9af4f75d4241`
+was run once on the retained current archive copy. Statistics preserved all
+13,990 conversations, 2,410,329 messages, dates, agent counts and ordered
+workspace results. Elapsed time was 10.25 seconds and maximum RSS was
+1,498,792 KiB: no clear improvement over the retained earlier development
+run. Intervening analytics work changed the archive's physical state between
+runs, so this is not an identical-state performance comparison. The archive
+observations and executable stayed unchanged within this run, and the whole
+process group stopped without a guard intervention. No additional statistics
+run is warranted until a relevant implementation change is available.
+
+Original issue validation update (2026-09-11 UTC, unreleased): reviewed the
+source changes recorded in `ed7d166a` and the complete v6 remote gate receipt.
+The fixed snapshot passed formatting, all-target Clippy with warnings denied,
+175 selected library tests, 53 selected integration tests and 68 goldens.
+Two integration tests failed: Shelley batch metadata retained an old analytics
+workspace, and the 80-source signal fixture's prefix query matched neighboring
+source IDs. Both repairs and subsequent fallback-cancellation, progress and
+stale-cursor corrections await v7 validation. Strict UBS remains red because
+the pinned Rust scan times out and the Python scan reports findings; this is
+not release clearance. Frozen CLI SHA256:
+`9424674a31c3e0d28af3c4ad573d38ab2e2f32bc10762b4f122456706d9fc1bb`.
+The registry-backed source-resume test passed in both indexing modes. Bounded
+analytics-reset interruption/reopen and absent-FTS Codebuff storage controls
+also passed; the latter does not establish published Codebuff connector
+adoption. Current archive validation remains separate from original reporter
+archives: a retained 2,410,329-message copy resumed analytics through 595,664
+messages, then stopped with typed interruption/143 without forced termination.
+Its measured peak was 3,835,012 KiB. These corpus probes used development
+binaries from the test gate, not optimized release builds, and do not certify
+released performance. Old/new stats outputs agreed, but the approximately
+10-second runtime and 1.55 GB memory use did not improve in those runs.
+Private archives and machine identities are kept outside the repository.
+Separately, the official v0.8.0 Linux x86_64 asset was checked against its
+published archive checksum and executed once per search mode on the retained
+current copy. Both lexical and default-hybrid searches timed out during setup
+at the requested 3,000 ms and returned zero hits despite exit 0. Neither run
+demonstrates working search on that archive. The executable and archive
+observations were unchanged and both process groups stopped. This official
+release baseline uses different source and optimization settings from the
+development probes above; the timings are not an old/new performance comparison.
+A separate single invocation using the official release's unmodified default
+120,000 ms budget succeeded: five distinct hits, no timeout, 6.94 seconds and
+2,558,324 KiB maximum RSS. Hybrid intent fell back to lexical because model
+download consent was absent; no model was downloaded. Source archive and
+executable observations were unchanged, and all child processes stopped.
+This establishes default-command retrieval on this current copy. It does not
+satisfy the earlier three-second probes, memory targets, semantic retrieval,
+or original-reporter acceptance. The earlier short-budget failures must not
+be read as proof that default search cannot finish.
+GitHub metadata still identifies v0.8.0 as the published 2026-09-10 release;
+these subsequent source changes are unreleased. Original issue acceptance
+remains open.
+
 Original issue implementation follow-up (2026-09-11 UTC, unreleased): Prime
 explicit-file routing, migration-aware schema-only storage admission, known
 legacy hash-space rebuilding, and completed-backfill no-op caching are under

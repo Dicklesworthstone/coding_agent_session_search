@@ -61,6 +61,472 @@ fn runtime_connector(name: &str) -> Box<dyn Connector + Send> {
 }
 
 #[test]
+fn gh424_deferred_omp_analytics_cli_maintenance_preserves_published_search() -> anyhow::Result<()> {
+    use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
+    use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use coding_agent_search::storage::sqlite::SqliteStorage;
+    use fs2::FileExt;
+    use serde_json::Value;
+    use std::time::Duration;
+
+    let temp = tempfile::tempdir()?;
+    let home = temp.path();
+    let data_dir = home.join("cass state");
+    fs::create_dir_all(&data_dir)?;
+    let db_path = home.join("custom archive.db");
+    // A historical canonical archive fixture, not a claim of live application history.
+    let storage = SqliteStorage::open(&db_path)?;
+    let agent = storage.ensure_agent(&Agent {
+        id: None,
+        slug: "pi_agent".into(),
+        name: "Pi Agent".into(),
+        version: None,
+        kind: AgentKind::Cli,
+    })?;
+    let conversation = Conversation {
+        id: None,
+        agent_slug: "pi_agent".into(),
+        workspace: None,
+        external_id: Some("legacy-omp-maintenance".into()),
+        title: Some("OMP repair".into()),
+        source_path: home.join(".omp/agent/sessions/work/legacy.jsonl"),
+        started_at: Some(1_700_000_000_000),
+        ended_at: Some(1_700_000_001_000),
+        approx_tokens: None,
+        metadata_json: json!({"source":"pi_agent"}),
+        source_id: "local".into(),
+        origin_host: None,
+        messages: (0..2)
+            .map(|idx| Message {
+                id: None,
+                idx,
+                role: if idx == 0 {
+                    MessageRole::User
+                } else {
+                    MessageRole::Agent
+                },
+                author: None,
+                created_at: Some(1_700_000_000_000 + idx * 1_000),
+                content: format!("omprepairproofz original message {idx}"),
+                extra_json: json!({}),
+                snippets: vec![],
+            })
+            .collect(),
+    };
+    storage.insert_conversations_batched(&[(agent, None, &conversation)])?;
+    storage.rebuild_analytics()?;
+    storage.rebuild_token_daily_stats()?;
+    storage.rebuild_daily_stats()?;
+    let ledger_totals = |storage: &SqliteStorage| -> anyhow::Result<(i64, i64, i64, i64)> {
+        Ok(storage.raw().query_row_map("SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(total_tokens), 0) FROM token_usage", &[],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)))?)
+    };
+    let token_rollup_totals = |storage: &SqliteStorage| -> anyhow::Result<(i64, i64, i64, i64)> {
+        Ok(storage.raw().query_row_map("SELECT api_call_count, total_input_tokens, total_output_tokens, grand_total_tokens FROM token_daily_stats WHERE agent_slug = 'all' AND source_id = 'all' AND model_family = 'all'", &[],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)))?)
+    };
+    let daily_totals = |storage: &SqliteStorage| -> anyhow::Result<(i64, i64, i64)> {
+        Ok(storage.raw().query_row_map("SELECT session_count, message_count, total_chars FROM daily_stats WHERE agent_slug = 'all' AND source_id = 'all'", &[],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)))?)
+    };
+    // These are the actual persisted estimates, not an API-usage parsing oracle.
+    let original_ledger = ledger_totals(&storage)?;
+    assert_eq!(original_ledger.0, 2);
+    assert!(original_ledger.3 > 0);
+    let original_token_rollup = token_rollup_totals(&storage)?;
+    assert_eq!(original_token_rollup, original_ledger);
+    let original_daily = daily_totals(&storage)?;
+    assert_eq!((original_daily.0, original_daily.1), (1, 2));
+    assert!(original_daily.2 > 0);
+    storage.raw().execute("INSERT INTO meta(key, value) VALUES('legacy_omp_reclassification_v1', 'analytics_pending')")?;
+    let original_id = storage.list_conversations(10, 0)?[0].id.unwrap();
+    let original_ids: Vec<_> = storage
+        .fetch_messages(original_id)?
+        .iter()
+        .map(|m| m.id)
+        .collect();
+    storage.close()?;
+
+    let command = |args: &[&str], defer: bool| -> Command {
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        cmd.env_clear()
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("PATH", "/usr/bin:/bin")
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("CASS_DATA_DIR", &data_dir)
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("RUST_MIN_STACK", "134217728")
+            .env(
+                "CASS_DEFER_ANALYTICS_UPDATES",
+                if defer { "1" } else { "0" },
+            )
+            .current_dir(home)
+            .arg("--db")
+            .arg(&db_path)
+            .args(args)
+            .arg("--data-dir")
+            .arg(&data_dir);
+        cmd
+    };
+    let parse_output =
+        |args: &[&str], output: &std::process::Output, expected_success: bool| -> Value {
+            let diagnostic = format!(
+                "args={args:?}; status={}; stdout={}; stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.status.success(), expected_success, "{diagnostic}");
+            if expected_success {
+                serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                    panic!("invalid success stdout JSON: {error}; {diagnostic}")
+                })
+            } else {
+                assert!(
+                    output.stdout.is_empty(),
+                    "failure emitted stdout; {diagnostic}"
+                );
+                // main::handle_fatal_error emits the terminal robot envelope on
+                // stderr, after any analytics progress diagnostics.
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let terminal = stderr
+                    .lines()
+                    .rev()
+                    .find(|line| !line.trim().is_empty())
+                    .unwrap_or_else(|| panic!("missing failure stderr JSON; {diagnostic}"));
+                let envelope: Value = serde_json::from_str(terminal).unwrap_or_else(|error| {
+                    panic!("invalid failure stderr JSON: {error}; {diagnostic}")
+                });
+                assert_eq!(
+                    envelope["error"]["code"].as_i64(),
+                    output.status.code().map(i64::from),
+                    "error envelope and process exit disagree; {diagnostic}"
+                );
+                envelope
+            }
+        };
+    let run = |args: &[&str], defer: bool, expected_success: bool| -> Value {
+        let output = assert_cmd::Command::from_std(command(args, defer))
+            .timeout(Duration::from_secs(120))
+            .output()
+            .unwrap_or_else(|error| panic!("CLI failed to complete: {error}; args={args:?}"));
+        parse_output(args, &output, expected_success)
+    };
+    let refused = run(
+        &["analytics", "rebuild", "--track", "all", "--json"],
+        false,
+        false,
+    );
+    assert_eq!(refused["error"]["code"], 9, "{refused}");
+    assert_eq!(refused["error"]["kind"], "rebuild-error", "{refused}");
+    assert_eq!(refused["error"]["retryable"], true, "{refused}");
+    let refusal = refused.to_string();
+    assert!(
+        refusal.contains("cannot rebuild legacy OMP analytics without a migration marker"),
+        "{refused}"
+    );
+    assert!(
+        refusal.contains("custom archive.db") && refusal.contains("cass state"),
+        "{refused}"
+    );
+    let before_index = SqliteStorage::open_readonly(&db_path)?;
+    let legacy_state: String = before_index.raw().query_row_map(
+        "SELECT value FROM meta WHERE key = 'legacy_omp_reclassification_v1'",
+        &[],
+        |row| row.get_typed(0),
+    )?;
+    assert_eq!(legacy_state, "analytics_pending");
+    let v2_rows: i64 = before_index.raw().query_row_map(
+        "SELECT COUNT(*) FROM meta WHERE key = 'legacy_omp_reclassification_v2'",
+        &[],
+        |row| row.get_typed(0),
+    )?;
+    assert_eq!(v2_rows, 0);
+    assert_eq!(
+        before_index.list_conversations(10, 0)?[0].agent_slug,
+        "pi_agent"
+    );
+    assert_eq!(
+        before_index
+            .fetch_messages(original_id)?
+            .iter()
+            .map(|m| m.id)
+            .collect::<Vec<_>>(),
+        original_ids
+    );
+    let metrics_before_index: i64 = before_index.raw().query_row_map(
+        "SELECT COUNT(*) FROM message_metrics WHERE agent_slug = 'pi_agent'",
+        &[],
+        |row| row.get_typed(0),
+    )?;
+    assert_eq!(metrics_before_index, 2);
+    assert_eq!(ledger_totals(&before_index)?, original_ledger);
+    assert_eq!(token_rollup_totals(&before_index)?, original_token_rollup);
+    assert_eq!(daily_totals(&before_index)?, original_daily);
+    before_index.close_without_checkpoint()?;
+    run(&["index", "--full", "--json"], true, true);
+    let lexical_path = coding_agent_search::search::tantivy::expected_index_dir(&data_dir);
+    let manifest = fs::read(lexical_path.join("MANIFEST"))?;
+    let search = || {
+        let result = run(
+            &[
+                "search",
+                "omprepairproofz",
+                "--agent",
+                "omp",
+                "--mode",
+                "lexical",
+                "--json",
+                "--no-maintenance",
+                "--limit",
+                "10",
+            ],
+            false,
+            true,
+        );
+        assert_eq!(result["hits"].as_array().unwrap().len(), 2, "{result}");
+    };
+    search();
+    let assert_pending = || {
+        let status = run(&["analytics", "status", "--json"], false, true);
+        assert_eq!(
+            status["data"]["recommended_action"], "rebuild_all",
+            "{status}"
+        );
+        let signal = status["data"]["drift"]["signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|signal| signal["signal"] == "legacy_omp_analytics_pending")
+            .unwrap();
+        assert!(
+            signal["detail"]
+                .as_str()
+                .unwrap()
+                .contains("custom archive.db")
+        );
+        let validation = run(&["analytics", "validate", "--json"], false, true);
+        let check = validation["data"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["id"] == "migration.legacy_omp_analytics_pending")
+            .unwrap();
+        assert_eq!(check["ok"], false);
+        assert!(
+            check["suggested_action"]
+                .as_str()
+                .unwrap()
+                .contains("custom archive.db")
+        );
+    };
+    assert_pending();
+    // A single-track rebuild can make every Track A bucket agree while the
+    // all-projection migration authority must remain pending.
+    run(
+        &["analytics", "rebuild", "--track", "a", "--json"],
+        false,
+        true,
+    );
+    assert_pending();
+    let scoped = run(
+        &[
+            "analytics",
+            "rebuild",
+            "--track",
+            "all",
+            "--since",
+            "2023-11-14",
+            "--json",
+        ],
+        false,
+        true,
+    );
+    assert!(scoped["data"]["since_ms"].is_i64(), "{scoped}");
+    assert_pending();
+    let doctor = run(&["doctor", "--json"], false, true);
+    let check = doctor["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "legacy_omp_analytics")
+        .unwrap();
+    assert_eq!(check["status"], "warn");
+    assert_eq!(check["fix_applied"], false);
+    assert!(
+        check["message"]
+            .as_str()
+            .unwrap()
+            .contains("custom archive.db")
+    );
+
+    // A real advisory lock makes the conflict deterministic. No child is
+    // allowed to open the writer, migrate schema, or reset any projection.
+    let held_lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(data_dir.join("index-run.lock"))?;
+    held_lock.try_lock_exclusive()?;
+    let db_before_busy = fs::read(&db_path)?;
+    let wal_path = db_path.with_extension("db-wal");
+    let wal_before_busy = if wal_path.exists() {
+        Some(fs::read(&wal_path)?)
+    } else {
+        None
+    };
+    for args in [
+        vec!["analytics", "rebuild", "--track", "all", "--json"],
+        vec!["analytics", "rebuild", "--track", "a", "--json"],
+        vec!["analytics", "rebuild", "--track", "b", "--json"],
+        vec![
+            "analytics",
+            "rebuild",
+            "--track",
+            "all",
+            "--since",
+            "2023-11-14",
+            "--json",
+        ],
+        vec!["analytics", "validate", "--fix", "--json"],
+    ] {
+        let output = assert_cmd::Command::from_std(command(&args, false))
+            .timeout(Duration::from_secs(30))
+            .assert()
+            .code(7)
+            .get_output()
+            .clone();
+        let error = parse_output(&args, &output, false);
+        assert_eq!(error["error"]["code"], 7, "{error}");
+        assert_eq!(error["error"]["kind"], "index-busy", "{error}");
+        assert_eq!(error["error"]["retryable"], true, "{error}");
+        assert_eq!(fs::read(&db_path)?, db_before_busy);
+        let wal_after_busy = if wal_path.exists() {
+            Some(fs::read(&wal_path)?)
+        } else {
+            None
+        };
+        assert_eq!(wal_after_busy, wal_before_busy);
+    }
+    // Read-only validation remains usable while another maintenance owner holds the lock.
+    run(&["analytics", "validate", "--json"], false, true);
+    assert_eq!(fs::read(&db_path)?, db_before_busy);
+    let wal_after_read = if wal_path.exists() {
+        Some(fs::read(&wal_path)?)
+    } else {
+        None
+    };
+    assert_eq!(wal_after_read, wal_before_busy);
+    drop(held_lock);
+    assert_pending();
+    let rebuilt = run(
+        &["analytics", "rebuild", "--track", "all", "--json"],
+        false,
+        true,
+    );
+    assert_eq!(rebuilt["data"]["tracks_rebuilt"], json!(["a", "b"]));
+    assert_eq!(rebuilt["data"]["track_a"]["message_metrics_rows"], 2);
+    let storage = SqliteStorage::open_readonly(&db_path)?;
+    assert_eq!(storage.list_conversations(10, 0)?.len(), 1);
+    let canonical = &storage.list_conversations(10, 0)?[0];
+    assert_eq!(canonical.id, Some(original_id));
+    assert_eq!(canonical.agent_slug, "omp");
+    assert_eq!(
+        storage
+            .fetch_messages(original_id)?
+            .iter()
+            .map(|m| m.id)
+            .collect::<Vec<_>>(),
+        original_ids
+    );
+    let state: String = storage.raw().query_row_map(
+        "SELECT value FROM meta WHERE key = 'legacy_omp_reclassification_v2'",
+        &[],
+        |row| row.get_typed(0),
+    )?;
+    assert!(state.starts_with("complete:"), "{state}");
+    let metric_count: i64 = storage.raw().query_row_map(
+        "SELECT COUNT(*) FROM message_metrics WHERE agent_slug = 'omp'",
+        &[],
+        |row| row.get_typed(0),
+    )?;
+    assert_eq!(metric_count, 2);
+    let daily_messages: i64 =
+        storage
+            .raw()
+            .query_row_map("SELECT SUM(message_count) FROM usage_daily", &[], |row| {
+                row.get_typed(0)
+            })?;
+    assert_eq!(daily_messages, 2);
+    let stale_metrics: i64 = storage.raw().query_row_map(
+        "SELECT COUNT(*) FROM message_metrics WHERE agent_slug = 'pi_agent'",
+        &[],
+        |row| row.get_typed(0),
+    )?;
+    assert_eq!(stale_metrics, 0);
+    assert_eq!(ledger_totals(&storage)?, original_ledger);
+    assert_eq!(token_rollup_totals(&storage)?, original_token_rollup);
+    assert_eq!(daily_totals(&storage)?, original_daily);
+    let omp_ledger_rows: i64 = storage.raw().query_row_map("SELECT COUNT(*) FROM token_usage t JOIN agents a ON a.id = t.agent_id WHERE a.slug = 'omp'", &[], |row| row.get_typed(0))?;
+    assert_eq!(omp_ledger_rows, original_ledger.0);
+    let stale_token_rollups: i64 = storage.raw().query_row_map(
+        "SELECT COUNT(*) FROM token_daily_stats WHERE agent_slug = 'pi_agent'",
+        &[],
+        |row| row.get_typed(0),
+    )?;
+    assert_eq!(stale_token_rollups, 0);
+    let stale_daily_rows: i64 = storage.raw().query_row_map(
+        "SELECT COUNT(*) FROM daily_stats WHERE agent_slug = 'pi_agent'",
+        &[],
+        |row| row.get_typed(0),
+    )?;
+    assert_eq!(stale_daily_rows, 0);
+    storage.close_without_checkpoint()?;
+    let status = run(&["analytics", "status", "--json"], false, true);
+    assert!(
+        !status["data"]["drift"]["signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|signal| signal["signal"] == "legacy_omp_analytics_pending")
+    );
+    search();
+    assert_eq!(fs::read(lexical_path.join("MANIFEST"))?, manifest);
+    run(
+        &["analytics", "rebuild", "--track", "all", "--json"],
+        false,
+        true,
+    );
+    run(&["analytics", "validate", "--fix", "--json"], false, true);
+    let replay = SqliteStorage::open_readonly(&db_path)?;
+    assert_eq!(replay.list_conversations(10, 0)?.len(), 1);
+    assert_eq!(
+        replay
+            .fetch_messages(original_id)?
+            .iter()
+            .map(|m| m.id)
+            .collect::<Vec<_>>(),
+        original_ids
+    );
+    let replay_daily_messages: i64 =
+        replay
+            .raw()
+            .query_row_map("SELECT SUM(message_count) FROM usage_daily", &[], |row| {
+                row.get_typed(0)
+            })?;
+    assert_eq!(replay_daily_messages, 2);
+    assert_eq!(ledger_totals(&replay)?, original_ledger);
+    assert_eq!(token_rollup_totals(&replay)?, original_token_rollup);
+    assert_eq!(daily_totals(&replay)?, original_daily);
+    assert_eq!(fs::read(lexical_path.join("MANIFEST"))?, manifest);
+    Ok(())
+}
+
+#[test]
 fn omp_v18_profiles_are_first_class_and_not_scanned_by_pi_agent() {
     let temp = tempfile::tempdir().expect("tempdir");
     let home = temp.path().join("copied-home");

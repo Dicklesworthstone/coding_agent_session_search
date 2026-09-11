@@ -16,8 +16,9 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 ---
 
 Scope window: this update covers the changes after the 2026-08-31 v0.7.1
-binary release, through the 2026-09-10 v0.8.0 binary release. Earlier version
-entries retain their existing scope. Git commits, release metadata, and Beads supply
+binary release, through the 2026-09-10 v0.8.0 binary release and the unreleased
+2026-09-11 follow-ups. Earlier version entries retain their existing scope.
+Git commits, release metadata, and Beads supply
 the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ## Release Timeline
@@ -31,6 +32,24 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- Devin incremental scans retain messages committed within the watermark's
+  whole second. WAL-only appends and replay preserve message identity (#449).
+- Pending OMP analytics repair appears in status, validation and doctor.
+  A full, unscoped analytics rebuild completes all affected projections;
+  scoped repairs retain the pending state. Analytics mutations share the
+  data directory's maintenance lock with indexing (#413, #426).
+- Interrupted indexing can resume from durably completed source files. Reuse
+  checks the parser build contract and source observations, so changed files,
+  changed parsers and incomplete sources are parsed again (#426).
+- Legacy analytics repair commits bounded message batches and retains a resume
+  cursor. Cancellation preserves completed work, and progress identifies the
+  analytics phase in message units. Initial clearing of ordinary rowid tables
+  is also batched; unexpected `WITHOUT ROWID` layouts retain the transactional
+  fallback. These bounds do not cap total process memory (#413, #426).
+- `stats` reports storage failures as errors instead of successful zero counts.
+  Empty archives and unmatched source filters still return real zeros. Agent
+  and workspace ordering remains deterministic; large-archive latency and
+  memory requirements remain open (#452).
 - Explicit Prime watch requests keep the selected file scope and classify
   `.prime/agent/sessions` correctly (#388).
 - Current-schema archive opens avoid the engine's whole-database hydration

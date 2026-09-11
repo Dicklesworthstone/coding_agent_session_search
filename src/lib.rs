@@ -18365,7 +18365,17 @@ fn run_analytics_status(
     let filter = analytics_query_filter(&conn, common)?;
 
     analytics::query::query_status(&conn, &filter)
-        .map(|r| r.to_json())
+        .map(|mut r| {
+            let db_path = analytics_db_path(&common.data_dir, db_path_override);
+            let data_dir = resolve_data_dir(&common.data_dir, db_path_override);
+            for signal in &mut r.drift.signals {
+                if signal.signal == "legacy_omp_analytics_pending" {
+                    signal.detail = format!("Canonical OMP identity changed; analytics completion remains pending. Run {} without --since/--days.",
+                        cass_dataset_command(&data_dir, &db_path, &["analytics", "rebuild", "--track", "all", "--json"]));
+                }
+            }
+            r.to_json()
+        })
         .map_err(analytics_query_cli_error)
 }
 
@@ -18571,12 +18581,34 @@ fn format_rebuild_cutoff(since_ms: i64) -> String {
         .unwrap_or_else(|| format!("{day_start_ms} ms"))
 }
 
-/// Run `cass analytics rebuild` — rebuild analytics rollup tables.
-///
-/// Track A (message_metrics + usage_hourly + usage_daily +
-/// usage_models_daily) is rebuilt from `messages`, optionally windowed by
-/// `--since`/`--days` (GH #412). Track B (token_daily_stats) is rebuilt from
-/// the `token_usage` ledger and is always full.
+/// Serialize analytics mutations with indexing and other maintenance for this data directory.
+fn acquire_analytics_maintenance_lock(
+    data_dir: &Path,
+    db_path: &Path,
+) -> CliResult<crate::indexer::SearchMaintenanceMutationGuard> {
+    crate::indexer::acquire_search_maintenance_mutation_lock(
+        data_dir,
+        db_path,
+        crate::search::asset_state::SearchMaintenanceJobKind::AnalyticsRebuild,
+    )
+    .map_err(|error| {
+        let rendered = format!("{error:#}");
+        if error_chain_indicates_active_cass_index(&rendered) {
+            return active_index_run_details(data_dir, db_path)
+                .map(|details| details.to_cli_error())
+                .unwrap_or_else(|| index_storage_contention_cli_error(&rendered));
+        }
+        CliError {
+            code: 5,
+            kind: CliErrorKind::Storage.kind_str(),
+            message: format!("Failed to acquire analytics maintenance lock: {rendered}"),
+            hint: Some(format!("Check permissions under {}.", data_dir.display())),
+            retryable: true,
+        }
+    })
+}
+
+/// Rebuild Track A (optionally windowed) and/or the full Track B ledger rollups.
 fn run_analytics_rebuild(
     common: &AnalyticsCommon,
     _force: bool,
@@ -18608,6 +18640,10 @@ fn run_analytics_rebuild(
         });
     }
 
+    // Hold through all phase transactions and the final storage checkpoint.
+    // Acquiring before the writer opens also protects schema repair writes.
+    let maintenance_guard = acquire_analytics_maintenance_lock(&data_dir, &db_path)?;
+    let maintenance_progress = maintenance_guard.progress_atomic();
     let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
         code: 9,
         kind: CliErrorKind::DbError.kind_str(),
@@ -18621,6 +18657,64 @@ fn run_analytics_rebuild(
     let overall_start = std::time::Instant::now();
     let mut tracks_rebuilt: Vec<&str> = Vec::new();
     let mut payload = serde_json::Map::new();
+
+    // Only the full, unscoped operation can complete the migration's
+    // all-projection authority. Single-track/windowed repairs retain it.
+    let legacy_omp_rebuild = if track == AnalyticsTrack::All && since_ms.is_none() {
+        let pending =
+            crate::storage::sqlite::legacy_omp_analytics_pending(storage.raw()).map_err(|e| {
+                CliError {
+                    code: 9,
+                    kind: CliErrorKind::DbError.kind_str(),
+                    message: format!("Failed to read OMP analytics authority: {e:#}"),
+                    hint: Some(format!(
+                        "Run {}.",
+                        cass_dataset_command(&data_dir, &db_path, &["doctor", "--json"],)
+                    )),
+                    retryable: true,
+                }
+            })?;
+        if pending {
+            eprintln!("Resuming pending OMP analytics identity repair...");
+            let last_processed = std::cell::Cell::new(None::<i64>);
+            let report_committed_progress = |processed: i64, _total: i64| {
+                // The first callback reports an existing resume cursor, not
+                // new work. Only subsequent committed message advancement
+                // refreshes the forward-progress timestamp.
+                if last_processed
+                    .replace(Some(processed))
+                    .is_some_and(|prior| processed > prior)
+                {
+                    maintenance_progress.store(
+                        FrankenStorage::now_millis(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+            };
+            // Resume the stored ownership context. An analytics command must
+            // never reclassify canonical identities behind a published index.
+            // Legacy unbound markers require the indexing migration first.
+            let rebuilt = storage.rebuild_legacy_omp_analytics_with_progress(Some(&report_committed_progress), None, None)
+                .map_err(|e| CliError {
+                    code: 9,
+                    kind: CliErrorKind::RebuildError.kind_str(),
+                    message: format!("OMP analytics repair failed: {e:#}"),
+                    hint: Some(format!("Retry {} to resume committed analytics progress. If the migration marker has no ownership context, run {} first to migrate canonical identity and publish lexical search.",
+                        cass_dataset_command(&data_dir, &db_path, &["analytics", "rebuild", "--track", "all", "--json"]),
+                        cass_dataset_command(&data_dir, &db_path, &["index", "--json"]))),
+                    retryable: true,
+                })?;
+            maintenance_progress.store(
+                FrankenStorage::now_millis(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            rebuilt
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // The window only ever applies to Track A; advertising it in the JSON
     // payload for a Track-B-only run would tell automation a window was
@@ -18641,8 +18735,10 @@ fn run_analytics_rebuild(
             ),
             None => eprintln!("Rebuilding analytics (Track A)..."),
         }
-        let result = storage
-            .rebuild_analytics_since(since_ms)
+        let result = legacy_omp_rebuild
+            .as_ref()
+            .map(|(result, _, _)| Ok(result.clone()))
+            .unwrap_or_else(|| storage.rebuild_analytics_since(since_ms))
             .map_err(|e| CliError {
                 code: 9,
                 kind: CliErrorKind::RebuildError.kind_str(),
@@ -18687,16 +18783,24 @@ fn run_analytics_rebuild(
             eprintln!("Rebuilding analytics (Track B: token_daily_stats)...");
         }
         let track_b_start = std::time::Instant::now();
-        let rows_created = storage.rebuild_token_daily_stats().map_err(|e| CliError {
-            code: 9,
-            kind: CliErrorKind::ArchiveTokenDailyStatsRebuild.kind_str(),
-            message: format!("Track B (token_daily_stats) rebuild failed: {e}"),
-            hint: Some(
-                "The token_usage ledger may be corrupt — run 'cass doctor check --json'.".into(),
-            ),
-            retryable: true,
-        })?;
-        let track_b_elapsed_ms = track_b_start.elapsed().as_millis() as u64;
+        let rows_created = legacy_omp_rebuild
+            .as_ref()
+            .map(|(_, rows, _)| Ok(*rows))
+            .unwrap_or_else(|| storage.rebuild_token_daily_stats())
+            .map_err(|e| CliError {
+                code: 9,
+                kind: CliErrorKind::ArchiveTokenDailyStatsRebuild.kind_str(),
+                message: format!("Track B (token_daily_stats) rebuild failed: {e}"),
+                hint: Some(
+                    "The token_usage ledger may be corrupt — run 'cass doctor check --json'."
+                        .into(),
+                ),
+                retryable: true,
+            })?;
+        let track_b_elapsed_ms = legacy_omp_rebuild
+            .as_ref()
+            .map(|(_, _, elapsed)| *elapsed)
+            .unwrap_or_else(|| track_b_start.elapsed().as_millis() as u64);
         eprintln!(
             "Track B complete: {rows_created} token_daily_stats rows in {track_b_elapsed_ms}ms"
         );
@@ -19112,8 +19216,34 @@ fn run_analytics_validate(
     };
     let db_path = analytics_db_path(&common.data_dir, db_path_override);
 
+    let _maintenance_guard = if fix {
+        Some(acquire_analytics_maintenance_lock(
+            &resolve_data_dir(&common.data_dir, db_path_override),
+            &db_path,
+        )?)
+    } else {
+        None
+    };
     let pre_conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
-    let pre_report = analytics::validate::run_validation(&pre_conn, &config);
+    let mut pre_report = analytics::validate::run_validation(&pre_conn, &config);
+    let scope_pending_action = |report: &mut analytics::validate::ValidationReport| {
+        for check in &mut report.checks {
+            if check.id == "migration.legacy_omp_analytics_pending" {
+                check.suggested_action = Some(cass_dataset_command(
+                    &resolve_data_dir(&common.data_dir, db_path_override),
+                    &db_path,
+                    &["analytics", "rebuild", "--track", "all", "--json"],
+                ));
+            } else if check.id == "migration.legacy_omp_authority" {
+                check.suggested_action = Some(cass_dataset_command(
+                    &resolve_data_dir(&common.data_dir, db_path_override),
+                    &db_path,
+                    &["doctor", "--json"],
+                ));
+            }
+        }
+    };
+    scope_pending_action(&mut pre_report);
     let pre_summary = analytics_validation_summary(&pre_report);
     let repair_plan = fix.then(|| analytics::validate::build_repair_plan(&pre_report));
 
@@ -19254,6 +19384,7 @@ fn run_analytics_validate(
 
     let conn = open_franken_analytics_db(&common.data_dir, db_path_override)?;
     let mut report = analytics::validate::run_validation(&conn, &config);
+    scope_pending_action(&mut report);
     if fix {
         annotate_deferred_analytics_failures(&mut report, &deferred_check_ids);
     }
@@ -35301,6 +35432,71 @@ fn stats_query_error(operation: &str, err: crate::franken_sync::FrankenError) ->
     }
 }
 
+#[derive(Default)]
+struct UnfilteredConversationStats {
+    count: i64,
+    agents: HashMap<Option<i64>, i64>,
+    workspaces: HashMap<i64, i64>,
+    oldest: Option<i64>,
+    newest: Option<i64>,
+}
+
+fn unfiltered_conversation_stats(
+    conn: &crate::franken_sync::Connection,
+) -> Result<UnfilteredConversationStats, crate::franken_sync::FrankenError> {
+    use crate::franken_sync::compat::RowExt as _;
+
+    let deadline = std::time::Instant::now() + CLI_DB_QUERY_RETRY_TIMEOUT;
+    let mut backoff = Duration::from_millis(4);
+    loop {
+        // A failed streaming attempt may have delivered a prefix. Discard that
+        // attempt's entire fold before retrying, so rows cannot be counted twice.
+        let mut stats = UnfilteredConversationStats::default();
+        let mut callback_failed = false;
+        let result = conn.query_with_params_for_each(
+            "SELECT agent_id, workspace_id, started_at FROM conversations",
+            &[],
+            |row| {
+                let values = (|| {
+                    Ok::<_, crate::franken_sync::FrankenError>((
+                        row.get_typed::<Option<i64>>(0)?,
+                        row.get_typed::<Option<i64>>(1)?,
+                        row.get_typed::<Option<i64>>(2)?,
+                    ))
+                })()
+                .inspect_err(|_| callback_failed = true)?;
+                let (agent, workspace, started_at) = values;
+                stats.count += 1;
+                *stats.agents.entry(agent).or_default() += 1;
+                if let Some(workspace) = workspace {
+                    *stats.workspaces.entry(workspace).or_default() += 1;
+                }
+                if let Some(started_at) = started_at {
+                    stats.oldest = Some(stats.oldest.map_or(started_at, |old| old.min(started_at)));
+                    stats.newest = Some(stats.newest.map_or(started_at, |old| old.max(started_at)));
+                }
+                Ok(())
+            },
+        );
+        match result {
+            Ok(()) => return Ok(stats),
+            Err(err) if callback_failed => return Err(err),
+            Err(err) if crate::storage::sqlite::retryable_franken_error(&err) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(err);
+                }
+                crate::storage::sqlite::sleep_with_franken_retry_backoff(
+                    &mut backoff,
+                    deadline.saturating_duration_since(now),
+                    Duration::from_millis(64),
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 fn append_source_filter_condition(
     sql: &mut String,
     params: &mut Vec<crate::franken_sync::compat::ParamValue>,
@@ -35429,10 +35625,23 @@ fn run_stats(
     let conversation_sql =
         format!("SELECT COUNT(*) FROM conversations c{source_join}{source_where}");
     let message_sql = stats_message_count_sql(source_join, &source_where);
+    let mut unfiltered = if source_join.is_empty() && source_where.is_empty() {
+        Some(unfiltered_conversation_stats(&conn).map_err(|err| {
+            stats_query_error(
+                "count conversations, group agents/workspaces, and read conversation date range",
+                err,
+            )
+        })?)
+    } else {
+        None
+    };
 
-    let conversation_count: i64 =
+    let conversation_count: i64 = if let Some(stats) = &unfiltered {
+        stats.count
+    } else {
         franken_query_row_map_retry(&conn, &conversation_sql, &params, |r| r.get_typed(0))
-            .map_err(|err| stats_query_error("count conversations", err))?;
+            .map_err(|err| stats_query_error("count conversations", err))?
+    };
 
     let message_count: i64 =
         franken_query_row_map_retry(&conn, &message_sql, &params, |r| r.get_typed(0))
@@ -35447,11 +35656,14 @@ fn run_stats(
         .collect();
 
     let agent_sql = stats_agent_count_sql(source_join, &source_where);
-    let mut agent_count_rows: Vec<(Option<i64>, i64)> =
+    let mut agent_count_rows: Vec<(Option<i64>, i64)> = if let Some(stats) = &mut unfiltered {
+        std::mem::take(&mut stats.agents).into_iter().collect()
+    } else {
         franken_query_map_collect_retry(&conn, &agent_sql, &params, |r| {
             Ok((r.get_typed::<Option<i64>>(0)?, r.get_typed::<i64>(1)?))
         })
-        .map_err(|e| CliError::unknown(format!("query: {e}")))?;
+        .map_err(|e| CliError::unknown(format!("query: {e}")))?
+    };
     sort_stats_counts(&mut agent_count_rows);
     let agent_rows: Vec<(String, i64)> = agent_count_rows
         .into_iter()
@@ -35472,11 +35684,14 @@ fn run_stats(
         .collect();
 
     let ws_sql = stats_workspace_count_sql(source_join, &source_where);
-    let mut workspace_count_rows: Vec<(i64, i64)> =
+    let mut workspace_count_rows: Vec<(i64, i64)> = if let Some(stats) = &mut unfiltered {
+        std::mem::take(&mut stats.workspaces).into_iter().collect()
+    } else {
         franken_query_map_collect_retry(&conn, &ws_sql, &params, |r| {
             Ok((r.get_typed::<i64>(0)?, r.get_typed::<i64>(1)?))
         })
-        .map_err(|e| CliError::unknown(format!("query: {e}")))?;
+        .map_err(|e| CliError::unknown(format!("query: {e}")))?
+    };
     sort_stats_counts(&mut workspace_count_rows);
     let ws_rows: Vec<(String, i64)> = workspace_count_rows
         .into_iter()
@@ -35500,11 +35715,14 @@ fn run_stats(
             "SELECT MIN(started_at), MAX(started_at) FROM conversations c{source_join}{source_where} AND started_at IS NOT NULL"
         )
     };
-    let (oldest, newest): (Option<i64>, Option<i64>) =
+    let (oldest, newest): (Option<i64>, Option<i64>) = if let Some(stats) = &unfiltered {
+        (stats.oldest, stats.newest)
+    } else {
         franken_query_row_map_retry(&conn, &date_sql, &params, |r| {
             Ok((r.get_typed(0)?, r.get_typed(1)?))
         })
-        .map_err(|err| stats_query_error("read conversation date range", err))?;
+        .map_err(|err| stats_query_error("read conversation date range", err))?
+    };
     let raw_mirror_summary = crate::raw_mirror::storage_summary(&data_dir);
 
     // Get per-source breakdown if requested (P3.7)
@@ -37323,6 +37541,7 @@ fn doctor_anomaly_for_check(name: &str, status: &str, message: &str) -> DoctorAn
         "repair_failure_marker" => DoctorAnomaly::RepairPreviouslyFailed,
         "post_repair_probes" => DoctorAnomaly::RepairPreviouslyFailed,
         "derivative_cleanup" => DoctorAnomaly::DegradedDerivedAssets,
+        "legacy_omp_analytics" => DoctorAnomaly::DegradedDerivedAssets,
         "config" | "sources_config" | "config_exclusion_risks" => {
             DoctorAnomaly::ConfigExclusionRisk
         }
@@ -37446,6 +37665,7 @@ fn doctor_safe_auto_manual_next_command(check: &DoctorCheckReport) -> &'static s
         }
         "candidate_staging" | "coverage_comparison_gate" => "cass doctor repair --dry-run --json",
         "storage_pressure" | "full_rebuild_readiness" => "cass doctor cleanup --json",
+        "legacy_omp_analytics" => "cass analytics rebuild --track all --json",
         _ => "cass doctor check --json",
     }
 }
@@ -87403,6 +87623,7 @@ struct DoctorBoundedArchiveDbProbe {
     integrity: Option<Result<DoctorDatabaseIntegrityProbe, String>>,
     integrity_skipped_reason: Option<String>,
     fts_state: Option<DoctorFtsTableState>,
+    legacy_omp_analytics_pending: Result<bool, String>,
 }
 
 enum DoctorBoundedArchiveDbProbeOutcome {
@@ -87865,6 +88086,10 @@ fn run_bounded_doctor_archive_db_probe(
         let mut integrity = None;
         let mut integrity_skipped_reason = None;
         let mut fts_state = None;
+        set_phase("legacy_omp_analytics_authority");
+        let legacy_omp_analytics_pending =
+            crate::storage::sqlite::legacy_omp_analytics_pending_with_query(|sql| conn.query(sql))
+                .map_err(|error| format!("{error:#}"));
         if conv_count.is_some() && msg_count.is_some() {
             if let Some(reason) = deep_integrity_skip_reason {
                 set_phase("integrity_probe_deferred_large_archive");
@@ -87887,6 +88112,7 @@ fn run_bounded_doctor_archive_db_probe(
             integrity,
             integrity_skipped_reason,
             fts_state,
+            legacy_omp_analytics_pending,
         });
     });
 
@@ -88426,6 +88652,40 @@ pub(crate) fn run_doctor_impl(
                         doctor_archive_db_probe_hard_timeout(doctor_archive_bundle_bytes(&db_path));
                     match run_bounded_doctor_archive_db_probe(conn, &db_path, probe_timeout) {
                         DoctorBoundedArchiveDbProbeOutcome::Completed(probe) => {
+                            match &probe.legacy_omp_analytics_pending {
+                                Ok(false) => {}
+                                Ok(true) => {
+                                    add_check!(
+                                        "legacy_omp_analytics",
+                                        "warn",
+                                        format!(
+                                            "OMP analytics identity repair is pending even if table counts match; lexical publication is independent. Run {} without --since/--days.",
+                                            cass_dataset_command(
+                                                &data_dir,
+                                                &db_path,
+                                                &[
+                                                    "analytics",
+                                                    "rebuild",
+                                                    "--track",
+                                                    "all",
+                                                    "--json"
+                                                ]
+                                            )
+                                        ),
+                                        false
+                                    );
+                                }
+                                Err(error) => {
+                                    add_check!(
+                                        "legacy_omp_analytics",
+                                        "warn",
+                                        format!(
+                                            "OMP analytics completion authority could not be read: {error}; inspect the archive before maintenance."
+                                        ),
+                                        false
+                                    );
+                                }
+                            }
                             if let (Some(conv_count), Some(msg_count)) =
                                 (probe.conv_count, probe.msg_count)
                             {
@@ -110262,11 +110522,52 @@ mod legacy_source_filter_tests {
     fn stats_grouping_preserves_sql_results_with_large_unused_payloads() {
         use crate::franken_sync::compat::{ConnectionExt as _, RowExt as _};
 
+        fn assert_fold_matches_sql(conn: &crate::franken_sync::Connection) {
+            let folded = unfiltered_conversation_stats(conn).expect("stream real statistics");
+            let count: i64 = conn
+                .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                    row.get_typed(0)
+                })
+                .expect("SQL count oracle");
+            assert_eq!(folded.count, count);
+            let dates: (Option<i64>, Option<i64>) = conn
+                .query_row_map(
+                    "SELECT MIN(started_at), MAX(started_at) FROM conversations WHERE started_at IS NOT NULL",
+                    &[],
+                    |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+                )
+                .expect("SQL date oracle");
+            assert_eq!((folded.oldest, folded.newest), dates);
+            let mut agents: Vec<(Option<i64>, i64)> = conn
+                .query_map_collect(
+                    "SELECT agent_id, COUNT(*) FROM conversations GROUP BY agent_id ORDER BY COUNT(*) DESC",
+                    &[],
+                    |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+                )
+                .expect("SQL agent oracle");
+            let mut folded_agents: Vec<_> = folded.agents.into_iter().collect();
+            sort_stats_counts(&mut agents);
+            sort_stats_counts(&mut folded_agents);
+            assert_eq!(folded_agents, agents);
+            let mut workspaces: Vec<(i64, i64)> = conn
+                .query_map_collect(
+                    "SELECT workspace_id, COUNT(*) FROM conversations WHERE workspace_id IS NOT NULL GROUP BY workspace_id ORDER BY COUNT(*) DESC",
+                    &[],
+                    |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+                )
+                .expect("SQL workspace oracle");
+            let mut folded_workspaces: Vec<_> = folded.workspaces.into_iter().collect();
+            sort_stats_counts(&mut workspaces);
+            sort_stats_counts(&mut folded_workspaces);
+            assert_eq!(folded_workspaces, workspaces);
+        }
+
         let tmp = tempfile::tempdir().expect("temporary archive");
         let path = tmp.path().join("stats.db");
         let writer = crate::franken_sync::Connection::open(path.to_string_lossy().into_owned())
             .expect("create archive");
-        writer.execute("CREATE TABLE conversations (id INTEGER PRIMARY KEY, agent_id INTEGER, workspace_id INTEGER, source_id TEXT, origin_host TEXT, payload TEXT)").expect("conversations");
+        writer.execute("CREATE TABLE conversations (id INTEGER PRIMARY KEY, agent_id INTEGER, workspace_id INTEGER, source_id TEXT, origin_host TEXT, payload TEXT, started_at INTEGER)").expect("conversations");
+        assert_fold_matches_sql(&writer);
         writer
             .execute("CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT)")
             .expect("sources");
@@ -110275,7 +110576,7 @@ mod legacy_source_filter_tests {
         for id in 1..=24_i64 {
             writer
                 .execute_compat(
-                    "INSERT INTO conversations VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO conversations VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     crate::franken_sync::params![
                         id,
                         (id % 4 != 0).then_some(id % 3),
@@ -110286,14 +110587,24 @@ mod legacy_source_filter_tests {
                             _ => "registered-local",
                         },
                         if id % 3 == 1 { Some("remote-a") } else { None },
-                        payload.as_str()
+                        payload.as_str(),
+                        (id % 4 != 0).then_some((id - 12) * 1000)
                     ],
                 )
                 .expect("payload-heavy conversation");
         }
+        assert_fold_matches_sql(&writer);
+        writer
+            .execute("UPDATE conversations SET started_at = NULL")
+            .expect("plant all-NULL dates");
+        assert_fold_matches_sql(&writer);
+        writer
+            .execute("UPDATE conversations SET started_at = CASE WHEN id % 4 != 0 THEN (id - 12) * 1000 ELSE NULL END")
+            .expect("restore mixed pre-epoch and NULL dates");
         writer.close().expect("publish archive");
         let conn = open_franken_cli_read_db(path, "stats parity", Duration::from_secs(5))
             .expect("same reader as stats");
+        assert_fold_matches_sql(&conn);
         for (label, sql, expected_route) in [
             (
                 "old",

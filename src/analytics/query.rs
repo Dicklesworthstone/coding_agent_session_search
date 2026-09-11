@@ -1317,6 +1317,15 @@ pub fn query_status(conn: &Connection, filter: &AnalyticsFilter) -> AnalyticsRes
     };
 
     let mut drift_signals: Vec<DriftSignal> = Vec::new();
+    let legacy_omp_pending = crate::storage::sqlite::legacy_omp_analytics_pending(conn)
+        .map_err(|error| AnalyticsError::Db(format!("{error:#}")))?;
+    if legacy_omp_pending {
+        drift_signals.push(DriftSignal {
+            signal: "legacy_omp_analytics_pending".into(),
+            detail: "Canonical OMP identity changed; analytics remain pending even when row counts match. Complete the full, unscoped analytics rebuild for this archive.".into(),
+            severity: "error".into(),
+        });
+    }
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1400,7 +1409,9 @@ pub fn query_status(conn: &Connection, filter: &AnalyticsFilter) -> AnalyticsRes
     let has_error_drift = drift_signals.iter().any(|s| s.severity == "error");
     let has_warning_drift = drift_signals.iter().any(|s| s.severity == "warning");
 
-    let recommended_action = if has_error_drift {
+    let recommended_action = if legacy_omp_pending {
+        "rebuild_all"
+    } else if has_error_drift {
         if mm.row_count == 0 && tu.row_count == 0 {
             "rebuild_all"
         } else if mm.row_count > 0 && (uh.row_count == 0 || ud.row_count == 0) {
@@ -1448,8 +1459,8 @@ pub fn query_status(conn: &Connection, filter: &AnalyticsFilter) -> AnalyticsRes
         },
         drift: DriftInfo {
             signals: drift_signals,
-            track_a_fresh,
-            track_b_fresh,
+            track_a_fresh: track_a_fresh && !legacy_omp_pending,
+            track_b_fresh: track_b_fresh && !legacy_omp_pending,
         },
         recommended_action: recommended_action.into(),
     })

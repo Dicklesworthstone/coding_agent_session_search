@@ -22,6 +22,8 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
+use clap::Parser;
+use coding_agent_search::{Cli, Commands, search::query::SearchMode};
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
@@ -279,11 +281,46 @@ fn timed_out_search_returns_before_slow_operation_and_names_shed_sections() -> T
             format!("search timeout omitted skipped section {section}: {budget}"),
         )?;
     }
+    let recommendation = budget["recommended_next_probe"]
+        .as_str()
+        .ok_or_else(|| test_error("search timeout omitted its bounded retry"))?;
+    let retry_args = shell_words::split(recommendation)?;
     ensure(
-        budget["recommended_next_probe"]
-            .as_str()
-            .is_some_and(|probe| probe.contains("cass search") && probe.contains("--timeout")),
-        "search timeout did not recommend a bounded search retry",
+        retry_args.first().is_some_and(|arg| arg == "cass"),
+        "search retry named a different executable",
+    )?;
+    // A dataset-scoped retry puts the global --db before the subcommand.
+    // Parse its real CLI contract instead of requiring the literal prefix
+    // "cass search", which rejects correctly preserved database selection.
+    let retry = Cli::try_parse_from(retry_args)?;
+    ensure(
+        retry.db == Some(data_dir.join("agent_search.db")),
+        "search retry changed the database",
+    )?;
+    let Some(Commands::Search {
+        query,
+        data_dir: retry_data,
+        timeout: Some(retry_timeout),
+        mode: Some(SearchMode::Lexical),
+        json: true,
+        robot_meta: true,
+        rerank: true,
+        explain: true,
+        aggregate: Some(aggregate),
+        ..
+    }) = retry.command
+    else {
+        return Err(test_error(
+            "search retry lost requested mode or output flags",
+        ));
+    };
+    ensure(
+        query == "hello" && retry_data.as_ref() == Some(&data_dir) && aggregate == ["agent"],
+        "search retry changed the query, dataset, or aggregation",
+    )?;
+    ensure(
+        retry_timeout > 120 && retry_timeout <= 300_000,
+        "search retry did not preserve a larger bounded timeout",
     )?;
     ensure(
         payload.get("aggregations").is_none() && payload.get("explanation").is_none(),

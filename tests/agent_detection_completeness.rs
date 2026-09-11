@@ -1091,6 +1091,141 @@ mod devin_ingestion {
     }
 
     #[test]
+    fn devin_same_second_wal_append_and_replay_preserve_five_messages() {
+        use coding_agent_search::storage::sqlite::SqliteStorage;
+
+        const SECOND: i64 = 1_700_001_000;
+        for streaming in ["0", "1"] {
+            let home = tempfile::tempdir().expect("isolated Devin precision home");
+            let db = home.path().join("sessions.db");
+            let data = home.path().join("cass-data");
+            seed_store(&db);
+            cass(home.path(), &data)
+                .env("CASS_STREAMING_INDEX", streaming)
+                .args(["index", "--full", "--json"])
+                .assert()
+                .success();
+
+            let save_watermark = || {
+                let storage = SqliteStorage::open(&data.join("agent_search.db"))
+                    .expect("open canonical metadata");
+                storage
+                    .set_last_scan_ts(SECOND * 1000 + 500)
+                    .expect("global watermark");
+                storage
+                    .set_connector_last_scan_ts("devin", SECOND * 1000 + 500)
+                    .expect("Devin watermark");
+                storage.close().expect("close canonical writer before CLI");
+            };
+            save_watermark();
+            let writer = Connection::open(db.to_string_lossy().as_ref()).expect("Devin WAL writer");
+            writer
+                .execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
+                .expect("retain live WAL");
+            writer
+                .execute_compat(
+                    "INSERT INTO message_nodes VALUES (8, 'kept', 5, ?1, ?2)",
+                    params![
+                        json!({"role":"user", "content":"devinneedle followup"}).to_string(),
+                        SECOND
+                    ],
+                )
+                .expect("append boundary-second turn");
+            writer
+                .execute_compat(
+                    "UPDATE sessions SET main_chain_id = 8, last_activity_at = ?1 WHERE id = 'kept'",
+                    params![SECOND],
+                )
+                .expect("advance boundary-second chain");
+            writer
+                .execute_compat(
+                    "INSERT INTO sessions VALUES ('prior', 'prior second', NULL, NULL, NULL, ?1, ?1, 9, 0)",
+                    params![SECOND - 1],
+                )
+                .expect("insert eligible older negative control");
+            writer
+                .execute_compat(
+                    "INSERT INTO message_nodes VALUES (9, 'prior', NULL, ?1, ?2)",
+                    params![
+                        json!({"role":"user", "content":"priorsecondneedle"}).to_string(),
+                        SECOND - 1
+                    ],
+                )
+                .expect("insert prior-second control message");
+            assert!(
+                fs::metadata(db.with_extension("db-wal"))
+                    .expect("live WAL")
+                    .len()
+                    > 32
+            );
+            let before = source_bundle_bytes(&db);
+            let (_, factory) = get_connector_factories()
+                .into_iter()
+                .find(|(slug, _)| *slug == "devin")
+                .expect("Devin factory");
+            let mut ctx = ScanContext::with_roots(
+                home.path().to_path_buf(),
+                vec![ScanRoot::local(db.clone())],
+                None,
+            );
+            assert_eq!(
+                factory().scan(&ctx).expect("both visible controls").len(),
+                2
+            );
+            // This is the cutoff selected from SECOND*1000+500 by the
+            // production watermark map, independently covered by its unit test.
+            ctx.since_ts = Some(SECOND * 1000);
+            let eligible = factory().scan(&ctx).expect("native boundary cutoff");
+            assert_eq!(eligible.len(), 1, "prior second must remain excluded");
+            assert_eq!(eligible[0].external_id.as_deref(), Some("kept"));
+            assert_eq!(eligible[0].messages.len(), 5);
+
+            for replay in 0..2 {
+                // Persist an exact half-second watermark, avoiding wall-clock
+                // timing or sleeps. Reset it for replay so both invocations
+                // must parse the same boundary-second provider state.
+                if replay > 0 {
+                    save_watermark();
+                }
+                cass(home.path(), &data)
+                    .env("CASS_STREAMING_INDEX", streaming)
+                    .args(["index", "--json"])
+                    .assert()
+                    .success();
+                for (query, expected) in [("devinneedle", 5), ("priorsecondneedle", 0)] {
+                    let output = cass(home.path(), &data)
+                        .args([
+                            "search", query, "--mode", "lexical", "--agent", "devin", "--json",
+                            "--limit", "20",
+                        ])
+                        .assert()
+                        .success()
+                        .get_output()
+                        .stdout
+                        .clone();
+                    let result: Value = serde_json::from_slice(&output).expect("search JSON");
+                    assert_eq!(
+                        result["budget"]["timed_out"].as_bool(),
+                        Some(false),
+                        "a timed-out search cannot prove prior-second exclusion: {result}"
+                    );
+                    assert_eq!(
+                        result["hits"].as_array().expect("hits").len(),
+                        expected,
+                        "streaming={streaming} replay={replay}: {result}"
+                    );
+                }
+                assert_eq!(
+                    source_bundle_bytes(&db),
+                    before,
+                    "source conservation during replay"
+                );
+            }
+            drop(writer);
+        }
+    }
+
+    #[test]
     fn devin_file_override_watch_ingests_wal_only_commit_without_touching_source() {
         use std::process::{Child, Stdio};
         use std::time::Instant;

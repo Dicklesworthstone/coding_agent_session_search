@@ -275,6 +275,10 @@ fn hold_active_lexical_rebuild_lock(
     )
     .expect("write rebuild state");
 
+    hold_lexical_rebuild_lock_only(data_dir, db_path)
+}
+
+fn hold_lexical_rebuild_lock_only(data_dir: &Path, db_path: &Path) -> fs::File {
     let lock_path = data_dir.join("index-run.lock");
     let mut lock_file = fs::OpenOptions::new()
         .create(true)
@@ -3309,7 +3313,39 @@ fn search_robot_meta_includes_fallback_and_cache_stats() {
 fn search_cursor_manifest_marks_rebuilding_generation_best_effort() -> Result<(), Box<dyn Error>> {
     let data_dir = isolated_search_demo_data()?;
     let db_path = data_dir.path().join("agent_search.db");
-    let _lock = hold_active_lexical_rebuild_lock(data_dir.path(), &db_path, true, None);
+    util::prepare_copied_search_fixture(data_dir.path())?;
+    let index_path = coding_agent_search::search::tantivy::expected_index_dir(data_dir.path());
+    assert!(index_path.join("MANIFEST").is_file());
+    let checkpoint_path = index_path.join(".lexical-rebuild-state.json");
+    let checkpoint_bytes = fs::read(&checkpoint_path)?;
+    let checkpoint: Value = serde_json::from_slice(&checkpoint_bytes)?;
+    assert_eq!(
+        checkpoint["completed"], true,
+        "real fixture repair must finish"
+    );
+
+    let mut baseline = base_cmd();
+    baseline.args([
+        "search",
+        "hello",
+        "--json",
+        "--mode",
+        "lexical",
+        "--no-maintenance",
+        "--limit",
+        "1",
+        "--data-dir",
+        data_dir.path().to_str().expect("utf8 fixture path"),
+    ]);
+    let baseline_output = baseline.assert().success().get_output().clone();
+    let baseline_json: Value = serde_json::from_slice(&baseline_output.stdout)?;
+    assert!(
+        !baseline_json["hits"]
+            .as_array()
+            .expect("baseline hits")
+            .is_empty()
+    );
+    let _lock = hold_lexical_rebuild_lock_only(data_dir.path(), &db_path);
 
     let mut cmd = base_cmd();
     cmd.args([
@@ -3326,6 +3362,8 @@ fn search_cursor_manifest_marks_rebuilding_generation_best_effort() -> Result<()
     let assert = cmd.assert().success();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
     let json: Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert!(!json["hits"].as_array().expect("search hits").is_empty());
+    assert_eq!(fs::read(&checkpoint_path)?, checkpoint_bytes);
     let manifest = json["_meta"]
         .get("cursor_manifest")
         .and_then(Value::as_object)
