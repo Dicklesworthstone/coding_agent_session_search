@@ -12509,7 +12509,7 @@ impl FrankenStorage {
                 let mut fts_pending_chars = 0usize;
                 let mut _fts_inserted_total = 0usize;
                 let inserted_messages =
-                    franken_append_insert_new_messages(&tx, existing_id, &new_messages)?;
+                    franken_append_insert_new_messages(&tx, existing_id, &new_messages, conv)?;
                 let inserted_chars = inserted_messages
                     .iter()
                     .map(|(_, msg)| msg.content.len() as i64)
@@ -13153,7 +13153,7 @@ impl FrankenStorage {
         let (inserted_last_idx, inserted_last_created_at) =
             borrowed_messages_tail_state(&new_messages);
         let inserted_messages =
-            franken_append_insert_new_messages(tx, conversation_id, &new_messages)?;
+            franken_append_insert_new_messages(tx, conversation_id, &new_messages, conv)?;
         let inserted_chars = inserted_messages
             .iter()
             .map(|(_, msg)| msg.content.len() as i64)
@@ -15468,7 +15468,7 @@ impl FrankenStorage {
                 let (inserted_last_idx, inserted_last_created_at) =
                     borrowed_messages_tail_state(&new_messages);
                 let inserted_append_messages =
-                    franken_append_insert_new_messages(&tx, existing_id, &new_messages)?;
+                    franken_append_insert_new_messages(&tx, existing_id, &new_messages, conv)?;
                 total_chars += inserted_append_messages
                     .iter()
                     .map(|(_, msg)| msg.content.len() as i64)
@@ -15605,7 +15605,7 @@ impl FrankenStorage {
                         let (inserted_last_idx, inserted_last_created_at) =
                             borrowed_messages_tail_state(&new_messages);
                         let inserted_append_messages =
-                            franken_append_insert_new_messages(&tx, existing_id, &new_messages)?;
+                            franken_append_insert_new_messages(&tx, existing_id, &new_messages, conv)?;
                         total_chars += inserted_append_messages
                             .iter()
                             .map(|(_, msg)| msg.content.len() as i64)
@@ -17222,9 +17222,17 @@ fn franken_append_insert_new_messages<'a>(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
     messages: &[&'a Message],
+    conv: &Conversation,
 ) -> Result<Vec<(i64, &'a Message)>> {
     let mut inserted = Vec::with_capacity(messages.len());
     for msg in messages {
+        if conv.agent_slug == "grok_bot" {
+            // Native-ID reconciliation proved this index new in this
+            // transaction. A conflicting writer must abort/retry the packet,
+            // never silently discard its new native entry via OR IGNORE.
+            inserted.push((franken_insert_new_message(tx, conversation_id, msg)?, *msg));
+            continue;
+        }
         if let Some(message_id) =
             franken_insert_new_message_ignore_duplicate(tx, conversation_id, msg)?
         {
