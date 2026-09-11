@@ -1783,6 +1783,8 @@ const FTS_FALLBACK_REPAIR_PENDING_DETAIL_MAX_BYTES: usize = 400;
 const LEXICAL_REPAIR_DEFERRED_COUNT_META_KEY: &str = "lexical_repair_deferred_consecutive_runs";
 const LEXICAL_REPAIR_DEFERRED_REASON_META_KEY: &str = "lexical_repair_deferred_reason";
 const FTS_FRANKEN_REBUILD_GENERATION: i64 = 1;
+/// Rowid parity cannot certify content after an in-place canonical revision.
+const FTS_FRANKEN_CONTENT_REVISION_PENDING: i64 = -1;
 /// Exact canonical cardinality driven by the compact parent-rowid domain.
 /// FrankenSQLite 0.1.19 lowers this shape to `CountIndexEqRun`: each real
 /// conversation rowid counts its complete equality-prefix run in the
@@ -1803,6 +1805,7 @@ const FTS_INDEXED_CANONICAL_INTERSECTION_SQL: &str = "SELECT m.conversation_id \
 const DAILY_STATS_HEALTH_META_KEY: &str = "daily_stats_archive_fingerprint";
 const DAILY_STATS_HEALTH_GENERATION_META_KEY: &str = "daily_stats_health_generation";
 const DAILY_STATS_HEALTH_GENERATION: i64 = 1;
+const DAILY_STATS_CONTENT_REVISION_PENDING: i64 = -1;
 
 /// SQL to clear all rows from the contentless `fts_messages` table.
 ///
@@ -5226,7 +5229,8 @@ impl FrankenStorage {
             storage.repair_missing_current_schema_objects()
         })?;
         storage.apply_config()?;
-        storage.set_fts_messages_present_cache(true);
+        // Migrations intentionally leave the derived FTS shadow absent.
+        // Keep UNKNOWN until a write transaction observes the real catalog.
         Ok(storage)
     }
 
@@ -5321,7 +5325,7 @@ impl FrankenStorage {
             fts_shadow_run,
         );
         storage.apply_config()?;
-        storage.set_fts_messages_present_cache(true);
+        // Canonical schema readiness does not imply an FTS shadow exists.
         Ok(storage)
     }
 
@@ -5345,7 +5349,8 @@ impl FrankenStorage {
                 writer
                     .index_writer_busy_timeout_ms
                     .store(busy_timeout_ms, Ordering::Relaxed);
-                writer.set_fts_messages_present_cache(true);
+                // Reacquisition constructs an UNKNOWN cache: neither a prior
+                // missing shadow nor a newly materialized one may be guessed.
                 Ok((writer, true))
             }
             CachedEphemeralWriter::Uninitialized => {
@@ -7692,6 +7697,8 @@ pub struct InsertOutcome {
     pub conversation_id: i64,
     pub conversation_inserted: bool,
     pub inserted_indices: Vec<i64>,
+    /// Native messages whose payload changed without allocating another row.
+    pub updated_indices: Vec<i64>,
     /// Existing messages need new derived workspace associations or titles,
     /// not reinsertion. Provider metadata alone does not set this flag.
     pub workspace_changed: bool,
@@ -7727,7 +7734,13 @@ fn franken_reconcile_cursor_workspace(
     conv: &Conversation,
 ) -> Result<bool> {
     if shelley_metadata_is_authoritative(conv) {
-        return franken_reconcile_shelley_metadata(tx, agent_id, conversation_id, workspace_id, conv);
+        return franken_reconcile_shelley_metadata(
+            tx,
+            agent_id,
+            conversation_id,
+            workspace_id,
+            conv,
+        );
     }
     if conv.external_id.is_none()
         || !cursor_workspace_attribution_is_authoritative(
@@ -7814,14 +7827,24 @@ fn franken_reconcile_shelley_metadata(
     conv: &Conversation,
 ) -> Result<bool> {
     let (previous_workspace, previous_title, mut metadata): (
-        Option<i64>, Option<String>, serde_json::Value,
+        Option<i64>,
+        Option<String>,
+        serde_json::Value,
     ) = tx.query_row_map(
         "SELECT workspace_id, title, metadata_json, metadata_bin FROM conversations WHERE id = ?1",
         fparams![conversation_id],
-        |row| Ok((row.get_typed(0)?, row.get_typed(1)?, franken_read_metadata_compat(row, 2, 3))),
+        |row| {
+            Ok((
+                row.get_typed(0)?,
+                row.get_typed(1)?,
+                franken_read_metadata_compat(row, 2, 3),
+            ))
+        },
     )?;
     if !metadata.is_object() {
-        anyhow::bail!("cannot reconcile Shelley metadata for conversation {conversation_id}: canonical metadata is not an object");
+        anyhow::bail!(
+            "cannot reconcile Shelley metadata for conversation {conversation_id}: canonical metadata is not an object"
+        );
     }
     let workspace_changed = previous_workspace != workspace_id;
     let title_changed = previous_title != conv.title;
@@ -7833,8 +7856,11 @@ fn franken_reconcile_shelley_metadata(
         }
     }
     if let Some(original) = conv.metadata_json.pointer("/cass/workspace_original") {
-        let cass = metadata.as_object_mut().expect("checked object")
-            .entry("cass").or_insert_with(|| serde_json::json!({}));
+        let cass = metadata
+            .as_object_mut()
+            .expect("checked object")
+            .entry("cass")
+            .or_insert_with(|| serde_json::json!({}));
         if let Some(cass) = cass.as_object_mut()
             && cass.get("workspace_original") != Some(original)
         {
@@ -8158,7 +8184,7 @@ fn collect_new_messages_for_existing_conversation<'a>(
     existing_replay_fingerprints: &mut HashSet<MessageReplayFingerprint>,
     replay_skip_log: &'static str,
 ) -> ExistingConversationNewMessages<'a> {
-    if conv.agent_slug == "grok_bot" {
+    if matches!(conv.agent_slug.as_str(), "grok_bot" | "codebuff") {
         return reconciled_native_messages(conv);
     }
     let mut idx_collision_count = 0usize;
@@ -8206,7 +8232,11 @@ fn collect_new_messages_for_existing_conversation<'a>(
 fn reconciled_native_messages(conv: &Conversation) -> ExistingConversationNewMessages<'_> {
     ExistingConversationNewMessages {
         messages: conv.messages.iter().collect(),
-        new_chars: conv.messages.iter().map(|msg| msg.content.len() as i64).sum(),
+        new_chars: conv
+            .messages
+            .iter()
+            .map(|msg| msg.content.len() as i64)
+            .sum(),
         idx_collision_count: 0,
         first_collision_idx: None,
     }
@@ -8224,7 +8254,10 @@ fn franken_reconcile_native_message_indices<'a>(
     if conv.agent_slug != "grok_bot" {
         return Ok(Cow::Borrowed(conv));
     }
-    let external_id = conv.external_id.as_deref().filter(|id| !id.is_empty())
+    let external_id = conv
+        .external_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
         .context("Grok Bot rolling transcript requires its account/agent replica identity")?;
     let existing: Option<(i64, Option<i64>)> = tx.query_row_map(
         "SELECT id, started_at FROM conversations WHERE source_id = ?1 AND agent_id = ?2 AND external_id = ?3",
@@ -8276,7 +8309,9 @@ fn franken_reconcile_native_message_indices<'a>(
             continue;
         }
         let idx = match max_idx {
-            Some(previous) => previous.checked_add(1).context("Grok Bot canonical message index exhausted")?,
+            Some(previous) => previous
+                .checked_add(1)
+                .context("Grok Bot canonical message index exhausted")?,
             None => 0,
         };
         max_idx = Some(idx);
@@ -8289,9 +8324,548 @@ fn franken_reconcile_native_message_indices<'a>(
 }
 
 fn grok_bot_native_entry_id(extra: &serde_json::Value) -> Result<&str> {
-    extra.get("grok_bot_entry_id").and_then(serde_json::Value::as_str)
+    extra
+        .get("grok_bot_entry_id")
+        .and_then(serde_json::Value::as_str)
         .filter(|id| !id.trim().is_empty())
         .context("Grok Bot message is missing its native entry ID")
+}
+
+struct CodebuffRevision {
+    conversation_id: i64,
+    started_at: Option<i64>,
+    source_id: String,
+    previous_content_chars: i64,
+    message: Message,
+    fts: FtsEntry,
+}
+
+fn codebuff_native_message_id(extra: &serde_json::Value) -> Result<&str> {
+    let id = extra
+        .get("codebuff_message_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .context("Codebuff / Freebuff message requires its native ID")?;
+    anyhow::ensure!(
+        extra.get("id").and_then(serde_json::Value::as_str) == Some(id),
+        "Codebuff / Freebuff native ID disagrees with its source envelope"
+    );
+    Ok(id)
+}
+
+/// The FAD shared-lineage transcript is a mutable snapshot. Preserve canonical
+/// row IDs and positions while replacing same-ID payloads, never deduplicating
+/// distinct IDs by content/time. Role, author and timestamp are immutable;
+/// duplicates inside a packet are malformed even if their payloads match.
+fn franken_reconcile_codebuff_messages<'a>(
+    tx: &FrankenTransaction<'_>,
+    agent_id: i64,
+    conv: &'a Conversation,
+    revisions: &mut Vec<CodebuffRevision>,
+) -> Result<Cow<'a, Conversation>> {
+    if conv.agent_slug != "codebuff" {
+        return Ok(Cow::Borrowed(conv));
+    }
+    let external_id = conv
+        .external_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .context("Codebuff / Freebuff transcript requires its store-scoped identity")?;
+    let existing: Option<(i64, Option<i64>)> = tx.query_row_map(
+        "SELECT id, started_at FROM conversations WHERE source_id = ?1 AND agent_id = ?2 AND external_id = ?3",
+        fparams![conv.source_id.as_str(), agent_id, external_id],
+        |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+    ).optional()?;
+    let mut native = HashMap::new();
+    let mut max_idx = None::<i64>;
+    if let Some((conversation_id, _)) = existing {
+        for row in tx.query_params(
+            "SELECT id, idx, role, author, created_at, content, extra_json, extra_bin FROM messages WHERE conversation_id = ?1",
+            fparams![conversation_id],
+        )? {
+            let extra_json = franken_read_message_extra_compat(&row, 6, 7);
+            let id = codebuff_native_message_id(&extra_json)?.to_owned();
+            let idx = row.get_typed::<i64>(1)?;
+            let message = Message {
+                id: Some(row.get_typed(0)?), idx,
+                role: role_from_str(&row.get_typed::<String>(2)?),
+                author: row.get_typed(3)?, created_at: row.get_typed(4)?,
+                content: row.get_typed(5)?, extra_json, snippets: Vec::new(),
+            };
+            anyhow::ensure!(native.insert(id, message).is_none(),
+                "Codebuff / Freebuff canonical transcript has duplicate native IDs");
+            max_idx = Some(max_idx.map_or(idx, |old| old.max(idx)));
+        }
+    }
+    let mut reconciled = conv.clone();
+    reconciled.messages.clear();
+    if let Some((conversation_id, started_at)) = existing {
+        reconciled.started_at = started_at;
+        let (source_path, title, workspace): (String, Option<String>, Option<String>) = tx.query_row_map(
+            "SELECT c.source_path, c.title, (SELECT w.path FROM workspaces w WHERE w.id = c.workspace_id)
+             FROM conversations c WHERE c.id = ?1",
+            fparams![conversation_id],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+        )?;
+        reconciled.source_path = source_path.into();
+        reconciled.title = title;
+        reconciled.workspace = workspace.map(PathBuf::from);
+    }
+    let mut packet_ids = HashSet::new();
+    for message in &conv.messages {
+        let native_id = codebuff_native_message_id(&message.extra_json)?;
+        anyhow::ensure!(
+            packet_ids.insert(native_id),
+            "Codebuff / Freebuff packet has duplicate native IDs"
+        );
+        if let Some(old) = native.get(native_id) {
+            anyhow::ensure!(
+                old.role == message.role
+                    && old.author == message.author
+                    && old.created_at == message.created_at,
+                "Codebuff / Freebuff native ID changed immutable role, author or timestamp"
+            );
+            let message_id = old.id.context("canonical message lacks row ID")?;
+            if old.content == message.content
+                && old.extra_json == message.extra_json
+                && franken_codebuff_snippets_match(tx, message_id, &message.snippets)?
+            {
+                continue;
+            }
+            let mut revised = message.clone();
+            revised.id = Some(message_id);
+            revised.idx = old.idx;
+            let (json, bin) = franken_message_insert_payload(&revised)?;
+            tx.execute_compat(
+                "UPDATE messages SET content = ?2, extra_json = ?3, extra_bin = ?4 WHERE id = ?1",
+                fparams![
+                    message_id,
+                    revised.content.as_str(),
+                    json.as_deref(),
+                    bin.as_deref()
+                ],
+            )?;
+            tx.execute_compat(
+                "DELETE FROM snippets WHERE message_id = ?1",
+                fparams![message_id],
+            )?;
+            franken_insert_snippets(tx, message_id, &revised.snippets)?;
+            revisions.push(CodebuffRevision {
+                conversation_id: existing.context("canonical message lacks conversation")?.0,
+                started_at: reconciled.started_at,
+                source_id: conv.source_id.clone(),
+                previous_content_chars: i64::try_from(old.content.len())
+                    .context("message length exceeds analytics range")?,
+                fts: FtsEntry::from_message(message_id, &revised, &reconciled),
+                message: revised,
+            });
+        } else {
+            let idx = max_idx.map_or(Ok(0), |idx| {
+                idx.checked_add(1)
+                    .context("Codebuff / Freebuff canonical message index exhausted")
+            })?;
+            max_idx = Some(idx);
+            let mut message = message.clone();
+            message.id = None;
+            message.idx = idx;
+            reconciled.messages.push(message);
+        }
+    }
+    Ok(Cow::Owned(reconciled))
+}
+
+fn franken_codebuff_snippets_match(
+    tx: &FrankenTransaction<'_>,
+    message_id: i64,
+    incoming: &[Snippet],
+) -> Result<bool> {
+    let rows = tx.query_params(
+        "SELECT file_path, start_line, end_line, language, snippet_text FROM snippets WHERE message_id = ?1 ORDER BY id",
+        fparams![message_id],
+    )?;
+    codebuff_snippet_rows_match(&rows, incoming)
+}
+
+fn codebuff_snippet_rows_match(rows: &[FrankenRow], incoming: &[Snippet]) -> Result<bool> {
+    if rows.len() != incoming.len() {
+        return Ok(false);
+    }
+    for (row, snippet) in rows.iter().zip(incoming) {
+        if row.get_typed::<Option<String>>(0)? != snippet.file_path.as_ref().map(path_to_string)
+            || row.get_typed::<Option<i64>>(1)? != snippet.start_line
+            || row.get_typed::<Option<i64>>(2)? != snippet.end_line
+            || row.get_typed::<Option<String>>(3)? != snippet.language
+            || row.get_typed::<Option<String>>(4)? != snippet.snippet_text
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn codebuff_tool_count(extra: &serde_json::Value) -> u32 {
+    fn count(blocks: &[serde_json::Value]) -> u32 {
+        blocks.iter().fold(0_u32, |total, block| {
+            let own =
+                u32::from(block.get("type").and_then(serde_json::Value::as_str) == Some("tool"));
+            let nested = block
+                .get("blocks")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, |blocks| count(blocks));
+            total.saturating_add(own).saturating_add(nested)
+        })
+    }
+    extra
+        .get("blocks")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, |blocks| count(blocks))
+}
+
+/// Update only materialized analytics. A deferred initial insert has no metric
+/// row and remains due for normal backfill; a later deferred revision still
+/// corrects an already-published contribution instead of leaving it stale.
+fn franken_apply_codebuff_revision_projections(
+    storage: &FrankenStorage,
+    tx: &FrankenTransaction<'_>,
+    revision: &CodebuffRevision,
+    defer_lexical_updates: bool,
+) -> Result<()> {
+    let message_id = revision.fts.message_id;
+    if !defer_lexical_updates
+        && !storage.fts_inline_writes_suspended()
+        && storage.fts_messages_present_cached(tx)
+    {
+        let mut fts = revision.fts.clone();
+        let (source_path, title, workspace): (String, Option<String>, Option<String>) = tx.query_row_map(
+            "SELECT c.source_path, c.title, (SELECT w.path FROM workspaces w WHERE w.id = c.workspace_id)
+             FROM conversations c WHERE c.id = ?1",
+            fparams![revision.conversation_id],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+        )?;
+        fts.source_path = source_path;
+        fts.title = title.unwrap_or_default();
+        fts.workspace = workspace.unwrap_or_default();
+        tx.execute_compat(
+            "DELETE FROM fts_messages WHERE rowid = ?1",
+            fparams![message_id],
+        )?;
+        franken_batch_insert_fts(storage, tx, std::slice::from_ref(&fts))?;
+    } else {
+        tx.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams![
+                FTS_FRANKEN_REBUILD_META_KEY,
+                FTS_FRANKEN_CONTENT_REVISION_PENDING.to_string()
+            ],
+        )?;
+        tx.execute_compat(
+            "DELETE FROM meta WHERE key = ?1",
+            fparams![FTS_FRANKEN_REBUILD_FINGERPRINT_META_KEY],
+        )?;
+    }
+    let old: Option<MessageMetricsEntry> = tx
+        .query_row_map(
+            "SELECT message_id, created_at_ms, hour_id, day_id, agent_slug, workspace_id,
+         source_id, role, content_chars, content_tokens_est, model_name, model_family,
+         model_tier, provider, api_input_tokens, api_output_tokens, api_cache_read_tokens,
+         api_cache_creation_tokens, api_thinking_tokens, api_service_tier, api_data_source,
+         tool_call_count, has_tool_calls, has_plan FROM message_metrics WHERE message_id = ?1",
+            fparams![message_id],
+            |row| {
+                Ok(MessageMetricsEntry {
+                    message_id: row.get_typed(0)?,
+                    created_at_ms: row.get_typed(1)?,
+                    hour_id: row.get_typed(2)?,
+                    day_id: row.get_typed(3)?,
+                    agent_slug: row.get_typed(4)?,
+                    workspace_id: row.get_typed(5)?,
+                    source_id: row.get_typed(6)?,
+                    role: row.get_typed(7)?,
+                    content_chars: row.get_typed(8)?,
+                    content_tokens_est: row.get_typed(9)?,
+                    model_name: row.get_typed(10)?,
+                    model_family: row.get_typed(11)?,
+                    model_tier: row.get_typed(12)?,
+                    provider: row.get_typed(13)?,
+                    api_input_tokens: row.get_typed(14)?,
+                    api_output_tokens: row.get_typed(15)?,
+                    api_cache_read_tokens: row.get_typed(16)?,
+                    api_cache_creation_tokens: row.get_typed(17)?,
+                    api_thinking_tokens: row.get_typed(18)?,
+                    api_service_tier: row.get_typed(19)?,
+                    api_data_source: row.get_typed(20)?,
+                    tool_call_count: row.get_typed(21)?,
+                    has_tool_calls: row.get_typed::<i64>(22)? != 0,
+                    has_plan: row.get_typed::<i64>(23)? != 0,
+                })
+            },
+        )
+        .optional()?;
+    let message = &revision.message;
+    let mut usage = crate::connectors::extract_tokens_for_agent(
+        "codebuff",
+        &message.extra_json,
+        &message.content,
+        &role_str(&message.role),
+    );
+    usage.tool_call_count = codebuff_tool_count(&message.extra_json);
+    usage.has_tool_calls = usage.tool_call_count > 0;
+    let content_chars =
+        i64::try_from(message.content.len()).context("message length exceeds analytics range")?;
+    if let Some(old) = old {
+        // Track A may have been backfilled while Track B remains deferred.
+        anyhow::ensure!(
+            old.api_data_source == "estimated" && old.model_name.is_none(),
+            "Codebuff / Freebuff revision has unsupported provider-usage analytics"
+        );
+        let mut new = old.clone();
+        new.content_chars = content_chars;
+        new.content_tokens_est = content_chars / 4;
+        new.api_input_tokens = usage.input_tokens;
+        new.api_output_tokens = usage.output_tokens;
+        new.api_cache_read_tokens = usage.cache_read_tokens;
+        new.api_cache_creation_tokens = usage.cache_creation_tokens;
+        new.api_thinking_tokens = usage.thinking_tokens;
+        new.tool_call_count = i64::from(usage.tool_call_count);
+        new.has_tool_calls = usage.has_tool_calls;
+        new.has_plan = has_plan_for_role(&new.role, &message.content);
+        franken_replace_codebuff_rollup_contribution(tx, &old, &new)?;
+        tx.execute_compat(
+            "UPDATE message_metrics SET content_chars = ?2, content_tokens_est = ?3,
+             api_input_tokens = ?4, api_output_tokens = ?5, tool_call_count = ?6,
+             has_tool_calls = ?7, has_plan = ?8, api_cache_read_tokens = ?9,
+             api_cache_creation_tokens = ?10, api_thinking_tokens = ?11 WHERE message_id = ?1",
+            fparams![
+                message_id,
+                new.content_chars,
+                new.content_tokens_est,
+                new.api_input_tokens,
+                new.api_output_tokens,
+                new.tool_call_count,
+                i64::from(new.has_tool_calls),
+                i64::from(new.has_plan),
+                new.api_cache_read_tokens,
+                new.api_cache_creation_tokens,
+                new.api_thinking_tokens
+            ],
+        )?;
+    }
+    // Track B uses its own persisted contribution, never the independently
+    // rebuildable Track A metrics as a proxy for what was previously counted.
+    let ledger = tx.query_params(
+        "SELECT day_id, source_id, model_family, content_chars, input_tokens, output_tokens,
+         cache_read_tokens, cache_creation_tokens, thinking_tokens, total_tokens,
+         tool_call_count, estimated_cost_usd, data_source, model_name
+         FROM token_usage WHERE message_id = ?1",
+        fparams![message_id],
+    )?;
+    if let Some(old) = ledger.first() {
+        anyhow::ensure!(
+            old.get_typed::<String>(12)? == "estimated"
+                && old.get_typed::<Option<String>>(13)?.is_none(),
+            "Codebuff / Freebuff revision has unsupported provider-usage token ledger"
+        );
+        let delta = TokenStatsDelta {
+            total_input_tokens: usage.input_tokens.unwrap_or(0)
+                - old.get_typed::<Option<i64>>(4)?.unwrap_or(0),
+            total_output_tokens: usage.output_tokens.unwrap_or(0)
+                - old.get_typed::<Option<i64>>(5)?.unwrap_or(0),
+            total_cache_read_tokens: usage.cache_read_tokens.unwrap_or(0)
+                - old.get_typed::<Option<i64>>(6)?.unwrap_or(0),
+            total_cache_creation_tokens: usage.cache_creation_tokens.unwrap_or(0)
+                - old.get_typed::<Option<i64>>(7)?.unwrap_or(0),
+            total_thinking_tokens: usage.thinking_tokens.unwrap_or(0)
+                - old.get_typed::<Option<i64>>(8)?.unwrap_or(0),
+            grand_total_tokens: usage.total_tokens().unwrap_or(0)
+                - old.get_typed::<Option<i64>>(9)?.unwrap_or(0),
+            total_content_chars: content_chars - old.get_typed::<i64>(3)?,
+            total_tool_calls: i64::from(usage.tool_call_count) - old.get_typed::<i64>(10)?,
+            estimated_cost_usd: -old.get_typed::<Option<f64>>(11)?.unwrap_or(0.0),
+            ..TokenStatsDelta::default()
+        };
+        let mut tokens = TokenStatsAggregator::new();
+        tokens.deltas.insert(
+            (
+                old.get_typed(0)?,
+                "codebuff".into(),
+                old.get_typed(1)?,
+                old.get_typed::<Option<String>>(2)?
+                    .unwrap_or_else(|| "unknown".into()),
+            ),
+            delta,
+        );
+        // Missing aggregate buckets are still due for backfill. Applying a
+        // revision must not invent a bucket containing only its delta.
+        for (day, agent, source, model, delta) in tokens.expand() {
+            tx.execute_compat(
+                "UPDATE token_daily_stats SET total_input_tokens = total_input_tokens + ?5,
+                 total_output_tokens = total_output_tokens + ?6,
+                 total_cache_read_tokens = total_cache_read_tokens + ?7,
+                 total_cache_creation_tokens = total_cache_creation_tokens + ?8,
+                 total_thinking_tokens = total_thinking_tokens + ?9,
+                 grand_total_tokens = grand_total_tokens + ?10,
+                 total_content_chars = total_content_chars + ?11,
+                 total_tool_calls = total_tool_calls + ?12,
+                 estimated_cost_usd = estimated_cost_usd + ?13, last_updated = ?14
+                 WHERE day_id = ?1 AND agent_slug = ?2 AND source_id = ?3 AND model_family = ?4",
+                fparams![
+                    day,
+                    agent.as_str(),
+                    source.as_str(),
+                    model.as_str(),
+                    delta.total_input_tokens,
+                    delta.total_output_tokens,
+                    delta.total_cache_read_tokens,
+                    delta.total_cache_creation_tokens,
+                    delta.total_thinking_tokens,
+                    delta.grand_total_tokens,
+                    delta.total_content_chars,
+                    delta.total_tool_calls,
+                    delta.estimated_cost_usd,
+                    FrankenStorage::now_millis()
+                ],
+            )?;
+        }
+        tx.execute_compat(
+            "UPDATE token_usage SET content_chars = ?2, input_tokens = ?3, output_tokens = ?4,
+             total_tokens = ?5, tool_call_count = ?6, has_tool_calls = ?7,
+             cache_read_tokens = ?8, cache_creation_tokens = ?9, thinking_tokens = ?10,
+             estimated_cost_usd = NULL WHERE message_id = ?1",
+            fparams![
+                message_id,
+                content_chars,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.total_tokens(),
+                i64::from(usage.tool_call_count),
+                i64::from(usage.has_tool_calls),
+                usage.cache_read_tokens,
+                usage.cache_creation_tokens,
+                usage.thinking_tokens
+            ],
+        )?;
+        franken_update_conversation_token_summaries_in_tx(tx, revision.conversation_id)?;
+    }
+    if !ledger.is_empty() {
+        let day = revision
+            .started_at
+            .map(FrankenStorage::day_id_from_millis)
+            .unwrap_or(0);
+        tx.execute_compat(
+            "UPDATE daily_stats SET total_chars = total_chars + ?3, last_updated = ?4
+             WHERE day_id = ?1 AND agent_slug IN ('codebuff', 'all') AND source_id IN (?2, 'all')",
+            fparams![
+                day,
+                revision.source_id.as_str(),
+                content_chars - revision.previous_content_chars,
+                FrankenStorage::now_millis()
+            ],
+        )?;
+    } else {
+        // Track A backfill does not prove this message was counted in daily
+        // stats. Preserve the bucket and require its bounded canonical rebuild.
+        tx.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams![
+                DAILY_STATS_HEALTH_GENERATION_META_KEY,
+                DAILY_STATS_CONTENT_REVISION_PENDING.to_string()
+            ],
+        )?;
+        tx.execute_compat(
+            "DELETE FROM meta WHERE key = ?1",
+            fparams![DAILY_STATS_HEALTH_META_KEY],
+        )?;
+    }
+    Ok(())
+}
+
+fn franken_replace_codebuff_rollup_contribution(
+    tx: &FrankenTransaction<'_>,
+    old: &MessageMetricsEntry,
+    new: &MessageMetricsEntry,
+) -> Result<()> {
+    let mut previous = AnalyticsRollupAggregator::new();
+    previous.record(old);
+    let mut current = AnalyticsRollupAggregator::new();
+    current.record(new);
+    for (table, bucket_col, deltas) in [
+        ("usage_hourly", "hour_id", &previous.hourly),
+        ("usage_daily", "day_id", &previous.daily),
+    ] {
+        for ((bucket, agent, workspace, source), delta) in deltas {
+            let present = tx.query_row_map(
+                &format!("SELECT 1 FROM {table} WHERE {bucket_col} = ?1 AND agent_slug = ?2 AND workspace_id = ?3 AND source_id = ?4"),
+                fparams![*bucket, agent.as_str(), *workspace, source.as_str()],
+                |row| row.get_typed::<i64>(0),
+            ).optional()?.is_some();
+            if !present {
+                let key = (*bucket, agent.clone(), *workspace, source.clone());
+                if table == "usage_hourly" {
+                    current.hourly.remove(&key);
+                } else {
+                    current.daily.remove(&key);
+                }
+                continue;
+            }
+            franken_relocate_rollup_subtract(
+                tx,
+                table,
+                vec![
+                    (bucket_col, ParamValue::from(*bucket)),
+                    ("agent_slug", ParamValue::from(agent.as_str())),
+                    ("workspace_id", ParamValue::from(*workspace)),
+                    ("source_id", ParamValue::from(source.as_str())),
+                ],
+                *workspace,
+                delta,
+            )?;
+        }
+    }
+    for ((day, agent, workspace, source, family, tier), delta) in &previous.models_daily {
+        let present = tx
+            .query_row_map(
+                "SELECT 1 FROM usage_models_daily WHERE day_id = ?1 AND agent_slug = ?2
+             AND workspace_id = ?3 AND source_id = ?4 AND model_family = ?5 AND model_tier = ?6",
+                fparams![
+                    *day,
+                    agent.as_str(),
+                    *workspace,
+                    source.as_str(),
+                    family.as_str(),
+                    tier.as_str()
+                ],
+                |row| row.get_typed::<i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if !present {
+            current.models_daily.remove(&(
+                *day,
+                agent.clone(),
+                *workspace,
+                source.clone(),
+                family.clone(),
+                tier.clone(),
+            ));
+            continue;
+        }
+        franken_relocate_rollup_subtract(
+            tx,
+            "usage_models_daily",
+            vec![
+                ("day_id", ParamValue::from(*day)),
+                ("agent_slug", ParamValue::from(agent.as_str())),
+                ("workspace_id", ParamValue::from(*workspace)),
+                ("source_id", ParamValue::from(source.as_str())),
+                ("model_family", ParamValue::from(family.as_str())),
+                ("model_tier", ParamValue::from(tier.as_str())),
+            ],
+            *workspace,
+            delta,
+        )?;
+    }
+    franken_flush_analytics_rollups_in_tx(tx, &current)?;
+    Ok(())
 }
 
 fn franken_existing_conversation_append_tail_state(
@@ -8978,6 +9552,71 @@ pub struct MessageForEmbedding {
 // =========================================================================
 
 impl FrankenStorage {
+    /// Compare the normalized, redacted packet before the indexer admits a
+    /// canonical write. Revisions need a durable lexical repair checkpoint:
+    /// they leave both message count and the rowid watermark unchanged.
+    pub(crate) fn codebuff_message_revisions_needed(&self, conv: &Conversation) -> Result<bool> {
+        if conv.agent_slug != "codebuff" {
+            return Ok(false);
+        }
+        let external_id = conv
+            .external_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .context("Codebuff / Freebuff transcript requires its store-scoped identity")?;
+        let existing: Option<i64> = self
+            .conn
+            .query_row_map(
+                "SELECT id FROM conversations WHERE source_id = ?1 AND external_id = ?2
+             AND agent_id = (SELECT id FROM agents WHERE slug = 'codebuff')",
+                fparams![conv.source_id.as_str(), external_id],
+                |row| row.get_typed(0),
+            )
+            .optional()?;
+        let mut native = HashMap::new();
+        if let Some(conversation_id) = existing {
+            for row in self.conn.query_with_params(
+                "SELECT id, role, author, created_at, content, extra_json, extra_bin
+                 FROM messages WHERE conversation_id = ?1",
+                &[SqliteValue::from(conversation_id)],
+            )? {
+                let extra = franken_read_message_extra_compat(&row, 5, 6);
+                let native_id = codebuff_native_message_id(&extra)?.to_owned();
+                anyhow::ensure!(
+                    native.insert(native_id, (row, extra)).is_none(),
+                    "Codebuff / Freebuff canonical transcript has duplicate native IDs"
+                );
+            }
+        }
+        let mut packet_ids = HashSet::new();
+        let mut changed = false;
+        for message in &conv.messages {
+            let native_id = codebuff_native_message_id(&message.extra_json)?;
+            anyhow::ensure!(
+                packet_ids.insert(native_id),
+                "Codebuff / Freebuff packet has duplicate native IDs"
+            );
+            let Some((row, extra)) = native.get(native_id) else {
+                continue;
+            };
+            anyhow::ensure!(
+                role_from_str(&row.get_typed::<String>(1)?) == message.role
+                    && row.get_typed::<Option<String>>(2)? == message.author
+                    && row.get_typed::<Option<i64>>(3)? == message.created_at,
+                "Codebuff / Freebuff native ID changed immutable role, author or timestamp"
+            );
+            let snippets = self.conn.query_with_params(
+                "SELECT file_path, start_line, end_line, language, snippet_text
+                 FROM snippets WHERE message_id = ?1 ORDER BY id",
+                &[SqliteValue::from(row.get_typed::<i64>(0)?)],
+            )?;
+            changed |= row.get_typed::<String>(4)? != message.content
+                || extra != &message.extra_json
+                || !codebuff_snippet_rows_match(&snippets, &message.snippets)?;
+        }
+        Ok(changed)
+    }
+
     /// Read-only admission for the indexer's durable pre-mutation checkpoint.
     /// Cursor Agent external IDs are stable across workspace attribution changes.
     pub(crate) fn cursor_workspace_repair_needed(
@@ -9856,7 +10495,11 @@ impl FrankenStorage {
         &self,
         progress: Option<&dyn Fn(i64, i64)>,
         heartbeat: Option<&dyn Fn()>,
+        control: Option<&dyn Fn() -> Result<()>>,
     ) -> Result<()> {
+        if let Some(control) = control {
+            control()?;
+        }
         let Some(context) = self.legacy_omp_pending_context()? else {
             return Ok(());
         };
@@ -9865,22 +10508,32 @@ impl FrankenStorage {
         }
         self.rebuild_analytics_since_with_chunk_size_and_progress(
             None,
-            ANALYTICS_REBUILD_CHUNK_SIZE,
+            LEGACY_OMP_ANALYTICS_CHUNK_SIZE,
             progress,
             heartbeat,
             Some(context.as_str()),
+            control,
         )
         .with_context(|| "rebuilding analytics after legacy OMP identity upgrade")?;
+        if let Some(progress) = progress {
+            progress(0, 0);
+        }
         if let Some(heartbeat) = heartbeat {
             heartbeat();
         }
-        self.rebuild_token_daily_stats_with_progress(heartbeat)
+        self.rebuild_token_daily_stats_with_progress(heartbeat, control)
             .with_context(|| "rebuilding token rollups after legacy OMP identity upgrade")?;
+        if let Some(progress) = progress {
+            progress(0, 0);
+        }
         if let Some(heartbeat) = heartbeat {
             heartbeat();
         }
-        self.rebuild_daily_stats_with_progress(heartbeat)
+        self.rebuild_daily_stats_with_progress(heartbeat, control)
             .with_context(|| "rebuilding daily stats after legacy OMP identity upgrade")?;
+        if let Some(control) = control {
+            control()?;
+        }
         self.record_legacy_omp_phase_complete(LEGACY_OMP_ANALYTICS_REBUILT_META_KEY)?;
         Ok(())
     }
@@ -12447,6 +13100,15 @@ impl FrankenStorage {
         conv: &Conversation,
         defer_analytics_updates: bool,
     ) -> Result<InsertOutcome> {
+        if conv.agent_slug == "codebuff" {
+            return self
+                .insert_conversations_batched_with_analytics(
+                    &[(agent_id, workspace_id, conv)],
+                    defer_analytics_updates,
+                )?
+                .pop()
+                .context("Codebuff / Freebuff insert returned no outcome");
+        }
         let normalized_conv = normalized_conversation_for_storage(conv);
         let conv = normalized_conv.as_ref();
         self.ensure_source_for_conversation(conv)?;
@@ -12601,6 +13263,7 @@ impl FrankenStorage {
                     conversation_id: existing_id,
                     conversation_inserted: false,
                     inserted_indices,
+                    updated_indices: Vec::new(),
                     workspace_changed,
                 });
             }
@@ -12625,7 +13288,9 @@ impl FrankenStorage {
                 continue;
             }
             let incoming_replay = message_replay_fingerprint(msg);
-            if conv.agent_slug != "grok_bot" && pending_replay_fingerprints.contains(&incoming_replay) {
+            if conv.agent_slug != "grok_bot"
+                && pending_replay_fingerprints.contains(&incoming_replay)
+            {
                 tracing::debug!(
                     conversation_id = conv_id,
                     idx = msg.idx,
@@ -12698,6 +13363,7 @@ impl FrankenStorage {
             conversation_id: conv_id,
             conversation_inserted: true,
             inserted_indices,
+            updated_indices: Vec::new(),
             workspace_changed: false,
         })
     }
@@ -12777,7 +13443,9 @@ impl FrankenStorage {
             }
 
             let incoming_replay = message_replay_fingerprint(msg);
-            if conv.agent_slug != "grok_bot" && pending_replay_fingerprints.contains(&incoming_replay) {
+            if conv.agent_slug != "grok_bot"
+                && pending_replay_fingerprints.contains(&incoming_replay)
+            {
                 tracing::debug!(
                     conversation_id = conv_id,
                     idx = msg.idx,
@@ -12881,6 +13549,7 @@ impl FrankenStorage {
             conversation_id: conv_id,
             conversation_inserted: true,
             inserted_indices,
+            updated_indices: Vec::new(),
             workspace_changed: false,
         })
     }
@@ -13100,6 +13769,7 @@ impl FrankenStorage {
             conversation_id: existing_id,
             conversation_inserted: false,
             inserted_indices,
+            updated_indices: Vec::new(),
             workspace_changed: false,
         })
     }
@@ -13262,6 +13932,7 @@ impl FrankenStorage {
             conversation_id,
             conversation_inserted: false,
             inserted_indices,
+            updated_indices: Vec::new(),
             workspace_changed: false,
         })
     }
@@ -13670,6 +14341,13 @@ impl FrankenStorage {
             self.read_daily_stats_health_generation()? == Some(DAILY_STATS_HEALTH_GENERATION)
                 && self.read_daily_stats_archive_fingerprint()?.as_deref()
                     == Some(archive_fingerprint),
+        )
+    }
+
+    pub(crate) fn daily_stats_content_repair_required(&self) -> Result<bool> {
+        Ok(
+            self.read_daily_stats_health_generation()?
+                == Some(DAILY_STATS_CONTENT_REVISION_PENDING),
         )
     }
 
@@ -14220,6 +14898,14 @@ impl FrankenStorage {
     }
 
     fn ensure_fts_consistency_via_frankensqlite(&self) -> Result<FtsConsistencyRepair> {
+        if self.read_fts_franken_rebuild_generation()? == Some(FTS_FRANKEN_CONTENT_REVISION_PENDING)
+        {
+            if let Some(detail) = self.fts_shadow_recreate_refused()? {
+                anyhow::bail!("{detail}");
+            }
+            let inserted_rows = self.rebuild_fts_via_frankensqlite()?;
+            return Ok(FtsConsistencyRepair::Rebuilt { inserted_rows });
+        }
         let before = self.inspect_search_fallback_fts_parity()?;
         match before.status {
             FtsShadowParityStatus::Healthy => {
@@ -15345,7 +16031,11 @@ impl FrankenStorage {
         conversations: &[(i64, Option<i64>, &Conversation)],
         defer_analytics_updates: bool,
     ) -> Result<Vec<InsertOutcome>> {
-        self.insert_conversations_batched_with_completion(conversations, defer_analytics_updates, None)
+        self.insert_conversations_batched_with_completion(
+            conversations,
+            defer_analytics_updates,
+            None,
+        )
     }
 
     pub fn source_ingest_ledger_entries(&self) -> Result<HashMap<String, String>> {
@@ -15361,7 +16051,11 @@ impl FrankenStorage {
         conversations: &[(i64, Option<i64>, &Conversation)],
         completion: &SourceIngestLedgerEntry,
     ) -> Result<Vec<InsertOutcome>> {
-        self.insert_conversations_batched_with_completion(conversations, defer_analytics_updates_enabled(), Some(completion))
+        self.insert_conversations_batched_with_completion(
+            conversations,
+            defer_analytics_updates_enabled(),
+            Some(completion),
+        )
     }
 
     fn insert_conversations_batched_with_completion(
@@ -15371,7 +16065,8 @@ impl FrankenStorage {
         completion: Option<&SourceIngestLedgerEntry>,
     ) -> Result<Vec<InsertOutcome>> {
         if let Some(completion) = completion
-            && (!completion.key.starts_with("source_ingest_v1:") || completion.key.len() == "source_ingest_v1:".len())
+            && (!completion.key.starts_with("source_ingest_v1:")
+                || completion.key.len() == "source_ingest_v1:".len())
         {
             bail!("source completion ledger key must name a source_ingest_v1 observation");
         }
@@ -15404,6 +16099,7 @@ impl FrankenStorage {
         ensure_sources_in_tx(&tx, conversations)?;
 
         let mut outcomes = Vec::with_capacity(conversations.len());
+        let mut codebuff_revisions = Vec::new();
         let mut fts_entries = Vec::new();
         let mut fts_pending_chars = 0usize;
         let mut fts_inserted_total = 0usize;
@@ -15424,7 +16120,19 @@ impl FrankenStorage {
 
         for &(agent_id, workspace_id, raw_conv) in conversations {
             let normalized_conv = normalized_conversation_for_storage(raw_conv);
-            let reconciled_conv = franken_reconcile_native_message_indices(&tx, agent_id, normalized_conv.as_ref())?;
+            let revision_start = codebuff_revisions.len();
+            let codebuff_conv = franken_reconcile_codebuff_messages(
+                &tx,
+                agent_id,
+                normalized_conv.as_ref(),
+                &mut codebuff_revisions,
+            )?;
+            let updated_indices = codebuff_revisions[revision_start..]
+                .iter()
+                .map(|revision| revision.message.idx)
+                .collect();
+            let reconciled_conv =
+                franken_reconcile_native_message_indices(&tx, agent_id, codebuff_conv.as_ref())?;
             let conv = reconciled_conv.as_ref();
             let mut total_chars: i64 = 0;
             let mut inserted_indices = Vec::with_capacity(conv.messages.len());
@@ -15547,7 +16255,8 @@ impl FrankenStorage {
                         for msg in &conv.messages {
                             let incoming_replay = message_replay_fingerprint(msg);
                             if pending_messages.contains_key(&msg.idx)
-                                || (conv.agent_slug != "grok_bot" && pending_replay_fingerprints.contains(&incoming_replay))
+                                || (!matches!(conv.agent_slug.as_str(), "grok_bot" | "codebuff")
+                                    && pending_replay_fingerprints.contains(&incoming_replay))
                             {
                                 continue;
                             }
@@ -15604,8 +16313,12 @@ impl FrankenStorage {
                         )?;
                         let (inserted_last_idx, inserted_last_created_at) =
                             borrowed_messages_tail_state(&new_messages);
-                        let inserted_append_messages =
-                            franken_append_insert_new_messages(&tx, existing_id, &new_messages, conv)?;
+                        let inserted_append_messages = franken_append_insert_new_messages(
+                            &tx,
+                            existing_id,
+                            &new_messages,
+                            conv,
+                        )?;
                         total_chars += inserted_append_messages
                             .iter()
                             .map(|(_, msg)| msg.content.len() as i64)
@@ -15672,7 +16385,20 @@ impl FrankenStorage {
                 }
             };
 
-            if !defer_analytics_updates {
+            let workspace_id = if conv.agent_slug == "codebuff" {
+                tx.query_row_map(
+                    "SELECT workspace_id FROM conversations WHERE id = ?1",
+                    fparams![conv_id],
+                    |row| row.get_typed::<Option<i64>>(0),
+                )?
+            } else {
+                workspace_id
+            };
+            if !defer_analytics_updates
+                && (conv.agent_slug != "codebuff"
+                    || session_count_delta > 0
+                    || !inserted_messages.is_empty())
+            {
                 let delta = StatsDelta {
                     session_count_delta,
                     message_count_delta: inserted_messages.len() as i64,
@@ -15698,7 +16424,7 @@ impl FrankenStorage {
 
                 for &(message_id, msg) in &inserted_messages {
                     let role_s = role_str(&msg.role);
-                    let usage = if historical_raw_json(&msg.extra_json).is_some() {
+                    let mut usage = if historical_raw_json(&msg.extra_json).is_some() {
                         crate::connectors::extract_tokens_for_agent(
                             &conv.agent_slug,
                             &serde_json::Value::Null,
@@ -15713,6 +16439,10 @@ impl FrankenStorage {
                             &role_s,
                         )
                     };
+                    if conv.agent_slug == "codebuff" {
+                        usage.tool_call_count = codebuff_tool_count(&msg.extra_json);
+                        usage.has_tool_calls = usage.tool_call_count > 0;
+                    }
 
                     let msg_ts = msg
                         .created_at
@@ -15856,6 +16586,7 @@ impl FrankenStorage {
                 conversation_id: conv_id,
                 conversation_inserted: session_count_delta > 0,
                 inserted_indices,
+                updated_indices,
                 workspace_changed: franken_reconcile_cursor_workspace(
                     &tx,
                     agent_id,
@@ -15957,6 +16688,41 @@ impl FrankenStorage {
             for conv_id in &conv_ids_to_summarize {
                 franken_update_conversation_token_summaries_in_tx(&tx, *conv_id)?;
             }
+        }
+
+        // Canonical rows changed during planning so later packets saw their
+        // latest payload. Apply derived revisions after first-packet buffers:
+        // otherwise buffered FTS/analytics could resurrect the older content.
+        for revision in &codebuff_revisions {
+            franken_apply_codebuff_revision_projections(
+                self,
+                &tx,
+                revision,
+                defer_lexical_updates,
+            )?;
+        }
+        if !codebuff_revisions.is_empty() {
+            // Revisions do not advance the rowid watermark. A fresh generation
+            // also invalidates checkpoints from an interrupted earlier revision.
+            let generation = format!("message_revision:{:032x}", rand::random::<u128>());
+            for tier in [SemanticIdentityTier::Fast, SemanticIdentityTier::Quality] {
+                tx.execute_compat(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                    fparams![tier.meta_key(), generation.as_str()],
+                )?;
+            }
+            tx.execute("DELETE FROM meta WHERE key = 'last_embedded_message_id'")?;
+            tx.execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams![
+                    TOKEN_USAGE_REVISION_GENERATION_META_KEY,
+                    generation.as_str()
+                ],
+            )?;
+            tx.execute_compat(
+                "DELETE FROM meta WHERE key = ?1",
+                fparams![TOKEN_DAILY_STATS_REBUILD_CURSOR_KEY],
+            )?;
         }
 
         // Repeated packets can change a conversation's workspace more than
@@ -17226,7 +17992,7 @@ fn franken_append_insert_new_messages<'a>(
 ) -> Result<Vec<(i64, &'a Message)>> {
     let mut inserted = Vec::with_capacity(messages.len());
     for msg in messages {
-        if conv.agent_slug == "grok_bot" {
+        if matches!(conv.agent_slug.as_str(), "grok_bot" | "codebuff") {
             // Native-ID reconciliation proved this index new in this
             // transaction. A conflicting writer must abort/retry the packet,
             // never silently discard its new native entry via OR IGNORE.
@@ -17684,8 +18450,12 @@ fn franken_collect_batched_existing_new_messages<'a>(
     HashMap<i64, MessageMergeFingerprint>,
     HashSet<MessageReplayFingerprint>,
 )> {
-    if conv.agent_slug == "grok_bot" {
-        return Ok((reconciled_native_messages(conv), HashMap::new(), HashSet::new()));
+    if matches!(conv.agent_slug.as_str(), "grok_bot" | "codebuff") {
+        return Ok((
+            reconciled_native_messages(conv),
+            HashMap::new(),
+            HashSet::new(),
+        ));
     }
     let tail_metadata = franken_cached_existing_conversation_tail_metadata(tx, conversation_id)?;
     let tail_state = tail_metadata.complete_tail_state();
@@ -18340,6 +19110,8 @@ const TOKEN_DAILY_STATS_TABLE: &str = "token_daily_stats";
 const TOKEN_DAILY_STATS_REBUILD_STAGE_TABLE: &str = "token_daily_stats_rebuild_stage";
 /// `meta` key holding the persisted rebuild cursor (GH #386).
 const TOKEN_DAILY_STATS_REBUILD_CURSOR_KEY: &str = "token_daily_stats_rebuild_cursor";
+/// Same-row ledger revisions must invalidate both resumed and active rebuilds.
+const TOKEN_USAGE_REVISION_GENERATION_META_KEY: &str = "token_usage_revision_generation";
 
 /// Same upsert as the live-table writer, addressed to `table` — which must be
 /// one of the two compile-time table-name constants above (never caller
@@ -18655,11 +19427,12 @@ fn franken_reassociate_cursor_analytics_workspace(
     conv: &Conversation,
 ) -> Result<()> {
     if conv.external_id.is_none()
-        || !(shelley_metadata_is_authoritative(conv) || cursor_workspace_attribution_is_authoritative(
-            &conv.agent_slug,
-            conv.workspace.as_deref(),
-            &conv.metadata_json,
-        ))
+        || !(shelley_metadata_is_authoritative(conv)
+            || cursor_workspace_attribution_is_authoritative(
+                &conv.agent_slug,
+                conv.workspace.as_deref(),
+                &conv.metadata_json,
+            ))
     {
         return Ok(());
     }
@@ -18939,11 +19712,18 @@ fn franken_update_conversation_token_summaries_in_tx(
 struct TokenDailyStatsLedgerFingerprint {
     row_count: i64,
     max_id: i64,
+    revision_generation: Option<String>,
 }
 
 impl TokenDailyStatsLedgerFingerprint {
     fn fingerprint(&self) -> String {
-        format!("token_usage-v1:{}:{}", self.row_count, self.max_id)
+        match &self.revision_generation {
+            Some(generation) => format!(
+                "token_usage-v2:{}:{}:{generation}",
+                self.row_count, self.max_id
+            ),
+            None => format!("token_usage-v1:{}:{}", self.row_count, self.max_id),
+        }
     }
 }
 
@@ -18955,7 +19735,18 @@ fn token_daily_stats_ledger_fingerprint(
         fparams![],
         |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
     )?;
-    Ok(TokenDailyStatsLedgerFingerprint { row_count, max_id })
+    let revision_generation = conn
+        .query_row_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            fparams![TOKEN_USAGE_REVISION_GENERATION_META_KEY],
+            |row| row.get_typed(0),
+        )
+        .optional()?;
+    Ok(TokenDailyStatsLedgerFingerprint {
+        row_count,
+        max_id,
+        revision_generation,
+    })
 }
 
 /// Persisted Track B rebuild cursor (GH #386), stored as JSON under
@@ -19047,15 +19838,20 @@ impl FrankenStorage {
     /// live `token_daily_stats` table is replaced only by the final atomic
     /// swap, so readers never observe a half-rebuilt rollup.
     pub fn rebuild_token_daily_stats(&self) -> Result<usize> {
-        self.rebuild_token_daily_stats_with_progress(None)
+        self.rebuild_token_daily_stats_with_progress(None, None)
     }
 
     fn rebuild_token_daily_stats_with_progress(
         &self,
         heartbeat: Option<&dyn Fn()>,
+        control: Option<&dyn Fn() -> Result<()>>,
     ) -> Result<usize> {
         const CONVERSATION_BATCH_SIZE: usize = 1_000;
         const TOKEN_USAGE_BATCH_SIZE: usize = 10_000;
+
+        if let Some(control) = control {
+            control()?;
+        }
 
         if let Some(heartbeat) = heartbeat {
             heartbeat();
@@ -19093,6 +19889,9 @@ impl FrankenStorage {
                 (cursor.last_conversation_id, cursor.rows_created)
             }
             None => {
+                if let Some(control) = control {
+                    control()?;
+                }
                 // No checkpoint, or the ledger changed since it was taken:
                 // the staged partial aggregate is unusable. Reset it in one
                 // transaction so a crash here leaves either the old
@@ -19111,6 +19910,9 @@ impl FrankenStorage {
         };
 
         loop {
+            if let Some(control) = control {
+                control()?;
+            }
             let mut tx = self.conn.transaction()?;
             let conversation_rows = tx.query_map_collect(
                 "SELECT c.id, c.started_at, c.source_id,
@@ -19136,12 +19938,18 @@ impl FrankenStorage {
             let mut aggregate = TokenStatsAggregator::new();
 
             for (conversation_id, started_at, source_id, agent_slug) in conversation_rows {
+                if let Some(control) = control {
+                    control()?;
+                }
                 last_conversation_id = conversation_id;
                 let conversation_day_id = started_at.map(Self::day_id_from_millis).unwrap_or(0);
                 let mut last_token_usage_id = 0_i64;
                 let mut session_model_family = String::from("unknown");
 
                 loop {
+                    if let Some(control) = control {
+                        control()?;
+                    }
                     let usage_rows = tx.query_map_collect(
                         "SELECT id, day_id, role,
                                 COALESCE(model_family, 'unknown'),
@@ -19239,6 +20047,9 @@ impl FrankenStorage {
             }
 
             let entries = aggregate.expand();
+            if let Some(control) = control {
+                control()?;
+            }
             rows_created = rows_created.saturating_add(entries.len());
             franken_update_token_daily_stats_batched_in_tx_for_table(
                 &tx,
@@ -19253,6 +20064,9 @@ impl FrankenStorage {
                     rows_created,
                 },
             )?;
+            if let Some(control) = control {
+                control()?;
+            }
             tx.commit()?;
             tracing::debug!(
                 target: "cass::analytics",
@@ -19270,7 +20084,30 @@ impl FrankenStorage {
         // with a potentially incomplete mixture of snapshots. Fail closed and
         // leave both the live table and resumable stage/cursor untouched. The
         // next run observes the new fingerprint and safely restarts the stage.
-        let ledger_after = token_daily_stats_ledger_fingerprint(&self.conn)?;
+        // Check the exact ledger generation inside the publication transaction;
+        // otherwise a revision between admission and BEGIN could publish a
+        // stale stage despite passing the earlier fingerprint check.
+        if let Some(control) = control {
+            control()?;
+        }
+        let mut tx = self.conn.transaction()?;
+        let (row_count, max_id) = tx.query_row_map(
+            "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM token_usage",
+            fparams![],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        )?;
+        let revision_generation = tx
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams![TOKEN_USAGE_REVISION_GENERATION_META_KEY],
+                |row| row.get_typed(0),
+            )
+            .optional()?;
+        let ledger_after = TokenDailyStatsLedgerFingerprint {
+            row_count,
+            max_id,
+            revision_generation,
+        };
         if ledger_after.fingerprint() != ledger.fingerprint() {
             bail!(
                 "token_daily_stats phase=pre_publish_consistency: token_usage ledger changed during rebuild (before={}, after={}); the last-good live rollup was preserved — rerun `cass analytics rebuild --track b` once ingest is idle",
@@ -19283,7 +20120,6 @@ impl FrankenStorage {
         // one transaction, the checkpoint is retired with it, and the scratch
         // table is dropped so a finished rebuild leaves the archive schema
         // exactly as it found it.
-        let mut tx = self.conn.transaction()?;
         tx.execute(&format!("DELETE FROM {TOKEN_DAILY_STATS_TABLE}"))?;
         tx.execute(&format!(
             "INSERT INTO {TOKEN_DAILY_STATS_TABLE} (
@@ -19310,6 +20146,9 @@ impl FrankenStorage {
             "DELETE FROM meta WHERE key = ?1",
             fparams![TOKEN_DAILY_STATS_REBUILD_CURSOR_KEY],
         )?;
+        if let Some(control) = control {
+            control()?;
+        }
         tx.commit()?;
         if let Some(heartbeat) = heartbeat {
             heartbeat();
@@ -19368,8 +20207,166 @@ impl FrankenStorage {
         chunk_size: usize,
     ) -> Result<AnalyticsRebuildResult> {
         self.rebuild_analytics_since_with_chunk_size_and_progress(
-            since_ms, chunk_size, None, None, None,
+            since_ms, chunk_size, None, None, None, None,
         )
+    }
+
+    fn reset_legacy_omp_analytics(
+        &self,
+        context: &str,
+        progress: Option<&dyn Fn(i64, i64)>,
+        heartbeat: Option<&dyn Fn()>,
+        control: Option<&dyn Fn() -> Result<()>>,
+    ) -> Result<()> {
+        const TABLES: [(&str, &str, &str); 4] = [
+            (
+                "message_metrics",
+                "SELECT rowid FROM message_metrics ORDER BY rowid LIMIT 128",
+                "DELETE FROM message_metrics WHERE rowid IN",
+            ),
+            (
+                "usage_hourly",
+                "SELECT rowid FROM usage_hourly ORDER BY rowid LIMIT 128",
+                "DELETE FROM usage_hourly WHERE rowid IN",
+            ),
+            (
+                "usage_daily",
+                "SELECT rowid FROM usage_daily ORDER BY rowid LIMIT 128",
+                "DELETE FROM usage_daily WHERE rowid IN",
+            ),
+            (
+                "usage_models_daily",
+                "SELECT rowid FROM usage_models_daily ORDER BY rowid LIMIT 128",
+                "DELETE FROM usage_models_daily WHERE rowid IN",
+            ),
+        ];
+        let checkpoint = || -> Result<()> {
+            if let Some(progress) = progress {
+                progress(0, 0);
+            }
+            if let Some(heartbeat) = heartbeat {
+                heartbeat();
+            }
+            if let Some(control) = control {
+                control()?;
+            }
+            Ok(())
+        };
+        checkpoint()?;
+        // Inspect the actual archive before invalidating authority. The current
+        // schema uses rowid tables; a historical alternate layout must not be
+        // mistaken for the bounded SeekRowid path supported by fsqlite 0.3.18.
+        let layouts: Vec<(String, String, String, i64)> =
+            self.conn
+                .query_map_collect("PRAGMA table_list", fparams![], |row| {
+                    Ok((
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(4)?,
+                    ))
+                })?;
+        let mut bounded = true;
+        for (table, _, _) in TABLES {
+            let layout = layouts.iter().find(|(schema, name, kind, _)| {
+                schema == "main" && name == table && kind == "table"
+            });
+            let Some((_, _, _, without_rowid)) = layout else {
+                bail!("cannot reset legacy OMP analytics: missing ordinary table {table}");
+            };
+            if *without_rowid != 0 {
+                bounded = false;
+                tracing::warn!(
+                    target: "cass::analytics",
+                    table,
+                    "legacy OMP analytics table is WITHOUT ROWID; retaining the unbounded transactional reset because fsqlite 0.3.18 lacks bounded primary-key delete seeks"
+                );
+            }
+        }
+        checkpoint()?;
+        let mut tx = self.conn.transaction()?;
+        tx.execute_compat(
+            "DELETE FROM meta WHERE key IN (?1, ?2, ?3, ?4)",
+            fparams![
+                LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY,
+                LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY,
+                LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY,
+                LEGACY_OMP_ANALYTICS_REBUILT_META_KEY
+            ],
+        )?;
+        if let Some(control) = control {
+            control()?;
+        }
+        tx.commit()?;
+        checkpoint()?;
+
+        if bounded {
+            // Always take the first remaining keys, including negative IDs.
+            // Missing cursor authority makes interruption during clearing
+            // idempotent: reopen clears the remainder before rebuilding.
+            for (_, select_sql, delete_prefix) in TABLES {
+                loop {
+                    checkpoint()?;
+                    let mut tx = self.conn.transaction()?;
+                    let ids: Vec<i64> =
+                        tx.query_map_collect(select_sql, fparams![], |row| row.get_typed(0))?;
+                    if ids.is_empty() {
+                        tx.commit()?;
+                        break;
+                    }
+                    let deleted = delete_rows_by_i64_chunks(&tx, delete_prefix, &ids)?;
+                    anyhow::ensure!(
+                        deleted == ids.len(),
+                        "legacy OMP analytics reset lost selected rows"
+                    );
+                    if let Some(control) = control {
+                        control()?;
+                    }
+                    tx.commit()?;
+                    checkpoint()?;
+                }
+            }
+        }
+
+        checkpoint()?;
+        let mut tx = self.conn.transaction()?;
+        if !bounded {
+            // Preserve the previous all-table reset for unexpected layouts.
+            // This fallback deliberately carries no row-count/RSS bound.
+            for (table, _, _) in TABLES {
+                tx.execute(&format!("DELETE FROM {table}"))?;
+                if let Some(control) = control {
+                    control()?;
+                }
+            }
+        }
+        for (table, _, _) in TABLES {
+            let remaining: Vec<i64> = tx.query_map_collect(
+                &format!("SELECT 1 FROM {table} LIMIT 1"),
+                fparams![],
+                |row| row.get_typed(0),
+            )?;
+            anyhow::ensure!(
+                remaining.is_empty(),
+                "legacy OMP analytics reset left rows in {table}"
+            );
+        }
+        for (key, value) in [
+            (LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY, context),
+            (LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY, "start"),
+            (LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY, "0"),
+        ] {
+            tx.execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams![key, value],
+            )?;
+        }
+        if let Some(control) = control {
+            control()?;
+        }
+        tx.commit()?;
+        checkpoint()?;
+        Ok(())
     }
 
     fn rebuild_analytics_since_with_chunk_size_and_progress(
@@ -19379,7 +20376,11 @@ impl FrankenStorage {
         progress: Option<&dyn Fn(i64, i64)>,
         heartbeat: Option<&dyn Fn()>,
         resume_context: Option<&str>,
+        control: Option<&dyn Fn() -> Result<()>>,
     ) -> Result<AnalyticsRebuildResult> {
+        if let Some(control) = control {
+            control()?;
+        }
         let start = Instant::now();
         let chunk_size = i64::try_from(chunk_size.max(1)).unwrap_or(i64::MAX);
 
@@ -19399,6 +20400,9 @@ impl FrankenStorage {
         // is the whole table.
         if let Some(heartbeat) = heartbeat {
             heartbeat();
+        }
+        if let Some(control) = control {
+            control()?;
         }
         let total_messages: i64 =
             self.conn
@@ -19425,6 +20429,9 @@ impl FrankenStorage {
         // 10k-row chunk on a 652k-message archive; the single-table keyset
         // costs ~0.2 s. Both maps are tiny next to `messages`: one entry per
         // conversation and one per agent.
+        if let Some(control) = control {
+            control()?;
+        }
         let agent_slugs: HashMap<i64, String> = self
             .conn
             .query_map_collect("SELECT id, slug FROM agents", fparams![], |row| {
@@ -19434,6 +20441,9 @@ impl FrankenStorage {
             .collect();
         if let Some(heartbeat) = heartbeat {
             heartbeat();
+        }
+        if let Some(control) = control {
+            control()?;
         }
         let conversation_dims: HashMap<i64, AnalyticsConversationDim> = self
             .conn
@@ -19557,7 +20567,15 @@ impl FrankenStorage {
         // the rebuild sees a partially rebuilt rollup instead of the old one;
         // an interrupted run leaves a prefix that the next full rebuild
         // simply re-derives.
-        if resume_cursor.is_none() {
+        if resume_cursor.is_none()
+            && let Some(context) = resume_context
+        {
+            self.reset_legacy_omp_analytics(context, progress, heartbeat, control)?;
+        }
+        if resume_cursor.is_none() && resume_context.is_none() {
+            if let Some(control) = control {
+                control()?;
+            }
             let mut tx = self.conn.transaction()?;
             match scope {
                 None => {
@@ -19585,36 +20603,20 @@ impl FrankenStorage {
                     )?;
                 }
             }
-            if resume_context.is_none() {
-                // Any ordinary full or scoped rebuild changes the live
-                // message-metrics/usage surfaces outside the OMP cursor's
-                // transaction chain. Retaining that cursor would make a later
-                // migration resume add already-rebuilt rollup deltas again.
-                // Invalidate it atomically with this reset; the migration then
-                // restarts from a known-empty scope instead of double-counting.
-                tx.execute_compat(
-                    "DELETE FROM meta WHERE key IN (?1, ?2, ?3)",
-                    fparams![
-                        LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY,
-                        LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY,
-                        LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY
-                    ],
-                )?;
-            }
-            if let Some(context) = resume_context {
-                tx.execute_compat(
-                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
-                    fparams![LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY, context],
-                )?;
-                tx.execute_compat(
-                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
-                    fparams![LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY, "start"],
-                )?;
-                tx.execute_compat(
-                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, '0')",
-                    fparams![LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY],
-                )?;
-            }
+            // Any ordinary full or scoped rebuild changes the live
+            // message-metrics/usage surfaces outside the OMP cursor's
+            // transaction chain. Retaining that cursor would make a later
+            // migration resume add already-rebuilt rollup deltas again.
+            // Invalidate it atomically with this reset; the migration then
+            // restarts from a known-empty scope instead of double-counting.
+            tx.execute_compat(
+                "DELETE FROM meta WHERE key IN (?1, ?2, ?3)",
+                fparams![
+                    LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY,
+                    LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY,
+                    LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY
+                ],
+            )?;
             tx.commit()?;
         }
 
@@ -19623,7 +20625,7 @@ impl FrankenStorage {
         // including `i64::MIN`, is reachable; later pages use `id > last_id`.
         let (resumed_last_id, mut processed) = resume_cursor.unwrap_or((None, 0));
         let starting_processed = processed;
-        if starting_processed > 0
+        if (starting_processed > 0 || resume_context.is_some())
             && let Some(progress) = progress
         {
             progress(starting_processed, total_messages);
@@ -19643,6 +20645,51 @@ impl FrankenStorage {
         let mut usage_models_daily_rows: usize = 0;
 
         loop {
+            if let Some(control) = control {
+                control()?;
+            }
+            // Plan with byte lengths before hydrating raw payloads. A single
+            // oversized native message is processed alone without truncation.
+            let fetch_limit = if resume_context.is_some() {
+                let lower = if first_page {
+                    i64::MIN
+                } else {
+                    let Some(next) = last_id.checked_add(1) else {
+                        break;
+                    };
+                    next
+                };
+                let lengths: Vec<i64> = self.conn.query_map_collect(
+                    "SELECT COALESCE(LENGTH(CAST(content AS BLOB)), 0)
+                            + COALESCE(LENGTH(CAST(extra_json AS BLOB)), 0)
+                            + COALESCE(LENGTH(extra_bin), 0)
+                     FROM messages WHERE id >= ?1 ORDER BY id LIMIT ?2",
+                    fparams![
+                        lower,
+                        chunk_size.min(LEGACY_OMP_ANALYTICS_CHUNK_SIZE as i64)
+                    ],
+                    |row| row.get_typed(0),
+                )?;
+                let mut bytes = 0_i64;
+                let mut count = 0_i64;
+                for length in lengths {
+                    let next = bytes.saturating_add(length.max(0));
+                    if count > 0 && next > LEGACY_OMP_ANALYTICS_PAGE_BYTES {
+                        break;
+                    }
+                    bytes = next;
+                    count += 1;
+                }
+                if count == 0 {
+                    break;
+                }
+                count
+            } else {
+                chunk_size
+            };
+            if let Some(control) = control {
+                control()?;
+            }
             let decode_row = |row: &FrankenRow| {
                 let extra_json = row
                     .get_typed::<Option<String>>(3)?
@@ -19669,7 +20716,7 @@ impl FrankenStorage {
                      FROM messages m
                      ORDER BY m.id
                      LIMIT ?1",
-                    fparams![chunk_size],
+                    fparams![fetch_limit],
                     decode_row,
                 )?
             } else {
@@ -19680,7 +20727,7 @@ impl FrankenStorage {
                      WHERE m.id > ?1
                      ORDER BY m.id
                      LIMIT ?2",
-                    fparams![last_id, chunk_size],
+                    fparams![last_id, fetch_limit],
                     decode_row,
                 )?
             };
@@ -19699,6 +20746,9 @@ impl FrankenStorage {
             let mut rollup_agg = AnalyticsRollupAggregator::new();
 
             for row in &rows {
+                if let Some(control) = control {
+                    control()?;
+                }
                 let Some(dim) = conversation_dims.get(&row.conversation_id) else {
                     // The former inner JOIN dropped messages whose
                     // conversation row is gone; keep that behaviour.
@@ -19723,8 +20773,12 @@ impl FrankenStorage {
                     .as_ref()
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
-                let usage =
+                let mut usage =
                     crate::connectors::extract_tokens_for_agent(agent_slug, &extra, content, role);
+                if agent_slug == "codebuff" {
+                    usage.tool_call_count = codebuff_tool_count(&extra);
+                    usage.has_tool_calls = usage.tool_call_count > 0;
+                }
                 let model_info = usage
                     .model_name
                     .as_deref()
@@ -19772,14 +20826,31 @@ impl FrankenStorage {
                 rollup_agg.record(&entry);
                 entries.push(entry);
             }
+            // Extraction has copied only compact metrics into `entries`.
+            // Do not retain raw content/JSON beside the writer's dirty pages.
+            drop(rows);
 
             kept += entries.len() as i64;
             let next_processed = processed.saturating_add(fetched as i64);
             if !entries.is_empty() || resume_context.is_some() {
+                if let Some(control) = control {
+                    control()?;
+                }
                 // GH #424: one short write transaction per chunk.
                 let mut tx = self.conn.transaction()?;
                 if !entries.is_empty() {
-                    total_inserted += franken_insert_message_metrics_batched_in_tx(&tx, &entries)?;
+                    for entry in &entries {
+                        if let Some(control) = control {
+                            control()?;
+                        }
+                        total_inserted += franken_insert_message_metrics_batched_in_tx(
+                            &tx,
+                            std::slice::from_ref(entry),
+                        )?;
+                    }
+                    if let Some(control) = control {
+                        control()?;
+                    }
                     let (hourly, daily, models_daily) =
                         franken_flush_analytics_rollups_in_tx(&tx, &rollup_agg)?;
                     usage_hourly_rows += hourly;
@@ -19805,9 +20876,15 @@ impl FrankenStorage {
                         ],
                     )?;
                 }
+                if let Some(control) = control {
+                    control()?;
+                }
                 tx.commit()?;
             }
             processed = next_processed;
+            if let Some(control) = control {
+                control()?;
+            }
 
             // Per-chunk progress at INFO so a multi-hour rebuild is
             // distinguishable from a hang (GH #412).
@@ -19836,7 +20913,7 @@ impl FrankenStorage {
                 heartbeat();
             }
 
-            if (fetched as i64) < chunk_size {
+            if (fetched as i64) < fetch_limit {
                 break;
             }
         }
@@ -19872,13 +20949,17 @@ impl FrankenStorage {
 
     /// Rebuild all daily stats from scratch.
     pub fn rebuild_daily_stats(&self) -> Result<DailyStatsRebuildResult> {
-        self.rebuild_daily_stats_with_progress(None)
+        self.rebuild_daily_stats_with_progress(None, None)
     }
 
     fn rebuild_daily_stats_with_progress(
         &self,
         heartbeat: Option<&dyn Fn()>,
+        control: Option<&dyn Fn() -> Result<()>>,
     ) -> Result<DailyStatsRebuildResult> {
+        if let Some(control) = control {
+            control()?;
+        }
         const DAILY_STATS_REBUILD_CONVERSATION_BATCH_SIZE: usize = 1_000;
         const DAILY_STATS_REBUILD_MESSAGE_BATCH_SIZE: usize = 10_000;
 
@@ -19901,6 +20982,9 @@ impl FrankenStorage {
         // message corpus, defeating the bounded query batches above. The live
         // materialization remains untouched until the final atomic publish, so
         // an interrupted rebuild leaves the last known-good stats available.
+        if let Some(control) = control {
+            control()?;
+        }
         self.conn
             .execute(
                 "CREATE TEMP TABLE IF NOT EXISTS daily_stats_rebuild_stage (
@@ -19966,6 +21050,9 @@ impl FrankenStorage {
             // defending against — see 860acb12).  Inline agent slug via
             // correlated subquery and degrade NULL agent_id to 'unknown' for
             // consistency with the lexical/FTS rebuild paths.
+            if let Some(control) = control {
+                control()?;
+            }
             let conversation_rows = match self.conn.query_with_params(
                 "SELECT c.id, c.started_at,
                         COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown'),
@@ -20023,6 +21110,9 @@ impl FrankenStorage {
             let entries = aggregate.expand();
             expanded_entries_flushed += entries.len();
             if !entries.is_empty() {
+                if let Some(control) = control {
+                    control()?;
+                }
                 let mut batch_tx = self.conn.transaction().with_context(|| {
                     format!(
                         "daily_stats phase=conversation_stage_begin last_conversation_id={last_conversation_id}"
@@ -20038,6 +21128,9 @@ impl FrankenStorage {
                         "daily_stats phase=conversation_stage_upsert last_conversation_id={last_conversation_id}"
                     )
                 })?;
+                if let Some(control) = control {
+                    control()?;
+                }
                 batch_tx.commit().with_context(|| {
                     format!(
                         "daily_stats phase=conversation_stage_commit last_conversation_id={last_conversation_id}"
@@ -20081,6 +21174,9 @@ impl FrankenStorage {
                         aggregate.record_delta(&agent_slug, &source_id, day_id, 0, 1, content_len);
                         Ok(())
                     };
+                    if let Some(control) = control {
+                        control()?;
+                    }
                     let scan_result = if first_message_page {
                         let scan_params = [
                             SqliteValue::from(conversation_id),
@@ -20134,6 +21230,9 @@ impl FrankenStorage {
                     let entries = aggregate.expand();
                     expanded_entries_flushed += entries.len();
                     if !entries.is_empty() {
+                        if let Some(control) = control {
+                            control()?;
+                        }
                         let mut batch_tx = self.conn.transaction().with_context(|| {
                             format!(
                                 "daily_stats phase=message_stage_begin conversation_id={conversation_id} cursor_message_idx={cursor_message_idx}"
@@ -20149,6 +21248,9 @@ impl FrankenStorage {
                                 "daily_stats phase=message_stage_upsert conversation_id={conversation_id} cursor_message_idx={cursor_message_idx}"
                             )
                         })?;
+                        if let Some(control) = control {
+                            control()?;
+                        }
                         batch_tx.commit().with_context(|| {
                             format!(
                                 "daily_stats phase=message_stage_commit conversation_id={conversation_id} cursor_message_idx={cursor_message_idx}"
@@ -20194,6 +21296,9 @@ impl FrankenStorage {
             )
             .with_context(|| "daily_stats phase=stage_count metric=total_sessions")?;
 
+        if let Some(control) = control {
+            control()?;
+        }
         let mut publish_tx = self
             .conn
             .transaction()
@@ -20210,6 +21315,16 @@ impl FrankenStorage {
              FROM daily_stats_rebuild_stage",
             )
             .with_context(|| "daily_stats phase=publish_insert")?;
+        publish_tx.execute_compat(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+            fparams![
+                DAILY_STATS_HEALTH_GENERATION_META_KEY,
+                DAILY_STATS_HEALTH_GENERATION.to_string()
+            ],
+        )?;
+        if let Some(control) = control {
+            control()?;
+        }
         publish_tx
             .commit()
             .with_context(|| "daily_stats phase=publish_commit")?;
@@ -21256,6 +22371,9 @@ fn sql_like_match_bytes(val: &[u8], pat: &[u8]) -> bool {
 /// Default keyset chunk for `rebuild_analytics_since`: rows fetched per
 /// `SELECT` and committed per transaction (GH #424).
 const ANALYTICS_REBUILD_CHUNK_SIZE: usize = 10_000;
+/// Bound legacy repair's transaction and simultaneously materialized payloads.
+const LEGACY_OMP_ANALYTICS_CHUNK_SIZE: usize = 128;
+const LEGACY_OMP_ANALYTICS_PAGE_BYTES: i64 = 8 * 1024 * 1024;
 
 /// Per-conversation dimensions resolved once per analytics rebuild instead
 /// of being JOINed into every keyset chunk (GH #424).
@@ -26317,6 +27435,532 @@ mod tests {
     /// message without replaying additive usage rollups, while an unrelated
     /// analytics rebuild invalidates the cursor and safely starts over.
     #[test]
+    #[serial]
+    fn gh424_legacy_omp_payload_budget_cancellation_and_resume() -> anyhow::Result<()> {
+        #[derive(Debug, thiserror::Error)]
+        #[error("planted analytics cancellation")]
+        struct Stop;
+
+        let _lexical = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "1");
+        let dir = TempDir::new()?;
+        let storage = FrankenStorage::open(&dir.path().join("bounded-analytics.db"))?;
+        let agent = gh423_agent(&storage);
+        let mut conv = gh423_storage_snapshot();
+        // Two individually valid payloads exceed the combined read budget.
+        // The third message is small and must survive the short first page.
+        conv.messages[0].content = "a".repeat(5 * 1024 * 1024);
+        conv.messages[1].content = "b".repeat(5 * 1024 * 1024);
+        storage.insert_conversations_batched_with_analytics(&[(agent, None, &conv)], false)?;
+        let context = "gh424-byte-budget-control";
+        let cancel = || -> Result<()> { Err(Stop.into()) };
+        let error = storage
+            .rebuild_analytics_since_with_chunk_size_and_progress(
+                None,
+                128,
+                None,
+                None,
+                Some(context),
+                Some(&cancel),
+            )
+            .expect_err("cancellation before reset must refuse mutation");
+        assert!(error.downcast_ref::<Stop>().is_some());
+        let count = || -> Result<i64> {
+            Ok(storage.raw().query_row_map(
+                "SELECT COUNT(*) FROM message_metrics",
+                fparams![],
+                |row| row.get_typed(0),
+            )?)
+        };
+        assert_eq!(count()?, 3);
+
+        let stop = std::cell::Cell::new(false);
+        let committed = std::cell::RefCell::new(Vec::new());
+        let progress = |processed: i64, _total: i64| {
+            if processed > 0 {
+                committed.borrow_mut().push(processed);
+                stop.set(true);
+            }
+        };
+        let control = || -> Result<()> { if stop.get() { Err(Stop.into()) } else { Ok(()) } };
+        let error = storage
+            .rebuild_analytics_since_with_chunk_size_and_progress(
+                None,
+                128,
+                Some(&progress),
+                None,
+                Some(context),
+                Some(&control),
+            )
+            .context("legacy repair caller")
+            .expect_err("stop after committed byte-bounded page");
+        assert!(error.downcast_ref::<Stop>().is_some());
+        assert_eq!(
+            *committed.borrow(),
+            vec![1],
+            "byte limit applies before raw payload hydration"
+        );
+        assert_eq!(count()?, 1);
+        let cursor: String = storage.raw().query_row_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            fparams![LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(cursor, "1");
+        stop.set(false);
+        storage.rebuild_analytics_since_with_chunk_size_and_progress(
+            None,
+            128,
+            None,
+            None,
+            Some(context),
+            Some(&control),
+        )?;
+        assert_eq!(
+            count()?,
+            3,
+            "short byte page must not hide the remaining tail"
+        );
+        let totals: (i64, i64) = storage.raw().query_row_map(
+            "SELECT SUM(content_chars), SUM(tool_call_count) FROM message_metrics",
+            fparams![],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        )?;
+        assert_eq!(
+            totals,
+            (
+                conv.messages
+                    .iter()
+                    .map(|message| message.content.len() as i64)
+                    .sum(),
+                3
+            )
+        );
+        for table in ["usage_hourly", "usage_daily", "usage_models_daily"] {
+            let messages: i64 = storage.raw().query_row_map(
+                &format!("SELECT SUM(message_count) FROM {table}"),
+                fparams![],
+                |row| row.get_typed(0),
+            )?;
+            assert_eq!(messages, 3, "resume must not double-count {table}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn gh424_legacy_omp_cancellation_rolls_back_inflight_metrics_and_cursor() -> anyhow::Result<()>
+    {
+        #[derive(Debug, thiserror::Error)]
+        #[error("planted in-transaction analytics cancellation")]
+        struct Stop;
+
+        let _lexical = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "1");
+        let dir = TempDir::new()?;
+        let storage = FrankenStorage::open(&dir.path().join("cancel-analytics-write.db"))?;
+        let agent = gh423_agent(&storage);
+        let conv = gh423_storage_snapshot();
+        storage.insert_conversations_batched_with_analytics(&[(agent, None, &conv)], false)?;
+        let context = "gh424-write-cancellation";
+        let control = || -> Result<()> {
+            let count: i64 = storage.raw().query_row_map(
+                "SELECT COUNT(*) FROM message_metrics",
+                fparams![],
+                |row| row.get_typed(0),
+            )?;
+            if count == 1 { Err(Stop.into()) } else { Ok(()) }
+        };
+        let error = storage
+            .rebuild_analytics_since_with_chunk_size_and_progress(
+                None,
+                128,
+                None,
+                None,
+                Some(context),
+                Some(&control),
+            )
+            .expect_err("stop after a real metric insert must roll back its chunk");
+        assert!(error.downcast_ref::<Stop>().is_some());
+        for table in [
+            "message_metrics",
+            "usage_hourly",
+            "usage_daily",
+            "usage_models_daily",
+        ] {
+            let count: i64 = storage.raw().query_row_map(
+                &format!("SELECT COUNT(*) FROM {table}"),
+                fparams![],
+                |row| row.get_typed(0),
+            )?;
+            assert_eq!(count, 0, "cancelled transaction must not publish {table}");
+        }
+        let cursor: String = storage.raw().query_row_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            fparams![LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(cursor, "0");
+        storage.rebuild_analytics_since_with_chunk_size_and_progress(
+            None,
+            128,
+            None,
+            None,
+            Some(context),
+            None,
+        )?;
+        let count: i64 = storage.raw().query_row_map(
+            "SELECT COUNT(*) FROM message_metrics",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(count, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn gh424_legacy_omp_bounded_reset_reopens_at_each_boundary() -> anyhow::Result<()> {
+        #[derive(Debug, thiserror::Error)]
+        #[error("planted committed reset interruption")]
+        struct Stop;
+
+        fn rows(storage: &FrankenStorage, sql: &str) -> Result<Vec<Vec<SqliteValue>>> {
+            Ok(storage
+                .raw()
+                .query(sql)?
+                .iter()
+                .map(|row| row.values().to_vec())
+                .collect())
+        }
+        fn rollups(storage: &FrankenStorage) -> Result<Vec<Vec<Vec<SqliteValue>>>> {
+            ["usage_hourly", "usage_daily", "usage_models_daily"]
+                .into_iter()
+                .map(|table| {
+                    rows(
+                        storage,
+                        &format!(
+                            "SELECT agent_slug, workspace_id, source_id, message_count,
+                            user_message_count, assistant_message_count, tool_call_count,
+                            plan_message_count, api_coverage_message_count,
+                            content_tokens_est_total, api_tokens_total
+                     FROM {table} ORDER BY rowid"
+                        ),
+                    )
+                })
+                .collect()
+        }
+        let dir = TempDir::new()?;
+        let path = dir.path().join("bounded-reset.db");
+        let storage = FrankenStorage::open(&path)?;
+        let agent = gh423_agent(&storage);
+        let mut conv = gh423_storage_snapshot();
+        let template = conv.messages[0].clone();
+        conv.messages = (0..130)
+            .map(|idx| {
+                let mut message = template.clone();
+                message.idx = idx;
+                message.created_at = Some(1_767_225_622_759 + idx * 86_400_000);
+                message.extra_json["id"] = serde_json::json!(format!("reset-{idx}"));
+                message.extra_json["codebuff_message_id"] =
+                    serde_json::json!(format!("reset-{idx}"));
+                message
+            })
+            .collect();
+        storage.insert_conversations_batched_with_analytics(&[(agent, None, &conv)], false)?;
+        storage.rebuild_analytics_since_with_chunk_size(None, 128)?;
+        let canonical = rows(&storage, "SELECT * FROM messages ORDER BY id")?;
+        let metrics = rows(
+            &storage,
+            "SELECT * FROM message_metrics ORDER BY message_id",
+        )?;
+        let usage = rollups(&storage)?;
+        assert_eq!(canonical.len(), 130);
+        assert_eq!(metrics.len(), 130);
+        assert!(usage.iter().all(|table| table.len() == 130));
+        let context = "gh424-bounded-reset";
+        for (key, value) in [
+            (
+                LEGACY_OMP_RECLASSIFICATION_META_KEY,
+                format!("analytics_pending:{context}"),
+            ),
+            (LEGACY_OMP_ANALYTICS_REBUILT_META_KEY, context.to_string()),
+            (
+                LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY,
+                "obsolete-context".into(),
+            ),
+            (LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY, "777".into()),
+            (LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY, "777".into()),
+        ] {
+            storage.raw().execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams![key, value],
+            )?;
+        }
+        drop(storage);
+
+        // Each boundary is observed only by a heartbeat outside the write
+        // transaction, then the actual connection is closed and reopened.
+        for boundary in 0..3 {
+            let storage = FrankenStorage::open(&path)?;
+            let stop = std::cell::Cell::new(false);
+            let unknown_progress = std::cell::Cell::new(false);
+            let progress = |current, total| {
+                if current == 0 && total == 0 {
+                    unknown_progress.set(true);
+                }
+            };
+            let heartbeat = || {
+                let count: i64 = storage
+                    .raw()
+                    .query_row_map("SELECT COUNT(*) FROM message_metrics", fparams![], |row| {
+                        row.get_typed(0)
+                    })
+                    .expect("read committed reset metrics");
+                let hourly: i64 = storage
+                    .raw()
+                    .query_row_map("SELECT COUNT(*) FROM usage_hourly", fparams![], |row| {
+                        row.get_typed(0)
+                    })
+                    .expect("read committed reset rollup");
+                let cursor: Option<String> = storage
+                    .raw()
+                    .query_row_map(
+                        "SELECT value FROM meta WHERE key = ?1",
+                        fparams![LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY],
+                        |row| row.get_typed(0),
+                    )
+                    .optional()
+                    .expect("read committed reset cursor");
+                if match boundary {
+                    0 => count == 2 && hourly == 130,
+                    1 => count == 0 && hourly == 130,
+                    _ => count == 0 && hourly == 0 && cursor.as_deref() == Some("start"),
+                } {
+                    stop.set(true);
+                }
+            };
+            let control = || -> Result<()> { if stop.get() { Err(Stop.into()) } else { Ok(()) } };
+            let error = storage
+                .rebuild_analytics_since_with_chunk_size_and_progress(
+                    None,
+                    128,
+                    Some(&progress),
+                    Some(&heartbeat),
+                    Some(context),
+                    Some(&control),
+                )
+                .expect_err("committed reset boundary must interrupt the real rebuild");
+            assert!(error.downcast_ref::<Stop>().is_some());
+            assert!(unknown_progress.get());
+            assert_eq!(
+                rows(&storage, "SELECT * FROM messages ORDER BY id")?,
+                canonical
+            );
+            let marker: String = storage.raw().query_row_map(
+                "SELECT value FROM meta WHERE key = ?1",
+                fparams![LEGACY_OMP_RECLASSIFICATION_META_KEY],
+                |row| row.get_typed(0),
+            )?;
+            assert_eq!(marker, format!("analytics_pending:{context}"));
+            let complete: i64 = storage.raw().query_row_map(
+                "SELECT COUNT(*) FROM meta WHERE key = ?1",
+                fparams![LEGACY_OMP_ANALYTICS_REBUILT_META_KEY],
+                |row| row.get_typed(0),
+            )?;
+            assert_eq!(
+                complete, 0,
+                "partially cleared analytics must lose completion authority"
+            );
+            for key in [
+                LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY,
+                LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY,
+                LEGACY_OMP_ANALYTICS_CURSOR_PROCESSED_META_KEY,
+            ] {
+                let value: Option<String> = storage
+                    .raw()
+                    .query_row_map(
+                        "SELECT value FROM meta WHERE key = ?1",
+                        fparams![key],
+                        |row| row.get_typed(0),
+                    )
+                    .optional()?;
+                if boundary < 2 {
+                    assert_eq!(value, None, "clearing must not retain cursor {key}");
+                } else {
+                    let expected = if key == LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY {
+                        context
+                    } else if key == LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY {
+                        "start"
+                    } else {
+                        "0"
+                    };
+                    assert_eq!(value.as_deref(), Some(expected));
+                }
+            }
+        }
+        let storage = FrankenStorage::open(&path)?;
+        let message_progress = std::cell::RefCell::new(Vec::new());
+        let progress = |current, total| message_progress.borrow_mut().push((current, total));
+        storage.rebuild_analytics_since_with_chunk_size_and_progress(
+            None,
+            128,
+            Some(&progress),
+            None,
+            Some(context),
+            None,
+        )?;
+        assert!(message_progress.borrow().contains(&(0, 130)));
+        assert!(message_progress.borrow().contains(&(130, 130)));
+        assert_eq!(
+            rows(&storage, "SELECT * FROM messages ORDER BY id")?,
+            canonical
+        );
+        assert_eq!(
+            rows(
+                &storage,
+                "SELECT * FROM message_metrics ORDER BY message_id"
+            )?,
+            metrics
+        );
+        assert_eq!(rollups(&storage)?, usage);
+        storage.rebuild_analytics_since_with_chunk_size_and_progress(
+            None,
+            128,
+            None,
+            None,
+            Some(context),
+            None,
+        )?;
+        assert_eq!(
+            rows(
+                &storage,
+                "SELECT * FROM message_metrics ORDER BY message_id"
+            )?,
+            metrics
+        );
+        assert_eq!(
+            rollups(&storage)?,
+            usage,
+            "completed cursor replay must not double-count"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gh424_legacy_omp_reset_without_rowid_preserves_transactional_fallback() -> anyhow::Result<()>
+    {
+        let dir = TempDir::new()?;
+        let storage = FrankenStorage::open(&dir.path().join("alternate-layout-reset.db"))?;
+        let agent = gh423_agent(&storage);
+        storage.insert_conversations_batched_with_analytics(
+            &[(agent, None, &gh423_storage_snapshot())],
+            false,
+        )?;
+        // Retain the original table and all its actual columns/constraints;
+        // the alternate layout changes only the presence of a hidden rowid.
+        let original_schema: String = storage.raw().query_row_map(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'usage_models_daily'",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        storage
+            .raw()
+            .execute("ALTER TABLE usage_models_daily RENAME TO retained_usage_models_daily")?;
+        storage.raw().execute(&format!(
+            "{} WITHOUT ROWID",
+            original_schema.trim().trim_end_matches(';')
+        ))?;
+        storage
+            .raw()
+            .execute("INSERT INTO usage_models_daily SELECT * FROM retained_usage_models_daily")?;
+        let alternate_schema: String = storage.raw().query_row_map(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'usage_models_daily'",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        let without_rowid: i64 = storage.raw().query_row_map(
+            "PRAGMA table_list('usage_models_daily')",
+            fparams![],
+            |row| row.get_typed(4),
+        )?;
+        assert_eq!(
+            without_rowid, 1,
+            "the warned fallback must use a real WITHOUT ROWID layout"
+        );
+        let context = "gh424-alternate-layout";
+        let control = || -> Result<()> {
+            let metrics: i64 = storage.raw().query_row_map(
+                "SELECT COUNT(*) FROM message_metrics",
+                fparams![],
+                |row| row.get_typed(0),
+            )?;
+            anyhow::ensure!(metrics != 0, "planted fallback transaction stop");
+            Ok(())
+        };
+        let error = storage
+            .reset_legacy_omp_analytics(context, None, None, Some(&control))
+            .expect_err("fallback cancellation must roll back the table reset");
+        assert!(
+            error
+                .to_string()
+                .contains("planted fallback transaction stop")
+        );
+        let metrics: i64 = storage.raw().query_row_map(
+            "SELECT COUNT(*) FROM message_metrics",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(metrics, 3);
+        let alternate: i64 = storage.raw().query_row_map(
+            "SELECT message_count FROM usage_models_daily",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(alternate, 3);
+        let cursors: i64 = storage.raw().query_row_map(
+            "SELECT COUNT(*) FROM meta WHERE key = ?1",
+            fparams![LEGACY_OMP_ANALYTICS_CURSOR_CONTEXT_META_KEY],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(cursors, 0);
+        storage.reset_legacy_omp_analytics(context, None, None, None)?;
+        for table in [
+            "message_metrics",
+            "usage_hourly",
+            "usage_daily",
+            "usage_models_daily",
+        ] {
+            let remaining: i64 = storage.raw().query_row_map(
+                &format!("SELECT COUNT(*) FROM {table}"),
+                fparams![],
+                |row| row.get_typed(0),
+            )?;
+            assert_eq!(remaining, 0, "fallback must clear {table}");
+        }
+        let cursor: String = storage.raw().query_row_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            fparams![LEGACY_OMP_ANALYTICS_CURSOR_LAST_ID_META_KEY],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(cursor, "start");
+        let canonical: i64 =
+            storage
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                    row.get_typed(0)
+                })?;
+        assert_eq!(canonical, 3);
+        let retained_schema: String = storage.raw().query_row_map(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'usage_models_daily'",
+            fparams![],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(
+            retained_schema, alternate_schema,
+            "reset must preserve the alternate schema"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn gh424_legacy_omp_analytics_cursor_resumes_without_double_counting() -> anyhow::Result<()> {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use std::path::PathBuf;
@@ -26380,6 +28024,7 @@ mod tests {
                 None,
                 None,
                 Some(context),
+                None,
             )
             .expect_err("a full-archive cursor must not be applied to a scoped rebuild");
         assert!(
@@ -26403,6 +28048,7 @@ mod tests {
                 Some(&interrupt_after_first_chunk),
                 Some(&heartbeat),
                 Some(context),
+                None,
             )
         }));
         assert!(
@@ -26445,6 +28091,7 @@ mod tests {
             None,
             Some(&heartbeat),
             Some(context),
+            None,
         )?;
         let resumed_metrics: i64 = storage.conn.query_row_map(
             "SELECT COUNT(*) FROM message_metrics",
@@ -26508,6 +28155,7 @@ mod tests {
                 Some(&interrupt_after_first_chunk),
                 Some(&heartbeat),
                 Some(drift_context),
+                None,
             )
         }));
         assert!(
@@ -26539,6 +28187,7 @@ mod tests {
             None,
             Some(&heartbeat),
             Some(drift_context),
+            None,
         )?;
         let drift_resumed_usage = usage_snapshot()?;
         let drift_resumed_metrics: i64 = storage.conn.query_row_map(
@@ -33016,20 +34665,32 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let path = dir.path().join("native.db");
             let storage = FrankenStorage::open(&path).unwrap();
-            let agent = storage.ensure_agent(&Agent {
-                id: None, slug: "grok_bot".into(), name: "Grok Bot".into(),
-                version: None, kind: AgentKind::Cli,
-            }).unwrap();
+            let agent = storage
+                .ensure_agent(&Agent {
+                    id: None,
+                    slug: "grok_bot".into(),
+                    name: "Grok Bot".into(),
+                    version: None,
+                    kind: AgentKind::Cli,
+                })
+                .unwrap();
             let first = gh447_native_window(1, 200);
             let original = gh447_persist(&storage, agent, &first, batched).unwrap();
             assert_eq!(original.inserted_indices, (0..200).collect::<Vec<_>>());
             let before = storage.fetch_messages(original.conversation_id).unwrap();
-            assert_eq!(before.len(), 200, "distinct native IDs survive identical text/time");
+            assert_eq!(
+                before.len(),
+                200,
+                "distinct native IDs survive identical text/time"
+            );
             let encoded: i64 = storage.raw().query_row_map(
                 "SELECT COUNT(*) FROM messages WHERE extra_bin IS NOT NULL AND extra_json IS NULL",
                 fparams![], |row| row.get_typed(0),
             ).unwrap();
-            assert_eq!(encoded, 200, "replay must actually read MessagePack identities");
+            assert_eq!(
+                encoded, 200,
+                "replay must actually read MessagePack identities"
+            );
             let rolled = gh447_native_window(2, 200);
             let outcome = gh447_persist(&storage, agent, &rolled, batched).unwrap();
             assert_eq!(outcome.conversation_id, original.conversation_id);
@@ -33037,7 +34698,10 @@ mod tests {
             assert_eq!(outcome.inserted_indices, vec![200]);
             let after = storage.fetch_messages(original.conversation_id).unwrap();
             assert_eq!(after.len(), 201);
-            assert_eq!(serde_json::to_value(&after[..200]).unwrap(), serde_json::to_value(&before).unwrap());
+            assert_eq!(
+                serde_json::to_value(&after[..200]).unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
             assert_eq!(after[200].extra_json["grok_bot_entry_id"], "entry-201");
             assert_eq!(after[200].idx, 200);
             drop(storage);
@@ -33048,14 +34712,24 @@ mod tests {
                 assert_eq!(outcome.conversation_id, original.conversation_id);
             }
             let mut nonoverlap = gh447_native_window(1000, 3);
-            for message in &mut nonoverlap.messages { message.created_at = None; }
+            for message in &mut nonoverlap.messages {
+                message.created_at = None;
+            }
             nonoverlap.ended_at = None;
             let outcome = gh447_persist(&storage, agent, &nonoverlap, batched).unwrap();
             assert_eq!(outcome.inserted_indices, vec![201, 202, 203]);
-            assert!(gh447_persist(&storage, agent, &nonoverlap, batched).unwrap().inserted_indices.is_empty());
+            assert!(
+                gh447_persist(&storage, agent, &nonoverlap, batched)
+                    .unwrap()
+                    .inserted_indices
+                    .is_empty()
+            );
             let saved = storage.fetch_messages(original.conversation_id).unwrap();
             assert_eq!(saved.len(), 204);
-            assert_eq!(serde_json::to_value(&saved[..201]).unwrap(), serde_json::to_value(&after).unwrap());
+            assert_eq!(
+                serde_json::to_value(&saved[..201]).unwrap(),
+                serde_json::to_value(&after).unwrap()
+            );
         }
     }
 
@@ -33064,37 +34738,1410 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("ledger.db");
         let storage = FrankenStorage::open(&path).unwrap();
-        let agent = storage.ensure_agent(&Agent {
-            id: None, slug: "grok_bot".into(), name: "Grok Bot".into(),
-            version: None, kind: AgentKind::Cli,
-        }).unwrap();
+        let agent = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "grok_bot".into(),
+                name: "Grok Bot".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
         let completion = SourceIngestLedgerEntry {
-            key: "source_ingest_v1:sample".into(), observation: "verified source observation".into(),
+            key: "source_ingest_v1:sample".into(),
+            observation: "verified source observation".into(),
         };
         let first = gh447_native_window(1, 2);
         let mut invalid = gh447_native_window(3, 1);
         invalid.messages[0].extra_json = serde_json::Value::Null;
-        assert!(storage.insert_conversations_batched_with_source_completion(
-            &[(agent, None, &first), (agent, None, &invalid)], &completion,
-        ).is_err());
+        assert!(
+            storage
+                .insert_conversations_batched_with_source_completion(
+                    &[(agent, None, &first), (agent, None, &invalid)],
+                    &completion,
+                )
+                .is_err()
+        );
         assert!(storage.source_ingest_ledger_entries().unwrap().is_empty());
-        let messages: i64 = storage.raw().query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| row.get_typed(0)).unwrap();
-        assert_eq!(messages, 0, "failed final batch must roll back earlier canonical writes");
-        let outcomes = storage.insert_conversations_batched_with_source_completion(&[(agent, None, &first)], &completion).unwrap();
+        let messages: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(
+            messages, 0,
+            "failed final batch must roll back earlier canonical writes"
+        );
+        let outcomes = storage
+            .insert_conversations_batched_with_source_completion(
+                &[(agent, None, &first)],
+                &completion,
+            )
+            .unwrap();
         assert_eq!(outcomes[0].inserted_indices, vec![0, 1]);
         drop(storage);
         let storage = FrankenStorage::open(&path).unwrap();
-        assert_eq!(storage.source_ingest_ledger_entries().unwrap().get(&completion.key), Some(&completion.observation));
-        assert_eq!(storage.fetch_messages(outcomes[0].conversation_id).unwrap().len(), 2);
-        let changed = SourceIngestLedgerEntry { key: completion.key.clone(), observation: "changed observation".into() };
-        assert!(storage.insert_conversations_batched_with_source_completion(&[(agent, None, &invalid)], &changed).is_err());
-        assert_eq!(storage.source_ingest_ledger_entries().unwrap().get(&completion.key), Some(&completion.observation));
-        let empty = SourceIngestLedgerEntry { key: "source_ingest_v1:empty".into(), observation: "verified empty source".into() };
-        assert!(storage.insert_conversations_batched_with_source_completion(&[], &empty).is_err());
-        assert!(!storage.source_ingest_ledger_entries().unwrap().contains_key(&empty.key));
-        let foreign = SourceIngestLedgerEntry { key: "schema_version".into(), observation: "bad".into() };
-        assert!(storage.insert_conversations_batched_with_source_completion(&[], &foreign).is_err());
+        assert_eq!(
+            storage
+                .source_ingest_ledger_entries()
+                .unwrap()
+                .get(&completion.key),
+            Some(&completion.observation)
+        );
+        assert_eq!(
+            storage
+                .fetch_messages(outcomes[0].conversation_id)
+                .unwrap()
+                .len(),
+            2
+        );
+        let changed = SourceIngestLedgerEntry {
+            key: completion.key.clone(),
+            observation: "changed observation".into(),
+        };
+        assert!(
+            storage
+                .insert_conversations_batched_with_source_completion(
+                    &[(agent, None, &invalid)],
+                    &changed
+                )
+                .is_err()
+        );
+        assert_eq!(
+            storage
+                .source_ingest_ledger_entries()
+                .unwrap()
+                .get(&completion.key),
+            Some(&completion.observation)
+        );
+        let empty = SourceIngestLedgerEntry {
+            key: "source_ingest_v1:empty".into(),
+            observation: "verified empty source".into(),
+        };
+        assert!(
+            storage
+                .insert_conversations_batched_with_source_completion(&[], &empty)
+                .is_err()
+        );
+        assert!(
+            !storage
+                .source_ingest_ledger_entries()
+                .unwrap()
+                .contains_key(&empty.key)
+        );
+        let foreign = SourceIngestLedgerEntry {
+            key: "schema_version".into(),
+            observation: "bad".into(),
+        };
+        assert!(
+            storage
+                .insert_conversations_batched_with_source_completion(&[], &foreign)
+                .is_err()
+        );
         assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    }
+
+    fn gh423_storage_snapshot() -> Conversation {
+        Conversation {
+            id: None, agent_slug: "codebuff".into(), workspace: None,
+            external_id: Some(r#"["/profile/.config/manicode","project","native-chat"]"#.into()),
+            title: Some("Codebuff / Freebuff".into()),
+            source_path: PathBuf::from("/profile/.config/manicode/projects/project/chats/native-chat/chat-messages.json"),
+            started_at: Some(1_767_225_622_759), ended_at: Some(1_767_225_622_759), approx_tokens: None,
+            metadata_json: serde_json::json!({"shared_lineage":true,"storage_format":"manicode-chat-messages-array"}),
+            messages: (0..3).map(|idx| Message {
+                id: None, idx, role: MessageRole::Agent, author: None,
+                created_at: Some(1_767_225_622_759), content: "oldneedle unchanged tool output".into(),
+                extra_json: serde_json::json!({"id":format!("native-{idx}"),"codebuff_message_id":format!("native-{idx}"),
+                    "variant":"ai", "isComplete":false, "credits":1.25,
+                    "blocks":[{"type":"tool","toolCallId":format!("call-{idx}"),"toolName":"read_files",
+                        "input":{"paths":["src/main.rs"]},"output":"oldneedle unchanged tool output"}]}),
+                snippets: vec![Snippet { id:None, file_path:Some(PathBuf::from("src/main.rs")),
+                    start_line:Some(1), end_line:Some(1), language:Some("rust".into()), snippet_text:Some("old snippet".into()) }],
+            }).collect(), source_id: "local".into(), origin_host: None,
+        }
+    }
+
+    fn gh423_revise(conv: &mut Conversation) {
+        let message = &mut conv.messages[1];
+        message.content = "newneedle finished tool output and final ordered response".into();
+        message.extra_json["isComplete"] = serde_json::json!(true);
+        message.extra_json["blocks"][0]["output"] =
+            serde_json::json!("newneedle finished tool output");
+        message.extra_json["blocks"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+            "type":"text","content":"final ordered response"}));
+        message.extra_json["blocks"].as_array_mut().unwrap().push(serde_json::json!({
+            "type":"agent", "content":"Nested review", "blocks":[{"type":"tool",
+                "toolCallId":"nested-call", "toolName":"read_files", "input":{}, "output":"reviewed"}]}));
+        message.snippets[0].snippet_text = Some("updated snippet".into());
+        message.snippets.push(Snippet {
+            id: None,
+            file_path: None,
+            start_line: None,
+            end_line: None,
+            language: Some("text".into()),
+            snippet_text: Some("second snippet".into()),
+        });
+    }
+
+    fn gh423_persist(
+        storage: &FrankenStorage,
+        agent: i64,
+        conv: &Conversation,
+        route: u8,
+    ) -> Result<InsertOutcome> {
+        match route {
+            0 => storage.insert_conversation_tree_with_analytics(agent, None, conv, false),
+            1 => {
+                let (writer, _) = storage.acquire_cached_ephemeral_writer()?;
+                let outcome =
+                    writer.insert_conversation_tree_with_analytics(agent, None, conv, false);
+                storage.release_cached_ephemeral_writer(writer);
+                outcome
+            }
+            _ => storage
+                .insert_conversations_batched_with_analytics(&[(agent, None, conv)], false)?
+                .pop()
+                .context("expected Codebuff outcome"),
+        }
+    }
+
+    fn gh423_agent(storage: &FrankenStorage) -> i64 {
+        storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codebuff".into(),
+                name: "Codebuff / Freebuff".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap()
+    }
+
+    fn gh423_analytics_snapshot(storage: &FrankenStorage) -> Vec<String> {
+        [
+            "daily_stats",
+            "token_usage",
+            "token_daily_stats",
+            "message_metrics",
+            "usage_hourly",
+            "usage_daily",
+            "usage_models_daily",
+        ]
+        .iter()
+        .map(|table| {
+            format!(
+                "{:?}",
+                storage
+                    .raw()
+                    .query(&format!("SELECT * FROM {table} ORDER BY 1, 2, 3"))
+                    .unwrap()
+            )
+        })
+        .collect()
+    }
+
+    fn gh423_assert_analytics(
+        storage: &FrankenStorage,
+        conversation_id: i64,
+        expected_messages: i64,
+        expected_chars: i64,
+        expected_tools: i64,
+    ) {
+        let counts: (i64, i64, i64) = storage.raw().query_row_map(
+            "SELECT session_count, message_count, total_chars FROM daily_stats WHERE agent_slug = 'codebuff' AND source_id = 'local'",
+            fparams![], |row| Ok((row.get_typed(0)?,row.get_typed(1)?,row.get_typed(2)?)),
+        ).unwrap();
+        assert_eq!(counts, (1, expected_messages, expected_chars));
+        for table in ["token_usage", "message_metrics"] {
+            let totals: (i64, i64) = storage
+                .raw()
+                .query_row_map(
+                    &format!("SELECT COUNT(*), SUM(content_chars) FROM {table}"),
+                    fparams![],
+                    |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+                )
+                .unwrap();
+            assert_eq!(totals, (expected_messages, expected_chars));
+        }
+        let token_daily: (i64, i64, i64, i64) = storage.raw().query_row_map(
+            "SELECT api_call_count, session_count, total_content_chars, total_tool_calls FROM token_daily_stats
+             WHERE agent_slug = 'codebuff' AND source_id = 'local' AND model_family = 'unknown'",
+            fparams![], |row| Ok((row.get_typed(0)?,row.get_typed(1)?,row.get_typed(2)?,row.get_typed(3)?)),
+        ).unwrap();
+        assert_eq!(
+            token_daily,
+            (expected_messages, 1, expected_chars, expected_tools)
+        );
+        for table in ["usage_hourly", "usage_daily", "usage_models_daily"] {
+            let totals: (i64, i64, i64) = storage.raw().query_row_map(
+                &format!("SELECT SUM(message_count), SUM(tool_call_count), SUM(api_coverage_message_count) FROM {table}"),
+                fparams![], |row| Ok((row.get_typed(0)?,row.get_typed(1)?,row.get_typed(2)?)),
+            ).unwrap();
+            assert_eq!(
+                totals,
+                (expected_messages, expected_tools, 0),
+                "credits are not API tokens"
+            );
+        }
+        let summary: (i64, i64) = storage
+            .raw()
+            .query_row_map(
+                "SELECT assistant_message_count, tool_call_count FROM conversations WHERE id = ?1",
+                fparams![conversation_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        assert_eq!(summary, (expected_messages, expected_tools));
+        let token_totals: (i64,i64,i64) = storage.raw().query_row_map(
+            "SELECT (SELECT SUM(total_tokens) FROM token_usage),
+             (SELECT grand_total_tokens FROM token_daily_stats WHERE agent_slug = 'codebuff' AND source_id = 'local' AND model_family = 'unknown'),
+             (SELECT grand_total_tokens FROM conversations WHERE id = ?1)",
+            fparams![conversation_id], |row| Ok((row.get_typed(0)?,row.get_typed(1)?,row.get_typed(2)?)),
+        ).unwrap();
+        let canonical_estimate: i64 = storage.raw().query_row_map(
+            "SELECT SUM(CAST(octet_length(content) / 4 AS INTEGER)) FROM messages WHERE conversation_id = ?1",
+            fparams![conversation_id], |row|row.get_typed(0),
+        ).unwrap();
+        assert_eq!(
+            token_totals,
+            (canonical_estimate, canonical_estimate, canonical_estimate)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn gh423_codebuff_revision_admission_compares_payload_without_mutation() {
+        let _lexical = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("revision-admission.db")).unwrap();
+        let agent = gh423_agent(&storage);
+        let original = gh423_storage_snapshot();
+        assert!(
+            !storage
+                .codebuff_message_revisions_needed(&original)
+                .unwrap()
+        );
+        let outcome = storage
+            .insert_conversation_tree(agent, None, &original)
+            .unwrap();
+        let saved = storage.fetch_messages(outcome.conversation_id).unwrap();
+        let analytics = gh423_analytics_snapshot(&storage);
+        assert!(
+            !storage
+                .codebuff_message_revisions_needed(&original)
+                .unwrap()
+        );
+
+        let mut tail = original.clone();
+        let mut message = tail.messages[0].clone();
+        message.extra_json["id"] = serde_json::json!("new-native");
+        message.extra_json["codebuff_message_id"] = serde_json::json!("new-native");
+        tail.messages.push(message);
+        assert!(!storage.codebuff_message_revisions_needed(&tail).unwrap());
+        for mutation in 0..3 {
+            let mut revised = original.clone();
+            match mutation {
+                0 => revised.messages[1].content = "revised admission needle".into(),
+                1 => revised.messages[1].extra_json["isComplete"] = serde_json::json!(true),
+                _ => revised.messages[1].snippets[0].snippet_text = Some("revised snippet".into()),
+            }
+            assert!(storage.codebuff_message_revisions_needed(&revised).unwrap());
+            let mut isolated = revised.clone();
+            isolated.source_id = "other-source".into();
+            assert!(
+                !storage
+                    .codebuff_message_revisions_needed(&isolated)
+                    .unwrap()
+            );
+            isolated = revised.clone();
+            isolated.external_id = Some("other-store".into());
+            assert!(
+                !storage
+                    .codebuff_message_revisions_needed(&isolated)
+                    .unwrap()
+            );
+            isolated = revised;
+            isolated.agent_slug = "other-agent".into();
+            assert!(
+                !storage
+                    .codebuff_message_revisions_needed(&isolated)
+                    .unwrap()
+            );
+        }
+        let mut invalid = original.clone();
+        invalid.messages[1].role = MessageRole::User;
+        assert!(storage.codebuff_message_revisions_needed(&invalid).is_err());
+        invalid = original.clone();
+        invalid.messages.push(invalid.messages[0].clone());
+        assert!(storage.codebuff_message_revisions_needed(&invalid).is_err());
+        invalid = original.clone();
+        invalid.messages[1].extra_json["codebuff_message_id"] =
+            serde_json::json!("conflicting-marker");
+        assert!(storage.codebuff_message_revisions_needed(&invalid).is_err());
+        assert_eq!(
+            serde_json::to_value(storage.fetch_messages(outcome.conversation_id).unwrap()).unwrap(),
+            serde_json::to_value(&saved).unwrap(),
+        );
+        assert_eq!(gh423_analytics_snapshot(&storage), analytics);
+        assert!(
+            !storage
+                .semantic_identity_rebuild_required(SemanticIdentityTier::Fast)
+                .unwrap()
+        );
+
+        // Legacy JSON and current MessagePack extras use the same decoder.
+        storage
+            .raw()
+            .execute_compat(
+                "UPDATE messages SET extra_json = ?2, extra_bin = NULL WHERE id = ?1",
+                fparams![
+                    saved[1].id.unwrap(),
+                    serde_json::to_string(&original.messages[1].extra_json).unwrap()
+                ],
+            )
+            .unwrap();
+        assert!(
+            !storage
+                .codebuff_message_revisions_needed(&original)
+                .unwrap()
+        );
+        let mut revised = original.clone();
+        gh423_revise(&mut revised);
+        assert!(storage.codebuff_message_revisions_needed(&revised).unwrap());
+        storage
+            .insert_conversation_tree(agent, None, &revised)
+            .unwrap();
+        assert!(!storage.codebuff_message_revisions_needed(&revised).unwrap());
+    }
+
+    #[test]
+    #[serial]
+    fn gh423_codebuff_revisions_preserve_ids_payload_fts_and_analytics_all_routes() {
+        let _lexical = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
+        for route in 0..3 {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("revisions.db");
+            let storage = FrankenStorage::open(&path).unwrap();
+            storage.ensure_search_fallback_fts_consistency().unwrap();
+            let agent = gh423_agent(&storage);
+            let mut conv = gh423_storage_snapshot();
+            let first = gh423_persist(&storage, agent, &conv, route).unwrap();
+            assert_eq!(
+                first.inserted_indices,
+                vec![0, 1, 2],
+                "same text/time IDs remain distinct"
+            );
+            assert!(first.updated_indices.is_empty());
+            let before = storage.fetch_messages(first.conversation_id).unwrap();
+            if route == 0 {
+                // Historical JSON and current MessagePack envelopes must use
+                // the same native identity reconciliation.
+                storage
+                    .raw()
+                    .execute_compat(
+                        "UPDATE messages SET extra_json = ?2, extra_bin = NULL WHERE id = ?1",
+                        fparams![
+                            before[1].id.unwrap(),
+                            serde_json::to_string(&before[1].extra_json).unwrap()
+                        ],
+                    )
+                    .unwrap();
+            }
+            storage
+                .set_last_embedded_message_id(before[2].id.unwrap())
+                .unwrap();
+            gh423_revise(&mut conv);
+            let update = gh423_persist(&storage, agent, &conv, route).unwrap();
+            assert_eq!(update.conversation_id, first.conversation_id);
+            assert!(update.inserted_indices.is_empty());
+            assert_eq!(update.updated_indices, vec![1]);
+            assert!(!update.workspace_changed);
+            let after = storage.fetch_messages(first.conversation_id).unwrap();
+            assert_eq!(after.len(), 3);
+            for idx in 0..3 {
+                assert_eq!(
+                    (after[idx].id, after[idx].idx),
+                    (before[idx].id, before[idx].idx)
+                );
+            }
+            assert_eq!(after[1].content, conv.messages[1].content);
+            assert_eq!(after[1].extra_json, conv.messages[1].extra_json);
+            for idx in [0, 2] {
+                assert_eq!(
+                    serde_json::to_value(&after[idx]).unwrap(),
+                    serde_json::to_value(&before[idx]).unwrap()
+                );
+            }
+            let snippets: Vec<String> = storage
+                .raw()
+                .query_map_collect(
+                    "SELECT snippet_text FROM snippets WHERE message_id = ?1 ORDER BY id",
+                    fparams![after[1].id.unwrap()],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(snippets, vec!["updated snippet", "second snippet"]);
+            let matches: Vec<i64> = storage
+                .raw()
+                .query_map_collect(
+                    "SELECT rowid FROM fts_messages WHERE fts_messages MATCH 'newneedle'",
+                    fparams![],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(matches, vec![after[1].id.unwrap()]);
+            let old_matches: Vec<i64> = storage.raw().query_map_collect(
+                "SELECT rowid FROM fts_messages WHERE fts_messages MATCH 'oldneedle' ORDER BY rowid",
+                fparams![], |row| row.get_typed(0),
+            ).unwrap();
+            assert_eq!(
+                old_matches,
+                vec![after[0].id.unwrap(), after[2].id.unwrap()]
+            );
+            gh423_assert_analytics(
+                &storage,
+                first.conversation_id,
+                3,
+                conv.messages.iter().map(|m| m.content.len() as i64).sum(),
+                4,
+            );
+            for tier in [SemanticIdentityTier::Fast, SemanticIdentityTier::Quality] {
+                assert!(storage.semantic_identity_rebuild_required(tier).unwrap());
+                storage.complete_semantic_identity_rebuild(tier).unwrap();
+            }
+            assert_eq!(storage.get_last_embedded_message_id().unwrap(), None);
+            let analytics = gh423_analytics_snapshot(&storage);
+            let replay = gh423_persist(&storage, agent, &conv, route).unwrap();
+            assert!(replay.inserted_indices.is_empty() && replay.updated_indices.is_empty());
+            assert_eq!(gh423_analytics_snapshot(&storage), analytics);
+            assert!(
+                !storage
+                    .semantic_identity_rebuild_required(SemanticIdentityTier::Fast)
+                    .unwrap()
+            );
+            drop(storage);
+            let storage = FrankenStorage::open(&path).unwrap();
+            let replay = gh423_persist(&storage, agent, &conv, 0).unwrap();
+            assert!(replay.updated_indices.is_empty() && replay.inserted_indices.is_empty());
+            assert_eq!(
+                serde_json::to_value(storage.fetch_messages(first.conversation_id).unwrap())
+                    .unwrap(),
+                serde_json::to_value(after).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn gh423_codebuff_multiple_batch_revisions_and_new_native_tail_conserve_counts() {
+        let _lexical = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("batch.db")).unwrap();
+        storage.ensure_search_fallback_fts_consistency().unwrap();
+        let agent = gh423_agent(&storage);
+        let first = gh423_storage_snapshot();
+        let mut second = first.clone();
+        gh423_revise(&mut second);
+        let mut third = second.clone();
+        third.messages[1].content = "thirdneedle final revision".into();
+        let mut new = first.messages[0].clone();
+        new.idx = 0; // A packet position collision is not a native identity collision.
+        new.extra_json["id"] = serde_json::json!("new-native");
+        new.extra_json["codebuff_message_id"] = serde_json::json!("new-native");
+        third.messages.push(new);
+        let outcomes = storage
+            .insert_conversations_batched_with_analytics(
+                &[
+                    (agent, None, &first),
+                    (agent, None, &second),
+                    (agent, None, &third),
+                    (agent, None, &third),
+                ],
+                false,
+            )
+            .unwrap();
+        assert_eq!(outcomes[0].inserted_indices, vec![0, 1, 2]);
+        assert_eq!(outcomes[1].updated_indices, vec![1]);
+        assert_eq!(outcomes[2].updated_indices, vec![1]);
+        assert_eq!(outcomes[2].inserted_indices, vec![3]);
+        assert!(outcomes[3].updated_indices.is_empty() && outcomes[3].inserted_indices.is_empty());
+        let saved = storage.fetch_messages(outcomes[0].conversation_id).unwrap();
+        assert_eq!(saved.len(), 4);
+        assert_eq!(saved[1].content, "thirdneedle final revision");
+        assert_eq!(saved[3].idx, 3);
+        assert_eq!(saved[3].extra_json["codebuff_message_id"], "new-native");
+        gh423_assert_analytics(
+            &storage,
+            outcomes[0].conversation_id,
+            4,
+            third.messages.iter().map(|m| m.content.len() as i64).sum(),
+            5,
+        );
+        let matches: Vec<i64> = storage
+            .raw()
+            .query_map_collect(
+                "SELECT rowid FROM fts_messages WHERE fts_messages MATCH 'newneedle'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert!(
+            matches.is_empty(),
+            "buffered intermediate FTS must not survive"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn gh423_codebuff_conflicting_native_identity_rolls_back_every_projection() {
+        let _lexical = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
+        for defect in 0..5 {
+            let dir = TempDir::new().unwrap();
+            let storage = FrankenStorage::open(&dir.path().join("conflict.db")).unwrap();
+            storage.ensure_search_fallback_fts_consistency().unwrap();
+            let agent = gh423_agent(&storage);
+            let original = gh423_storage_snapshot();
+            let inserted = gh423_persist(&storage, agent, &original, 0).unwrap();
+            let before = storage.fetch_messages(inserted.conversation_id).unwrap();
+            let analytics = gh423_analytics_snapshot(&storage);
+            let mut revision = original.clone();
+            gh423_revise(&mut revision);
+            let mut invalid = revision.clone();
+            match defect {
+                0 => invalid.messages[1].role = MessageRole::User,
+                1 => invalid.messages[1].created_at = Some(1),
+                2 => invalid.messages[1].author = Some("different identity".into()),
+                3 => invalid.messages.push(invalid.messages[1].clone()),
+                _ => {
+                    invalid.messages[1].extra_json["codebuff_message_id"] =
+                        serde_json::json!("wrong")
+                }
+            }
+            assert!(
+                storage
+                    .insert_conversations_batched_with_analytics(
+                        &[(agent, None, &revision), (agent, None, &invalid)],
+                        false
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                serde_json::to_value(storage.fetch_messages(inserted.conversation_id).unwrap())
+                    .unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
+            assert_eq!(gh423_analytics_snapshot(&storage), analytics);
+            assert!(
+                !storage
+                    .semantic_identity_rebuild_required(SemanticIdentityTier::Fast)
+                    .unwrap()
+            );
+            let snippets: Vec<String> = storage
+                .raw()
+                .query_map_collect(
+                    "SELECT snippet_text FROM snippets ORDER BY id",
+                    fparams![],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(snippets, vec!["old snippet", "old snippet", "old snippet"]);
+            let matches: Vec<i64> = storage
+                .raw()
+                .query_map_collect(
+                    "SELECT rowid FROM fts_messages WHERE fts_messages MATCH 'newneedle'",
+                    fparams![],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert!(matches.is_empty());
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn gh423_codebuff_revision_preserves_canonical_fts_metadata() {
+        let _lexical = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("canonical-fts-context.db")).unwrap();
+        storage.ensure_search_fallback_fts_consistency().unwrap();
+        let agent = gh423_agent(&storage);
+        let mut conv = gh423_storage_snapshot();
+        conv.title = Some("storedtitle".into());
+        conv.source_path = "/storedsource/chat.json".into();
+        conv.workspace = Some("/storedworkspace".into());
+        let workspace = storage
+            .ensure_workspace(conv.workspace.as_deref().unwrap(), None)
+            .unwrap();
+        let first = storage
+            .insert_conversation_tree(agent, Some(workspace), &conv)
+            .unwrap();
+        gh423_revise(&mut conv);
+        conv.title = Some("changedtitle".into());
+        conv.source_path = "/aliassource/chat.json".into();
+        conv.workspace = Some("/changedworkspace".into());
+        let mut tail = conv.messages[0].clone();
+        tail.content = "tailneedle".into();
+        tail.extra_json["id"] = serde_json::json!("native-tail");
+        tail.extra_json["codebuff_message_id"] = serde_json::json!("native-tail");
+        conv.messages.push(tail);
+        let alias_workspace = storage
+            .ensure_workspace(conv.workspace.as_deref().unwrap(), None)
+            .unwrap();
+        storage
+            .insert_conversation_tree(agent, Some(alias_workspace), &conv)
+            .unwrap();
+        let canonical: (String, String, i64) = storage
+            .raw()
+            .query_row_map(
+                "SELECT source_path, title, workspace_id FROM conversations WHERE id = ?1",
+                fparams![first.conversation_id],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            canonical,
+            (
+                "/storedsource/chat.json".into(),
+                "storedtitle".into(),
+                workspace
+            )
+        );
+        for table in ["message_metrics", "token_usage"] {
+            let canonical_count: i64 = storage
+                .raw()
+                .query_row_map(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE workspace_id = ?1"),
+                    fparams![workspace],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(
+                canonical_count, 4,
+                "new tails retain the canonical workspace in {table}"
+            );
+        }
+        for (term, expected) in [
+            ("title:storedtitle", 4),
+            ("title:changedtitle", 0),
+            ("source_path:storedsource", 4),
+            ("source_path:aliassource", 0),
+            ("workspace:storedworkspace", 4),
+            ("workspace:changedworkspace", 0),
+            ("oldneedle", 2),
+            ("newneedle", 1),
+            ("tailneedle", 1),
+        ] {
+            let count: i64 = storage
+                .raw()
+                .query_row_map(
+                    "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH ?1",
+                    fparams![term],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(count, expected, "{term}");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn gh423_codebuff_partial_analytics_revisions_preserve_independent_projections() {
+        let _lexical = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
+        for mode in 0..3 {
+            let dir = TempDir::new().unwrap();
+            let storage = FrankenStorage::open(&dir.path().join("partial-analytics.db")).unwrap();
+            storage.ensure_search_fallback_fts_consistency().unwrap();
+            let agent = gh423_agent(&storage);
+            let mut conv = gh423_storage_snapshot();
+            let first = storage
+                .insert_conversations_batched_with_analytics(&[(agent, None, &conv)], mode == 0)
+                .unwrap();
+            let conversation_id = first[0].conversation_id;
+            let ids: Vec<_> = storage
+                .fetch_messages(conversation_id)
+                .unwrap()
+                .iter()
+                .map(|message| (message.id, message.idx))
+                .collect();
+            if mode == 0 {
+                // Real deferred ingest followed by the independently available
+                // Track A rebuild must remain revisable without a token ledger.
+                storage.rebuild_analytics().unwrap();
+            } else {
+                // Partial-materialization controls retain the real token
+                // ledger while the other derived surfaces require backfill.
+                for table in ["usage_hourly", "usage_daily", "usage_models_daily"] {
+                    storage
+                        .raw()
+                        .execute(&format!("DELETE FROM {table}"))
+                        .unwrap();
+                }
+                if mode == 1 {
+                    storage
+                        .raw()
+                        .execute("DELETE FROM message_metrics")
+                        .unwrap();
+                } else {
+                    storage.raw().execute("DELETE FROM daily_stats").unwrap();
+                    storage
+                        .raw()
+                        .execute("DELETE FROM token_daily_stats")
+                        .unwrap();
+                }
+            }
+            gh423_revise(&mut conv);
+            let revision = storage
+                .insert_conversation_tree(agent, None, &conv)
+                .unwrap();
+            assert_eq!(revision.updated_indices, vec![1]);
+            assert!(revision.inserted_indices.is_empty());
+            let chars: i64 = conv
+                .messages
+                .iter()
+                .map(|message| message.content.len() as i64)
+                .sum();
+            for (table, present) in [("message_metrics", mode != 1), ("token_usage", mode != 0)] {
+                let totals: (i64, i64, i64) = storage.raw().query_row_map(
+                    &format!("SELECT COUNT(*), COALESCE(SUM(content_chars), 0), COALESCE(SUM(tool_call_count), 0) FROM {table}"),
+                    fparams![], |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+                ).unwrap();
+                assert_eq!(
+                    totals,
+                    if present { (3, chars, 4) } else { (0, 0, 0) },
+                    "mode={mode}, {table}"
+                );
+            }
+            for table in ["usage_hourly", "usage_daily", "usage_models_daily"] {
+                let totals: (i64, i64) = storage.raw().query_row_map(
+                    &format!("SELECT COALESCE(SUM(message_count), 0), COALESCE(SUM(tool_call_count), 0) FROM {table}"),
+                    fparams![], |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+                ).unwrap();
+                assert_eq!(totals, if mode == 0 { (3, 4) } else { (0, 0) });
+            }
+            for table in ["daily_stats", "token_daily_stats"] {
+                let count: i64 = storage
+                    .raw()
+                    .query_row_map(
+                        &format!("SELECT COUNT(*) FROM {table}"),
+                        fparams![],
+                        |row| row.get_typed(0),
+                    )
+                    .unwrap();
+                if mode == 1 {
+                    assert!(count > 0);
+                } else {
+                    assert_eq!(count, 0);
+                }
+            }
+            if mode == 1 {
+                let daily: (i64, i64, i64) = storage.raw().query_row_map(
+                    "SELECT session_count, message_count, total_chars FROM daily_stats WHERE agent_slug = 'codebuff' AND source_id = 'local'",
+                    fparams![], |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+                ).unwrap();
+                assert_eq!(daily, (1, 3, chars));
+                let tokens: (i64, i64) = storage.raw().query_row_map(
+                    "SELECT total_content_chars, total_tool_calls FROM token_daily_stats WHERE agent_slug = 'codebuff' AND source_id = 'local' AND model_family = 'unknown'",
+                    fparams![], |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+                ).unwrap();
+                assert_eq!(tokens, (chars, 4));
+            }
+            for (term, expected) in [("oldneedle", 2), ("newneedle", 1)] {
+                let count: i64 = storage
+                    .raw()
+                    .query_row_map(
+                        "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH ?1",
+                        fparams![term],
+                        |row| row.get_typed(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, expected);
+            }
+            let snapshot = gh423_analytics_snapshot(&storage);
+            let replay = storage
+                .insert_conversation_tree(agent, None, &conv)
+                .unwrap();
+            assert!(replay.inserted_indices.is_empty() && replay.updated_indices.is_empty());
+            assert_eq!(gh423_analytics_snapshot(&storage), snapshot);
+            assert_eq!(
+                storage
+                    .fetch_messages(conversation_id)
+                    .unwrap()
+                    .iter()
+                    .map(|message| (message.id, message.idx))
+                    .collect::<Vec<_>>(),
+                ids
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn gh423_codebuff_partial_daily_bucket_requires_bounded_canonical_rebuild() {
+        let _lexical = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
+        let _conversations = set_env_var("CASS_DAILY_STATS_REBUILD_CONVERSATION_BATCH_SIZE", "1");
+        let _messages = set_env_var("CASS_DAILY_STATS_REBUILD_MESSAGE_BATCH_SIZE", "2");
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("partial-shared-day.db")).unwrap();
+        let agent = gh423_agent(&storage);
+        let mut conv = gh423_storage_snapshot();
+        let mut sibling = conv.clone();
+        sibling.external_id = Some("sibling-shared-day".into());
+        sibling.source_path = "/sibling/chat.json".into();
+        storage
+            .insert_conversation_tree(agent, None, &sibling)
+            .unwrap();
+        storage
+            .record_daily_stats_archive_fingerprint("original-bucket")
+            .unwrap();
+        storage
+            .insert_conversations_batched_with_analytics(&[(agent, None, &conv)], true)
+            .unwrap();
+        storage.rebuild_analytics().unwrap();
+        let daily = || -> (i64, i64, i64) {
+            storage.raw().query_row_map(
+                "SELECT session_count, message_count, total_chars FROM daily_stats WHERE agent_slug = 'codebuff' AND source_id = 'local'",
+                fparams![], |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+            ).unwrap()
+        };
+        let sibling_chars: i64 = sibling
+            .messages
+            .iter()
+            .map(|message| message.content.len() as i64)
+            .sum();
+        assert_eq!(daily(), (1, 3, sibling_chars));
+        gh423_revise(&mut conv);
+        storage
+            .insert_conversation_tree(agent, None, &conv)
+            .unwrap();
+        assert_eq!(
+            daily(),
+            (1, 3, sibling_chars),
+            "deferred messages never contributed a byte delta to this bucket"
+        );
+        assert!(storage.daily_stats_content_repair_required().unwrap());
+        assert!(
+            !storage
+                .daily_stats_is_known_healthy_for_archive_fingerprint("original-bucket")
+                .unwrap()
+        );
+        let rebuilt = storage.rebuild_daily_stats().unwrap();
+        assert_eq!(rebuilt.total_sessions, 2);
+        let revised_chars: i64 = conv
+            .messages
+            .iter()
+            .map(|message| message.content.len() as i64)
+            .sum();
+        assert_eq!(daily(), (2, 6, sibling_chars + revised_chars));
+        assert!(!storage.daily_stats_content_repair_required().unwrap());
+        let replay = storage
+            .insert_conversation_tree(agent, None, &conv)
+            .unwrap();
+        assert!(replay.updated_indices.is_empty() && replay.inserted_indices.is_empty());
+        assert_eq!(daily(), (2, 6, sibling_chars + revised_chars));
+        assert!(!storage.daily_stats_content_repair_required().unwrap());
+    }
+
+    #[test]
+    #[serial]
+    fn gh423_codebuff_deferred_fts_revision_requires_content_repair() {
+        let _lexical = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
+        for suspended in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let storage = FrankenStorage::open(&dir.path().join("revision-fts.db")).unwrap();
+            storage.ensure_search_fallback_fts_consistency().unwrap();
+            let agent = gh423_agent(&storage);
+            let mut conv = gh423_storage_snapshot();
+            storage
+                .insert_conversation_tree(agent, None, &conv)
+                .unwrap();
+            storage.record_fts_franken_rebuild_generation().unwrap();
+            storage
+                .record_search_fallback_fts_archive_fingerprint("unchanged-rowids")
+                .unwrap();
+            gh423_revise(&mut conv);
+            if suspended {
+                assert!(storage.suspend_fts_inline_writes("bounded test budget exhausted".into()));
+                storage
+                    .insert_conversation_tree(agent, None, &conv)
+                    .unwrap();
+            } else {
+                let _defer = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "1");
+                storage
+                    .insert_conversation_tree(agent, None, &conv)
+                    .unwrap();
+            }
+            let term_count = |term: &str| -> i64 {
+                storage
+                    .raw()
+                    .query_row_map(
+                        "SELECT COUNT(*) FROM fts_messages WHERE fts_messages MATCH ?1",
+                        fparams![term],
+                        |row| row.get_typed(0),
+                    )
+                    .unwrap()
+            };
+            assert_eq!(term_count("oldneedle"), 3);
+            assert_eq!(term_count("newneedle"), 0);
+            assert_eq!(
+                storage.inspect_search_fallback_fts_parity().unwrap().status,
+                FtsShadowParityStatus::Healthy
+            );
+            assert!(
+                !storage
+                    .fallback_fts_is_known_healthy_for_archive_fingerprint("unchanged-rowids")
+                    .unwrap()
+            );
+            arm_fts_rebuild_interruption(1);
+            let error = storage
+                .ensure_search_fallback_fts_consistency()
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("injected FTS rebuild interruption"));
+            assert_eq!(
+                term_count("oldneedle"),
+                3,
+                "failed repair preserves prior publication"
+            );
+            assert_eq!(
+                storage.read_fts_franken_rebuild_generation().unwrap(),
+                Some(FTS_FRANKEN_CONTENT_REVISION_PENDING)
+            );
+            assert!(matches!(
+                storage.ensure_search_fallback_fts_consistency().unwrap(),
+                FtsConsistencyRepair::Rebuilt { inserted_rows: 3 }
+            ));
+            assert_eq!(term_count("oldneedle"), 2);
+            assert_eq!(term_count("newneedle"), 1);
+            assert_eq!(
+                storage.read_fts_franken_rebuild_generation().unwrap(),
+                Some(FTS_FRANKEN_REBUILD_GENERATION)
+            );
+            storage
+                .insert_conversation_tree(agent, None, &conv)
+                .unwrap();
+            assert!(matches!(
+                storage.ensure_search_fallback_fts_consistency().unwrap(),
+                FtsConsistencyRepair::AlreadyHealthy { rows: 3 }
+            ));
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn gh423_codebuff_writer_lifecycle_revisions_keep_absent_fts_optional() {
+        let _lexical = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
+        for lane in 0..3 {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("writer-lifecycle.db");
+            let owner = FrankenStorage::open(&path).unwrap();
+            let agent = gh423_agent(&owner);
+            let mut conv = gh423_storage_snapshot();
+            let first = if lane == 2 {
+                // The initial batch learns that FTS is absent. Returning and
+                // reacquiring this same connection must not manufacture a
+                // positive presence result for the following revision.
+                let (writer, reusable) = owner.acquire_cached_ephemeral_writer().unwrap();
+                assert!(reusable);
+                let first = gh423_persist(&writer, agent, &conv, 2).unwrap();
+                owner.release_cached_ephemeral_writer(writer);
+                first
+            } else {
+                gh423_persist(&owner, agent, &conv, 0).unwrap()
+            };
+            let before = owner.fetch_messages(first.conversation_id).unwrap();
+            let writer = match lane {
+                0 => FrankenStorage::open(&path).unwrap(),
+                1 => FrankenStorage::open_writer(&path).unwrap(),
+                _ => {
+                    let (writer, reusable) = owner.acquire_cached_ephemeral_writer().unwrap();
+                    assert!(reusable);
+                    writer
+                }
+            };
+            gh423_revise(&mut conv);
+            let revision = gh423_persist(&writer, agent, &conv, 2).unwrap();
+            assert_eq!(revision.conversation_id, first.conversation_id);
+            assert_eq!(revision.updated_indices, vec![1]);
+            assert!(revision.inserted_indices.is_empty());
+            let saved = writer.fetch_messages(first.conversation_id).unwrap();
+            assert_eq!(saved.len(), 3);
+            for (old, new) in before.iter().zip(&saved) {
+                assert_eq!((old.id, old.idx), (new.id, new.idx));
+            }
+            assert_eq!(saved[1].content, conv.messages[1].content);
+            assert_eq!(saved[1].extra_json, conv.messages[1].extra_json);
+            assert_eq!(
+                writer.inspect_search_fallback_fts_parity().unwrap().status,
+                FtsShadowParityStatus::Absent
+            );
+            assert_eq!(
+                writer.read_fts_franken_rebuild_generation().unwrap(),
+                Some(FTS_FRANKEN_CONTENT_REVISION_PENDING)
+            );
+            gh423_assert_analytics(
+                &writer,
+                first.conversation_id,
+                3,
+                conv.messages
+                    .iter()
+                    .map(|message| message.content.len() as i64)
+                    .sum(),
+                4,
+            );
+            let analytics = gh423_analytics_snapshot(&writer);
+            let replay = gh423_persist(&writer, agent, &conv, 2).unwrap();
+            assert!(replay.updated_indices.is_empty() && replay.inserted_indices.is_empty());
+            assert_eq!(gh423_analytics_snapshot(&writer), analytics);
+            if lane == 2 {
+                owner.release_cached_ephemeral_writer(writer);
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn gh423_codebuff_absent_fts_revision_reopens_and_recovers_failed_repair() {
+        let _lexical = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
+        for route in 0..3 {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("absent-revision-fts.db");
+            let storage = FrankenStorage::open(&path).unwrap();
+            assert_eq!(
+                storage.inspect_search_fallback_fts_parity().unwrap().status,
+                FtsShadowParityStatus::Absent
+            );
+            let agent = gh423_agent(&storage);
+            let mut conv = gh423_storage_snapshot();
+            let first = gh423_persist(&storage, agent, &conv, route).unwrap();
+            let ids: Vec<_> = storage
+                .fetch_messages(first.conversation_id)
+                .unwrap()
+                .iter()
+                .map(|message| (message.id, message.idx))
+                .collect();
+            gh423_revise(&mut conv);
+            let revision = gh423_persist(&storage, agent, &conv, route).unwrap();
+            assert_eq!(revision.updated_indices, vec![1]);
+            assert!(revision.inserted_indices.is_empty());
+            assert_eq!(
+                storage.inspect_search_fallback_fts_parity().unwrap().status,
+                FtsShadowParityStatus::Absent,
+                "native revisions must not require or eagerly create an FTS shadow"
+            );
+            assert_eq!(
+                storage.read_fts_franken_rebuild_generation().unwrap(),
+                Some(FTS_FRANKEN_CONTENT_REVISION_PENDING)
+            );
+            let canonical =
+                serde_json::to_value(storage.fetch_messages(first.conversation_id).unwrap())
+                    .unwrap();
+            let analytics = gh423_analytics_snapshot(&storage);
+            drop(storage);
+
+            let storage = FrankenStorage::open(&path).unwrap();
+            let replay = gh423_persist(&storage, agent, &conv, route).unwrap();
+            assert!(replay.inserted_indices.is_empty() && replay.updated_indices.is_empty());
+            assert_eq!(
+                storage.read_fts_franken_rebuild_generation().unwrap(),
+                Some(FTS_FRANKEN_CONTENT_REVISION_PENDING),
+                "unchanged replay must retain the unfulfilled repair obligation"
+            );
+            // Exercise real absent-table creation and row insertion, then
+            // roll back before publication and reopen the database file.
+            arm_fts_rebuild_interruption(2);
+            let error = storage
+                .ensure_search_fallback_fts_consistency()
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("injected FTS rebuild interruption"));
+            assert_eq!(
+                storage.inspect_search_fallback_fts_parity().unwrap().status,
+                FtsShadowParityStatus::Absent,
+                "failed first publication must roll back the created shadow"
+            );
+            assert_eq!(
+                storage.read_fts_franken_rebuild_generation().unwrap(),
+                Some(FTS_FRANKEN_CONTENT_REVISION_PENDING)
+            );
+            assert_eq!(
+                serde_json::to_value(storage.fetch_messages(first.conversation_id).unwrap())
+                    .unwrap(),
+                canonical
+            );
+            assert_eq!(gh423_analytics_snapshot(&storage), analytics);
+            drop(storage);
+
+            let storage = FrankenStorage::open(&path).unwrap();
+            assert!(matches!(
+                storage.ensure_search_fallback_fts_consistency().unwrap(),
+                FtsConsistencyRepair::Rebuilt { inserted_rows: 3 }
+            ));
+            for (term, expected) in [
+                ("newneedle", vec![ids[1].0.unwrap()]),
+                ("oldneedle", vec![ids[0].0.unwrap(), ids[2].0.unwrap()]),
+            ] {
+                let hits: Vec<i64> = storage
+                    .raw()
+                    .query_map_collect(
+                        "SELECT rowid FROM fts_messages WHERE fts_messages MATCH ?1 ORDER BY rowid",
+                        fparams![term],
+                        |row| row.get_typed(0),
+                    )
+                    .unwrap();
+                assert_eq!(hits, expected);
+            }
+            assert_eq!(
+                serde_json::to_value(storage.fetch_messages(first.conversation_id).unwrap())
+                    .unwrap(),
+                canonical
+            );
+            assert_eq!(gh423_analytics_snapshot(&storage), analytics);
+            assert_eq!(
+                storage.read_fts_franken_rebuild_generation().unwrap(),
+                Some(FTS_FRANKEN_REBUILD_GENERATION)
+            );
+            assert!(matches!(
+                storage.ensure_search_fallback_fts_consistency().unwrap(),
+                FtsConsistencyRepair::AlreadyHealthy { rows: 3 }
+            ));
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn gh423_codebuff_analytics_rebuild_revision_replay_conserves_tool_counts() {
+        let _lexical = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("revision-analytics.db")).unwrap();
+        let agent = gh423_agent(&storage);
+        let mut conv = gh423_storage_snapshot();
+        let first = storage
+            .insert_conversation_tree(agent, None, &conv)
+            .unwrap();
+        let ids: Vec<_> = storage
+            .fetch_messages(first.conversation_id)
+            .unwrap()
+            .iter()
+            .map(|message| (message.id, message.idx))
+            .collect();
+        storage.rebuild_analytics().unwrap();
+        gh423_assert_analytics(
+            &storage,
+            first.conversation_id,
+            3,
+            conv.messages
+                .iter()
+                .map(|message| message.content.len() as i64)
+                .sum(),
+            3,
+        );
+        gh423_revise(&mut conv);
+        let revision = storage
+            .insert_conversation_tree(agent, None, &conv)
+            .unwrap();
+        assert_eq!(revision.updated_indices, vec![1]);
+        assert!(revision.inserted_indices.is_empty());
+        storage.rebuild_analytics().unwrap();
+        gh423_assert_analytics(
+            &storage,
+            first.conversation_id,
+            3,
+            conv.messages
+                .iter()
+                .map(|message| message.content.len() as i64)
+                .sum(),
+            4,
+        );
+        let analytics = gh423_analytics_snapshot(&storage);
+        let replay = storage
+            .insert_conversation_tree(agent, None, &conv)
+            .unwrap();
+        assert!(replay.updated_indices.is_empty());
+        assert!(replay.inserted_indices.is_empty());
+        assert_eq!(gh423_analytics_snapshot(&storage), analytics);
+        assert_eq!(
+            storage
+                .fetch_messages(first.conversation_id)
+                .unwrap()
+                .iter()
+                .map(|message| (message.id, message.idx))
+                .collect::<Vec<_>>(),
+            ids
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn gh423_codebuff_revision_invalidates_running_token_rebuild_and_resume() {
+        let _lexical = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("revision-token-resume.db")).unwrap();
+        let agent = gh423_agent(&storage);
+        let mut conv = gh423_storage_snapshot();
+        let first = storage
+            .insert_conversation_tree(agent, None, &conv)
+            .unwrap();
+        let before = token_daily_stats_ledger_fingerprint(storage.raw()).unwrap();
+        gh423_revise(&mut conv);
+        let revised = std::cell::Cell::new(false);
+        let heartbeat = || {
+            if !revised.get()
+                && read_token_daily_stats_rebuild_cursor(storage.raw())
+                    .unwrap()
+                    .is_some()
+            {
+                // This callback runs after the real staged batch committed.
+                // Canonical ingest must invalidate that already-built stage.
+                let outcome = storage
+                    .insert_conversation_tree(agent, None, &conv)
+                    .unwrap();
+                assert_eq!(outcome.updated_indices, vec![1]);
+                revised.set(true);
+            }
+        };
+        let error = storage
+            .rebuild_token_daily_stats_with_progress(Some(&heartbeat), None)
+            .unwrap_err();
+        assert!(error.to_string().contains("phase=pre_publish_consistency"));
+        assert!(revised.get());
+        let after = token_daily_stats_ledger_fingerprint(storage.raw()).unwrap();
+        assert_eq!(
+            (before.row_count, before.max_id),
+            (after.row_count, after.max_id)
+        );
+        assert_ne!(before.fingerprint(), after.fingerprint());
+        assert!(
+            read_token_daily_stats_rebuild_cursor(storage.raw())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            historical_table_exists(storage.raw(), TOKEN_DAILY_STATS_REBUILD_STAGE_TABLE).unwrap()
+        );
+        gh423_assert_analytics(
+            &storage,
+            first.conversation_id,
+            3,
+            conv.messages
+                .iter()
+                .map(|message| message.content.len() as i64)
+                .sum(),
+            4,
+        );
+        storage.rebuild_token_daily_stats().unwrap();
+        gh423_assert_analytics(
+            &storage,
+            first.conversation_id,
+            3,
+            conv.messages
+                .iter()
+                .map(|message| message.content.len() as i64)
+                .sum(),
+            4,
+        );
+        let analytics = gh423_analytics_snapshot(&storage);
+        let replay = storage
+            .insert_conversation_tree(agent, None, &conv)
+            .unwrap();
+        assert!(replay.updated_indices.is_empty());
+        assert_eq!(gh423_analytics_snapshot(&storage), analytics);
+    }
+
+    #[test]
+    #[serial]
+    fn gh423_codebuff_deferred_revision_keeps_published_analytics_consistent() {
+        let _lexical = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
+        for initial_deferred in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let storage = FrankenStorage::open(&dir.path().join("deferred.db")).unwrap();
+            let agent = gh423_agent(&storage);
+            let mut conv = gh423_storage_snapshot();
+            let first = storage
+                .insert_conversations_batched_with_analytics(
+                    &[(agent, None, &conv)],
+                    initial_deferred,
+                )
+                .unwrap();
+            gh423_revise(&mut conv);
+            let revision = storage
+                .insert_conversations_batched_with_analytics(&[(agent, None, &conv)], true)
+                .unwrap();
+            assert_eq!(revision[0].updated_indices, vec![1]);
+            if initial_deferred {
+                let count: i64 = storage
+                    .raw()
+                    .query_row_map("SELECT COUNT(*) FROM message_metrics", fparams![], |row| {
+                        row.get_typed(0)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    count, 0,
+                    "deferred initial rows still require normal backfill"
+                );
+            } else {
+                gh423_assert_analytics(
+                    &storage,
+                    first[0].conversation_id,
+                    3,
+                    conv.messages.iter().map(|m| m.content.len() as i64).sum(),
+                    4,
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn gh423_codebuff_native_revisions_are_source_and_store_scoped() {
+        let _lexical = set_env_var("CASS_DEFER_LEXICAL_UPDATES", "0");
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("scopes.db")).unwrap();
+        let agent = gh423_agent(&storage);
+        let first = gh423_storage_snapshot();
+        let mut second_store = first.clone();
+        second_store.external_id =
+            Some(r#"["/second/.config/manicode","project","native-chat"]"#.into());
+        second_store.source_path = PathBuf::from(
+            "/second/.config/manicode/projects/project/chats/native-chat/chat-messages.json",
+        );
+        let mut remote = first.clone();
+        remote.source_id = "remote-machine".into();
+        remote.origin_host = Some("remote-host".into());
+        let outcomes = storage
+            .insert_conversations_batched_with_analytics(
+                &[
+                    (agent, None, &first),
+                    (agent, None, &second_store),
+                    (agent, None, &remote),
+                ],
+                false,
+            )
+            .unwrap();
+        let ids: HashSet<i64> = outcomes
+            .iter()
+            .map(|outcome| outcome.conversation_id)
+            .collect();
+        assert_eq!(ids.len(), 3);
+        let before_store = storage.fetch_messages(outcomes[1].conversation_id).unwrap();
+        let before_remote = storage.fetch_messages(outcomes[2].conversation_id).unwrap();
+        let mut revised = first.clone();
+        gh423_revise(&mut revised);
+        let updated = gh423_persist(&storage, agent, &revised, 0).unwrap();
+        assert_eq!(updated.conversation_id, outcomes[0].conversation_id);
+        assert_eq!(updated.updated_indices, vec![1]);
+        assert_eq!(
+            serde_json::to_value(storage.fetch_messages(outcomes[1].conversation_id).unwrap())
+                .unwrap(),
+            serde_json::to_value(before_store).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(storage.fetch_messages(outcomes[2].conversation_id).unwrap())
+                .unwrap(),
+            serde_json::to_value(before_remote).unwrap()
+        );
     }
 
     fn gh447_native_window(start: u32, count: u32) -> Conversation {
@@ -33115,9 +36162,17 @@ mod tests {
         }
     }
 
-    fn gh447_persist(storage: &FrankenStorage, agent: i64, conv: &Conversation, batched: bool) -> Result<InsertOutcome> {
+    fn gh447_persist(
+        storage: &FrankenStorage,
+        agent: i64,
+        conv: &Conversation,
+        batched: bool,
+    ) -> Result<InsertOutcome> {
         if batched {
-            Ok(storage.insert_conversations_batched_with_analytics(&[(agent, None, conv)], false)?.pop().unwrap())
+            Ok(storage
+                .insert_conversations_batched_with_analytics(&[(agent, None, conv)], false)?
+                .pop()
+                .unwrap())
         } else {
             storage.insert_conversation_tree_with_analytics(agent, None, conv, false)
         }
@@ -33127,32 +36182,75 @@ mod tests {
     fn gh447_native_fifo_batch_packets_and_scopes_are_independent() {
         let dir = TempDir::new().unwrap();
         let storage = FrankenStorage::open(&dir.path().join("scope.db")).unwrap();
-        let agent = storage.ensure_agent(&Agent {
-            id: None, slug: "grok_bot".into(), name: "Grok Bot".into(),
-            version: None, kind: AgentKind::Cli,
-        }).unwrap();
+        let agent = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "grok_bot".into(),
+                name: "Grok Bot".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
         let first = gh447_native_window(1, 200);
         let second = gh447_native_window(2, 200);
         let third = gh447_native_window(201, 2);
         let mut other_account = first.clone();
-        other_account.external_id = Some(first.external_id.as_ref().unwrap().replace("user_a", "user_b"));
+        other_account.external_id = Some(
+            first
+                .external_id
+                .as_ref()
+                .unwrap()
+                .replace("user_a", "user_b"),
+        );
         let mut other_agent = first.clone();
-        other_agent.external_id = Some(first.external_id.as_ref().unwrap().replace("agent-a", "agent-b"));
+        other_agent.external_id = Some(
+            first
+                .external_id
+                .as_ref()
+                .unwrap()
+                .replace("agent-a", "agent-b"),
+        );
         let mut remote = first.clone();
         remote.source_id = "remote-native".into();
-        let outcomes = storage.insert_conversations_batched_with_analytics(&[
-            (agent, None, &first), (agent, None, &second), (agent, None, &second),
-            (agent, None, &third), (agent, None, &other_account),
-            (agent, None, &other_agent), (agent, None, &remote),
-        ], false).unwrap();
-        assert_eq!(outcomes.iter().map(|o| o.inserted_indices.len()).collect::<Vec<_>>(), vec![200, 1, 0, 1, 200, 200, 200]);
+        let outcomes = storage
+            .insert_conversations_batched_with_analytics(
+                &[
+                    (agent, None, &first),
+                    (agent, None, &second),
+                    (agent, None, &second),
+                    (agent, None, &third),
+                    (agent, None, &other_account),
+                    (agent, None, &other_agent),
+                    (agent, None, &remote),
+                ],
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            outcomes
+                .iter()
+                .map(|o| o.inserted_indices.len())
+                .collect::<Vec<_>>(),
+            vec![200, 1, 0, 1, 200, 200, 200]
+        );
         let original = outcomes[0].conversation_id;
-        assert!(outcomes[..4].iter().all(|outcome| outcome.conversation_id == original));
+        assert!(
+            outcomes[..4]
+                .iter()
+                .all(|outcome| outcome.conversation_id == original)
+        );
         assert_eq!(outcomes[3].inserted_indices, vec![201]);
-        let scopes = [original, outcomes[4].conversation_id, outcomes[5].conversation_id, outcomes[6].conversation_id];
+        let scopes = [
+            original,
+            outcomes[4].conversation_id,
+            outcomes[5].conversation_id,
+            outcomes[6].conversation_id,
+        ];
         assert_eq!(scopes.into_iter().collect::<HashSet<_>>().len(), 4);
         assert_eq!(storage.fetch_messages(original).unwrap().len(), 202);
-        for id in &scopes[1..] { assert_eq!(storage.fetch_messages(*id).unwrap().len(), 200); }
+        for id in &scopes[1..] {
+            assert_eq!(storage.fetch_messages(*id).unwrap().len(), 200);
+        }
     }
 
     #[test]
@@ -33160,18 +36258,30 @@ mod tests {
         for batched in [false, true] {
             let dir = TempDir::new().unwrap();
             let storage = FrankenStorage::open(&dir.path().join("conflict.db")).unwrap();
-            let agent = storage.ensure_agent(&Agent {
-                id: None, slug: "grok_bot".into(), name: "Grok Bot".into(),
-                version: None, kind: AgentKind::Cli,
-            }).unwrap();
+            let agent = storage
+                .ensure_agent(&Agent {
+                    id: None,
+                    slug: "grok_bot".into(),
+                    name: "Grok Bot".into(),
+                    version: None,
+                    kind: AgentKind::Cli,
+                })
+                .unwrap();
             let initial = gh447_native_window(1, 2);
-            let id = gh447_persist(&storage, agent, &initial, batched).unwrap().conversation_id;
+            let id = gh447_persist(&storage, agent, &initial, batched)
+                .unwrap()
+                .conversation_id;
             // Exercise the historical JSON-column form alongside normal MessagePack rows.
             storage.raw().execute_compat(
                 "UPDATE messages SET extra_json = ?1, extra_bin = NULL WHERE conversation_id = ?2 AND idx = 0",
                 fparams![serde_json::to_string(&initial.messages[0].extra_json).unwrap(), id],
             ).unwrap();
-            assert!(gh447_persist(&storage, agent, &initial, batched).unwrap().inserted_indices.is_empty());
+            assert!(
+                gh447_persist(&storage, agent, &initial, batched)
+                    .unwrap()
+                    .inserted_indices
+                    .is_empty()
+            );
             let before = serde_json::to_value(storage.fetch_messages(id).unwrap()).unwrap();
             for defect in 0..5 {
                 let mut invalid = gh447_native_window(3, 1);
@@ -33185,16 +36295,35 @@ mod tests {
                 }
                 invalid.messages.push(conflicting);
                 let result = if batched {
-                    storage.insert_conversations_batched_with_analytics(&[(agent, None, &gh447_native_window(9, 1)), (agent, None, &invalid)], false).map(|_| ())
+                    storage
+                        .insert_conversations_batched_with_analytics(
+                            &[
+                                (agent, None, &gh447_native_window(9, 1)),
+                                (agent, None, &invalid),
+                            ],
+                            false,
+                        )
+                        .map(|_| ())
                 } else {
                     gh447_persist(&storage, agent, &invalid, false).map(|_| ())
                 };
-                assert!(result.is_err(), "identity defect {defect} must refuse the complete transaction");
-                assert_eq!(serde_json::to_value(storage.fetch_messages(id).unwrap()).unwrap(), before);
+                assert!(
+                    result.is_err(),
+                    "identity defect {defect} must refuse the complete transaction"
+                );
+                assert_eq!(
+                    serde_json::to_value(storage.fetch_messages(id).unwrap()).unwrap(),
+                    before
+                );
             }
             let mut duplicate = gh447_native_window(3, 1);
             duplicate.messages.push(duplicate.messages[0].clone());
-            assert_eq!(gh447_persist(&storage, agent, &duplicate, batched).unwrap().inserted_indices, vec![2]);
+            assert_eq!(
+                gh447_persist(&storage, agent, &duplicate, batched)
+                    .unwrap()
+                    .inserted_indices,
+                vec![2]
+            );
             let mut conflicting_duplicate = gh447_native_window(4, 1);
             let mut second = conflicting_duplicate.messages[0].clone();
             second.content = "changed under same ID".into();
@@ -33202,7 +36331,12 @@ mod tests {
             assert!(gh447_persist(&storage, agent, &conflicting_duplicate, batched).is_err());
             assert_eq!(storage.fetch_messages(id).unwrap().len(), 3);
             let empty = gh447_native_window(1, 0);
-            assert!(gh447_persist(&storage, agent, &empty, batched).unwrap().inserted_indices.is_empty());
+            assert!(
+                gh447_persist(&storage, agent, &empty, batched)
+                    .unwrap()
+                    .inserted_indices
+                    .is_empty()
+            );
         }
     }
 
@@ -33211,57 +36345,97 @@ mod tests {
         for batched in [false, true] {
             let dir = TempDir::new().unwrap();
             let storage = FrankenStorage::open(&dir.path().join("shelley.db")).unwrap();
-            let agent = storage.ensure_agent(&Agent {
-                id: None, slug: "shelley".into(), name: "Shelley".into(),
-                version: None, kind: AgentKind::Cli,
-            }).unwrap();
+            let agent = storage
+                .ensure_agent(&Agent {
+                    id: None,
+                    slug: "shelley".into(),
+                    name: "Shelley".into(),
+                    version: None,
+                    kind: AgentKind::Cli,
+                })
+                .unwrap();
             let old_path = PathBuf::from("/old");
             let new_path = PathBuf::from("/new");
             let old = storage.ensure_workspace(&old_path, None).unwrap();
             let new = storage.ensure_workspace(&new_path, None).unwrap();
             let mut conv = Conversation {
-                id: None, agent_slug: "shelley".into(), workspace: Some(old_path),
-                external_id: Some("shelley:fixture:alpha".into()), title: Some("old title".into()),
-                source_path: PathBuf::from("/source/shelley.db"), started_at: Some(100),
-                ended_at: Some(100), approx_tokens: None,
+                id: None,
+                agent_slug: "shelley".into(),
+                workspace: Some(old_path),
+                external_id: Some("shelley:fixture:alpha".into()),
+                title: Some("old title".into()),
+                source_path: PathBuf::from("/source/shelley.db"),
+                started_at: Some(100),
+                ended_at: Some(100),
+                approx_tokens: None,
                 metadata_json: serde_json::json!({"source":"shelley","shelley":{"archived":false},"cass":{"retained":true}}),
                 messages: vec![Message {
-                    id: None, idx: 7, role: MessageRole::User, author: None,
-                    created_at: Some(100), content: "retained Shelley content".into(),
-                    extra_json: serde_json::json!({"keep":true}), snippets: vec![],
-                }], source_id: "local".into(), origin_host: None,
+                    id: None,
+                    idx: 7,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(100),
+                    content: "retained Shelley content".into(),
+                    extra_json: serde_json::json!({"keep":true}),
+                    snippets: vec![],
+                }],
+                source_id: "local".into(),
+                origin_host: None,
             };
-            let original = storage.insert_conversation_tree(agent, Some(old), &conv).unwrap();
-            let messages = serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap()).unwrap();
+            let original = storage
+                .insert_conversation_tree(agent, Some(old), &conv)
+                .unwrap();
+            let messages =
+                serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap())
+                    .unwrap();
             conv.messages.clear();
             conv.metadata_json = serde_json::json!({"source":"shelley","shelley":{"archived":true,"tags":["reviewed"]}});
             let mut generation = None;
             for step in 0..5 {
-                if step == 1 { conv.title = Some("new title".into()); }
-                if step == 2 { conv.workspace = Some(new_path.clone()); }
+                if step == 1 {
+                    conv.title = Some("new title".into());
+                }
+                if step == 2 {
+                    conv.workspace = Some(new_path.clone());
+                }
                 let workspace = if step < 2 { old } else { new };
                 let outcome = if batched {
-                    storage.insert_conversations_batched(&[(agent, Some(workspace), &conv)]).unwrap().pop().unwrap()
+                    storage
+                        .insert_conversations_batched(&[(agent, Some(workspace), &conv)])
+                        .unwrap()
+                        .pop()
+                        .unwrap()
                 } else {
-                    storage.insert_conversation_tree(agent, Some(workspace), &conv).unwrap()
+                    storage
+                        .insert_conversation_tree(agent, Some(workspace), &conv)
+                        .unwrap()
                 };
                 assert_eq!(outcome.conversation_id, original.conversation_id);
                 assert!(!outcome.conversation_inserted);
                 assert!(outcome.inserted_indices.is_empty());
                 assert_eq!(outcome.workspace_changed, step == 1 || step == 2);
-                assert_eq!(serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap()).unwrap(), messages);
+                assert_eq!(
+                    serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap())
+                        .unwrap(),
+                    messages
+                );
                 let saved = storage.list_conversations(10, 0).unwrap().pop().unwrap();
                 assert_eq!(saved.metadata_json["cass"]["retained"], true);
                 assert_eq!(saved.metadata_json["shelley"]["archived"], true);
                 assert_eq!(saved.title, conv.title);
                 for tier in [SemanticIdentityTier::Fast, SemanticIdentityTier::Quality] {
                     let current = storage.semantic_identity_rebuild_generation(tier).unwrap();
-                    if step < 2 { assert!(current.is_none()); }
-                    else if step == 2 {
+                    if step < 2 {
+                        assert!(current.is_none());
+                    } else if step == 2 {
                         assert!(current.is_some());
-                        if generation.is_none() { generation = current.clone(); }
+                        if generation.is_none() {
+                            generation = current.clone();
+                        }
                         assert_eq!(current, generation);
-                    } else { assert_eq!(current, generation); }
+                    } else {
+                        assert_eq!(current, generation);
+                    }
                 }
             }
         }
@@ -34404,10 +37578,47 @@ mod tests {
         let record_heartbeat = || {
             heartbeat_events.set(heartbeat_events.get().saturating_add(1));
         };
+        let stop_after_metrics = std::cell::Cell::new(false);
+        let stop_progress = |processed: i64, total: i64| {
+            if processed > 0 && processed == total {
+                stop_after_metrics.set(true);
+            }
+        };
+        let stop_control = || -> Result<()> {
+            anyhow::ensure!(
+                !stop_after_metrics.get(),
+                "planted stop before token rollups"
+            );
+            Ok(())
+        };
+        let cancelled = storage
+            .rebuild_legacy_omp_analytics_with_progress(
+                Some(&stop_progress),
+                Some(&record_heartbeat),
+                Some(&stop_control),
+            )
+            .expect_err("finishing message metrics must not certify remaining analytics phases");
+        assert!(format!("{cancelled:#}").contains("planted stop before token rollups"));
+        let pending = storage.reclassify_legacy_omp_conversations()?;
+        assert!(!pending.lexical_rebuild_required);
+        assert!(pending.analytics_rebuild_required);
+        let unknown_phases = std::cell::Cell::new(0_usize);
+        let resumed_progress = |processed: i64, total: i64| {
+            record_progress(processed, total);
+            if processed == 0 && total == 0 {
+                unknown_phases.set(unknown_phases.get() + 1);
+            }
+        };
         storage.rebuild_legacy_omp_analytics_with_progress(
-            Some(&record_progress),
+            Some(&resumed_progress),
             Some(&record_heartbeat),
+            None,
         )?;
+        assert_eq!(
+            unknown_phases.get(),
+            2,
+            "non-message phases must revoke the completed message denominator"
+        );
         assert!(
             progress_events.get() >= 2,
             "message-metrics rebuild must report start and committed progress"
@@ -35770,7 +38981,7 @@ mod tests {
         // The current-XDG guard has restored the pre-scan empty value.
         // Completion must promote the stored scan context, not hash this
         // changed environment after the lexical publish.
-        storage.rebuild_legacy_omp_analytics_with_progress(None, None)?;
+        storage.rebuild_legacy_omp_analytics_with_progress(None, None, None)?;
         storage.mark_legacy_omp_lexical_publish_complete()?;
         let completed_state: String = storage.conn.query_row_map(
             "SELECT value FROM meta WHERE key = ?1",
@@ -38799,7 +42010,7 @@ mod tests {
         };
 
         let error = storage
-            .rebuild_token_daily_stats_with_progress(Some(&heartbeat))
+            .rebuild_token_daily_stats_with_progress(Some(&heartbeat), None)
             .expect_err("a changed ledger must reject publication");
         assert!(
             error.to_string().contains("phase=pre_publish_consistency"),

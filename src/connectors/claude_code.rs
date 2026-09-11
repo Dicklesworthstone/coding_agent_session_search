@@ -107,7 +107,8 @@ impl Connector for ClaudeCodeConnector {
         hooks: &mut franken_agent_detection::connectors::SourceScanHooks<'_>,
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
-        self.inner.scan_with_source_boundaries(ctx, hooks, on_conversation)
+        self.inner
+            .scan_with_source_boundaries(ctx, hooks, on_conversation)
     }
 
     fn detect(&self) -> DetectionResult {

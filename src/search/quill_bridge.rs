@@ -1080,6 +1080,28 @@ impl QuillCassIndex {
         Ok(())
     }
 
+    /// Remove a bounded batch of stable CASS identities. Quill requires a
+    /// committed writer for deletion, so publish any pending plain additions
+    /// first. The removal publishes its own successor; these two publications
+    /// are not one atomic whole-conversation replacement.
+    pub fn delete_cass_document_ids(&mut self, document_ids: &[String]) -> Result<()> {
+        if document_ids.is_empty() {
+            return Ok(());
+        }
+        self.commit()?;
+        let ids: Vec<&str> = document_ids.iter().map(String::as_str).collect();
+        self.with_engine_liveness(|| {
+            drive(|cx| {
+                let index = &self.index;
+                let ids = &ids;
+                async move { index.delete_documents(&cx, ids).await }
+            })
+        })
+        .map_err(|error| anyhow!("removing revised CASS documents from Quill: {error}"))?;
+        self.tick_heartbeat();
+        Ok(())
+    }
+
     /// Publish everything staged since the last commit.
     ///
     /// # Errors

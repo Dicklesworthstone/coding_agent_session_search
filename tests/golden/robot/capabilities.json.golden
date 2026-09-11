@@ -64,9 +64,11 @@
     "qwen",
     "grok",
     "devin",
+    "grok_bot",
     "goose",
     "crush",
-    "hermes"
+    "hermes",
+    "shelley"
   ],
   "global_flags": [
     {

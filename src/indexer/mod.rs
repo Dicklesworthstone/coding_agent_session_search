@@ -53,14 +53,14 @@ use crate::connector_ingest_diagnostics::{
     ConnectorIngestDiagnostic, ConnectorIngestReport, ConnectorIngestRun, ProviderIngestSummary,
 };
 use crate::connectors::{
-    Connector, DiscoveredSourceFile, ScanContext, ScanRoot, aider::AiderConnector, amp::AmpConnector,
-    antigravity::AntigravityConnector, chatgpt::ChatGptConnector, claude_code::ClaudeCodeConnector,
-    clawdbot::ClawdbotConnector, cline::ClineConnector, codex::CodexConnector,
-    copilot::CopilotConnector, copilot_cli::CopilotCliConnector, cursor::CursorConnector,
-    factory::FactoryConnector, gemini::GeminiConnector, grok::GrokConnector, kimi::KimiConnector,
-    muse::MuseConnector, omp::OmpConnector, openclaw::OpenClawConnector,
-    opencode::OpenCodeConnector, pi_agent::PiAgentConnector, qwen::QwenConnector,
-    vibe::VibeConnector,
+    Connector, DiscoveredSourceFile, ScanContext, ScanRoot, aider::AiderConnector,
+    amp::AmpConnector, antigravity::AntigravityConnector, chatgpt::ChatGptConnector,
+    claude_code::ClaudeCodeConnector, clawdbot::ClawdbotConnector, cline::ClineConnector,
+    codex::CodexConnector, copilot::CopilotConnector, copilot_cli::CopilotCliConnector,
+    cursor::CursorConnector, factory::FactoryConnector, gemini::GeminiConnector,
+    grok::GrokConnector, kimi::KimiConnector, muse::MuseConnector, omp::OmpConnector,
+    openclaw::OpenClawConnector, opencode::OpenCodeConnector, pi_agent::PiAgentConnector,
+    qwen::QwenConnector, vibe::VibeConnector,
 };
 use crate::connectors::{NormalizedConversation, NormalizedMessage, NormalizedSnippet};
 use crate::model::conversation_packet::{
@@ -309,7 +309,9 @@ fn conversation_is_subagent(conversation: &NormalizedConversation) -> bool {
     conversation_source_is_subagent(&conversation.source_path)
         || (conversation.agent_slug == "shelley"
             && conversation.metadata["source"] == "shelley"
-            && conversation.metadata.pointer("/shelley/parent_conversation_id")
+            && conversation
+                .metadata
+                .pointer("/shelley/parent_conversation_id")
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|parent| !parent.trim().is_empty()))
 }
@@ -320,7 +322,9 @@ fn should_skip_subagent(conversation: &NormalizedConversation) -> bool {
 
 #[cfg(test)]
 mod subagent_skip_tests {
-    use super::{NormalizedConversation, conversation_is_subagent, conversation_source_is_subagent};
+    use super::{
+        NormalizedConversation, conversation_is_subagent, conversation_source_is_subagent,
+    };
     use std::path::Path;
 
     #[test]
@@ -346,13 +350,23 @@ mod subagent_skip_tests {
     #[test]
     fn gh415_shelley_subagent_requires_authoritative_parent_metadata() {
         let mut conversation = NormalizedConversation {
-            agent_slug: "shelley".into(), external_id: Some("child".into()),
-            title: None, workspace: None, source_path: "/source/sessions.sqlite3".into(),
-            started_at: None, ended_at: None, messages: Vec::new(),
+            agent_slug: "shelley".into(),
+            external_id: Some("child".into()),
+            title: None,
+            workspace: None,
+            source_path: "/source/sessions.sqlite3".into(),
+            started_at: None,
+            ended_at: None,
+            messages: Vec::new(),
             metadata: serde_json::json!({"source":"shelley", "shelley":{"parent_conversation_id":"parent"}}),
         };
         assert!(conversation_is_subagent(&conversation));
-        for parent in [serde_json::Value::Null, serde_json::json!(""), serde_json::json!("  "), serde_json::json!(123)] {
+        for parent in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("  "),
+            serde_json::json!(123),
+        ] {
             conversation.metadata["shelley"]["parent_conversation_id"] = parent;
             assert!(!conversation_is_subagent(&conversation));
         }
@@ -985,6 +999,7 @@ fn record_connector_ingest_report(
 struct CanonicalMutationCounts {
     inserted_conversations: usize,
     inserted_messages: usize,
+    updated_messages: usize,
 }
 
 impl CanonicalMutationCounts {
@@ -996,11 +1011,12 @@ impl CanonicalMutationCounts {
             inserted_messages: self
                 .inserted_messages
                 .saturating_add(other.inserted_messages),
+            updated_messages: self.updated_messages.saturating_add(other.updated_messages),
         }
     }
 
     fn changed(self) -> bool {
-        self.inserted_conversations > 0 || self.inserted_messages > 0
+        self.inserted_conversations > 0 || self.inserted_messages > 0 || self.updated_messages > 0
     }
 }
 
@@ -1059,6 +1075,7 @@ pub(crate) const INDEX_PHASE_SEMANTIC_VECTOR_PUBLISH: usize = 6;
 pub(crate) const INDEX_PHASE_SEMANTIC_HNSW: usize = 7;
 pub(crate) const INDEX_PHASE_SEMANTIC_MANIFEST: usize = 8;
 pub(crate) const INDEX_PHASE_SEMANTIC_FINALIZE: usize = 9;
+pub(crate) const INDEX_PHASE_ANALYTICS_REBUILD: usize = 10;
 
 #[derive(Debug, Default)]
 pub struct IndexingProgress {
@@ -1201,7 +1218,7 @@ pub struct IndexingProgress {
 pub struct IndexInterrupted;
 
 impl std::fmt::Display for IndexInterrupted {
-    fn fmt(&self, f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("indexing interrupted after committed batch; resume with cass index")
     }
 }
@@ -1209,9 +1226,13 @@ impl std::fmt::Display for IndexInterrupted {
 impl std::error::Error for IndexInterrupted {}
 
 impl IndexingProgress {
-    pub fn request_stop(&self) { self.stop_requested.store(true,Ordering::Release); }
+    pub fn request_stop(&self) {
+        self.stop_requested.store(true, Ordering::Release);
+    }
 
-    pub fn stop_requested(&self) -> bool { self.stop_requested.load(Ordering::Acquire) }
+    pub fn stop_requested(&self) -> bool {
+        self.stop_requested.load(Ordering::Acquire)
+    }
     pub(crate) fn phase_label_for(phase: usize) -> &'static str {
         match phase {
             INDEX_PHASE_PREPARING => "preparing",
@@ -1224,6 +1245,7 @@ impl IndexingProgress {
             INDEX_PHASE_SEMANTIC_HNSW => "semantic_hnsw",
             INDEX_PHASE_SEMANTIC_MANIFEST => "semantic_manifest",
             INDEX_PHASE_SEMANTIC_FINALIZE => "semantic_finalize",
+            INDEX_PHASE_ANALYTICS_REBUILD => "analytics_rebuild",
             _ => "preparing",
         }
     }
@@ -1232,7 +1254,7 @@ impl IndexingProgress {
         match phase {
             INDEX_PHASE_SCANNING => "connectors",
             INDEX_PHASE_LEXICAL_INDEXING | INDEX_PHASE_SEMANTIC_REPLAY => "conversations",
-            INDEX_PHASE_SEMANTIC_EMBEDDING => "messages",
+            INDEX_PHASE_SEMANTIC_EMBEDDING | INDEX_PHASE_ANALYTICS_REBUILD => "messages",
             INDEX_PHASE_SEMANTIC_VECTOR_PUBLISH | INDEX_PHASE_SEMANTIC_HNSW => "vectors",
             INDEX_PHASE_SEMANTIC_MANIFEST | INDEX_PHASE_SEMANTIC_FINALIZE => "steps",
             _ => "items",
@@ -1624,6 +1646,30 @@ impl IndexingProgress {
                 "staged_shard_build_observed_amplification_milli": active_rebuild_json_optional_u64(is_rebuilding, rebuild_pipeline_staged_shard_build_observed_amplification_milli),
             },
         })
+    }
+}
+
+fn check_legacy_omp_analytics_stop(progress: Option<&Arc<IndexingProgress>>) -> Result<()> {
+    if progress.is_some_and(|progress| progress.stop_requested()) {
+        return Err(anyhow::Error::new(IndexInterrupted));
+    }
+    Ok(())
+}
+
+fn report_legacy_omp_analytics_progress(
+    progress: Option<&Arc<IndexingProgress>>,
+    processed: i64,
+    total: i64,
+) {
+    if let Some(progress) = progress {
+        let processed = usize::try_from(processed.max(0)).unwrap_or(usize::MAX);
+        let total = usize::try_from(total.max(0)).unwrap_or(usize::MAX);
+        progress.set_phase_progress(INDEX_PHASE_ANALYTICS_REBUILD, processed, total);
+        if processed == 0 && total == 0 {
+            // The aggregate-only phases do not expose a message denominator.
+            // Do not leave the preceding message pass looking 100% complete.
+            progress.total_is_final.store(false, Ordering::Relaxed);
+        }
     }
 }
 
@@ -9974,9 +10020,7 @@ fn should_skip_broad_scan_after_watch_once_authoritative_repair(
     full_rebuild: bool,
     repaired_from_authoritative_canonical_db: bool,
 ) -> bool {
-    has_watch_once_paths
-        && !full_rebuild
-        && repaired_from_authoritative_canonical_db
+    has_watch_once_paths && !full_rebuild && repaired_from_authoritative_canonical_db
 }
 
 fn should_repair_fallback_fts_after_full_index_run(
@@ -12029,7 +12073,7 @@ fn repair_daily_stats_if_drifted(
         )
     })?;
 
-    if health.populated && health.drift == 0 {
+    if health.populated && health.drift == 0 && !storage.daily_stats_content_repair_required()? {
         if let Some(archive_fingerprint) = known_archive_fingerprint {
             storage.record_daily_stats_archive_fingerprint(archive_fingerprint)?;
         }
@@ -12914,49 +12958,71 @@ fn remember_discovered_connector(discovered_names: &mut Vec<String>, connector_n
 }
 
 fn source_ledger_key(source: &DiscoveredSourceFile, ctx: &ScanContext) -> String {
-    let canonical=std::fs::canonicalize(&source.source_path).unwrap_or_else(|_|source.source_path.clone());
-    let mappings=ctx.scan_roots.iter().map(|root|serde_json::json!([
-        root.path,root.workspace_rewrites
-    ])).collect::<Vec<_>>();
+    let canonical =
+        std::fs::canonicalize(&source.source_path).unwrap_or_else(|_| source.source_path.clone());
+    let mappings = ctx
+        .scan_roots
+        .iter()
+        .map(|root| serde_json::json!([root.path, root.workspace_rewrites]))
+        .collect::<Vec<_>>();
     let identity = serde_json::json!([
-        source.provider_slug, source.scan_root, canonical,
-        source.origin.source_id, source.origin.kind, source.origin.host,mappings
+        source.provider_slug,
+        source.scan_root,
+        canonical,
+        source.origin.source_id,
+        source.origin.kind,
+        source.origin.host,
+        mappings
     ]);
-    format!("source_ingest_v1:{}", blake3::hash(identity.to_string().as_bytes()).to_hex())
+    format!(
+        "source_ingest_v1:{}",
+        blake3::hash(identity.to_string().as_bytes()).to_hex()
+    )
 }
 
 fn source_file_observation(path: &Path) -> Option<serde_json::Value> {
     match std::fs::metadata(path) {
         Ok(metadata) => {
-            let observation=serde_json::json!({
+            let observation = serde_json::json!({
             "path":path,"size":metadata.len(),
             "mtime_ns":metadata.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos().to_string(),
             });
             #[cfg(unix)]
             let observation = {
                 use std::os::unix::fs::MetadataExt;
-                let mut observation=observation;
-                observation["device"]=serde_json::json!(metadata.dev());
-                observation["inode"]=serde_json::json!(metadata.ino());
-                observation["ctime"]=serde_json::json!([metadata.ctime(),metadata.ctime_nsec()]);
+                let mut observation = observation;
+                observation["device"] = serde_json::json!(metadata.dev());
+                observation["inode"] = serde_json::json!(metadata.ino());
+                observation["ctime"] = serde_json::json!([metadata.ctime(), metadata.ctime_nsec()]);
                 observation
             };
             Some(observation)
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound =>
-            Some(serde_json::json!({"path":path,"absent":true})),
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Some(serde_json::json!({"path":path,"absent":true}))
+        }
         Err(_) => None,
     }
 }
 
 fn source_ledger_matches(observation: &str, source: &DiscoveredSourceFile) -> bool {
-    let Ok(saved) = serde_json::from_str::<serde_json::Value>(observation) else { return false; };
+    let Ok(saved) = serde_json::from_str::<serde_json::Value>(observation) else {
+        return false;
+    };
+    if saved["producer_contract"].as_str() != Some(env!("CASS_SOURCE_INGEST_CONTRACT")) {
+        return false;
+    }
     if saved["primary"] != source_file_observation(&source.source_path).unwrap_or_default() {
         return false;
     }
-    let Some(files) = saved["dependencies"].as_array() else { return false; };
-    files.iter().all(|file| file["path"].as_str().is_some_and(|path|
-        source_file_observation(Path::new(path)).as_ref() == Some(file)))
+    let Some(files) = saved["dependencies"].as_array() else {
+        return false;
+    };
+    files.iter().all(|file| {
+        file["path"]
+            .as_str()
+            .is_some_and(|path| source_file_observation(Path::new(path)).as_ref() == Some(file))
+    })
 }
 
 /// Keep only the final bounded batch until the connector certifies a source.
@@ -12970,7 +13036,9 @@ fn scan_with_durable_source_boundaries(
 ) -> Result<()> {
     if !connector.supports_source_boundaries() {
         return connector.scan_with_callback(ctx, &mut |conversation| {
-            if let Some(conversation) = prepare(conversation)? { sender.push(conversation)?; }
+            if let Some(conversation) = prepare(conversation)? {
+                sender.push(conversation)?;
+            }
             Ok(())
         });
     }
@@ -12981,35 +13049,67 @@ fn scan_with_durable_source_boundaries(
     let filtered = std::cell::Cell::new(false);
     let before = std::cell::RefCell::new(None);
     let primary_before = std::cell::RefCell::new(None);
-    let dependencies_before: HashMap<_,_> = connector.discover_source_files(&ctx)?
-        .into_iter().filter_map(|source|source_file_observation(&source.source_path)
-            .map(|observation|(source.source_path,observation))).collect();
+    let dependencies_before: HashMap<_, _> = connector
+        .discover_source_files(&ctx)?
+        .into_iter()
+        .filter_map(|source| {
+            source_file_observation(&source.source_path)
+                .map(|observation| (source.source_path, observation))
+        })
+        .collect();
     let flush_error = std::cell::RefCell::new(None);
     let mut should_scan = |source: &DiscoveredSourceFile| {
-        if config.progress.as_ref().is_some_and(|progress|progress.stop_requested()) { return false; }
+        if config
+            .progress
+            .as_ref()
+            .is_some_and(|progress| progress.stop_requested())
+        {
+            return false;
+        }
         if let Err(error) = sender.borrow_mut().flush() {
             *flush_error.borrow_mut() = Some(error);
             return false;
         }
         filtered.set(scan_path_exclusions_active());
-        *before.borrow_mut() = source.source_path.parent().and_then(source_file_observation);
+        *before.borrow_mut() = source
+            .source_path
+            .parent()
+            .and_then(source_file_observation);
         *primary_before.borrow_mut() = source_file_observation(&source.source_path);
-        let skip = !filtered.get() && config.source_ledger.get(&source_ledger_key(source,&ctx))
-            .is_some_and(|saved| source_ledger_matches(saved,source));
+        let skip = env!("CASS_SOURCE_INGEST_REUSE") == "true"
+            && !filtered.get()
+            && config
+                .source_ledger
+                .get(&source_ledger_key(source, &ctx))
+                .is_some_and(|saved| source_ledger_matches(saved, source));
         tracing::debug!(connector=%source.provider_slug, skipped=skip,"source_ingest_observation");
         !skip
     };
     let mut complete = |completion: &franken_agent_detection::connectors::SourceCompletion| {
-        if filtered.get() || completion.conversations_emitted == 0
+        if filtered.get()
+            || completion.conversations_emitted == 0
             || completion.source.fs_metadata_changed()
-            || completion.required_sidecars.iter().any(DiscoveredSourceFile::fs_metadata_changed)
-        { return sender.borrow_mut().flush(); }
+            || completion
+                .required_sidecars
+                .iter()
+                .any(DiscoveredSourceFile::fs_metadata_changed)
+        {
+            return sender.borrow_mut().flush();
+        }
         let Some(primary) = source_file_observation(&completion.source.source_path) else {
             return sender.borrow_mut().flush();
         };
-        if Some(&primary) != primary_before.borrow().as_ref() { return sender.borrow_mut().flush(); }
-        let parent = completion.source.source_path.parent().and_then(source_file_observation);
-        if parent.is_none() || parent != *before.borrow() { return sender.borrow_mut().flush(); }
+        if Some(&primary) != primary_before.borrow().as_ref() {
+            return sender.borrow_mut().flush();
+        }
+        let parent = completion
+            .source
+            .source_path
+            .parent()
+            .and_then(source_file_observation);
+        if parent.is_none() || parent != *before.borrow() {
+            return sender.borrow_mut().flush();
+        }
         let mut dependencies = vec![parent.expect("checked parent")];
         for sidecar in &completion.required_sidecars {
             let Some(observation) = source_file_observation(&sidecar.source_path) else {
@@ -13021,24 +13121,36 @@ fn scan_with_durable_source_boundaries(
             dependencies.push(observation);
         }
         let entry = crate::storage::sqlite::SourceIngestLedgerEntry {
-            key:source_ledger_key(&completion.source,&ctx),
-            observation:serde_json::json!({"primary":primary,"dependencies":dependencies}).to_string(),
+            key: source_ledger_key(&completion.source, &ctx),
+            observation: serde_json::json!({"primary":primary,"dependencies":dependencies,
+                "producer_contract":env!("CASS_SOURCE_INGEST_CONTRACT")})
+            .to_string(),
         };
         sender.borrow_mut().complete_source(entry)
     };
     let mut hooks = franken_agent_detection::connectors::SourceScanHooks {
-        should_scan_source:Some(&mut should_scan), on_source_complete:Some(&mut complete),
+        should_scan_source: Some(&mut should_scan),
+        on_source_complete: Some(&mut complete),
     };
     connector.scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {
-        if config.progress.as_ref().is_some_and(|progress|progress.stop_requested()) {
+        if config
+            .progress
+            .as_ref()
+            .is_some_and(|progress| progress.stop_requested())
+        {
             anyhow::bail!("indexing interrupted at source boundary");
         }
         match prepare(conversation)? {
             Some(conversation) => sender.borrow_mut().push(conversation),
-            None => { filtered.set(true); Ok(()) }
+            None => {
+                filtered.set(true);
+                Ok(())
+            }
         }
     })?;
-    if let Some(error) = flush_error.into_inner() { return Err(error); }
+    if let Some(error) = flush_error.into_inner() {
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -13094,11 +13206,14 @@ impl<'a> StreamingBatchSender<'a> {
         // Keep the final conversation until the next push or source-complete
         // event. Even an oversized singleton must share its final transaction
         // with the source observation; the limiter already admits one giant.
-        if !self.retain_final && self.conversations.len() == 1
+        if !self.retain_final
+            && self.conversations.len() == 1
             && (self.message_count > DEFAULT_STREAMING_BATCH_LIMITS.max_messages
                 || self.content_bytes > DEFAULT_STREAMING_BATCH_LIMITS.max_chars
                 || self.retained_bytes > DEFAULT_STREAMING_BATCH_LIMITS.max_chars)
-        { self.flush()?; }
+        {
+            self.flush()?;
+        }
 
         Ok(())
     }
@@ -13145,18 +13260,31 @@ impl<'a> StreamingBatchSender<'a> {
         Ok(())
     }
 
-    fn complete_source(&mut self, completion: crate::storage::sqlite::SourceIngestLedgerEntry) -> Result<()> {
-        if self.conversations.is_empty() { return Ok(()); }
+    fn complete_source(
+        &mut self,
+        completion: crate::storage::sqlite::SourceIngestLedgerEntry,
+    ) -> Result<()> {
+        if self.conversations.is_empty() {
+            return Ok(());
+        }
         let byte_reservation = std::mem::take(&mut self.byte_reservation);
         let conversations = std::mem::take(&mut self.conversations);
-        self.message_count=0; self.content_bytes=0; self.retained_bytes=0;
+        self.message_count = 0;
+        self.content_bytes = 0;
+        self.retained_bytes = 0;
         if let Err(error) = self.tx.send(IndexMessage::SourceComplete {
-            connector_name:self.connector_name, conversations, completion, byte_reservation,
+            connector_name: self.connector_name,
+            conversations,
+            completion,
+            byte_reservation,
         }) {
-            drop(error); self.flow_limiter.release(byte_reservation);
-            return Err(anyhow::Error::new(StreamingConsumerDisconnected { connector_name:self.connector_name }));
+            drop(error);
+            self.flow_limiter.release(byte_reservation);
+            return Err(anyhow::Error::new(StreamingConsumerDisconnected {
+                connector_name: self.connector_name,
+            }));
         }
-        self.next_batch_is_discovered=false;
+        self.next_batch_is_discovered = false;
         Ok(())
     }
 }
@@ -13375,35 +13503,41 @@ fn spawn_connector_producer(
                     config.active_source_filter.as_ref(),
                 );
             active_source_skipped |= preparse_active_source_skipped;
-            match scan_with_durable_source_boundaries(conn.as_ref(), &ctx, &config, &mut batch_sender, |mut conversation| {
-                if should_skip_active_session_source(
-                    config.active_source_filter.as_ref(),
-                    SourceKind::Local,
-                    &conversation.source_path,
-                ) {
-                    active_source_skipped = true;
-                    return Ok(None);
-                }
-                if should_skip_subagent(&conversation) {
-                    return Ok(None);
-                }
-                ingest_diagnostics.observe_conversation(&mut conversation);
-                prepare_conversation_for_ingest(
-                    &config.data_dir,
-                    name,
-                    &local_origin,
-                    None,
-                    &mut conversation,
-                );
-                // #332: each parsed conversation is live work even while the
-                // batch sender buffers it below publication thresholds — this
-                // tick keeps the stall watchdog from firing during a long
-                // parse of a large source artifact.
-                if let Some(p) = &config.progress {
-                    p.tick_activity();
-                }
-                Ok(Some(conversation))
-            }) {
+            match scan_with_durable_source_boundaries(
+                conn.as_ref(),
+                &ctx,
+                &config,
+                &mut batch_sender,
+                |mut conversation| {
+                    if should_skip_active_session_source(
+                        config.active_source_filter.as_ref(),
+                        SourceKind::Local,
+                        &conversation.source_path,
+                    ) {
+                        active_source_skipped = true;
+                        return Ok(None);
+                    }
+                    if should_skip_subagent(&conversation) {
+                        return Ok(None);
+                    }
+                    ingest_diagnostics.observe_conversation(&mut conversation);
+                    prepare_conversation_for_ingest(
+                        &config.data_dir,
+                        name,
+                        &local_origin,
+                        None,
+                        &mut conversation,
+                    );
+                    // #332: each parsed conversation is live work even while the
+                    // batch sender buffers it below publication thresholds — this
+                    // tick keeps the stall watchdog from firing during a long
+                    // parse of a large source artifact.
+                    if let Some(p) = &config.progress {
+                        p.tick_activity();
+                    }
+                    Ok(Some(conversation))
+                },
+            ) {
                 Ok(()) => {
                     if let Err(error) = batch_sender.flush() {
                         if is_streaming_consumer_disconnected(&error) {
@@ -13481,41 +13615,47 @@ fn spawn_connector_producer(
                     config.active_source_filter.as_ref(),
                 );
             active_source_skipped |= preparse_active_source_skipped;
-            match scan_with_durable_source_boundaries(conn.as_ref(), &ctx, &config, &mut batch_sender, |mut conversation| {
-                if should_skip_active_session_source(
-                    config.active_source_filter.as_ref(),
-                    root.origin.kind,
-                    &conversation.source_path,
-                ) {
-                    active_source_skipped = true;
-                    return Ok(None);
-                }
-                if should_skip_subagent(&conversation) {
-                    return Ok(None);
-                }
-                ingest_diagnostics.observe_conversation(&mut conversation);
-                prepare_conversation_for_ingest(
-                    &config.data_dir,
-                    name,
-                    &root.origin,
-                    Some(root),
-                    &mut conversation,
-                );
-
-                if !was_detected && !is_discovered {
-                    if let Some(p) = &config.progress {
-                        p.discovered_agents.fetch_add(1, Ordering::Relaxed);
+            match scan_with_durable_source_boundaries(
+                conn.as_ref(),
+                &ctx,
+                &config,
+                &mut batch_sender,
+                |mut conversation| {
+                    if should_skip_active_session_source(
+                        config.active_source_filter.as_ref(),
+                        root.origin.kind,
+                        &conversation.source_path,
+                    ) {
+                        active_source_skipped = true;
+                        return Ok(None);
                     }
-                    is_discovered = true;
-                }
+                    if should_skip_subagent(&conversation) {
+                        return Ok(None);
+                    }
+                    ingest_diagnostics.observe_conversation(&mut conversation);
+                    prepare_conversation_for_ingest(
+                        &config.data_dir,
+                        name,
+                        &root.origin,
+                        Some(root),
+                        &mut conversation,
+                    );
 
-                // #332: parsed-conversation liveness tick (see the local-scan
-                // callback above).
-                if let Some(p) = &config.progress {
-                    p.tick_activity();
-                }
-                Ok(Some(conversation))
-            }) {
+                    if !was_detected && !is_discovered {
+                        if let Some(p) = &config.progress {
+                            p.discovered_agents.fetch_add(1, Ordering::Relaxed);
+                        }
+                        is_discovered = true;
+                    }
+
+                    // #332: parsed-conversation liveness tick (see the local-scan
+                    // callback above).
+                    if let Some(p) = &config.progress {
+                        p.tick_activity();
+                    }
+                    Ok(Some(conversation))
+                },
+            ) {
                 Ok(()) => {
                     if let Err(error) = batch_sender.flush() {
                         if is_streaming_consumer_disconnected(&error) {
@@ -13706,8 +13846,10 @@ fn run_streaming_consumer(
     // Per-connector stats tracking (T7.4)
     let mut connector_stats: HashMap<String, ConnectorStats> = HashMap::new();
     let mut failed_scan_connectors = BTreeSet::new();
-    let source_commit_limit = dotenvy::var("CASS_INDEX_MAX_SOURCE_COMMITS").ok()
-        .and_then(|value|value.parse::<usize>().ok()).filter(|limit|*limit>0);
+    let source_commit_limit = dotenvy::var("CASS_INDEX_MAX_SOURCE_COMMITS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|limit| *limit > 0);
     let mut source_commits = 0usize;
 
     // Card 3 (flat combining, §14.2): when enabled and at least one
@@ -13729,9 +13871,14 @@ fn run_streaming_consumer(
     let mut deferred_non_batch: VecDeque<IndexMessage> = VecDeque::new();
 
     loop {
-        if progress.as_ref().is_some_and(|progress|progress.stop_requested()) {
-            if let Some(index) = t_index.as_deref_mut() { index.commit()?; }
-            best_effort_abort_wal_checkpoint(data_dir);
+        if progress
+            .as_ref()
+            .is_some_and(|progress| progress.stop_requested())
+        {
+            if let Some(index) = t_index.as_deref_mut() {
+                index.commit()?;
+            }
+            best_effort_abort_wal_checkpoint_for_db(&storage.database_path()?);
             return Err(anyhow::Error::new(IndexInterrupted));
         }
         // Drain any deferred messages from a prior combine-drain first, in
@@ -13930,27 +14077,109 @@ fn run_streaming_consumer(
                     "streaming_ingest"
                 );
             }
-            Ok(IndexMessage::SourceComplete { connector_name, conversations, completion, byte_reservation }) => {
-                let count=conversations.len();
-                let messages=conversations.iter().map(|conv|conv.messages.len()).sum::<usize>();
-                let result = ingest_batch_detailed_with_source_completion(
-                    storage, t_index.as_deref_mut(), data_dir, &conversations, progress, lexical_strategy,
-                    defer_streaming_checkpoints, progress_bump,
-                    (!failed_scan_connectors.contains(connector_name)).then_some(&completion),
-                );
+            Ok(IndexMessage::SourceComplete {
+                connector_name,
+                conversations,
+                completion,
+                byte_reservation,
+            }) => {
+                let count = conversations.len();
+                let messages = conversations
+                    .iter()
+                    .map(|conv| conv.messages.len())
+                    .sum::<usize>();
+                if !switched_to_indexing {
+                    if let Some(p) = progress {
+                        p.phase
+                            .store(INDEX_PHASE_LEXICAL_INDEXING, Ordering::Relaxed);
+                        p.total.store(0, Ordering::Relaxed);
+                        p.current.store(0, Ordering::Relaxed);
+                        p.total_is_final.store(false, Ordering::Relaxed);
+                    }
+                    switched_to_indexing = true;
+                }
+                if let Some(p) = progress {
+                    p.total.fetch_add(count, Ordering::Relaxed);
+                    p.tick_activity();
+                }
+                let mut completion_written = !failed_scan_connectors.contains(connector_name);
+                let first = if should_inject_non_watch_ingest_test_oom(&conversations) {
+                    Err(anyhow::Error::new(
+                        crate::franken_sync::FrankenError::OutOfMemory,
+                    ))
+                } else {
+                    ingest_batch_detailed_with_source_completion(
+                        storage,
+                        t_index.as_deref_mut(),
+                        data_dir,
+                        &conversations,
+                        progress,
+                        lexical_strategy,
+                        defer_streaming_checkpoints,
+                        progress_bump,
+                        completion_written.then_some(&completion),
+                    )
+                };
+                let result = match first {
+                    Err(error) if error_is_out_of_memory(&error) => {
+                        // Preserve the ordinary split/defer/quarantine recovery.
+                        // A partial retry must never certify this source as complete.
+                        completion_written = false;
+                        ingest_non_watch_oom_retry_or_quarantine(
+                            storage,
+                            data_dir,
+                            &conversations,
+                            progress,
+                            lexical_strategy,
+                            defer_streaming_checkpoints,
+                            progress_bump,
+                            error,
+                        )
+                    }
+                    result => result,
+                };
+                if let Ok(outcome) = &result
+                    && conversations.iter().any(|conversation| {
+                        outcome.deferred_sources.contains(&conversation.source_path)
+                    })
+                {
+                    failed_scan_connectors.insert(connector_name.to_string());
+                }
                 drop(conversations);
                 flow_limiter.release(byte_reservation);
-                ingest_outcome=ingest_outcome.accumulate(result?);
-                total_conversations+=count; total_messages+=messages;
-                remember_discovered_connector(&mut discovered_names,connector_name);
-                let stats=connector_stats.entry(connector_name.to_string()).or_insert_with(||ConnectorStats {
-                    name:connector_name.to_string(),..Default::default()
-                });
-                stats.conversations+=count; stats.messages+=messages;
-                tracing::info!(connector=connector_name,conversations=count,"source_ingest_committed");
-                source_commits+=1;
-                if source_commit_limit.is_some_and(|limit|source_commits>=limit)
-                    && let Some(progress)=progress { progress.request_stop(); }
+                ingest_outcome = ingest_outcome.accumulate(result?);
+                total_conversations += count;
+                total_messages += messages;
+                remember_discovered_connector(&mut discovered_names, connector_name);
+                let stats = connector_stats
+                    .entry(connector_name.to_string())
+                    .or_insert_with(|| ConnectorStats {
+                        name: connector_name.to_string(),
+                        ..Default::default()
+                    });
+                stats.conversations += count;
+                stats.messages += messages;
+                if last_commit.elapsed() >= streaming_consumer_commit_interval() {
+                    if let Some(index) = t_index.as_deref_mut()
+                        && let Err(error) = index.commit()
+                    {
+                        tracing::warn!(%error, "incremental commit failed");
+                    }
+                    last_commit = std::time::Instant::now();
+                }
+                if completion_written {
+                    tracing::info!(
+                        connector = connector_name,
+                        conversations = count,
+                        "source_ingest_committed"
+                    );
+                    source_commits += 1;
+                    if source_commit_limit.is_some_and(|limit| source_commits >= limit)
+                        && let Some(progress) = progress
+                    {
+                        progress.request_stop();
+                    }
+                }
             }
             Ok(IndexMessage::ScanError {
                 connector_name,
@@ -14240,9 +14469,16 @@ fn run_streaming_index_with_connector_factories(
     // Create bounded channel for backpressure
     let (tx, rx) = bounded::<IndexMessage>(STREAMING_CHANNEL_SIZE);
     let producer_config = StreamingProducerConfig {
-        source_ledger: Arc::new(if matches!(lexical_strategy,LexicalPopulationStrategy::InlineRebuildFromScan) {
-            HashMap::new()
-        } else { storage.source_ingest_ledger_entries()? }),
+        source_ledger: Arc::new(
+            if matches!(
+                lexical_strategy,
+                LexicalPopulationStrategy::InlineRebuildFromScan
+            ) {
+                HashMap::new()
+            } else {
+                storage.source_ingest_ledger_entries()?
+            },
+        ),
         flow_limiter: Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
         data_dir: opts.data_dir.clone(),
         additional_scan_roots: additional_scan_roots.clone(),
@@ -14384,19 +14620,38 @@ fn run_batch_index_with_connector_factories(
     scan_start_ts: Option<i64>,
     progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
-    let (boundary, fallback): (Vec<_>,Vec<_>) = connector_factories.into_iter()
-        .partition(|(_,factory)|factory().supports_source_boundaries());
+    let (boundary, fallback): (Vec<_>, Vec<_>) = connector_factories
+        .into_iter()
+        .partition(|(_, factory)| factory().supports_source_boundaries());
     if !boundary.is_empty() {
         let completed = run_streaming_index_with_connector_factories(
-            storage,t_index.as_deref_mut(),opts,since_ts,lexical_strategy,
-            additional_scan_roots.clone(),local_connector_roots.clone(),boundary,
-            scan_start_ts,progress_bump,
+            storage,
+            t_index.as_deref_mut(),
+            opts,
+            since_ts,
+            lexical_strategy,
+            additional_scan_roots.clone(),
+            local_connector_roots.clone(),
+            boundary,
+            scan_start_ts,
+            progress_bump,
         )?;
-        if fallback.is_empty() { return Ok(completed); }
+        if fallback.is_empty() {
+            return Ok(completed);
+        }
         return run_batch_index_with_connector_factories(
-            storage,t_index,opts,since_ts,lexical_strategy,additional_scan_roots,
-            local_connector_roots,fallback,scan_start_ts,progress_bump,
-        ).map(|remaining|completed.accumulate(remaining));
+            storage,
+            t_index,
+            opts,
+            since_ts,
+            lexical_strategy,
+            additional_scan_roots,
+            local_connector_roots,
+            fallback,
+            scan_start_ts,
+            progress_bump,
+        )
+        .map(|remaining| completed.accumulate(remaining));
     }
     let connector_factories = fallback;
     let scan_start = std::time::Instant::now();
@@ -16668,9 +16923,24 @@ fn run_index_inner(
                 "legacy OMP analytics rebuild remains pending because CASS_DEFER_ANALYTICS_UPDATES is enabled; the completed lexical publication will not be repeated"
             );
         } else {
+            check_legacy_omp_analytics_stop(opts.progress.as_ref())?;
+            let prior_progress = opts.progress.as_ref().map(|progress| {
+                (
+                    progress.phase.load(Ordering::Relaxed),
+                    progress.current.load(Ordering::Relaxed),
+                    progress.total.load(Ordering::Relaxed),
+                    progress.total_is_final.load(Ordering::Relaxed),
+                )
+            });
             index_run_lock
                 .set_phase(initial_lock_mode, "analytics:legacy_omp")
                 .with_context(|| "publishing legacy OMP analytics phase in index-run status")?;
+            if let Some(progress) = opts.progress.as_ref() {
+                progress.set_phase_progress(INDEX_PHASE_ANALYTICS_REBUILD, 0, 0);
+                // The storage callback publishes the exact message count
+                // after opening the repair; zero here is not a known total.
+                progress.total_is_final.store(false, Ordering::Relaxed);
+            }
             let report_analytics_heartbeat = || {
                 if let Some(progress) = opts.progress.as_ref() {
                     progress.tick_activity();
@@ -16678,21 +16948,29 @@ fn run_index_inner(
                 bump_index_run_lock_progress_atomic(&progress_bump);
             };
             let report_analytics_progress = |processed: i64, total: i64| {
-                if let Some(progress) = opts.progress.as_ref() {
-                    let processed = usize::try_from(processed.max(0)).unwrap_or(usize::MAX);
-                    let total = usize::try_from(total.max(0)).unwrap_or(usize::MAX);
-                    progress.set_phase_progress(INDEX_PHASE_PREPARING, processed, total);
-                }
+                report_legacy_omp_analytics_progress(opts.progress.as_ref(), processed, total);
                 report_analytics_heartbeat();
             };
+            let check_analytics_stop = || check_legacy_omp_analytics_stop(opts.progress.as_ref());
             storage
                 .rebuild_legacy_omp_analytics_with_progress(
                     Some(&report_analytics_progress),
                     Some(&report_analytics_heartbeat),
+                    Some(&check_analytics_stop),
                 )
                 .with_context(|| {
                     "rebuilding legacy OMP analytics after lexical publication with resumable progress"
                 })?;
+            if let (Some(progress), Some((phase, current, total, total_is_final))) =
+                (opts.progress.as_ref(), prior_progress)
+            {
+                // Terminal indexing summaries count conversations. Analytics
+                // message counts must not replace the completed lexical count.
+                progress.set_phase_progress(phase, current, total);
+                progress
+                    .total_is_final
+                    .store(total_is_final, Ordering::Relaxed);
+            }
         }
     }
 
@@ -18083,13 +18361,18 @@ fn classify_final_wal_checkpoint(
 /// and stock SQLite integrity checks fail. Report the truth instead so the
 /// operator (and the next startup's recovery) know the WAL is still stranded.
 pub fn best_effort_abort_wal_checkpoint(data_dir: &Path) {
-    let db_path = data_dir.join("agent_search.db");
+    best_effort_abort_wal_checkpoint_for_db(&data_dir.join("agent_search.db"));
+}
+
+fn best_effort_abort_wal_checkpoint_for_db(db_path: &Path) {
     if !db_path.exists() {
         return;
     }
-    match run_bounded_abort_wal_checkpoint(db_path.clone(), ABORT_WAL_CHECKPOINT_TIMEOUT, |path| {
-        run_final_wal_checkpoint(path, "stall abort")
-    }) {
+    match run_bounded_abort_wal_checkpoint(
+        db_path.to_path_buf(),
+        ABORT_WAL_CHECKPOINT_TIMEOUT,
+        |path| run_final_wal_checkpoint(path, "stall abort"),
+    ) {
         AbortWalCheckpointAttempt::Finished(Ok(FinalWalCheckpointOutcome::Completed)) => {
             tracing::info!(
                 db_path = %db_path.display(),
@@ -25057,17 +25340,30 @@ fn ingest_batch_detailed(
     defer_checkpoints: bool,
     progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
-    ingest_batch_detailed_with_source_completion(storage,t_index,data_dir,convs,progress,
-        lexical_strategy,defer_checkpoints,progress_bump,None)
+    ingest_batch_detailed_with_source_completion(
+        storage,
+        t_index,
+        data_dir,
+        convs,
+        progress,
+        lexical_strategy,
+        defer_checkpoints,
+        progress_bump,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn ingest_batch_detailed_with_source_completion(
-    storage:&FrankenStorage,t_index:Option<&mut TantivyIndex>,data_dir:&Path,
-    convs:&[NormalizedConversation],progress:&Option<Arc<IndexingProgress>>,
-    lexical_strategy:LexicalPopulationStrategy,defer_checkpoints:bool,
-    progress_bump:Option<&Arc<AtomicI64>>,
-    completion:Option<&crate::storage::sqlite::SourceIngestLedgerEntry>,
+    storage: &FrankenStorage,
+    t_index: Option<&mut TantivyIndex>,
+    data_dir: &Path,
+    convs: &[NormalizedConversation],
+    progress: &Option<Arc<IndexingProgress>>,
+    lexical_strategy: LexicalPopulationStrategy,
+    defer_checkpoints: bool,
+    progress_bump: Option<&Arc<AtomicI64>>,
+    completion: Option<&crate::storage::sqlite::SourceIngestLedgerEntry>,
 ) -> Result<NonWatchIngestOutcome> {
     let trace_span =
         robot_trace_ingest_start("ingest_batch", convs, lexical_strategy, defer_checkpoints);
@@ -25133,6 +25429,7 @@ fn ingest_batch_detailed_with_source_completion(
         canonical_mutations: CanonicalMutationCounts {
             inserted_conversations: batch_outcome.inserted_conversations,
             inserted_messages: batch_outcome.inserted_messages,
+            updated_messages: batch_outcome.updated_messages,
         },
         quarantined_conversations: 0,
         lexical_update_deferred: batch_outcome.lexical_update_deferred,
@@ -27692,7 +27989,10 @@ fn dispatch_watch_callback<F>(
 fn is_database_watch_root(kind: ConnectorKind, root: &ScanRoot) -> bool {
     (kind == ConnectorKind::Shelley
         || (kind == ConnectorKind::Devin
-            && root.path.extension().is_some_and(|extension| extension == "db")))
+            && root
+                .path
+                .extension()
+                .is_some_and(|extension| extension == "db")))
         && root.path.is_file()
 }
 
@@ -29199,12 +29499,11 @@ fn classify_paths(
             }
             let matched_root = !matching_roots.is_empty();
             for (kind, root) in matching_roots {
-                let scan_path =
-                    if prefer_explicit_paths && !is_database_watch_root(kind, root) {
-                        explicit_watch_once_scan_path(kind, &p)
-                    } else {
-                        root.path.clone()
-                    };
+                let scan_path = if prefer_explicit_paths && !is_database_watch_root(kind, root) {
+                    explicit_watch_once_scan_path(kind, &p)
+                } else {
+                    root.path.clone()
+                };
                 let mut scan_root = root.clone();
                 scan_root.path = scan_path.clone();
                 let key = (
@@ -30255,9 +30554,31 @@ pub mod persist {
     /// twice; this helper walks once and yields a slice of positional
     /// indices that `TantivyIndex::add_messages_from_packet` can use
     /// directly.
-    fn lexical_packet_for_canonical_outcome(storage: &FrankenStorage, conv: &Conversation, conversation_id: i64) -> Result<ConversationPacket> {
-        if conv.agent_slug == "grok_bot" {
+    fn lexical_packet_for_canonical_outcome(
+        storage: &FrankenStorage,
+        conv: &Conversation,
+        conversation_id: i64,
+    ) -> Result<ConversationPacket> {
+        if matches!(conv.agent_slug.as_str(), "grok_bot" | "codebuff") {
             let mut canonical = conv.clone();
+            canonical.id = Some(conversation_id);
+            let (source_path, title, workspace_id, started_at): (String, Option<String>, Option<i64>, Option<i64>) = storage.raw().query_row_map(
+                "SELECT source_path, title, workspace_id, started_at FROM conversations WHERE id = ?1",
+                &[ParamValue::from(conversation_id)],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)),
+            )?;
+            canonical.source_path = source_path.into();
+            canonical.title = title;
+            canonical.started_at = started_at;
+            canonical.workspace = workspace_id
+                .map(|workspace_id| {
+                    storage.raw().query_row_map(
+                        "SELECT path FROM workspaces WHERE id = ?1",
+                        &[ParamValue::from(workspace_id)],
+                        |row| Ok(std::path::PathBuf::from(row.get_typed::<String>(0)?)),
+                    )
+                })
+                .transpose()?;
             canonical.messages = storage.fetch_messages(conversation_id)?;
             return Ok(lexical_packet_for_persist(&canonical));
         }
@@ -30312,6 +30633,45 @@ pub mod persist {
             .filter(|(_, message)| inserted.contains(&message.idx))
             .map(|(position, _)| position)
             .collect()
+    }
+
+    fn changed_message_indices(outcome: &InsertOutcome) -> Vec<i64> {
+        outcome
+            .inserted_indices
+            .iter()
+            .chain(&outcome.updated_indices)
+            .copied()
+            .collect()
+    }
+
+    fn publish_changed_packet_messages(
+        index: &mut TantivyIndex,
+        packet: &ConversationPacket,
+        positional: &[usize],
+        conversation_id: i64,
+        has_revisions: bool,
+    ) -> Result<()> {
+        if has_revisions {
+            index.reconcile_messages_from_packet(packet, positional, Some(conversation_id))
+        } else {
+            index.add_messages_from_packet(packet, Some(positional), Some(conversation_id), |_| {
+                Ok(())
+            })
+        }
+    }
+
+    fn publish_canonical_packet_for_rebuild(
+        index: &mut TantivyIndex,
+        packet: &ConversationPacket,
+        conversation_id: i64,
+        native_snapshot: bool,
+    ) -> Result<()> {
+        if native_snapshot {
+            let positions: Vec<_> = (0..packet.payload.messages.len()).collect();
+            index.reconcile_messages_from_packet(packet, &positions, Some(conversation_id))
+        } else {
+            index.add_messages_from_packet(packet, None, Some(conversation_id), |_| Ok(()))
+        }
     }
 
     #[cfg(test)]
@@ -30372,6 +30732,7 @@ pub mod persist {
     pub(super) struct PersistBatchOutcome {
         pub inserted_conversations: usize,
         pub inserted_messages: usize,
+        pub updated_messages: usize,
         pub workspace_changes: usize,
         pub semantic_delta_max_message_id: Option<i64>,
         pub semantic_delta_inputs: Vec<EmbeddingInput>,
@@ -30387,6 +30748,9 @@ pub mod persist {
             self.inserted_messages = self
                 .inserted_messages
                 .saturating_add(outcome.inserted_indices.len());
+            self.updated_messages = self
+                .updated_messages
+                .saturating_add(outcome.updated_indices.len());
             if outcome.workspace_changed {
                 self.workspace_changes = self.workspace_changes.saturating_add(1);
                 self.lexical_update_deferred = true;
@@ -30417,6 +30781,7 @@ pub mod persist {
         }
 
         pub(super) fn merge(&mut self, other: Self) {
+            self.updated_messages = self.updated_messages.saturating_add(other.updated_messages);
             self.workspace_changes = self
                 .workspace_changes
                 .saturating_add(other.workspace_changes);
@@ -30489,19 +30854,17 @@ pub mod persist {
         storage: &FrankenStorage,
         outcome: &InsertOutcome,
     ) -> Result<(Vec<EmbeddingInput>, Option<i64>)> {
-        if outcome.inserted_indices.is_empty() {
+        let changed_indices = changed_message_indices(outcome);
+        if changed_indices.is_empty() {
             return Ok((Vec::new(), None));
         }
 
-        let message_ids_by_idx = load_inserted_message_ids_by_idx(
-            storage,
-            outcome.conversation_id,
-            &outcome.inserted_indices,
-        )?;
-        if message_ids_by_idx.len() != outcome.inserted_indices.len() {
+        let message_ids_by_idx =
+            load_inserted_message_ids_by_idx(storage, outcome.conversation_id, &changed_indices)?;
+        if message_ids_by_idx.len() != changed_indices.len() {
             tracing::warn!(
                 conversation_id = outcome.conversation_id,
-                expected_inserted_indices = outcome.inserted_indices.len(),
+                expected_changed_indices = changed_indices.len(),
                 resolved_canonical_message_ids = message_ids_by_idx.len(),
                 "skipping packet semantic delta rows without persisted canonical ids"
             );
@@ -31534,35 +31897,42 @@ pub mod persist {
             match lexical_strategy {
                 LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild => continue,
                 LexicalPopulationStrategy::InlineRebuildFromScan => {
-                    let packet = lexical_packet_for_canonical_outcome(storage,internal_conv,outcome.conversation_id)?;
-                    t_index
-                        .as_deref_mut()
-                        .expect("inline rebuild requires Tantivy writer")
-                        .add_messages_from_packet(
-                            &packet,
-                            None,
-                            Some(outcome.conversation_id),
-                            |_| Ok(()),
-                        )?;
+                    let packet = lexical_packet_for_canonical_outcome(
+                        storage,
+                        internal_conv,
+                        outcome.conversation_id,
+                    )?;
+                    publish_canonical_packet_for_rebuild(
+                        t_index
+                            .as_deref_mut()
+                            .expect("inline rebuild requires Tantivy writer"),
+                        &packet,
+                        outcome.conversation_id,
+                        matches!(internal_conv.agent_slug.as_str(), "grok_bot" | "codebuff"),
+                    )?;
                 }
                 LexicalPopulationStrategy::IncrementalInline => {
-                    if !outcome.inserted_indices.is_empty() {
-                        let packet = lexical_packet_for_canonical_outcome(storage,internal_conv,outcome.conversation_id)?;
-                        let positional =
-                            positional_indices_for_inserted(&packet, &outcome.inserted_indices);
+                    let changed_indices = changed_message_indices(&outcome);
+                    if !changed_indices.is_empty() {
+                        let packet = lexical_packet_for_canonical_outcome(
+                            storage,
+                            internal_conv,
+                            outcome.conversation_id,
+                        )?;
+                        let positional = positional_indices_for_inserted(&packet, &changed_indices);
                         if !positional.is_empty() {
                             let add_result = if should_inject_incremental_lexical_update_oom() {
                                 Err(anyhow::anyhow!("out of memory"))
                             } else {
-                                t_index
-                                    .as_deref_mut()
-                                    .expect("incremental inline updates require Tantivy writer")
-                                    .add_messages_from_packet(
-                                        &packet,
-                                        Some(&positional),
-                                        Some(outcome.conversation_id),
-                                        |_| Ok(()),
-                                    )
+                                publish_changed_packet_messages(
+                                    t_index.as_deref_mut().expect(
+                                        "incremental inline updates require Tantivy writer",
+                                    ),
+                                    &packet,
+                                    &positional,
+                                    outcome.conversation_id,
+                                    !outcome.updated_indices.is_empty(),
+                                )
                             };
                             if let Err(error) = add_result {
                                 if should_defer_incremental_lexical_update_after_error(&error) {
@@ -31825,11 +32195,13 @@ pub mod persist {
     ) -> Result<()> {
         tracing::info!(agent = %conv.agent_slug, messages = conv.messages.len(), "persist_conversation");
         prepare_cursor_workspace_repair(storage, None, std::slice::from_ref(conv))?;
+        prepare_codebuff_message_repair(storage, Some(t_index.path()), std::slice::from_ref(conv))?;
         let internal_conv = map_to_internal(conv);
         let InsertOutcome {
             conversation_id,
             conversation_inserted: _conversation_inserted,
             inserted_indices,
+            updated_indices,
             workspace_changed: _,
         } = with_ephemeral_writer(storage, false, "persist_conversation", |writer| {
             let agent = Agent {
@@ -31850,19 +32222,26 @@ pub mod persist {
             writer.insert_conversation_tree(agent_id, workspace_id, &internal_conv)
         })?;
 
-        // Only add newly inserted messages to the Tantivy index
-        // (incremental). Routed through the packet pipeline per
+        // Publish inserted messages and replace revised native messages.
+        // Routed through the packet pipeline per
         // ibuuh.32 sink migration; equivalence guaranteed by
         // tests::persist_packet_pipeline_matches_legacy_for_incremental_inline.
-        if !defer_lexical_updates_enabled() && !inserted_indices.is_empty() {
-            let packet = lexical_packet_for_canonical_outcome(storage,&internal_conv,conversation_id)?;
-            let positional = positional_indices_for_inserted(&packet, &inserted_indices);
+        let changed_indices: Vec<_> = inserted_indices
+            .iter()
+            .chain(&updated_indices)
+            .copied()
+            .collect();
+        if !defer_lexical_updates_enabled() && !changed_indices.is_empty() {
+            let packet =
+                lexical_packet_for_canonical_outcome(storage, &internal_conv, conversation_id)?;
+            let positional = positional_indices_for_inserted(&packet, &changed_indices);
             if !positional.is_empty() {
-                t_index.add_messages_from_packet(
+                publish_changed_packet_messages(
+                    t_index,
                     &packet,
-                    Some(&positional),
-                    Some(conversation_id),
-                    |_| Ok(()),
+                    &positional,
+                    conversation_id,
+                    !updated_indices.is_empty(),
                 )?;
             }
         }
@@ -31879,11 +32258,13 @@ pub mod persist {
         let total_started = Instant::now();
         let db_started = Instant::now();
         prepare_cursor_workspace_repair(storage, None, std::slice::from_ref(conv))?;
+        prepare_codebuff_message_repair(storage, Some(t_index.path()), std::slice::from_ref(conv))?;
         let internal_conv = map_to_internal(conv);
         let InsertOutcome {
             conversation_id,
             conversation_inserted: _conversation_inserted,
             inserted_indices,
+            updated_indices,
             workspace_changed: _,
         } = with_ephemeral_writer(storage, false, "persist_conversation", |writer| {
             let agent = Agent {
@@ -31905,22 +32286,29 @@ pub mod persist {
         })?;
         profile.db_duration += db_started.elapsed();
 
-        if !defer_lexical_updates_enabled() && !inserted_indices.is_empty() {
+        let changed_indices: Vec<_> = inserted_indices
+            .iter()
+            .chain(&updated_indices)
+            .copied()
+            .collect();
+        if !defer_lexical_updates_enabled() && !changed_indices.is_empty() {
             let packet_started = Instant::now();
-            let packet = lexical_packet_for_canonical_outcome(storage,&internal_conv,conversation_id)?;
+            let packet =
+                lexical_packet_for_canonical_outcome(storage, &internal_conv, conversation_id)?;
             profile.packet_duration += packet_started.elapsed();
 
             let positional_started = Instant::now();
-            let positional = positional_indices_for_inserted(&packet, &inserted_indices);
+            let positional = positional_indices_for_inserted(&packet, &changed_indices);
             profile.positional_duration += positional_started.elapsed();
 
             if !positional.is_empty() {
                 let tantivy_add_started = Instant::now();
-                t_index.add_messages_from_packet(
+                publish_changed_packet_messages(
+                    t_index,
                     &packet,
-                    Some(&positional),
-                    Some(conversation_id),
-                    |_| Ok(()),
+                    &positional,
+                    conversation_id,
+                    !updated_indices.is_empty(),
                 )?;
                 profile.tantivy_add_duration += tantivy_add_started.elapsed();
             }
@@ -32052,6 +32440,34 @@ pub mod persist {
         Ok(())
     }
 
+    fn prepare_codebuff_message_repair(
+        storage: &FrankenStorage,
+        index_path: Option<&Path>,
+        convs: &[NormalizedConversation],
+    ) -> Result<()> {
+        for conv in convs.iter().filter(|conv| conv.agent_slug == "codebuff") {
+            if !storage.codebuff_message_revisions_needed(&map_to_internal(conv))? {
+                continue;
+            }
+            let index_path = index_path
+                .context("Codebuff message revision requires the canonical index directory")?;
+            let db_path = storage.database_path()?;
+            // An in-place revision leaves COUNT/MAX unchanged. Revoke lexical
+            // authority before committing canonical rows, so a failed publish
+            // followed by an unchanged source replay still rebuilds from SQLite.
+            // This repair mode needs no archive-wide count for admission.
+            let mut state = super::LexicalRebuildState::new(
+                super::deferred_lexical_rebuild_db_state(&db_path, 0),
+                super::LEXICAL_REBUILD_PAGE_SIZE,
+            );
+            state.set_execution_mode(super::LexicalRebuildExecutionMode::CanonicalMetadataRepair);
+            super::persist_lexical_rebuild_state(index_path, &state)?;
+            super::sync_parent_directory(&super::lexical_rebuild_state_path(index_path))?;
+            return Ok(());
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn persist_conversations_batched_inner(
         storage: &FrankenStorage,
@@ -32071,6 +32487,18 @@ pub mod persist {
         // transaction can change workspace associations. A crash or failed
         // publication is then recovered by the existing full canonical rebuild.
         prepare_cursor_workspace_repair(storage, raw_mirror_data_dir, convs)?;
+        if convs.iter().any(|conv| conv.agent_slug == "codebuff") {
+            let canonical_index_path = raw_mirror_data_dir
+                .map(crate::search::tantivy::index_dir)
+                .transpose()?;
+            prepare_codebuff_message_repair(
+                storage,
+                canonical_index_path
+                    .as_deref()
+                    .or_else(|| t_index.as_deref().map(TantivyIndex::path)),
+                convs,
+            )?;
+        }
         if lexical_population_strategy_requires_inline_tantivy(lexical_strategy)
             && t_index.is_none()
         {
@@ -32080,7 +32508,8 @@ pub mod persist {
             );
         }
 
-        let begin_concurrent_enabled = source_completion.is_none() && begin_concurrent_writes_enabled();
+        let begin_concurrent_enabled =
+            source_completion.is_none() && begin_concurrent_writes_enabled();
         let duplicate_keys_present =
             begin_concurrent_enabled && duplicate_conversation_keys_present(convs);
 
@@ -32192,7 +32621,10 @@ pub mod persist {
                     outcomes.extend(with_concurrent_retry(
                         SERIAL_CHUNK_CONTENTION_RETRIES,
                         || match source_completion.filter(|_| end == prepared.len()) {
-                            Some(completion) => writer.insert_conversations_batched_with_source_completion(chunk_refs, completion),
+                            Some(completion) => writer
+                                .insert_conversations_batched_with_source_completion(
+                                    chunk_refs, completion,
+                                ),
                             None => writer.insert_conversations_batched(chunk_refs),
                         },
                     )?);
@@ -32227,35 +32659,43 @@ pub mod persist {
                 match lexical_strategy {
                     LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild => continue,
                     LexicalPopulationStrategy::InlineRebuildFromScan => {
-                        let packet = lexical_packet_for_canonical_outcome(storage,internal_conv,outcome.conversation_id)?;
-                        t_index
-                            .as_deref_mut()
-                            .expect("inline rebuild requires Tantivy writer")
-                            .add_messages_from_packet(
-                                &packet,
-                                None,
-                                Some(outcome.conversation_id),
-                                |_| Ok(()),
-                            )?;
+                        let packet = lexical_packet_for_canonical_outcome(
+                            storage,
+                            internal_conv,
+                            outcome.conversation_id,
+                        )?;
+                        publish_canonical_packet_for_rebuild(
+                            t_index
+                                .as_deref_mut()
+                                .expect("inline rebuild requires Tantivy writer"),
+                            &packet,
+                            outcome.conversation_id,
+                            matches!(internal_conv.agent_slug.as_str(), "grok_bot" | "codebuff"),
+                        )?;
                     }
                     LexicalPopulationStrategy::IncrementalInline => {
-                        if !outcome.inserted_indices.is_empty() {
-                            let packet = lexical_packet_for_canonical_outcome(storage,internal_conv,outcome.conversation_id)?;
+                        let changed_indices = changed_message_indices(outcome);
+                        if !changed_indices.is_empty() {
+                            let packet = lexical_packet_for_canonical_outcome(
+                                storage,
+                                internal_conv,
+                                outcome.conversation_id,
+                            )?;
                             let positional =
-                                positional_indices_for_inserted(&packet, &outcome.inserted_indices);
+                                positional_indices_for_inserted(&packet, &changed_indices);
                             if !positional.is_empty() {
                                 let add_result = if should_inject_incremental_lexical_update_oom() {
                                     Err(anyhow::anyhow!("out of memory"))
                                 } else {
-                                    t_index
-                                        .as_deref_mut()
-                                        .expect("incremental inline updates require Tantivy writer")
-                                        .add_messages_from_packet(
-                                            &packet,
-                                            Some(&positional),
-                                            Some(outcome.conversation_id),
-                                            |_| Ok(()),
-                                        )
+                                    publish_changed_packet_messages(
+                                        t_index.as_deref_mut().expect(
+                                            "incremental inline updates require Tantivy writer",
+                                        ),
+                                        &packet,
+                                        &positional,
+                                        outcome.conversation_id,
+                                        !outcome.updated_indices.is_empty(),
+                                    )
                                 };
                                 if let Err(error) = add_result {
                                     if should_defer_incremental_lexical_update_after_error(&error) {
@@ -32623,6 +33063,285 @@ pub mod persist {
             let reader = index.reader().expect("reader");
             crate::search::quill_bridge::refresh_reader(&reader).expect("reload");
             reader.doc_count().expect("doc count")
+        }
+
+        #[test]
+        #[serial]
+        fn gh423_codebuff_indexer_revisions_replace_search_preserving_canonical_identity() {
+            let _defer = set_env("CASS_DEFER_LEXICAL_UPDATES", "0");
+            for route in 0..3 {
+                let _begin = set_env(
+                    "CASS_INDEXER_BEGIN_CONCURRENT",
+                    if route == 2 { "1" } else { "0" },
+                );
+                let dir = tempfile::TempDir::new().unwrap();
+                let storage = create_franken_db(&dir.path().join("agent_search.db"));
+                let index_path = crate::search::tantivy::index_dir(dir.path()).unwrap();
+                let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+                let mut conv = NormalizedConversation {
+                    agent_slug: "codebuff".into(),
+                    external_id: Some(r#"["/profile/.config/manicode","project","chat"]"#.into()),
+                    title: Some("Shared lineage".into()), workspace: None,
+                    source_path: "/profile/.config/manicode/projects/project/chats/chat/chat-messages.json".into(),
+                    started_at: Some(1_700_000_000_000), ended_at: Some(1_700_000_000_000),
+                    metadata: serde_json::json!({"shared_lineage":true}),
+                    messages: (0..4).map(|idx| NormalizedMessage {
+                        idx, role: "assistant".into(), author: None,
+                        created_at: Some(1_700_000_000_000),
+                        content: format!("oldneedle marker{idx}"),
+                        extra: serde_json::json!({"id":format!("native-{idx}"),"codebuff_message_id":format!("native-{idx}"),"isComplete":false}),
+                        snippets: Vec::new(), invocations: Vec::new(),
+                    }).collect(),
+                };
+                let persist = |index: &mut TantivyIndex, conv: &NormalizedConversation| {
+                    if route == 0 {
+                        persist_conversation(&storage, index, conv).unwrap();
+                        None
+                    } else {
+                        Some(
+                            persist_conversations_batched_inner(
+                                &storage,
+                                Some(index),
+                                std::slice::from_ref(conv),
+                                LexicalPopulationStrategy::IncrementalInline,
+                                false,
+                                true,
+                                Some(dir.path()),
+                                PersistHeartbeat::NONE,
+                                None,
+                            )
+                            .unwrap(),
+                        )
+                    }
+                };
+                let hits = |index: &TantivyIndex, term: &str| {
+                    let reader = index.reader().unwrap();
+                    let parser = frankensearch::quill::query::CassQueryParser::new(
+                        frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
+                    )
+                    .unwrap();
+                    let query = parser.parse(
+                        term,
+                        &frankensearch::quill::query::CassQueryFilters::default(),
+                    );
+                    let page = crate::search::quill_bridge::search_paginated(
+                        &reader,
+                        &query.query,
+                        32,
+                        0,
+                        true,
+                    )
+                    .unwrap();
+                    let ids: HashSet<_> = page
+                        .hits
+                        .iter()
+                        .map(|hit| hit.document_id.clone())
+                        .collect();
+                    assert_eq!(
+                        ids.len(),
+                        page.hits.len(),
+                        "no duplicate document identities"
+                    );
+                    assert_eq!(page.total_count, Some(ids.len()));
+                    ids
+                };
+                persist(&mut index, &conv);
+                assert_eq!(tantivy_doc_count(&mut index), 4);
+                let original_hit = hits(&index, "marker0");
+                assert_eq!(original_hit.len(), 1);
+                let conversation_id: i64 = storage
+                    .raw()
+                    .query_row_map("SELECT id FROM conversations", &[], |row| row.get_typed(0))
+                    .unwrap();
+                let original_ids: Vec<_> = storage
+                    .fetch_messages(conversation_id)
+                    .unwrap()
+                    .iter()
+                    .map(|message| (message.id, message.idx))
+                    .collect();
+
+                // The source may be reached through another path, and a native
+                // message can finish in place or become non-searchable noise.
+                conv.source_path = "/profile/alias/manicode/chat-messages.json".into();
+                conv.messages[0].content = "newneedle marker0".into();
+                conv.messages[0].extra["isComplete"] = serde_json::json!(true);
+                conv.messages[2].content.clear();
+                conv.messages.push(NormalizedMessage {
+                    idx: 4,
+                    role: "assistant".into(),
+                    author: None,
+                    created_at: Some(1_700_000_000_001),
+                    content: "tailneedle marker4".into(),
+                    extra: serde_json::json!({"id":"native-4","codebuff_message_id":"native-4"}),
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                });
+                if let Some(outcome) = persist(&mut index, &conv) {
+                    assert_eq!(outcome.inserted_conversations, 0);
+                    assert_eq!(outcome.inserted_messages, 1);
+                    assert_eq!(outcome.updated_messages, 2);
+                }
+                assert_eq!(tantivy_doc_count(&mut index), 4);
+                assert_eq!(
+                    hits(&index, "newneedle"),
+                    original_hit,
+                    "stable stored source path controls lexical identity"
+                );
+                assert_eq!(hits(&index, "oldneedle").len(), 2);
+                assert!(hits(&index, "marker2").is_empty());
+                assert_eq!(hits(&index, "tailneedle").len(), 1);
+                let stored = storage.fetch_messages(conversation_id).unwrap();
+                assert_eq!(stored.len(), 5);
+                assert_eq!(
+                    stored[..4]
+                        .iter()
+                        .map(|message| (message.id, message.idx))
+                        .collect::<Vec<_>>(),
+                    original_ids
+                );
+                assert_eq!(stored[0].content, "newneedle marker0");
+                assert!(stored[2].content.is_empty());
+                let all_ids: Vec<_> = stored
+                    .iter()
+                    .map(|message| (message.id, message.idx))
+                    .collect();
+                if let Some(replay) = persist(&mut index, &conv) {
+                    assert_eq!(replay.inserted_messages, 0);
+                    assert_eq!(replay.updated_messages, 0);
+                }
+                assert_eq!(tantivy_doc_count(&mut index), 4);
+                assert_eq!(hits(&index, "newneedle"), original_hit);
+                assert_eq!(
+                    storage
+                        .fetch_messages(conversation_id)
+                        .unwrap()
+                        .iter()
+                        .map(|message| (message.id, message.idx))
+                        .collect::<Vec<_>>(),
+                    all_ids
+                );
+
+                // Full scan packets can overlap within a batch and across
+                // batches. Hydrating final canonical history must remain an
+                // upsert even when neither packet inserts another message.
+                let mut full_index =
+                    TantivyIndex::open_or_create(&dir.path().join("full-index")).unwrap();
+                persist_conversations_batched_inner(
+                    &storage,
+                    Some(&mut full_index),
+                    &[conv.clone(), conv.clone()],
+                    LexicalPopulationStrategy::InlineRebuildFromScan,
+                    false,
+                    false,
+                    Some(dir.path()),
+                    PersistHeartbeat::NONE,
+                    None,
+                )
+                .unwrap();
+                full_index.commit().unwrap();
+                persist_conversations_batched_inner(
+                    &storage,
+                    Some(&mut full_index),
+                    std::slice::from_ref(&conv),
+                    LexicalPopulationStrategy::InlineRebuildFromScan,
+                    false,
+                    false,
+                    Some(dir.path()),
+                    PersistHeartbeat::NONE,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(tantivy_doc_count(&mut full_index), 4);
+                assert_eq!(hits(&full_index, "newneedle"), original_hit);
+                assert!(hits(&full_index, "marker2").is_empty());
+
+                // Stop after the real canonical transaction, before any
+                // lexical publication. The unchanged replay must retain the
+                // durable repair obligation despite unchanged COUNT/MAX(id).
+                conv.messages[0].content = "durableneedle marker0".into();
+                let deferred = persist_conversations_batched_inner(
+                    &storage,
+                    None,
+                    std::slice::from_ref(&conv),
+                    LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                    false,
+                    false,
+                    Some(dir.path()),
+                    PersistHeartbeat::NONE,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(deferred.updated_messages, 1);
+                let pending = super::super::load_lexical_rebuild_state(&index_path)
+                    .unwrap()
+                    .unwrap();
+                assert!(!pending.completed);
+                assert!(pending.requires_restart_from_zero_on_resume());
+                assert_eq!(hits(&index, "newneedle"), original_hit);
+                assert!(hits(&index, "durableneedle").is_empty());
+                let replay = persist_conversations_batched_inner(
+                    &storage,
+                    None,
+                    std::slice::from_ref(&conv),
+                    LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                    false,
+                    false,
+                    Some(dir.path()),
+                    PersistHeartbeat::NONE,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(replay.updated_messages, 0);
+                assert!(
+                    !super::super::load_lexical_rebuild_state(&index_path)
+                        .unwrap()
+                        .unwrap()
+                        .completed
+                );
+                drop(index);
+                super::super::rebuild_tantivy_from_db_deferred_startup(
+                    &storage.database_path().unwrap(),
+                    dir.path(),
+                    1,
+                    None,
+                )
+                .unwrap();
+                let index = TantivyIndex::open_or_create(&index_path).unwrap();
+                assert_eq!(hits(&index, "durableneedle"), original_hit);
+                assert!(hits(&index, "newneedle").is_empty());
+                assert_eq!(index.doc_count().unwrap(), 4);
+                assert!(
+                    super::super::load_lexical_rebuild_state(&index_path)
+                        .unwrap()
+                        .unwrap()
+                        .completed
+                );
+
+                // A filesystem failure to revoke authority must happen before
+                // changing the canonical payload, and preserve the old state.
+                let checkpoint = super::super::lexical_rebuild_state_path(&index_path);
+                std::fs::rename(&checkpoint, index_path.join("retained-checkpoint.json")).unwrap();
+                std::fs::create_dir(&checkpoint).unwrap();
+                conv.messages[0].content = "mustnotcommit marker0".into();
+                assert!(
+                    persist_conversations_batched_inner(
+                        &storage,
+                        None,
+                        std::slice::from_ref(&conv),
+                        LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                        false,
+                        false,
+                        Some(dir.path()),
+                        PersistHeartbeat::NONE,
+                        None,
+                    )
+                    .is_err()
+                );
+                assert_eq!(
+                    storage.fetch_messages(conversation_id).unwrap()[0].content,
+                    "durableneedle marker0"
+                );
+            }
         }
 
         #[test]
@@ -44823,6 +45542,39 @@ mod tests {
     }
 
     #[test]
+    fn legacy_omp_analytics_progress_reports_messages_and_typed_stop() {
+        let progress = Arc::new(IndexingProgress::default());
+        check_legacy_omp_analytics_stop(Some(&progress)).expect("repair initially permitted");
+        report_legacy_omp_analytics_progress(Some(&progress), 128, 513);
+        let snapshot = progress.snapshot_json(1000);
+        assert_eq!(snapshot["phase"], serde_json::json!("analytics_rebuild"));
+        assert_eq!(
+            snapshot["phase_code"],
+            serde_json::json!(INDEX_PHASE_ANALYTICS_REBUILD)
+        );
+        assert_eq!(snapshot["unit"], serde_json::json!("messages"));
+        assert_eq!(snapshot["current"], serde_json::json!(128));
+        assert_eq!(snapshot["total"], serde_json::json!(513));
+        assert!(progress.total_is_final.load(Ordering::Relaxed));
+
+        progress.request_stop();
+        let error = check_legacy_omp_analytics_stop(Some(&progress))
+            .context("legacy OMP analytics checkpoint")
+            .expect_err("stop request must escape the repair callback");
+        assert!(error.downcast_ref::<IndexInterrupted>().is_some());
+        assert_eq!(progress.current.load(Ordering::Relaxed), 128);
+        assert_eq!(progress.phase_label(), "analytics_rebuild");
+        check_legacy_omp_analytics_stop(None).expect("headless callers without a stop source");
+
+        let aggregate_progress = Arc::new(IndexingProgress::default());
+        report_legacy_omp_analytics_progress(Some(&aggregate_progress), 513, 513);
+        report_legacy_omp_analytics_progress(Some(&aggregate_progress), 0, 0);
+        assert_eq!(aggregate_progress.phase_label(), "analytics_rebuild");
+        assert_eq!(aggregate_progress.current.load(Ordering::Relaxed), 0);
+        assert!(!aggregate_progress.total_is_final.load(Ordering::Relaxed));
+    }
+
+    #[test]
     fn snapshot_json_includes_rebuild_pipeline_runtime_metrics() {
         let progress = IndexingProgress::default();
         progress.phase.store(2, Ordering::Relaxed);
@@ -45105,52 +45857,63 @@ mod tests {
 
     #[test]
     fn streaming_consumer_preserves_discovered_connector_with_no_batches() {
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir_all(&data_dir).unwrap();
+        for scan_start_ts in [None, Some(1_700_000_000_000)] {
+            let tmp = TempDir::new().unwrap();
+            let data_dir = tmp.path().join("data");
+            std::fs::create_dir_all(&data_dir).unwrap();
 
-        let db_path = data_dir.join("db.sqlite");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
-        let progress = Arc::new(IndexingProgress::default());
-        let (tx, rx) = bounded(2);
+            let db_path = data_dir.join("db.sqlite");
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            ensure_fts_schema(&storage);
+            storage.set_connector_last_scan_ts("claude", 7).unwrap();
+            let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
+            let progress = Arc::new(IndexingProgress::default());
+            let (tx, rx) = bounded(2);
 
-        tx.send(IndexMessage::Done {
-            connector_name: "claude",
-            scan_ms: 42,
-            is_discovered: true,
-            scan_succeeded: true,
-            active_source_skipped: false,
-        })
-        .unwrap();
-        drop(tx);
+            tx.send(IndexMessage::Done {
+                connector_name: "claude",
+                scan_ms: 42,
+                is_discovered: true,
+                scan_succeeded: true,
+                active_source_skipped: false,
+            })
+            .unwrap();
+            drop(tx);
 
-        let (discovered, mutations) = run_streaming_consumer(
-            rx,
-            1,
-            &storage,
-            &data_dir,
-            Some(&mut index),
-            Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
-            &Some(progress.clone()),
-            LexicalPopulationStrategy::IncrementalInline,
-            None,
-            None,
-        )
-        .unwrap();
+            let (discovered, mutations) = run_streaming_consumer(
+                rx,
+                1,
+                &storage,
+                &data_dir,
+                Some(&mut index),
+                Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
+                &Some(progress.clone()),
+                LexicalPopulationStrategy::IncrementalInline,
+                scan_start_ts,
+                None,
+            )
+            .unwrap();
 
-        assert_eq!(discovered, vec!["claude".to_string()]);
-        assert_eq!(mutations, CanonicalMutationCounts::default());
-        let stats = progress.stats.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(stats.agents_discovered, vec!["claude".to_string()]);
-        assert_eq!(stats.total_conversations, 0);
-        assert_eq!(stats.total_messages, 0);
-        assert_eq!(
-            mutations.scanned_connectors,
-            BTreeSet::from(["claude".to_string()])
-        );
-        assert!(!mutations.scan_had_errors);
+            assert_eq!(discovered, vec!["claude".to_string()]);
+            assert_eq!(mutations, CanonicalMutationCounts::default());
+            let stats = progress.stats.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(stats.agents_discovered, vec!["claude".to_string()]);
+            assert_eq!(stats.total_conversations, 0);
+            assert_eq!(stats.total_messages, 0);
+            assert_eq!(
+                mutations.scanned_connectors,
+                if scan_start_ts.is_some() {
+                    BTreeSet::from(["claude".to_string()])
+                } else {
+                    BTreeSet::new()
+                }
+            );
+            assert_eq!(
+                storage.get_connector_last_scan_ts("claude").unwrap(),
+                Some(scan_start_ts.unwrap_or(7))
+            );
+            assert!(!mutations.scan_had_errors);
+        }
     }
 
     #[test]
@@ -45380,6 +46143,7 @@ mod tests {
             CanonicalMutationCounts {
                 inserted_conversations: 1,
                 inserted_messages: 2,
+                updated_messages: 0,
             }
         );
         assert_eq!(conversation_count, 1);
@@ -45547,81 +46311,52 @@ mod tests {
     #[test]
     #[serial]
     fn streaming_consumer_defers_small_non_watch_oom_without_quarantine() {
-        let oom_guard = set_env("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS", "1");
-        // Pin the pressure probe to "never real pressure" so the size gate is
-        // what decides, deterministically, on any host.
-        let _reserve_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir_all(&data_dir).unwrap();
+        for source_completion in [false, true] {
+            let oom_guard = set_env("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS", "1");
+            // Pin the pressure probe to "never real pressure" so the size gate is
+            // what decides, deterministically, on any host.
+            let _reserve_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
+            let tmp = TempDir::new().unwrap();
+            let data_dir = tmp.path().join("data");
+            std::fs::create_dir_all(&data_dir).unwrap();
 
-        let db_path = data_dir.join("db.sqlite");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
-        let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
-        let progress = Arc::new(IndexingProgress::default());
-        let conv = norm_conv(Some("defer-single"), vec![norm_msg(0, 1_700_000_000_000)]);
-        let prior_watermark = 1_600_000_000_000;
-        let scan_watermark = 1_700_000_123_456;
-        storage
-            .set_connector_last_scan_ts("codex", prior_watermark)
-            .unwrap();
+            let db_path = data_dir.join("db.sqlite");
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            ensure_fts_schema(&storage);
+            let mut index = TantivyIndex::open_or_create(&index_dir(&data_dir).unwrap()).unwrap();
+            let progress = Arc::new(IndexingProgress::default());
+            let conv = norm_conv(Some("defer-single"), vec![norm_msg(0, 1_700_000_000_000)]);
+            let prior_watermark = 1_600_000_000_000;
+            let scan_watermark = 1_700_000_123_456;
+            storage
+                .set_connector_last_scan_ts("codex", prior_watermark)
+                .unwrap();
+            let send_batch = |tx: &Sender<IndexMessage>| {
+                if source_completion {
+                    tx.send(IndexMessage::SourceComplete {
+                        connector_name: "codex",
+                        conversations: vec![conv.clone()],
+                        completion: crate::storage::sqlite::SourceIngestLedgerEntry {
+                            key: "source_ingest_v1:consumer-oom".into(),
+                            observation: "{}".into(),
+                        },
+                        byte_reservation: 0,
+                    })
+                    .unwrap();
+                } else {
+                    send_conversation_batches(tx, "codex", vec![conv.clone()], true);
+                }
+            };
 
-        let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
-        send_conversation_batches(&tx, "codex", vec![conv.clone()], true);
-        send_done(&tx, "codex", true);
-        send_done(&tx, "claude", true);
-        drop(tx);
-
-        let (_discovered, outcome) = run_streaming_consumer(
-            rx,
-            2,
-            &storage,
-            &data_dir,
-            Some(&mut index),
-            Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
-            &Some(progress.clone()),
-            LexicalPopulationStrategy::IncrementalInline,
-            Some(scan_watermark),
-            None,
-        )
-        .expect("small-conversation NoMem without real pressure should defer, not fail");
-
-        assert_eq!(outcome.quarantined_conversations, 0);
-        assert!(outcome.lexical_update_deferred);
-        assert!(outcome.scan_had_errors);
-        assert_eq!(
-            outcome.deferred_sources,
-            BTreeSet::from([conv.source_path.clone()])
-        );
-        assert_eq!(
-            outcome.scanned_connectors,
-            BTreeSet::from(["claude".to_string()])
-        );
-        assert_eq!(
-            storage.get_connector_last_scan_ts("codex").unwrap(),
-            Some(prior_watermark)
-        );
-        assert_eq!(
-            storage.get_connector_last_scan_ts("claude").unwrap(),
-            Some(scan_watermark)
-        );
-        assert!(
-            !data_dir
-                .join("quarantine/index_ingest_poison.jsonl")
-                .exists(),
-            "a small conversation with no real memory pressure must be deferred, not quarantined (#298)"
-        );
-
-        drop(oom_guard);
-        for expected_inserted in [1, 0] {
             let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
-            send_conversation_batches(&tx, "codex", vec![conv.clone()], true);
+            send_batch(&tx);
             send_done(&tx, "codex", true);
+            send_done(&tx, "claude", true);
             drop(tx);
-            let (_, retried) = run_streaming_consumer(
+
+            let (_discovered, outcome) = run_streaming_consumer(
                 rx,
-                1,
+                2,
                 &storage,
                 &data_dir,
                 Some(&mut index),
@@ -45631,15 +46366,76 @@ mod tests {
                 Some(scan_watermark),
                 None,
             )
-            .unwrap();
-            assert!(!retried.scan_had_errors);
-            assert!(retried.deferred_sources.is_empty());
-            assert_eq!(retried.inserted_messages, expected_inserted);
+            .expect("small-conversation NoMem without real pressure should defer, not fail");
+
+            assert!(
+                storage.source_ingest_ledger_entries().unwrap().is_empty(),
+                "deferred canonical ingestion must not certify source completion"
+            );
+            assert_eq!(outcome.quarantined_conversations, 0);
+            assert!(outcome.lexical_update_deferred);
+            assert!(outcome.scan_had_errors);
+            assert_eq!(
+                outcome.deferred_sources,
+                BTreeSet::from([conv.source_path.clone()])
+            );
+            assert_eq!(
+                outcome.scanned_connectors,
+                BTreeSet::from(["claude".to_string()])
+            );
             assert_eq!(
                 storage.get_connector_last_scan_ts("codex").unwrap(),
+                Some(prior_watermark)
+            );
+            assert_eq!(
+                storage.get_connector_last_scan_ts("claude").unwrap(),
                 Some(scan_watermark)
             );
-            assert_eq!(storage.total_message_count().unwrap(), 1);
+            assert!(
+                !data_dir
+                    .join("quarantine/index_ingest_poison.jsonl")
+                    .exists(),
+                "a small conversation with no real memory pressure must be deferred, not quarantined (#298)"
+            );
+
+            drop(oom_guard);
+            for expected_inserted in [1, 0] {
+                let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
+                send_batch(&tx);
+                send_done(&tx, "codex", true);
+                drop(tx);
+                let (_, retried) = run_streaming_consumer(
+                    rx,
+                    1,
+                    &storage,
+                    &data_dir,
+                    Some(&mut index),
+                    Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
+                    &Some(progress.clone()),
+                    LexicalPopulationStrategy::IncrementalInline,
+                    Some(scan_watermark),
+                    None,
+                )
+                .unwrap();
+                assert!(!retried.scan_had_errors);
+                assert!(retried.deferred_sources.is_empty());
+                assert_eq!(retried.inserted_messages, expected_inserted);
+                assert_eq!(
+                    storage.get_connector_last_scan_ts("codex").unwrap(),
+                    Some(scan_watermark)
+                );
+                assert_eq!(storage.total_message_count().unwrap(), 1);
+                assert_eq!(
+                    storage.source_ingest_ledger_entries().unwrap().len(),
+                    usize::from(source_completion)
+                );
+                assert_eq!(
+                    progress.phase.load(Ordering::Relaxed),
+                    INDEX_PHASE_LEXICAL_INDEXING
+                );
+                assert_eq!(progress.total.load(Ordering::Relaxed), 1);
+                assert_eq!(progress.current.load(Ordering::Relaxed), 1);
+            }
         }
     }
 
@@ -46725,6 +47521,7 @@ mod tests {
             CanonicalMutationCounts {
                 inserted_conversations: expected_conversations as usize,
                 inserted_messages: expected_messages as usize,
+                updated_messages: 0,
             }
         );
         assert_eq!(
@@ -47339,41 +48136,68 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn gh426_source_observation_rejects_same_size_restored_mtime_rewrite() {
-        let temp=TempDir::new().unwrap();let path=temp.path().join("source.jsonl");
-        std::fs::write(&path,b"before").unwrap();
-        let modified=std::fs::metadata(&path).unwrap().modified().unwrap();
-        let source=DiscoveredSourceFile::new("claude_code",&ScanRoot::local(temp.path().to_path_buf()),
-            path.clone(),crate::connectors::DiscoveredSourceRole::PrimarySessionLog,true).with_fs_metadata();
-        let before=source_file_observation(&path).unwrap();
-        let saved=serde_json::json!({"primary":before,"dependencies":[source_file_observation(temp.path()).unwrap()]}).to_string();
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("source.jsonl");
+        std::fs::write(&path, b"before").unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let source = DiscoveredSourceFile::new(
+            "claude_code",
+            &ScanRoot::local(temp.path().to_path_buf()),
+            path.clone(),
+            crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+            true,
+        )
+        .with_fs_metadata();
+        let before = source_file_observation(&path).unwrap();
+        let saved=serde_json::json!({"primary":before,"dependencies":[source_file_observation(temp.path()).unwrap()],
+            "producer_contract":env!("CASS_SOURCE_INGEST_CONTRACT")}).to_string();
         std::thread::sleep(Duration::from_millis(2));
-        std::fs::write(&path,b"after!").unwrap();
-        std::fs::OpenOptions::new().write(true).open(&path).unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(modified)).unwrap();
-        assert!(!source.fs_metadata_changed(),"planted rewrite must evade upstream millisecond/size guard");
-        assert_ne!(source_file_observation(&path).unwrap(),before);
-        assert!(!source_ledger_matches(&saved,&source));
+        std::fs::write(&path, b"after!").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert!(
+            !source.fs_metadata_changed(),
+            "planted rewrite must evade upstream millisecond/size guard"
+        );
+        assert_ne!(source_file_observation(&path).unwrap(), before);
+        assert!(!source_ledger_matches(&saved, &source));
     }
 
     #[test]
     fn gh426_source_observation_rejects_changed_primary_sidecar_and_new_dependency() {
-        let temp=TempDir::new().unwrap();
-        let path=temp.path().join("source.jsonl");
-        let sidecar=temp.path().join("source.json");
-        std::fs::write(&path,b"source").unwrap();
-        std::fs::write(&sidecar,b"sidecar").unwrap();
-        let source=DiscoveredSourceFile::new("kiro",&ScanRoot::local(temp.path().to_path_buf()),
-            path.clone(),crate::connectors::DiscoveredSourceRole::PrimarySessionLog,true).with_fs_metadata();
-        let snapshot=||serde_json::json!({"primary":source_file_observation(&path).unwrap(),
-            "dependencies":[source_file_observation(temp.path()).unwrap(),source_file_observation(&sidecar).unwrap()]}).to_string();
-        let saved=snapshot();assert!(source_ledger_matches(&saved,&source));
-        std::fs::write(&sidecar,b"changed sidecar").unwrap();
-        assert!(!source_ledger_matches(&saved,&source));
-        let saved=snapshot();std::fs::write(&path,b"changed primary").unwrap();
-        assert!(!source_ledger_matches(&saved,&source));
-        let saved=snapshot();std::fs::write(temp.path().join("new-required-sidecar"),b"new").unwrap();
-        assert!(!source_ledger_matches(&saved,&source));
-        assert!(!source_ledger_matches("{}",&source));
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("source.jsonl");
+        let sidecar = temp.path().join("source.json");
+        std::fs::write(&path, b"source").unwrap();
+        std::fs::write(&sidecar, b"sidecar").unwrap();
+        let source = DiscoveredSourceFile::new(
+            "kiro",
+            &ScanRoot::local(temp.path().to_path_buf()),
+            path.clone(),
+            crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+            true,
+        )
+        .with_fs_metadata();
+        let snapshot = || {
+            serde_json::json!({"primary":source_file_observation(&path).unwrap(),
+            "producer_contract":env!("CASS_SOURCE_INGEST_CONTRACT"),
+            "dependencies":[source_file_observation(temp.path()).unwrap(),source_file_observation(&sidecar).unwrap()]}).to_string()
+        };
+        let saved = snapshot();
+        assert!(source_ledger_matches(&saved, &source));
+        std::fs::write(&sidecar, b"changed sidecar").unwrap();
+        assert!(!source_ledger_matches(&saved, &source));
+        let saved = snapshot();
+        std::fs::write(&path, b"changed primary").unwrap();
+        assert!(!source_ledger_matches(&saved, &source));
+        let saved = snapshot();
+        std::fs::write(temp.path().join("new-required-sidecar"), b"new").unwrap();
+        assert!(!source_ledger_matches(&saved, &source));
+        assert!(!source_ledger_matches("{}", &source));
     }
 
     #[test]
@@ -47433,6 +48257,7 @@ mod tests {
             CanonicalMutationCounts {
                 inserted_conversations: 1,
                 inserted_messages: 1,
+                updated_messages: 0,
             },
             "streaming configured scan roots",
         )?;
@@ -47629,6 +48454,7 @@ mod tests {
             CanonicalMutationCounts {
                 inserted_conversations: 1,
                 inserted_messages: 1,
+                updated_messages: 0,
             },
             "batch configured scan roots",
         )?;
@@ -47954,6 +48780,7 @@ mod tests {
             CanonicalMutationCounts {
                 inserted_conversations: 1,
                 inserted_messages: 2,
+                updated_messages: 0,
             }
         );
         assert_eq!(conversation_count, 1);
@@ -53996,7 +54823,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         assert_eq!(watch_scan_lower_bound(ConnectorKind::Shelley, None), None);
         for input in [0, 1, 1_700_000_000_999, i64::MAX] {
-            assert_eq!(watch_scan_lower_bound(ConnectorKind::Shelley, Some(input)), None);
+            assert_eq!(
+                watch_scan_lower_bound(ConnectorKind::Shelley, Some(input)),
+                None
+            );
         }
         for name in ["shelley.db", "sessions.sqlite3", "history"] {
             let db = tmp.path().join(name);
@@ -60236,11 +61066,27 @@ mod tests {
         let inserted_messages = CanonicalMutationCounts {
             inserted_conversations: 0,
             inserted_messages: 1,
+            updated_messages: 0,
         };
         let inserted_conversations = CanonicalMutationCounts {
             inserted_conversations: 1,
             inserted_messages: 0,
+            updated_messages: 0,
         };
+        let revised_messages = CanonicalMutationCounts {
+            inserted_conversations: 0,
+            inserted_messages: 0,
+            updated_messages: 1,
+        };
+
+        assert!(revised_messages.changed());
+        assert!(
+            should_redrive_final_lexical_checkpoint_refresh_after_pre_scan_repair(
+                true,
+                revised_messages
+            )
+        );
+        assert_eq!(unchanged.accumulate(revised_messages), revised_messages);
 
         assert!(
             should_redrive_final_lexical_checkpoint_refresh_after_pre_scan_repair(
@@ -60422,6 +61268,7 @@ mod tests {
         let changed = CanonicalMutationCounts {
             inserted_conversations: 0,
             inserted_messages: 1,
+            updated_messages: 0,
         };
 
         assert!(should_skip_noop_final_lexical_checkpoint_refresh(
@@ -60626,6 +61473,7 @@ mod tests {
             CanonicalMutationCounts {
                 inserted_conversations: 1,
                 inserted_messages: 0,
+                updated_messages: 0,
             },
             None,
         ));
@@ -61011,6 +61859,7 @@ mod tests {
             CanonicalMutationCounts {
                 inserted_conversations: 1,
                 inserted_messages: 0,
+                updated_messages: 0,
             },
             Some(42),
         ));

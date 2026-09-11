@@ -151,6 +151,11 @@
       "found": false
     },
     {
+      "name": "grok_bot",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
       "name": "goose",
       "path": "(not detected)",
       "found": false
@@ -162,6 +167,11 @@
     },
     {
       "name": "hermes",
+      "path": "(not detected)",
+      "found": false
+    },
+    {
+      "name": "shelley",
       "path": "(not detected)",
       "found": false
     }

@@ -1889,6 +1889,7 @@ dependencies = [
  "anyhow",
  "asupersync",
  "base64 0.23.1",
+ "blake3",
  "bloomfilter",
  "chrono",
  "dirs",
@@ -1899,6 +1900,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "tracing",
+ "url",
  "urlencoding",
  "walkdir",
 ]

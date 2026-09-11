@@ -375,6 +375,86 @@ fn main() {
     validate_path_dependency_contracts(&manifest_dir, &manifest, packaged_manifest);
     emit_vergen_metadata();
     emit_build_commit_metadata(&manifest_dir);
+    emit_source_ingest_contract(&manifest_dir);
+}
+
+/// A completed source is reusable only by the parser/normalizer that read it.
+/// Hash build inputs rather than Git HEAD: release tarballs have no Git metadata,
+/// and two dirty builds at the same commit can contain different parser fixes.
+fn emit_source_ingest_contract(manifest_dir: &Path) {
+    // Cargo pins registry/git source bytes, but a local path dependency can
+    // change its parser without changing this crate's manifest or lockfile.
+    // Such development builds must reparse instead of reusing an unproven
+    // completion. In particular, hashing only a sibling's version is unsafe.
+    let lock_text = fs::read_to_string(manifest_dir.join("Cargo.lock"))
+        .unwrap_or_else(|error| fatal(format!("cannot read ingest dependency lock: {error}")));
+    let lock: Value = toml::from_str(&lock_text)
+        .unwrap_or_else(|error| fatal(format!("cannot parse ingest dependency lock: {error}")));
+    let crate_name = env::var("CARGO_PKG_NAME").unwrap_or_default();
+    let crate_version = env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    let pinned_dependencies =
+        lock.get("package")
+            .and_then(Value::as_array)
+            .is_some_and(|packages| {
+                !packages.is_empty()
+                    && packages.iter().all(|package| {
+                        package.get("source").and_then(Value::as_str).is_some()
+                            || (package.get("name").and_then(Value::as_str)
+                                == Some(crate_name.as_str())
+                                && package.get("version").and_then(Value::as_str)
+                                    == Some(crate_version.as_str()))
+                    })
+            });
+    println!("cargo:rustc-env=CASS_SOURCE_INGEST_REUSE={pinned_dependencies}");
+    let mut inputs = BTreeSet::from([
+        PathBuf::from("Cargo.toml"),
+        PathBuf::from("Cargo.lock"),
+        PathBuf::from("build.rs"),
+    ]);
+    let mut directories = vec![PathBuf::from("src")];
+    while let Some(directory) = directories.pop() {
+        println!("cargo:rerun-if-changed={}", directory.display());
+        let entries = fs::read_dir(manifest_dir.join(&directory))
+            .unwrap_or_else(|error| fatal(format!("cannot read ingest inputs: {error}")));
+        for entry in entries {
+            let entry = entry
+                .unwrap_or_else(|error| fatal(format!("cannot inspect ingest input: {error}")));
+            let path = directory.join(entry.file_name());
+            let kind = entry.file_type().unwrap_or_else(|error| {
+                fatal(format!("cannot inspect ingest input type: {error}"))
+            });
+            if kind.is_dir() {
+                directories.push(path);
+            } else {
+                inputs.insert(path);
+            }
+        }
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"cass-source-ingest-contract-v1\0");
+    for input in inputs {
+        println!("cargo:rerun-if-changed={}", input.display());
+        let name = input.to_string_lossy().replace('\\', "/");
+        let bytes = fs::read(manifest_dir.join(&input))
+            .unwrap_or_else(|error| fatal(format!("cannot read ingest input {name}: {error}")));
+        hasher.update(&(name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(&bytes);
+    }
+    let features: BTreeSet<_> = env::vars()
+        .filter(|(name, _)| name.starts_with("CARGO_FEATURE_"))
+        .collect();
+    for (name, value) in features {
+        hasher.update(name.as_bytes());
+        hasher.update(b"=");
+        hasher.update(value.as_bytes());
+        hasher.update(b"\0");
+    }
+    println!(
+        "cargo:rustc-env=CASS_SOURCE_INGEST_CONTRACT={}",
+        hasher.finalize()
+    );
 }
 
 /// Embed the build commit at compile time (GH #399).

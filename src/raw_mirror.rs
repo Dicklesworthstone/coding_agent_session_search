@@ -1486,7 +1486,10 @@ pub(crate) fn capture_source_file_with_chunk_policy(
         // or application configuration. The parser's chat allowlist must not
         // be bypassed by preserving the entire source container.
         // Keep this check before filesystem access and mirror initialization.
-        return Err(anyhow!("disabled_sensitive_container: {} source files cannot be raw-mirrored", input.provider));
+        return Err(anyhow!(
+            "disabled_sensitive_container: {} source files cannot be raw-mirrored",
+            input.provider
+        ));
     }
     if chunk_threshold_bytes == 0 {
         return Err(anyhow!(
@@ -3340,20 +3343,39 @@ mod tests {
         for provider in ["grok_bot", "shelley"] {
             for source_path in [&source, &temp.path().join("missing.blob")] {
                 let result = capture_source_file(RawMirrorCaptureInput {
-                    data_dir: &data_dir, provider, source_id: "local", origin_kind: "local",
-                    origin_host: None, source_path, db_links: &[],
+                    data_dir: &data_dir,
+                    provider,
+                    source_id: "local",
+                    origin_kind: "local",
+                    origin_host: None,
+                    source_path,
+                    db_links: &[],
                 });
-                assert!(result.unwrap_err().to_string().starts_with("disabled_sensitive_container:"));
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .starts_with("disabled_sensitive_container:")
+                );
                 assert!(!data_dir.exists(), "denial cannot initialize a raw mirror");
             }
         }
         assert_eq!(fs::read(&source).unwrap(), bytes);
         assert_eq!(fs::metadata(&source).unwrap().modified().unwrap(), modified);
         let control = capture_source_file(RawMirrorCaptureInput {
-            data_dir: &data_dir, provider: "codex", source_id: "local", origin_kind: "local",
-            origin_host: None, source_path: &source, db_links: &[],
-        }).unwrap();
-        assert!(!control.already_present, "ordinary providers remain capturable");
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source,
+            db_links: &[],
+        })
+        .unwrap();
+        assert!(
+            !control.already_present,
+            "ordinary providers remain capturable"
+        );
     }
 
     #[test]

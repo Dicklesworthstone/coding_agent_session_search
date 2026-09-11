@@ -1540,11 +1540,17 @@ CASS_VERSION=0.4.2
         // An older/custom probe can still report this directory under the
         // generic unknown provider. Parse that real wire shape before passing
         // it to automatic source configuration.
-        let parsed = parse_probe_output("laptop",
-            "===PROBE_START===\nAGENT_DATA=/Users/test/Library/Application Support/Grok Bot/sand-client-persistence|1|200\nAGENT_DATA=/Users/test/.codex/sessions|2|3\n===PROBE_END===", 1);
+        let parsed = parse_probe_output(
+            "laptop",
+            "===PROBE_START===\nAGENT_DATA=/Users/test/Library/Application Support/Grok Bot/sand-client-persistence|1|200\nAGENT_DATA=/Users/test/.codex/sessions|2|3\n===PROBE_END===",
+            1,
+        );
         assert_eq!(parsed.detected_agents.len(), 2);
         let generator = super::super::config::SourceConfigGenerator::new();
-        assert_eq!(generator.generate_source("laptop", &parsed).paths, vec!["/Users/test/.codex/sessions"]);
+        assert_eq!(
+            generator.generate_source("laptop", &parsed).paths,
+            vec!["/Users/test/.codex/sessions"]
+        );
     }
 
     #[test]

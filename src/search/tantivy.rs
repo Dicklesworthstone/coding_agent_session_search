@@ -1499,6 +1499,10 @@ pub struct TantivyIndex {
 }
 
 impl TantivyIndex {
+    pub(crate) fn path(&self) -> &Path {
+        self.inner.path()
+    }
+
     pub fn open_or_create(path: &Path) -> Result<Self> {
         materialize_federated_search_bundle_for_write(path)?;
         wipe_index_dir_on_schema_hash_mismatch(path)?;
@@ -1945,6 +1949,102 @@ impl TantivyIndex {
             self.inner.add_cass_documents(&docs)?;
             on_batch_flushed(flushed_docs)
         }
+    }
+
+    /// Reconcile selected canonical messages under their stable identities.
+    /// A replacement filtered as noise removes its old live document. Each
+    /// bounded engine batch publishes independently; errors propagate and a
+    /// retry converges without promising whole-conversation atomicity.
+    pub fn reconcile_messages_from_packet(
+        &mut self,
+        packet: &ConversationPacket,
+        message_indices: &[usize],
+        conversation_id_override: Option<i64>,
+    ) -> Result<()> {
+        self.reconcile_packet_messages_with_limits(
+            packet,
+            message_indices,
+            conversation_id_override,
+            tantivy_add_batch_max_messages(),
+            tantivy_add_batch_max_chars(),
+        )
+    }
+
+    fn reconcile_packet_messages_with_limits(
+        &mut self,
+        packet: &ConversationPacket,
+        message_indices: &[usize],
+        conversation_id_override: Option<i64>,
+        max_messages: usize,
+        max_chars: usize,
+    ) -> Result<()> {
+        let messages = &packet.payload.messages;
+        // Reject invalid selectors before publishing even the first batch.
+        if let Some(index) = message_indices
+            .iter()
+            .find(|&&index| index >= messages.len())
+        {
+            anyhow::bail!(
+                "packet message index {} out of range for packet with {} messages",
+                index,
+                messages.len()
+            );
+        }
+        let mut context = cass_doc_context_from_packet(packet);
+        if let Some(id) = conversation_id_override {
+            context.conversation_id = Some(id);
+        }
+        let mut docs = Vec::new();
+        let mut removals = Vec::new();
+        let mut pending_indices = BTreeSet::new();
+        let mut pending_bytes = 0usize;
+        for &index in message_indices {
+            let message = messages
+                .get(index)
+                .context("validated packet index disappeared")?;
+            let msg_idx = message.idx.max(0) as u64;
+            // Repeated selectors are valid replay, but one engine batch may
+            // not contain a duplicate live identity.
+            if pending_indices.contains(&msg_idx) {
+                self.flush_packet_revisions(&mut docs, &mut removals)?;
+                pending_indices.clear();
+                pending_bytes = 0;
+            }
+            pending_indices.insert(msg_idx);
+            if let Some(doc) = cass_document_for_packet_message(&context, message) {
+                pending_bytes = pending_bytes.saturating_add(doc.content.len());
+                docs.push(doc);
+            } else {
+                let identity = frankensearch::quill::cass::cass_document_identity(
+                    &context.source_id,
+                    frankensearch::quill::cass::CassConversationKey {
+                        source_path: &context.source_path,
+                        id: context.conversation_id,
+                    },
+                    msg_idx,
+                );
+                pending_bytes = pending_bytes.saturating_add(identity.len());
+                removals.push(identity);
+            }
+            if pending_indices.len() >= max_messages.max(1) || pending_bytes >= max_chars.max(1) {
+                self.flush_packet_revisions(&mut docs, &mut removals)?;
+                pending_indices.clear();
+                pending_bytes = 0;
+            }
+        }
+        self.flush_packet_revisions(&mut docs, &mut removals)
+    }
+
+    fn flush_packet_revisions(
+        &mut self,
+        docs: &mut Vec<FsCassDocument>,
+        removals: &mut Vec<String>,
+    ) -> Result<()> {
+        self.inner.upsert_cass_documents(docs)?;
+        self.inner.delete_cass_document_ids(removals)?;
+        docs.clear();
+        removals.clear();
+        Ok(())
     }
 
     /// Total live documents in the published snapshot.
@@ -2549,6 +2649,223 @@ mod tests {
             cooldown_ms: 300_000,
         };
         assert!(status.should_merge());
+    }
+
+    fn gh423_lexical_packet(count: usize) -> ConversationPacket {
+        let conv = NormalizedConversation {
+            agent_slug: "codebuff".into(),
+            external_id: Some("shared-lineage-chat".into()),
+            title: Some("Shared lineage".into()),
+            workspace: Some(PathBuf::from("/work/project")),
+            source_path: PathBuf::from("/shared/manicode/chat-messages.json"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_000),
+            metadata: serde_json::json!({"cass":{"origin":{"source_id":"remote-source","kind":"ssh","host":"remote-host"}}}),
+            messages: (0..count)
+                .map(|position| NormalizedMessage {
+                    idx: i64::try_from(position).unwrap() * 3 + 5,
+                    role: "assistant".into(),
+                    author: None,
+                    created_at: Some(1_700_000_000_000),
+                    content: format!("oldrevision marker{position}"),
+                    extra: Value::Null,
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                })
+                .collect(),
+        };
+        ConversationPacket::from_normalized_conversation(
+            &conv,
+            ConversationPacketProvenance::local(),
+        )
+    }
+
+    fn gh423_lexical_hits(index: &TantivyIndex, term: &str) -> BTreeSet<String> {
+        let reader = index.reader().unwrap();
+        let parser = frankensearch::quill::query::CassQueryParser::new(
+            frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
+        )
+        .unwrap();
+        let query = parser.parse(
+            term,
+            &frankensearch::quill::query::CassQueryFilters::default(),
+        );
+        let page =
+            crate::search::quill_bridge::search_paginated(&reader, &query.query, 128, 0, true)
+                .unwrap();
+        let hits: BTreeSet<_> = page
+            .hits
+            .iter()
+            .map(|hit| hit.document_id.clone())
+            .collect();
+        assert_eq!(
+            hits.len(),
+            page.hits.len(),
+            "each stable identity is live exactly once"
+        );
+        assert_eq!(page.total_count, Some(hits.len()));
+        hits
+    }
+
+    fn gh423_lexical_identity(
+        packet: &ConversationPacket,
+        position: usize,
+        conversation_id: i64,
+    ) -> String {
+        let context = cass_doc_context_from_packet(packet);
+        frankensearch::quill::cass::cass_document_identity(
+            &context.source_id,
+            frankensearch::quill::cass::CassConversationKey {
+                source_path: &context.source_path,
+                id: Some(conversation_id),
+            },
+            packet.payload.messages[position].idx.max(0) as u64,
+        )
+    }
+
+    #[test]
+    fn gh423_lexical_revisions_replace_all_32_and_preserve_untouched_across_batches() {
+        let dir = TempDir::new().unwrap();
+        let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+        let mut packet = gh423_lexical_packet(33);
+        index
+            .add_messages_from_packet(&packet, None, Some(77), |_| Ok(()))
+            .unwrap();
+        index.commit().unwrap();
+        assert_eq!(index.doc_count().unwrap(), 33);
+        let indices: Vec<usize> = (0..32).collect();
+        let expected: BTreeSet<String> = indices
+            .iter()
+            .map(|&idx| gh423_lexical_identity(&packet, idx, 77))
+            .collect();
+        let untouched = gh423_lexical_identity(&packet, 32, 77);
+        for &position in &indices {
+            packet.payload.messages[position].content =
+                format!("newrevision completed response marker{position}");
+        }
+        // Run the production batching body with small limits to cross both
+        // document and content thresholds without a giant fixture or env race.
+        index
+            .reconcile_packet_messages_with_limits(&packet, &indices, Some(77), 7, 80)
+            .unwrap();
+        index.commit().unwrap();
+        assert_eq!(index.doc_count().unwrap(), 33);
+        assert_eq!(gh423_lexical_hits(&index, "newrevision"), expected);
+        assert_eq!(
+            gh423_lexical_hits(&index, "oldrevision"),
+            BTreeSet::from([untouched.clone()])
+        );
+        let mut repeated_selectors = indices.clone();
+        repeated_selectors.push(0);
+        index
+            .reconcile_messages_from_packet(&packet, &repeated_selectors, Some(77))
+            .unwrap();
+        index.commit().unwrap();
+        assert_eq!(index.doc_count().unwrap(), 33);
+        assert_eq!(gh423_lexical_hits(&index, "newrevision"), expected);
+        for &position in &indices {
+            packet.payload.messages[position].content.clear();
+        }
+        index
+            .reconcile_packet_messages_with_limits(&packet, &indices, Some(77), 7, 80)
+            .unwrap();
+        assert_eq!(index.doc_count().unwrap(), 1);
+        assert_eq!(
+            gh423_lexical_hits(&index, "oldrevision"),
+            BTreeSet::from([untouched])
+        );
+        assert!(gh423_lexical_hits(&index, "newrevision").is_empty());
+        index
+            .reconcile_messages_from_packet(&packet, &indices, Some(77))
+            .unwrap();
+        assert_eq!(
+            index.doc_count().unwrap(),
+            1,
+            "repeated removals are idempotent"
+        );
+    }
+
+    #[test]
+    fn gh423_lexical_noise_removal_commits_pending_work_and_preserves_sibling_identity() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let dir = TempDir::new().unwrap();
+        let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let heartbeat = Arc::clone(&ticks);
+        index.set_heartbeat(Some(Arc::new(move || {
+            heartbeat.fetch_add(1, Ordering::Relaxed);
+        })));
+        let mut packet = gh423_lexical_packet(3);
+        index
+            .add_messages_from_packet(&packet, None, Some(77), |_| Ok(()))
+            .unwrap();
+        index
+            .add_messages_from_packet(&packet, None, Some(88), |_| Ok(()))
+            .unwrap();
+        index.commit().unwrap();
+        let mut pending = gh423_lexical_packet(1);
+        pending.payload.identity.source_path = "/pending/chat-messages.json".into();
+        pending.payload.messages[0].content = "pendingneedle survives removal".into();
+        index
+            .add_messages_from_packet(&pending, None, Some(99), |_| Ok(()))
+            .unwrap();
+        assert_eq!(
+            index.doc_count().unwrap(),
+            6,
+            "plain addition is still pending"
+        );
+        let before_ticks = ticks.load(Ordering::Relaxed);
+        packet.payload.messages[0].content = "   \n\t".into();
+        packet.payload.messages[1].content = "OK".into();
+        index
+            .reconcile_messages_from_packet(&packet, &[0, 1], Some(77))
+            .unwrap();
+        assert!(
+            ticks.load(Ordering::Relaxed) >= before_ticks + 2,
+            "commit and removal both tick liveness"
+        );
+        assert_eq!(index.doc_count().unwrap(), 5);
+        let mut survivors: BTreeSet<String> = (0..3)
+            .map(|position| gh423_lexical_identity(&packet, position, 88))
+            .collect();
+        survivors.insert(gh423_lexical_identity(&packet, 2, 77));
+        assert_eq!(gh423_lexical_hits(&index, "oldrevision"), survivors);
+        assert_eq!(
+            gh423_lexical_hits(&index, "pendingneedle"),
+            BTreeSet::from([gh423_lexical_identity(&pending, 0, 99)])
+        );
+        index
+            .reconcile_messages_from_packet(&packet, &[0, 1], Some(77))
+            .unwrap();
+        assert_eq!(index.doc_count().unwrap(), 5);
+        index.set_heartbeat(None);
+    }
+
+    #[test]
+    fn gh423_lexical_out_of_range_selector_refuses_before_any_publication() {
+        let dir = TempDir::new().unwrap();
+        let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+        let mut packet = gh423_lexical_packet(2);
+        index
+            .add_messages_from_packet(&packet, None, Some(77), |_| Ok(()))
+            .unwrap();
+        index.commit().unwrap();
+        let before = gh423_lexical_hits(&index, "oldrevision");
+        packet.payload.messages[0].content = "newrevision must not publish".into();
+        let error = index
+            .reconcile_messages_from_packet(&packet, &[0, 2], Some(77))
+            .unwrap_err();
+        assert!(error.to_string().contains("out of range"));
+        assert_eq!(index.doc_count().unwrap(), 2);
+        assert_eq!(gh423_lexical_hits(&index, "oldrevision"), before);
+        assert!(gh423_lexical_hits(&index, "newrevision").is_empty());
+        index
+            .reconcile_messages_from_packet(&packet, &[], Some(77))
+            .unwrap();
+        assert_eq!(index.doc_count().unwrap(), 2);
     }
 
     /// #440: an armed resume reconcile routes exactly the owed leading

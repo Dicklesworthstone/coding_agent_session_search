@@ -2642,13 +2642,20 @@ Host production !legacy-prod
     #[test]
     fn gh447_remote_autoconfig_rejects_sensitive_grok_bot_probe_reports() {
         let generator = SourceConfigGenerator::new();
-        let report = make_test_probe(true, vec![
-            make_test_agent("grok_bot", "/custom/replica-root"),
-            make_test_agent("grok-bot", "/another/replica-root"),
-            make_test_agent("unknown", "/Users/test/Library/Application Support/Grok Bot/sand-client-persistence"),
-            make_test_agent("grok", "~/.grok/sessions"),
-            make_test_agent("codex", "~/.codex/sessions"),
-        ], Some(make_test_sys_info("darwin", "/Users/test")));
+        let report = make_test_probe(
+            true,
+            vec![
+                make_test_agent("grok_bot", "/custom/replica-root"),
+                make_test_agent("grok-bot", "/another/replica-root"),
+                make_test_agent(
+                    "unknown",
+                    "/Users/test/Library/Application Support/Grok Bot/sand-client-persistence",
+                ),
+                make_test_agent("grok", "~/.grok/sessions"),
+                make_test_agent("codex", "~/.codex/sessions"),
+            ],
+            Some(make_test_sys_info("darwin", "/Users/test")),
+        );
         let source = generator.generate_source("laptop", &report);
         assert_eq!(source.paths, vec!["~/.grok/sessions", "~/.codex/sessions"]);
         assert_eq!(source.source_type, SourceKind::Ssh);

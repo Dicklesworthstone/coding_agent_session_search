@@ -3830,7 +3830,9 @@ impl SemanticIndexer {
             TierKind::Fast => manifest.fast_tier.as_ref(),
             TierKind::Quality => manifest.quality_tier.as_ref(),
         };
-        let Some(artifact) = artifact else { return Ok(None); };
+        let Some(artifact) = artifact else {
+            return Ok(None);
+        };
         // An identity-rebuild fingerprint is not a canonical fingerprint.
         // That finalization may still have work to do after publication.
         if !artifact.db_fingerprint.starts_with("content-v1:") {
@@ -3842,7 +3844,8 @@ impl SemanticIndexer {
             model_revision: model_revision.into(),
             max_conversations: 1,
         };
-        Ok(self.completed_backfill_cache(storage, data_dir, manifest, &plan)?
+        Ok(self
+            .completed_backfill_cache(storage, data_dir, manifest, &plan)?
             .map(|(_, cache)| cache.artifact.db_fingerprint))
     }
 
@@ -3856,7 +3859,9 @@ impl SemanticIndexer {
         let archive_before = BackfillFilePair::archive(storage);
         let candidate = self.reusable_backfill_candidate(data_dir, manifest, plan);
         let cache_path = data_dir.join(VECTOR_INDEX_DIR).join(format!(
-            ".completed-backfill-{}-{}.json", plan.tier.as_str(), self.embedder_id()
+            ".completed-backfill-{}-{}.json",
+            plan.tier.as_str(),
+            self.embedder_id()
         ));
         let artifact = match plan.tier {
             TierKind::Fast => manifest.fast_tier.as_ref(),
@@ -3900,7 +3905,9 @@ impl SemanticIndexer {
             plan.tier.as_str(),
             self.embedder_id()
         ));
-        if let Some((path, cache)) = self.completed_backfill_cache(storage, data_dir, manifest, &plan)? {
+        if let Some((path, cache)) =
+            self.completed_backfill_cache(storage, data_dir, manifest, &plan)?
+        {
             let artifact = cache.artifact;
             sink.emit(
                 SemanticProgressEvent::Complete,
@@ -6349,10 +6356,26 @@ mod tests {
         let first = run(&mut manifest)?;
         assert!(first.published && !first.unchanged);
         let fingerprint = manifest.fast_tier.as_ref().unwrap().db_fingerprint.clone();
-        assert_eq!(indexer.completed_backfill_fingerprint(&storage, temp.path(), &manifest,
-            TierKind::Fast, "hash")?, Some(fingerprint.clone()));
-        assert_eq!(indexer.completed_backfill_fingerprint(&storage, temp.path(), &manifest,
-            TierKind::Fast, "foreign-model")?, None);
+        assert_eq!(
+            indexer.completed_backfill_fingerprint(
+                &storage,
+                temp.path(),
+                &manifest,
+                TierKind::Fast,
+                "hash"
+            )?,
+            Some(fingerprint.clone())
+        );
+        assert_eq!(
+            indexer.completed_backfill_fingerprint(
+                &storage,
+                temp.path(),
+                &manifest,
+                TierKind::Fast,
+                "foreign-model"
+            )?,
+            None
+        );
         let vectors_before = fs::read(&first.index_path)?;
         let manifest_before = fs::read(SemanticManifest::path(temp.path()))?;
         let vector_stamp =
@@ -6375,8 +6398,16 @@ mod tests {
         storage.raw().execute(
             "UPDATE messages SET content = 'changed earlier content' WHERE conversation_id = 1",
         )?;
-        assert_eq!(indexer.completed_backfill_fingerprint(&storage, temp.path(), &manifest,
-            TierKind::Fast, "hash")?, None);
+        assert_eq!(
+            indexer.completed_backfill_fingerprint(
+                &storage,
+                temp.path(),
+                &manifest,
+                TierKind::Fast,
+                "hash"
+            )?,
+            None
+        );
         assert_eq!(
             crate::indexer::lexical_storage_fingerprint_for_storage(&storage)?,
             fingerprint
@@ -6392,8 +6423,16 @@ mod tests {
             .join(VECTOR_INDEX_DIR)
             .join(".completed-backfill-fast-fnv1a-384.json");
         fs::write(&cache_path, b"incomplete cache")?;
-        assert_eq!(indexer.completed_backfill_fingerprint(&storage, temp.path(), &manifest,
-            TierKind::Fast, "hash")?, None);
+        assert_eq!(
+            indexer.completed_backfill_fingerprint(
+                &storage,
+                temp.path(),
+                &manifest,
+                TierKind::Fast,
+                "hash"
+            )?,
+            None
+        );
         let recovered = run(&mut manifest)?;
         assert!(!recovered.unchanged && recovered.published);
         assert_eq!(recovered.embedded_docs, 0);

@@ -35265,12 +35265,39 @@ fn stats_message_count_sql(source_join: &str, source_where: &str) -> String {
 fn stats_workspace_count_sql(source_join: &str, source_where: &str) -> String {
     if source_where.is_empty() {
         format!(
-            "SELECT c.workspace_id, COUNT(*) FROM conversations c{source_join} WHERE c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC"
+            "SELECT c.workspace_id, COUNT(*) FROM conversations c{source_join} WHERE c.workspace_id IS NOT NULL GROUP BY c.workspace_id"
         )
     } else {
         format!(
-            "SELECT c.workspace_id, COUNT(*) FROM conversations c{source_join}{source_where} AND c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC"
+            "SELECT c.workspace_id, COUNT(*) FROM conversations c{source_join}{source_where} AND c.workspace_id IS NOT NULL GROUP BY c.workspace_id"
         )
+    }
+}
+
+fn stats_agent_count_sql(source_join: &str, source_where: &str) -> String {
+    format!(
+        "SELECT c.agent_id, COUNT(*) FROM conversations c{source_join}{source_where} GROUP BY c.agent_id"
+    )
+}
+
+fn sort_stats_counts<K: Ord>(rows: &mut [(K, i64)]) {
+    // Keep aggregate ordering out of SQL: fsqlite 0.3.18's pager-backed
+    // GROUP BY lane rejects ORDER BY COUNT(*) and materializes input rows.
+    // Sort only the groups, with ascending IDs (NULL first) breaking ties.
+    rows.sort_by(|(left_id, left_count), (right_id, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_id.cmp(right_id))
+    });
+}
+
+fn stats_query_error(operation: &str, err: crate::franken_sync::FrankenError) -> CliError {
+    CliError {
+        code: 5,
+        kind: CliErrorKind::Storage.kind_str(),
+        message: format!("stats could not {operation}: {err}"),
+        hint: Some("Run 'cass doctor --json' to inspect the archive; unavailable statistics are not zero counts.".into()),
+        retryable: crate::storage::sqlite::retryable_franken_error(&err),
     }
 }
 
@@ -35403,32 +35430,13 @@ fn run_stats(
         format!("SELECT COUNT(*) FROM conversations c{source_join}{source_where}");
     let message_sql = stats_message_count_sql(source_join, &source_where);
 
-    let mut conversation_count: i64 =
+    let conversation_count: i64 =
         franken_query_row_map_retry(&conn, &conversation_sql, &params, |r| r.get_typed(0))
-            .unwrap_or(0);
+            .map_err(|err| stats_query_error("count conversations", err))?;
 
-    let mut message_count: i64 =
-        franken_query_row_map_retry(&conn, &message_sql, &params, |r| r.get_typed(0)).unwrap_or(0);
-    if conversation_count == 0 {
-        conversation_count = fresh_franken_count_retry(
-            &db_path,
-            "stats",
-            Duration::from_secs(30),
-            &conversation_sql,
-            &params,
-        )
-        .unwrap_or(0);
-    }
-    if message_count == 0 {
-        message_count = fresh_franken_count_retry(
-            &db_path,
-            "stats",
-            Duration::from_secs(30),
-            &message_sql,
-            &params,
-        )
-        .unwrap_or(0);
-    }
+    let message_count: i64 =
+        franken_query_row_map_retry(&conn, &message_sql, &params, |r| r.get_typed(0))
+            .map_err(|err| stats_query_error("count messages", err))?;
 
     let agent_lookup: HashMap<i64, String> =
         franken_query_map_collect_retry(&conn, "SELECT id, slug FROM agents", &[], |r| {
@@ -35438,14 +35446,13 @@ fn run_stats(
         .into_iter()
         .collect();
 
-    let agent_sql = format!(
-        "SELECT c.agent_id, COUNT(*) FROM conversations c{source_join}{source_where} GROUP BY c.agent_id ORDER BY COUNT(*) DESC"
-    );
-    let agent_count_rows: Vec<(Option<i64>, i64)> =
+    let agent_sql = stats_agent_count_sql(source_join, &source_where);
+    let mut agent_count_rows: Vec<(Option<i64>, i64)> =
         franken_query_map_collect_retry(&conn, &agent_sql, &params, |r| {
             Ok((r.get_typed::<Option<i64>>(0)?, r.get_typed::<i64>(1)?))
         })
         .map_err(|e| CliError::unknown(format!("query: {e}")))?;
+    sort_stats_counts(&mut agent_count_rows);
     let agent_rows: Vec<(String, i64)> = agent_count_rows
         .into_iter()
         .map(|(agent_id, count)| {
@@ -35465,11 +35472,12 @@ fn run_stats(
         .collect();
 
     let ws_sql = stats_workspace_count_sql(source_join, &source_where);
-    let workspace_count_rows: Vec<(i64, i64)> =
+    let mut workspace_count_rows: Vec<(i64, i64)> =
         franken_query_map_collect_retry(&conn, &ws_sql, &params, |r| {
             Ok((r.get_typed::<i64>(0)?, r.get_typed::<i64>(1)?))
         })
         .map_err(|e| CliError::unknown(format!("query: {e}")))?;
+    sort_stats_counts(&mut workspace_count_rows);
     let ws_rows: Vec<(String, i64)> = workspace_count_rows
         .into_iter()
         .filter_map(|(workspace_id, count)| {
@@ -35496,7 +35504,7 @@ fn run_stats(
         franken_query_row_map_retry(&conn, &date_sql, &params, |r| {
             Ok((r.get_typed(0)?, r.get_typed(1)?))
         })
-        .unwrap_or((None, None));
+        .map_err(|err| stats_query_error("read conversation date range", err))?;
     let raw_mirror_summary = crate::raw_mirror::storage_summary(&data_dir);
 
     // Get per-source breakdown if requested (P3.7)
@@ -77949,47 +77957,79 @@ paths = ["~/.claude/projects"]
         let before = std::fs::metadata(&source_path).unwrap().modified().unwrap();
         let mut cache = HashMap::new();
         for provider in ["shelley", "grok_bot"] {
-        for origin in ["local", "ssh"] {
-            for apply in [false, true] {
-                let candidate = DoctorRawMirrorBackfillCandidate {
-                    conversation_id: 17, provider: provider.into(),
-                    source_path: Some(source_path.display().to_string()),
-                    source_id: if origin == "local" { "local" } else { "remote" }.into(),
-                    origin_host: None, origin_kind: Some(origin.into()),
-                    started_at_ms: None, message_count: 1,
-                };
-                let receipt = doctor_raw_mirror_backfill_candidate_receipt(
-                    &data_dir, &candidate, &HashMap::new(), &HashMap::new(), &mut cache, apply,
-                );
-                assert_eq!(receipt.action, "disabled_sensitive_container");
-                assert!(!doctor_raw_mirror_backfill_receipt_would_mutate(&receipt));
-                assert!(receipt.source_stat_snapshot.is_none());
-                assert!(!receipt.raw_source_captured);
-                assert!(!receipt.raw_mirror_db_linked);
-                assert!(!receipt.db_projection_only);
-                let variable = if provider == "shelley" { "CASS_SHELLEY_DB" } else { "CASS_GROK_BOT_DATA_ROOT" };
-                assert!(receipt.warnings.iter().any(|message| message.contains(variable)));
-                let mut report = DoctorRawMirrorBackfillReport::default();
-                accumulate_doctor_raw_mirror_backfill_receipt(&mut report, receipt);
-                assert_eq!(report.eligible_live_source_count, 0);
-                assert_eq!(report.existing_raw_manifest_link_count, 0);
-                assert_eq!(report.capture_failure_count, 0);
+            for origin in ["local", "ssh"] {
+                for apply in [false, true] {
+                    let candidate = DoctorRawMirrorBackfillCandidate {
+                        conversation_id: 17,
+                        provider: provider.into(),
+                        source_path: Some(source_path.display().to_string()),
+                        source_id: if origin == "local" { "local" } else { "remote" }.into(),
+                        origin_host: None,
+                        origin_kind: Some(origin.into()),
+                        started_at_ms: None,
+                        message_count: 1,
+                    };
+                    let receipt = doctor_raw_mirror_backfill_candidate_receipt(
+                        &data_dir,
+                        &candidate,
+                        &HashMap::new(),
+                        &HashMap::new(),
+                        &mut cache,
+                        apply,
+                    );
+                    assert_eq!(receipt.action, "disabled_sensitive_container");
+                    assert!(!doctor_raw_mirror_backfill_receipt_would_mutate(&receipt));
+                    assert!(receipt.source_stat_snapshot.is_none());
+                    assert!(!receipt.raw_source_captured);
+                    assert!(!receipt.raw_mirror_db_linked);
+                    assert!(!receipt.db_projection_only);
+                    let variable = if provider == "shelley" {
+                        "CASS_SHELLEY_DB"
+                    } else {
+                        "CASS_GROK_BOT_DATA_ROOT"
+                    };
+                    assert!(
+                        receipt
+                            .warnings
+                            .iter()
+                            .any(|message| message.contains(variable))
+                    );
+                    let mut report = DoctorRawMirrorBackfillReport::default();
+                    accumulate_doctor_raw_mirror_backfill_receipt(&mut report, receipt);
+                    assert_eq!(report.eligible_live_source_count, 0);
+                    assert_eq!(report.existing_raw_manifest_link_count, 0);
+                    assert_eq!(report.capture_failure_count, 0);
+                }
             }
         }
-        }
-        assert!(cache.is_empty(), "denial must precede source reads and hashing");
+        assert!(
+            cache.is_empty(),
+            "denial must precede source reads and hashing"
+        );
         assert!(!data_dir.exists());
         assert_eq!(std::fs::read(&source_path).unwrap(), bytes);
-        assert_eq!(std::fs::metadata(&source_path).unwrap().modified().unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&source_path).unwrap().modified().unwrap(),
+            before
+        );
         // Ordinary source files remain eligible; do not disable all backfill.
         let control = DoctorRawMirrorBackfillCandidate {
-            conversation_id: 18, provider: "codex".into(),
-            source_path: Some(source_path.display().to_string()), source_id: "local".into(),
-            origin_host: None, origin_kind: Some("local".into()),
-            started_at_ms: None, message_count: 1,
+            conversation_id: 18,
+            provider: "codex".into(),
+            source_path: Some(source_path.display().to_string()),
+            source_id: "local".into(),
+            origin_host: None,
+            origin_kind: Some("local".into()),
+            started_at_ms: None,
+            message_count: 1,
         };
         let receipt = doctor_raw_mirror_backfill_candidate_receipt(
-            &data_dir, &control, &HashMap::new(), &HashMap::new(), &mut cache, false,
+            &data_dir,
+            &control,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut cache,
+            false,
         );
         assert_eq!(receipt.action, "would_capture_live_source");
         assert!(doctor_raw_mirror_backfill_receipt_would_mutate(&receipt));
@@ -84324,6 +84364,7 @@ fn wait_with_progress<T>(
             let phase_str = match phase {
                 1 => "Scanning",
                 2 => "Indexing",
+                indexer::INDEX_PHASE_ANALYTICS_REBUILD => "Rebuilding analytics",
                 _ => "Preparing",
             };
 
@@ -84355,12 +84396,17 @@ fn wait_with_progress<T>(
                         phase_str, rebuild_indicator, scan_progress
                     )
                 }
-            } else if phase == 2 {
+            } else if phase == 2 || phase == indexer::INDEX_PHASE_ANALYTICS_REBUILD {
                 if total > 0 {
                     let pct = (current as f64 / total as f64 * 100.0).min(100.0);
                     format!(
-                        "{}{}: {}/{} conversations ({:.0}%)",
-                        phase_str, rebuild_indicator, current, total, pct
+                        "{}{}: {}/{} {} ({:.0}%)",
+                        phase_str,
+                        rebuild_indicator,
+                        current,
+                        total,
+                        indexer::IndexingProgress::phase_unit_for(phase),
+                        pct
                     )
                 } else {
                     format!("{}{}: Processing...", phase_str, rebuild_indicator)
@@ -84411,6 +84457,9 @@ fn wait_with_progress<T>(
                 match phase {
                     1 => eprintln!("Scanning for agents..."),
                     2 => eprintln!("Indexing conversations..."),
+                    indexer::INDEX_PHASE_ANALYTICS_REBUILD => {
+                        eprintln!("Rebuilding analytics...")
+                    }
                     _ => {}
                 }
                 last_phase = phase;
@@ -84430,7 +84479,10 @@ fn wait_with_progress<T>(
                 last_agents = agents;
             }
 
-            if phase == 2 && current > last_current && current.is_multiple_of(100) {
+            if phase == indexer::INDEX_PHASE_ANALYTICS_REBUILD && current != last_current {
+                eprintln!("  Rebuilt analytics for {current}/{total} messages");
+                last_current = current;
+            } else if phase == 2 && current > last_current && current.is_multiple_of(100) {
                 if total > 0 {
                     eprintln!("  Indexed {}/{} conversations", current, total);
                 } else {
@@ -102429,7 +102481,10 @@ impl IndexShutdownSignals {
         } else {
             Vec::new()
         };
-        Ok(Self { streams, received: None })
+        Ok(Self {
+            streams,
+            received: None,
+        })
     }
 
     fn poll(&mut self, progress: &indexer::IndexingProgress) {
@@ -102509,11 +102564,7 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
         let current = progress.current.load(Ordering::Relaxed);
         let total = progress.total.load(Ordering::Relaxed);
         if phase != last_phase || current != last_current || total != last_total {
-            let phase_str = match phase {
-                1 => "scanning",
-                2 => "indexing",
-                _ => "preparing",
-            };
+            let phase_str = indexer::IndexingProgress::phase_label_for(phase);
             if total > 0 {
                 eprintln!("  {phase_str}: {current}/{total}");
             } else {
@@ -102541,11 +102592,7 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
     if (final_phase != last_phase || final_current != last_current || final_total != last_total)
         && final_total > 0
     {
-        let phase_str = match final_phase {
-            1 => "scanning",
-            2 => "indexing",
-            _ => "preparing",
-        };
+        let phase_str = indexer::IndexingProgress::phase_label_for(final_phase);
         eprintln!("  {phase_str}: {final_current}/{final_total}");
     }
 
@@ -103232,6 +103279,7 @@ impl IndexStallWatchdog {
         // pre-index-IO graces below still lengthen the bound where they apply.
         let abort_eligible = self.abort_all_phases
             || phase_code == indexer::INDEX_PHASE_LEXICAL_INDEXING
+            || phase_code == indexer::INDEX_PHASE_ANALYTICS_REBUILD
             || pre_index_lexical_wedge
             || finalize_wedge;
         // #319/#321: while the indexer signals `finalizing`, the phase-0 /
@@ -103722,6 +103770,54 @@ mod stall_diagnostics_tests {
         assert_eq!(abort["event"], serde_json::json!("stall_aborting"));
         assert_eq!(abort["abort_process"], serde_json::json!(true));
         assert_eq!(abort["exit_code"], serde_json::json!(70));
+        Ok(())
+    }
+
+    #[test]
+    fn gh426_watchdog_bounds_analytics_repair_in_all_index_modes() -> anyhow::Result<()> {
+        use super::{IndexStallAbortPolicy, IndexStallWatchdog};
+        use crate::indexer::{INDEX_PHASE_ANALYTICS_REBUILD, IndexingProgress};
+        use anyhow::Context as _;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let tmp = TempDir::new()?;
+        for (watch, semantic) in [(false, false), (true, false), (false, true)] {
+            let progress = IndexingProgress::default();
+            progress.set_phase_progress(INDEX_PHASE_ANALYTICS_REBUILD, 128, 513);
+            let mut watchdog = IndexStallWatchdog::with_abort_policy(
+                tmp.path().to_path_buf(),
+                Duration::from_millis(50),
+                IndexStallAbortPolicy::AbortLexicalPhases,
+            )
+            .watch_aware(watch)
+            .semantic_aware(semantic);
+            watchdog.abort_all_phases = false;
+            watchdog.threshold = Some(Duration::from_millis(1));
+            watchdog.abort_threshold = Some(Duration::from_millis(2));
+            watchdog.last_phase = INDEX_PHASE_ANALYTICS_REBUILD;
+            watchdog.last_current = 128;
+            watchdog.last_activity = progress.activity.load(Ordering::Relaxed);
+            watchdog.last_progress_advance = std::time::Instant::now() - Duration::from_millis(100);
+
+            let report = watchdog
+                .observe(&progress, 100)
+                .context("analytics stall report")?;
+            assert_eq!(report["event"], "stall_detected");
+            assert_ne!(report["abort_process"], true);
+            let abort = watchdog
+                .observe(&progress, 200)
+                .context("analytics stall bound")?;
+            assert_eq!(abort["event"], "stall_aborting");
+            assert_eq!(abort["exit_code"], 70);
+            assert_eq!(abort["abort_process"], true);
+
+            // Committed work resets the stall even in a phase that can abort;
+            // an active repair is neither idle watch nor an opaque model build.
+            progress.current.store(129, Ordering::Relaxed);
+            assert!(watchdog.observe(&progress, 201).is_none());
+            assert!(watchdog.stall_abort_reported_for_phase.is_none());
+        }
         Ok(())
     }
 
@@ -105249,6 +105345,7 @@ fn run_index_with_data(
                 indexer::INDEX_PHASE_SEMANTIC_HNSW => "Semantic HNSW",
                 indexer::INDEX_PHASE_SEMANTIC_MANIFEST => "Semantic manifest",
                 indexer::INDEX_PHASE_SEMANTIC_FINALIZE => "Semantic finalize",
+                indexer::INDEX_PHASE_ANALYTICS_REBUILD => "Rebuilding analytics",
                 _ => "Preparing",
             };
 
@@ -105591,7 +105688,9 @@ fn run_index_with_data(
             retryable: true,
         }),
     };
-    if res.is_ok() && let Some(code) = shutdown_signals.received {
+    if res.is_ok()
+        && let Some(code) = shutdown_signals.received
+    {
         // The final batch can complete just as the CLI observes a signal.
         // Honor the request without certifying an interrupted invocation as
         // successful merely because the worker won that race.
@@ -110127,7 +110226,7 @@ mod legacy_source_filter_tests {
         );
         assert_eq!(
             stats_workspace_count_sql("", ""),
-            "SELECT c.workspace_id, COUNT(*) FROM conversations c WHERE c.workspace_id IS NOT NULL GROUP BY c.workspace_id ORDER BY COUNT(*) DESC",
+            "SELECT c.workspace_id, COUNT(*) FROM conversations c WHERE c.workspace_id IS NOT NULL GROUP BY c.workspace_id",
             "unfiltered workspace stats can aggregate workspace IDs before path lookup"
         );
 
@@ -110156,6 +110255,123 @@ mod legacy_source_filter_tests {
         assert!(
             workspace_sql.contains(" AND c.workspace_id IS NOT NULL"),
             "source-filtered workspace stats append the non-null guard after the source WHERE; sql={workspace_sql}"
+        );
+    }
+
+    #[test]
+    fn stats_grouping_preserves_sql_results_with_large_unused_payloads() {
+        use crate::franken_sync::compat::{ConnectionExt as _, RowExt as _};
+
+        let tmp = tempfile::tempdir().expect("temporary archive");
+        let path = tmp.path().join("stats.db");
+        let writer = crate::franken_sync::Connection::open(path.to_string_lossy().into_owned())
+            .expect("create archive");
+        writer.execute("CREATE TABLE conversations (id INTEGER PRIMARY KEY, agent_id INTEGER, workspace_id INTEGER, source_id TEXT, origin_host TEXT, payload TEXT)").expect("conversations");
+        writer
+            .execute("CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT)")
+            .expect("sources");
+        writer.execute("INSERT INTO sources VALUES ('local', 'local'), ('remote-a', 'ssh'), ('registered-local', 'local')").expect("source kinds");
+        let payload = "unused archive payload ".repeat(8192);
+        for id in 1..=24_i64 {
+            writer
+                .execute_compat(
+                    "INSERT INTO conversations VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    crate::franken_sync::params![
+                        id,
+                        (id % 4 != 0).then_some(id % 3),
+                        (id % 5 != 0).then_some(id % 12),
+                        match id % 3 {
+                            0 => "local",
+                            1 => "remote-a",
+                            _ => "registered-local",
+                        },
+                        if id % 3 == 1 { Some("remote-a") } else { None },
+                        payload.as_str()
+                    ],
+                )
+                .expect("payload-heavy conversation");
+        }
+        writer.close().expect("publish archive");
+        let conn = open_franken_cli_read_db(path, "stats parity", Duration::from_secs(5))
+            .expect("same reader as stats");
+        for (label, sql, expected_route) in [
+            (
+                "old",
+                format!("{} ORDER BY COUNT(*) DESC", stats_agent_count_sql("", "")),
+                "group_by_fallback",
+            ),
+            (
+                "new",
+                stats_agent_count_sql("", ""),
+                "group_by_storage_substrate",
+            ),
+        ] {
+            let trace_path = tmp.path().join(format!("{label}.log"));
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(
+                    std::fs::File::create(&trace_path).expect("trace file"),
+                ))
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                conn.query(&sql).expect("trace actual grouped execution");
+            });
+            let trace = std::fs::read_to_string(trace_path).expect("read engine trace");
+            assert!(
+                trace.contains(expected_route),
+                "expected {expected_route}: {trace}"
+            );
+            if label == "new" {
+                assert!(
+                    !trace.contains("group_by_fallback"),
+                    "new query must stay on storage grouping: {trace}"
+                );
+            }
+        }
+        for filter in [
+            None,
+            Some(SourceFilter::Local),
+            Some(SourceFilter::Remote),
+            Some(SourceFilter::SourceId("remote-a".to_string())),
+            Some(SourceFilter::SourceId("absent".to_string())),
+        ] {
+            let joined = matches!(filter, Some(SourceFilter::Local | SourceFilter::Remote));
+            let join = if joined {
+                " LEFT JOIN sources s ON s.id = c.source_id"
+            } else {
+                ""
+            };
+            let (condition, param) = source_filter_where_clause_with_columns(
+                filter.as_ref(),
+                "c.source_id",
+                if joined { "s.kind" } else { "NULL" },
+                "c.origin_host",
+            );
+            let params: Vec<crate::franken_sync::compat::ParamValue> =
+                param.as_deref().map(Into::into).into_iter().collect();
+            for sql in [
+                stats_agent_count_sql(join, &condition),
+                stats_workspace_count_sql(join, &condition),
+            ] {
+                let read = |query: &str| -> Vec<(Option<i64>, i64)> {
+                    conn.query_map_collect(query, &params, |row| {
+                        Ok((row.get_typed(0)?, row.get_typed(1)?))
+                    })
+                    .expect("execute real aggregate")
+                };
+                let mut old = read(&format!("{sql} ORDER BY COUNT(*) DESC"));
+                let mut new = read(&sql);
+                sort_stats_counts(&mut old);
+                sort_stats_counts(&mut new);
+                assert_eq!(new, old, "source-filtered aggregate parity: {sql}");
+            }
+        }
+        let mut ties = vec![(Some(3), 2), (None, 2), (Some(1), 2), (Some(9), 3)];
+        sort_stats_counts(&mut ties);
+        assert_eq!(
+            ties,
+            vec![(Some(9), 3), (None, 2), (Some(1), 2), (Some(3), 2)]
         );
     }
 

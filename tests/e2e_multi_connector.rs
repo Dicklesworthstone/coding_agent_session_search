@@ -27,31 +27,67 @@ fn grok_bot_fifo_cli_preserves_evicted_and_new_messages() {
 
     fn encoded_key(key: &str) -> String {
         let alphabet = b"abcdefghijklmnopqrstuvwxyz234567";
-        key.bytes().flat_map(|byte| (0..8).rev().map(move |bit| (byte >> bit) & 1))
-            .collect::<Vec<_>>().chunks(5).map(|chunk| {
-                let value = chunk.iter().fold(0_u8, |value, bit| (value << 1) | *bit) << (5 - chunk.len());
+        key.bytes()
+            .flat_map(|byte| (0..8).rev().map(move |bit| (byte >> bit) & 1))
+            .collect::<Vec<_>>()
+            .chunks(5)
+            .map(|chunk| {
+                let value =
+                    chunk.iter().fold(0_u8, |value, bit| (value << 1) | *bit) << (5 - chunk.len());
                 char::from(alphabet[usize::from(value)])
-            }).collect()
+            })
+            .collect()
     }
     fn command(home: &Path, data: &Path, root: &Path, streaming: &str) -> assert_cmd::Command {
         let mut command = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
-        command.env_clear().env("HOME", home).env("USERPROFILE", home)
-            .env("XDG_CONFIG_HOME", home.join(".config")).env("XDG_DATA_HOME", home.join(".local/share"))
-            .env("CASS_GROK_BOT_DATA_ROOT", root).env("CASS_DATA_DIR", data)
-            .env("CASS_IGNORE_SOURCES_CONFIG", "1").env("CASS_STREAMING_INDEX", streaming)
-            .env("CASS_AUTO_REFRESH", "0").env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-            .env("RUST_MIN_STACK", "134217728").current_dir(home).timeout(Duration::from_secs(180));
-        if let Ok(system_root) = dotenvy::var("SystemRoot") { command.env("SystemRoot", system_root); }
+        command
+            .env_clear()
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("CASS_GROK_BOT_DATA_ROOT", root)
+            .env("CASS_DATA_DIR", data)
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CASS_STREAMING_INDEX", streaming)
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("RUST_MIN_STACK", "134217728")
+            .current_dir(home)
+            .timeout(Duration::from_secs(180));
+        if let Ok(system_root) = dotenvy::var("SystemRoot") {
+            command.env("SystemRoot", system_root);
+        }
         command
     }
     fn search(home: &Path, data: &Path, root: &Path, needle: &str, streaming: &str) -> Value {
-        let output = command(home, data, root, streaming).args([
-            "search", needle, "--agent", "grok_bot", "--mode", "lexical", "--json",
-            "--no-maintenance", "--timeout", "10000",
-        ]).assert().success().get_output().stdout.clone();
+        let output = command(home, data, root, streaming)
+            .args([
+                "search",
+                needle,
+                "--agent",
+                "grok_bot",
+                "--mode",
+                "lexical",
+                "--json",
+                "--no-maintenance",
+                "--timeout",
+                "10000",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
         let result: Value = serde_json::from_slice(&output).unwrap();
-        assert_ne!(result.pointer("/budget/timed_out").and_then(Value::as_bool), Some(true));
-        assert!(result["hits"].is_array(), "search must return verified hits");
+        assert_ne!(
+            result.pointer("/budget/timed_out").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            result["hits"].is_array(),
+            "search must return verified hits"
+        );
         result
     }
     for streaming in ["0", "1"] {
@@ -62,18 +98,22 @@ fn grok_bot_fifo_cli_preserves_evicted_and_new_messages() {
         fs::create_dir_all(&root).unwrap();
         let key = "sand.client.slice.account.auth0%7Cuser_00000000000000000000000000.transcript.replicas.81da155f-cc4c-58b3-aadf-770858d5e55c";
         let path = root.join(format!("{}.blob", encoded_key(key)));
-        let window = |start: u32| json!({"schemaVersion":1,"value":{"entries":
+        let window = |start: u32| {
+            json!({"schemaVersion":1,"value":{"entries":
             (start..start + 200).map(|native| json!({
                 "kind":"send-message","id":format!("entry-{native}"),
                 "message":{"type":"text","content": match native {
                     1 => "groknativeevictedneedle", 201 => "groknativenewtailneedle", _ => "identical timestamp and content",
                 }},"timestampMs":1_767_225_622_759_i64,
                 "secretRequest":{"content":"grokexcludedsecretneedle"},
-            })).collect::<Vec<_>>()}});
+            })).collect::<Vec<_>>()}})
+        };
         fs::write(&path, window(1).to_string()).unwrap();
         let original_source = fs::read(&path).unwrap();
-        command(home, &data, &root, streaming).args(["index", "--full", "--json", "--no-progress-events"])
-            .assert().success();
+        command(home, &data, &root, streaming)
+            .args(["index", "--full", "--json", "--no-progress-events"])
+            .assert()
+            .success();
         assert_eq!(fs::read(&path).unwrap(), original_source);
         let (conversation_id, before) = {
             let storage = FrankenStorage::open_readonly(&data.join("agent_search.db")).unwrap();
@@ -94,7 +134,9 @@ fn grok_bot_fifo_cli_preserves_evicted_and_new_messages() {
         for full in [false, false, true] {
             let mut index = command(home, &data, &root, streaming);
             index.args(["index", "--json", "--no-progress-events"]);
-            if full { index.arg("--full"); }
+            if full {
+                index.arg("--full");
+            }
             index.assert().success();
             assert_eq!(fs::read(&path).unwrap(), rolled_source);
             let storage = FrankenStorage::open_readonly(&data.join("agent_search.db")).unwrap();
@@ -107,15 +149,39 @@ fn grok_bot_fifo_cli_preserves_evicted_and_new_messages() {
             for needle in ["groknativeevictedneedle", "groknativenewtailneedle"] {
                 let result = search(home, &data, &root, needle, streaming);
                 let hits = result["hits"].as_array().unwrap();
-                assert_eq!(hits.len(), 1, "canonical old/new message must remain searchable");
+                assert_eq!(
+                    hits.len(),
+                    1,
+                    "canonical old/new message must remain searchable"
+                );
                 assert_eq!(hits[0]["agent"], "grok_bot");
-                let view = command(home, &data, &root, streaming).args(["view"])
-                    .arg(&path).args(["--conversation-id", &conversation_id.to_string(), "--line", &hits[0]["line_number"].as_u64().unwrap().to_string(), "--json"])
-                    .assert().success().get_output().stdout.clone();
+                let view = command(home, &data, &root, streaming)
+                    .args(["view"])
+                    .arg(&path)
+                    .args([
+                        "--conversation-id",
+                        &conversation_id.to_string(),
+                        "--line",
+                        &hits[0]["line_number"].as_u64().unwrap().to_string(),
+                        "--json",
+                    ])
+                    .assert()
+                    .success()
+                    .get_output()
+                    .stdout
+                    .clone();
                 let value: Value = serde_json::from_slice(&view).unwrap();
-                assert!(value.to_string().contains(needle), "canonical view must retain the searched message");
+                assert!(
+                    value.to_string().contains(needle),
+                    "canonical view must retain the searched message"
+                );
             }
-            assert!(search(home, &data, &root, "grokexcludedsecretneedle", streaming)["hits"].as_array().unwrap().is_empty());
+            assert!(
+                search(home, &data, &root, "grokexcludedsecretneedle", streaming)["hits"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 }

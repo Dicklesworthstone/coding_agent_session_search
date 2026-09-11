@@ -43,10 +43,11 @@ impl Connector for CodexConnector {
         hooks: &mut franken_agent_detection::connectors::SourceScanHooks<'_>,
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
-        self.inner.scan_with_source_boundaries(ctx, hooks, &mut |mut conversation| {
-            augment_modern_codex_messages(&mut conversation, ctx.progress_tick.as_deref());
-            on_conversation(conversation)
-        })
+        self.inner
+            .scan_with_source_boundaries(ctx, hooks, &mut |mut conversation| {
+                augment_modern_codex_messages(&mut conversation, ctx.progress_tick.as_deref());
+                on_conversation(conversation)
+            })
     }
 
     fn detect(&self) -> DetectionResult {

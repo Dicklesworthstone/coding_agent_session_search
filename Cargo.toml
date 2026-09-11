@@ -226,6 +226,7 @@ strict-path-dep-validation = []
 cass-layer-b-conformance = []
 
 [build-dependencies]
+blake3 = "1.8.5"
 vergen = { version = "10.0.0", default-features = false, features = ["build", "cargo"] }
 toml = "1.1.2"
 
