@@ -1062,6 +1062,7 @@ pub(crate) const INDEX_PHASE_SEMANTIC_FINALIZE: usize = 9;
 
 #[derive(Debug, Default)]
 pub struct IndexingProgress {
+    stop_requested: AtomicBool,
     pub total: AtomicUsize,
     pub current: AtomicUsize,
     /// #332: monotonic work-liveness tick. Producer threads bump it once per
@@ -1197,6 +1198,9 @@ pub struct IndexingProgress {
 }
 
 impl IndexingProgress {
+    pub fn request_stop(&self) { self.stop_requested.store(true,Ordering::Release); }
+
+    pub fn stop_requested(&self) -> bool { self.stop_requested.load(Ordering::Acquire) }
     pub(crate) fn phase_label_for(phase: usize) -> &'static str {
         match phase {
             INDEX_PHASE_PREPARING => "preparing",
@@ -12879,6 +12883,7 @@ fn next_streaming_batch(
 }
 
 struct StreamingBatchSender<'a> {
+    retain_final: bool,
     tx: &'a Sender<IndexMessage>,
     flow_limiter: Arc<StreamingByteLimiter>,
     connector_name: &'static str,
@@ -12943,6 +12948,7 @@ fn scan_with_durable_source_boundaries(
     }
     let mut ctx = ctx.clone();
     ctx.since_ts = None;
+    sender.retain_final = true;
     let sender = std::cell::RefCell::new(sender);
     let filtered = std::cell::Cell::new(false);
     let before = std::cell::RefCell::new(None);
@@ -13003,6 +13009,7 @@ impl<'a> StreamingBatchSender<'a> {
         is_discovered: bool,
     ) -> Self {
         Self {
+            retain_final: false,
             tx,
             flow_limiter,
             connector_name,
@@ -13050,6 +13057,11 @@ impl<'a> StreamingBatchSender<'a> {
         // Keep the final conversation until the next push or source-complete
         // event. Even an oversized singleton must share its final transaction
         // with the source observation; the limiter already admits one giant.
+        if !self.retain_final && self.conversations.len() == 1
+            && (self.message_count > DEFAULT_STREAMING_BATCH_LIMITS.max_messages
+                || self.content_bytes > DEFAULT_STREAMING_BATCH_LIMITS.max_chars
+                || self.retained_bytes > DEFAULT_STREAMING_BATCH_LIMITS.max_chars)
+        { self.flush()?; }
 
         Ok(())
     }
@@ -13873,6 +13885,29 @@ fn run_streaming_consumer(
                     "streaming_ingest"
                 );
             }
+            Ok(IndexMessage::SourceComplete { connector_name, conversations, completion, byte_reservation }) => {
+                let count=conversations.len();
+                let messages=conversations.iter().map(|conv|conv.messages.len()).sum::<usize>();
+                let result = persist::persist_conversations_batched_inner(
+                    storage, t_index.as_deref_mut(), &conversations, lexical_strategy,
+                    defer_streaming_checkpoints, false, Some(data_dir),
+                    persist::PersistHeartbeat::new(progress.as_deref(), progress_bump),
+                    (!failed_scan_connectors.contains(connector_name)).then_some(&completion),
+                );
+                drop(conversations);
+                flow_limiter.release(byte_reservation);
+                let outcome=result?;
+                total_conversations+=count; total_messages+=messages;
+                remember_discovered_connector(&mut discovered_names,connector_name);
+                ingest_outcome.canonical_mutations.inserted_conversations+=outcome.inserted_conversations;
+                ingest_outcome.canonical_mutations.inserted_messages+=outcome.inserted_messages;
+                ingest_outcome.lexical_update_deferred |= outcome.lexical_update_deferred;
+                if let Some(progress)=progress {
+                    progress.current.fetch_add(count,Ordering::Relaxed);
+                    progress.tick_activity();
+                }
+                tracing::info!(connector=connector_name,conversations=count,"source_ingest_committed");
+            }
             Ok(IndexMessage::ScanError {
                 connector_name,
                 error,
@@ -14303,6 +14338,21 @@ fn run_batch_index_with_connector_factories(
     scan_start_ts: Option<i64>,
     progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
+    let (boundary, fallback): (Vec<_>,Vec<_>) = connector_factories.into_iter()
+        .partition(|(_,factory)|factory().supports_source_boundaries());
+    if !boundary.is_empty() {
+        let completed = run_streaming_index_with_connector_factories(
+            storage,t_index.as_deref_mut(),opts,since_ts,lexical_strategy,
+            additional_scan_roots.clone(),local_connector_roots.clone(),boundary,
+            scan_start_ts,progress_bump,
+        )?;
+        if fallback.is_empty() { return Ok(completed); }
+        return run_batch_index_with_connector_factories(
+            storage,t_index,opts,since_ts,lexical_strategy,additional_scan_roots,
+            local_connector_roots,fallback,scan_start_ts,progress_bump,
+        ).map(|remaining|completed.accumulate(remaining));
+    }
+    let connector_factories = fallback;
     let scan_start = std::time::Instant::now();
 
     // First pass: Scan all to get counts if we have progress tracker
@@ -31833,6 +31883,7 @@ pub mod persist {
             false,
             None,
             PersistHeartbeat::NONE,
+            None,
         )
     }
 
@@ -31860,6 +31911,7 @@ pub mod persist {
             false,
             Some(data_dir),
             heartbeat,
+            None,
         )
     }
 
@@ -31884,6 +31936,7 @@ pub mod persist {
             true,
             Some(data_dir),
             heartbeat,
+            None,
         )
     }
 
@@ -31926,7 +31979,7 @@ pub mod persist {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn persist_conversations_batched_inner(
+    pub(super) fn persist_conversations_batched_inner(
         storage: &FrankenStorage,
         mut t_index: Option<&mut TantivyIndex>,
         convs: &[NormalizedConversation],
@@ -31935,6 +31988,7 @@ pub mod persist {
         capture_semantic_delta: bool,
         raw_mirror_data_dir: Option<&Path>,
         heartbeat: PersistHeartbeat<'_>,
+        source_completion: Option<&crate::storage::sqlite::SourceIngestLedgerEntry>,
     ) -> Result<PersistBatchOutcome> {
         if convs.is_empty() {
             return Ok(PersistBatchOutcome::default());
@@ -31952,7 +32006,7 @@ pub mod persist {
             );
         }
 
-        let begin_concurrent_enabled = begin_concurrent_writes_enabled();
+        let begin_concurrent_enabled = source_completion.is_none() && begin_concurrent_writes_enabled();
         let duplicate_keys_present =
             begin_concurrent_enabled && duplicate_conversation_keys_present(convs);
 
@@ -32063,7 +32117,10 @@ pub mod persist {
                     // conflict as a fatal exit 7 that discards the run.
                     outcomes.extend(with_concurrent_retry(
                         SERIAL_CHUNK_CONTENTION_RETRIES,
-                        || writer.insert_conversations_batched(chunk_refs),
+                        || match source_completion.filter(|_| end == prepared.len()) {
+                            Some(completion) => writer.insert_conversations_batched_with_source_completion(chunk_refs, completion),
+                            None => writer.insert_conversations_batched(chunk_refs),
+                        },
                     )?);
                     // gh373/oeu5a: each written chunk is live work even while
                     // the batch-level `current` bump waits for the whole
@@ -47154,6 +47211,7 @@ mod tests {
             detected_remote_failure_connector_factory,
             tx,
             StreamingProducerConfig {
+                source_ledger: Arc::new(HashMap::new()),
                 flow_limiter: flow_limiter.clone(),
                 data_dir: data_dir.clone(),
                 additional_scan_roots: vec![ScanRoot::remote(
@@ -47813,6 +47871,7 @@ mod tests {
             disconnect_aware_connector_factory,
             tx,
             StreamingProducerConfig {
+                source_ledger: Arc::new(HashMap::new()),
                 flow_limiter: Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
                 data_dir,
                 additional_scan_roots: vec![ScanRoot::remote(
