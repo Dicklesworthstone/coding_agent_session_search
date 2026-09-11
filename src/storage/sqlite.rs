@@ -12726,6 +12726,8 @@ impl FrankenStorage {
         let mut tx = self.conn.transaction()?;
         profile.tx_open_duration += tx_open_start.elapsed();
 
+        let reconciled_conv = franken_reconcile_native_message_indices(&tx, agent_id, conv)?;
+        let conv = reconciled_conv.as_ref();
         let existing_lookup_start = Instant::now();
         let existing =
             franken_find_existing_conversation_by_key(&tx, &conversation_key, Some(conv))?;
@@ -12775,7 +12777,7 @@ impl FrankenStorage {
             }
 
             let incoming_replay = message_replay_fingerprint(msg);
-            if pending_replay_fingerprints.contains(&incoming_replay) {
+            if conv.agent_slug != "grok_bot" && pending_replay_fingerprints.contains(&incoming_replay) {
                 tracing::debug!(
                     conversation_id = conv_id,
                     idx = msg.idx,
@@ -12907,6 +12909,8 @@ impl FrankenStorage {
         let mut tx = self.conn.transaction()?;
         profile.tx_open_duration += tx_open_start.elapsed();
 
+        let reconciled_conv = franken_reconcile_native_message_indices(&tx, agent_id, conv)?;
+        let conv = reconciled_conv.as_ref();
         let existing_lookup_start = Instant::now();
         let existing = franken_find_existing_conversation_with_tail_by_key(
             &tx,

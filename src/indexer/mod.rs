@@ -13037,10 +13037,6 @@ impl<'a> StreamingBatchSender<'a> {
         }
     }
 
-    fn mark_next_batch_discovered(&mut self) {
-        self.next_batch_is_discovered = true;
-    }
-
     fn push(&mut self, conversation: NormalizedConversation) -> Result<()> {
         let footprint = conversation_batch_footprint(&conversation);
         let would_exceed_limits = !self.conversations.is_empty()
@@ -13684,6 +13680,9 @@ fn run_streaming_consumer(
     // Per-connector stats tracking (T7.4)
     let mut connector_stats: HashMap<String, ConnectorStats> = HashMap::new();
     let mut failed_scan_connectors = BTreeSet::new();
+    let source_commit_limit = dotenvy::var("CASS_INDEX_MAX_SOURCE_COMMITS").ok()
+        .and_then(|value|value.parse::<usize>().ok()).filter(|limit|*limit>0);
+    let mut source_commits = 0usize;
 
     // Card 3 (flat combining, §14.2): when enabled and at least one
     // additional producer is live, we opportunistically drain pending
@@ -13706,7 +13705,7 @@ fn run_streaming_consumer(
     loop {
         if progress.as_ref().is_some_and(|progress|progress.stop_requested()) {
             if let Some(index) = t_index.as_deref_mut() { index.commit()?; }
-            persist::with_ephemeral_writer(storage,false,"checkpointing interrupted indexing",|_|Ok(()))?;
+            best_effort_abort_wal_checkpoint(data_dir);
             return Err(anyhow::Error::new(IndexInterrupted));
         }
         // Drain any deferred messages from a prior combine-drain first, in
@@ -13927,6 +13926,9 @@ fn run_streaming_consumer(
                     progress.tick_activity();
                 }
                 tracing::info!(connector=connector_name,conversations=count,"source_ingest_committed");
+                source_commits+=1;
+                if source_commit_limit.is_some_and(|limit|source_commits>=limit)
+                    && let Some(progress)=progress { progress.request_stop(); }
             }
             Ok(IndexMessage::ScanError {
                 connector_name,
@@ -14216,7 +14218,9 @@ fn run_streaming_index_with_connector_factories(
     // Create bounded channel for backpressure
     let (tx, rx) = bounded::<IndexMessage>(STREAMING_CHANNEL_SIZE);
     let producer_config = StreamingProducerConfig {
-        source_ledger: Arc::new(storage.source_ingest_ledger_entries()?),
+        source_ledger: Arc::new(if matches!(lexical_strategy,LexicalPopulationStrategy::InlineRebuildFromScan) {
+            HashMap::new()
+        } else { storage.source_ingest_ledger_entries()? }),
         flow_limiter: Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
         data_dir: opts.data_dir.clone(),
         additional_scan_roots: additional_scan_roots.clone(),
@@ -30210,6 +30214,15 @@ pub mod persist {
     /// twice; this helper walks once and yields a slice of positional
     /// indices that `TantivyIndex::add_messages_from_packet` can use
     /// directly.
+    fn lexical_packet_for_canonical_outcome(storage: &FrankenStorage, conv: &Conversation, conversation_id: i64) -> Result<ConversationPacket> {
+        if conv.agent_slug == "grok_bot" {
+            let mut canonical = conv.clone();
+            canonical.messages = storage.fetch_messages(conversation_id)?;
+            return Ok(lexical_packet_for_persist(&canonical));
+        }
+        Ok(lexical_packet_for_persist(conv))
+    }
+
     fn lexical_packet_for_persist(conv: &Conversation) -> ConversationPacket {
         // #291 Gap A: the incremental/`--watch` inline ingest path materializes the
         // whole conversation here, so a heavy (image/base64) conversation would
@@ -31480,7 +31493,7 @@ pub mod persist {
             match lexical_strategy {
                 LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild => continue,
                 LexicalPopulationStrategy::InlineRebuildFromScan => {
-                    let packet = lexical_packet_for_persist(internal_conv);
+                    let packet = lexical_packet_for_canonical_outcome(storage,internal_conv,outcome.conversation_id)?;
                     t_index
                         .as_deref_mut()
                         .expect("inline rebuild requires Tantivy writer")
@@ -31493,7 +31506,7 @@ pub mod persist {
                 }
                 LexicalPopulationStrategy::IncrementalInline => {
                     if !outcome.inserted_indices.is_empty() {
-                        let packet = lexical_packet_for_persist(internal_conv);
+                        let packet = lexical_packet_for_canonical_outcome(storage,internal_conv,outcome.conversation_id)?;
                         let positional =
                             positional_indices_for_inserted(&packet, &outcome.inserted_indices);
                         if !positional.is_empty() {
@@ -31801,7 +31814,7 @@ pub mod persist {
         // ibuuh.32 sink migration; equivalence guaranteed by
         // tests::persist_packet_pipeline_matches_legacy_for_incremental_inline.
         if !defer_lexical_updates_enabled() && !inserted_indices.is_empty() {
-            let packet = lexical_packet_for_persist(&internal_conv);
+            let packet = lexical_packet_for_canonical_outcome(storage,&internal_conv,conversation_id)?;
             let positional = positional_indices_for_inserted(&packet, &inserted_indices);
             if !positional.is_empty() {
                 t_index.add_messages_from_packet(
@@ -31853,7 +31866,7 @@ pub mod persist {
 
         if !defer_lexical_updates_enabled() && !inserted_indices.is_empty() {
             let packet_started = Instant::now();
-            let packet = lexical_packet_for_persist(&internal_conv);
+            let packet = lexical_packet_for_canonical_outcome(storage,&internal_conv,conversation_id)?;
             profile.packet_duration += packet_started.elapsed();
 
             let positional_started = Instant::now();
@@ -32173,7 +32186,7 @@ pub mod persist {
                 match lexical_strategy {
                     LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild => continue,
                     LexicalPopulationStrategy::InlineRebuildFromScan => {
-                        let packet = lexical_packet_for_persist(internal_conv);
+                        let packet = lexical_packet_for_canonical_outcome(storage,internal_conv,outcome.conversation_id)?;
                         t_index
                             .as_deref_mut()
                             .expect("inline rebuild requires Tantivy writer")
@@ -32186,7 +32199,7 @@ pub mod persist {
                     }
                     LexicalPopulationStrategy::IncrementalInline => {
                         if !outcome.inserted_indices.is_empty() {
-                            let packet = lexical_packet_for_persist(internal_conv);
+                            let packet = lexical_packet_for_canonical_outcome(storage,internal_conv,outcome.conversation_id)?;
                             let positional =
                                 positional_indices_for_inserted(&packet, &outcome.inserted_indices);
                             if !positional.is_empty() {
