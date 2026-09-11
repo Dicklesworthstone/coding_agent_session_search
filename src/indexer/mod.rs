@@ -12896,6 +12896,105 @@ fn remember_discovered_connector(discovered_names: &mut Vec<String>, connector_n
     }
 }
 
+fn source_ledger_key(source: &DiscoveredSourceFile) -> String {
+    let identity = serde_json::json!([
+        source.provider_slug, source.scan_root, source.source_path,
+        source.origin.source_id, source.origin.kind, source.origin.host
+    ]);
+    format!("source_ingest_v1:{}", blake3::hash(identity.to_string().as_bytes()).to_hex())
+}
+
+fn source_file_observation(path: &Path) -> Option<serde_json::Value> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Some(serde_json::json!({
+            "path":path,"size":metadata.len(),
+            "mtime_ns":metadata.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos().to_string(),
+        })),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound =>
+            Some(serde_json::json!({"path":path,"absent":true})),
+        Err(_) => None,
+    }
+}
+
+fn source_ledger_matches(observation: &str, source: &DiscoveredSourceFile) -> bool {
+    let Ok(saved) = serde_json::from_str::<serde_json::Value>(observation) else { return false; };
+    if saved["primary"] != source_file_observation(&source.source_path).unwrap_or_default() {
+        return false;
+    }
+    let Some(files) = saved["dependencies"].as_array() else { return false; };
+    files.iter().all(|file| file["path"].as_str().is_some_and(|path|
+        source_file_observation(Path::new(path)).as_ref() == Some(file)))
+}
+
+/// Keep only the final bounded batch until the connector certifies a source.
+/// Filtering or a changing reconstruction dependency withholds the marker.
+fn scan_with_durable_source_boundaries(
+    connector: &dyn Connector,
+    ctx: &ScanContext,
+    config: &StreamingProducerConfig,
+    sender: &mut StreamingBatchSender<'_>,
+    mut prepare: impl FnMut(NormalizedConversation) -> Result<Option<NormalizedConversation>>,
+) -> Result<()> {
+    if !connector.supports_source_boundaries() {
+        return connector.scan_with_callback(ctx, &mut |conversation| {
+            if let Some(conversation) = prepare(conversation)? { sender.push(conversation)?; }
+            Ok(())
+        });
+    }
+    let mut ctx = ctx.clone();
+    ctx.since_ts = None;
+    let sender = std::cell::RefCell::new(sender);
+    let filtered = std::cell::Cell::new(false);
+    let before = std::cell::RefCell::new(None);
+    let flush_error = std::cell::RefCell::new(None);
+    let mut should_scan = |source: &DiscoveredSourceFile| {
+        if let Err(error) = sender.borrow_mut().flush() {
+            *flush_error.borrow_mut() = Some(error);
+            return false;
+        }
+        filtered.set(scan_path_exclusions_active());
+        *before.borrow_mut() = source.source_path.parent().and_then(source_file_observation);
+        let skip = !filtered.get() && config.source_ledger.get(&source_ledger_key(source))
+            .is_some_and(|saved| source_ledger_matches(saved,source));
+        tracing::debug!(connector=%source.provider_slug, skipped=skip,"source_ingest_observation");
+        !skip
+    };
+    let mut complete = |completion: &franken_agent_detection::connectors::SourceCompletion| {
+        if filtered.get() || completion.conversations_emitted == 0
+            || completion.source.fs_metadata_changed()
+            || completion.required_sidecars.iter().any(DiscoveredSourceFile::fs_metadata_changed)
+        { return sender.borrow_mut().flush(); }
+        let Some(primary) = source_file_observation(&completion.source.source_path) else {
+            return sender.borrow_mut().flush();
+        };
+        let parent = completion.source.source_path.parent().and_then(source_file_observation);
+        if parent.is_none() || parent != *before.borrow() { return sender.borrow_mut().flush(); }
+        let mut dependencies = vec![parent.expect("checked parent")];
+        for sidecar in &completion.required_sidecars {
+            let Some(observation) = source_file_observation(&sidecar.source_path) else {
+                return sender.borrow_mut().flush();
+            };
+            dependencies.push(observation);
+        }
+        let entry = crate::storage::sqlite::SourceIngestLedgerEntry {
+            key:source_ledger_key(&completion.source),
+            observation:serde_json::json!({"primary":primary,"dependencies":dependencies}).to_string(),
+        };
+        sender.borrow_mut().complete_source(entry)
+    };
+    let mut hooks = franken_agent_detection::connectors::SourceScanHooks {
+        should_scan_source:Some(&mut should_scan), on_source_complete:Some(&mut complete),
+    };
+    connector.scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {
+        match prepare(conversation)? {
+            Some(conversation) => sender.borrow_mut().push(conversation),
+            None => { filtered.set(true); Ok(()) }
+        }
+    })?;
+    if let Some(error) = flush_error.into_inner() { return Err(error); }
+    Ok(())
+}
+
 impl<'a> StreamingBatchSender<'a> {
     fn new(
         tx: &'a Sender<IndexMessage>,
@@ -12948,13 +13047,9 @@ impl<'a> StreamingBatchSender<'a> {
         self.byte_reservation = self.byte_reservation.saturating_add(byte_reservation);
         self.conversations.push(conversation);
 
-        let single_conversation_exceeds_limits = self.conversations.len() == 1
-            && (self.message_count > DEFAULT_STREAMING_BATCH_LIMITS.max_messages
-                || self.content_bytes > DEFAULT_STREAMING_BATCH_LIMITS.max_chars
-                || self.retained_bytes > DEFAULT_STREAMING_BATCH_LIMITS.max_chars);
-        if single_conversation_exceeds_limits {
-            self.flush()?;
-        }
+        // Keep the final conversation until the next push or source-complete
+        // event. Even an oversized singleton must share its final transaction
+        // with the source observation; the limiter already admits one giant.
 
         Ok(())
     }
@@ -12998,6 +13093,21 @@ impl<'a> StreamingBatchSender<'a> {
         self.retained_bytes = 0;
         self.byte_reservation = 0;
         self.next_batch_is_discovered = false;
+        Ok(())
+    }
+
+    fn complete_source(&mut self, completion: crate::storage::sqlite::SourceIngestLedgerEntry) -> Result<()> {
+        if self.conversations.is_empty() { return Ok(()); }
+        let byte_reservation = std::mem::take(&mut self.byte_reservation);
+        let conversations = std::mem::take(&mut self.conversations);
+        self.message_count=0; self.content_bytes=0; self.retained_bytes=0;
+        if let Err(error) = self.tx.send(IndexMessage::SourceComplete {
+            connector_name:self.connector_name, conversations, completion, byte_reservation,
+        }) {
+            drop(error); self.flow_limiter.release(byte_reservation);
+            return Err(anyhow::Error::new(StreamingConsumerDisconnected { connector_name:self.connector_name }));
+        }
+        self.next_batch_is_discovered=false;
         Ok(())
     }
 }
@@ -13216,17 +13326,17 @@ fn spawn_connector_producer(
                     config.active_source_filter.as_ref(),
                 );
             active_source_skipped |= preparse_active_source_skipped;
-            match conn.scan_with_callback(&ctx, &mut |mut conversation| {
+            match scan_with_durable_source_boundaries(conn.as_ref(), &ctx, &config, &mut batch_sender, |mut conversation| {
                 if should_skip_active_session_source(
                     config.active_source_filter.as_ref(),
                     SourceKind::Local,
                     &conversation.source_path,
                 ) {
                     active_source_skipped = true;
-                    return Ok(());
+                    return Ok(None);
                 }
                 if should_skip_subagent(&conversation) {
-                    return Ok(());
+                    return Ok(None);
                 }
                 ingest_diagnostics.observe_conversation(&mut conversation);
                 prepare_conversation_for_ingest(
@@ -13243,7 +13353,7 @@ fn spawn_connector_producer(
                 if let Some(p) = &config.progress {
                     p.tick_activity();
                 }
-                batch_sender.push(conversation)
+                Ok(Some(conversation))
             }) {
                 Ok(()) => {
                     if let Err(error) = batch_sender.flush() {
@@ -13322,17 +13432,17 @@ fn spawn_connector_producer(
                     config.active_source_filter.as_ref(),
                 );
             active_source_skipped |= preparse_active_source_skipped;
-            match conn.scan_with_callback(&ctx, &mut |mut conversation| {
+            match scan_with_durable_source_boundaries(conn.as_ref(), &ctx, &config, &mut batch_sender, |mut conversation| {
                 if should_skip_active_session_source(
                     config.active_source_filter.as_ref(),
                     root.origin.kind,
                     &conversation.source_path,
                 ) {
                     active_source_skipped = true;
-                    return Ok(());
+                    return Ok(None);
                 }
                 if should_skip_subagent(&conversation) {
-                    return Ok(());
+                    return Ok(None);
                 }
                 ingest_diagnostics.observe_conversation(&mut conversation);
                 prepare_conversation_for_ingest(
@@ -13348,7 +13458,6 @@ fn spawn_connector_producer(
                         p.discovered_agents.fetch_add(1, Ordering::Relaxed);
                     }
                     is_discovered = true;
-                    batch_sender.mark_next_batch_discovered();
                 }
 
                 // #332: parsed-conversation liveness tick (see the local-scan
@@ -13356,7 +13465,7 @@ fn spawn_connector_producer(
                 if let Some(p) = &config.progress {
                     p.tick_activity();
                 }
-                batch_sender.push(conversation)
+                Ok(Some(conversation))
             }) {
                 Ok(()) => {
                     if let Err(error) = batch_sender.flush() {
