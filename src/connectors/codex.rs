@@ -33,6 +33,22 @@ impl CodexConnector {
 }
 
 impl Connector for CodexConnector {
+    fn supports_source_boundaries(&self) -> bool {
+        self.inner.supports_source_boundaries()
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut franken_agent_detection::connectors::SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        self.inner.scan_with_source_boundaries(ctx, hooks, &mut |mut conversation| {
+            augment_modern_codex_messages(&mut conversation, ctx.progress_tick.as_deref());
+            on_conversation(conversation)
+        })
+    }
+
     fn detect(&self) -> DetectionResult {
         self.inner.detect()
     }

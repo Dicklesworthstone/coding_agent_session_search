@@ -97,6 +97,19 @@ impl ClaudeCodeConnector {
 }
 
 impl Connector for ClaudeCodeConnector {
+    fn supports_source_boundaries(&self) -> bool {
+        self.inner.supports_source_boundaries()
+    }
+
+    fn scan_with_source_boundaries(
+        &self,
+        ctx: &ScanContext,
+        hooks: &mut franken_agent_detection::connectors::SourceScanHooks<'_>,
+        on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    ) -> Result<()> {
+        self.inner.scan_with_source_boundaries(ctx, hooks, on_conversation)
+    }
+
     fn detect(&self) -> DetectionResult {
         let redirect_roots = claude_env_redirect_roots(
             dotenvy::var("CLAUDE_CONFIG_DIR").ok().as_deref(),
