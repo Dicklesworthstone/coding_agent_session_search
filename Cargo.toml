@@ -152,7 +152,7 @@ bytemuck = "1.25.0"
 #      plus a new engine-version stamp (quill 0.2.4) in every fresh MANIFEST.
 # Revisit when a frankensearch crate release contains both fixes.
 frankensearch = { version = "=0.4.3", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
-franken-agent-detection = { version = "=0.2.4", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes", "devin", "shelley"] }
+franken-agent-detection = { version = "=0.2.4", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes", "devin", "shelley", "grok-bot"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache

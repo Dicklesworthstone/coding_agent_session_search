@@ -156,7 +156,7 @@ fn connector_factories_all_instantiate_and_detect() {
 fn feature_gated_connectors_available() {
     let slugs = factory_fad_slugs();
     for gated in [
-        "chatgpt", "cursor", "opencode", "crush", "goose", "hermes", "devin", "shelley",
+        "chatgpt", "cursor", "opencode", "crush", "goose", "hermes", "devin", "shelley", "grok_bot",
     ] {
         assert!(
             slugs.contains(gated),
@@ -164,7 +164,7 @@ fn feature_gated_connectors_available() {
              Check Cargo.toml enables the feature for franken-agent-detection"
         );
     }
-    assert_eq!(slugs.len(), 30, "Expected 30 connector factories");
+    assert_eq!(slugs.len(), 31, "Expected 31 connector factories");
 }
 
 // ---------------------------------------------------------------------------

@@ -156,6 +156,7 @@ const CONTRACTS: &[DependencyContract] = &[
             "cursor",
             "devin",
             "goose",
+            "grok-bot",
             "hermes",
             "opencode",
             "shelley",
