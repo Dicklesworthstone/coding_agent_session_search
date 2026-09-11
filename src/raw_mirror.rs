@@ -1481,12 +1481,12 @@ pub(crate) fn capture_source_file_with_chunk_policy(
     chunk_threshold_bytes: u64,
     chunk_size_bytes: usize,
 ) -> Result<RawMirrorCaptureRecord> {
-    if input.provider == "shelley" {
-        // Shelley co-locates conversations with credentials and application
-        // configuration. Neither its database nor its WAL/SHM sidecars may
-        // enter the raw mirror, even when an explicit source asks for capture.
+    if matches!(input.provider, "shelley" | "grok_bot") {
+        // These providers co-locate chat with credentials, approval payloads,
+        // or application configuration. The parser's chat allowlist must not
+        // be bypassed by preserving the entire source container.
         // Keep this check before filesystem access and mirror initialization.
-        return Err(anyhow!("disabled_sensitive_container: Shelley source files cannot be raw-mirrored"));
+        return Err(anyhow!("disabled_sensitive_container: {} source files cannot be raw-mirrored", input.provider));
     }
     if chunk_threshold_bytes == 0 {
         return Err(anyhow!(
@@ -3328,6 +3328,33 @@ fn set_private_dir_permissions(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gh447_sensitive_containers_refuse_capture_before_reading_or_creating_mirrors() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("archive");
+        let source = temp.path().join("replica.blob");
+        let bytes = br#"{"schemaVersion":1,"value":{"entries":[{"kind":"secret-request","content":"excluded-secret"}]}}"#;
+        fs::write(&source, bytes).unwrap();
+        let modified = fs::metadata(&source).unwrap().modified().unwrap();
+        for provider in ["grok_bot", "shelley"] {
+            for source_path in [&source, &temp.path().join("missing.blob")] {
+                let result = capture_source_file(RawMirrorCaptureInput {
+                    data_dir: &data_dir, provider, source_id: "local", origin_kind: "local",
+                    origin_host: None, source_path, db_links: &[],
+                });
+                assert!(result.unwrap_err().to_string().starts_with("disabled_sensitive_container:"));
+                assert!(!data_dir.exists(), "denial cannot initialize a raw mirror");
+            }
+        }
+        assert_eq!(fs::read(&source).unwrap(), bytes);
+        assert_eq!(fs::metadata(&source).unwrap().modified().unwrap(), modified);
+        let control = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir, provider: "codex", source_id: "local", origin_kind: "local",
+            origin_host: None, source_path: &source, db_links: &[],
+        }).unwrap();
+        assert!(!control.already_present, "ordinary providers remain capturable");
+    }
 
     #[test]
     fn capture_source_file_writes_doctor_compatible_manifest_idempotently() {

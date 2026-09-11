@@ -49430,10 +49430,14 @@ fn doctor_raw_mirror_backfill_candidate_receipt(
         source_path.as_deref(),
     );
 
-    if provider == "shelley" {
+    if matches!(provider.as_str(), "shelley" | "grok_bot") {
         receipt.action = "disabled_sensitive_container".to_string();
         receipt.warnings.push(
-            "Shelley stores credentials and application settings alongside conversations. Raw mirror capture and linking are disabled; index the original local database directly with CASS_SHELLEY_DB or a local source path.".to_string(),
+            if provider == "shelley" {
+                "Shelley stores credentials and application settings alongside conversations. Raw mirror capture and linking are disabled; index the original local database directly with CASS_SHELLEY_DB or a local source path."
+            } else {
+                "Grok Bot replicas mix chat with secret and approval payloads. Raw mirror capture and linking are disabled; index the original local replica directly with CASS_GROK_BOT_DATA_ROOT."
+            }.to_string(),
         );
         return receipt;
     }
@@ -77944,10 +77948,11 @@ paths = ["~/.claude/projects"]
         std::fs::write(&source_path, bytes).unwrap();
         let before = std::fs::metadata(&source_path).unwrap().modified().unwrap();
         let mut cache = HashMap::new();
+        for provider in ["shelley", "grok_bot"] {
         for origin in ["local", "ssh"] {
             for apply in [false, true] {
                 let candidate = DoctorRawMirrorBackfillCandidate {
-                    conversation_id: 17, provider: "shelley".into(),
+                    conversation_id: 17, provider: provider.into(),
                     source_path: Some(source_path.display().to_string()),
                     source_id: if origin == "local" { "local" } else { "remote" }.into(),
                     origin_host: None, origin_kind: Some(origin.into()),
@@ -77962,13 +77967,15 @@ paths = ["~/.claude/projects"]
                 assert!(!receipt.raw_source_captured);
                 assert!(!receipt.raw_mirror_db_linked);
                 assert!(!receipt.db_projection_only);
-                assert!(receipt.warnings.iter().any(|message| message.contains("CASS_SHELLEY_DB")));
+                let variable = if provider == "shelley" { "CASS_SHELLEY_DB" } else { "CASS_GROK_BOT_DATA_ROOT" };
+                assert!(receipt.warnings.iter().any(|message| message.contains(variable)));
                 let mut report = DoctorRawMirrorBackfillReport::default();
                 accumulate_doctor_raw_mirror_backfill_receipt(&mut report, receipt);
                 assert_eq!(report.eligible_live_source_count, 0);
                 assert_eq!(report.existing_raw_manifest_link_count, 0);
                 assert_eq!(report.capture_failure_count, 0);
             }
+        }
         }
         assert!(cache.is_empty(), "denial must precede source reads and hashing");
         assert!(!data_dir.exists());

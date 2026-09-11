@@ -53,7 +53,7 @@ use crate::connector_ingest_diagnostics::{
     ConnectorIngestDiagnostic, ConnectorIngestReport, ConnectorIngestRun, ProviderIngestSummary,
 };
 use crate::connectors::{
-    Connector, ScanRoot, aider::AiderConnector, amp::AmpConnector,
+    Connector, DiscoveredSourceFile, ScanContext, ScanRoot, aider::AiderConnector, amp::AmpConnector,
     antigravity::AntigravityConnector, chatgpt::ChatGptConnector, claude_code::ClaudeCodeConnector,
     clawdbot::ClawdbotConnector, cline::ClineConnector, codex::CodexConnector,
     copilot::CopilotConnector, copilot_cli::CopilotCliConnector, cursor::CursorConnector,
@@ -27522,6 +27522,7 @@ impl ConnectorKind {
             "kiro" => Some(Self::Kiro),
             "devin" => Some(Self::Devin),
             "shelley" => Some(Self::Shelley),
+            "grok_bot" => Some(Self::GrokBot),
             "openhands" => Some(Self::OpenHands),
             "goose" => Some(Self::Goose),
             "crush" => Some(Self::Crush),
@@ -27558,6 +27559,7 @@ impl ConnectorKind {
             Self::Kiro => "kiro",
             Self::Devin => "devin",
             Self::Shelley => "shelley",
+            Self::GrokBot => "grok_bot",
             Self::OpenHands => "openhands",
             Self::Goose => "goose",
             Self::Crush => "crush",
@@ -27595,6 +27597,7 @@ impl ConnectorKind {
             Self::Kiro => Box::new(franken_agent_detection::KiroConnector::new()),
             Self::Devin => Box::new(franken_agent_detection::DevinConnector::new()),
             Self::Shelley => Box::new(franken_agent_detection::ShelleyConnector::new()),
+            Self::GrokBot => Box::new(franken_agent_detection::GrokBotConnector::new()),
             Self::OpenHands => Box::new(franken_agent_detection::OpenHandsConnector::new()),
             Self::Goose => Box::new(franken_agent_detection::GooseConnector::new()),
             Self::Crush => Box::new(franken_agent_detection::CrushConnector::new()),
@@ -28794,6 +28797,8 @@ enum ConnectorKind {
     Devin,
     #[serde(rename = "sh", alias = "Shelley")]
     Shelley,
+    #[serde(rename = "gb", alias = "GrokBot")]
+    GrokBot,
     #[serde(rename = "oh", alias = "OpenHands")]
     OpenHands,
     #[serde(rename = "gs", alias = "Goose")]
