@@ -8262,7 +8262,7 @@ fn franken_reconcile_native_message_indices<'a>(
     for message in &conv.messages {
         let native_id = grok_bot_native_entry_id(&message.extra_json)?.to_owned();
         let identity = (
-            role_str(&message.role).to_string(),
+            role_str(&message.role),
             message.author.clone(),
             message.created_at,
             message.content.clone(),
@@ -15370,6 +15370,9 @@ impl FrankenStorage {
             && (!completion.key.starts_with("source_ingest_v1:") || completion.key.len() == "source_ingest_v1:".len())
         {
             bail!("source completion ledger key must name a source_ingest_v1 observation");
+        }
+        if conversations.is_empty() && completion.is_some() {
+            bail!("source completion requires a final canonical conversation batch");
         }
         if conversations.is_empty() && completion.is_none() {
             return Ok(Vec::new());
@@ -33042,6 +33045,44 @@ mod tests {
             assert_eq!(saved.len(), 204);
             assert_eq!(serde_json::to_value(&saved[..201]).unwrap(), serde_json::to_value(&after).unwrap());
         }
+    }
+
+    #[test]
+    fn gh426_source_completion_commits_with_canonical_rows_and_rolls_back_on_failure() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ledger.db");
+        let storage = FrankenStorage::open(&path).unwrap();
+        let agent = storage.ensure_agent(&Agent {
+            id: None, slug: "grok_bot".into(), name: "Grok Bot".into(),
+            version: None, kind: AgentKind::Cli,
+        }).unwrap();
+        let completion = SourceIngestLedgerEntry {
+            key: "source_ingest_v1:sample".into(), observation: "verified source observation".into(),
+        };
+        let first = gh447_native_window(1, 2);
+        let mut invalid = gh447_native_window(3, 1);
+        invalid.messages[0].extra_json = serde_json::Value::Null;
+        assert!(storage.insert_conversations_batched_with_source_completion(
+            &[(agent, None, &first), (agent, None, &invalid)], &completion,
+        ).is_err());
+        assert!(storage.source_ingest_ledger_entries().unwrap().is_empty());
+        let messages: i64 = storage.raw().query_row_map("SELECT COUNT(*) FROM messages", fparams![], |row| row.get_typed(0)).unwrap();
+        assert_eq!(messages, 0, "failed final batch must roll back earlier canonical writes");
+        let outcomes = storage.insert_conversations_batched_with_source_completion(&[(agent, None, &first)], &completion).unwrap();
+        assert_eq!(outcomes[0].inserted_indices, vec![0, 1]);
+        drop(storage);
+        let storage = FrankenStorage::open(&path).unwrap();
+        assert_eq!(storage.source_ingest_ledger_entries().unwrap().get(&completion.key), Some(&completion.observation));
+        assert_eq!(storage.fetch_messages(outcomes[0].conversation_id).unwrap().len(), 2);
+        let changed = SourceIngestLedgerEntry { key: completion.key.clone(), observation: "changed observation".into() };
+        assert!(storage.insert_conversations_batched_with_source_completion(&[(agent, None, &invalid)], &changed).is_err());
+        assert_eq!(storage.source_ingest_ledger_entries().unwrap().get(&completion.key), Some(&completion.observation));
+        let empty = SourceIngestLedgerEntry { key: "source_ingest_v1:empty".into(), observation: "verified empty source".into() };
+        assert!(storage.insert_conversations_batched_with_source_completion(&[], &empty).is_err());
+        assert!(!storage.source_ingest_ledger_entries().unwrap().contains_key(&empty.key));
+        let foreign = SourceIngestLedgerEntry { key: "schema_version".into(), observation: "bad".into() };
+        assert!(storage.insert_conversations_batched_with_source_completion(&[], &foreign).is_err());
+        assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
     }
 
     fn gh447_native_window(start: u32, count: u32) -> Conversation {
