@@ -9808,7 +9808,7 @@ fn should_probe_pending_historical_bundles(
 
 fn should_run_targeted_watch_once_only(
     has_watch_once_paths: bool,
-    watch_enabled: bool,
+    _watch_enabled: bool,
     full_rebuild: bool,
     _needs_rebuild: bool,
     _canonical_sessions_before_salvage: usize,
@@ -9823,7 +9823,9 @@ fn should_run_targeted_watch_once_only(
     // one changed session". `needs_rebuild` is true for essentially any change a
     // watch-once exists to ingest, so gating the targeted path on it defeated the
     // feature; the size-based deferral now keeps the run path-bounded.
-    has_watch_once_paths && !watch_enabled && !full_rebuild
+    // watch_sources returns after these explicit paths even with --watch.
+    // Startup must obey the same scope instead of broad-scanning neighbors.
+    has_watch_once_paths && !full_rebuild
 }
 
 fn should_skip_absent_explicit_watch_once_paths(opts: &IndexOptions) -> bool {
@@ -9968,12 +9970,11 @@ fn can_skip_unchanged_explicit_watch_once_index_run(
 
 fn should_skip_broad_scan_after_watch_once_authoritative_repair(
     has_watch_once_paths: bool,
-    watch_enabled: bool,
+    _watch_enabled: bool,
     full_rebuild: bool,
     repaired_from_authoritative_canonical_db: bool,
 ) -> bool {
     has_watch_once_paths
-        && !watch_enabled
         && !full_rebuild
         && repaired_from_authoritative_canonical_db
 }
@@ -12913,11 +12914,12 @@ fn remember_discovered_connector(discovered_names: &mut Vec<String>, connector_n
 }
 
 fn source_ledger_key(source: &DiscoveredSourceFile, ctx: &ScanContext) -> String {
+    let canonical=std::fs::canonicalize(&source.source_path).unwrap_or_else(|_|source.source_path.clone());
     let mappings=ctx.scan_roots.iter().map(|root|serde_json::json!([
         root.path,root.workspace_rewrites
     ])).collect::<Vec<_>>();
     let identity = serde_json::json!([
-        source.provider_slug, source.scan_root, source.source_path,
+        source.provider_slug, source.scan_root, canonical,
         source.origin.source_id, source.origin.kind, source.origin.host,mappings
     ]);
     format!("source_ingest_v1:{}", blake3::hash(identity.to_string().as_bytes()).to_hex())
@@ -12925,10 +12927,22 @@ fn source_ledger_key(source: &DiscoveredSourceFile, ctx: &ScanContext) -> String
 
 fn source_file_observation(path: &Path) -> Option<serde_json::Value> {
     match std::fs::metadata(path) {
-        Ok(metadata) => Some(serde_json::json!({
+        Ok(metadata) => {
+            let observation=serde_json::json!({
             "path":path,"size":metadata.len(),
             "mtime_ns":metadata.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos().to_string(),
-        })),
+            });
+            #[cfg(unix)]
+            let observation = {
+                use std::os::unix::fs::MetadataExt;
+                let mut observation=observation;
+                observation["device"]=serde_json::json!(metadata.dev());
+                observation["inode"]=serde_json::json!(metadata.ino());
+                observation["ctime"]=serde_json::json!([metadata.ctime(),metadata.ctime_nsec()]);
+                observation
+            };
+            Some(observation)
+        },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound =>
             Some(serde_json::json!({"path":path,"absent":true})),
         Err(_) => None,
@@ -12966,6 +12980,10 @@ fn scan_with_durable_source_boundaries(
     let sender = std::cell::RefCell::new(sender);
     let filtered = std::cell::Cell::new(false);
     let before = std::cell::RefCell::new(None);
+    let primary_before = std::cell::RefCell::new(None);
+    let dependencies_before: HashMap<_,_> = connector.discover_source_files(&ctx)?
+        .into_iter().filter_map(|source|source_file_observation(&source.source_path)
+            .map(|observation|(source.source_path,observation))).collect();
     let flush_error = std::cell::RefCell::new(None);
     let mut should_scan = |source: &DiscoveredSourceFile| {
         if config.progress.as_ref().is_some_and(|progress|progress.stop_requested()) { return false; }
@@ -12975,6 +12993,7 @@ fn scan_with_durable_source_boundaries(
         }
         filtered.set(scan_path_exclusions_active());
         *before.borrow_mut() = source.source_path.parent().and_then(source_file_observation);
+        *primary_before.borrow_mut() = source_file_observation(&source.source_path);
         let skip = !filtered.get() && config.source_ledger.get(&source_ledger_key(source,&ctx))
             .is_some_and(|saved| source_ledger_matches(saved,source));
         tracing::debug!(connector=%source.provider_slug, skipped=skip,"source_ingest_observation");
@@ -12988,6 +13007,7 @@ fn scan_with_durable_source_boundaries(
         let Some(primary) = source_file_observation(&completion.source.source_path) else {
             return sender.borrow_mut().flush();
         };
+        if Some(&primary) != primary_before.borrow().as_ref() { return sender.borrow_mut().flush(); }
         let parent = completion.source.source_path.parent().and_then(source_file_observation);
         if parent.is_none() || parent != *before.borrow() { return sender.borrow_mut().flush(); }
         let mut dependencies = vec![parent.expect("checked parent")];
@@ -12995,6 +13015,9 @@ fn scan_with_durable_source_boundaries(
             let Some(observation) = source_file_observation(&sidecar.source_path) else {
                 return sender.borrow_mut().flush();
             };
+            if dependencies_before.get(&sidecar.source_path) != Some(&observation) {
+                return sender.borrow_mut().flush();
+            }
             dependencies.push(observation);
         }
         let entry = crate::storage::sqlite::SourceIngestLedgerEntry {
@@ -13910,24 +13933,20 @@ fn run_streaming_consumer(
             Ok(IndexMessage::SourceComplete { connector_name, conversations, completion, byte_reservation }) => {
                 let count=conversations.len();
                 let messages=conversations.iter().map(|conv|conv.messages.len()).sum::<usize>();
-                let result = persist::persist_conversations_batched_inner(
-                    storage, t_index.as_deref_mut(), &conversations, lexical_strategy,
-                    defer_streaming_checkpoints, false, Some(data_dir),
-                    persist::PersistHeartbeat::new(progress.as_deref(), progress_bump),
+                let result = ingest_batch_detailed_with_source_completion(
+                    storage, t_index.as_deref_mut(), data_dir, &conversations, progress, lexical_strategy,
+                    defer_streaming_checkpoints, progress_bump,
                     (!failed_scan_connectors.contains(connector_name)).then_some(&completion),
                 );
                 drop(conversations);
                 flow_limiter.release(byte_reservation);
-                let outcome=result?;
+                ingest_outcome=ingest_outcome.accumulate(result?);
                 total_conversations+=count; total_messages+=messages;
                 remember_discovered_connector(&mut discovered_names,connector_name);
-                ingest_outcome.canonical_mutations.inserted_conversations+=outcome.inserted_conversations;
-                ingest_outcome.canonical_mutations.inserted_messages+=outcome.inserted_messages;
-                ingest_outcome.lexical_update_deferred |= outcome.lexical_update_deferred;
-                if let Some(progress)=progress {
-                    progress.current.fetch_add(count,Ordering::Relaxed);
-                    progress.tick_activity();
-                }
+                let stats=connector_stats.entry(connector_name.to_string()).or_insert_with(||ConnectorStats {
+                    name:connector_name.to_string(),..Default::default()
+                });
+                stats.conversations+=count; stats.messages+=messages;
                 tracing::info!(connector=connector_name,conversations=count,"source_ingest_committed");
                 source_commits+=1;
                 if source_commit_limit.is_some_and(|limit|source_commits>=limit)
@@ -25038,6 +25057,18 @@ fn ingest_batch_detailed(
     defer_checkpoints: bool,
     progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
+    ingest_batch_detailed_with_source_completion(storage,t_index,data_dir,convs,progress,
+        lexical_strategy,defer_checkpoints,progress_bump,None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ingest_batch_detailed_with_source_completion(
+    storage:&FrankenStorage,t_index:Option<&mut TantivyIndex>,data_dir:&Path,
+    convs:&[NormalizedConversation],progress:&Option<Arc<IndexingProgress>>,
+    lexical_strategy:LexicalPopulationStrategy,defer_checkpoints:bool,
+    progress_bump:Option<&Arc<AtomicI64>>,
+    completion:Option<&crate::storage::sqlite::SourceIngestLedgerEntry>,
+) -> Result<NonWatchIngestOutcome> {
     let trace_span =
         robot_trace_ingest_start("ingest_batch", convs, lexical_strategy, defer_checkpoints);
     // Persistence now uses short-lived writer connections internally so the
@@ -25049,14 +25080,16 @@ fn ingest_batch_detailed(
     // and flag `persist_in_progress` for the watchdog's defense-in-depth
     // grace — one giant conversation legitimately persists for minutes.
     let persist_in_progress = PersistInProgressGuard::engage(progress.as_deref());
-    let batch_result = persist::persist_conversations_batched_with_raw_mirror_links(
+    let batch_result = persist::persist_conversations_batched_inner(
         storage,
         t_index,
-        data_dir,
         convs,
         lexical_strategy,
         defer_checkpoints,
+        false,
+        Some(data_dir),
         persist::PersistHeartbeat::new(progress.as_deref(), progress_bump),
+        completion,
     );
     let batch_outcome = match batch_result {
         Ok(batch_outcome) => batch_outcome,
@@ -27600,7 +27633,7 @@ impl ConnectorKind {
             Self::Kiro => Box::new(franken_agent_detection::KiroConnector::new()),
             Self::Devin => Box::new(franken_agent_detection::DevinConnector::new()),
             Self::Shelley => Box::new(franken_agent_detection::ShelleyConnector::new()),
-            Self::GrokBot => Box::new(franken_agent_detection::GrokBotConnector::new()),
+            Self::GrokBot => Box::new(crate::connectors::grok::GrokBotConnector::new()),
             Self::OpenHands => Box::new(franken_agent_detection::OpenHandsConnector::new()),
             Self::Goose => Box::new(franken_agent_detection::GooseConnector::new()),
             Self::Crush => Box::new(franken_agent_detection::CrushConnector::new()),
@@ -47304,6 +47337,25 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn gh426_source_observation_rejects_same_size_restored_mtime_rewrite() {
+        let temp=TempDir::new().unwrap();let path=temp.path().join("source.jsonl");
+        std::fs::write(&path,b"before").unwrap();
+        let modified=std::fs::metadata(&path).unwrap().modified().unwrap();
+        let source=DiscoveredSourceFile::new("claude_code",&ScanRoot::local(temp.path().to_path_buf()),
+            path.clone(),crate::connectors::DiscoveredSourceRole::PrimarySessionLog,true).with_fs_metadata();
+        let before=source_file_observation(&path).unwrap();
+        let saved=serde_json::json!({"primary":before,"dependencies":[source_file_observation(temp.path()).unwrap()]}).to_string();
+        std::thread::sleep(Duration::from_millis(2));
+        std::fs::write(&path,b"after!").unwrap();
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified)).unwrap();
+        assert!(!source.fs_metadata_changed(),"planted rewrite must evade upstream millisecond/size guard");
+        assert_ne!(source_file_observation(&path).unwrap(),before);
+        assert!(!source_ledger_matches(&saved,&source));
+    }
+
+    #[test]
     fn gh426_source_observation_rejects_changed_primary_sidecar_and_new_dependency() {
         let temp=TempDir::new().unwrap();
         let path=temp.path().join("source.jsonl");
@@ -49356,9 +49408,8 @@ mod tests {
              targeted watch-once to the requested paths (ingesting the changed sessions inline \
              and deferring any broader rebuild), never silently broadened into a full-corpus scan"
         );
-        // Watch mode, full rebuild, and absent explicit paths are never a
-        // targeted path-bounded run (regardless of index health).
-        assert!(!should_run_targeted_watch_once_only(
+        // --watch-once bounds startup even when --watch is also supplied.
+        assert!(should_run_targeted_watch_once_only(
             true, true, false, false, 43_678
         ));
         assert!(!should_run_targeted_watch_once_only(
@@ -49634,7 +49685,7 @@ mod tests {
             should_skip_broad_scan_after_watch_once_authoritative_repair(true, false, false, true)
         );
         assert!(
-            !should_skip_broad_scan_after_watch_once_authoritative_repair(true, true, false, true)
+            should_skip_broad_scan_after_watch_once_authoritative_repair(true, true, false, true)
         );
         assert!(
             !should_skip_broad_scan_after_watch_once_authoritative_repair(true, false, true, true)

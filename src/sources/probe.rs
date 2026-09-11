@@ -208,11 +208,25 @@ fn shell_single_quote_arg(value: &str) -> String {
     format!("'{}'", value.replace('\'', r#"'\''"#))
 }
 
+/// Local discovery does not imply that a mixed application container is safe
+/// to copy to another machine. Also recognize old probe reports whose generic
+/// path classifier called the Grok Bot directory an unknown provider.
+pub(crate) fn remote_probe_source_allowed(agent: &str, path: &str) -> bool {
+    if matches!(agent, "grok_bot" | "grok-bot") {
+        return false;
+    }
+    let path = path.replace('\\', "/");
+    !path.contains("/Library/Application Support/Grok Bot/")
+        && !path.ends_with("/Library/Application Support/Grok Bot")
+}
+
 fn collect_probe_dirs(probe_paths: Vec<(&'static str, Vec<String>)>) -> Vec<String> {
     let mut dir_list = Vec::new();
-    for (_slug, paths) in probe_paths {
+    for (slug, paths) in probe_paths {
         for path in paths {
-            dir_list.push(path);
+            if remote_probe_source_allowed(slug, &path) {
+                dir_list.push(path);
+            }
         }
     }
     dir_list.sort();
@@ -1507,6 +1521,30 @@ CASS_VERSION=0.4.2
         assert!(script.contains("===PROBE_START==="));
         assert!(script.contains("===PROBE_END==="));
         assert!(script.contains("for dir in \"${PROBE_DIRS[@]}\""));
+    }
+
+    #[test]
+    fn gh447_remote_probe_excludes_grok_bot_mixed_container_and_keeps_grok_cli() {
+        let path = "~/Library/Application Support/Grok Bot/sand-client-persistence";
+        let paths = collect_probe_dirs(vec![
+            ("grok_bot", vec![path.into(), "/custom/replica-root".into()]),
+            ("unknown", vec![path.into()]),
+            ("grok", vec!["~/.grok/sessions".into()]),
+            ("codex", vec!["~/.codex/sessions".into()]),
+        ]);
+        assert_eq!(paths, vec!["~/.codex/sessions", "~/.grok/sessions"]);
+        let script = build_probe_script();
+        assert!(!script.contains("Grok Bot"));
+        assert!(script.contains("~/.grok/sessions"));
+        assert!(script.contains("~/.codex/sessions"));
+        // An older/custom probe can still report this directory under the
+        // generic unknown provider. Parse that real wire shape before passing
+        // it to automatic source configuration.
+        let parsed = parse_probe_output("laptop",
+            "===PROBE_START===\nAGENT_DATA=/Users/test/Library/Application Support/Grok Bot/sand-client-persistence|1|200\nAGENT_DATA=/Users/test/.codex/sessions|2|3\n===PROBE_END===", 1);
+        assert_eq!(parsed.detected_agents.len(), 2);
+        let generator = super::super::config::SourceConfigGenerator::new();
+        assert_eq!(generator.generate_source("laptop", &parsed).paths, vec!["/Users/test/.codex/sessions"]);
     }
 
     #[test]

@@ -1231,6 +1231,9 @@ impl SourceConfigGenerator {
         let mut paths = Vec::new();
 
         for agent in &probe.detected_agents {
+            if !super::probe::remote_probe_source_allowed(&agent.agent_type, &agent.path) {
+                continue;
+            }
             // Use the detected path directly
             paths.push(agent.path.clone());
         }
@@ -2634,6 +2637,21 @@ Host production !legacy-prod
         assert_eq!(source.sync_schedule, SyncSchedule::Manual);
         assert!(!source.paths.is_empty());
         assert!(source.paths.contains(&"~/.claude/projects".to_string()));
+    }
+
+    #[test]
+    fn gh447_remote_autoconfig_rejects_sensitive_grok_bot_probe_reports() {
+        let generator = SourceConfigGenerator::new();
+        let report = make_test_probe(true, vec![
+            make_test_agent("grok_bot", "/custom/replica-root"),
+            make_test_agent("grok-bot", "/another/replica-root"),
+            make_test_agent("unknown", "/Users/test/Library/Application Support/Grok Bot/sand-client-persistence"),
+            make_test_agent("grok", "~/.grok/sessions"),
+            make_test_agent("codex", "~/.codex/sessions"),
+        ], Some(make_test_sys_info("darwin", "/Users/test")));
+        let source = generator.generate_source("laptop", &report);
+        assert_eq!(source.paths, vec!["~/.grok/sessions", "~/.codex/sessions"]);
+        assert_eq!(source.source_type, SourceKind::Ssh);
     }
 
     #[test]

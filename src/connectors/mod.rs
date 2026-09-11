@@ -277,6 +277,10 @@ fn pi_agent_connector_factory() -> Box<dyn Connector + Send> {
     Box::new(pi_agent::PiAgentConnector::new())
 }
 
+fn grok_bot_connector_factory() -> Box<dyn Connector + Send> {
+    Box::new(grok::GrokBotConnector::new())
+}
+
 /// Return connector factories with CASS-specific wrappers applied.
 ///
 /// Codex passes through CASS's enrichment wrapper so modern `function_call`
@@ -293,6 +297,7 @@ pub fn get_connector_factories() -> Vec<(&'static str, ConnectorFactory)> {
                 "codex" => codex_connector_factory as ConnectorFactory,
                 "omp" => omp_connector_factory as ConnectorFactory,
                 "pi_agent" => pi_agent_connector_factory as ConnectorFactory,
+                "grok_bot" => grok_bot_connector_factory as ConnectorFactory,
                 _ => factory,
             };
             (name, factory)
