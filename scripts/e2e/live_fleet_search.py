@@ -67,6 +67,15 @@ def json_documents(text):
     return documents
 
 
+def json_document(text):
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as error:
+        # Keep malformed private command output in its existing receipt. An
+        # exception should identify the location without echoing that content.
+        raise ValueError(f"invalid JSON at line {error.lineno}, column {error.colno}") from None
+
+
 class FleetRun:
     def __init__(self, inventory, binary, tailscale=False):
         self.tailscale = tailscale
@@ -76,7 +85,7 @@ class FleetRun:
             raise ValueError("inventory must be outside the repository")
         if inventory.stat().st_mode & 0o077:
             raise ValueError("inventory must have private permissions (0600)")
-        self.inventory = json.loads(inventory.read_text())
+        self.inventory = json_document(inventory.read_text())
         self.hosts = self.inventory["hosts"]
         if not self.hosts or len({h["ssh"] for h in self.hosts}) != len(self.hosts):
             raise ValueError("inventory must contain distinct hosts")
@@ -147,7 +156,7 @@ class FleetRun:
         request = {"phase": "initial", "session": self.token + label, "marker": self.token + " " + label}
         try:
             output = self.remote(label + "-seed", host, request)
-            return {"label": label, "host": host, "request": request, **json.loads(output)}
+            return {"label": label, "host": host, "request": request, **json_document(output)}
         except (RuntimeError, ValueError, OSError) as error:
             return {"label": label, "failed": type(error).__name__}
 
@@ -169,12 +178,12 @@ class FleetRun:
 
     def sync(self, label, expected_exit=0):
         # --json promises one document, including the nested indexing result.
-        result = json.loads(self.cass(label, ["sources", "sync", "--all", "--json"],
+        result = json_document(self.cass(label, ["sources", "sync", "--all", "--json"],
                                       timeout=600, expected_exit=expected_exit))
         expected_status = {0: "complete", 7: "index_failed", 8: "partial"}[expected_exit]
         assert result["status"] == expected_status, "sync status disagrees with exit"
         if result["total_files"] and not expected_exit:
-            assert result["indexing"]["success"] is True, "sync omitted completed indexing"
+            assert result["indexing"]["success"] is True, "sync omitted completed indexing"  # ubs:ignore — require the JSON boolean; integer 1 is not success.
         return result
 
     def verify(self, phase, expected_per_host):
@@ -194,10 +203,10 @@ class FleetRun:
             assert all(h["source_id"] == label and h.get("origin_host") == host["target"] and host["request"]["marker"] in h["content"] for h in selected), "source provenance mismatch"
             scoped_identities.update((h["source_id"], h["source_path"], h["line_number"]) for h in selected)
             scoped_evidence.update(evidence(hit) for hit in selected)
-        assert scoped_identities == identities, "global search disagrees with source-scoped results"
-        assert scoped_evidence == global_evidence, "global search changed content or provenance"
-        assert not self.search(phase + "-local-negative", self.token, "local"), "remote sessions leaked into local scope"
-        assert not self.search(phase + "-missing-negative", self.token, "nonexistent-source"), "unknown source broadened query"
+        assert scoped_identities == identities, "global search disagrees with source-scoped results"  # ubs:ignore — acceptance assertion; main rejects optimized Python before any workflow.
+        assert scoped_evidence == global_evidence, "global search changed content or provenance"  # ubs:ignore — acceptance assertion; main rejects optimized Python before any workflow.
+        assert not self.search(phase + "-local-negative", self.token, "local"), "remote sessions leaked into local scope"  # ubs:ignore — acceptance assertion; main rejects optimized Python before any workflow.
+        assert not self.search(phase + "-missing-negative", self.token, "nonexistent-source"), "unknown source broadened query"  # ubs:ignore — acceptance assertion; main rejects optimized Python before any workflow.
         hybrid = self.search(phase + "-default-hybrid", self.token, mode=None)
         assert {(h["source_id"], h["source_path"], h["line_number"]) for h in hybrid} == identities, "default hybrid lost fleet evidence"
         assert {evidence(hit) for hit in hybrid} == global_evidence, "default hybrid changed content or provenance"
@@ -208,13 +217,13 @@ class FleetRun:
         discovery_args = ["sources", "discover", "--json"]
         if self.tailscale:
             discovery_args.append("--tailscale")
-        discovery = json.loads(self.cass("discovery", discovery_args))
+        discovery = json_document(self.cass("discovery", discovery_args))
         if self.tailscale:
             assert not discovery.get("discovery_warning"), "Tailscale discovery unavailable"
         aliases = {host["name"] for host in discovery.get("hosts", [])}
         assert all(host["ssh"].rsplit("@", 1)[-1] in aliases for host in self.hosts), "SSH discovery omitted an inventory alias"
         if self.tailscale:
-            baseline = json.loads(self.cass("ssh-only-discovery", ["sources", "discover", "--json"]))
+            baseline = json_document(self.cass("ssh-only-discovery", ["sources", "discover", "--json"]))
             configured = {host["name"] for host in baseline.get("hosts", [])}
             assert any(host["ssh"].rsplit("@", 1)[-1] not in configured for host in self.hosts), "no inventory target required Tailscale discovery"
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
@@ -251,7 +260,7 @@ class FleetRun:
             busy = self.sync("index-busy-sync", expected_exit=7)
             assert busy["indexing"].get("error"), "missing indexing failure detail"
             assert self.verify("index-busy", 2) == initial, "failed ingest changed canonical evidence"
-        recovered = json.loads(self.cass("mirror-reingest", ["sources", "reingest", "--from-mirror", "--json"], timeout=600))
+        recovered = json_document(self.cass("mirror-reingest", ["sources", "reingest", "--from-mirror", "--json"], timeout=600))
         assert recovered["status"] == "complete" and recovered["indexing"]["success"], "mirror recovery did not complete"
         self.verify("mirror-recovered", 3)
         for host in self.ready:
