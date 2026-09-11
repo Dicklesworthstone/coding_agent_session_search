@@ -105532,6 +105532,15 @@ fn run_index_with_data(
     let mut active_index_error = None::<ActiveIndexRunDetails>;
     let mut res = match index_handle.join() {
         Ok(result) => result.map_err(|e| {
+            if e.downcast_ref::<indexer::IndexInterrupted>().is_some() {
+                return CliError {
+                    code: shutdown_signals.received.unwrap_or(130),
+                    kind: CliErrorKind::Index.kind_str(),
+                    message: "index interrupted after finishing the in-flight batch".into(),
+                    hint: Some("Rerun the same index command to resume from committed source observations.".into()),
+                    retryable: true,
+                };
+            }
             let chain = e
                 .chain()
                 .map(std::string::ToString::to_string)
@@ -105575,6 +105584,18 @@ fn run_index_with_data(
             retryable: true,
         }),
     };
+    if res.is_ok() && let Some(code) = shutdown_signals.received {
+        // The final batch can complete just as the CLI observes a signal.
+        // Honor the request without certifying an interrupted invocation as
+        // successful merely because the worker won that race.
+        res = Err(CliError {
+            code,
+            kind: CliErrorKind::Index.kind_str(),
+            message: "index completed its current work after a stop was requested".into(),
+            hint: Some("Rerun the same index command to confirm completion.".into()),
+            retryable: true,
+        });
+    }
     if let Some(previous) = previous_robot_trace_ingest {
         let _ = indexer::set_robot_trace_ingest_enabled(previous);
     }
