@@ -1062,7 +1062,7 @@ pub(crate) const INDEX_PHASE_SEMANTIC_FINALIZE: usize = 9;
 
 #[derive(Debug, Default)]
 pub struct IndexingProgress {
-    stop_requested: AtomicBool,
+    pub stop_requested: AtomicBool,
     pub total: AtomicUsize,
     pub current: AtomicUsize,
     /// #332: monotonic work-liveness tick. Producer threads bump it once per
@@ -1196,6 +1196,17 @@ pub struct IndexingProgress {
     /// Conservative observed amplification used by staged shard admission.
     pub rebuild_pipeline_staged_shard_build_observed_amplification_milli: Mutex<Option<u64>>,
 }
+
+#[derive(Debug)]
+pub struct IndexInterrupted;
+
+impl std::fmt::Display for IndexInterrupted {
+    fn fmt(&self, f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
+        f.write_str("indexing interrupted after committed batch; resume with cass index")
+    }
+}
+
+impl std::error::Error for IndexInterrupted {}
 
 impl IndexingProgress {
     pub fn request_stop(&self) { self.stop_requested.store(true,Ordering::Release); }
@@ -12954,6 +12965,7 @@ fn scan_with_durable_source_boundaries(
     let before = std::cell::RefCell::new(None);
     let flush_error = std::cell::RefCell::new(None);
     let mut should_scan = |source: &DiscoveredSourceFile| {
+        if config.progress.as_ref().is_some_and(|progress|progress.stop_requested()) { return false; }
         if let Err(error) = sender.borrow_mut().flush() {
             *flush_error.borrow_mut() = Some(error);
             return false;
@@ -12992,6 +13004,9 @@ fn scan_with_durable_source_boundaries(
         should_scan_source:Some(&mut should_scan), on_source_complete:Some(&mut complete),
     };
     connector.scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {
+        if config.progress.as_ref().is_some_and(|progress|progress.stop_requested()) {
+            anyhow::bail!("indexing interrupted at source boundary");
+        }
         match prepare(conversation)? {
             Some(conversation) => sender.borrow_mut().push(conversation),
             None => { filtered.set(true); Ok(()) }
@@ -13689,6 +13704,11 @@ fn run_streaming_consumer(
     let mut deferred_non_batch: VecDeque<IndexMessage> = VecDeque::new();
 
     loop {
+        if progress.as_ref().is_some_and(|progress|progress.stop_requested()) {
+            if let Some(index) = t_index.as_deref_mut() { index.commit()?; }
+            persist::with_ephemeral_writer(storage,false,"checkpointing interrupted indexing",|_|Ok(()))?;
+            return Err(anyhow::Error::new(IndexInterrupted));
+        }
         // Drain any deferred messages from a prior combine-drain first, in
         // the exact order they arrived on the channel. This preserves the
         // invariant that every message is handled exactly once, in order,
