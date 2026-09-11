@@ -1481,6 +1481,13 @@ pub(crate) fn capture_source_file_with_chunk_policy(
     chunk_threshold_bytes: u64,
     chunk_size_bytes: usize,
 ) -> Result<RawMirrorCaptureRecord> {
+    if input.provider == "shelley" {
+        // Shelley co-locates conversations with credentials and application
+        // configuration. Neither its database nor its WAL/SHM sidecars may
+        // enter the raw mirror, even when an explicit source asks for capture.
+        // Keep this check before filesystem access and mirror initialization.
+        return Err(anyhow!("disabled_sensitive_container: Shelley source files cannot be raw-mirrored"));
+    }
     if chunk_threshold_bytes == 0 {
         return Err(anyhow!(
             "raw mirror chunk threshold must be greater than zero"

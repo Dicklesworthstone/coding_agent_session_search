@@ -113,6 +113,11 @@ impl Connection {
         &self.inner
     }
 
+    /// Descriptor-bound identity, distinct from a possibly replaced pathname.
+    pub fn file_identity(&self) -> Result<Option<FileIdentity>, FrankenError> {
+        drive(self.inner.file_identity())
+    }
+
     /// Execute a single SQL statement, returning the affected row count.
     pub fn execute(&self, sql: &str) -> Result<usize, FrankenError> {
         drive(self.inner.execute(sql))

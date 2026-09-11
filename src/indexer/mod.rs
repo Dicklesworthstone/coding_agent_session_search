@@ -305,13 +305,22 @@ fn conversation_source_is_subagent(source_path: &Path) -> bool {
 /// subagent-class transcripts before they are ingested, so they never enter the
 /// canonical DB / lexical index / raw-mirror and never trigger the OOM→quarantine
 /// path. Applied at every connector scan callback.
-fn should_skip_subagent_source(source_path: &Path) -> bool {
-    skip_subagents_active() && conversation_source_is_subagent(source_path)
+fn conversation_is_subagent(conversation: &NormalizedConversation) -> bool {
+    conversation_source_is_subagent(&conversation.source_path)
+        || (conversation.agent_slug == "shelley"
+            && conversation.metadata["source"] == "shelley"
+            && conversation.metadata.pointer("/shelley/parent_conversation_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|parent| !parent.trim().is_empty()))
+}
+
+fn should_skip_subagent(conversation: &NormalizedConversation) -> bool {
+    skip_subagents_active() && conversation_is_subagent(conversation)
 }
 
 #[cfg(test)]
 mod subagent_skip_tests {
-    use super::conversation_source_is_subagent;
+    use super::{NormalizedConversation, conversation_is_subagent, conversation_source_is_subagent};
     use std::path::Path;
 
     #[test]
@@ -332,6 +341,27 @@ mod subagent_skip_tests {
         assert!(!conversation_source_is_subagent(Path::new(
             "/home/u/subagents/archive/session.jsonl"
         )));
+    }
+
+    #[test]
+    fn gh415_shelley_subagent_requires_authoritative_parent_metadata() {
+        let mut conversation = NormalizedConversation {
+            agent_slug: "shelley".into(), external_id: Some("child".into()),
+            title: None, workspace: None, source_path: "/source/sessions.sqlite3".into(),
+            started_at: None, ended_at: None, messages: Vec::new(),
+            metadata: serde_json::json!({"source":"shelley", "shelley":{"parent_conversation_id":"parent"}}),
+        };
+        assert!(conversation_is_subagent(&conversation));
+        for parent in [serde_json::Value::Null, serde_json::json!(""), serde_json::json!("  "), serde_json::json!(123)] {
+            conversation.metadata["shelley"]["parent_conversation_id"] = parent;
+            assert!(!conversation_is_subagent(&conversation));
+        }
+        conversation.metadata["shelley"]["parent_conversation_id"] = serde_json::json!("parent");
+        conversation.metadata["source"] = serde_json::json!("other");
+        assert!(!conversation_is_subagent(&conversation));
+        conversation.metadata["source"] = serde_json::json!("shelley");
+        conversation.agent_slug = "codex".into();
+        assert!(!conversation_is_subagent(&conversation));
     }
 }
 
@@ -13186,7 +13216,7 @@ fn spawn_connector_producer(
                     active_source_skipped = true;
                     return Ok(());
                 }
-                if should_skip_subagent_source(&conversation.source_path) {
+                if should_skip_subagent(&conversation) {
                     return Ok(());
                 }
                 ingest_diagnostics.observe_conversation(&mut conversation);
@@ -13292,7 +13322,7 @@ fn spawn_connector_producer(
                     active_source_skipped = true;
                     return Ok(());
                 }
-                if should_skip_subagent_source(&conversation.source_path) {
+                if should_skip_subagent(&conversation) {
                     return Ok(());
                 }
                 ingest_diagnostics.observe_conversation(&mut conversation);
@@ -13771,8 +13801,9 @@ fn run_streaming_consumer(
                     remember_discovered_connector(&mut discovered_names, connector_name);
                 }
                 if is_discovered && effective_scan_succeeded {
-                    let connector_watermark_safe =
-                        !scan_path_exclusions_active() && !active_source_skipped;
+                    let connector_watermark_safe = scan_start_ts.is_some()
+                        && !scan_path_exclusions_active()
+                        && !active_source_skipped;
                     if connector_watermark_safe {
                         ingest_outcome
                             .scanned_connectors
@@ -13893,7 +13924,7 @@ fn run_streaming_index(
     lexical_strategy: LexicalPopulationStrategy,
     additional_scan_roots: Vec<ScanRoot>,
     local_connector_roots: LocalConnectorRootsOverride,
-    scan_start_ts: i64,
+    scan_start_ts: Option<i64>,
     progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
     run_streaming_index_with_connector_factories(
@@ -13963,7 +13994,7 @@ fn run_streaming_index_with_connector_factories(
     additional_scan_roots: Vec<ScanRoot>,
     local_connector_roots: LocalConnectorRootsOverride,
     connector_factories: Vec<(&'static str, ConnectorFactory)>,
-    scan_start_ts: i64,
+    scan_start_ts: Option<i64>,
     progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
     if connector_factories.is_empty() {
@@ -14052,7 +14083,7 @@ fn run_streaming_index_with_connector_factories(
         producer_config.flow_limiter.clone(),
         &opts.progress,
         lexical_strategy,
-        Some(scan_start_ts),
+        scan_start_ts,
         progress_bump,
     );
 
@@ -14123,7 +14154,7 @@ fn run_batch_index(
     lexical_strategy: LexicalPopulationStrategy,
     additional_scan_roots: Vec<ScanRoot>,
     local_connector_roots: LocalConnectorRootsOverride,
-    scan_start_ts: i64,
+    scan_start_ts: Option<i64>,
     progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
     run_batch_index_with_connector_factories(
@@ -14150,7 +14181,7 @@ fn run_batch_index_with_connector_factories(
     additional_scan_roots: Vec<ScanRoot>,
     local_connector_roots: LocalConnectorRootsOverride,
     connector_factories: Vec<(&'static str, ConnectorFactory)>,
-    scan_start_ts: i64,
+    scan_start_ts: Option<i64>,
     progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
     let scan_start = std::time::Instant::now();
@@ -14296,6 +14327,7 @@ fn run_batch_index_with_connector_factories(
                             });
                             active_source_skipped |=
                                 local_convs.len() < conversations_before_active_filter;
+                            local_convs.retain(|conv| !should_skip_subagent(conv));
                             for conversation in &mut local_convs {
                                 ingest_diagnostics.observe_conversation(conversation);
                             }
@@ -14369,6 +14401,7 @@ fn run_batch_index_with_connector_factories(
                                 });
                                 active_source_skipped |=
                                     remote_convs.len() < conversations_before_active_filter;
+                                remote_convs.retain(|conv| !should_skip_subagent(conv));
                                 for conversation in &mut remote_convs {
                                     ingest_diagnostics.observe_conversation(conversation);
                                 }
@@ -14521,7 +14554,7 @@ fn run_batch_index_with_connector_factories(
             && persistence_completed
             && !pending.active_source_skipped
             && !scan_path_exclusions_active();
-        if connector_watermark_safe {
+        if connector_watermark_safe && let Some(scan_start_ts) = scan_start_ts {
             scanned_connectors.insert(pending.name.to_string());
             if let Err(error) = persist::with_ephemeral_writer(
                 storage,
@@ -14663,7 +14696,18 @@ pub fn run_index(
     opts: IndexOptions,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
 ) -> Result<()> {
-    run_index_inner(opts, event_channel, None)
+    run_index_inner(opts, event_channel, None, None)
+}
+
+/// Re-read only the selected remote mirrors, without advancing local scan
+/// watermarks or treating unchanged mirror metadata as proof of ingestion.
+pub fn run_index_for_mirror_sources(opts: IndexOptions, source_ids: Vec<String>) -> Result<()> {
+    anyhow::ensure!(!source_ids.is_empty(), "mirror reingest requires a source");
+    anyhow::ensure!(
+        !opts.watch && opts.watch_once_paths.is_none() && !opts.force_rebuild,
+        "mirror reingest cannot run a watch or canonical-only rebuild"
+    );
+    run_index_inner(opts, None, Some(Arc::new(HashMap::new())), Some(source_ids))
 }
 
 /// qu81y class-B injection seam: run one index pass with the connectors'
@@ -14679,7 +14723,12 @@ pub fn run_index_with_local_connector_roots(
     local_connector_roots: HashMap<String, Vec<PathBuf>>,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
 ) -> Result<()> {
-    run_index_inner(opts, event_channel, Some(Arc::new(local_connector_roots)))
+    run_index_inner(
+        opts,
+        event_channel,
+        Some(Arc::new(local_connector_roots)),
+        None,
+    )
 }
 
 /// Per-connector local scan roots override (qu81y): `Some(map)` means a
@@ -14698,6 +14747,7 @@ fn run_index_inner(
     opts: IndexOptions,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
     local_connector_roots: LocalConnectorRootsOverride,
+    mirror_source_ids: Option<Vec<String>>,
 ) -> Result<()> {
     ACTIVE_SESSION_SOURCE_SKIP_OBSERVED.store(false, Ordering::Relaxed);
     let _progress_reset = RunIndexProgressReset::new(opts.progress.clone());
@@ -15313,8 +15363,9 @@ fn run_index_inner(
     preflight_phase!("watch_startup:probe_lexical_checkpoint");
     let mut initial_matching_lexical_checkpoint = MatchingLexicalRebuildStateStatus::default();
     let mut restart_pending_lexical_rebuild_from_zero = false;
-    let resume_lexical_rebuild = if opts.force_rebuild {
-        // force_rebuild always starts from scratch; never resume a stale checkpoint.
+    let resume_lexical_rebuild = if opts.force_rebuild || mirror_source_ids.is_some() {
+        // A mirror-only request must reach its selected scan, rather than
+        // returning after resuming a pre-existing canonical lexical rebuild.
         false
     } else if initial_canonical_sessions_before_salvage > 0 {
         if let Some(status) = nonresumable_pending_lexical_rebuild_status_without_fingerprint(
@@ -15666,13 +15717,14 @@ fn run_index_inner(
         // automatic path for explicit full/rebuilt/empty recovery, and expose
         // the old populated-incremental discovery behavior behind
         // CASS_PREFLIGHT_HISTORICAL_SALVAGE_DISCOVERY=1.
-        let probe_pending_historical_bundles = should_probe_pending_historical_bundles(
-            opts.full,
-            canonical_storage_rebuilt,
-            canonical_sessions_before_salvage,
-            canonical_only_full_rebuild,
-            preflight_historical_salvage_discovery_enabled(),
-        );
+        let probe_pending_historical_bundles = mirror_source_ids.is_none()
+            && should_probe_pending_historical_bundles(
+                opts.full,
+                canonical_storage_rebuilt,
+                canonical_sessions_before_salvage,
+                canonical_only_full_rebuild,
+                preflight_historical_salvage_discovery_enabled(),
+            );
         let mut has_pending_historical_bundles = if probe_pending_historical_bundles {
             storage.has_pending_historical_bundles(&opts.db_path)?
         } else {
@@ -15694,7 +15746,8 @@ fn run_index_inner(
             canonical_sessions_before_salvage,
         );
         targeted_watch_once_only_run = targeted_watch_once_only;
-        let should_salvage_historical = !targeted_watch_once_only
+        let should_salvage_historical = mirror_source_ids.is_none()
+            && !targeted_watch_once_only
             && should_salvage_historical_databases(
                 canonical_storage_rebuilt,
                 canonical_sessions_before_salvage,
@@ -16108,7 +16161,15 @@ fn run_index_inner(
                 // qu81y closed-world override: sources.toml resolution is
                 // HOME/XDG-scoped, so an env-free run must not consult it —
                 // the override map is the complete scan universe.
-                let additional_scan_roots = if local_connector_roots.is_some() {
+                let additional_scan_roots = if let Some(source_ids) = &mirror_source_ids {
+                    additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir)
+                        .into_iter()
+                        .filter(|root| {
+                            root.origin.kind.is_remote()
+                                && source_ids.contains(&root.origin.source_id)
+                        })
+                        .collect()
+                } else if local_connector_roots.is_some() {
                     Vec::new()
                 } else {
                     additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir)
@@ -16118,7 +16179,12 @@ fn run_index_inner(
                 // be fully re-scanned every run), and capture fingerprints to
                 // persist for the roots we still scan.
                 let (additional_scan_roots, mirror_fingerprints_to_store) =
-                    plan_remote_mirror_scan_skips(&storage, &opts, additional_scan_roots);
+                    if mirror_source_ids.is_some() {
+                        (additional_scan_roots, Vec::new())
+                    } else {
+                        plan_remote_mirror_scan_skips(&storage, &opts, additional_scan_roots)
+                    };
+                let scan_watermark = mirror_source_ids.is_none().then_some(scan_start_ts);
                 let scan_requires_tantivy =
                     lexical_population_strategy_requires_inline_tantivy(lexical_strategy);
 
@@ -16146,7 +16212,7 @@ fn run_index_inner(
                         lexical_strategy,
                         additional_scan_roots.clone(),
                         local_connector_roots.clone(),
-                        scan_start_ts,
+                        scan_watermark,
                         Some(&progress_bump),
                     )?;
                     // F4 (cass tech debt): a completed scan is a real
@@ -16174,7 +16240,7 @@ fn run_index_inner(
                         lexical_strategy,
                         additional_scan_roots.clone(),
                         local_connector_roots.clone(),
-                        scan_start_ts,
+                        scan_watermark,
                         Some(&progress_bump),
                     )?;
                     bump_index_run_lock_progress_atomic(&progress_bump);
@@ -16817,13 +16883,15 @@ fn run_index_inner(
     } else {
         let now_ms = FrankenStorage::now_millis();
         let preserve_scan_watermark = scan_watermark_preservation_active();
-        let performed_scan_for_global_watermark =
-            performed_scan && !preserve_scan_watermark && !scan_had_errors;
+        let performed_scan_for_global_watermark = performed_scan
+            && mirror_source_ids.is_none()
+            && !preserve_scan_watermark
+            && !scan_had_errors;
         // `scanned_connectors` already excludes the exact connector that
         // skipped an active source (and excludes every connector when path
         // exclusions are configured). Persist the remaining safe connector
         // watermarks even when one unrelated connector must stay behind.
-        let performed_scan_for_connector_watermarks = performed_scan;
+        let performed_scan_for_connector_watermarks = performed_scan && mirror_source_ids.is_none();
         if performed_scan && preserve_scan_watermark {
             tracing::info!(
                 db_path = %opts.db_path.display(),
@@ -27260,6 +27328,7 @@ impl ConnectorKind {
             "prime_agent" => Some(Self::PrimeAgent),
             "kiro" => Some(Self::Kiro),
             "devin" => Some(Self::Devin),
+            "shelley" => Some(Self::Shelley),
             "openhands" => Some(Self::OpenHands),
             "goose" => Some(Self::Goose),
             "crush" => Some(Self::Crush),
@@ -27295,6 +27364,7 @@ impl ConnectorKind {
             Self::PrimeAgent => "prime_agent",
             Self::Kiro => "kiro",
             Self::Devin => "devin",
+            Self::Shelley => "shelley",
             Self::OpenHands => "openhands",
             Self::Goose => "goose",
             Self::Crush => "crush",
@@ -27331,6 +27401,7 @@ impl ConnectorKind {
             Self::PrimeAgent => Box::new(franken_agent_detection::PrimeAgentConnector::new()),
             Self::Kiro => Box::new(franken_agent_detection::KiroConnector::new()),
             Self::Devin => Box::new(franken_agent_detection::DevinConnector::new()),
+            Self::Shelley => Box::new(franken_agent_detection::ShelleyConnector::new()),
             Self::OpenHands => Box::new(franken_agent_detection::OpenHandsConnector::new()),
             Self::Goose => Box::new(franken_agent_detection::GooseConnector::new()),
             Self::Crush => Box::new(franken_agent_detection::CrushConnector::new()),
@@ -27386,18 +27457,16 @@ fn dispatch_watch_callback<F>(
     }
 }
 
-fn is_devin_database_watch_root(kind: ConnectorKind, root: &ScanRoot) -> bool {
-    kind == ConnectorKind::Devin
-        && root
-            .path
-            .extension()
-            .is_some_and(|extension| extension == "db")
+fn is_database_watch_root(kind: ConnectorKind, root: &ScanRoot) -> bool {
+    (kind == ConnectorKind::Shelley
+        || (kind == ConnectorKind::Devin
+            && root.path.extension().is_some_and(|extension| extension == "db")))
         && root.path.is_file()
 }
 
 fn watch_scan_lower_bound(kind: ConnectorKind, since_ts: Option<i64>) -> Option<i64> {
-    if kind == ConnectorKind::Devin {
-        // Devin filters sessions by provider activity time, which can precede
+    if matches!(kind, ConnectorKind::Devin | ConnectorKind::Shelley) {
+        // Database providers filter by activity time, which can precede
         // the WAL commit that triggered this scan. Filesystem event times cannot
         // bound it, even after rounding to seconds. Re-read the changed store and
         // let idempotent ingestion skip unchanged sessions; retain event
@@ -27448,10 +27517,10 @@ where
 
     // Watch all detected roots
     for (kind, root) in &roots {
-        // Devin's explicit database override can be a file. SQLite commits
+        // An explicit database override can be a file. SQLite commits
         // may touch only a sibling WAL, including creating it after startup.
         // Watch the parent, but retain the database root for classification.
-        let (watch_path, mode) = if is_devin_database_watch_root(*kind, root) {
+        let (watch_path, mode) = if is_database_watch_root(*kind, root) {
             (
                 root.path.parent().unwrap_or(&root.path),
                 RecursiveMode::NonRecursive,
@@ -27822,6 +27891,8 @@ fn reindex_paths_with_semantic_delta(
         let preserve_this_watch_watermark = preserve_watch_watermark
             || preparse_active_source_skipped
             || active_sources_skipped > 0;
+
+        convs.retain(|conv| !should_skip_subagent(conv));
 
         for conversation in &mut convs {
             ingest_diagnostics.observe_conversation(conversation);
@@ -28528,6 +28599,8 @@ enum ConnectorKind {
     Kiro,
     #[serde(rename = "dv", alias = "Devin")]
     Devin,
+    #[serde(rename = "sh", alias = "Shelley")]
+    Shelley,
     #[serde(rename = "oh", alias = "OpenHands")]
     OpenHands,
     #[serde(rename = "gs", alias = "Goose")]
@@ -28805,6 +28878,11 @@ fn explicit_watch_once_connector_hint(path: &Path) -> Option<ConnectorKind> {
         Some(ConnectorKind::Claude)
     } else if has_pair(".gemini", "tmp") {
         Some(ConnectorKind::Gemini)
+    } else if components
+        .windows(3)
+        .any(|window| window[0] == ".prime" && window[1] == "agent" && window[2] == "sessions")
+    {
+        Some(ConnectorKind::PrimeAgent)
     } else if crate::connectors::omp::owns_session_path(path) {
         Some(ConnectorKind::Omp)
     } else {
@@ -28865,7 +28943,7 @@ fn classify_paths(
                     continue;
                 }
                 if p.starts_with(&root.path)
-                    || (is_devin_database_watch_root(*kind, root)
+                    || (is_database_watch_root(*kind, root)
                         && database_sidecar_paths(&root.path).contains(&p))
                 {
                     if let Some(index) =
@@ -28888,7 +28966,7 @@ fn classify_paths(
             let matched_root = !matching_roots.is_empty();
             for (kind, root) in matching_roots {
                 let scan_path =
-                    if prefer_explicit_paths && !is_devin_database_watch_root(kind, root) {
+                    if prefer_explicit_paths && !is_database_watch_root(kind, root) {
                         explicit_watch_once_scan_path(kind, &p)
                     } else {
                         root.path.clone()
@@ -29061,13 +29139,15 @@ fn additional_scan_roots_for_scan_or_watch(
     // machines with many historical bundles and configured mirrors. Defer that
     // work until a source scan or watch session actually needs it.
     sync_sources_config_to_db(storage);
-    build_scan_roots(storage, data_dir)
+    build_scan_roots(Some(storage), data_dir)
         .into_iter()
         .filter(|root| !(root.origin.source_id == LOCAL_SOURCE_ID && root.path == data_dir))
         .collect()
 }
 
-pub fn build_scan_roots(storage: &FrankenStorage, data_dir: &Path) -> Vec<ScanRoot> {
+/// When no storage is supplied, discover configured paths without opening the
+/// archive. This permits mirror previews before acquiring the indexing lock.
+pub fn build_scan_roots(storage: Option<&FrankenStorage>, data_dir: &Path) -> Vec<ScanRoot> {
     let mut roots = Vec::new();
 
     // Add local default root with local provenance
@@ -29091,14 +29171,9 @@ pub fn build_scan_roots(storage: &FrankenStorage, data_dir: &Path) -> Vec<ScanRo
 
             for path in &source.paths {
                 if source.is_remote() {
-                    let expanded_path = if path.starts_with("~/") {
-                        path.to_string()
-                    } else if path.starts_with('~') {
-                        path.replacen('~', "~/", 1)
-                    } else {
-                        path.to_string()
-                    };
-                    let safe_name = path_to_safe_dirname(&expanded_path);
+                    // Sync keys mirror directories by the exact configured
+                    // path, independent of remote home expansion.
+                    let safe_name = path_to_safe_dirname(path);
                     let mirror_base = data_dir.join("remotes").join(&source.name).join("mirror");
                     let mirror_path = mirror_base.join(&safe_name);
 
@@ -29143,7 +29218,9 @@ pub fn build_scan_roots(storage: &FrankenStorage, data_dir: &Path) -> Vec<ScanRo
     }
 
     // Fallback: remote mirror roots from registered sources
-    if let Ok(sources) = storage.list_sources() {
+    if let Some(storage) = storage
+        && let Ok(sources) = storage.list_sources()
+    {
         for source in sources {
             // Parse platform from source
             let platform =
@@ -29194,14 +29271,7 @@ pub fn build_scan_roots(storage: &FrankenStorage, data_dir: &Path) -> Vec<ScanRo
                         continue;
                     };
                     if source.kind.is_remote() {
-                        let expanded_path = if path.starts_with("~/") {
-                            path.to_string()
-                        } else if path.starts_with('~') {
-                            path.replacen('~', "~/", 1)
-                        } else {
-                            path.to_string()
-                        };
-                        let safe_name = path_to_safe_dirname(&expanded_path);
+                        let safe_name = path_to_safe_dirname(path);
                         let mirror_path = data_dir
                             .join("remotes")
                             .join(&source.id)
@@ -30078,7 +30148,7 @@ pub mod persist {
                 self.workspace_changes = self.workspace_changes.saturating_add(1);
                 self.lexical_update_deferred = true;
                 self.lexical_update_error =
-                    Some("canonical Cursor workspace attribution changed".to_string());
+                    Some("canonical provider title or workspace changed".to_string());
             }
         }
 
@@ -36089,7 +36159,7 @@ mod tests {
             Vec::new(),
             None,
             vec![("codex", failing_explicit_file_root_connector_factory)],
-            FrankenStorage::now_millis(),
+            Some(FrankenStorage::now_millis()),
             None,
         )
         .expect("failed scan should not abort batch indexing");
@@ -47060,7 +47130,7 @@ mod tests {
             )],
             None,
             vec![("claude", watermark_sensitive_remote_connector_factory)],
-            FrankenStorage::now_millis(),
+            Some(FrankenStorage::now_millis()),
             None,
         )
         .context(
@@ -47142,7 +47212,7 @@ mod tests {
             vec![configured_local_scan_root(local_root_path)],
             None,
             vec![("claude", watermark_sensitive_remote_connector_factory)],
-            FrankenStorage::now_millis(),
+            Some(FrankenStorage::now_millis()),
             None,
         )
         .context("configured local roots should keep the connector incremental watermark")?;
@@ -47189,7 +47259,7 @@ mod tests {
             Vec::new(),
             None,
             vec![("claude", panic_connector_factory)],
-            FrankenStorage::now_millis(),
+            Some(FrankenStorage::now_millis()),
             None,
         )
         .expect_err("producer panic should abort streaming indexing");
@@ -47256,7 +47326,7 @@ mod tests {
             )],
             None,
             vec![("claude", watermark_sensitive_remote_connector_factory)],
-            FrankenStorage::now_millis(),
+            Some(FrankenStorage::now_millis()),
             None,
         )
         .context(
@@ -47336,7 +47406,7 @@ mod tests {
             vec![configured_local_scan_root(local_root_path)],
             None,
             vec![("claude", watermark_sensitive_remote_connector_factory)],
-            FrankenStorage::now_millis(),
+            Some(FrankenStorage::now_millis()),
             None,
         )
         .context("configured local roots should keep the connector incremental watermark")?;
@@ -47389,7 +47459,7 @@ mod tests {
                 Vec::new(),
                 None,
                 vec![("codex", failing_explicit_file_root_connector_factory)],
-                FrankenStorage::now_millis(),
+                Some(FrankenStorage::now_millis()),
                 None,
             )?;
 
@@ -47475,7 +47545,7 @@ mod tests {
                 ("claude", active_batch_watermark_connector_factory),
                 ("codex", safe_batch_watermark_connector_factory),
             ],
-            scan_start_ts,
+            Some(scan_start_ts),
             None,
         )?;
 
@@ -47502,7 +47572,7 @@ mod tests {
             Vec::new(),
             None,
             vec![("codex", safe_batch_watermark_connector_factory)],
-            next_scan_ts,
+            Some(next_scan_ts),
             None,
         )?;
         assert!(deferred.scan_had_errors);
@@ -47522,7 +47592,7 @@ mod tests {
             Vec::new(),
             None,
             vec![("codex", safe_batch_watermark_connector_factory)],
-            next_scan_ts,
+            Some(next_scan_ts),
             None,
         )?;
         assert!(!retried.scan_had_errors);
@@ -47571,7 +47641,7 @@ mod tests {
             Vec::new(),
             None,
             vec![("codex", deferred_batch_connector_factory)],
-            FrankenStorage::now_millis(),
+            Some(FrankenStorage::now_millis()),
             None,
         )
         .expect("deferred batch ingest should not require a Tantivy writer");
@@ -53631,6 +53701,38 @@ mod tests {
     }
 
     #[test]
+    fn gh415_shelley_watch_accepts_old_timestamps_and_only_its_database_sidecars() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(watch_scan_lower_bound(ConnectorKind::Shelley, None), None);
+        for input in [0, 1, 1_700_000_000_999, i64::MAX] {
+            assert_eq!(watch_scan_lower_bound(ConnectorKind::Shelley, Some(input)), None);
+        }
+        for name in ["shelley.db", "sessions.sqlite3", "history"] {
+            let db = tmp.path().join(name);
+            fs::write(&db, b"source database").unwrap();
+            let root = ScanRoot::local(db.clone());
+            let roots = vec![(ConnectorKind::Shelley, root.clone())];
+            for event in std::iter::once(db.clone()).chain(database_sidecar_paths(&db)) {
+                fs::write(&event, b"database event").unwrap();
+                for explicit in [false, true] {
+                    let classified = classify_paths(vec![event.clone()], &roots, explicit);
+                    assert_eq!(classified.len(), 1, "{name}: {}", event.display());
+                    assert_eq!(classified[0].0, ConnectorKind::Shelley);
+                    assert_eq!(classified[0].1.path, db);
+                    assert_eq!(classified[0].1.origin, root.origin);
+                }
+            }
+            for suffix in ["-wal-extra", "2-wal", ".other"] {
+                let neighbor = tmp.path().join(format!("{name}{suffix}"));
+                fs::write(&neighbor, b"unrelated event").unwrap();
+                for explicit in [false, true] {
+                    assert!(classify_paths(vec![neighbor.clone()], &roots, explicit).is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn classify_devin_database_sidecars_preserves_root_and_rejects_neighbors() {
         let tmp = TempDir::new().unwrap();
         let db = tmp.path().join("sessions.db");
@@ -53824,6 +53926,37 @@ mod tests {
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::Codex);
         assert_eq!(classified[0].1.path, session);
+    }
+
+    #[test]
+    fn classify_paths_keeps_explicit_prime_file_and_rejects_similar_provider_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = tmp.path().join(".prime/agent/sessions/chosen.jsonl");
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(&session, b"{}\n").unwrap();
+        let roots = vec![
+            (
+                ConnectorKind::PrimeAgent,
+                ScanRoot::local(tmp.path().to_path_buf()),
+            ),
+            (
+                ConnectorKind::PiAgent,
+                ScanRoot::local(tmp.path().to_path_buf()),
+            ),
+        ];
+        let classified = classify_paths(vec![session.clone()], &roots, true);
+        assert_eq!(classified.len(), 1);
+        assert_eq!(classified[0].0, ConnectorKind::PrimeAgent);
+        assert_eq!(classified[0].1.path, session);
+        for path in [
+            ".prime-other/agent/sessions/x.jsonl",
+            ".pi/agent/sessions/x.jsonl",
+        ] {
+            assert_ne!(
+                explicit_watch_once_connector_hint(&tmp.path().join(path)),
+                Some(ConnectorKind::PrimeAgent)
+            );
+        }
     }
 
     #[test]
@@ -56900,7 +57033,7 @@ mod tests {
         let db_path = data_dir.join("db.sqlite");
         let storage = FrankenStorage::open(&db_path).unwrap();
 
-        let roots = build_scan_roots(&storage, &data_dir);
+        let roots = build_scan_roots(Some(&storage), &data_dir);
 
         // Should have at least the local root
         assert!(!roots.is_empty());
@@ -56938,7 +57071,7 @@ mod tests {
         let mirror_dir = data_dir.join("remotes").join("laptop").join("mirror");
         std::fs::create_dir_all(&mirror_dir).unwrap();
 
-        let roots = build_scan_roots(&storage, &data_dir);
+        let roots = build_scan_roots(Some(&storage), &data_dir);
 
         // Should have local root + remote root
         assert_eq!(roots.len(), 2);
@@ -56953,6 +57086,41 @@ mod tests {
             Some("user@laptop.local".to_string())
         );
         assert_eq!(remote_root.platform, Some(Platform::Linux));
+    }
+
+    #[test]
+    #[serial]
+    fn build_scan_roots_preserves_remote_mirror_path_keys() {
+        let _guard = ignore_sources_config();
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let storage = FrankenStorage::open(&data_dir.join("db.sqlite")).unwrap();
+
+        for path in ["~", "~/.codex/sessions", "/home/operator/.codex/sessions"] {
+            storage
+                .upsert_source(&crate::sources::provenance::Source {
+                    id: "laptop".to_string(),
+                    kind: SourceKind::Ssh,
+                    host_label: Some("operator@laptop.invalid".to_string()),
+                    machine_id: None,
+                    platform: Some("linux".to_string()),
+                    config_json: Some(serde_json::json!({"paths": [path]})),
+                    created_at: None,
+                    updated_at: None,
+                })
+                .unwrap();
+            let mirror = data_dir
+                .join("remotes/laptop/mirror")
+                .join(path_to_safe_dirname(path));
+            std::fs::create_dir_all(&mirror).unwrap();
+
+            let roots = build_scan_roots(Some(&storage), &data_dir);
+            assert_eq!(roots.len(), 2, "configured mirror missing for {path}");
+            let remote = roots.iter().find(|root| root.origin.is_remote()).unwrap();
+            assert_eq!(remote.path, mirror);
+            assert_eq!(remote.origin.source_id, "laptop");
+        }
     }
 
     #[test]
@@ -56985,7 +57153,7 @@ mod tests {
         let mirror_dir = data_dir.join("remotes").join("laptop").join("mirror");
         std::fs::create_dir_all(&mirror_dir).unwrap();
 
-        let roots = build_scan_roots(&storage, &data_dir);
+        let roots = build_scan_roots(Some(&storage), &data_dir);
 
         // Should only have local root (remote skipped because mirror doesn't exist)
         assert_eq!(roots.len(), 1);
@@ -57024,7 +57192,7 @@ mod tests {
             })
             .unwrap();
 
-        let roots = build_scan_roots(&storage, &data_dir);
+        let roots = build_scan_roots(Some(&storage), &data_dir);
 
         assert_eq!(roots.len(), 2);
         let backup_scan_root = roots
@@ -60438,7 +60606,7 @@ mod tests {
             Vec::new(),
             None,
             vec![("codex", factory)],
-            FrankenStorage::now_millis(),
+            Some(FrankenStorage::now_millis()),
             None,
         )
         .unwrap();

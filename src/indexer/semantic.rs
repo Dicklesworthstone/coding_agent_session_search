@@ -238,8 +238,98 @@ pub struct SemanticBackfillBatchOutcome {
     pub last_offset: i64,
     pub checkpoint_saved: bool,
     pub published: bool,
+    /// The completed artifact was already current; no scan or publish ran.
+    pub unchanged: bool,
     pub index_path: PathBuf,
     pub manifest_path: PathBuf,
+}
+
+/// Cache only completed coverage. File identities include ctime on Unix so
+/// restoring an old mtime after an in-place edit cannot authorize a no-op.
+/// Platforms without that change stamp keep the full reconciliation path.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct BackfillFileStamp {
+    len: u64,
+    modified: (u64, u32),
+    changed: (i64, i64),
+    identity: (u64, u64),
+}
+
+#[cfg(unix)]
+fn backfill_file_stamp(path: &Path) -> Option<Option<BackfillFileStamp>> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(None),
+        _ => return None,
+    };
+    let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    Some(Some(BackfillFileStamp {
+        len: metadata.len(),
+        modified: (modified.as_secs(), modified.subsec_nanos()),
+        changed: (metadata.ctime(), metadata.ctime_nsec()),
+        identity: (metadata.dev(), metadata.ino()),
+    }))
+}
+
+#[cfg(not(unix))]
+fn backfill_file_stamp(_path: &Path) -> Option<Option<BackfillFileStamp>> {
+    None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct BackfillFilePair {
+    path: PathBuf,
+    main: BackfillFileStamp,
+    wal: Option<BackfillFileStamp>,
+}
+
+impl BackfillFilePair {
+    fn capture(path: &Path, wal: &Path) -> Option<Self> {
+        Some(Self {
+            path: path.canonicalize().ok()?,
+            main: backfill_file_stamp(path)??,
+            wal: backfill_file_stamp(wal)?,
+        })
+    }
+
+    #[cfg(unix)]
+    fn archive(storage: &FrankenStorage) -> Option<Self> {
+        if storage.raw().as_async().in_transaction() {
+            return None;
+        }
+        // The VFS resolves symlinks before choosing its WAL. Bind this lookup
+        // to the actual open main-file descriptor as well: a pathname can
+        // have been replaced since the storage handle was opened.
+        let path = storage.database_path().ok()?.canonicalize().ok()?;
+        let file = fs::File::open(&path).ok()?;
+        let descriptor = storage.raw().file_identity().ok()??;
+        if crate::franken_sync::FileIdentity::from_file(&file).ok()? != Some(descriptor) {
+            return None;
+        }
+        let pair = Self::capture(
+            &path,
+            &crate::storage::sqlite::database_sidecar_path(&path, "-wal"),
+        )?;
+        let current_file = fs::File::open(&path).ok()?;
+        (crate::franken_sync::FileIdentity::from_file(&current_file).ok()? == Some(descriptor))
+            .then_some(pair)
+    }
+
+    #[cfg(not(unix))]
+    fn archive(_storage: &FrankenStorage) -> Option<Self> {
+        None
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CompletedBackfillCache {
+    version: u32,
+    archive: BackfillFilePair,
+    vectors: BackfillFilePair,
+    artifact: ArtifactRecord,
+    vector_space_revision: String,
+    last_offset: i64,
 }
 
 impl SemanticBackfillBatchOutcome {
@@ -3354,6 +3444,7 @@ impl SemanticIndexer {
             last_offset: plan.last_offset,
             checkpoint_saved: !complete,
             published: complete,
+            unchanged: false,
             index_path: if complete { final_path } else { staging_path },
             manifest_path,
         })
@@ -3516,6 +3607,23 @@ impl SemanticIndexer {
         }
         let mut snapshot = FsVectorIndex::open(&snapshot_path)
             .map_err(|err| anyhow::anyhow!("open semantic backfill candidate: {err}"))?;
+        // Historical hash indexes used the generic "1.0" revision. Those
+        // vectors cannot be appended to or served as the current space, but
+        // an explicit canonical backfill is the supported way to replace
+        // them. Restart coverage instead of repeatedly rejecting the only
+        // command capable of producing a compatible artifact.
+        if self.embedder_id() == "fnv1a-384"
+            && snapshot.embedder_id() == self.embedder_id()
+            && snapshot.dimension() == self.embedder_dimension()
+            && snapshot.embedder_revision() == "1.0"
+        {
+            drop(snapshot);
+            tracing::info!(
+                reason = "legacy_hash_vector_space",
+                "rebuilding semantic coverage from the canonical archive"
+            );
+            return self.build_backfill_from_storage(storage, data_dir, manifest, plan, caps, sink);
+        }
         if snapshot.embedder_id() != self.embedder_id()
             || snapshot.dimension() != self.embedder_dimension()
             || snapshot.embedder_revision() != self.vector_space_revision()?
@@ -3707,6 +3815,75 @@ impl SemanticIndexer {
         Ok(outcome)
     }
 
+    /// Reuse the canonical fingerprint only when the completed artifact and
+    /// descriptor-bound archive/WAL observations still match. This lets the
+    /// CLI avoid a full canonical count scan before an unchanged backfill.
+    pub(crate) fn completed_backfill_fingerprint(
+        &self,
+        storage: &FrankenStorage,
+        data_dir: &Path,
+        manifest: &SemanticManifest,
+        tier: TierKind,
+        model_revision: &str,
+    ) -> Result<Option<String>> {
+        let artifact = match tier {
+            TierKind::Fast => manifest.fast_tier.as_ref(),
+            TierKind::Quality => manifest.quality_tier.as_ref(),
+        };
+        let Some(artifact) = artifact else { return Ok(None); };
+        // An identity-rebuild fingerprint is not a canonical fingerprint.
+        // That finalization may still have work to do after publication.
+        if !artifact.db_fingerprint.starts_with("content-v1:") {
+            return Ok(None);
+        }
+        let plan = SemanticBackfillStoragePlan {
+            tier,
+            db_fingerprint: artifact.db_fingerprint.clone(),
+            model_revision: model_revision.into(),
+            max_conversations: 1,
+        };
+        Ok(self.completed_backfill_cache(storage, data_dir, manifest, &plan)?
+            .map(|(_, cache)| cache.artifact.db_fingerprint))
+    }
+
+    fn completed_backfill_cache(
+        &self,
+        storage: &FrankenStorage,
+        data_dir: &Path,
+        manifest: &SemanticManifest,
+        plan: &SemanticBackfillStoragePlan,
+    ) -> Result<Option<(PathBuf, CompletedBackfillCache)>> {
+        let archive_before = BackfillFilePair::archive(storage);
+        let candidate = self.reusable_backfill_candidate(data_dir, manifest, plan);
+        let cache_path = data_dir.join(VECTOR_INDEX_DIR).join(format!(
+            ".completed-backfill-{}-{}.json", plan.tier.as_str(), self.embedder_id()
+        ));
+        let artifact = match plan.tier {
+            TierKind::Fast => manifest.fast_tier.as_ref(),
+            TierKind::Quality => manifest.quality_tier.as_ref(),
+        };
+        if manifest.checkpoint.is_none()
+            && let (Some(archive), Some(path), Some(artifact)) =
+                (archive_before.as_ref(), candidate, artifact)
+            && artifact.ready
+            && artifact.db_fingerprint == plan.db_fingerprint
+            && let Ok(file) = fs::File::open(&cache_path)
+            && let Ok(cache) = serde_json::from_reader::<_, CompletedBackfillCache>(
+                std::io::Read::take(file, 64 * 1024),
+            )
+            && cache.version == 1
+            && cache.archive == *archive
+            && cache.artifact == *artifact
+            && cache.vector_space_revision == self.vector_space_revision()?
+            && BackfillFilePair::capture(&path, &fsvi_wal_path_for(&path)).as_ref()
+                == Some(&cache.vectors)
+            && BackfillFilePair::archive(storage).as_ref() == Some(archive)
+        {
+            return Ok(Some((path, cache)));
+        }
+        Ok(None)
+    }
+
     fn run_backfill_from_storage_with_caps_and_sink(
         &self,
         storage: &FrankenStorage,
@@ -3716,16 +3893,97 @@ impl SemanticIndexer {
         caps: SemanticCheckpointCaps,
         sink: &SemanticProgressSink,
     ) -> Result<SemanticBackfillBatchOutcome> {
-        if let Some(candidate) = self.reusable_backfill_candidate(data_dir, manifest, &plan) {
-            return self.reconcile_backfill_from_storage(
+        let archive_before = BackfillFilePair::archive(storage);
+        let candidate = self.reusable_backfill_candidate(data_dir, manifest, &plan);
+        let cache_path = data_dir.join(VECTOR_INDEX_DIR).join(format!(
+            ".completed-backfill-{}-{}.json",
+            plan.tier.as_str(),
+            self.embedder_id()
+        ));
+        if let Some((path, cache)) = self.completed_backfill_cache(storage, data_dir, manifest, &plan)? {
+            let artifact = cache.artifact;
+            sink.emit(
+                SemanticProgressEvent::Complete,
+                SemanticProgressFields {
+                    rows_processed: Some(artifact.conversation_count),
+                    rows_total: Some(artifact.conversation_count),
+                    note: Some("unchanged: canonical archive and completed vectors match".into()),
+                    ..Default::default()
+                },
+            );
+            return Ok(SemanticBackfillBatchOutcome {
+                tier: plan.tier,
+                embedder_id: self.embedder_id().into(),
+                embedded_docs: 0,
+                conversations_processed: artifact.conversation_count,
+                total_conversations: artifact.conversation_count,
+                last_offset: cache.last_offset,
+                checkpoint_saved: false,
+                published: true,
+                unchanged: true,
+                index_path: path,
+                manifest_path: SemanticManifest::path(data_dir),
+            });
+        }
+        let tier = plan.tier;
+        let outcome = if let Some(candidate) = candidate {
+            self.reconcile_backfill_from_storage(
                 storage,
                 data_dir,
                 manifest,
                 plan,
                 (&candidate, caps),
                 sink,
-            );
+            )?
+        } else {
+            self.build_backfill_from_storage(storage, data_dir, manifest, plan, caps, sink)?
+        };
+        // Publish a cache only when the entire canonical scan observed a
+        // stable archive. This is a skip hint, never serving authority: every
+        // manifest, producer and artifact check above must also agree.
+        if outcome.published
+            && let Some(archive) = archive_before
+            && BackfillFilePair::archive(storage).as_ref() == Some(&archive)
+            && let Some(vectors) = BackfillFilePair::capture(
+                &outcome.index_path,
+                &fsvi_wal_path_for(&outcome.index_path),
+            )
+            && let Some(artifact) = match tier {
+                TierKind::Fast => manifest.fast_tier.as_ref(),
+                TierKind::Quality => manifest.quality_tier.as_ref(),
+            }
+        {
+            let cache = CompletedBackfillCache {
+                version: 1,
+                archive,
+                vectors,
+                artifact: artifact.clone(),
+                vector_space_revision: self.vector_space_revision()?.into(),
+                last_offset: outcome.last_offset,
+            };
+            let saved = (|| -> Result<()> {
+                let mut staged = tempfile::NamedTempFile::new_in(data_dir.join(VECTOR_INDEX_DIR))?;
+                serde_json::to_writer(staged.as_file_mut(), &cache)?;
+                staged.as_file().sync_all()?;
+                staged.persist(&cache_path)?;
+                Ok(())
+            })();
+            if let Err(error) = saved {
+                tracing::debug!(%error, "completed backfill cache unavailable; next run will reconcile");
+            }
         }
+        Ok(outcome)
+    }
+
+    fn build_backfill_from_storage(
+        &self,
+        storage: &FrankenStorage,
+        data_dir: &Path,
+        manifest: &mut SemanticManifest,
+        plan: SemanticBackfillStoragePlan,
+        caps: SemanticCheckpointCaps,
+        sink: &SemanticProgressSink,
+    ) -> Result<SemanticBackfillBatchOutcome> {
         // A cursor without its vectors proves no coverage. This includes a
         // crash after moving staging to live but before saving the manifest.
         if manifest.checkpoint.as_ref().is_some_and(|checkpoint| {
@@ -5978,6 +6236,236 @@ mod tests {
             assert!(done.published);
             assert_eq!(FsVectorIndex::open(&done.index_path)?.record_count(), 4);
         }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh458_backfill_cache_binds_real_wal_and_rejects_pinned_read_snapshots() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("archive.db");
+        let alias = temp.path().join("alias.db");
+        let writer = FrankenStorage::open(&path)?;
+        writer
+            .raw()
+            .execute("CREATE TABLE cache_probe(id INTEGER PRIMARY KEY, value TEXT)")?;
+        writer
+            .raw()
+            .execute("INSERT INTO cache_probe VALUES(1, 'old')")?;
+        std::os::unix::fs::symlink(&path, &alias)?;
+        let reader = FrankenStorage::open_readonly(&alias)?;
+        let before = BackfillFilePair::archive(&reader).expect("fresh alias handle");
+        assert_eq!(before.path, path.canonicalize()?);
+        assert_eq!(
+            before.wal,
+            backfill_file_stamp(&crate::storage::sqlite::database_sidecar_path(
+                &path, "-wal"
+            ))
+            .unwrap()
+        );
+        assert!(!crate::storage::sqlite::database_sidecar_path(&alias, "-wal").exists());
+        reader.raw().execute("BEGIN")?;
+        assert_eq!(
+            reader
+                .raw()
+                .query("SELECT value FROM cache_probe WHERE id=1")?[0]
+                .get_typed::<String>(0)?,
+            "old"
+        );
+        writer
+            .raw()
+            .execute("UPDATE cache_probe SET value='new' WHERE id=1")?;
+        assert_eq!(
+            reader
+                .raw()
+                .query("SELECT value FROM cache_probe WHERE id=1")?[0]
+                .get_typed::<String>(0)?,
+            "old"
+        );
+        assert!(
+            BackfillFilePair::archive(&reader).is_none(),
+            "old snapshot must not authorize a cache under new file stamps"
+        );
+        reader.raw().execute("ROLLBACK")?;
+        let after = BackfillFilePair::archive(&reader).expect("autocommit alias handle");
+        assert_ne!(
+            after, before,
+            "the real WAL changed despite stable alias and rowid"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh458_backfill_cache_rejects_replaced_archive_path() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("archive.db");
+        let replacement = temp.path().join("replacement.db");
+        drop(FrankenStorage::open(&path)?);
+        drop(FrankenStorage::open(&replacement)?);
+        let reader = FrankenStorage::open_readonly(&path)?;
+        assert!(BackfillFilePair::archive(&reader).is_some());
+        fs::rename(&path, temp.path().join("retained-original.db"))?;
+        fs::rename(&replacement, &path)?;
+        assert!(
+            BackfillFilePair::archive(&reader).is_none(),
+            "a descriptor on the old inode must not certify the replacement"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh458_unchanged_backfill_preserves_completed_generation_without_replay() -> Result<()> {
+        let temp = tempdir()?;
+        let storage = FrankenStorage::open(&temp.path().join("agent_search.db"))?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        for name in ["first", "second"] {
+            storage.insert_conversation_tree(agent_id, None, &test_conversation(name, name))?;
+        }
+        let indexer = SemanticIndexer::new("hash", None)?;
+        let mut manifest = SemanticManifest::default();
+        let run = |manifest: &mut SemanticManifest| {
+            indexer.run_backfill_from_storage(
+                &storage,
+                temp.path(),
+                manifest,
+                SemanticBackfillStoragePlan {
+                    tier: TierKind::Fast,
+                    db_fingerprint: crate::indexer::lexical_storage_fingerprint_for_storage(
+                        &storage,
+                    )?,
+                    model_revision: "hash".into(),
+                    max_conversations: 2,
+                },
+            )
+        };
+        let first = run(&mut manifest)?;
+        assert!(first.published && !first.unchanged);
+        let vectors_before = fs::read(&first.index_path)?;
+        let manifest_before = fs::read(SemanticManifest::path(temp.path()))?;
+        let vector_stamp =
+            BackfillFilePair::capture(&first.index_path, &fsvi_wal_path_for(&first.index_path));
+        let replay = run(&mut manifest)?;
+        assert!(replay.unchanged && replay.published);
+        assert_eq!(replay.embedded_docs, 0);
+        assert_eq!(replay.last_offset, first.last_offset);
+        assert_eq!(
+            fs::read(SemanticManifest::path(temp.path()))?,
+            manifest_before
+        );
+        assert_eq!(fs::read(&first.index_path)?, vectors_before);
+        assert_eq!(
+            BackfillFilePair::capture(&first.index_path, &fsvi_wal_path_for(&first.index_path)),
+            vector_stamp
+        );
+
+        // Same row count and tail fingerprint; an old row's content changed.
+        let fingerprint = manifest.fast_tier.as_ref().unwrap().db_fingerprint.clone();
+        storage.raw().execute(
+            "UPDATE messages SET content = 'changed earlier content' WHERE conversation_id = 1",
+        )?;
+        assert_eq!(
+            crate::indexer::lexical_storage_fingerprint_for_storage(&storage)?,
+            fingerprint
+        );
+        let changed = run(&mut manifest)?;
+        assert!(!changed.unchanged);
+        assert_eq!(changed.embedded_docs, 1);
+        assert_ne!(fs::read(&changed.index_path)?, vectors_before);
+
+        // Missing/corrupt cache is merely a full-reconciliation miss.
+        let cache_path = temp
+            .path()
+            .join(VECTOR_INDEX_DIR)
+            .join(".completed-backfill-fast-fnv1a-384.json");
+        fs::write(&cache_path, b"incomplete cache")?;
+        let recovered = run(&mut manifest)?;
+        assert!(!recovered.unchanged && recovered.published);
+        assert_eq!(recovered.embedded_docs, 0);
+        assert!(run(&mut manifest)?.unchanged);
+        Ok(())
+    }
+
+    #[test]
+    fn gh458_backfill_upgrades_legacy_hash_space_without_reusing_old_vectors() -> Result<()> {
+        let temp = tempdir()?;
+        let storage = FrankenStorage::open(&temp.path().join("agent_search.db"))?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        for name in ["first", "second"] {
+            storage.insert_conversation_tree(agent_id, None, &test_conversation(name, name))?;
+        }
+        let indexer = SemanticIndexer::new("hash", None)?;
+        let mut manifest = SemanticManifest::default();
+        let fingerprint = crate::indexer::lexical_storage_fingerprint_for_storage(&storage)?;
+        let run = |manifest: &mut SemanticManifest, max_conversations| {
+            indexer.run_backfill_from_storage(
+                &storage,
+                temp.path(),
+                manifest,
+                SemanticBackfillStoragePlan {
+                    tier: TierKind::Fast,
+                    db_fingerprint: fingerprint.clone(),
+                    model_revision: "hash".into(),
+                    max_conversations,
+                },
+            )
+        };
+        let published = run(&mut manifest, 2)?;
+        assert!(published.published);
+        let index = FsVectorIndex::open(&published.index_path)?;
+        let expected: Vec<_> = (0..index.record_count())
+            .map(|row| Ok((index.doc_id_at(row)?.to_owned(), index.vector_at_f32(row)?)))
+            .collect::<Result<_>>()?;
+        drop(index);
+        let mut legacy = FsVectorIndex::create_with_revision(
+            &published.index_path,
+            indexer.embedder_id(),
+            "1.0",
+            indexer.embedder_dimension(),
+            FsQuantization::F16,
+        )?;
+        // Same canonical IDs with deliberately wrong old-space values catch
+        // relabeling or reuse without recomputing the embeddings.
+        for (id, _) in &expected {
+            legacy.write_record(id, &vec![0.0; indexer.embedder_dimension()])?;
+        }
+        legacy.finish()?;
+        let prior_bytes = fs::read(&published.index_path)?;
+        let first = run(&mut manifest, 1)?;
+        assert_eq!(first.embedded_docs, 1);
+        assert!(first.checkpoint_saved);
+        assert!(!first.published);
+        assert!(!manifest.fast_tier.as_ref().unwrap().ready);
+        assert_eq!(fs::read(&published.index_path)?, prior_bytes);
+        let second = run(&mut manifest, 1)?;
+        assert_eq!(second.embedded_docs, 1);
+        assert!(second.published);
+        assert!(manifest.fast_tier.as_ref().unwrap().ready);
+        let rebuilt = FsVectorIndex::open(&second.index_path)?;
+        assert_eq!(rebuilt.embedder_revision(), HASH_VECTOR_SPACE_REVISION);
+        assert_eq!(rebuilt.record_count(), expected.len());
+        let actual: HashMap<_, _> = (0..rebuilt.record_count())
+            .map(|row| {
+                Ok((
+                    rebuilt.doc_id_at(row)?.to_owned(),
+                    rebuilt.vector_at_f32(row)?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        assert_eq!(actual, expected.into_iter().collect());
         Ok(())
     }
 

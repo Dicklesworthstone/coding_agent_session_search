@@ -156,7 +156,7 @@ fn connector_factories_all_instantiate_and_detect() {
 fn feature_gated_connectors_available() {
     let slugs = factory_fad_slugs();
     for gated in [
-        "chatgpt", "cursor", "opencode", "crush", "goose", "hermes", "devin",
+        "chatgpt", "cursor", "opencode", "crush", "goose", "hermes", "devin", "shelley",
     ] {
         assert!(
             slugs.contains(gated),
@@ -164,7 +164,7 @@ fn feature_gated_connectors_available() {
              Check Cargo.toml enables the feature for franken-agent-detection"
         );
     }
-    assert_eq!(slugs.len(), 29, "Expected 29 connector factories");
+    assert_eq!(slugs.len(), 30, "Expected 30 connector factories");
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +487,210 @@ mod prime_ingestion {
     use std::fs;
     use std::io::Write;
     use std::time::Duration;
+
+    fn prime_command(home: &std::path::Path, data: &std::path::Path) -> std::process::Command {
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        command
+            .env_clear()
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("PATH", "")
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CASS_DATA_DIR", data)
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("RUST_MIN_STACK", "134217728")
+            .current_dir(home);
+        if let Ok(system_root) = dotenvy::var("SystemRoot") {
+            command.env("SystemRoot", system_root);
+        }
+        command
+    }
+
+    fn write_prime(path: &std::path::Path, id: &str, text: &str) -> Vec<u8> {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes = format!(
+            "{}\n{}\n",
+            json!({"type":"session","version":3,"id":id,"cwd":"/work/prime"}),
+            json!({"type":"message","id":"first","parentId":null,
+                "message":{"role":"user","content":text}})
+        )
+        .into_bytes();
+        fs::write(path, &bytes).unwrap();
+        bytes
+    }
+
+    fn prime_search(home: &std::path::Path, data: &std::path::Path, query: &str) -> Value {
+        let mut command = assert_cmd::Command::from_std(prime_command(home, data));
+        let output = command
+            .args([
+                "search",
+                query,
+                "--mode",
+                "lexical",
+                "--json",
+                "--no-maintenance",
+                "--timeout",
+                "3000",
+                "--limit",
+                "100",
+            ])
+            .timeout(Duration::from_secs(10))
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let result: Value = serde_json::from_slice(&output).unwrap();
+        assert_ne!(
+            result.pointer("/budget/timed_out").and_then(Value::as_bool),
+            Some(true),
+            "timed out search cannot prove absence: {result}"
+        );
+        assert!(result["hits"].is_array(), "missing hits: {result}");
+        result
+    }
+
+    #[test]
+    fn prime_explicit_file_watch_once_excludes_neighbors_and_replays_without_duplicates() {
+        let home = tempfile::tempdir().unwrap();
+        let data = home.path().join("cass-data");
+        let sessions = home.path().join(".prime/agent/sessions");
+        write_prime(
+            &sessions.join("baseline.jsonl"),
+            "baseline",
+            "primebaseline",
+        );
+        assert_cmd::Command::from_std(prime_command(home.path(), &data))
+            .args(["index", "--full", "--json"])
+            .timeout(Duration::from_secs(120))
+            .assert()
+            .success();
+        let target = sessions.join("chosen.jsonl");
+        let bytes = write_prime(&target, "chosen", "primechosenneedle");
+        let neighbor = sessions.join("neighbor.jsonl");
+        let neighbor_bytes = write_prime(&neighbor, "neighbor", "primeexcludedneedle");
+        let pi = home.path().join(".pi/agent/sessions/other.jsonl");
+        let pi_bytes = write_prime(&pi, "pi-neighbor", "primeexcludedneedle");
+        for _ in 0..2 {
+            assert_cmd::Command::from_std(prime_command(home.path(), &data))
+                .args(["index", "--watch", "--watch-once"])
+                .arg(&target)
+                .arg("--json")
+                .timeout(Duration::from_secs(120))
+                .assert()
+                .success();
+            let found = prime_search(home.path(), &data, "primechosenneedle");
+            let hits = found["hits"].as_array().unwrap();
+            assert_eq!(
+                hits.len(),
+                1,
+                "target must be indexed exactly once: {found}"
+            );
+            assert_eq!(hits[0]["agent"], "prime_agent");
+            assert_eq!(hits[0]["source_path"], target.to_string_lossy().as_ref());
+            let excluded = prime_search(home.path(), &data, "primeexcludedneedle");
+            assert!(
+                excluded["hits"].as_array().unwrap().is_empty(),
+                "neighbor leakage: {excluded}"
+            );
+        }
+        assert_eq!(fs::read(target).unwrap(), bytes);
+        assert_eq!(fs::read(neighbor).unwrap(), neighbor_bytes);
+        assert_eq!(fs::read(pi).unwrap(), pi_bytes);
+    }
+
+    #[test]
+    fn prime_configured_root_live_watch_indexes_new_file_without_unrelated_sources() {
+        use std::process::{Child, Stdio};
+        use std::time::Instant;
+        struct WatchChild(Child);
+        impl Drop for WatchChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let data = home.path().join("cass-data");
+        let sessions = home.path().join("configured-prime-store");
+        write_prime(
+            &sessions.join("baseline.jsonl"),
+            "baseline",
+            "primebaseline",
+        );
+        let stdout = home.path().join("watch.stdout");
+        let stderr = home.path().join("watch.stderr");
+        let logs = || {
+            format!(
+                "stdout:\n{}\nstderr:\n{}",
+                fs::read_to_string(&stdout).unwrap_or_default(),
+                fs::read_to_string(&stderr).unwrap_or_default()
+            )
+        };
+        let mut watch = WatchChild(
+            prime_command(home.path(), &data)
+                .env("PRIME_AGENT_SESSION_DIR", &sessions)
+                .env("RUST_LOG", "info")
+                .arg("--verbose")
+                .args(["index", "--watch", "--watch-interval", "1", "--json"])
+                .stdout(Stdio::from(fs::File::create(&stdout).unwrap()))
+                .stderr(Stdio::from(fs::File::create(&stderr).unwrap()))
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while !logs().contains("watch mode: minimum interval between scan cycles") {
+            assert!(
+                watch.0.try_wait().unwrap().is_none(),
+                "watch exited: {}",
+                logs()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "watch startup timeout: {}",
+                logs()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let unrelated = home.path().join("unrelated-store/session.jsonl");
+        let unrelated_bytes = write_prime(&unrelated, "unrelated", "primeunrelatedneedle");
+        let target = sessions.join("new-session.jsonl");
+        let bytes = write_prime(&target, "new-session", "primeliveneedle");
+        loop {
+            let found = prime_search(home.path(), &data, "primeliveneedle");
+            if !found["hits"].as_array().unwrap().is_empty() {
+                assert_eq!(found["hits"].as_array().unwrap().len(), 1, "{found}");
+                assert_eq!(found["hits"][0]["agent"], "prime_agent");
+                assert_eq!(
+                    found["hits"][0]["source_path"],
+                    target.to_string_lossy().as_ref()
+                );
+                break;
+            }
+            assert!(
+                watch.0.try_wait().unwrap().is_none(),
+                "watch exited: {}",
+                logs()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "new file never indexed: {}",
+                logs()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let excluded = prime_search(home.path(), &data, "primeunrelatedneedle");
+        assert!(
+            excluded["hits"].as_array().unwrap().is_empty(),
+            "{excluded}"
+        );
+        assert_eq!(fs::read(target).unwrap(), bytes);
+        assert_eq!(fs::read(unrelated).unwrap(), unrelated_bytes);
+    }
 
     #[test]
     fn prime_active_branch_survives_cli_ingestion_and_incremental_append() {

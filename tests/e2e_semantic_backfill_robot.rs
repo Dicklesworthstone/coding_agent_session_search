@@ -754,6 +754,61 @@ fn robot_models_backfill_keeps_archive_and_assets_scoped_to_path_overrides() -> 
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn gh458_robot_unchanged_maintenance_skips_packet_replay_and_publication() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let data_dir = temp.path().join("cass-data");
+    let db_path = temp.path().join("agent_search.db");
+    seed_canonical_db(&db_path)?;
+    assert_eq!(
+        run_robot_backfill(&data_dir, &db_path)?["status"],
+        "checkpointed"
+    );
+    assert_eq!(
+        run_robot_backfill(&data_dir, &db_path)?["status"],
+        "published"
+    );
+    let before = vector_files_snapshot(&data_dir)?;
+    let progress = temp.path().join("unchanged-progress.jsonl");
+    let output = robot_backfill_command(&data_dir, &db_path)
+        .env("CASS_SEMANTIC_PROGRESS_JSONL", &progress)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&output)?;
+    assert_eq!(report["status"], "unchanged", "{report}");
+    assert_eq!(report["unchanged"], true);
+    assert_eq!(report["embedded_docs"], 0);
+    assert_eq!(report["published"], true);
+    assert_eq!(vector_files_snapshot(&data_dir)?, before);
+    let events: Vec<Value> = fs::read_to_string(&progress)?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    assert_eq!(
+        events.len(),
+        1,
+        "a no-op must not replay packets or republish: {events:?}"
+    );
+    assert_eq!(events[0]["event"], "complete");
+
+    // A changed early row has the same conversation count and maximum IDs.
+    // It must miss the cache and actually replace the old document identity.
+    {
+        let storage = FrankenStorage::open(&db_path)?;
+        storage.raw().execute("UPDATE messages SET content = 'updated early semantic document' WHERE conversation_id = 1")?;
+    }
+    let changed = run_robot_backfill(&data_dir, &db_path)?;
+    assert_eq!(changed["status"], "published");
+    assert_eq!(changed["unchanged"], false);
+    assert_eq!(changed["embedded_docs"], 1);
+    assert_ne!(vector_files_snapshot(&data_dir)?, before);
+    Ok(())
+}
+
 #[test]
 fn robot_models_backfill_checkpoints_then_publishes_fast_tier() -> TestResult {
     let temp = tempfile::tempdir()?;

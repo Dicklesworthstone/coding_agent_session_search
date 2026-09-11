@@ -281,6 +281,10 @@ sync_schedule = "manual"
             .as_str()
             .is_some_and(|s| !s.is_empty())
     );
+    assert!(
+        !data.join("agent_search.db").exists(),
+        "a refused mirror preview must not create/open the archive for writing"
+    );
     FileExt::unlock(&lock).unwrap();
 
     let ingested = command()
@@ -320,6 +324,182 @@ sync_schedule = "manual"
     let hits = searched["hits"].as_array().unwrap();
     assert_eq!(hits.len(), 1, "{searched}");
     assert_eq!(hits[0]["source_id"], "workstation");
+    tracker.complete();
+}
+
+#[test]
+fn sources_reingest_scope_streaming() {
+    assert_sources_reingest_scope("1");
+}
+
+#[test]
+fn sources_reingest_scope_batch() {
+    assert_sources_reingest_scope("0");
+}
+
+fn assert_sources_reingest_scope(streaming: &str) {
+    use coding_agent_search::sources::sync::path_to_safe_dirname;
+
+    let tracker = tracker_for(&format!("sources_reingest_scope_{streaming}"));
+    let root = tempfile::tempdir().unwrap().keep();
+    let home = root.join("home");
+    let config = root.join("config");
+    let data = root.join("data");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join(".env"), "").unwrap();
+    // Windows home discovery need not honor HOME. Limit ordinary local
+    // discovery to this fixture's provider and set its explicit data root.
+    let disabled_agents: Vec<_> = coding_agent_search::connectors::get_connector_factories()
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| *name != "codex")
+        .collect();
+    let disabled_agents = toml::to_string(&std::collections::BTreeMap::from([(
+        "disabled_agents",
+        disabled_agents,
+    )]))
+    .unwrap();
+    create_sources_config(
+        &config,
+        &format!(
+            r#"{disabled_agents}
+[[sources]]
+name = "alpha"
+type = "ssh"
+host = "operator@alpha.invalid"
+paths = ["/synthetic/.codex/sessions"]
+[[sources]]
+name = "beta"
+type = "ssh"
+host = "operator@beta.invalid"
+paths = ["~"]
+[[sources]]
+name = "absent"
+type = "ssh"
+host = "operator@absent.invalid"
+paths = ["/synthetic/.codex/sessions"]
+"#
+        ),
+    );
+    let seed = |path: &Path, id: &str| {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let meta = serde_json::json!({"timestamp":"2026-09-01T00:00:00Z", "type":"session_meta", "payload":{"id":id,"cwd":"/synthetic/project","cli_version":"0.42.0"}});
+        let message = serde_json::json!({"timestamp":"2026-09-01T00:00:01Z", "type":"response_item", "payload":{"type":"message","role":"user","content":[{"type":"input_text","text":format!("mirrorscopeproof {id}")}]}});
+        fs::write(path, format!("{meta}\n{message}\n")).unwrap();
+    };
+    let alpha = data
+        .join("remotes/alpha/mirror")
+        .join(path_to_safe_dirname("/synthetic/.codex/sessions"));
+    let beta = data
+        .join("remotes/beta/mirror")
+        .join(path_to_safe_dirname("~"))
+        .join(".codex/sessions");
+    seed(&alpha.join("rollout-alpha.jsonl"), "alpha-first");
+    seed(&beta.join("rollout-beta.jsonl"), "beta-first");
+    seed(
+        &home.join(".codex/sessions/rollout-local.jsonl"),
+        "local-first",
+    );
+    let command = || {
+        let mut command = tracker.cass_std_command();
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_DATA_HOME", root.join("xdg"))
+            .env("CASS_DATA_DIR", &data)
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("RUST_MIN_STACK", "134217728")
+            .env("CASS_STREAMING_INDEX", streaming)
+            .env("CODEX_HOME", home.join(".codex"))
+            .current_dir(&home);
+        tracker.command_environment().apply_to_std(&mut command);
+        command
+    };
+    let run = |args: &[&str], code| {
+        let output = command().args(args).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    // A mixed valid/invalid selection must fail before the first writable open.
+    run(
+        &["sources", "reingest", "--source", "alpha,unknown", "--json"],
+        2,
+    );
+    assert!(!data.join("agent_search.db").exists());
+    let ingest = |args: &[&str]| {
+        let output = run(args, 0);
+        let payload: Value = serde_json::from_slice(&output.stdout).expect("single reingest JSON");
+        assert_eq!(payload["status"], "complete", "{payload}");
+        assert_eq!(payload["indexing"]["success"], true, "{payload}");
+        payload
+    };
+    let search_sources = |expected: &[&str]| {
+        let output = run(
+            &[
+                "search",
+                "mirrorscopeproof",
+                "--robot",
+                "--mode",
+                "lexical",
+                "--no-maintenance",
+                "--no-daemon",
+            ],
+            0,
+        );
+        let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let mut actual: Vec<_> = payload["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hit| hit["source_id"].as_str().unwrap())
+            .collect();
+        actual.sort_unstable();
+        assert_eq!(
+            actual, expected,
+            "unselected mirror/local history was ingested: {payload}"
+        );
+    };
+    let first = ingest(&["sources", "reingest", "--source", "ALPHA", "--json"]);
+    assert_eq!(first["sources"], serde_json::json!(["alpha"]));
+    assert_eq!(first["missing_mirrors"], serde_json::json!([]));
+    assert_eq!(first["mirror_roots"].as_array().unwrap().len(), 1);
+    search_sources(&["alpha"]);
+    {
+        let storage = FrankenStorage::open(&data.join("agent_search.db")).unwrap();
+        assert_eq!(storage.get_last_scan_ts().unwrap(), None);
+        assert_eq!(storage.get_connector_last_scan_ts("codex").unwrap(), None);
+        storage.set_last_scan_ts(1234).unwrap();
+        storage.set_connector_last_scan_ts("codex", 1234).unwrap();
+    }
+    seed(&alpha.join("rollout-alpha-second.jsonl"), "alpha-second");
+    ingest(&[
+        "sources", "reingest", "--source", "alpha", "--full", "--json",
+    ]);
+    search_sources(&["alpha", "alpha"]);
+    ingest(&["sources", "reingest", "--source", "alpha", "--json"]);
+    search_sources(&["alpha", "alpha"]);
+    let all = ingest(&["sources", "reingest", "--json"]);
+    assert_eq!(all["missing_mirrors"], serde_json::json!(["absent"]));
+    search_sources(&["alpha", "alpha", "beta"]);
+    {
+        let storage = FrankenStorage::open_readonly(&data.join("agent_search.db")).unwrap();
+        assert_eq!(storage.get_last_scan_ts().unwrap(), Some(1234));
+        assert_eq!(
+            storage.get_connector_last_scan_ts("codex").unwrap(),
+            Some(1234)
+        );
+    }
+    // A subsequent ordinary scan must still see local history that predates
+    // all the mirror-only runs. Neither scan mode may hide it with a watermark.
+    run(&["index", "--json"], 0);
+    search_sources(&["alpha", "alpha", "beta", "local"]);
     tracker.complete();
 }
 

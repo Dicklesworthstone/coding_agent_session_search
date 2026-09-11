@@ -1,5 +1,40 @@
 # CASS 0.8.0 changelog research
 
+Original issue implementation follow-up (2026-09-11 UTC, unreleased): Prime
+explicit-file routing, migration-aware schema-only storage admission, known
+legacy hash-space rebuilding, and completed-backfill no-op caching are under
+combined remote validation. The cache is a maintenance skip hint, never search
+serving authority; Unix descriptor identity and DB/WAL/vector change stamps
+bind it to the completed artifact. Changed archives still require canonical
+reconciliation, and concurrent indexing is still excluded. New tests include
+same-tail edits, symlink WAL routing, old read transactions, replaced archive
+paths, legacy wrong-vector replacement, and real Prime watcher notifications.
+No native large-archive performance or remaining issue closure is claimed.
+The fleet-only follow-up gate below timed out after1800s during Clippy and
+executed no Rust tests; the combined candidate uses the supported10800s RCH
+transport limit without changing behavioral assertions or scanner policy.
+
+Reingest follow-up (2026-09-11 UTC, original `av59c`, unreleased): reviewed the
+source after `b65e6803` and the retained two-mirror reproducer below. The source
+filter previously narrowed only the report. The new scan entry point selects
+remote roots, suppresses local discovery and historical salvage, forces mirror
+recovery past unchanged-file fingerprints, and preserves global/per-connector
+local watermarks in both streaming and batch ingestion. Mixed valid/unknown
+filters fail before archive creation; preview discovery no longer opens the
+database before the index lock. Both configured and database-fallback mirror
+discovery now hash the exact configured path, matching sync for a bare `~`.
+Real CLI regressions cover selective/full/replay/all-mirror ingestion, missing
+mirrors, watermark preservation and subsequent local indexing; execution is
+pending. A separate synthetic harness reproduction proved the TMPDIR symlink
+privacy bypass: one inventory was written inside an isolated fake checkout
+before the fix; after resolving the artifact root, the same case exits 2 with
+no inventory inside, while normal external initialization still succeeds.
+The first remote validation snapshot omitted `.gitattributes`, so all-target
+Clippy failed at its existing `include_str!`; that attempt is retained and
+cannot certify the gate. Final validation and the unchanged all-ten-host
+authentication/strict-UBS acceptance remain pending. GitHub metadata was checked:
+v0.8.0 is published at 2026-09-10 16:11:54 UTC; these fixes are unreleased.
+
 Bounded setup probe follow-up (2026-09-10, original `av59c`): commit `7459cdeb`
 limits optional health/stats/du/find measurements to a shared two-second budget.
 Directory presence remains useful when measurements are unavailable; estimates

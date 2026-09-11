@@ -7311,6 +7311,7 @@ async fn execute_cli(
                         robot_trace_ingest,
                         background,
                         None,
+                        None,
                     )?;
                 }
                 Commands::Search {
@@ -49429,6 +49430,14 @@ fn doctor_raw_mirror_backfill_candidate_receipt(
         source_path.as_deref(),
     );
 
+    if provider == "shelley" {
+        receipt.action = "disabled_sensitive_container".to_string();
+        receipt.warnings.push(
+            "Shelley stores credentials and application settings alongside conversations. Raw mirror capture and linking are disabled; index the original local database directly with CASS_SHELLEY_DB or a local source path.".to_string(),
+        );
+        return receipt;
+    }
+
     if provider == "unknown" || source_path.is_none() {
         receipt.action = "unknown_mapping_db_projection_only".to_string();
         receipt.db_projection_only = true;
@@ -77927,6 +77936,59 @@ paths = ["~/.claude/projects"]
     }
 
     #[test]
+    fn gh415_doctor_sensitive_container_never_becomes_repairable_mirror() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("sensitive-container");
+        let bytes = b"security boundary probe: must never be read by doctor";
+        std::fs::write(&source_path, bytes).unwrap();
+        let before = std::fs::metadata(&source_path).unwrap().modified().unwrap();
+        let mut cache = HashMap::new();
+        for origin in ["local", "ssh"] {
+            for apply in [false, true] {
+                let candidate = DoctorRawMirrorBackfillCandidate {
+                    conversation_id: 17, provider: "shelley".into(),
+                    source_path: Some(source_path.display().to_string()),
+                    source_id: if origin == "local" { "local" } else { "remote" }.into(),
+                    origin_host: None, origin_kind: Some(origin.into()),
+                    started_at_ms: None, message_count: 1,
+                };
+                let receipt = doctor_raw_mirror_backfill_candidate_receipt(
+                    &data_dir, &candidate, &HashMap::new(), &HashMap::new(), &mut cache, apply,
+                );
+                assert_eq!(receipt.action, "disabled_sensitive_container");
+                assert!(!doctor_raw_mirror_backfill_receipt_would_mutate(&receipt));
+                assert!(receipt.source_stat_snapshot.is_none());
+                assert!(!receipt.raw_source_captured);
+                assert!(!receipt.raw_mirror_db_linked);
+                assert!(!receipt.db_projection_only);
+                assert!(receipt.warnings.iter().any(|message| message.contains("CASS_SHELLEY_DB")));
+                let mut report = DoctorRawMirrorBackfillReport::default();
+                accumulate_doctor_raw_mirror_backfill_receipt(&mut report, receipt);
+                assert_eq!(report.eligible_live_source_count, 0);
+                assert_eq!(report.existing_raw_manifest_link_count, 0);
+                assert_eq!(report.capture_failure_count, 0);
+            }
+        }
+        assert!(cache.is_empty(), "denial must precede source reads and hashing");
+        assert!(!data_dir.exists());
+        assert_eq!(std::fs::read(&source_path).unwrap(), bytes);
+        assert_eq!(std::fs::metadata(&source_path).unwrap().modified().unwrap(), before);
+        // Ordinary source files remain eligible; do not disable all backfill.
+        let control = DoctorRawMirrorBackfillCandidate {
+            conversation_id: 18, provider: "codex".into(),
+            source_path: Some(source_path.display().to_string()), source_id: "local".into(),
+            origin_host: None, origin_kind: Some("local".into()),
+            started_at_ms: None, message_count: 1,
+        };
+        let receipt = doctor_raw_mirror_backfill_candidate_receipt(
+            &data_dir, &control, &HashMap::new(), &HashMap::new(), &mut cache, false,
+        );
+        assert_eq!(receipt.action, "would_capture_live_source");
+        assert!(doctor_raw_mirror_backfill_receipt_would_mutate(&receipt));
+    }
+
+    #[test]
     fn raw_mirror_backfill_refuses_capture_when_source_content_hash_is_unavailable() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
@@ -104797,6 +104859,7 @@ fn run_index_with_data(
     robot_trace_ingest: bool,
     background: bool,
     mut captured_result: Option<&mut Option<serde_json::Value>>,
+    mirror_source_ids: Option<Vec<String>>,
 ) -> CliResult<()> {
     use crate::franken_sync::compat::{ConnectionExt, RowExt};
     use std::time::Instant;
@@ -104846,6 +104909,7 @@ fn run_index_with_data(
         build_hnsw.hash(&mut hasher);
         embedder.hash(&mut hasher);
         robot_trace_ingest.hash(&mut hasher);
+        mirror_source_ids.hash(&mut hasher);
         format!("{}", data_dir.display()).hash(&mut hasher);
         hasher.finish()
     };
@@ -105064,7 +105128,10 @@ fn run_index_with_data(
     let previous_robot_trace_ingest =
         robot_trace_ingest.then(|| indexer::set_robot_trace_ingest_enabled(true));
     let index_handle = index_worker_thread_builder()
-        .spawn(move || indexer::run_index(opts_clone, None))
+        .spawn(move || match mirror_source_ids {
+            Some(source_ids) => indexer::run_index_for_mirror_sources(opts_clone, source_ids),
+            None => indexer::run_index(opts_clone, None),
+        })
         .map_err(|error| CliError {
             code: 9,
             kind: CliErrorKind::Index.kind_str(),
@@ -116742,6 +116809,7 @@ fn run_sources_sync(
             false, // robot_trace_ingest
             false, // background
             is_robot.then_some(&mut indexing_result),
+            None,
         )
     } else {
         Ok(())
@@ -116834,6 +116902,25 @@ fn run_sources_reingest(
     })?;
 
     let remote_sources: Vec<_> = config.remote_sources().collect();
+    if let Some(names) = &source_filter {
+        let unknown: Vec<_> = names
+            .iter()
+            .filter(|name| {
+                !remote_sources
+                    .iter()
+                    .any(|source| source_names_equal(name, &source.name))
+            })
+            .collect();
+        if names.is_empty() || !unknown.is_empty() {
+            return Err(CliError {
+                code: 2,
+                kind: "usage",
+                message: format!("unknown remote source selection: {unknown:?}"),
+                hint: Some("Run 'cass sources list' to see configured remote sources.".into()),
+                retryable: false,
+            });
+        }
+    }
     if remote_sources.is_empty() {
         let is_robot = output_format.is_some() || robot_format_from_env().is_some();
         if is_robot {
@@ -116884,30 +116971,26 @@ fn run_sources_reingest(
         };
 
     let data_dir = default_data_dir();
-    let db_path = data_dir.join("agent_search.db");
-
     // Surface the mirror roots that will actually be scanned so the operator
-    // can confirm the mirror is present before the (potentially long) ingest.
-    let mut mirror_roots: Vec<String> = Vec::new();
-    let mut missing_mirrors: Vec<String> = Vec::new();
-    if let Ok(storage) = crate::storage::sqlite::FrankenStorage::open(&db_path) {
-        let roots = crate::indexer::build_scan_roots(&storage, &data_dir);
-        let selected_names: std::collections::HashSet<&str> =
-            selected.iter().map(|s| s.name.as_str()).collect();
-        for root in &roots {
-            if selected_names.contains(root.origin.source_id.as_str()) {
-                mirror_roots.push(root.path.display().to_string());
-            }
-        }
-    }
-    for source in &selected {
-        if !mirror_roots
-            .iter()
-            .any(|p| p.contains(&format!("/remotes/{}/", source.name)))
-        {
-            missing_mirrors.push(source.name.clone());
-        }
-    }
+    // can confirm the mirror is present without opening a database before
+    // the indexer acquires its writer lock. Compare source identities, not
+    // platform-specific substrings of rendered filesystem paths.
+    let selected_names: Vec<String> = selected.iter().map(|s| s.name.clone()).collect();
+    let roots: Vec<_> = crate::indexer::build_scan_roots(None, &data_dir)
+        .into_iter()
+        .filter(|root| {
+            root.origin.kind.is_remote() && selected_names.contains(&root.origin.source_id)
+        })
+        .collect();
+    let mirror_roots: Vec<_> = roots
+        .iter()
+        .map(|root| root.path.display().to_string())
+        .collect();
+    let missing_mirrors: Vec<_> = selected_names
+        .iter()
+        .filter(|name| !roots.iter().any(|root| &root.origin.source_id == *name))
+        .cloned()
+        .collect();
 
     let is_robot = output_format.is_some() || robot_format_from_env().is_some();
     if !is_robot {
@@ -116956,6 +117039,7 @@ fn run_sources_reingest(
         false, // robot_trace_ingest
         false, // background
         is_robot.then_some(&mut indexing_result),
+        Some(selected_names),
     );
 
     if is_robot {
@@ -119501,7 +119585,15 @@ fn run_models_backfill(
             }
         })?;
 
-    let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
+    let storage = crate::storage::sqlite::open_current_schema_storage_with_timeout(
+        &db_path,
+        std::time::Duration::from_secs(10),
+    )
+    .and_then(|current| match current {
+        Some(storage) => Ok(storage),
+        None => FrankenStorage::open(&db_path),
+    })
+    .map_err(|e| CliError {
         code: 5,
         kind: CliErrorKind::Storage.kind_str(),
         message: format!("Failed to open cass database {}: {e}", db_path.display()),
@@ -119685,7 +119777,9 @@ fn run_models_backfill(
     }
 
     let progress_pct = outcome.progress_pct();
-    let status = if outcome.published {
+    let status = if outcome.unchanged {
+        "unchanged"
+    } else if outcome.published {
         "published"
     } else if outcome.checkpoint_saved {
         "checkpointed"
@@ -119733,6 +119827,7 @@ fn run_models_backfill(
                 "last_offset": outcome.last_offset,
                 "checkpoint_saved": outcome.checkpoint_saved,
                 "published": outcome.published,
+                "unchanged": outcome.unchanged,
                 "index_path": outcome.index_path.display().to_string(),
                 "manifest_path": outcome.manifest_path.display().to_string(),
                 "backlog": backlog,

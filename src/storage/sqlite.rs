@@ -706,7 +706,7 @@ pub(crate) fn open_current_schema_storage_with_timeout(
     }
 
     let mut storage = FrankenStorage::new(
-        open_franken_raw_connection_with_timeout(path, timeout)?,
+        open_index_schema_connection_with_timeout(path, timeout)?,
         path.to_path_buf(),
     );
     storage.apply_open_stage_busy_timeout();
@@ -735,6 +735,70 @@ pub(crate) fn open_current_schema_storage_with_timeout(
     storage.repair_missing_current_schema_objects()?;
     storage.apply_config()?;
     Ok(Some(storage))
+}
+
+/// Ordinary engine handles permit prepared-query optimization to hydrate the
+/// whole compatibility database. Schema-only handles prohibit that promotion
+/// (fsqlite #402). Use one only when the pinned engine would skip its first-open
+/// repair anyway (GH #443/#450); FTS validation and CASS repair remain enabled.
+fn open_index_schema_connection_with_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> Result<FrankenConnection> {
+    if !index_engine_migration_is_complete(path) {
+        return open_franken_raw_connection_with_timeout(path, timeout);
+    }
+    let deadline = Instant::now() + timeout;
+    let mut backoff = Duration::from_millis(4);
+    loop {
+        let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
+        match FrankenConnection::open_existing_schema_only(path.to_string_lossy().to_string()) {
+            Ok(conn) => return Ok(conn),
+            Err(err) if retryable_franken_error(&err) && Instant::now() < deadline => {
+                sleep_with_franken_retry_backoff(
+                    &mut backoff,
+                    deadline.saturating_duration_since(Instant::now()),
+                    Duration::from_millis(128),
+                );
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "opening migrated index archive schema at {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+}
+
+fn index_engine_migration_is_complete(path: &Path) -> bool {
+    // fsqlite-core 0.3.18 migration::MigrationMarker and
+    // CURRENT_MIGRATION_VERSION. build.rs enforces this exact engine family;
+    // review this admission when changing the pin. The engine's marker is
+    // pathname-scoped, not an integrity attestation or content fingerprint.
+    // Missing/old/malformed markers must still reach its repair constructor.
+    #[derive(Deserialize)]
+    struct EngineMigrationMarker {
+        last_upgrade_version: u32,
+        last_run_at: u64,
+        repairs_applied: Vec<String>,
+    }
+    let mut marker_path = path.as_os_str().to_os_string();
+    marker_path.push(".fsqlite-migration-state");
+    let Ok(file) = fs::File::open(Path::new(&marker_path)) else {
+        return false;
+    };
+    let Ok(marker) =
+        serde_json::from_reader::<_, EngineMigrationMarker>(std::io::Read::take(file, 64 * 1024))
+    else {
+        return false;
+    };
+    // Deserialize the entire engine contract, including fields not used by
+    // the decision, rather than accepting a truncated version-only object.
+    let _ = (marker.last_run_at, marker.repairs_applied);
+    marker.last_upgrade_version >= 1
 }
 
 pub(crate) fn open_franken_readonly_storage_with_timeout(
@@ -7628,8 +7692,15 @@ pub struct InsertOutcome {
     pub conversation_id: i64,
     pub conversation_inserted: bool,
     pub inserted_indices: Vec<i64>,
-    /// Existing messages need new derived workspace associations, not reinsertion.
+    /// Existing messages need new derived workspace associations or titles,
+    /// not reinsertion. Provider metadata alone does not set this flag.
     pub workspace_changed: bool,
+}
+
+/// A completed source observation committed with its final canonical batch.
+pub struct SourceIngestLedgerEntry {
+    pub key: String,
+    pub observation: String,
 }
 
 fn cursor_workspace_attribution_is_authoritative(
@@ -7655,6 +7726,9 @@ fn franken_reconcile_cursor_workspace(
     workspace_id: Option<i64>,
     conv: &Conversation,
 ) -> Result<bool> {
+    if shelley_metadata_is_authoritative(conv) {
+        return franken_reconcile_shelley_metadata(tx, agent_id, conversation_id, workspace_id, conv);
+    }
     if conv.external_id.is_none()
         || !cursor_workspace_attribution_is_authoritative(
             &conv.agent_slug,
@@ -7721,6 +7795,74 @@ fn franken_reconcile_cursor_workspace(
         }
     }
     Ok(previous_workspace != workspace_id)
+}
+
+fn shelley_metadata_is_authoritative(conv: &Conversation) -> bool {
+    conv.agent_slug == "shelley"
+        && conv.external_id.is_some()
+        && conv.metadata_json["source"] == "shelley"
+        && conv.metadata_json["shelley"].is_object()
+}
+
+/// Refresh provider-owned fields without replacing canonical messages or CASS metadata.
+/// The return value requests republication only when searchable fields changed.
+fn franken_reconcile_shelley_metadata(
+    tx: &FrankenTransaction<'_>,
+    agent_id: i64,
+    conversation_id: i64,
+    workspace_id: Option<i64>,
+    conv: &Conversation,
+) -> Result<bool> {
+    let (previous_workspace, previous_title, mut metadata): (
+        Option<i64>, Option<String>, serde_json::Value,
+    ) = tx.query_row_map(
+        "SELECT workspace_id, title, metadata_json, metadata_bin FROM conversations WHERE id = ?1",
+        fparams![conversation_id],
+        |row| Ok((row.get_typed(0)?, row.get_typed(1)?, franken_read_metadata_compat(row, 2, 3))),
+    )?;
+    if !metadata.is_object() {
+        anyhow::bail!("cannot reconcile Shelley metadata for conversation {conversation_id}: canonical metadata is not an object");
+    }
+    let workspace_changed = previous_workspace != workspace_id;
+    let title_changed = previous_title != conv.title;
+    let mut changed = workspace_changed || title_changed;
+    for field in ["source", "shelley"] {
+        if metadata.get(field) != conv.metadata_json.get(field) {
+            metadata[field] = conv.metadata_json[field].clone();
+            changed = true;
+        }
+    }
+    if let Some(original) = conv.metadata_json.pointer("/cass/workspace_original") {
+        let cass = metadata.as_object_mut().expect("checked object")
+            .entry("cass").or_insert_with(|| serde_json::json!({}));
+        if let Some(cass) = cass.as_object_mut()
+            && cass.get("workspace_original") != Some(original)
+        {
+            cass.insert("workspace_original".to_string(), original.clone());
+            changed = true;
+        }
+    }
+    if changed {
+        if workspace_changed {
+            ensure_workspaces_in_tx(tx, &[(agent_id, workspace_id, conv)])?;
+        }
+        let (json, binary) = franken_metadata_insert_payload(&metadata)?;
+        tx.execute_compat(
+            "UPDATE conversations SET workspace_id = ?1, title = ?2, metadata_json = ?3, metadata_bin = ?4 WHERE id = ?5",
+            fparams![workspace_id, conv.title.as_deref(), json.as_deref(), binary.as_deref(), conversation_id],
+        )?;
+        if workspace_changed {
+            let generation = format!("workspace:{:032x}", rand::random::<u128>());
+            for tier in [SemanticIdentityTier::Fast, SemanticIdentityTier::Quality] {
+                tx.execute_compat(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                    fparams![tier.meta_key(), generation.as_str()],
+                )?;
+            }
+            tx.execute("DELETE FROM meta WHERE key = 'last_embedded_message_id'")?;
+        }
+    }
+    Ok(workspace_changed || title_changed)
 }
 
 #[cfg(test)]
@@ -8016,6 +8158,9 @@ fn collect_new_messages_for_existing_conversation<'a>(
     existing_replay_fingerprints: &mut HashSet<MessageReplayFingerprint>,
     replay_skip_log: &'static str,
 ) -> ExistingConversationNewMessages<'a> {
+    if conv.agent_slug == "grok_bot" {
+        return reconciled_native_messages(conv);
+    }
     let mut idx_collision_count = 0usize;
     let mut first_collision_idx: Option<i64> = None;
     let mut new_chars: i64 = 0;
@@ -8054,6 +8199,99 @@ fn collect_new_messages_for_existing_conversation<'a>(
         idx_collision_count,
         first_collision_idx,
     }
+}
+
+/// Grok Bot packets have already been reconciled transactionally by native ID.
+/// Every remaining message is new, regardless of timestamp or content equality.
+fn reconciled_native_messages(conv: &Conversation) -> ExistingConversationNewMessages<'_> {
+    ExistingConversationNewMessages {
+        messages: conv.messages.iter().collect(),
+        new_chars: conv.messages.iter().map(|msg| msg.content.len() as i64).sum(),
+        idx_collision_count: 0,
+        first_collision_idx: None,
+    }
+}
+
+/// Resolve rolling-window positions before the ordinary idx-based append path.
+/// Canonical message envelopes are the durable native-ID map; no second mapping
+/// table can drift from them. Read and append share the writer transaction,
+/// including multiple overlapping windows submitted in one batch.
+fn franken_reconcile_native_message_indices<'a>(
+    tx: &FrankenTransaction<'_>,
+    agent_id: i64,
+    conv: &'a Conversation,
+) -> Result<Cow<'a, Conversation>> {
+    if conv.agent_slug != "grok_bot" {
+        return Ok(Cow::Borrowed(conv));
+    }
+    let external_id = conv.external_id.as_deref().filter(|id| !id.is_empty())
+        .context("Grok Bot rolling transcript requires its account/agent replica identity")?;
+    let existing: Option<(i64, Option<i64>)> = tx.query_row_map(
+        "SELECT id, started_at FROM conversations WHERE source_id = ?1 AND agent_id = ?2 AND external_id = ?3",
+        fparams![conv.source_id.as_str(), agent_id, external_id],
+        |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+    ).optional()?;
+    let mut native_messages = HashMap::new();
+    let mut max_idx = None::<i64>;
+    if let Some((conversation_id, _)) = existing {
+        for row in tx.query_params(
+            "SELECT idx, role, author, created_at, content, extra_json, extra_bin FROM messages WHERE conversation_id = ?1",
+            fparams![conversation_id],
+        )? {
+            let idx = row.get_typed::<i64>(0)?;
+            let extra = franken_read_message_extra_compat(&row, 5, 6);
+            let native_id = grok_bot_native_entry_id(&extra)?.to_owned();
+            let identity = (
+                row.get_typed::<String>(1)?,
+                row.get_typed::<Option<String>>(2)?,
+                row.get_typed::<Option<i64>>(3)?,
+                row.get_typed::<String>(4)?,
+                extra,
+            );
+            if native_messages.insert(native_id, identity).is_some() {
+                bail!("Grok Bot canonical transcript contains duplicate native entry IDs");
+            }
+            max_idx = Some(max_idx.map_or(idx, |previous| previous.max(idx)));
+        }
+    }
+    let mut reconciled = conv.clone();
+    reconciled.messages.clear();
+    if let Some((_, started_at)) = existing {
+        reconciled.started_at = started_at;
+    }
+    for message in &conv.messages {
+        let native_id = grok_bot_native_entry_id(&message.extra_json)?.to_owned();
+        let identity = (
+            role_str(&message.role).to_string(),
+            message.author.clone(),
+            message.created_at,
+            message.content.clone(),
+            message.extra_json.clone(),
+        );
+        if let Some(canonical) = native_messages.get(&native_id) {
+            if canonical != &identity {
+                // Do not log native IDs or chat content in the diagnostic.
+                bail!("Grok Bot native entry ID conflicts with its canonical message");
+            }
+            continue;
+        }
+        let idx = match max_idx {
+            Some(previous) => previous.checked_add(1).context("Grok Bot canonical message index exhausted")?,
+            None => 0,
+        };
+        max_idx = Some(idx);
+        native_messages.insert(native_id, identity);
+        let mut message = message.clone();
+        message.idx = idx;
+        reconciled.messages.push(message);
+    }
+    Ok(Cow::Owned(reconciled))
+}
+
+fn grok_bot_native_entry_id(extra: &serde_json::Value) -> Result<&str> {
+    extra.get("grok_bot_entry_id").and_then(serde_json::Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .context("Grok Bot message is missing its native entry ID")
 }
 
 fn franken_existing_conversation_append_tail_state(
@@ -8395,6 +8633,9 @@ fn collect_append_only_tail_messages<'a>(
     existing_max_idx: i64,
     existing_max_created_at: i64,
 ) -> Option<ExistingConversationNewMessages<'a>> {
+    if conv.agent_slug == "grok_bot" {
+        return Some(reconciled_native_messages(conv));
+    }
     if conv.messages.is_empty() {
         return Some(ExistingConversationNewMessages {
             messages: Vec::new(),
@@ -12212,6 +12453,8 @@ impl FrankenStorage {
         let defer_lexical_updates = defer_storage_lexical_updates_enabled();
         let conversation_key = conversation_merge_key(agent_id, conv);
         let mut tx = self.conn.transaction()?;
+        let reconciled_conv = franken_reconcile_native_message_indices(&tx, agent_id, conv)?;
+        let conv = reconciled_conv.as_ref();
         let existing = franken_find_existing_conversation_with_tail_by_key(
             &tx,
             &conversation_key,
@@ -12382,7 +12625,7 @@ impl FrankenStorage {
                 continue;
             }
             let incoming_replay = message_replay_fingerprint(msg);
-            if pending_replay_fingerprints.contains(&incoming_replay) {
+            if conv.agent_slug != "grok_bot" && pending_replay_fingerprints.contains(&incoming_replay) {
                 tracing::debug!(
                     conversation_id = conv_id,
                     idx = msg.idx,
@@ -15098,7 +15341,37 @@ impl FrankenStorage {
         conversations: &[(i64, Option<i64>, &Conversation)],
         defer_analytics_updates: bool,
     ) -> Result<Vec<InsertOutcome>> {
-        if conversations.is_empty() {
+        self.insert_conversations_batched_with_completion(conversations, defer_analytics_updates, None)
+    }
+
+    pub fn source_ingest_ledger_entries(&self) -> Result<HashMap<String, String>> {
+        Ok(self.conn.query_map_collect(
+            "SELECT key, value FROM meta WHERE key >= 'source_ingest_v1:' AND key < 'source_ingest_v1;'",
+            fparams![],
+            |row| Ok((row.get_typed::<String>(0)?, row.get_typed::<String>(1)?)),
+        )?.into_iter().collect())
+    }
+
+    pub(crate) fn insert_conversations_batched_with_source_completion(
+        &self,
+        conversations: &[(i64, Option<i64>, &Conversation)],
+        completion: &SourceIngestLedgerEntry,
+    ) -> Result<Vec<InsertOutcome>> {
+        self.insert_conversations_batched_with_completion(conversations, defer_analytics_updates_enabled(), Some(completion))
+    }
+
+    fn insert_conversations_batched_with_completion(
+        &self,
+        conversations: &[(i64, Option<i64>, &Conversation)],
+        defer_analytics_updates: bool,
+        completion: Option<&SourceIngestLedgerEntry>,
+    ) -> Result<Vec<InsertOutcome>> {
+        if let Some(completion) = completion
+            && (!completion.key.starts_with("source_ingest_v1:") || completion.key.len() == "source_ingest_v1:".len())
+        {
+            bail!("source completion ledger key must name a source_ingest_v1 observation");
+        }
+        if conversations.is_empty() && completion.is_none() {
             return Ok(Vec::new());
         }
 
@@ -15144,7 +15417,8 @@ impl FrankenStorage {
 
         for &(agent_id, workspace_id, raw_conv) in conversations {
             let normalized_conv = normalized_conversation_for_storage(raw_conv);
-            let conv = normalized_conv.as_ref();
+            let reconciled_conv = franken_reconcile_native_message_indices(&tx, agent_id, normalized_conv.as_ref())?;
+            let conv = reconciled_conv.as_ref();
             let mut total_chars: i64 = 0;
             let mut inserted_indices = Vec::with_capacity(conv.messages.len());
             let mut inserted_messages: Vec<(i64, &Message)> =
@@ -15266,7 +15540,7 @@ impl FrankenStorage {
                         for msg in &conv.messages {
                             let incoming_replay = message_replay_fingerprint(msg);
                             if pending_messages.contains_key(&msg.idx)
-                                || pending_replay_fingerprints.contains(&incoming_replay)
+                                || (conv.agent_slug != "grok_bot" && pending_replay_fingerprints.contains(&incoming_replay))
                             {
                                 continue;
                             }
@@ -15695,6 +15969,12 @@ impl FrankenStorage {
             }
         }
 
+        if let Some(completion) = completion {
+            tx.execute_compat(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
+                fparams![completion.key.as_str(), completion.observation.as_str()],
+            )?;
+        }
         tx.commit()?;
 
         pricing_diag.log_summary();
@@ -17389,6 +17669,9 @@ fn franken_collect_batched_existing_new_messages<'a>(
     HashMap<i64, MessageMergeFingerprint>,
     HashSet<MessageReplayFingerprint>,
 )> {
+    if conv.agent_slug == "grok_bot" {
+        return Ok((reconciled_native_messages(conv), HashMap::new(), HashSet::new()));
+    }
     let tail_metadata = franken_cached_existing_conversation_tail_metadata(tx, conversation_id)?;
     let tail_state = tail_metadata.complete_tail_state();
     if let Some(tail_state) = tail_state
@@ -18357,11 +18640,11 @@ fn franken_reassociate_cursor_analytics_workspace(
     conv: &Conversation,
 ) -> Result<()> {
     if conv.external_id.is_none()
-        || !cursor_workspace_attribution_is_authoritative(
+        || !(shelley_metadata_is_authoritative(conv) || cursor_workspace_attribution_is_authoritative(
             &conv.agent_slug,
             conv.workspace.as_deref(),
             &conv.metadata_json,
-        )
+        ))
     {
         return Ok(());
     }
@@ -32713,6 +32996,225 @@ mod tests {
     }
 
     #[test]
+    fn gh447_native_fifo_retains_history_and_indices_across_restarts() {
+        for batched in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("native.db");
+            let storage = FrankenStorage::open(&path).unwrap();
+            let agent = storage.ensure_agent(&Agent {
+                id: None, slug: "grok_bot".into(), name: "Grok Bot".into(),
+                version: None, kind: AgentKind::Cli,
+            }).unwrap();
+            let first = gh447_native_window(1, 200);
+            let original = gh447_persist(&storage, agent, &first, batched).unwrap();
+            assert_eq!(original.inserted_indices, (0..200).collect::<Vec<_>>());
+            let before = storage.fetch_messages(original.conversation_id).unwrap();
+            assert_eq!(before.len(), 200, "distinct native IDs survive identical text/time");
+            let encoded: i64 = storage.raw().query_row_map(
+                "SELECT COUNT(*) FROM messages WHERE extra_bin IS NOT NULL AND extra_json IS NULL",
+                fparams![], |row| row.get_typed(0),
+            ).unwrap();
+            assert_eq!(encoded, 200, "replay must actually read MessagePack identities");
+            let rolled = gh447_native_window(2, 200);
+            let outcome = gh447_persist(&storage, agent, &rolled, batched).unwrap();
+            assert_eq!(outcome.conversation_id, original.conversation_id);
+            assert!(!outcome.conversation_inserted);
+            assert_eq!(outcome.inserted_indices, vec![200]);
+            let after = storage.fetch_messages(original.conversation_id).unwrap();
+            assert_eq!(after.len(), 201);
+            assert_eq!(serde_json::to_value(&after[..200]).unwrap(), serde_json::to_value(&before).unwrap());
+            assert_eq!(after[200].extra_json["grok_bot_entry_id"], "entry-201");
+            assert_eq!(after[200].idx, 200);
+            drop(storage);
+            let storage = FrankenStorage::open(&path).unwrap();
+            for replay in [&rolled, &first] {
+                let outcome = gh447_persist(&storage, agent, replay, batched).unwrap();
+                assert!(outcome.inserted_indices.is_empty());
+                assert_eq!(outcome.conversation_id, original.conversation_id);
+            }
+            let mut nonoverlap = gh447_native_window(1000, 3);
+            for message in &mut nonoverlap.messages { message.created_at = None; }
+            nonoverlap.ended_at = None;
+            let outcome = gh447_persist(&storage, agent, &nonoverlap, batched).unwrap();
+            assert_eq!(outcome.inserted_indices, vec![201, 202, 203]);
+            assert!(gh447_persist(&storage, agent, &nonoverlap, batched).unwrap().inserted_indices.is_empty());
+            let saved = storage.fetch_messages(original.conversation_id).unwrap();
+            assert_eq!(saved.len(), 204);
+            assert_eq!(serde_json::to_value(&saved[..201]).unwrap(), serde_json::to_value(&after).unwrap());
+        }
+    }
+
+    fn gh447_native_window(start: u32, count: u32) -> Conversation {
+        Conversation {
+            id: None, agent_slug: "grok_bot".into(), workspace: None,
+            external_id: Some("sand.client.slice.account.auth0%7Cuser_a.transcript.replicas.agent-a".into()),
+            title: Some("Grok Bot rolling transcript".into()),
+            source_path: PathBuf::from("/Grok Bot 空間/sand-client-persistence/replica.blob"),
+            started_at: Some(1_767_225_622_759), ended_at: Some(1_767_225_622_759), approx_tokens: None,
+            metadata_json: serde_json::json!({"history_kind":"rolling_agent_transcript","history_complete":false}),
+            messages: (start..start + count).enumerate().map(|(idx, native)| Message {
+                id: None, idx: idx as i64, role: MessageRole::Agent, author: None,
+                created_at: Some(1_767_225_622_759), content: "same-time identical chat".into(),
+                extra_json: serde_json::json!({"grok_bot_entry_id":format!("entry-{native}"),"grok_bot_entry_kind":"send-message"}),
+                snippets: vec![],
+            }).collect(),
+            source_id: "local".into(), origin_host: None,
+        }
+    }
+
+    fn gh447_persist(storage: &FrankenStorage, agent: i64, conv: &Conversation, batched: bool) -> Result<InsertOutcome> {
+        if batched {
+            Ok(storage.insert_conversations_batched_with_analytics(&[(agent, None, conv)], false)?.pop().unwrap())
+        } else {
+            storage.insert_conversation_tree_with_analytics(agent, None, conv, false)
+        }
+    }
+
+    #[test]
+    fn gh447_native_fifo_batch_packets_and_scopes_are_independent() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("scope.db")).unwrap();
+        let agent = storage.ensure_agent(&Agent {
+            id: None, slug: "grok_bot".into(), name: "Grok Bot".into(),
+            version: None, kind: AgentKind::Cli,
+        }).unwrap();
+        let first = gh447_native_window(1, 200);
+        let second = gh447_native_window(2, 200);
+        let third = gh447_native_window(201, 2);
+        let mut other_account = first.clone();
+        other_account.external_id = Some(first.external_id.as_ref().unwrap().replace("user_a", "user_b"));
+        let mut other_agent = first.clone();
+        other_agent.external_id = Some(first.external_id.as_ref().unwrap().replace("agent-a", "agent-b"));
+        let mut remote = first.clone();
+        remote.source_id = "remote-native".into();
+        let outcomes = storage.insert_conversations_batched_with_analytics(&[
+            (agent, None, &first), (agent, None, &second), (agent, None, &second),
+            (agent, None, &third), (agent, None, &other_account),
+            (agent, None, &other_agent), (agent, None, &remote),
+        ], false).unwrap();
+        assert_eq!(outcomes.iter().map(|o| o.inserted_indices.len()).collect::<Vec<_>>(), vec![200, 1, 0, 1, 200, 200, 200]);
+        let original = outcomes[0].conversation_id;
+        assert!(outcomes[..4].iter().all(|outcome| outcome.conversation_id == original));
+        assert_eq!(outcomes[3].inserted_indices, vec![201]);
+        let scopes = [original, outcomes[4].conversation_id, outcomes[5].conversation_id, outcomes[6].conversation_id];
+        assert_eq!(scopes.into_iter().collect::<HashSet<_>>().len(), 4);
+        assert_eq!(storage.fetch_messages(original).unwrap().len(), 202);
+        for id in &scopes[1..] { assert_eq!(storage.fetch_messages(*id).unwrap().len(), 200); }
+    }
+
+    #[test]
+    fn gh447_native_fifo_conflicts_and_missing_ids_roll_back_the_transaction() {
+        for batched in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let storage = FrankenStorage::open(&dir.path().join("conflict.db")).unwrap();
+            let agent = storage.ensure_agent(&Agent {
+                id: None, slug: "grok_bot".into(), name: "Grok Bot".into(),
+                version: None, kind: AgentKind::Cli,
+            }).unwrap();
+            let initial = gh447_native_window(1, 2);
+            let id = gh447_persist(&storage, agent, &initial, batched).unwrap().conversation_id;
+            // Exercise the historical JSON-column form alongside normal MessagePack rows.
+            storage.raw().execute_compat(
+                "UPDATE messages SET extra_json = ?1, extra_bin = NULL WHERE conversation_id = ?2 AND idx = 0",
+                fparams![serde_json::to_string(&initial.messages[0].extra_json).unwrap(), id],
+            ).unwrap();
+            assert!(gh447_persist(&storage, agent, &initial, batched).unwrap().inserted_indices.is_empty());
+            let before = serde_json::to_value(storage.fetch_messages(id).unwrap()).unwrap();
+            for defect in 0..5 {
+                let mut invalid = gh447_native_window(3, 1);
+                let mut conflicting = initial.messages[0].clone();
+                match defect {
+                    0 => conflicting.content = "conflicting native identity".into(),
+                    1 => conflicting.extra_json = serde_json::json!({}),
+                    2 => conflicting.extra_json["grok_bot_entry_id"] = serde_json::json!(" "),
+                    3 => conflicting.created_at = Some(99),
+                    _ => conflicting.role = MessageRole::User,
+                }
+                invalid.messages.push(conflicting);
+                let result = if batched {
+                    storage.insert_conversations_batched_with_analytics(&[(agent, None, &gh447_native_window(9, 1)), (agent, None, &invalid)], false).map(|_| ())
+                } else {
+                    gh447_persist(&storage, agent, &invalid, false).map(|_| ())
+                };
+                assert!(result.is_err(), "identity defect {defect} must refuse the complete transaction");
+                assert_eq!(serde_json::to_value(storage.fetch_messages(id).unwrap()).unwrap(), before);
+            }
+            let mut duplicate = gh447_native_window(3, 1);
+            duplicate.messages.push(duplicate.messages[0].clone());
+            assert_eq!(gh447_persist(&storage, agent, &duplicate, batched).unwrap().inserted_indices, vec![2]);
+            let mut conflicting_duplicate = gh447_native_window(4, 1);
+            let mut second = conflicting_duplicate.messages[0].clone();
+            second.content = "changed under same ID".into();
+            conflicting_duplicate.messages.push(second);
+            assert!(gh447_persist(&storage, agent, &conflicting_duplicate, batched).is_err());
+            assert_eq!(storage.fetch_messages(id).unwrap().len(), 3);
+            let empty = gh447_native_window(1, 0);
+            assert!(gh447_persist(&storage, agent, &empty, batched).unwrap().inserted_indices.is_empty());
+        }
+    }
+
+    #[test]
+    fn gh415_shelley_metadata_refresh_preserves_rows_and_invalidates_searchable_changes() {
+        for batched in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let storage = FrankenStorage::open(&dir.path().join("shelley.db")).unwrap();
+            let agent = storage.ensure_agent(&Agent {
+                id: None, slug: "shelley".into(), name: "Shelley".into(),
+                version: None, kind: AgentKind::Cli,
+            }).unwrap();
+            let old_path = PathBuf::from("/old");
+            let new_path = PathBuf::from("/new");
+            let old = storage.ensure_workspace(&old_path, None).unwrap();
+            let new = storage.ensure_workspace(&new_path, None).unwrap();
+            let mut conv = Conversation {
+                id: None, agent_slug: "shelley".into(), workspace: Some(old_path),
+                external_id: Some("shelley:fixture:alpha".into()), title: Some("old title".into()),
+                source_path: PathBuf::from("/source/shelley.db"), started_at: Some(100),
+                ended_at: Some(100), approx_tokens: None,
+                metadata_json: serde_json::json!({"source":"shelley","shelley":{"archived":false},"cass":{"retained":true}}),
+                messages: vec![Message {
+                    id: None, idx: 7, role: MessageRole::User, author: None,
+                    created_at: Some(100), content: "retained Shelley content".into(),
+                    extra_json: serde_json::json!({"keep":true}), snippets: vec![],
+                }], source_id: "local".into(), origin_host: None,
+            };
+            let original = storage.insert_conversation_tree(agent, Some(old), &conv).unwrap();
+            let messages = serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap()).unwrap();
+            conv.messages.clear();
+            conv.metadata_json = serde_json::json!({"source":"shelley","shelley":{"archived":true,"tags":["reviewed"]}});
+            let mut generation = None;
+            for step in 0..5 {
+                if step == 1 { conv.title = Some("new title".into()); }
+                if step == 2 { conv.workspace = Some(new_path.clone()); }
+                let workspace = if step < 2 { old } else { new };
+                let outcome = if batched {
+                    storage.insert_conversations_batched(&[(agent, Some(workspace), &conv)]).unwrap().pop().unwrap()
+                } else {
+                    storage.insert_conversation_tree(agent, Some(workspace), &conv).unwrap()
+                };
+                assert_eq!(outcome.conversation_id, original.conversation_id);
+                assert!(!outcome.conversation_inserted);
+                assert!(outcome.inserted_indices.is_empty());
+                assert_eq!(outcome.workspace_changed, step == 1 || step == 2);
+                assert_eq!(serde_json::to_value(storage.fetch_messages(original.conversation_id).unwrap()).unwrap(), messages);
+                let saved = storage.list_conversations(10, 0).unwrap().pop().unwrap();
+                assert_eq!(saved.metadata_json["cass"]["retained"], true);
+                assert_eq!(saved.metadata_json["shelley"]["archived"], true);
+                assert_eq!(saved.title, conv.title);
+                for tier in [SemanticIdentityTier::Fast, SemanticIdentityTier::Quality] {
+                    let current = storage.semantic_identity_rebuild_generation(tier).unwrap();
+                    if step < 2 { assert!(current.is_none()); }
+                    else if step == 2 {
+                        assert!(current.is_some());
+                        if generation.is_none() { generation = current.clone(); }
+                        assert_eq!(current, generation);
+                    } else { assert_eq!(current, generation); }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn gh459_cursor_workspace_repair_preserves_rows_and_requires_explicit_authority() {
         for batched in [false, true] {
             let dir = TempDir::new().unwrap();
@@ -37052,6 +37554,156 @@ mod tests {
             meta_version,
             CURRENT_SCHEMA_VERSION.to_string(),
             "meta.schema_version should match CURRENT_SCHEMA_VERSION"
+        );
+    }
+
+    #[test]
+    fn gh443_current_schema_open_preserves_rows_and_search_after_writes() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("migrated.db");
+        let marker_path = path.with_file_name("migrated.db.fsqlite-migration-state");
+        {
+            let storage = FrankenStorage::open(&path).unwrap();
+            storage
+                .raw()
+                .execute_batch(
+                    "CREATE TABLE startup_payload(id INTEGER PRIMARY KEY, content TEXT NOT NULL);\n\
+                 CREATE VIRTUAL TABLE startup_search USING fts5(content);\n\
+                 INSERT INTO startup_search(content) VALUES('prior searchable evidence');",
+                )
+                .unwrap();
+            let payload = "prior archive payload ".repeat(16384);
+            for id in 0..8_i64 {
+                storage
+                    .raw()
+                    .execute_compat(
+                        "INSERT INTO startup_payload(id,content) VALUES(?1,?2)",
+                        fparams![id, payload.as_str()],
+                    )
+                    .unwrap();
+            }
+        }
+        let marker = fs::read(&marker_path).unwrap();
+        assert!(index_engine_migration_is_complete(&path));
+        {
+            let mut old =
+                open_franken_raw_connection_with_timeout(&path, Duration::from_secs(10)).unwrap();
+            {
+                let metadata = old
+                    .prepare("SELECT value FROM meta WHERE key = ?1")
+                    .unwrap();
+                let versions = metadata
+                    .query_with_params(&[SqliteValue::Text("schema_version".into())])
+                    .unwrap();
+                assert_eq!(
+                    versions[0].get_typed::<String>(0).unwrap(),
+                    CURRENT_SCHEMA_VERSION.to_string()
+                );
+            }
+            assert!(
+                old.as_async().memdb_row_hydration_count() >= 8,
+                "control must exercise the old constructor's unrelated row hydration"
+            );
+            old.close_without_checkpoint_in_place().unwrap();
+        }
+        let storage = open_current_schema_storage_with_timeout(&path, Duration::from_secs(10))
+            .unwrap()
+            .expect("current migrated archive must open");
+        let metadata = storage
+            .raw()
+            .prepare("SELECT value FROM meta WHERE key = ?1")
+            .unwrap();
+        let versions = metadata
+            .query_with_params(&[SqliteValue::Text("schema_version".into())])
+            .unwrap();
+        assert_eq!(
+            versions[0].get_typed::<String>(0).unwrap(),
+            CURRENT_SCHEMA_VERSION.to_string()
+        );
+        assert_eq!(
+            storage.raw().as_async().memdb_row_hydration_count(),
+            0,
+            "metadata admission must not hydrate unrelated archive rows"
+        );
+        let rows = storage
+            .raw()
+            .query("SELECT id,content FROM startup_payload ORDER BY id")
+            .unwrap();
+        assert_eq!(rows.len(), 8);
+        for (id, row) in rows.iter().enumerate() {
+            assert_eq!(row.get_typed::<i64>(0).unwrap(), id as i64);
+            assert_eq!(
+                row.get_typed::<String>(1).unwrap(),
+                "prior archive payload ".repeat(16384)
+            );
+        }
+        storage
+            .raw()
+            .execute("INSERT INTO startup_search(content) VALUES('new searchable evidence')")
+            .unwrap();
+        let hits = storage.raw().query("SELECT content FROM startup_search WHERE startup_search MATCH 'searchable' ORDER BY rowid").unwrap();
+        assert_eq!(
+            hits.len(),
+            2,
+            "schema-only open must retain existing FTS and accept new writes"
+        );
+        assert_eq!(
+            hits[0].get_typed::<String>(0).unwrap(),
+            "prior searchable evidence"
+        );
+        assert_eq!(
+            hits[1].get_typed::<String>(0).unwrap(),
+            "new searchable evidence"
+        );
+        assert_eq!(fs::read(&marker_path).unwrap(), marker);
+    }
+
+    #[test]
+    fn gh443_current_schema_open_runs_required_engine_migration() {
+        for marker in [
+            None,
+            Some("not json"),
+            Some(r#"{"last_upgrade_version":1}"#),
+            Some(r#"{"last_upgrade_version":0,"last_run_at":0,"repairs_applied":[]}"#),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("pending.db");
+            let marker_path = path.with_file_name("pending.db.fsqlite-migration-state");
+            drop(FrankenStorage::open(&path).unwrap());
+            match marker {
+                Some(bytes) => fs::write(&marker_path, bytes).unwrap(),
+                None => {
+                    fs::rename(&marker_path, dir.path().join("retained-birth-marker.json")).unwrap()
+                }
+            }
+            assert!(!index_engine_migration_is_complete(&path));
+            let storage = open_current_schema_storage_with_timeout(&path, Duration::from_secs(10))
+                .unwrap()
+                .expect("required engine migration must still reach a usable archive");
+            assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+            assert!(
+                index_engine_migration_is_complete(&path),
+                "full constructor must finish and record required repair"
+            );
+        }
+    }
+
+    #[test]
+    fn gh443_current_schema_marker_cannot_admit_legacy_schema() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy.db");
+        {
+            let storage = FrankenStorage::open(&path).unwrap();
+            storage
+                .raw()
+                .execute("UPDATE meta SET value='13' WHERE key='schema_version'")
+                .unwrap();
+        }
+        assert!(index_engine_migration_is_complete(&path));
+        assert!(
+            open_current_schema_storage_with_timeout(&path, Duration::from_secs(10))
+                .unwrap()
+                .is_none()
         );
     }
 

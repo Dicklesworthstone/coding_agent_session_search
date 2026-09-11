@@ -87,7 +87,7 @@ class FleetRun:
         if self.ssh_config.is_relative_to(self.repo):
             raise ValueError("SSH configuration must be outside the repository")
         self.binary = str(Path(binary).resolve(strict=True))
-        self.root = Path(tempfile.mkdtemp(prefix="cass-live-fleet-"))
+        self.root = Path(tempfile.mkdtemp(prefix="cass-live-fleet-")).resolve()
         self.root.chmod(0o700)
         if self.root.is_relative_to(self.repo):
             raise ValueError("TMPDIR must be outside the repository")

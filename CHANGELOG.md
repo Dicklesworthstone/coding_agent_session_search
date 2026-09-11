@@ -29,6 +29,27 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ## [Unreleased]
 
+### Fixed
+
+- Explicit Prime watch requests keep the selected file scope and classify
+  `.prime/agent/sessions` correctly (#388).
+- Current-schema archive opens avoid the engine's whole-database hydration
+  path for already migrated archives, retaining required migration and schema
+  repair checks (#443, #450).
+- Semantic backfill rebuilds the known legacy hash-vector format. On Unix,
+  unchanged completed backfills can skip canonical replay and publication;
+  the cache checks archive, WAL, vector and producer identity, and changes
+  still trigger reconciliation (#458).
+- `sources reingest --source` restricts ingestion to the selected remote
+  mirrors and rejects unknown names even when mixed with valid names. Reingest
+  preserves local scan watermarks, so later ordinary indexing still discovers
+  local history. Mirror previews no longer open the database before the index
+  lock, and mirror lookup uses the same configured path keys as sync, including
+  a bare `~` (bead `av59c`).
+- The private fleet test harness resolves its artifact directory before
+  checking repository containment. A `TMPDIR` symlink into the checkout can no
+  longer place the private inventory there.
+
 ## [v0.8.0] -- 2026-09-10
 
 ### Known open at release

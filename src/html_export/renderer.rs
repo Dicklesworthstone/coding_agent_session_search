@@ -568,6 +568,7 @@ pub fn agent_display_name(slug: &str) -> &'static str {
         "prime_agent" => "Prime Agent",
         "kiro" => "Kiro",
         "devin" => "Devin",
+        "shelley" => "Shelley",
         _ => "AI Assistant",
     }
 }
@@ -1629,6 +1630,8 @@ mod tests {
         assert_eq!(agent_display_name("kimi"), "Kimi");
         assert_eq!(agent_display_name("qwen"), "Qwen");
         assert_eq!(agent_display_name("unknown"), "AI Assistant");
+        assert_eq!(agent_display_name("shelley"), "Shelley");
+        assert_eq!(agent_css_class("shelley"), "agent-default");
     }
 
     #[test]

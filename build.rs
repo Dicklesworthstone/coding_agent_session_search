@@ -158,6 +158,7 @@ const CONTRACTS: &[DependencyContract] = &[
             "goose",
             "hermes",
             "opencode",
+            "shelley",
         ],
         expected_default_features: None,
         repo_rel: "../franken_agent_detection",
