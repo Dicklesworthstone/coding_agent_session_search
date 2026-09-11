@@ -12912,10 +12912,13 @@ fn remember_discovered_connector(discovered_names: &mut Vec<String>, connector_n
     }
 }
 
-fn source_ledger_key(source: &DiscoveredSourceFile) -> String {
+fn source_ledger_key(source: &DiscoveredSourceFile, ctx: &ScanContext) -> String {
+    let mappings=ctx.scan_roots.iter().map(|root|serde_json::json!([
+        root.path,root.workspace_rewrites
+    ])).collect::<Vec<_>>();
     let identity = serde_json::json!([
         source.provider_slug, source.scan_root, source.source_path,
-        source.origin.source_id, source.origin.kind, source.origin.host
+        source.origin.source_id, source.origin.kind, source.origin.host,mappings
     ]);
     format!("source_ingest_v1:{}", blake3::hash(identity.to_string().as_bytes()).to_hex())
 }
@@ -12972,7 +12975,7 @@ fn scan_with_durable_source_boundaries(
         }
         filtered.set(scan_path_exclusions_active());
         *before.borrow_mut() = source.source_path.parent().and_then(source_file_observation);
-        let skip = !filtered.get() && config.source_ledger.get(&source_ledger_key(source))
+        let skip = !filtered.get() && config.source_ledger.get(&source_ledger_key(source,&ctx))
             .is_some_and(|saved| source_ledger_matches(saved,source));
         tracing::debug!(connector=%source.provider_slug, skipped=skip,"source_ingest_observation");
         !skip
@@ -12995,7 +12998,7 @@ fn scan_with_durable_source_boundaries(
             dependencies.push(observation);
         }
         let entry = crate::storage::sqlite::SourceIngestLedgerEntry {
-            key:source_ledger_key(&completion.source),
+            key:source_ledger_key(&completion.source,&ctx),
             observation:serde_json::json!({"primary":primary,"dependencies":dependencies}).to_string(),
         };
         sender.borrow_mut().complete_source(entry)
@@ -47298,6 +47301,27 @@ mod tests {
             "remote scan errors must prevent per-connector watermark advancement"
         );
         assert!(mutations.scan_had_errors);
+    }
+
+    #[test]
+    fn gh426_source_observation_rejects_changed_primary_sidecar_and_new_dependency() {
+        let temp=TempDir::new().unwrap();
+        let path=temp.path().join("source.jsonl");
+        let sidecar=temp.path().join("source.json");
+        std::fs::write(&path,b"source").unwrap();
+        std::fs::write(&sidecar,b"sidecar").unwrap();
+        let source=DiscoveredSourceFile::new("kiro",&ScanRoot::local(temp.path().to_path_buf()),
+            path.clone(),crate::connectors::DiscoveredSourceRole::PrimarySessionLog,true).with_fs_metadata();
+        let snapshot=||serde_json::json!({"primary":source_file_observation(&path).unwrap(),
+            "dependencies":[source_file_observation(temp.path()).unwrap(),source_file_observation(&sidecar).unwrap()]}).to_string();
+        let saved=snapshot();assert!(source_ledger_matches(&saved,&source));
+        std::fs::write(&sidecar,b"changed sidecar").unwrap();
+        assert!(!source_ledger_matches(&saved,&source));
+        let saved=snapshot();std::fs::write(&path,b"changed primary").unwrap();
+        assert!(!source_ledger_matches(&saved,&source));
+        let saved=snapshot();std::fs::write(temp.path().join("new-required-sidecar"),b"new").unwrap();
+        assert!(!source_ledger_matches(&saved,&source));
+        assert!(!source_ledger_matches("{}",&source));
     }
 
     #[test]
