@@ -102403,6 +102403,42 @@ fn index_worker_thread_builder() -> std::thread::Builder {
         .stack_size(INDEX_WORKER_STACK_SIZE_BYTES)
 }
 
+/// Poll cancel-safe Asupersync signal streams from the existing CLI progress
+/// loop. Signal delivery only requests a stop; the index worker owns draining
+/// the current batch, durable completion records and its indexing lock.
+struct IndexShutdownSignals {
+    streams: Vec<(asupersync::signal::Signal, i32)>,
+    received: Option<i32>,
+}
+
+impl IndexShutdownSignals {
+    fn new(enabled: bool) -> std::io::Result<Self> {
+        use asupersync::signal::{SignalKind, signal};
+        let streams = if enabled && cfg!(any(unix, windows)) {
+            vec![
+                (signal(SignalKind::interrupt())?, 130),
+                (signal(SignalKind::terminate())?, 143),
+            ]
+        } else {
+            Vec::new()
+        };
+        Ok(Self { streams, received: None })
+    }
+
+    fn poll(&mut self, progress: &indexer::IndexingProgress) {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        let mut context = Context::from_waker(Waker::noop());
+        for (signal, code) in &mut self.streams {
+            let mut receive = std::pin::pin!(signal.recv());
+            if matches!(receive.as_mut().poll(&mut context), Poll::Ready(Some(()))) {
+                self.received.get_or_insert(*code);
+                progress.request_stop();
+            }
+        }
+    }
+}
+
 /// Run an incremental index pass before a TUI or Search invocation when the
 /// user passes `--refresh` (alias `--catch-up`). Mirrors `cass index` with
 /// `full=false`, `force_rebuild=false`, `watch=false`, `semantic=false` so it
@@ -105124,6 +105160,13 @@ fn run_index_with_data(
     let mut progress_completion: Option<(indicatif::ProgressBar, usize, usize)> = None;
 
     // Run indexer in background thread so we can poll progress
+    let mut shutdown_signals = IndexShutdownSignals::new(!watch).map_err(|error| CliError {
+        code: 9,
+        kind: CliErrorKind::Index.kind_str(),
+        message: format!("failed to register indexing shutdown signals: {error}"),
+        hint: None,
+        retryable: true,
+    })?;
     let opts_clone = opts.clone();
     let previous_robot_trace_ingest =
         robot_trace_ingest.then(|| indexer::set_robot_trace_ingest_enabled(true));
@@ -105171,6 +105214,7 @@ fn run_index_with_data(
 
         loop {
             // Check if indexer finished
+            shutdown_signals.poll(&index_progress);
             if index_handle.is_finished() {
                 break;
             }
@@ -105304,6 +105348,7 @@ fn run_index_with_data(
                 .semantic_aware(semantic);
 
         loop {
+            shutdown_signals.poll(&index_progress);
             if index_handle.is_finished() {
                 break;
             }
@@ -105415,6 +105460,7 @@ fn run_index_with_data(
         // Finish-aware poll cadence: 100ms for snappy shutdown, but only emit a
         // `progress` event at `progress_interval`.
         loop {
+            shutdown_signals.poll(&index_progress);
             if index_handle.is_finished() {
                 break;
             }
@@ -105465,6 +105511,7 @@ fn run_index_with_data(
                 .watch_aware(watch)
                 .semantic_aware(semantic);
         while !index_handle.is_finished() {
+            shutdown_signals.poll(&index_progress);
             if let Some(payload) =
                 stall_watchdog.observe(&index_progress, start.elapsed().as_millis())
             {
