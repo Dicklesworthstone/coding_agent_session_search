@@ -1,5 +1,30 @@
 # Dependency Upgrade Log
 
+## September 2026 release update (in progress)
+
+Owner request: update stable dependencies individually, then publish a complete
+release through DSR, GitHub, crates.io and Homebrew without GitHub Actions.
+Registry inventory on September 12 UTC found 103 declarations covering 98
+direct packages; 18 packages have newer stable releases. No upgrade is yet
+validated in this pass. FrankenSQLite 0.3.18 and agent detection 0.2.4 are current.
+
+First candidate: crossbeam-channel 0.5.16 → 0.5.17. Its published changelog
+documents a bounded-channel `SelectedOperation` leak memory-safety fix,
+initialization overflow fixes, and timer corrections. CASS uses bounded
+channels in indexing and storage. A single-package lockfile update and remote
+validation are in progress; no other dependency is changed alongside it.
+Source: [published crate](https://static.crates.io/crates/crossbeam-channel/crossbeam-channel-0.5.17.crate).
+
+Pending: asupersync, console, reqwest, rustls, toml, which, lru, smallvec,
+FrankenTUI (four coordinated direct crates), dirs, frankensearch, wide,
+argon2 and flate2. Major API changes and the documented frankensearch hold
+require source review before adoption. Existing full-test and strict UBS
+release requirements remain in force.
+
+Publication baseline: GitHub v0.8.0; Homebrew v0.7.1; crates.io v0.7.0.
+The next release must verify every applicable venue rather than infer
+publication from a Git tag. No new version bump or release has happened yet.
+
 **Date:** 2026-02-17  
 **Project:** coding_agent_session_search (`cass`)  
 **Language:** Rust
