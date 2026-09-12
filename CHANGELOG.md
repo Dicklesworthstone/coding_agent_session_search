@@ -32,6 +32,11 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- Fleet setup retains resumable progress while its final sync is pending,
+  including after a failed sync or JSON-mode deferral.
+- Fleet auto-discovery excludes Muse's authentication file and configuration
+  directory from generated sync sources while retaining its session data.
+  Existing source configurations are unchanged.
 - Devin incremental scans retain messages committed within the watermark's
   whole second. WAL-only appends and replay preserve message identity (#449).
 - Pending OMP analytics repair appears in status, validation and doctor.

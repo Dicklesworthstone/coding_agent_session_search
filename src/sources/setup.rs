@@ -1225,8 +1225,11 @@ pub fn run_setup(opts: &SetupOptions) -> Result<SetupResult, SetupError> {
         println!("└{}", "─".repeat(70).dimmed());
     }
 
-    // Clear state on success
-    SetupState::clear()?;
+    // The CLI has not attempted the final sync yet (JSON mode defers it).
+    // Keep the selected hosts and completed phases so a failed sync can resume.
+    if !sync_pending {
+        SetupState::clear()?;
+    }
 
     let total_sessions: u64 = selected_hosts
         .iter()

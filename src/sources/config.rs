@@ -2662,6 +2662,33 @@ Host production !legacy-prod
     }
 
     #[test]
+    fn remote_autoconfig_rejects_muse_credentials_but_keeps_sessions() {
+        let generator = SourceConfigGenerator::new();
+        let report = make_test_probe(
+            true,
+            vec![
+                make_test_agent("muse", "~/.config/muse/auth.json"),
+                make_test_agent("muse", "~/.config/muse"),
+                make_test_agent("unknown", "/home/test/.config/muse/"),
+                make_test_agent("unknown", r"C:\Users\test\.config\muse\auth.json"),
+                make_test_agent("muse", "~/.local/share/muse/sessions"),
+                make_test_agent("muse", "~/.local/share/muse"),
+                make_test_agent("unknown", "~/.config/muse-other/sessions"),
+            ],
+            Some(make_test_sys_info("linux", "/home/test")),
+        );
+        let source = generator.generate_source("workstation", &report);
+        assert_eq!(
+            source.paths,
+            vec![
+                "~/.local/share/muse/sessions",
+                "~/.local/share/muse",
+                "~/.config/muse-other/sessions",
+            ]
+        );
+    }
+
+    #[test]
     fn test_generate_source_disambiguates_reserved_local_name() {
         let generator = SourceConfigGenerator::new();
         let probe = make_test_probe(

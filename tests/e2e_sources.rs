@@ -37,6 +37,109 @@ fn read_sources_config(config_dir: &Path) -> String {
     fs::read_to_string(&config_file).unwrap_or_default()
 }
 
+#[test]
+#[cfg(target_os = "linux")]
+fn sources_setup_resume_retains_pending_sync_after_real_transport_failure() {
+    use coding_agent_search::sources::probe::HostProbeResult;
+    use coding_agent_search::sources::setup::SetupState;
+
+    let tracker =
+        tracker_for("sources_setup_resume_retains_pending_sync_after_real_transport_failure");
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("config");
+    let cache = root.path().join("cache");
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(cache.join("cass")).unwrap();
+    create_sources_config(
+        &config,
+        "[[sources]]\nname = 'retry-peer'\ntype = 'ssh'\nhost = 'retry-peer'\npaths = ['~/.codex/sessions']\n",
+    );
+    // Real OpenSSH takes a deterministic failing transport, without contacting
+    // any external host or substituting a fake ssh/rsync executable.
+    let ssh_config = root.path().join("ssh_config");
+    fs::write(
+        &ssh_config,
+        "Host *\n  ProxyCommand false\n  BatchMode yes\n",
+    )
+    .unwrap();
+    let mut probe = HostProbeResult::unreachable("retry-peer", "unused fixture error");
+    probe.reachable = true;
+    probe.error = None;
+    let state = SetupState {
+        discovery_complete: true,
+        discovered_hosts: 1,
+        discovered_host_names: vec!["retry-peer".into()],
+        probing_complete: true,
+        probed_hosts: vec![probe],
+        selection_complete: true,
+        selected_host_names: vec!["retry-peer".into()],
+        installation_complete: true,
+        indexing_complete: true,
+        configuration_complete: true,
+        ..Default::default()
+    };
+    let state_path = cache.join("cass/setup_state.json");
+    fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+    let config_before = read_sources_config(&config);
+    let env = tracker
+        .command_environment()
+        .with_home(&home)
+        .with_var("XDG_CONFIG_HOME", &config)
+        .with_var("XDG_CACHE_HOME", &cache)
+        .with_var("XDG_DATA_HOME", root.path().join("data"))
+        .with_var("CASS_DATA_DIR", root.path().join("cass-data"))
+        .with_var("CASS_SSH_CONFIG", &ssh_config);
+    let args = [
+        "sources",
+        "setup",
+        "--resume",
+        "--non-interactive",
+        "--skip-install",
+        "--skip-index",
+    ];
+    let failed = env
+        .cass_assert_command()
+        .args(args)
+        .timeout(std::time::Duration::from_secs(30))
+        .output()
+        .unwrap();
+    assert!(
+        !failed.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&failed.stdout),
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains("final sync failed"),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&failed.stdout),
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    for _ in 0..2 {
+        let resumed = env
+            .cass_assert_command()
+            .args(args)
+            .arg("--json")
+            .timeout(std::time::Duration::from_secs(30))
+            .output()
+            .unwrap();
+        assert!(
+            resumed.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&resumed.stderr)
+        );
+        let result: Value = serde_json::from_slice(&resumed.stdout).unwrap();
+        assert_eq!(result["sync"]["status"], "pending");
+        let retained: SetupState = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(retained.selected_host_names, ["retry-peer"]);
+        assert!(retained.configuration_complete);
+        assert!(!retained.sync_complete);
+        assert_eq!(read_sources_config(&config), config_before);
+    }
+    tracker.complete();
+}
+
 fn read_optional_bytes(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
     match fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),

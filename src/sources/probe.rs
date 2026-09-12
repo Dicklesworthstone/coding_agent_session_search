@@ -216,6 +216,12 @@ pub(crate) fn remote_probe_source_allowed(agent: &str, path: &str) -> bool {
         return false;
     }
     let path = path.replace('\\', "/");
+    // FAD also probes Muse's authentication file to detect a local install.
+    // Neither that file nor its containing configuration tree is session data.
+    // Apply the path boundary even to old reports classified as "unknown".
+    if path.contains("/.config/muse/") || path.ends_with("/.config/muse") {
+        return false;
+    }
     !path.contains("/Library/Application Support/Grok Bot/")
         && !path.ends_with("/Library/Application Support/Grok Bot")
 }
@@ -1505,6 +1511,8 @@ CASS_VERSION=0.4.2
         assert!(script.contains("copilot-chat"), "missing copilot path");
         assert!(script.contains("~/.windsurf"), "missing windsurf path");
         assert!(script.contains("~/.factory"), "missing factory path");
+        assert!(script.contains("~/.local/share/muse/sessions"));
+        assert!(!script.contains("~/.config/muse"));
         assert!(script.contains("~/.clawdbot"), "missing clawdbot path");
         assert!(script.contains("~/.vibe"), "missing vibe path");
         assert!(script.contains("sourcegraph.amp"), "missing amp path");

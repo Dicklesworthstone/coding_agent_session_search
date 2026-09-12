@@ -1,5 +1,33 @@
 # CASS 0.8.0 changelog research
 
+Fleet follow-up (September 11, unreleased, bead av59c): published FAD 0.2.3
+lists `~/.config/muse/auth.json` and `~/.config/muse` as local discovery probes.
+CASS previously admitted both into automatic remote source configuration.
+The shared discovery/configuration predicate now excludes that configuration
+tree, including old reports classified as unknown, while retaining Muse's
+data roots. Existing manually configured sources are not rewritten. Focused
+remote validation passed as recorded below; this finding does not establish that any
+operator credentials were actually transferred.
+
+The same fleet review found `run_setup` cleared its saved state before the
+CLI attempted final sync, contradicting the failed-sync resume hint. State
+is now retained while sync is pending. The new CLI regression starts from
+fixture-backed completed setup, exercises a real OpenSSH transport failure,
+and checks repeated JSON resume still reports pending sync with the selected
+host and source configuration preserved. This is not successful live SSH
+recovery or all-ten-machine acceptance.
+
+Remote validation completed on September 11 at 20:26 UTC. Formatting and
+all-target Clippy passed, along with 34 library tests and the CLI regression.
+A test-only follow-up explicitly bound `CASS_DATA_DIR` and improved failure
+diagnostics; its formatting, scoped Clippy and CLI rerun passed. The first
+run's environment was checked and had no inherited data-directory override.
+Strict UBS 5.3.13 remains red: the four-file scan reported 5 critical findings
+and 1,781 warnings; the final test-file scan reported zero critical findings
+and 1,108 warnings. No findings were suppressed. The three production files
+and final test match their tested hashes. This is local unreleased work,
+not full-suite, successful fleet-recovery or release acceptance.
+
 Subsequent validation (2026-09-11 UTC, unreleased): v7 passed formatting,
 all-target Clippy, 178 library tests, 68 integration tests and 68 goldens.
 Two integration failures remain recorded: a Devin WAL append returned four
