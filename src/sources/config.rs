@@ -1389,7 +1389,10 @@ impl SourcesConfig {
 
         // Create backup if file exists
         let backup_path = if config_path.exists() {
-            Some(copy_sources_config_backup(&config_path, unique_backup_path)?)
+            Some(copy_sources_config_backup(
+                &config_path,
+                unique_backup_path,
+            )?)
         } else {
             None
         };
@@ -1831,8 +1834,14 @@ mod tests {
         .expect("retry symlink collision");
         assert_eq!(attempts, 2);
         assert_eq!(backup, fresh);
-        assert_eq!(std::fs::read(&backup).expect("read backup"), b"source config");
-        assert_eq!(std::fs::read(&source).expect("read source"), b"source config");
+        assert_eq!(
+            std::fs::read(&backup).expect("read backup"),
+            b"source config"
+        );
+        assert_eq!(
+            std::fs::read(&source).expect("read source"),
+            b"source config"
+        );
         assert_eq!(
             std::fs::read(&protected).expect("read protected file"),
             b"protected config"
