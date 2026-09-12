@@ -47,7 +47,7 @@ edition = "2024"
 [workspace]
 TOML
         printf 'fn main() {}\n' > "$proof_dir/crate/src/main.rs"
-        cd "$proof_dir/crate"
+        cd "$proof_dir/crate" || exit 1
         check_exit formatter-clean 0 env RUSTFMT="$CASS_TEST_REAL_RUSTFMT" bash "$gate" --verify-fmt
         printf 'fn main(){ }\n' > src/main.rs
         check_exit formatter-diff 1 env RUSTFMT="$CASS_TEST_REAL_RUSTFMT" bash "$gate" --verify-fmt
@@ -291,7 +291,7 @@ fi
 TMP_DIR="$(mktemp -d)"
 git -C "$PROJECT_ROOT" worktree add "$TMP_DIR" HEAD >/dev/null 2>&1 || true
 if [ -d "$TMP_DIR/.git" ] || [ -e "$TMP_DIR/.git" ]; then
-    cd "$TMP_DIR"
+    cd "$TMP_DIR" || exit 1
     mkdir -p tests/fixtures
     echo '{}' > tests/fixtures/synthetic.json
     git add tests/fixtures/synthetic.json 2>/dev/null || true
@@ -300,7 +300,7 @@ if [ -d "$TMP_DIR/.git" ] || [ -e "$TMP_DIR/.git" ]; then
     # The fixture .json should NOT match — UBS only filters extensions in the gate's list.
     file_count=$([ -z "$files" ] && echo 0 || echo "$files" | wc -l)
     expect_eq "scenario=fixture_only_change skips invocation" "$file_count" "0"
-    cd "$PROJECT_ROOT"
+    cd "$PROJECT_ROOT" || exit 1
     git -C "$PROJECT_ROOT" worktree remove --force "$TMP_DIR" >/dev/null 2>&1 || rm -rf "$TMP_DIR"
 fi
 
