@@ -29,16 +29,22 @@ set -uo pipefail
 test_log_counts() {
     awk '
         /^running [0-9]+ tests?$/ {
-            if (started != binaries) incomplete++
-            started++
+            announced[++depth] = $2
+            next
         }
-        /^test result: ok\. [0-9]+ passed;/ {
-            if (started != binaries + 1) incomplete++
-            binaries++; passed += $4; if ($4 == 0) empty++
+        /^test result: ok\. [0-9]+ passed; [0-9]+ failed; [0-9]+ ignored; [0-9]+ measured; [0-9]+ filtered out/ {
+            if (depth == 0) { incomplete++; next }
+            if ($6 != 0 || $4 + $6 + $8 + $10 != announced[depth]) incomplete++
+            if ($4 == 0) empty++
+            delete announced[depth--]
+            # Inherited subprocess output nests inside its parent test run.
+            # Count each top-level binary once; every child must still finish.
+            if (depth == 0) { binaries++; passed += $4 }
+            next
         }
-        /^test result: FAILED\./ { empty++ }
+        /^test result:/ { incomplete++ }
         END {
-            if (binaries == 0 || empty > 0 || incomplete > 0 || started != binaries) exit 1
+            if (binaries == 0 || empty > 0 || incomplete > 0 || depth != 0) exit 1
             printf "PASSED=%d BINARIES=%d\n", passed, binaries
         }
     ' "$1"
@@ -147,8 +153,8 @@ if [ "${1:-}" = --verify-compile-inputs ]; then
     exit $?
 fi
 
-PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$PROJECT_ROOT"
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)" || exit 1
+cd "$PROJECT_ROOT" || exit 1
 
 LIB_FILTER=""
 RUN_LIB=1
@@ -265,7 +271,7 @@ run_tests() {
 }
 
 run_ubs() {
-    local expected actual scanner expected_sha tool_dir
+    local expected actual scanner installed expected_sha tool_dir
     expected="$(tr -d '[:space:]' < .github/workflows/ubs-version.txt)"
     # The runner verifies its language modules against embedded release hashes.
     # Updating the pin also requires reviewing the new runner digest here.
@@ -274,12 +280,14 @@ run_ubs() {
         return 1
     fi
     expected_sha=47474fd2adee9be2af4796b656a68cb2074c95b9f50b8a7de492873b4528703f
-    scanner="$(command -v ubs || true)"
-    if [ -z "$scanner" ] || [ "$(sha256sum "$scanner" | cut -d' ' -f1)" != "$expected_sha" ]; then
-        # Preserve the worker's installed tool. A fresh private directory also
-        # prevents an unrelated tool update from racing this invocation.
-        tool_dir="$(mktemp -d -t cass-gate-ubs.XXXXXX)" || return 1
-        scanner="$tool_dir/ubs"
+    # Keep both runner and modules private: a different pinned UBS invocation
+    # would otherwise replace the shared module cache while this one scans.
+    tool_dir="$(mktemp -d -t cass-gate-ubs.XXXXXX)" || return 1
+    scanner="$tool_dir/ubs"
+    installed="$(command -v ubs || true)"
+    if [ -n "$installed" ] && [ "$(sha256sum "$installed" | cut -d' ' -f1)" = "$expected_sha" ]; then
+        cp "$installed" "$scanner" || return 1
+    else
         echo "gate: acquiring pinned UBS ${expected} in ${tool_dir}"
         curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
             --max-time 60 --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' \
@@ -292,6 +300,7 @@ run_ubs() {
     fi
     actual="$(bash "$scanner" --version)" || return 1
     echo "UBS_VERSION=${actual} UBS_PIN=${expected} UBS_SHA256=${expected_sha}"
+    echo "UBS_MODULE_DIR=${tool_dir}/modules"
     if [ "$#" -eq 0 ]; then
         echo "UBS_FILES=0 (no changed scanner-supported source files)"
         return 0
@@ -299,7 +308,7 @@ run_ubs() {
     printf 'UBS_FILE=%s\n' "$@"
     # The pinned runner emits only aggregate Rust counts in JSON/JSONL mode.
     # Text retains categories and source samples needed to diagnose a red gate.
-    bash "$scanner" --no-auto-update --format=text --ci --fail-on-warning "$@"
+    bash "$scanner" --module-dir="$tool_dir/modules" --no-auto-update --format=text --ci --fail-on-warning "$@"
 }
 
 # Every stage records its own exit code and preserves complete test output.

@@ -47,7 +47,7 @@ edition = "2024"
 [workspace]
 TOML
         printf 'fn main() {}\n' > "$proof_dir/crate/src/main.rs"
-        cd "$proof_dir/crate"
+        cd "$proof_dir/crate" || exit 1
         check_exit formatter-clean 0 env RUSTFMT="$CASS_TEST_REAL_RUSTFMT" bash "$gate" --verify-fmt
         printf 'fn main(){ }\n' > src/main.rs
         check_exit formatter-diff 1 env RUSTFMT="$CASS_TEST_REAL_RUSTFMT" bash "$gate" --verify-fmt
@@ -121,6 +121,58 @@ RECEIPT
     check_exit missing-test-start 1 bash "$gate" --verify-test-log "$proof_dir/tests-missing-start.txt"
     { cat "$proof_dir/tests-positive.txt"; echo 'test result: FAILED. 1 passed; 1 failed;'; } > "$proof_dir/tests-failed.txt"
     check_exit positive-and-failed-binary 1 bash "$gate" --verify-test-log "$proof_dir/tests-failed.txt"
+
+    # A real lib test self-spawns with inherited output: its one-test summary
+    # appears between the outer run start and its final 45-test summary.
+    # Accept balanced nesting without inflating the top-level assertion count.
+    cat > "$proof_dir/tests-child.txt" <<'TESTS'
+running 1 test
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 7073 filtered out
+TESTS
+    {
+        echo 'running 45 tests'
+        cat "$proof_dir/tests-child.txt"
+        echo 'test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 7029 filtered out'
+    } > "$proof_dir/tests-nested.txt"
+    check_exit nested-child-tests 0 bash "$gate" --verify-test-log "$proof_dir/tests-nested.txt"
+    check_exit nested-child-counted-once 0 rg -x -F 'PASSED=45 BINARIES=1' "$proof_dir/nested-child-tests.log"
+    {
+        echo 'running 2 tests'
+        cat "$proof_dir/tests-nested.txt"
+        echo 'test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'
+        cat "$proof_dir/tests-positive.txt"
+    } > "$proof_dir/tests-deep-nested.txt"
+    check_exit deep-nesting-and-next-binary 0 bash "$gate" --verify-test-log "$proof_dir/tests-deep-nested.txt"
+    check_exit deep-nesting-counted-once 0 rg -x -F 'PASSED=5 BINARIES=2' "$proof_dir/deep-nesting-and-next-binary.log"
+    { echo 'running 45 tests'; cat "$proof_dir/tests-child.txt"; } > "$proof_dir/tests-parent-truncated.txt"
+    check_exit completed-child-missing-parent 1 bash "$gate" --verify-test-log "$proof_dir/tests-parent-truncated.txt"
+    {
+        echo 'running 45 tests'
+        echo 'running 1 test'
+        echo 'test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'
+    } > "$proof_dir/tests-child-truncated.txt"
+    check_exit parent-cannot-close-missing-child 1 bash "$gate" --verify-test-log "$proof_dir/tests-child-truncated.txt"
+    {
+        echo 'running 3 tests'
+        cat "$proof_dir/tests-empty.txt"
+        echo 'test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'
+    } > "$proof_dir/tests-child-empty.txt"
+    check_exit nested-empty-child 1 bash "$gate" --verify-test-log "$proof_dir/tests-child-empty.txt"
+    {
+        echo 'running 3 tests'
+        echo 'running 1 test'
+        echo 'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out'
+        echo 'test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'
+    } > "$proof_dir/tests-child-failed.txt"
+    check_exit nested-failed-child 1 bash "$gate" --verify-test-log "$proof_dir/tests-child-failed.txt"
+    printf 'running 3 tests\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n' > "$proof_dir/tests-count-mismatch.txt"
+    check_exit mismatched-test-count 1 bash "$gate" --verify-test-log "$proof_dir/tests-count-mismatch.txt"
+    printf 'running 3 tests\ntest result: ok. 1 passed; 0 failed; 1 ignored; 1 measured; 0 filtered out\n' > "$proof_dir/tests-accounted.txt"
+    check_exit ignored-and-measured-accounted 0 bash "$gate" --verify-test-log "$proof_dir/tests-accounted.txt"
+    printf 'running 3 tests\ntest result: ok. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n' > "$proof_dir/tests-false-ok.txt"
+    check_exit nonzero-failures-in-ok-summary 1 bash "$gate" --verify-test-log "$proof_dir/tests-false-ok.txt"
+    { cat "$proof_dir/tests-positive.txt"; echo 'test result: ok. 1 passed;'; } > "$proof_dir/tests-malformed-summary.txt"
+    check_exit malformed-terminal-summary 1 bash "$gate" --verify-test-log "$proof_dir/tests-malformed-summary.txt"
     check_exit repeated-integration-target 2 bash "$gate" --integration 'e2e_lexical_fail_open:a,e2e_lexical_fail_open:b'
 
     # Exercise actual source admission and filesystem timestamps, without
@@ -239,7 +291,7 @@ fi
 TMP_DIR="$(mktemp -d)"
 git -C "$PROJECT_ROOT" worktree add "$TMP_DIR" HEAD >/dev/null 2>&1 || true
 if [ -d "$TMP_DIR/.git" ] || [ -e "$TMP_DIR/.git" ]; then
-    cd "$TMP_DIR"
+    cd "$TMP_DIR" || exit 1
     mkdir -p tests/fixtures
     echo '{}' > tests/fixtures/synthetic.json
     git add tests/fixtures/synthetic.json 2>/dev/null || true
@@ -248,7 +300,7 @@ if [ -d "$TMP_DIR/.git" ] || [ -e "$TMP_DIR/.git" ]; then
     # The fixture .json should NOT match — UBS only filters extensions in the gate's list.
     file_count=$([ -z "$files" ] && echo 0 || echo "$files" | wc -l)
     expect_eq "scenario=fixture_only_change skips invocation" "$file_count" "0"
-    cd "$PROJECT_ROOT"
+    cd "$PROJECT_ROOT" || exit 1
     git -C "$PROJECT_ROOT" worktree remove --force "$TMP_DIR" >/dev/null 2>&1 || rm -rf "$TMP_DIR"
 fi
 
