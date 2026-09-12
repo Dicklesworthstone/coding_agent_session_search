@@ -763,8 +763,21 @@ fn test_cli_pages_full_workflow_end_to_end() {
         "cli_export",
         Some("Run cass pages --config end-to-end export"),
     );
-    let export_output = command_env
-        .cass_std_command()
+    // Release validation can use a published producer while this test keeps
+    // the candidate's decryption library and preview server. Ordinary runs
+    // still exercise the candidate end to end; no external binary is required.
+    // Read the test launcher's override without loading .env into a running
+    // parallel test process or rejecting non-Unicode executable paths.
+    let mut export_command = if let Some(path) = std::env::var_os("CASS_TEST_PAGES_COMPAT_EXPORTER")
+    {
+        let mut command = std::process::Command::new(path);
+        command_env.apply_to_std(&mut command);
+        command
+    } else {
+        command_env.cass_std_command()
+    };
+    eprintln!("pages export producer: {:?}", export_command.get_program());
+    let export_output = export_command
         .arg("--db")
         .arg(&db_path)
         .arg("pages")
@@ -922,6 +935,20 @@ fn test_cli_pages_full_workflow_end_to_end() {
         Some("Decrypt CLI-generated bundle and compare contents"),
     );
     let config = load_config(&site_dir).expect("load generated config");
+    let params = config
+        .key_slots
+        .iter()
+        .find_map(|slot| slot.argon2_params.as_ref())
+        .expect("CLI export has a password slot");
+    assert_eq!(
+        (params.memory_kb, params.iterations, params.parallelism),
+        (65536, 3, 4),
+        "CLI export must use production Argon2 parameters"
+    );
+    assert!(
+        DecryptionEngine::unlock_with_password(config.clone(), "incorrect-pages-password").is_err(),
+        "a wrong password must not unlock the CLI-generated bundle"
+    );
     let decryptor = DecryptionEngine::unlock_with_password(config, TEST_PASSWORD)
         .expect("unlock CLI-generated bundle");
     let decrypted_path = temp_dir.path().join("cli-decrypted.db");
@@ -949,9 +976,9 @@ fn test_cli_pages_full_workflow_end_to_end() {
         conversation_count, 4,
         "CLI-generated bundle should export all conversations"
     );
-    assert!(
-        message_count > 0,
-        "CLI-generated bundle should export messages"
+    assert_eq!(
+        message_count, 40,
+        "CLI-generated bundle must retain every message"
     );
     tracker.end(
         "decrypt_roundtrip",
