@@ -3953,7 +3953,7 @@ fn has_db_sidecar_suffix(name: &str) -> bool {
 }
 
 /// Public schema version constant for external checks.
-pub const CURRENT_SCHEMA_VERSION: i64 = 20;
+pub const CURRENT_SCHEMA_VERSION: i64 = 21;
 pub(crate) const MIN_IN_PLACE_MIGRATION_SCHEMA_VERSION: i64 = 13;
 const LEGACY_OMP_RECLASSIFICATION_META_KEY: &str = "legacy_omp_reclassification_v2";
 const PREVIOUS_LEGACY_OMP_RECLASSIFICATION_META_KEY: &str = "legacy_omp_reclassification_v1";
@@ -4659,6 +4659,14 @@ SELECT
      WHERE ts.conversation_id = c.id)
 FROM conversations c
 WHERE c.external_id IS NOT NULL;
+";
+
+const MIGRATION_V21: &str = r"
+-- Context reads this covering index before hydrating its limited result sets.
+-- Keep wide metadata records out of candidate selection (GH #463). The rowid
+-- stored in each index entry supplies conversations.id without a table read.
+CREATE INDEX IF NOT EXISTS idx_conversations_context
+ON conversations(started_at DESC, workspace_id, agent_id);
 ";
 
 /// Row from the embedding_jobs table.
@@ -6312,6 +6320,7 @@ const POST_TAIL_CACHE_MIGRATION_STEPS: &[(i64, &str, &str)] = &[
     (18, "conversation_tail_state_hot_table", MIGRATION_V18),
     (19, "conversation_external_lookup", MIGRATION_V19),
     (20, "conversation_external_tail_lookup", MIGRATION_V20),
+    (21, "conversation_context_index", MIGRATION_V21),
 ];
 
 /// Run each pending migration through its own single-migration runner so an
@@ -7254,7 +7263,7 @@ fn current_schema_repair_batches_for_missing_tables(
 }
 
 /// Migration name lookup for backfilling `_schema_migrations` during transition.
-const MIGRATION_NAMES: [(i64, &str); 20] = [
+const MIGRATION_NAMES: [(i64, &str); 21] = [
     (1, "core_tables"),
     (2, "fts_messages"),
     (3, "fts_messages_rebuild"),
@@ -7275,6 +7284,7 @@ const MIGRATION_NAMES: [(i64, &str); 20] = [
     (18, "conversation_tail_state_hot_table"),
     (19, "conversation_external_lookup"),
     (20, "conversation_external_tail_lookup"),
+    (21, "conversation_context_index"),
 ];
 
 /// Transitions an existing database from `meta` table schema versioning to the
@@ -40917,6 +40927,49 @@ mod tests {
     }
 
     #[test]
+    fn migration_v21_adds_covering_context_index_without_changing_archive_rows() {
+        let storage = franken_storage_in_memory();
+        let conn = storage.raw();
+        // Reconstruct the preceding version, including a wide conversation.
+        conn.execute_batch(
+            "DROP INDEX idx_conversations_context;
+             DELETE FROM _schema_migrations WHERE version >= 21;
+             UPDATE meta SET value = '20' WHERE key = 'schema_version';
+             INSERT INTO agents(id, slug, name, kind, created_at, updated_at)
+                 VALUES(1, 'codex', 'Codex', 'cli', 0, 0);
+             INSERT INTO conversations(id, agent_id, source_path, started_at, metadata_bin)
+                 VALUES(1, 1, '/context.jsonl', 100, zeroblob(86016));",
+        )
+        .unwrap();
+        let before = conn
+            .query("SELECT * FROM conversations WHERE id = 1")
+            .unwrap();
+        storage.run_migrations().unwrap();
+        storage.run_migrations().unwrap();
+        assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        assert_eq!(
+            conn.query("SELECT * FROM conversations WHERE id = 1")
+                .unwrap(),
+            before
+        );
+        let columns: Vec<String> = conn
+            .query("PRAGMA index_info(idx_conversations_context)")
+            .unwrap()
+            .iter()
+            .map(|row| row.get_typed(2).unwrap())
+            .collect();
+        assert_eq!(columns, ["started_at", "workspace_id", "agent_id"]);
+        let recorded: i64 = conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 21",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, 1, "the additive migration must be idempotent");
+    }
+
+    #[test]
     fn migration_v20_backfills_conversation_external_tail_lookup() {
         let storage = franken_storage_in_memory();
         let agent_id = storage
@@ -40946,7 +40999,7 @@ mod tests {
             .unwrap();
         storage
             .raw()
-            .execute("DELETE FROM _schema_migrations WHERE version = 20")
+            .execute("DELETE FROM _schema_migrations WHERE version >= 20")
             .unwrap();
         storage
             .raw()

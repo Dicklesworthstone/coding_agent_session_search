@@ -92230,6 +92230,79 @@ fn find_context_source_conversation(
     .ok()
 }
 
+const CONTEXT_CANDIDATES_SQL: &str = "SELECT id, workspace_id, agent_id, started_at FROM conversations INDEXED BY idx_conversations_context";
+
+#[derive(Debug)]
+struct ContextCandidate {
+    id: i64,
+    workspace_id: Option<i64>,
+    agent_id: Option<i64>,
+    started_at: Option<i64>,
+}
+
+fn context_related_ids(
+    conn: &crate::franken_sync::Connection,
+    source: &ContextCandidate,
+    limit: usize,
+) -> CliResult<[Vec<i64>; 3]> {
+    use crate::franken_sync::compat::{ConnectionExt, RowExt};
+
+    let mut groups: [Vec<i64>; 3] = Default::default();
+    if limit == 0
+        || (source.workspace_id.is_none()
+            && source.agent_id.is_none()
+            && source.started_at.is_none())
+    {
+        return Ok(groups);
+    }
+    let has_index = !conn
+        .query("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_conversations_context'")
+        .map_err(|e| CliError::unknown(format!("context index lookup: {e}")))?
+        .is_empty();
+    // V21 is installed by the normal writable storage migration. Context must
+    // remain read-only and usable before that migration, too.
+    let sql = if has_index {
+        CONTEXT_CANDIDATES_SQL
+    } else {
+        "SELECT id, workspace_id, agent_id, started_at FROM conversations"
+    };
+    // In fsqlite 0.3.18 a WHERE on the ordered-index path still reads the
+    // conversation record. An unfiltered covering walk avoids every metadata
+    // overflow chain. Filter these small keys here, then hydrate only results.
+    let mut candidates = conn
+        .query_map_collect(sql, &[], |row| {
+            Ok(ContextCandidate {
+                id: row.get_typed(0)?,
+                workspace_id: row.get_typed(1)?,
+                agent_id: row.get_typed(2)?,
+                started_at: row.get_typed(3)?,
+            })
+        })
+        .map_err(|e| CliError::unknown(format!("context candidates: {e}")))?;
+    // DESC puts NULL timestamps last. Give previously unspecified ties a
+    // stable rowid order, independent of the index's other key columns.
+    candidates.sort_unstable_by(|a, b| b.started_at.cmp(&a.started_at).then(a.id.cmp(&b.id)));
+    let day_start = source.started_at.map(|ts| i128::from(ts - ts % 86_400_000));
+    for candidate in candidates {
+        if candidate.id == source.id {
+            continue;
+        }
+        let matches = [
+            source.workspace_id.is_some() && candidate.workspace_id == source.workspace_id,
+            day_start
+                .zip(candidate.started_at)
+                .is_some_and(|(start, ts)| (start..start + 86_400_000).contains(&i128::from(ts))),
+            source.agent_id.is_some() && candidate.agent_id == source.agent_id,
+        ];
+        for (group, matches) in groups.iter_mut().zip(matches) {
+            if matches && group.len() < limit {
+                group.push(candidate.id);
+            }
+        }
+    }
+    Ok(groups)
+}
+
 fn run_context(
     path: &Path,
     source_id: Option<&str>,
@@ -92238,13 +92311,18 @@ fn run_context(
     output_format: Option<RobotFormat>,
     limit: usize,
 ) -> CliResult<()> {
-    use crate::franken_sync::compat::{ConnectionExt, ParamValue, RowExt};
+    use crate::franken_sync::compat::{ConnectionExt, OptionalExtension, ParamValue, RowExt};
 
     let conn = open_franken_analytics_db(data_dir_override, db_override.as_ref())?;
 
     if let Some(source_id) = source_id {
         validate_followup_source_id(source_id, "cass context")?;
     }
+
+    // Keep selection and hydration on one archive snapshot even if an indexer
+    // commits between reads. Dropping the connection rolls back on any error.
+    conn.execute("BEGIN DEFERRED;")
+        .map_err(|e| CliError::unknown(format!("context read snapshot: {e}")))?;
 
     // Find the source conversation by path (normalized to string)
     let path_str = path.to_string_lossy().to_string();
@@ -92280,107 +92358,72 @@ fn run_context(
 
     let normalized_source_sql = normalized_source_identity_sql_expr("c.source_id", "c.origin_host");
 
-    // Find related sessions: same workspace (excluding self)
-    let same_workspace: Vec<(String, String, String, Option<i64>, String)> = if let Some(ws_id) =
-        workspace_id
-    {
-        let query = format!(
-                "SELECT c.source_path, c.title, COALESCE(a.slug, 'unknown'), c.started_at, {normalized_source_sql}
-                 FROM conversations c
-                 LEFT JOIN agents a ON c.agent_id = a.id
-                 WHERE c.workspace_id = ? AND c.id != ?
-                 ORDER BY c.started_at DESC
-                 LIMIT ?"
-            );
-        conn.query_map_collect(
-            &query,
-            &[
-                ParamValue::from(ws_id),
-                ParamValue::from(conv_id),
-                ParamValue::from(limit as i64),
-            ],
-            |r: &crate::franken_sync::Row| {
-                Ok((
-                    r.get_typed(0)?,
-                    r.get_typed::<Option<String>>(1)?.unwrap_or_default(),
-                    r.get_typed(2)?,
-                    r.get_typed(3)?,
-                    r.get_typed(4)?,
-                ))
-            },
-        )
-        .map_err(|e| CliError::unknown(format!("query: {e}")))?
-    } else {
-        Vec::new()
+    let [workspace_ids, day_ids, agent_ids] = context_related_ids(
+        &conn,
+        &ContextCandidate {
+            id: conv_id,
+            workspace_id,
+            agent_id,
+            started_at,
+        },
+        limit,
+    )?;
+    // A direct rowid lookup avoids the planner's join/sort table scans. Cache
+    // overlapping results so each selected wide row is read at most once.
+    type RelatedSession = (String, String, String, Option<i64>, String);
+    let mut hydrated: HashMap<i64, RelatedSession> = HashMap::new();
+    let query = format!(
+        "SELECT c.source_path, c.title, c.agent_id, c.started_at, {normalized_source_sql}
+         FROM conversations c WHERE c.id = ?1"
+    );
+    let mut hydrate = |ids: Vec<i64>| -> CliResult<Vec<RelatedSession>> {
+        ids.into_iter()
+            .map(|id| {
+                if let Some(row) = hydrated.get(&id) {
+                    return Ok(row.clone());
+                }
+                let (path, title, agent_id, started_at, source_id) = conn
+                    .query_row_map(&query, &[ParamValue::from(id)], |row| {
+                        Ok((
+                            row.get_typed::<String>(0)?,
+                            row.get_typed::<Option<String>>(1)?.unwrap_or_default(),
+                            row.get_typed::<Option<i64>>(2)?,
+                            row.get_typed::<Option<i64>>(3)?,
+                            row.get_typed::<String>(4)?,
+                        ))
+                    })
+                    .map_err(|e| CliError::unknown(format!("context session {id}: {e}")))?;
+                let agent: Option<String> = if let Some(agent_id) = agent_id {
+                    conn.query_row_map(
+                        "SELECT COALESCE(slug, 'unknown') FROM agents WHERE id = ?1",
+                        &[ParamValue::from(agent_id)],
+                        |row| row.get_typed(0),
+                    )
+                    .optional()
+                    .map_err(|e| CliError::unknown(format!("context agent: {e}")))?
+                } else {
+                    None
+                };
+                let row = (
+                    path,
+                    title,
+                    agent.unwrap_or_else(|| "unknown".into()),
+                    started_at,
+                    source_id,
+                );
+                hydrated.insert(id, row.clone());
+                Ok(row)
+            })
+            .collect()
     };
-
-    // Find related sessions: same day (within 24 hours of started_at)
-    let same_day: Vec<(String, String, String, Option<i64>, String)> = if let Some(ts) = started_at
-    {
-        let day_start = ts - (ts % 86_400_000); // Start of day in milliseconds
-        let day_end = day_start + 86_400_000;
-        let query = format!(
-            "SELECT c.source_path, c.title, COALESCE(a.slug, 'unknown'), c.started_at, {normalized_source_sql}
-                 FROM conversations c
-                 LEFT JOIN agents a ON c.agent_id = a.id
-                 WHERE c.started_at >= ? AND c.started_at < ? AND c.id != ?
-                 ORDER BY c.started_at DESC
-                 LIMIT ?"
-        );
-        conn.query_map_collect(
-            &query,
-            &[
-                ParamValue::from(day_start),
-                ParamValue::from(day_end),
-                ParamValue::from(conv_id),
-                ParamValue::from(limit as i64),
-            ],
-            |r: &crate::franken_sync::Row| {
-                Ok((
-                    r.get_typed(0)?,
-                    r.get_typed::<Option<String>>(1)?.unwrap_or_default(),
-                    r.get_typed(2)?,
-                    r.get_typed(3)?,
-                    r.get_typed(4)?,
-                ))
-            },
-        )
-        .map_err(|e| CliError::unknown(format!("query: {e}")))?
-    } else {
-        Vec::new()
-    };
-
-    // Find related sessions: same agent (excluding self).  Skip this lookup
-    // entirely when the source conversation has a NULL agent_id (legacy V1
-    // row) — there's no meaningful "same agent" grouping in that case.
-    let same_agent: Vec<(String, String, Option<i64>, String)> = if let Some(agent_id) = agent_id {
-        let query = format!(
-            "SELECT c.source_path, c.title, c.started_at, {normalized_source_sql}
-                 FROM conversations c
-                 WHERE c.agent_id = ? AND c.id != ?
-                 ORDER BY c.started_at DESC
-                 LIMIT ?"
-        );
-        conn.query_map_collect(
-            &query,
-            &[
-                ParamValue::from(agent_id),
-                ParamValue::from(conv_id),
-                ParamValue::from(limit as i64),
-            ],
-            |r: &crate::franken_sync::Row| {
-                Ok((
-                    r.get_typed(0)?,
-                    r.get_typed::<Option<String>>(1)?.unwrap_or_default(),
-                    r.get_typed(2)?,
-                    r.get_typed(3)?,
-                ))
-            },
-        )
-        .map_err(|e| CliError::unknown(format!("query: {e}")))?
-    } else {
-        Vec::new()
-    };
+    let same_workspace = hydrate(workspace_ids)?;
+    let same_day = hydrate(day_ids)?;
+    let same_agent: Vec<_> = hydrate(agent_ids)?
+        .into_iter()
+        .map(|(path, title, _, started_at, source_id)| (path, title, started_at, source_id))
+        .collect();
+    conn.execute("ROLLBACK;")
+        .map_err(|e| CliError::unknown(format!("context release snapshot: {e}")))?;
 
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
@@ -110787,6 +110830,99 @@ mod legacy_source_filter_tests {
         assert_eq!(count, 1);
 
         conn.close().expect("close writable legacy source test db");
+    }
+
+    #[test]
+    fn context_candidates_covering_plan_limits_and_legacy_nulls() {
+        use crate::franken_sync::compat::ConnectionExt as _;
+
+        let conn = crate::franken_sync::Connection::open(":memory:").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE conversations (
+                 id INTEGER PRIMARY KEY, workspace_id INTEGER, agent_id INTEGER,
+                 started_at INTEGER, metadata_bin BLOB
+             );
+             INSERT INTO conversations(id, workspace_id, agent_id, started_at) VALUES
+                 (1, 1, 1, 100), (2, 1, 2, 300), (3, 2, 1, 200),
+                 (4, 1, 1, NULL), (5, 2, 2, 86400000), (6, NULL, NULL, 250),
+                 (7, 1, 1, 300), (8, NULL, NULL, NULL);",
+        )
+        .unwrap();
+        let source = ContextCandidate {
+            id: 1,
+            workspace_id: Some(1),
+            agent_id: Some(1),
+            started_at: Some(100),
+        };
+        let expected = [vec![2, 7, 4], vec![2, 7, 6, 3], vec![7, 3, 4]];
+        assert_eq!(
+            context_related_ids(&conn, &source, usize::MAX).unwrap(),
+            expected
+        );
+        conn.execute(
+            "CREATE INDEX idx_conversations_context
+             ON conversations(started_at DESC, workspace_id, agent_id)",
+        )
+        .unwrap();
+        conn.execute("PRAGMA query_only = 1").unwrap();
+        assert_eq!(
+            context_related_ids(&conn, &source, usize::MAX).unwrap(),
+            expected
+        );
+        assert_eq!(
+            context_related_ids(&conn, &source, 1).unwrap(),
+            [vec![2], vec![2], vec![7]]
+        );
+        assert_eq!(
+            context_related_ids(&conn, &source, 0).unwrap(),
+            [Vec::<i64>::new(), vec![], vec![]]
+        );
+        let null_source = ContextCandidate {
+            id: 8,
+            workspace_id: None,
+            agent_id: None,
+            started_at: None,
+        };
+        assert_eq!(
+            context_related_ids(&conn, &null_source, 10).unwrap(),
+            [Vec::<i64>::new(), vec![], vec![]]
+        );
+
+        let index_root: i64 = conn
+            .query_row_map(
+                "SELECT rootpage FROM sqlite_master WHERE name = 'idx_conversations_context'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        let explain = conn
+            .query(&format!("EXPLAIN {CONTEXT_CANDIDATES_SQL}"))
+            .unwrap();
+        let mut read_roots = Vec::new();
+        for row in explain {
+            let opcode: String = row.get_typed(1).unwrap();
+            assert!(
+                !matches!(opcode.as_str(), "SeekRowid" | "SorterOpen"),
+                "{opcode}"
+            );
+            if opcode == "OpenRead" {
+                read_roots.push(row.get_typed::<i64>(3).unwrap());
+            }
+        }
+        assert_eq!(
+            read_roots,
+            vec![index_root],
+            "candidate scan must open only the covering index"
+        );
+        // Negative control: the same projection without the hint reads the
+        // conversation table, so narrow column names alone are not proof.
+        let unhinted = conn
+            .query("EXPLAIN SELECT id, workspace_id, agent_id, started_at FROM conversations")
+            .unwrap();
+        assert!(unhinted.iter().any(|row| {
+            row.get_typed::<String>(1).unwrap() == "OpenRead"
+                && row.get_typed::<i64>(3).unwrap() != index_root
+        }));
     }
 
     #[test]
