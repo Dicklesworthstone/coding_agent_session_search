@@ -5,17 +5,32 @@
 Owner request: update stable dependencies individually, then publish a complete
 release through DSR, GitHub, crates.io and Homebrew without GitHub Actions.
 Registry inventory on September 12 UTC found 103 declarations covering 98
-direct packages; 18 packages have newer stable releases. No upgrade is yet
-validated in this pass. FrankenSQLite 0.3.18 and agent detection 0.2.4 are current.
+direct packages; 18 packages have newer stable releases. Crossbeam has passed
+focused behavioral validation; the full release gate remains pending.
+FrankenSQLite 0.3.18 and agent detection 0.2.4 are current.
 
 First candidate: crossbeam-channel 0.5.16 → 0.5.17. Its published changelog
 documents a bounded-channel `SelectedOperation` leak memory-safety fix,
 initialization overflow fixes, and timer corrections. CASS uses bounded
-channels in indexing and storage. A single-package lockfile update and remote
-validation are in progress; no other dependency is changed alongside it.
+channels in indexing and storage. The isolated single-package candidate passed
+remote formatting, all-target Clippy, 31 library tests, three interrupted-index
+CLI tests and one fleet-setup transport-failure retry test, with no failures or
+ignored tests. The first admission ended with exit 143 before tests; a fresh
+continuation produced these results. Strict UBS timed out in its Rust module
+after 300 seconds, so the aggregate gate exited 1. Source verification passed
+after execution; this is a focused behavioral pass with an incomplete scanner,
+not full release clearance. The retained receipt SHA-256 is
+`6794594468ee8f3f45835a81417faa837c6f2c67b3c6ce494078adfc9af190d9`.
 Source: [published crate](https://static.crates.io/crates/crossbeam-channel/crossbeam-channel-0.5.17.crate).
 
-Pending: asupersync, console, reqwest, rustls, toml, which, lru, smallvec,
+Next candidate: asupersync 0.4.10 → 0.4.11. Published source review found the
+used runtime/Cx APIs compatible; current-thread tasks now run on the caller
+thread. The resolver changed only the runtime and its four required companion
+packages (macros, decision, evidence and kernel). Manifest and build-time pins
+are aligned; runtime, cancellation and real HTTP tests are pending.
+Source: [upstream release](https://github.com/Dicklesworthstone/asupersync/releases/tag/v0.4.11).
+
+Pending after asupersync: console, reqwest, rustls, toml, which, lru, smallvec,
 FrankenTUI (four coordinated direct crates), dirs, frankensearch, wide,
 argon2 and flate2. Major API changes and the documented frankensearch hold
 require source review before adoption. Existing full-test and strict UBS
@@ -24,6 +39,14 @@ release requirements remain in force.
 Publication baseline: GitHub v0.8.0; Homebrew v0.7.1; crates.io v0.7.0.
 The next release must verify every applicable venue rather than infer
 publication from a Git tag. No new version bump or release has happened yet.
+
+Interim `cargo audit` on the crossbeam candidate completed with exit 0 and
+zero vulnerability entries. It still reports the existing unmaintained
+`paste` and `rustls-pemfile` dependencies, plus RUSTSEC-2026-0253 for the
+transitive `lru` 0.16.4. The latter is an unsoundness warning concerning a
+panicking key destructor during `pop`; upgrading CASS's separate direct
+`lru` dependency does not remove that transitive copy. This is an interim
+inventory, not the final dependency or release security gate.
 
 **Date:** 2026-02-17  
 **Project:** coding_agent_session_search (`cass`)  

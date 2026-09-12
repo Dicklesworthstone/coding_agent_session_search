@@ -1,5 +1,20 @@
 # CASS 0.8.0 changelog research
 
+Next-release preparation (September 12 UTC, unreleased, bead yrjna): local
+Shelley/Grok Bot integration is represented by commits `5d187f87`, `59b5d10c`
+and the native-ID changes after v0.8.0. The published FAD dependency is now
+0.2.4; historical 0.2.3 references below identify the discovery evidence used
+at that time. The source-backup repair in `ee64d3b1` replaces an overwriting
+copy with exclusive destination creation and bounded retries. It adds real
+file and symlink conservation tests; those tests have not yet executed.
+Crossbeam-channel 0.5.17 is committed as `f5328832`. Its first remote gate
+was interrupted before a compiler or test verdict; the unchanged-source
+continuation passed formatting, all-target Clippy and 35 focused tests. Its
+strict UBS Rust module timed out after 300 seconds; source-after verification
+passed. Neither that update nor the planned 0.9.0 release has full release
+clearance. Asupersync 0.4.11 and its four companion packages are the next
+isolated dependency candidate; validation is pending.
+
 Fleet follow-up (September 11, unreleased, bead av59c): published FAD 0.2.3
 lists `~/.config/muse/auth.json` and `~/.config/muse` as local discovery probes.
 CASS previously admitted both into automatic remote source configuration.
