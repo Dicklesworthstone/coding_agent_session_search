@@ -280,9 +280,9 @@ dependencies = [
 
 [[package]]
 name = "asupersync"
-version = "0.4.10"
+version = "0.4.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e8b505d6aadb778c9c4b0ae174966641f11d578d253b7786f2407b17d5045ec"
+checksum = "1b83c430fa0ca573d28dd2d30edc646862e1a0601c165cec9b1ba11604f2f44d"
 dependencies = [
  "aes-gcm",
  "asupersync-macros",
@@ -342,9 +342,9 @@ dependencies = [
 
 [[package]]
 name = "asupersync-macros"
-version = "0.4.9"
+version = "0.4.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a14f9f162d8418e4e347f4965f42f41ca970f8e81be496e04ab4f79c94818c8"
+checksum = "9b69a87a0b76b17e4e0baf0c58bcdf3eeb921944719c8d12dd14cff385b559f9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1907,9 +1907,9 @@ dependencies = [
 
 [[package]]
 name = "franken-decision"
-version = "0.4.9"
+version = "0.4.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3645a3f60a4e63b19feac3121871cd5599fe46a10c4e90cabaee9fd6d27a030"
+checksum = "a327ccad6d0911079488ed5cf19d9f5f2354f50fa2800863e5ac90b07b590d92"
 dependencies = [
  "franken-evidence",
  "franken-kernel",
@@ -1918,9 +1918,9 @@ dependencies = [
 
 [[package]]
 name = "franken-evidence"
-version = "0.4.9"
+version = "0.4.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad9d4f7ad2461e03e792809d98c9f02dc816ab3b3766493a0b0bf6a07d7effc0"
+checksum = "118656e5fae1cee37b494b6890c43e42a30d994abfb9744d67603182b6482695"
 dependencies = [
  "serde",
  "serde_json",
@@ -1928,9 +1928,9 @@ dependencies = [
 
 [[package]]
 name = "franken-kernel"
-version = "0.4.9"
+version = "0.4.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92263c58ff55e6f171441ce40efb70ed26a2588d38a793435f2aeef456246696"
+checksum = "d0a00ffc65c4177f2e9b8f740ce97882bc599adb7b70de40eb74fda6ac2a88c4"
 dependencies = [
  "serde",
 ]

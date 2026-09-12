@@ -177,13 +177,13 @@ const CONTRACTS: &[DependencyContract] = &[
         // crates.io-only exact pin: every source (direct dep, frankensqlite
         // transitive, frankensearch transitive) resolves to a single published
         // release. The 0.4.x line (>=0.4.3,<0.5) is required by fsqlite 0.3.x,
-        // whose public API names asupersync 0.4.x types. The 0.4.10 pin
-        // adds the published Cx::is_cancelled API needed by Quill 0.2.3.
+        // whose public API names asupersync 0.4.x types. The 0.4.11 pin
+        // retains the Cx::is_cancelled API published in 0.4.10 for Quill 0.2.3.
         // Empty `expected_git` signals `validate_manifest_dependency_spec`
         // to skip git/rev checks.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.4.10",
+        expected_version: "0.4.11",
         expected_features: &["test-internals", "tls-native-roots"],
         expected_default_features: None,
         repo_rel: "../asupersync",
@@ -201,7 +201,7 @@ const CONTRACTS: &[DependencyContract] = &[
         // Registry pin (gh#453, gh#429, gh#410). 0.4.3 (quill 0.2.3)
         // clocks segment collection from retirement receipts, preserving
         // progress under continued publication. Cx::is_cancelled comes from
-        // the separately pinned asupersync 0.4.10.
+        // the separately pinned asupersync 0.4.11.
         // 0.4.2 extends the native Windows Quill
         // publication line with the explicit multilingual MiniLM embedding
         // profile while preserving the first crates.io line carrying

@@ -25,7 +25,7 @@ anyhow = "1.0.102"
 thiserror = "2.0.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "ansi", "json"] }
-asupersync = { version = "=0.4.10", features = ["test-internals", "tls-native-roots"] }
+asupersync = { version = "=0.4.11", features = ["test-internals", "tls-native-roots"] }
 clap = { version = "4.6.1", features = ["derive", "cargo", "env", "unicode", "wrap_help"] }
 clap_complete = "4.6.5"
 clap_mangen = "0.3.0"
@@ -141,7 +141,7 @@ bytemuck = "1.25.0"
 #      segments) shipped IN 0.4.3. Bumping buys none of it.
 #   2. Published 0.5.0 still declares `asupersync >= 0.4.4, < 0.5` while
 #      frankensearch-quill 0.2.4 calls `Cx::is_cancelled` — the defect
-#      frankensearch#44 describes. cass's exact `=0.4.10` pin masks it here,
+#      frankensearch#44 describes. cass's exact `=0.4.11` pin masks it here,
 #      but the declaration is still wrong upstream.
 #   3. frankensearch#45 (live-document publication floor; discard a failed
 #      replacement ingest instead of committing a tombstone-only MANIFEST) is
@@ -309,7 +309,7 @@ inherits = "release"
 debug = "line-tables-only"
 strip = false
 
-# The dependency graph is pinned to the asupersync 0.4.x line (0.4.10). Keep
+# The dependency graph is pinned to the asupersync 0.4.x line (0.4.11). Keep
 # the frankensqlite, frankensearch, and franken-agent-detection registry pins
 # aligned so Cargo.lock does not reintroduce a parallel asupersync 0.3.x stack.
 #
