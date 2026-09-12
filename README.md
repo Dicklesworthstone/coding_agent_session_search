@@ -655,6 +655,13 @@ holds down blobs referenced by captures from the last 7 days by default, writes
 `raw-mirror/v1/pruned.jsonl` for every non-empty plan, and refuses apply mode
 while an index/watch job is active.
 
+Use `--provider opencode` and/or `--source-path '*/opencode.db'` with an age
+or size rule to target one source without retiring unrelated captures.
+Repeated providers are alternatives; a source-path glob further narrows them.
+With a selector, `--max-size` measures unique blobs in that selection. Shared
+blobs still referenced outside it and orphan blobs without source provenance
+remain protected. The JSON plan records the selectors and `scope_blob_bytes`.
+
 Large mutable sources are stored as 4 MiB content-addressed chunks. Growing
 JSONL files reuse every unchanged complete chunk, and SQLite sources reuse
 unchanged 4 MiB byte regions, so each historical snapshot remains byte-exact without
@@ -1710,10 +1717,15 @@ Launch-time flags: `cass tui --refresh` (alias `--catch-up`) runs an incremental
 | `Ctrl+Space` | Momentary "peek" to XL context |
 | `F9` | Toggle match mode: prefix (default) ↔ standard |
 | `F12` / `Alt+R` | Cycle ranking: recent → balanced → relevance → quality → newest → oldest |
+| `Alt+F` | Cycle result grouping: agent → conversation → workspace → flat |
 | `Alt+S` | Cycle search mode (lexical / semantic / hybrid) |
 | `Ctrl+D` | Cycle density: Compact → Cozy → Spacious |
 | `Ctrl+1`..`Ctrl+9` | Save the current view to slot N |
 | `Shift+1`..`Shift+9` | Load the view from slot N |
+
+For one chronological list across agents, select **flat** grouping with `Alt+F`
+and **newest** ranking with `F12`. Grouping is also available in the command
+palette and is preserved with ranking and filters in saved views.
 
 ### Selection & Actions
 
