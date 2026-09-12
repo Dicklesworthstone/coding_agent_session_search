@@ -29,16 +29,22 @@ set -uo pipefail
 test_log_counts() {
     awk '
         /^running [0-9]+ tests?$/ {
-            if (started != binaries) incomplete++
-            started++
+            announced[++depth] = $2
+            next
         }
-        /^test result: ok\. [0-9]+ passed;/ {
-            if (started != binaries + 1) incomplete++
-            binaries++; passed += $4; if ($4 == 0) empty++
+        /^test result: ok\. [0-9]+ passed; [0-9]+ failed; [0-9]+ ignored; [0-9]+ measured; [0-9]+ filtered out/ {
+            if (depth == 0) { incomplete++; next }
+            if ($6 != 0 || $4 + $6 + $8 + $10 != announced[depth]) incomplete++
+            if ($4 == 0) empty++
+            delete announced[depth--]
+            # Inherited subprocess output nests inside its parent test run.
+            # Count each top-level binary once; every child must still finish.
+            if (depth == 0) { binaries++; passed += $4 }
+            next
         }
-        /^test result: FAILED\./ { empty++ }
+        /^test result:/ { incomplete++ }
         END {
-            if (binaries == 0 || empty > 0 || incomplete > 0 || started != binaries) exit 1
+            if (binaries == 0 || empty > 0 || incomplete > 0 || depth != 0) exit 1
             printf "PASSED=%d BINARIES=%d\n", passed, binaries
         }
     ' "$1"
