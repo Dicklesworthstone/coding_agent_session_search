@@ -251,6 +251,8 @@ pub(crate) fn physical_storage_bytes(data_dir: &Path) -> u64 {
 pub struct RawMirrorPruneOptions {
     pub older_than_ms: Option<i64>,
     pub max_size_bytes: Option<u64>,
+    pub providers: Vec<String>,
+    pub source_path: Option<String>,
     pub keep_tags: Vec<String>,
     pub safety_hold_down_ms: i64,
     pub apply: bool,
@@ -264,6 +266,12 @@ pub struct RawMirrorPruneReport {
     pub manifest_count: u64,
     pub unique_blob_count: u64,
     pub current_blob_bytes: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_blob_bytes: Option<u64>,
     pub orphan_blob_count: u64,
     pub orphan_blob_bytes: u64,
     pub safety_hold_down_ms: i64,
@@ -315,6 +323,33 @@ struct RawMirrorPhysicalBlob {
 }
 
 pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirrorPruneReport> {
+    let providers = options
+        .providers
+        .iter()
+        .map(|provider| provider.trim().to_string())
+        .collect::<HashSet<_>>();
+    if providers.contains("") {
+        anyhow::bail!("raw-mirror prune provider selector must not be empty");
+    }
+    let source_pattern = options
+        .source_path
+        .as_deref()
+        .map(|pattern| {
+            if pattern.trim().is_empty() {
+                anyhow::bail!("raw-mirror prune source-path selector must not be empty");
+            }
+            glob::Pattern::new(pattern).context("invalid raw-mirror prune source-path glob")
+        })
+        .transpose()?;
+    let scoped = !providers.is_empty() || source_pattern.is_some();
+    let matches_scope = |manifest: &RawMirrorPruneManifest| {
+        (providers.is_empty() || providers.contains(&manifest.provider))
+            && source_pattern
+                .as_ref()
+                .is_none_or(|pattern| pattern.matches(&manifest.original_path))
+    };
+    let mut reported_providers = providers.iter().cloned().collect::<Vec<_>>();
+    reported_providers.sort();
     let root = raw_mirror_root(data_dir);
     let mut report = RawMirrorPruneReport {
         initialized: false,
@@ -327,6 +362,9 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         manifest_count: 0,
         unique_blob_count: 0,
         current_blob_bytes: 0,
+        providers: reported_providers,
+        source_path: options.source_path.clone(),
+        scope_blob_bytes: scoped.then_some(0),
         orphan_blob_count: 0,
         orphan_blob_bytes: 0,
         safety_hold_down_ms: options.safety_hold_down_ms,
@@ -426,19 +464,49 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         .fold(0u64, u64::saturating_add);
 
     let now = now_ms();
-    let pinned_manifests = pinned_prune_manifest_ids(
+    let mut pinned_manifests = pinned_prune_manifest_ids(
         data_dir,
         &manifests,
         &options.keep_tags,
         options.safety_hold_down_ms,
         now,
     )?;
+    // Scope is an additional preservation boundary, including for blobs
+    // shared with a capture outside the requested provider/path selection.
+    pinned_manifests.extend(
+        manifests
+            .iter()
+            .filter(|manifest| !matches_scope(manifest))
+            .map(|manifest| manifest.manifest_id.clone()),
+    );
+    let budget_bytes = if scoped {
+        let scope_blobs = manifests
+            .iter()
+            .filter(|manifest| matches_scope(manifest))
+            .flat_map(|manifest| &manifest.blob_references)
+            .map(|reference| &reference.blob_relative_path)
+            .collect::<HashSet<_>>();
+        let bytes = scope_blobs
+            .iter()
+            .filter_map(|path| blob_size_by_relative.get(*path))
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        report.scope_blob_bytes = Some(bytes);
+        bytes
+    } else {
+        report.current_blob_bytes
+    };
     report.pinned_manifest_count = pinned_manifests.len() as u64;
     let mut pinned_blobs: HashSet<String> = blob_to_manifests
         .iter()
         .filter(|(_, manifest_ids)| manifest_ids.iter().any(|id| pinned_manifests.contains(id)))
         .map(|(blob_relative_path, _)| blob_relative_path.clone())
         .collect();
+    if scoped {
+        // Orphans have no trustworthy provider/path provenance. A scoped
+        // request cannot authorize reclaiming them.
+        pinned_blobs.extend(orphan_blobs.iter().map(|blob| blob.relative_path.clone()));
+    }
     if options.safety_hold_down_ms > 0 {
         let hold_down_cutoff = now.saturating_sub(options.safety_hold_down_ms);
         pinned_blobs.extend(
@@ -486,9 +554,9 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
     }
 
     if let Some(max_size_bytes) = options.max_size_bytes
-        && report.current_blob_bytes > max_size_bytes
+        && budget_bytes > max_size_bytes
     {
-        let mut projected_bytes = report.current_blob_bytes;
+        let mut projected_bytes = budget_bytes;
         for (blob_relative_path, manifest_ids) in &blob_to_manifests {
             if manifest_ids
                 .iter()
@@ -4740,6 +4808,7 @@ mod tests {
                 keep_tags: Vec::new(),
                 safety_hold_down_ms: 0,
                 apply: true,
+                ..RawMirrorPruneOptions::default()
             },
         )
         .expect_err("hostile inventory should fail closed");
@@ -5150,6 +5219,7 @@ mod tests {
                 keep_tags: Vec::new(),
                 safety_hold_down_ms: 0,
                 apply: false,
+                ..RawMirrorPruneOptions::default()
             },
         )
         .expect("dry-run prune");
@@ -5205,6 +5275,7 @@ mod tests {
                 keep_tags: Vec::new(),
                 safety_hold_down_ms: 0,
                 apply: true,
+                ..RawMirrorPruneOptions::default()
             },
         ) {
             Ok(_) => anyhow::bail!("symlinked prune audit log was accepted before deletion"),
@@ -5325,6 +5396,7 @@ mod tests {
                 keep_tags: Vec::new(),
                 safety_hold_down_ms: 0,
                 apply: true,
+                ..RawMirrorPruneOptions::default()
             },
         )
         .expect("apply prune");
@@ -5392,6 +5464,7 @@ mod tests {
                 keep_tags: Vec::new(),
                 safety_hold_down_ms: 0,
                 apply: true,
+                ..RawMirrorPruneOptions::default()
             },
         )
         .expect("apply one-manifest prune");
@@ -5468,6 +5541,7 @@ mod tests {
                 keep_tags: vec!["keep".to_string()],
                 safety_hold_down_ms: 0,
                 apply: true,
+                ..RawMirrorPruneOptions::default()
             },
         )
         .expect("keep-tag prune");
@@ -5512,6 +5586,7 @@ mod tests {
                 keep_tags: Vec::new(),
                 safety_hold_down_ms: 7 * 86_400_000,
                 apply: true,
+                ..RawMirrorPruneOptions::default()
             },
         )
         .expect("hold-down prune");
@@ -5570,6 +5645,96 @@ mod tests {
             "unexpected cached-blob error: {err:#}"
         );
         assert_eq!(fs::read(&source_path).expect("source bytes"), source_bytes);
+    }
+
+    #[test]
+    fn gh461_prune_selectors_preserve_outside_shared_and_orphan_blobs() {
+        let temp = tempfile::tempdir().expect("fixture");
+        let data_dir = temp.path().join("data");
+        let capture = |provider, name, bytes: &[u8]| {
+            let source_path = temp.path().join(name);
+            fs::write(&source_path, bytes).expect("source");
+            capture_source_file(RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider,
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &source_path,
+                db_links: &[],
+            })
+            .expect("capture")
+        };
+        let selected = capture("opencode", "target.db", b"shared bytes");
+        let sole_copy = capture("claude_code", "sole.jsonl", b"shared bytes");
+        let other_path = capture("opencode", "other.db", b"different source");
+        let root = raw_mirror_root(&data_dir);
+        let orphan_bytes = b"orphan without provider provenance";
+        let orphan_digest = blake3::hash(orphan_bytes).to_hex().to_string();
+        let orphan_path = root.join(raw_mirror_blob_relative_path(&orphan_digest).expect("digest"));
+        ensure_private_dir_descendant(&root, orphan_path.parent().expect("parent"))
+            .expect("orphan directory");
+        fs::write(&orphan_path, orphan_bytes).expect("orphan");
+
+        let options = RawMirrorPruneOptions {
+            providers: vec!["opencode".to_string()],
+            source_path: Some("*target.db".to_string()),
+            safety_hold_down_ms: 0,
+            ..RawMirrorPruneOptions::default()
+        };
+        for invalid in ["", "[invalid"] {
+            assert!(
+                prune(
+                    &data_dir,
+                    RawMirrorPruneOptions {
+                        source_path: Some(invalid.to_string()),
+                        ..options.clone()
+                    }
+                )
+                .is_err()
+            );
+        }
+        assert!(!root.join("pruned.jsonl").exists());
+
+        let within_budget = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                max_size_bytes: Some(selected.source_size_bytes),
+                ..options.clone()
+            },
+        )
+        .expect("scope budget");
+        assert_eq!(
+            within_budget.scope_blob_bytes,
+            Some(selected.source_size_bytes)
+        );
+        assert!(within_budget.current_blob_bytes > selected.source_size_bytes);
+        assert_eq!(within_budget.planned_manifest_count, 0);
+
+        let report = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                older_than_ms: Some(0),
+                max_size_bytes: Some(0),
+                apply: true,
+                ..options
+            },
+        )
+        .expect("scoped apply");
+        assert_eq!(report.applied_manifest_count, 1);
+        assert_eq!(report.applied_blob_count, 0);
+        assert_eq!(report.providers, ["opencode"]);
+        assert!(!root.join(&selected.manifest_relative_path).exists());
+        assert!(root.join(&sole_copy.manifest_relative_path).exists());
+        assert!(root.join(&other_path.manifest_relative_path).exists());
+        assert_eq!(
+            fs::read(root.join(&selected.blob_relative_path)).expect("shared"),
+            b"shared bytes"
+        );
+        assert_eq!(
+            fs::read(&orphan_path).expect("orphan remains"),
+            orphan_bytes
+        );
     }
 
     #[test]

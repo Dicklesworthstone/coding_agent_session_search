@@ -655,6 +655,13 @@ holds down blobs referenced by captures from the last 7 days by default, writes
 `raw-mirror/v1/pruned.jsonl` for every non-empty plan, and refuses apply mode
 while an index/watch job is active.
 
+Use `--provider opencode` and/or `--source-path '*/opencode.db'` with an age
+or size rule to target one source without retiring unrelated captures.
+Repeated providers are alternatives; a source-path glob further narrows them.
+With a selector, `--max-size` measures unique blobs in that selection. Shared
+blobs still referenced outside it and orphan blobs without source provenance
+remain protected. The JSON plan records the selectors and `scope_blob_bytes`.
+
 Large mutable sources are stored as 4 MiB content-addressed chunks. Growing
 JSONL files reuse every unchanged complete chunk, and SQLite sources reuse
 unchanged 4 MiB byte regions, so each historical snapshot remains byte-exact without
