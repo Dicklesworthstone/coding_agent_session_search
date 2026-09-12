@@ -2753,7 +2753,7 @@ pub struct DetailFindState {
     pub current: usize,
 }
 
-/// How results are grouped into panes (G to cycle).
+/// How results are grouped into panes (Alt+F to cycle).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ResultsGrouping {
     #[default]
@@ -4866,7 +4866,7 @@ fn sparkline_from_values(values: &[f64], max_width: usize) -> String {
         .collect()
 }
 
-/// Persisted filters+ranking for a saved-view slot.
+/// Persisted filters, ranking, and grouping for a saved-view slot.
 #[derive(Clone, Debug)]
 pub struct SavedView {
     pub slot: u8,
@@ -4876,6 +4876,7 @@ pub struct SavedView {
     pub created_from: Option<i64>,
     pub created_to: Option<i64>,
     pub ranking: RankingMode,
+    pub grouping_mode: ResultsGrouping,
     pub source_filter: SourceFilter,
 }
 
@@ -6599,6 +6600,7 @@ impl CassApp {
                 })
             }
             PaletteResult::OpenSavedViews => ftui::Cmd::msg(CassMsg::SavedViewsOpened),
+            PaletteResult::CycleGrouping => ftui::Cmd::msg(CassMsg::GroupingCycled),
             PaletteResult::SaveViewSlot(slot) => ftui::Cmd::msg(CassMsg::ViewSaved(slot)),
             PaletteResult::LoadViewSlot(slot) => ftui::Cmd::msg(CassMsg::ViewLoaded(slot)),
             PaletteResult::OpenBulkActions => ftui::Cmd::msg(CassMsg::BulkActionsOpened),
@@ -12558,6 +12560,10 @@ impl CassApp {
                     shortcuts::RANKING
                 ),
                 format!(
+                    "{} grouping: agent → conversation → workspace → flat (one list)",
+                    shortcuts::GROUPING
+                ),
+                format!(
                     "{}/{} cycle 18 themes (Tokyo Night → Daylight → Catppuccin → … → High Contrast) | {} toggle border style",
                     shortcuts::THEME,
                     shortcuts::THEME_PREV,
@@ -14683,6 +14689,8 @@ struct PersistedSavedView {
     #[serde(default)]
     ranking: Option<String>,
     #[serde(default)]
+    grouping_mode: Option<String>,
+    #[serde(default)]
     source_filter_kind: Option<String>,
     #[serde(default)]
     source_filter_value: Option<String>,
@@ -14786,6 +14794,25 @@ fn ranking_mode_str(value: RankingMode) -> &'static str {
         RankingMode::MatchQualityHeavy => "match_quality_heavy",
         RankingMode::DateNewest => "date_newest",
         RankingMode::DateOldest => "date_oldest",
+    }
+}
+
+fn parse_results_grouping(value: &str) -> Option<ResultsGrouping> {
+    match value.to_ascii_lowercase().as_str() {
+        "agent" => Some(ResultsGrouping::Agent),
+        "conversation" => Some(ResultsGrouping::Conversation),
+        "workspace" => Some(ResultsGrouping::Workspace),
+        "flat" => Some(ResultsGrouping::Flat),
+        _ => None,
+    }
+}
+
+fn results_grouping_str(value: ResultsGrouping) -> &'static str {
+    match value {
+        ResultsGrouping::Agent => "agent",
+        ResultsGrouping::Conversation => "conversation",
+        ResultsGrouping::Workspace => "workspace",
+        ResultsGrouping::Flat => "flat",
     }
 }
 
@@ -14915,6 +14942,7 @@ fn persisted_state_file_from_state(state: &PersistedState) -> PersistedStateFile
                 created_from: view.created_from,
                 created_to: view.created_to,
                 ranking: Some(ranking_mode_str(view.ranking).to_string()),
+                grouping_mode: Some(results_grouping_str(view.grouping_mode).to_string()),
                 source_filter_kind: Some(source_filter_kind),
                 source_filter_value,
                 source_filter: Some(serde_json::Value::String(
@@ -14989,6 +15017,11 @@ fn persisted_state_from_file(file: PersistedStateFile) -> PersistedState {
                 created_from: view.created_from,
                 created_to: view.created_to,
                 ranking,
+                grouping_mode: view
+                    .grouping_mode
+                    .as_deref()
+                    .and_then(parse_results_grouping)
+                    .unwrap_or_default(),
                 source_filter,
             })
         })
@@ -15799,7 +15832,9 @@ impl From<super::ftui_adapter::Event> for CassMsg {
                     KeyCode::Char('J') if alt => CassMsg::ToggleJsonView,
                     KeyCode::Char('r') if alt => CassMsg::ResultsRefreshed,
                     KeyCode::Char('b') if alt => CassMsg::BulkActionsOpened,
-                    KeyCode::Char('g') if alt => CassMsg::GroupingCycled,
+                    KeyCode::Char('f') | KeyCode::Char('F') if alt && !ctrl => {
+                        CassMsg::GroupingCycled
+                    }
                     KeyCode::Char('[') if alt => CassMsg::TimelineJumped { forward: false },
                     KeyCode::Char(']') if alt => CassMsg::TimelineJumped { forward: true },
 
@@ -19478,6 +19513,7 @@ impl super::ftui_adapter::Model for CassApp {
                     created_from: self.filters.created_from,
                     created_to: self.filters.created_to,
                     ranking: self.ranking_mode,
+                    grouping_mode: self.grouping_mode,
                     source_filter: normalize_source_filter(self.filters.source_filter.clone()),
                 };
                 // Replace existing slot or push
@@ -19510,6 +19546,8 @@ impl super::ftui_adapter::Model for CassApp {
                     self.filters.created_from = view.created_from;
                     self.filters.created_to = view.created_to;
                     self.ranking_mode = view.ranking;
+                    self.grouping_mode = view.grouping_mode;
+                    self.regroup_panes();
                     self.filters.source_filter =
                         normalize_source_filter(view.source_filter.clone());
                     let modal_was_open = self.show_saved_views_modal;
@@ -24874,6 +24912,7 @@ mod tests {
                 created_from: Some(1000),
                 created_to: Some(2000),
                 ranking: RankingMode::MatchQualityHeavy,
+                grouping_mode: ResultsGrouping::Flat,
                 source_filter: SourceFilter::SourceId("remote-buildbox".to_string()),
             }],
             analytics_since_ms: Some(111),
@@ -24912,6 +24951,7 @@ mod tests {
         );
         assert_eq!(loaded.saved_views.len(), 1);
         assert_eq!(loaded.saved_views[0].slot, 3);
+        assert_eq!(loaded.saved_views[0].grouping_mode, ResultsGrouping::Flat);
         assert_eq!(loaded.saved_views[0].label.as_deref(), Some("triage"));
         assert!(matches!(
             loaded.saved_views[0].source_filter,
@@ -24955,6 +24995,7 @@ mod tests {
                 created_to: None,
                 ranking: RankingMode::Balanced,
                 source_filter: SourceFilter::SourceId("  work-laptop  ".to_string()),
+                grouping_mode: ResultsGrouping::Agent,
             }],
             analytics_source_filter: SourceFilter::SourceId("  LOCAL  ".to_string()),
             ..persisted_state_defaults()
@@ -26466,6 +26507,7 @@ mod tests {
             created_to: None,
             ranking: RankingMode::Balanced,
             source_filter: SourceFilter::SourceId("  LOCAL  ".to_string()),
+            grouping_mode: ResultsGrouping::Agent,
         });
 
         let _ = app.update(CassMsg::ViewLoaded(7));
@@ -37467,6 +37509,7 @@ not jsonl",
                 created_from: None,
                 created_to: None,
                 ranking: RankingMode::Balanced,
+                grouping_mode: ResultsGrouping::Agent,
                 source_filter: SourceFilter::All,
             },
             SavedView {
@@ -37477,6 +37520,7 @@ not jsonl",
                 created_from: None,
                 created_to: None,
                 ranking: RankingMode::Balanced,
+                grouping_mode: ResultsGrouping::Agent,
                 source_filter: SourceFilter::All,
             },
             SavedView {
@@ -37487,6 +37531,7 @@ not jsonl",
                 created_from: None,
                 created_to: None,
                 ranking: RankingMode::Balanced,
+                grouping_mode: ResultsGrouping::Agent,
                 source_filter: SourceFilter::All,
             },
         ];
@@ -40198,6 +40243,137 @@ not jsonl",
         let _ = app.update(CassMsg::GroupingCycled);
         assert_eq!(app.grouping_mode, ResultsGrouping::Conversation);
         assert!(app.status.contains("Grouping:"));
+    }
+
+    #[test]
+    fn gh464_grouping_key_reaches_uncapped_flat_results() {
+        use crate::ui::ftui_adapter::{Event, KeyCode, KeyEvent, Modifiers};
+
+        let mut app = CassApp::default();
+        app.ranking_mode = RankingMode::DateNewest;
+        app.results = (0..180)
+            .map(|id| {
+                let mut hit = make_hit(id, &format!("/sessions/{id}"));
+                hit.agent = if id == 179 { "codex" } else { "claude_code" }.into();
+                hit.created_at = Some(180 - id as i64);
+                hit
+            })
+            .collect();
+        app.regroup_panes();
+        assert!(app.panes.iter().map(|p| p.hits.len()).sum::<usize>() < 180);
+
+        for (character, modifiers, expected) in [
+            ('f', Modifiers::ALT, ResultsGrouping::Conversation),
+            ('F', Modifiers::ALT, ResultsGrouping::Workspace),
+            (
+                'F',
+                Modifiers::ALT | Modifiers::SHIFT,
+                ResultsGrouping::Flat,
+            ),
+        ] {
+            let event =
+                Event::Key(KeyEvent::new(KeyCode::Char(character)).with_modifiers(modifiers));
+            let _ = app.update(CassMsg::from(event));
+            assert_eq!(app.grouping_mode, expected);
+        }
+        assert_eq!(app.panes.len(), 1);
+        assert_eq!(app.panes[0].hits.len(), 180);
+        assert_eq!(app.panes[0].total_count, 180);
+        assert!(
+            app.panes[0]
+                .hits
+                .windows(2)
+                .all(|p| p[0].created_at > p[1].created_at)
+        );
+        assert_eq!(app.ranking_mode, RankingMode::DateNewest);
+
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('f')).with_modifiers(Modifiers::ALT));
+        let _ = app.update(CassMsg::from(event));
+        assert_eq!(app.grouping_mode, ResultsGrouping::Agent);
+    }
+
+    #[test]
+    fn gh464_grouping_binding_preserves_text_and_agent_filter() {
+        use crate::ui::ftui_adapter::{Event, KeyCode, KeyEvent, Modifiers};
+
+        for character in ['f', 'F'] {
+            assert!(matches!(
+                CassMsg::from(Event::Key(KeyEvent::new(KeyCode::Char(character)))),
+                CassMsg::QueryChanged(text) if text == character.to_string()
+            ));
+            assert!(matches!(
+                CassMsg::from(Event::Key(
+                    KeyEvent::new(KeyCode::Char(character))
+                        .with_modifiers(Modifiers::CTRL | Modifiers::ALT)
+                )),
+                CassMsg::WildcardFallbackToggled | CassMsg::QueryChanged(_)
+            ));
+        }
+        for character in ['g', 'G'] {
+            assert!(matches!(
+                CassMsg::from(Event::Key(
+                    KeyEvent::new(KeyCode::Char(character)).with_modifiers(Modifiers::ALT)
+                )),
+                CassMsg::InputModeEntered(InputMode::Agent)
+            ));
+            assert!(matches!(
+                CassMsg::from(Event::Key(
+                    KeyEvent::new(KeyCode::Char(character))
+                        .with_modifiers(Modifiers::ALT | Modifiers::SHIFT)
+                )),
+                CassMsg::FilterAgentSet(agents) if agents.is_empty()
+            ));
+        }
+        let _ = take_raw_event();
+    }
+
+    #[test]
+    fn gh464_palette_and_saved_view_restore_grouping() {
+        let mut app = CassApp::default();
+        app.grouping_mode = ResultsGrouping::Workspace;
+        let _ = app.update(CassMsg::PaletteOpened);
+        let _ = app.update(CassMsg::PaletteQueryChanged("flat".to_string()));
+        app.palette_state.selected = app
+            .palette_state
+            .filtered
+            .iter()
+            .position(|item| matches!(item.action, PaletteAction::CycleGrouping))
+            .expect("flat grouping is discoverable in the palette");
+        let cmd = app.update(CassMsg::PaletteActionExecuted);
+        let msg = extract_msg(cmd).expect("palette dispatches the grouping action");
+        assert!(matches!(msg, CassMsg::GroupingCycled));
+        let _ = app.update(msg);
+        assert_eq!(app.grouping_mode, ResultsGrouping::Flat);
+        assert!(!app.command_palette.is_visible());
+        app.ranking_mode = RankingMode::DateNewest;
+        let _ = app.update(CassMsg::ViewSaved(4));
+
+        let dir = tempfile::tempdir().expect("state directory");
+        let path = dir.path().join("tui_state.json");
+        save_persisted_state_to_path(&path, &app.capture_persisted_state()).expect("save view");
+        let state = load_persisted_state_from_path(&path)
+            .expect("read view")
+            .expect("saved state");
+        let mut restored = CassApp::default();
+        restored.results = vec![make_hit(1, "/a"), make_hit(2, "/b")];
+        let _ = restored.update(CassMsg::StateLoaded(Box::new(state)));
+        let cmd = restored.update(CassMsg::ViewLoaded(4));
+        assert!(matches!(extract_msg(cmd), Some(CassMsg::SearchRequested)));
+        assert_eq!(restored.grouping_mode, ResultsGrouping::Flat);
+        assert_eq!(restored.ranking_mode, RankingMode::DateNewest);
+        assert_eq!(restored.panes.len(), 1);
+        assert_eq!(restored.panes[0].hits.len(), 2);
+
+        for grouping in [None, Some("unknown_future_grouping")] {
+            let file: PersistedStateFile = serde_json::from_value(serde_json::json!({
+                "saved_views": [{"slot": 1, "grouping_mode": grouping}]
+            }))
+            .expect("state fixture");
+            assert_eq!(
+                persisted_state_from_file(file).saved_views[0].grouping_mode,
+                ResultsGrouping::Agent
+            );
+        }
     }
 
     #[test]
