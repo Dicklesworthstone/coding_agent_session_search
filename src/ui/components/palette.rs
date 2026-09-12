@@ -23,7 +23,7 @@
 //! |-------------|------------------------------------------------------------|
 //! | Chrome      | ToggleTheme, ToggleDensity, ToggleHelpStrip, OpenUpdate    |
 //! | Filter      | FilterAgent, FilterWorkspace, FilterToday/Week/CustomDate  |
-//! | View        | OpenSavedViews, SaveViewSlot, LoadViewSlot, BulkActions, ReloadIndex |
+//! | View        | OpenSavedViews, CycleGrouping, SaveViewSlot, LoadViewSlot, BulkActions, ReloadIndex |
 //! | Analytics   | AnalyticsDashboard..AnalyticsCoverage                      |
 //! | Export      | ScreenshotHtml, ScreenshotSvg, ScreenshotText             |
 //! | Recording   | MacroRecordingToggle                                       |
@@ -160,6 +160,7 @@ pub enum PaletteAction {
     FilterWeek,
     FilterCustomDate,
     OpenSavedViews,
+    CycleGrouping,
     SaveViewSlot(u8),
     LoadViewSlot(u8),
     OpenBulkActions,
@@ -196,6 +197,7 @@ impl PaletteAction {
             | Self::FilterWeek
             | Self::FilterCustomDate => PaletteGroup::Filter,
             Self::OpenSavedViews
+            | Self::CycleGrouping
             | Self::SaveViewSlot(_)
             | Self::LoadViewSlot(_)
             | Self::OpenBulkActions
@@ -235,6 +237,7 @@ impl PaletteAction {
             Self::FilterCustomDate => "InputModeEntered(CreatedFrom)",
             // View
             Self::OpenSavedViews => "SavedViewsOpened",
+            Self::CycleGrouping => "GroupingCycled",
             Self::SaveViewSlot(_) => "ViewSaved(slot)",
             Self::LoadViewSlot(_) => "ViewLoaded(slot)",
             Self::OpenBulkActions => "BulkActionsOpened",
@@ -282,6 +285,8 @@ pub enum PaletteResult {
     SetTimeFilter { from: TimeFilterPreset },
     /// Open the saved-views picker.
     OpenSavedViews,
+    /// Cycle result panes through agent, conversation, workspace, and flat.
+    CycleGrouping,
     /// Save the current view to a numbered slot.
     SaveViewSlot(u8),
     /// Load a view from a numbered slot.
@@ -362,6 +367,7 @@ impl PaletteAction {
             Self::FilterCustomDate => PaletteResult::EnterInputMode(InputModeTarget::CreatedFrom),
             // Views
             Self::OpenSavedViews => PaletteResult::OpenSavedViews,
+            Self::CycleGrouping => PaletteResult::CycleGrouping,
             Self::SaveViewSlot(slot) => PaletteResult::SaveViewSlot(*slot),
             Self::LoadViewSlot(slot) => PaletteResult::LoadViewSlot(*slot),
             Self::OpenBulkActions => PaletteResult::OpenBulkActions,
@@ -496,6 +502,11 @@ pub fn default_actions() -> Vec<PaletteItem> {
             PaletteAction::OpenSavedViews,
             "Saved views",
             "List saved slots",
+        ),
+        item(
+            PaletteAction::CycleGrouping,
+            "Cycle result grouping (agent / conversation / workspace / flat)",
+            shortcuts::GROUPING,
         ),
         item(
             PaletteAction::ToggleDensity,
@@ -1051,6 +1062,7 @@ mod tests {
             PaletteAction::FilterWeek,
             PaletteAction::FilterCustomDate,
             PaletteAction::OpenSavedViews,
+            PaletteAction::CycleGrouping,
             PaletteAction::SaveViewSlot(1),
             PaletteAction::LoadViewSlot(1),
             PaletteAction::OpenBulkActions,

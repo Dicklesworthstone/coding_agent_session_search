@@ -14,6 +14,7 @@ pub const QUIT: &str = "Esc/F10";
 pub const CLEAR_FILTERS: &str = "Ctrl+Del";
 pub const RESET_STATE: &str = "Ctrl+Shift+Del";
 pub const RANKING: &str = "F12";
+pub const GROUPING: &str = "Alt+F";
 pub const REFRESH: &str = "Ctrl+Shift+R";
 pub const DETAIL_OPEN: &str = "Enter";
 pub const DETAIL_CLOSE: &str = "Esc";
