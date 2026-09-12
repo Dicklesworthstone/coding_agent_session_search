@@ -1357,7 +1357,7 @@ fn raw_mirror_dir_file_bytes(root: &Path) -> u64 {
     total
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 struct RawMirrorBlobCacheKey {
     data_dir: PathBuf,
     source_path: PathBuf,
@@ -1365,24 +1365,25 @@ struct RawMirrorBlobCacheKey {
     source_size_bytes: u64,
     source_mtime_ns: Option<u128>,
     source_change_time_ns: Option<u128>,
+    source_sidecars_fingerprint: Option<String>,
     chunk_threshold_bytes: u64,
     chunk_size_bytes: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 struct RawMirrorBlobSourceKey {
     data_dir: PathBuf,
     source_path: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct CachedRawMirrorBlobRecord {
     cache_key: RawMirrorBlobCacheKey,
     record: RawMirrorBlobRecord,
     stored_blob_fingerprints: Vec<RawMirrorStoredBlobFingerprint>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct RawMirrorStoredBlobFingerprint {
     blob_relative_path: String,
     file_identity: String,
@@ -1391,13 +1392,20 @@ struct RawMirrorStoredBlobFingerprint {
     change_time_ns: u128,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct RawMirrorBlobRecord {
     blob_blake3: String,
     blob_size_bytes: u64,
     source_content_blake3: String,
     source_size_bytes: u64,
     content_storage: Option<RawMirrorContentStorage>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedRawMirrorBlobCache {
+    version: u32,
+    entry: CachedRawMirrorBlobRecord,
+    entry_blake3: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1518,6 +1526,14 @@ pub(crate) fn capture_source_file_with_chunk_policy(
     ensure_private_dir_descendant(&root, &root.join("tmp"))?;
     let _mutation_lock = acquire_raw_mirror_mutation_lock(&root)?;
 
+    // Acquiring the mirror lock can wait behind another capture. Its source
+    // metadata must be current when it authorizes either cache or copy work.
+    let source_metadata = fs::symlink_metadata(input.source_path)?;
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+        return Err(anyhow!(
+            "raw mirror source changed identity while waiting for capture"
+        ));
+    }
     let cache_key = raw_mirror_blob_cache_key(
         &input,
         &source_metadata,
@@ -2396,9 +2412,104 @@ fn raw_mirror_blob_cache_key(
         source_size_bytes: source_metadata.len(),
         source_mtime_ns: source_metadata.modified().ok().and_then(system_time_to_ns),
         source_change_time_ns: source_change_time_ns(source_metadata),
+        source_sidecars_fingerprint: raw_mirror_source_sidecars_fingerprint(input.source_path),
         chunk_threshold_bytes,
         chunk_size_bytes,
     }
+}
+
+fn raw_mirror_source_sidecars_fingerprint(source_path: &Path) -> Option<String> {
+    let mut hasher = blake3::Hasher::new();
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut path = source_path.as_os_str().to_os_string();
+        path.push(suffix);
+        hasher.update(suffix.as_bytes());
+        match fs::symlink_metadata(Path::new(&path)) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                let fingerprint = format!(
+                    "{}:{}:{}:{};",
+                    source_identity_token(&metadata)?,
+                    metadata.len(),
+                    metadata.modified().ok().and_then(system_time_to_ns)?,
+                    source_change_time_ns(&metadata)?
+                );
+                hasher.update(fingerprint.as_bytes());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                hasher.update(b"absent;");
+            }
+            _ => return None,
+        }
+    }
+    Some(hasher.finalize().to_hex().to_string())
+}
+
+fn raw_mirror_blob_cache_path(root: &Path, key: &RawMirrorBlobCacheKey) -> Option<PathBuf> {
+    let source_key = serde_json::to_vec(&raw_mirror_blob_source_key(key)).ok()?;
+    Some(
+        root.join("capture-cache")
+            .join(format!("{}.json", blake3::hash(&source_key).to_hex())),
+    )
+}
+
+fn read_persisted_raw_mirror_blob_cache(
+    root: &Path,
+    key: &RawMirrorBlobCacheKey,
+) -> Option<CachedRawMirrorBlobRecord> {
+    let path = raw_mirror_blob_cache_path(root, key)?;
+    if raw_mirror_path_has_symlink_below_root(root, &path) {
+        return None;
+    }
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() > RAW_MIRROR_MANIFEST_MAX_BYTES {
+        return None;
+    }
+    let file = open_stable_source_file(&path, &metadata).ok()?;
+    let mut bytes = Vec::new();
+    file.take(RAW_MIRROR_MANIFEST_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > RAW_MIRROR_MANIFEST_MAX_BYTES {
+        return None;
+    }
+    let persisted: PersistedRawMirrorBlobCache = serde_json::from_slice(&bytes).ok()?;
+    if persisted.version != 1 || persisted.entry.cache_key != *key {
+        return None;
+    }
+    let entry_bytes = serde_json::to_vec(&persisted.entry).ok()?;
+    if blake3::hash(&entry_bytes).to_hex().as_str() != persisted.entry_blake3 {
+        return None;
+    }
+    Some(persisted.entry)
+}
+
+fn persist_raw_mirror_blob_cache(root: &Path, entry: &CachedRawMirrorBlobRecord) -> Result<()> {
+    let path = raw_mirror_blob_cache_path(root, &entry.cache_key)
+        .ok_or_else(|| anyhow!("raw mirror cache source path is not serializable"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("raw mirror cache has no parent"))?;
+    ensure_private_dir_descendant(root, parent)?;
+    if raw_mirror_path_has_symlink_below_root(root, &path) {
+        return Err(anyhow!("raw mirror cache path contains a symlink"));
+    }
+    let entry_bytes = serde_json::to_vec(entry)?;
+    let bytes = serde_json::to_vec(&PersistedRawMirrorBlobCache {
+        version: 1,
+        entry: entry.clone(),
+        entry_blake3: blake3::hash(&entry_bytes).to_hex().to_string(),
+    })?;
+    if bytes.len() as u64 > RAW_MIRROR_MANIFEST_MAX_BYTES {
+        return Err(anyhow!("raw mirror cache entry exceeds its size limit"));
+    }
+    let temporary = unique_temp_path(parent, "cache");
+    let mut file = private_create_new_file(&temporary)?;
+    file.write_all(&bytes)?;
+    sync_open_file_if_required(&file, || "sync raw mirror capture cache".to_string())?;
+    drop(file);
+    fs::rename(&temporary, &path)?;
+    sync_parent(&path)?;
+    Ok(())
 }
 
 fn cached_raw_mirror_blob_record(
@@ -2411,8 +2522,14 @@ fn cached_raw_mirror_blob_record(
     let cache = BLOB_CAPTURE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let source_key = raw_mirror_blob_source_key(key);
     let cached = {
+        let guard = cache.lock().ok()?;
+        let cached = guard
+            .get(&source_key)
+            .filter(|entry| entry.cache_key == *key)
+            .cloned();
+        drop(guard);
+        let cached = cached.or_else(|| read_persisted_raw_mirror_blob_cache(root, key))?;
         let mut guard = cache.lock().ok()?;
-        let cached = guard.get(&source_key).cloned()?;
         if cached.cache_key != *key {
             guard.remove(&source_key);
             return None;
@@ -2428,12 +2545,19 @@ fn cached_raw_mirror_blob_record(
     if raw_mirror_stored_blob_fingerprints(root, &record)
         .is_some_and(|current| current == cached.stored_blob_fingerprints)
     {
+        if !raw_mirror_blob_cache_source_is_current(key) {
+            return None;
+        }
+        remember_cached_raw_mirror_blob_record(cache, cached);
         return Some(record);
     }
 
     match cached_raw_mirror_blob_record_is_verified(root, &record) {
         Ok(()) => {
-            refresh_cached_raw_mirror_blob_fingerprints(cache, key, &record, root);
+            if !raw_mirror_blob_cache_source_is_current(key) {
+                return None;
+            }
+            cache_raw_mirror_blob_record(key.clone(), record.clone());
             Some(record)
         }
         Err(err) => {
@@ -2449,6 +2573,21 @@ fn cached_raw_mirror_blob_record(
             None
         }
     }
+}
+
+fn raw_mirror_blob_cache_source_is_current(key: &RawMirrorBlobCacheKey) -> bool {
+    fs::symlink_metadata(&key.source_path)
+        .ok()
+        .is_some_and(|metadata| {
+            !metadata.file_type().is_symlink()
+                && metadata.is_file()
+                && source_identity_token(&metadata) == key.source_identity
+                && metadata.len() == key.source_size_bytes
+                && metadata.modified().ok().and_then(system_time_to_ns) == key.source_mtime_ns
+                && source_change_time_ns(&metadata) == key.source_change_time_ns
+                && raw_mirror_source_sidecars_fingerprint(&key.source_path)
+                    == key.source_sidecars_fingerprint
+        })
 }
 
 fn raw_mirror_stored_blob_fingerprints(
@@ -2467,6 +2606,11 @@ fn raw_mirror_stored_blob_fingerprints(
     let mut seen = HashSet::new();
     let mut fingerprints = Vec::with_capacity(references.len());
     for reference in references {
+        if raw_mirror_blob_relative_path(&reference.blob_blake3).as_deref()
+            != Some(reference.blob_relative_path.as_str())
+        {
+            return None;
+        }
         if !seen.insert(reference.blob_relative_path.clone()) {
             continue;
         }
@@ -2490,25 +2634,6 @@ fn raw_mirror_stored_blob_fingerprints(
         });
     }
     Some(fingerprints)
-}
-
-fn refresh_cached_raw_mirror_blob_fingerprints(
-    cache: &Mutex<HashMap<RawMirrorBlobSourceKey, CachedRawMirrorBlobRecord>>,
-    key: &RawMirrorBlobCacheKey,
-    record: &RawMirrorBlobRecord,
-    root: &Path,
-) {
-    let Some(stored_blob_fingerprints) = raw_mirror_stored_blob_fingerprints(root, record) else {
-        return;
-    };
-    let source_key = raw_mirror_blob_source_key(key);
-    if let Ok(mut guard) = cache.lock()
-        && let Some(current) = guard.get_mut(&source_key)
-        && current.cache_key == *key
-        && current.record == *record
-    {
-        current.stored_blob_fingerprints = stored_blob_fingerprints;
-    }
 }
 
 fn cached_raw_mirror_blob_record_is_verified(
@@ -2556,28 +2681,39 @@ fn cache_raw_mirror_blob_record(key: RawMirrorBlobCacheKey, record: RawMirrorBlo
     let Some(stored_blob_fingerprints) = raw_mirror_stored_blob_fingerprints(&root, &record) else {
         return;
     };
+    let cached = CachedRawMirrorBlobRecord {
+        cache_key: key.clone(),
+        record,
+        stored_blob_fingerprints,
+    };
+    if let Err(error) = persist_raw_mirror_blob_cache(&root, &cached) {
+        tracing::debug!(%error, "raw mirror capture cache was not persisted; capture remains valid");
+    }
     let cache = BLOB_CAPTURE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    remember_cached_raw_mirror_blob_record(cache, cached);
+}
+
+fn remember_cached_raw_mirror_blob_record(
+    cache: &Mutex<HashMap<RawMirrorBlobSourceKey, CachedRawMirrorBlobRecord>>,
+    cached: CachedRawMirrorBlobRecord,
+) {
     if let Ok(mut guard) = cache.lock() {
-        let source_key = raw_mirror_blob_source_key(&key);
+        let source_key = raw_mirror_blob_source_key(&cached.cache_key);
         if !guard.contains_key(&source_key)
             && guard.len() >= RAW_MIRROR_BLOB_CACHE_MAX_ENTRIES
             && let Some(evicted) = guard.keys().next().cloned()
         {
             guard.remove(&evicted);
         }
-        guard.insert(
-            source_key,
-            CachedRawMirrorBlobRecord {
-                cache_key: key,
-                record,
-                stored_blob_fingerprints,
-            },
-        );
+        guard.insert(source_key, cached);
     }
 }
 
 fn raw_mirror_blob_cache_key_is_strong(key: &RawMirrorBlobCacheKey) -> bool {
-    key.source_identity.is_some() && key.source_change_time_ns.is_some()
+    key.source_identity.is_some()
+        && key.source_mtime_ns.is_some()
+        && key.source_change_time_ns.is_some()
+        && key.source_sidecars_fingerprint.is_some()
 }
 
 fn raw_mirror_blob_source_key(key: &RawMirrorBlobCacheKey) -> RawMirrorBlobSourceKey {
@@ -5447,6 +5583,7 @@ mod tests {
             source_size_bytes: 1,
             source_mtime_ns: Some(1),
             source_change_time_ns: Some(1),
+            source_sidecars_fingerprint: Some("no sidecars".to_string()),
             chunk_threshold_bytes: 1,
             chunk_size_bytes: 16,
         };
@@ -5493,6 +5630,186 @@ mod tests {
         assert!(guard.len() <= RAW_MIRROR_BLOB_CACHE_MAX_ENTRIES);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn gh461_capture_cache_survives_fresh_process() {
+        let child_root = dotenvy::var("CASS_TEST_GH461_CACHE_ROOT").ok();
+        let temporary = child_root
+            .is_none()
+            .then(|| tempfile::tempdir().expect("fixture"));
+        let fixture = child_root.as_ref().map(PathBuf::from).unwrap_or_else(|| {
+            temporary
+                .as_ref()
+                .expect("parent fixture")
+                .path()
+                .to_path_buf()
+        });
+        let data_dir = fixture.join("data");
+        let source_path = fixture.join("source.jsonl");
+        if child_root.is_none() {
+            fs::write(&source_path, b"unchanged source bytes\n").expect("source");
+        } else {
+            assert!(
+                BLOB_CAPTURE_CACHE.get().is_none(),
+                "child has no inherited memo"
+            );
+        }
+        let input = RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        };
+        let key = raw_mirror_blob_cache_key(
+            &input,
+            &fs::metadata(&source_path).expect("source metadata"),
+            RAW_MIRROR_CHUNK_THRESHOLD_BYTES,
+            RAW_MIRROR_CHUNK_SIZE_BYTES,
+        );
+        let cache_path =
+            raw_mirror_blob_cache_path(&raw_mirror_root(&data_dir), &key).expect("cache path");
+        let prior = fs::metadata(&cache_path).ok();
+        let capture = capture_source_file(input).expect("capture");
+        assert_eq!(
+            read_source_bytes(&data_dir, &capture.manifest_id).expect("mirror bytes"),
+            b"unchanged source bytes\n"
+        );
+        if child_root.is_some() {
+            let prior = prior.expect("parent persisted the cache");
+            let after = fs::metadata(&cache_path).expect("cache remains");
+            assert!(
+                same_source_identity(&prior, &after),
+                "recapture would replace the cache file"
+            );
+            assert!(!source_file_changed_during_capture(&prior, &after));
+            assert!(capture.already_present);
+            return;
+        }
+
+        let mut child =
+            std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "raw_mirror::tests::gh461_capture_cache_survives_fresh_process",
+                    "--nocapture",
+                ])
+                .env("CASS_TEST_GH461_CACHE_ROOT", &fixture)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("fresh process");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if child.try_wait().expect("child status").is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("fresh-process capture exceeded 30 seconds");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().expect("child output");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh461_persisted_cache_rejects_changed_source_sidecars_and_bad_entries() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let data_dir = fixture.path().join("data");
+        let source_path = fixture.path().join("source.jsonl");
+        fs::write(&source_path, b"original source\n").expect("source");
+        let input = || RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        };
+        let current_key = || {
+            raw_mirror_blob_cache_key(
+                &input(),
+                &fs::metadata(&source_path).expect("metadata"),
+                RAW_MIRROR_CHUNK_THRESHOLD_BYTES,
+                RAW_MIRROR_CHUNK_SIZE_BYTES,
+            )
+        };
+        let first = capture_source_file(input()).expect("capture");
+        let root = raw_mirror_root(&data_dir);
+        let initial = current_key();
+        let cache_path = raw_mirror_blob_cache_path(&root, &initial).expect("cache path");
+        let clear_memo = || {
+            BLOB_CAPTURE_CACHE
+                .get()
+                .expect("memo")
+                .lock()
+                .expect("memo lock")
+                .remove(&raw_mirror_blob_source_key(&initial));
+        };
+        clear_memo();
+        assert!(cached_raw_mirror_blob_record(&initial, &root).is_some());
+        clear_memo();
+        fs::write(fixture.path().join("source.jsonl-wal"), b"new WAL state").expect("WAL");
+        let with_wal = current_key();
+        assert_ne!(with_wal, initial);
+        assert!(cached_raw_mirror_blob_record(&initial, &root).is_none());
+        assert!(cached_raw_mirror_blob_record(&with_wal, &root).is_none());
+        capture_source_file(input()).expect("recapture after sidecar change");
+        clear_memo();
+        assert!(cached_raw_mirror_blob_record(&with_wal, &root).is_some());
+
+        clear_memo();
+        let original_mtime = fs::metadata(&source_path)
+            .expect("mtime")
+            .modified()
+            .expect("mtime");
+        fs::write(&source_path, b"modified source\n").expect("same-length change");
+        File::options()
+            .write(true)
+            .open(&source_path)
+            .expect("source file")
+            .set_times(fs::FileTimes::new().set_modified(original_mtime))
+            .expect("preserve mtime");
+        let modified = current_key();
+        assert_eq!(modified.source_size_bytes, initial.source_size_bytes);
+        assert_eq!(modified.source_mtime_ns, initial.source_mtime_ns);
+        assert!(cached_raw_mirror_blob_record(&with_wal, &root).is_none());
+        assert!(cached_raw_mirror_blob_record(&modified, &root).is_none());
+        let changed = capture_source_file(input()).expect("capture changed source");
+        assert_ne!(changed.blob_blake3, first.blob_blake3);
+
+        clear_memo();
+        fs::write(&cache_path, b"{truncated").expect("corrupt advisory cache");
+        assert!(cached_raw_mirror_blob_record(&modified, &root).is_none());
+        capture_source_file(input()).expect("bad cache falls back to capture");
+        clear_memo();
+        let mut envelope: PersistedRawMirrorBlobCache =
+            serde_json::from_slice(&fs::read(&cache_path).expect("cache")).expect("cache JSON");
+        envelope.entry.record.source_content_blake3 = "0".repeat(64);
+        fs::write(
+            &cache_path,
+            serde_json::to_vec(&envelope).expect("altered cache"),
+        )
+        .expect("cache write");
+        assert!(
+            cached_raw_mirror_blob_record(&modified, &root).is_none(),
+            "checksum mismatch cannot authorize reuse"
+        );
+    }
+
     #[test]
     fn blob_cache_refuses_keys_without_file_identity_and_change_time() {
         let temp = tempfile::TempDir::new().expect("tempdir");
@@ -5503,6 +5820,7 @@ mod tests {
             source_size_bytes: 1,
             source_mtime_ns: Some(1),
             source_change_time_ns: None,
+            source_sidecars_fingerprint: None,
             chunk_threshold_bytes: 1,
             chunk_size_bytes: 16,
         };
