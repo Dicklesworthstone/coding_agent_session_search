@@ -64,10 +64,8 @@ const DEPENDENCY_SPECS: &[DependencySpec] = &[
         package: "fsqlite",
         manifest_table: "dependencies",
         manifest_key: "frankensqlite",
-        // Registry-pinned since fsqlite 0.2.1 (now 0.3.0, carrying the
-        // asupersync-0.4.3 runtime migration and the GH#333/GH#334 fix wave);
-        // the compat gates in tests/frankensqlite_compat_gates.rs own the
-        // exact version.
+        // The compat gates in tests/frankensqlite_compat_gates.rs own the
+        // exact registry version and whole-family source identity.
         source_kind: "registry",
         repo_rel: "../frankensqlite",
         required_tests: &[
@@ -90,7 +88,7 @@ const DEPENDENCY_SPECS: &[DependencySpec] = &[
         package: "franken-agent-detection",
         manifest_table: "dependencies",
         manifest_key: "franken-agent-detection",
-        source_kind: "git",
+        source_kind: "registry",
         repo_rel: "../franken_agent_detection",
         required_tests: &[STRICT_CHECK_COMMAND, FULL_CHECK_COMMAND],
     },
@@ -108,7 +106,7 @@ const DEPENDENCY_SPECS: &[DependencySpec] = &[
         package: "frankensearch",
         manifest_table: "dependencies",
         manifest_key: "frankensearch",
-        source_kind: "git",
+        source_kind: "registry",
         repo_rel: "../frankensearch",
         required_tests: &[STRICT_CHECK_COMMAND, FULL_CHECK_COMMAND],
     },
@@ -117,7 +115,7 @@ const DEPENDENCY_SPECS: &[DependencySpec] = &[
         package: "ftui",
         manifest_table: "dependencies",
         manifest_key: "ftui",
-        source_kind: "git",
+        source_kind: "registry",
         repo_rel: "../frankentui",
         required_tests: &[STRICT_CHECK_COMMAND, FULL_CHECK_COMMAND],
     },
@@ -126,7 +124,7 @@ const DEPENDENCY_SPECS: &[DependencySpec] = &[
         package: "ftui-runtime",
         manifest_table: "dependencies",
         manifest_key: "ftui-runtime",
-        source_kind: "git",
+        source_kind: "registry",
         repo_rel: "../frankentui",
         required_tests: &[STRICT_CHECK_COMMAND, FULL_CHECK_COMMAND],
     },
@@ -135,7 +133,7 @@ const DEPENDENCY_SPECS: &[DependencySpec] = &[
         package: "ftui-tty",
         manifest_table: "dependencies",
         manifest_key: "ftui-tty",
-        source_kind: "git",
+        source_kind: "registry",
         repo_rel: "../frankentui",
         required_tests: &[STRICT_CHECK_COMMAND, FULL_CHECK_COMMAND],
     },
@@ -144,7 +142,7 @@ const DEPENDENCY_SPECS: &[DependencySpec] = &[
         package: "ftui-extras",
         manifest_table: "dependencies",
         manifest_key: "ftui-extras",
-        source_kind: "git",
+        source_kind: "registry",
         repo_rel: "../frankentui",
         required_tests: &[STRICT_CHECK_COMMAND, FULL_CHECK_COMMAND],
     },
@@ -153,7 +151,7 @@ const DEPENDENCY_SPECS: &[DependencySpec] = &[
         package: "tru",
         manifest_table: "dependencies",
         manifest_key: "toon",
-        source_kind: "git",
+        source_kind: "registry",
         repo_rel: "../toon_rust",
         required_tests: &[STRICT_CHECK_COMMAND, FULL_CHECK_COMMAND],
     },
@@ -916,7 +914,7 @@ mod tests {
         )?;
         ensure(
             dependencies.contains_key("frankensearch"),
-            "dependency drift live mode must see git dependency pins",
+            "dependency drift live mode must see FrankenSearch dependency pins",
         )
     }
 
@@ -957,9 +955,35 @@ mod tests {
             ),
         )?;
         ensure(
-            asupersync.version.as_deref() == Some("=0.4.10"),
+            asupersync.version.as_deref() == Some("=0.4.11"),
             "asupersync version pin should match Cargo.toml",
         )
+    }
+
+    #[test]
+    fn current_registry_dependencies_do_not_report_missing_git_pins() -> Result<(), Box<dyn Error>>
+    {
+        let manifest = checked_in_manifest()?;
+        for spec in DEPENDENCY_SPECS {
+            let pin = manifest_pin(&manifest, spec);
+            ensure(
+                spec.source_kind == "registry",
+                format!("{} must report its current registry source", spec.name),
+            )?;
+            ensure(
+                pin.status == "version-pinned",
+                format!("{} incorrectly reports {}", spec.name, pin.status),
+            )?;
+            ensure(
+                pin.version
+                    .as_deref()
+                    .is_some_and(|value| value.starts_with('='))
+                    && pin.git.is_none()
+                    && pin.rev.is_none(),
+                format!("{} must retain its exact registry pin", spec.name),
+            )?;
+        }
+        Ok(())
     }
 
     #[test]
