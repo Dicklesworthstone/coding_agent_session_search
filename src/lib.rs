@@ -1879,6 +1879,14 @@ pub enum MirrorCommand {
         #[arg(long, alias = "target-size")]
         max_size: Option<String>,
 
+        /// Limit retention to this provider slug. Repeat to select several providers.
+        #[arg(long = "provider")]
+        providers: Vec<String>,
+
+        /// Limit retention to captures whose original source path matches this glob.
+        #[arg(long)]
+        source_path: Option<String>,
+
         /// Preserve raw mirror captures linked to conversations with this tag.
         #[arg(long = "keep-tag")]
         keep_tag: Vec<String>,
@@ -8923,29 +8931,9 @@ async fn handle_import(cmd: ImportCommand, cli: &Cli) -> CliResult<()> {
 }
 
 fn run_mirror_command(cmd: MirrorCommand, cli: &Cli) -> CliResult<()> {
-    match cmd {
-        MirrorCommand::Prune {
-            data_dir,
-            older_than,
-            max_size,
-            keep_tag,
-            safety_hold_down,
-            dry_run: _,
-            apply,
-            json,
-        } => {
-            let structured_format = resolve_subcommand_structured_format(cli, json);
-            run_mirror_prune(
-                data_dir,
-                older_than,
-                max_size,
-                keep_tag,
-                safety_hold_down,
-                apply,
-                structured_format,
-            )
-        }
-    }
+    let MirrorCommand::Prune { json, .. } = &cmd;
+    let structured_format = resolve_subcommand_structured_format(cli, *json);
+    run_mirror_prune(cmd, structured_format)
 }
 
 /// `cass quarantine` (#292 ask #3): inspect and manage the
@@ -9570,20 +9558,43 @@ fn run_forget_command(
     Ok(())
 }
 
-fn run_mirror_prune(
-    data_dir_override: Option<PathBuf>,
-    older_than: Option<String>,
-    max_size: Option<String>,
-    keep_tags: Vec<String>,
-    safety_hold_down: String,
-    apply: bool,
-    output_format: Option<RobotFormat>,
-) -> CliResult<()> {
+fn run_mirror_prune(command: MirrorCommand, output_format: Option<RobotFormat>) -> CliResult<()> {
+    let MirrorCommand::Prune {
+        data_dir: data_dir_override,
+        older_than,
+        max_size,
+        providers,
+        source_path,
+        keep_tag: keep_tags,
+        safety_hold_down,
+        apply,
+        ..
+    } = command;
     if older_than.is_none() && max_size.is_none() {
         return Err(CliError::usage(
             "cass mirror prune needs at least one retention predicate",
             Some("Pass --older-than 90d and/or --max-size 100GB. Dry-run is the default; add --apply to prune.".to_string()),
         ));
+    }
+    if providers.iter().any(|provider| provider.trim().is_empty()) {
+        return Err(CliError::usage(
+            "mirror prune --provider must not be empty",
+            Some("Pass an agent slug such as opencode or codex.".to_string()),
+        ));
+    }
+    if let Some(pattern) = &source_path {
+        if pattern.trim().is_empty() {
+            return Err(CliError::usage(
+                "mirror prune --source-path must not be empty",
+                None,
+            ));
+        }
+        glob::Pattern::new(pattern).map_err(|error| {
+            CliError::usage(
+                format!("invalid mirror prune --source-path glob: {error}"),
+                Some("Quote the glob so your shell passes it to cass unchanged.".to_string()),
+            )
+        })?;
     }
 
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
@@ -9618,6 +9629,8 @@ fn run_mirror_prune(
         crate::raw_mirror::RawMirrorPruneOptions {
             older_than_ms,
             max_size_bytes,
+            providers,
+            source_path,
             keep_tags,
             safety_hold_down_ms,
             apply,
@@ -9661,6 +9674,13 @@ fn run_mirror_prune(
     println!("  Manifests: {}", report.manifest_count);
     println!("  Unique blobs: {}", report.unique_blob_count);
     println!("  Current blob bytes: {}", report.current_blob_bytes);
+    if let Some(bytes) = report.scope_blob_bytes {
+        println!("  Selected scope blob bytes: {bytes}");
+        println!("  Providers: {:?}", report.providers);
+        if let Some(pattern) = &report.source_path {
+            println!("  Source path glob: {pattern}");
+        }
+    }
     println!("  Orphan blobs: {}", report.orphan_blob_count);
     println!("  Orphan blob bytes: {}", report.orphan_blob_bytes);
     println!("  Pinned manifests: {}", report.pinned_manifest_count);
@@ -108261,8 +108281,7 @@ fn run_export(
 /// (b) the sub-process approach degrades cleanly to the stdout fallback
 /// when no tool is on PATH (headless servers, SSH sessions).
 fn copy_to_system_clipboard(text: &str) -> Result<&'static str, String> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
+    use std::process::Command;
 
     // (program, args). First match wins. Order matters on Linux:
     // Wayland sessions ignore X11 selections, so wl-copy must be tried
@@ -108281,60 +108300,15 @@ fn copy_to_system_clipboard(text: &str) -> Result<&'static str, String> {
 
     let mut last_err: Option<String> = None;
     for (program, args) in candidates {
-        // IMPORTANT: stdout / stderr go to /dev/null rather than piped.
-        // Linux clipboard tools (wl-copy, xclip, xsel) fork a daemon
-        // that holds the X11 / Wayland selection until the clipboard
-        // is replaced or the session ends. The parent exits as soon as
-        // stdin is closed, but the daemon inherits the parent's fds.
-        // If we piped stdout/stderr, `wait_with_output` would block
-        // forever waiting for those pipes to reach EOF — which only
-        // happens when the daemon dies, possibly minutes or hours later.
-        // /dev/null avoids that without requiring a separate reader
-        // thread or a tool-specific "no fork" flag (which not all of
-        // them expose).
-        let spawn_result = Command::new(program)
-            .args(args.iter().copied())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-        let mut child = match spawn_result {
-            Ok(c) => c,
-            Err(e) => {
-                // ENOENT etc.: tool not installed, try the next candidate.
-                last_err = Some(format!("{program}: {e}"));
-                continue;
-            }
-        };
-        // Take stdin and drop it via a scoped block so the write end of
-        // the pipe is closed *before* we wait — otherwise the child
-        // sits in `read(stdin)` forever and so do we.
-        let write_result = {
-            let mut stdin = match child.stdin.take() {
-                Some(s) => s,
-                None => {
-                    last_err = Some(format!("{program}: stdin pipe missing"));
-                    let _ = child.wait();
-                    continue;
-                }
-            };
-            stdin.write_all(text.as_bytes())
-        };
-        if let Err(e) = write_result {
-            last_err = Some(format!("{program}: write stdin: {e}"));
-            let _ = child.wait();
-            continue;
-        }
-        // `wait` returns as soon as the parent exits, even if a
-        // backgrounded daemon child keeps running with the inherited
-        // (now /dev/null) stdout / stderr.
-        match child.wait() {
+        let mut command = Command::new(program);
+        command.args(args.iter().copied());
+        match write_clipboard_command(command, text) {
             Ok(status) if status.success() => return Ok(program),
             Ok(status) => {
                 last_err = Some(format!("{program} exited with status {status}"));
             }
             Err(e) => {
-                last_err = Some(format!("{program}: wait: {e}"));
+                last_err = Some(format!("{program}: {e}"));
             }
         }
     }
@@ -108350,6 +108324,45 @@ fn copy_to_system_clipboard(text: &str) -> Result<&'static str, String> {
         }
         None => format!("no clipboard tool found on PATH (tried {tried})"),
     })
+}
+
+fn write_clipboard_command(
+    mut command: std::process::Command,
+    text: &str,
+) -> std::io::Result<std::process::ExitStatus> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    // Unlike a ChildStdin pipe, UnixStream::write suppresses SIGPIPE even
+    // when main has restored SIG_DFL for stdout. The unnamed pair keeps
+    // clipboard bytes off disk and delivers ordinary readable stdin.
+    #[cfg(unix)]
+    let (mut stdin, child_stdin) = std::os::unix::net::UnixStream::pair()?;
+    #[cfg(unix)]
+    command.stdin(Stdio::from(std::os::fd::OwnedFd::from(child_stdin)));
+    #[cfg(not(unix))]
+    command.stdin(Stdio::piped());
+
+    // Clipboard tools may fork a selection daemon that inherits these
+    // descriptors. Null output plus wait() avoids waiting for daemon EOF.
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = command.spawn()?;
+    // Command retains its configured stdin handle after spawn. Close that
+    // copy now so a child that exits early leaves no reader in this process.
+    drop(command);
+    #[cfg(not(unix))]
+    let mut stdin = match child.stdin.take() {
+        Some(stdin) => stdin,
+        None => {
+            let _ = child.wait();
+            return Err(std::io::Error::other("clipboard stdin pipe missing"));
+        }
+    };
+    let write_result = stdin.write_all(text.as_bytes());
+    drop(stdin);
+    let status = child.wait();
+    write_result?;
+    status
 }
 
 fn strip_stdin_line_ending(mut input: String) -> String {
@@ -110138,6 +110151,90 @@ mod export_timestamp_tests {
     use std::fs;
     use std::io::Write;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn ztlan_clipboard_stdin_survives_default_sigpipe_and_delivers_exact_bytes() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        if dotenvy::var("CASS_TEST_ZTLAN_SIGPIPE_CHILD")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            // Only this fresh process changes the signal disposition.
+            // Its parent test harness must never inherit SIG_DFL here.
+            sigpipe::reset();
+            let text = "clipboard 🦀\0\n".repeat(100_000);
+            let mut exits_without_reading = Command::new("sh");
+            exits_without_reading.args(["-c", "exit 23"]);
+            match super::write_clipboard_command(exits_without_reading, &text) {
+                Ok(status) => assert_eq!(status.code(), Some(23)),
+                Err(error) => assert!(
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ),
+                    "unexpected write error: {error}"
+                ),
+            }
+
+            let temp = TempDir::new().expect("clipboard receiver fixture");
+            let output_path = temp.path().join("received");
+            let mut reads_until_eof = Command::new("sh");
+            reads_until_eof
+                .args(["-c", "cat > \"$1\"", "cass-clipboard-test"])
+                .arg(&output_path);
+            assert!(
+                super::write_clipboard_command(reads_until_eof, &text)
+                    .expect("deliver clipboard bytes")
+                    .success()
+            );
+            assert_eq!(
+                fs::read(output_path).expect("receiver bytes"),
+                text.as_bytes()
+            );
+            assert!(
+                super::write_clipboard_command(Command::new(temp.path().join("absent")), &text)
+                    .is_err()
+            );
+            return;
+        }
+
+        let mut child = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "export_timestamp_tests::ztlan_clipboard_stdin_survives_default_sigpipe_and_delivers_exact_bytes",
+                "--nocapture",
+            ])
+            .env("CASS_TEST_ZTLAN_SIGPIPE_CHILD", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("fresh SIGPIPE test process");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if child.try_wait().expect("child status").is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("clipboard stdin did not close or notice the exited reader");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().expect("child output");
+        assert!(
+            output.status.success(),
+            "clipboard child terminated: {}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
 
     #[test]
     fn extract_message_timestamp_parses_multiple_shapes() {

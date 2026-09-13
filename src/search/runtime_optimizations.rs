@@ -66,9 +66,12 @@ impl ConfigSource {
 /// default to `default_value`. The env var name is included in every log
 /// event so operators can grep for it.
 fn read_bool_env(name: &str, default_value: bool) -> (bool, bool) {
-    let raw = match dotenvy::var(name) {
-        Ok(v) => v,
-        Err(_) => return (default_value, false),
+    parse_bool_value(name, dotenvy::var(name).ok().as_deref(), default_value)
+}
+
+fn parse_bool_value(name: &str, raw: Option<&str>, default_value: bool) -> (bool, bool) {
+    let Some(raw) = raw else {
+        return (default_value, false);
     };
     let normalized = raw.trim().to_ascii_lowercase();
     let parsed = match normalized.as_str() {
@@ -82,7 +85,7 @@ fn read_bool_env(name: &str, default_value: bool) -> (bool, bool) {
             tracing::debug!(
                 target: "cass::runtime_optimizations",
                 env_var = name,
-                raw = raw.as_str(),
+                raw,
                 value = b,
                 "runtime optimization configured from env var"
             );
@@ -92,8 +95,9 @@ fn read_bool_env(name: &str, default_value: bool) -> (bool, bool) {
             tracing::warn!(
                 target: "cass::runtime_optimizations",
                 env_var = name,
-                raw = raw.as_str(),
-                "unrecognized CASS_* env var value; treating as enabled. Recognized values: 1/true/on/yes (enable) or 0/false/off/no (disable)."
+                raw,
+                default_value,
+                "unrecognized CASS_* env var value; using the default. Recognized values: 1/true/on/yes (enable) or 0/false/off/no (disable)."
             );
             (default_value, true)
         }
@@ -212,60 +216,42 @@ impl RuntimeOptimizationsSnapshot {
 mod tests {
     use super::*;
 
-    /// Direct test of read_bool_env without OnceLock interference. Each
-    /// scenario uses a unique env-var name so concurrent test runs don't race.
+    /// Exercise the production parser without changing the process environment
+    /// or touching the startup OnceLocks shared by other libtest threads.
     #[test]
-    fn read_bool_env_recognizes_truthy_and_falsy_values() {
-        unsafe {
-            std::env::set_var("CASS_TEST_RBE_TRUTHY_1", "1");
-            std::env::set_var("CASS_TEST_RBE_TRUTHY_2", "true");
-            std::env::set_var("CASS_TEST_RBE_TRUTHY_3", "ON");
-            std::env::set_var("CASS_TEST_RBE_TRUTHY_4", "yes");
-            std::env::set_var("CASS_TEST_RBE_FALSY_1", "0");
-            std::env::set_var("CASS_TEST_RBE_FALSY_2", "false");
-            std::env::set_var("CASS_TEST_RBE_FALSY_3", "OFF");
-            std::env::set_var("CASS_TEST_RBE_FALSY_4", "no");
-        }
-        for name in [
-            "CASS_TEST_RBE_TRUTHY_1",
-            "CASS_TEST_RBE_TRUTHY_2",
-            "CASS_TEST_RBE_TRUTHY_3",
-            "CASS_TEST_RBE_TRUTHY_4",
-        ] {
-            let (v, _) = read_bool_env(name, true);
-            assert!(v, "{name} should resolve as true");
-        }
-        for name in [
-            "CASS_TEST_RBE_FALSY_1",
-            "CASS_TEST_RBE_FALSY_2",
-            "CASS_TEST_RBE_FALSY_3",
-            "CASS_TEST_RBE_FALSY_4",
-        ] {
-            let (v, _) = read_bool_env(name, true);
-            assert!(!v, "{name} should resolve as false");
+    fn bool_value_recognizes_truthy_and_falsy_values() {
+        for default in [false, true] {
+            for raw in ["1", "true", "ON", "yes", " TrUe\t"] {
+                let parsed = parse_bool_value("CASS_SIMD_DOT", Some(raw), default);
+                assert_eq!(parsed, (true, true), "raw={raw:?}"); // ubs:ignore -- intentional unit-test contract assertion.
+            }
+            for raw in ["0", "false", "OFF", "no", "\nFaLsE "] {
+                let parsed = parse_bool_value("CASS_SIMD_DOT", Some(raw), default);
+                assert_eq!(parsed, (false, true), "raw={raw:?}"); // ubs:ignore -- intentional unit-test contract assertion.
+            }
         }
     }
 
     #[test]
-    fn read_bool_env_unset_returns_default_with_not_from_env() {
-        let (v, from_env) = read_bool_env("CASS_TEST_RBE_NEVER_SET_8c14a293", true);
-        assert!(v);
-        assert!(!from_env);
-        let (v, from_env) = read_bool_env("CASS_TEST_RBE_NEVER_SET_8c14a294", false);
-        assert!(!v);
-        assert!(!from_env);
+    fn bool_value_unset_and_empty_preserve_distinct_provenance() {
+        for default in [false, true] {
+            let parsed = parse_bool_value("CASS_SIMD_DOT", None, default);
+            assert_eq!(parsed, (default, false)); // ubs:ignore -- intentional unit-test contract assertion.
+            for raw in ["", " \t\n"] {
+                let parsed = parse_bool_value("CASS_SIMD_DOT", Some(raw), default);
+                assert_eq!(parsed, (default, true), "raw={raw:?}"); // ubs:ignore -- intentional unit-test contract assertion.
+            }
+        }
     }
 
     #[test]
-    fn read_bool_env_unrecognized_value_falls_back_to_default_with_from_env_true() {
-        unsafe {
-            std::env::set_var("CASS_TEST_RBE_BANANA", "banana");
+    fn bool_value_unrecognized_uses_default_with_environment_provenance() {
+        for default in [false, true] {
+            for raw in ["banana", "2", "true false", "真"] {
+                let parsed = parse_bool_value("CASS_SIMD_DOT", Some(raw), default);
+                assert_eq!(parsed, (default, true), "raw={raw:?}"); // ubs:ignore -- intentional unit-test contract assertion.
+            }
         }
-        let (v, from_env) = read_bool_env("CASS_TEST_RBE_BANANA", true);
-        // Default was true; banana is unrecognized → stays true.
-        assert!(v);
-        // Source is still env (the var WAS set, just unparseable).
-        assert!(from_env);
     }
 
     #[test]
@@ -277,10 +263,10 @@ mod tests {
             config_source: ConfigSource::Env,
         };
         let v = snap.to_json_value();
-        assert_eq!(v["simd_dot"], true);
-        assert_eq!(v["parallel_search"], false);
-        assert_eq!(v["preconvert_f16"], true);
-        assert_eq!(v["config_source"], "env");
+        assert_eq!(v["simd_dot"], true); // ubs:ignore -- intentional unit-test contract assertion.
+        assert_eq!(v["parallel_search"], false); // ubs:ignore -- intentional unit-test contract assertion.
+        assert_eq!(v["preconvert_f16"], true); // ubs:ignore -- intentional unit-test contract assertion.
+        assert_eq!(v["config_source"], "env"); // ubs:ignore -- intentional unit-test contract assertion.
     }
 
     #[test]
@@ -291,6 +277,6 @@ mod tests {
             preconvert_f16: true,
             config_source: ConfigSource::Default,
         };
-        assert_eq!(snap.to_json_value()["config_source"], "default");
+        assert_eq!(snap.to_json_value()["config_source"], "default"); // ubs:ignore -- intentional unit-test contract assertion.
     }
 }

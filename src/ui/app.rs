@@ -40265,7 +40265,11 @@ not jsonl",
         for (character, modifiers, expected) in [
             ('f', Modifiers::ALT, ResultsGrouping::Conversation),
             ('F', Modifiers::ALT, ResultsGrouping::Workspace),
-            ('F', Modifiers::ALT | Modifiers::SHIFT, ResultsGrouping::Flat),
+            (
+                'F',
+                Modifiers::ALT | Modifiers::SHIFT,
+                ResultsGrouping::Flat,
+            ),
         ] {
             let event =
                 Event::Key(KeyEvent::new(KeyCode::Char(character)).with_modifiers(modifiers));

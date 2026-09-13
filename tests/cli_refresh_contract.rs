@@ -12,6 +12,88 @@ fn parse(args: &[&str]) -> Result<Cli, String> {
     Cli::try_parse_from(args).map_err(|err| format!("parse cass CLI for {args:?}: {err}"))
 }
 
+#[test]
+fn gh461_mirror_prune_cli_composes_provider_and_path_selectors() {
+    let temp = tempfile::tempdir().expect("fixture");
+    let data_dir = temp.path().join("data");
+    let capture = |provider, name, bytes: &[u8]| {
+        let source_path = temp.path().join(name);
+        std::fs::write(&source_path, bytes).expect("source");
+        capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider,
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("capture")
+    };
+    let selected = capture("opencode", "target.db", b"selected");
+    let other_path = capture("opencode", "other.db", b"other path");
+    let other_provider = capture("codex", "codex.jsonl", b"other provider");
+    let run = |extra: &[&str]| {
+        let mut command = assert_cmd::Command::new(env!("CARGO_BIN_EXE_cass"));
+        command
+            .args(["mirror", "prune", "--data-dir"])
+            .arg(&data_dir)
+            .args(["--older-than", "0s", "--safety-hold-down", "0s", "--json"])
+            .args(extra)
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .timeout(std::time::Duration::from_secs(30));
+        command.assert()
+    };
+    let result = run(&["--provider", "opencode", "--source-path", "*target.db"]).success();
+    let report: serde_json::Value =
+        serde_json::from_slice(&result.get_output().stdout).expect("prune JSON");
+    assert_eq!(
+        report["prune"]["providers"],
+        serde_json::json!(["opencode"])
+    );
+    assert_eq!(report["prune"]["source_path"], "*target.db");
+    assert_eq!(
+        report["prune"]["scope_blob_bytes"],
+        selected.source_size_bytes
+    );
+    let entries = report["prune"]["entries"].as_array().expect("entries");
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["path"] == selected.manifest_relative_path)
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry["path"] == other_path.manifest_relative_path)
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry["path"] == other_provider.manifest_relative_path)
+    );
+
+    let result = run(&["--provider", "opencode", "--provider", "codex"]).success();
+    let report: serde_json::Value =
+        serde_json::from_slice(&result.get_output().stdout).expect("union JSON");
+    assert_eq!(report["prune"]["planned_manifest_count"], 3);
+    let result = run(&["--provider", "absent"]).success();
+    let report: serde_json::Value =
+        serde_json::from_slice(&result.get_output().stdout).expect("no matches JSON");
+    assert_eq!(report["prune"]["planned_manifest_count"], 0);
+    run(&["--source-path", "[invalid"]).code(2);
+    run(&["--source-path", " "]).code(2);
+    run(&["--provider", " "]).code(2);
+    for capture in [selected, other_path, other_provider] {
+        assert!(
+            data_dir
+                .join("raw-mirror/v1")
+                .join(capture.manifest_relative_path)
+                .exists()
+        );
+    }
+}
+
 fn run_on_large_stack<F>(f: F) -> Result<(), String>
 where
     F: FnOnce() -> Result<(), String> + Send + 'static,
@@ -270,6 +352,7 @@ fn raw_mirror_and_doctor_modules_are_public_embedding_surfaces() -> Result<(), S
             keep_tags: Vec::new(),
             safety_hold_down_ms: 0,
             apply: false,
+            ..RawMirrorPruneOptions::default()
         },
     )
     .map_err(|err| format!("dry-run raw mirror prune: {err}"))?;

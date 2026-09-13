@@ -81,25 +81,23 @@ impl UpdateState {
 
     /// Save state to disk (synchronous)
     #[cfg(test)]
-    fn save(&self) -> Result<()> {
-        let path = state_path();
-        save_update_state_to_path(self, &path)
+    fn save(&self, path: &Path) -> Result<()> {
+        save_update_state_to_path(self, path)
     }
 
     /// Save state to disk (asynchronous)
     #[cfg(test)]
-    async fn save_async(&self) -> Result<()> {
-        let path = state_path();
+    async fn save_async(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             asupersync::fs::create_dir_all(parent)
                 .await
                 .with_context(|| format!("creating update state directory {}", parent.display()))?;
         }
         let json = serde_json::to_string_pretty(self).context("serializing update state")?;
-        let temp_path = write_update_state_temp_file_async(&path, json.as_bytes())
+        let temp_path = write_update_state_temp_file_async(path, json.as_bytes())
             .await
             .with_context(|| format!("writing temporary update state for {}", path.display()))?;
-        replace_update_state_file_from_temp(&temp_path, &path)
+        replace_update_state_file_from_temp(&temp_path, path)
             .with_context(|| format!("replacing {}", path.display()))?;
         Ok(())
     }
@@ -1675,36 +1673,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[serial]
     fn test_update_state_save_replaces_existing_symlink() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let (_outside_dir, target_file) = install_update_state_symlink(temp_dir.path());
-        unsafe {
-            std::env::set_var("CASS_DATA_DIR", temp_dir.path());
-        }
-
         let state = UpdateState {
             last_check_ts: 42,
             skipped_version: Some("0.2.0".to_string()),
         };
-        state.save().unwrap();
-
-        unsafe {
-            std::env::remove_var("CASS_DATA_DIR");
-        }
+        state
+            .save(&temp_dir.path().join("update_state.json"))
+            .unwrap();
         assert_update_state_symlink_was_replaced(temp_dir.path(), &target_file, 42);
     }
 
     #[cfg(unix)]
     #[test]
-    #[serial]
     fn test_update_state_save_async_replaces_existing_symlink() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let (_outside_dir, target_file) = install_update_state_symlink(temp_dir.path());
-        unsafe {
-            std::env::set_var("CASS_DATA_DIR", temp_dir.path());
-        }
-
         let state = UpdateState {
             last_check_ts: 43,
             skipped_version: Some("0.2.0".to_string()),
@@ -1712,11 +1698,9 @@ mod tests {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("build test runtime");
-        runtime.block_on(state.save_async()).unwrap();
-
-        unsafe {
-            std::env::remove_var("CASS_DATA_DIR");
-        }
+        runtime
+            .block_on(state.save_async(&temp_dir.path().join("update_state.json")))
+            .unwrap();
         assert_update_state_symlink_was_replaced(temp_dir.path(), &target_file, 43);
     }
 
