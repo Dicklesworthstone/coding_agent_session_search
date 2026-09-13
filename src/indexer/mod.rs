@@ -30673,69 +30673,80 @@ pub mod persist {
     use crate::sources::provenance::{Source, SourceKind};
     use crate::storage::sqlite::{FrankenStorage, IndexingCache, InsertOutcome};
 
-    /// `coding_agent_session_search-5b9p0` (ibuuh.32 follow-up):
-    /// builds a [`ConversationPacket`] for the lexical sink AND the
-    /// positional message-index slice that maps `outcome.inserted_indices`
-    /// (which are message *idx* values, not array positions) onto the
-    /// packet's `payload.messages` Vec. The legacy
-    /// `add_messages_with_conversation_id` filter walks `conv.messages`
-    /// twice; this helper walks once and yields a slice of positional
-    /// indices that `TantivyIndex::add_messages_from_packet` can use
-    /// directly.
+    /// Replay the capped canonical conversation after persistence. Callers map
+    /// changed message indices onto this packet only after its canonical prefix
+    /// has consumed the same content budget as an authoritative database rebuild.
     fn lexical_packet_for_canonical_outcome(
         storage: &FrankenStorage,
-        conv: &Conversation,
         conversation_id: i64,
     ) -> Result<ConversationPacket> {
-        if matches!(conv.agent_slug.as_str(), "grok_bot" | "codebuff") {
-            let mut canonical = conv.clone();
-            canonical.id = Some(conversation_id);
-            let (source_path, title, workspace_id, started_at): (String, Option<String>, Option<i64>, Option<i64>) = storage.raw().query_row_map(
-                "SELECT source_path, title, workspace_id, started_at FROM conversations WHERE id = ?1",
-                &[ParamValue::from(conversation_id)],
-                |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)),
-            )?;
-            canonical.source_path = source_path.into();
-            canonical.title = title;
-            canonical.started_at = started_at;
-            canonical.workspace = workspace_id
-                .map(|workspace_id| {
-                    storage.raw().query_row_map(
-                        "SELECT path FROM workspaces WHERE id = ?1",
-                        &[ParamValue::from(workspace_id)],
-                        |row| Ok(std::path::PathBuf::from(row.get_typed::<String>(0)?)),
-                    )
-                })
-                .transpose()?;
-            canonical.messages = storage.fetch_messages(conversation_id)?;
-            return Ok(lexical_packet_for_persist(&canonical));
-        }
-        Ok(lexical_packet_for_persist(conv))
-    }
-
-    fn lexical_packet_for_persist(conv: &Conversation) -> ConversationPacket {
-        // #291 Gap A: the incremental/`--watch` inline ingest path materializes the
-        // whole conversation here, so a heavy (image/base64) conversation would
-        // OOM→bisect→quarantine exactly as the `--full` rebuild did before #290.
-        // Apply the same per-conversation lexical content cap that
-        // `fetch_messages_for_lexical_rebuild` applies on the `--full` path, so the
-        // watch daemon truncates indexed text instead of quarantining.
-        ConversationPacket::from_canonical_replay(
-            conv,
-            ConversationPacketProvenance {
-                source_id: conv.source_id.clone(),
-                origin_kind: crate::search::tantivy::normalized_index_origin_kind(
-                    &conv.source_id,
+        // GH #466: persistence can retain an earlier, shorter message variant.
+        // Spend the lexical prefix budget on those canonical rows, before
+        // selecting inserted indices, rather than on the freshly parsed source.
+        // As in a full rebuild, omit stored metadata/snippets and hydrate
+        // bounded text. Only the canonical origin envelope is synthesized below;
+        // never clone the incoming transcript just to replace its messages.
+        let mut canonical = storage.raw().query_row_map(
+            "SELECT COALESCE(a.slug, 'unknown'), c.external_id, c.title, c.source_path,
+                    c.started_at, c.ended_at, c.source_id, c.origin_host, w.path
+             FROM conversations c
+             LEFT JOIN agents a ON a.id = c.agent_id
+             LEFT JOIN workspaces w ON w.id = c.workspace_id
+             WHERE c.id = ?1",
+            &[ParamValue::from(conversation_id)],
+            |row| {
+                let raw_source_id: Option<String> = row.get_typed(6)?;
+                let raw_origin_host: Option<String> = row.get_typed(7)?;
+                let source_id = crate::search::tantivy::normalized_index_source_id(
+                    raw_source_id.as_deref(),
                     None,
-                ),
-                origin_host: crate::search::tantivy::normalized_index_origin_host(
-                    conv.origin_host.as_deref(),
-                ),
+                    raw_origin_host.as_deref(),
+                );
+                let origin_host = if source_id == "local" {
+                    None
+                } else {
+                    crate::search::tantivy::normalized_index_origin_host(raw_origin_host.as_deref())
+                };
+                Ok(Conversation {
+                    id: Some(conversation_id),
+                    agent_slug: row.get_typed(0)?,
+                    external_id: row.get_typed(1)?,
+                    title: row.get_typed(2)?,
+                    source_path: row.get_typed::<String>(3)?.into(),
+                    started_at: row.get_typed(4)?,
+                    ended_at: row.get_typed(5)?,
+                    workspace: row.get_typed::<Option<String>>(8)?.map(Into::into),
+                    approx_tokens: None,
+                    metadata_json: serde_json::Value::Null,
+                    messages: Vec::new(),
+                    source_id,
+                    origin_host,
+                })
             },
-        )
-        .capped_for_inline_lexical_index(
-            crate::storage::sqlite::lexical_max_conversation_content_bytes(),
-        )
+        )?;
+        canonical.messages = storage.fetch_messages_for_lexical_rebuild(conversation_id)?;
+        let provenance = ConversationPacketProvenance {
+            source_id: canonical.source_id.clone(),
+            origin_kind: crate::search::tantivy::normalized_index_origin_kind(
+                &canonical.source_id,
+                None,
+            ),
+            origin_host: canonical.origin_host.clone(),
+        };
+        // The lexical packet sink reads this small origin envelope. Rebuild
+        // it from canonical columns without loading arbitrary stored metadata.
+        canonical.metadata_json = serde_json::json!({
+            "cass": {
+                "origin": {
+                    "source_id": &provenance.source_id,
+                    "kind": &provenance.origin_kind,
+                    "host": &provenance.origin_host,
+                }
+            }
+        });
+        Ok(ConversationPacket::from_canonical_replay_owned(
+            canonical, provenance,
+        ))
     }
 
     /// Map `outcome.inserted_indices` (message idx values from
@@ -30792,14 +30803,11 @@ pub mod persist {
         index: &mut TantivyIndex,
         packet: &ConversationPacket,
         conversation_id: i64,
-        native_snapshot: bool,
     ) -> Result<()> {
-        if native_snapshot {
-            let positions: Vec<_> = (0..packet.payload.messages.len()).collect();
-            index.reconcile_messages_from_packet(packet, &positions, Some(conversation_id))
-        } else {
-            index.add_messages_from_packet(packet, None, Some(conversation_id), |_| Ok(()))
-        }
+        // Every provider now replays canonical history. Overlapping source
+        // packets can therefore cover the same rows within or across batches.
+        let positions: Vec<_> = (0..packet.payload.messages.len()).collect();
+        index.reconcile_messages_from_packet(packet, &positions, Some(conversation_id))
     }
 
     #[cfg(test)]
@@ -32004,9 +32012,21 @@ pub mod persist {
         let defer_lexical_updates = defer_lexical_updates_enabled();
         let mut batch_outcome = PersistBatchOutcome::default();
 
+        let rebuild_inline = !ordered.is_empty()
+            && !defer_lexical_updates
+            && lexical_strategy == LexicalPopulationStrategy::InlineRebuildFromScan;
+        if rebuild_inline {
+            // Quill resolves replacement identities against published state.
+            // Publish any preceding incremental additions once at this batch
+            // boundary, rather than sealing every canonical conversation.
+            t_index
+                .as_deref_mut()
+                .expect("inline rebuild requires Tantivy writer")
+                .commit()?;
+        }
+        let mut rebuilt_conversation_ids = HashSet::new();
         let mut skip_inline_lexical_updates = false;
-        for (idx, outcome) in ordered {
-            let internal_conv = &internal_convs[idx];
+        for (_, outcome) in ordered {
             batch_outcome.record_insert_outcome(&outcome);
             if defer_lexical_updates || skip_inline_lexical_updates {
                 if capture_semantic_delta {
@@ -32025,28 +32045,25 @@ pub mod persist {
             match lexical_strategy {
                 LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild => continue,
                 LexicalPopulationStrategy::InlineRebuildFromScan => {
-                    let packet = lexical_packet_for_canonical_outcome(
-                        storage,
-                        internal_conv,
-                        outcome.conversation_id,
-                    )?;
-                    publish_canonical_packet_for_rebuild(
-                        t_index
-                            .as_deref_mut()
-                            .expect("inline rebuild requires Tantivy writer"),
-                        &packet,
-                        outcome.conversation_id,
-                        matches!(internal_conv.agent_slug.as_str(), "grok_bot" | "codebuff"),
-                    )?;
+                    // All outcomes are already persisted, so the first read
+                    // for this identity contains its final canonical snapshot.
+                    if rebuilt_conversation_ids.insert(outcome.conversation_id) {
+                        let packet =
+                            lexical_packet_for_canonical_outcome(storage, outcome.conversation_id)?;
+                        publish_canonical_packet_for_rebuild(
+                            t_index
+                                .as_deref_mut()
+                                .expect("inline rebuild requires Tantivy writer"),
+                            &packet,
+                            outcome.conversation_id,
+                        )?;
+                    }
                 }
                 LexicalPopulationStrategy::IncrementalInline => {
                     let changed_indices = changed_message_indices(&outcome);
                     if !changed_indices.is_empty() {
-                        let packet = lexical_packet_for_canonical_outcome(
-                            storage,
-                            internal_conv,
-                            outcome.conversation_id,
-                        )?;
+                        let packet =
+                            lexical_packet_for_canonical_outcome(storage, outcome.conversation_id)?;
                         let positional = positional_indices_for_inserted(&packet, &changed_indices);
                         if !positional.is_empty() {
                             let add_result = if should_inject_incremental_lexical_update_oom() {
@@ -32084,6 +32101,11 @@ pub mod persist {
                     packet_semantic_delta_for_outcome(storage, &outcome)?;
                 batch_outcome.extend_semantic_delta(inputs, max_message_id);
             }
+        }
+        if rebuild_inline {
+            t_index
+                .expect("inline rebuild requires Tantivy writer")
+                .commit()?;
         }
 
         Ok(batch_outcome)
@@ -32360,8 +32382,7 @@ pub mod persist {
             .copied()
             .collect();
         if !defer_lexical_updates_enabled() && !changed_indices.is_empty() {
-            let packet =
-                lexical_packet_for_canonical_outcome(storage, &internal_conv, conversation_id)?;
+            let packet = lexical_packet_for_canonical_outcome(storage, conversation_id)?;
             let positional = positional_indices_for_inserted(&packet, &changed_indices);
             if !positional.is_empty() {
                 publish_changed_packet_messages(
@@ -32421,8 +32442,7 @@ pub mod persist {
             .collect();
         if !defer_lexical_updates_enabled() && !changed_indices.is_empty() {
             let packet_started = Instant::now();
-            let packet =
-                lexical_packet_for_canonical_outcome(storage, &internal_conv, conversation_id)?;
+            let packet = lexical_packet_for_canonical_outcome(storage, conversation_id)?;
             profile.packet_duration += packet_started.elapsed();
 
             let positional_started = Instant::now();
@@ -32769,13 +32789,25 @@ pub mod persist {
         let mut batch_outcome = PersistBatchOutcome::default();
         record_persisted_raw_mirror_db_links(raw_mirror_data_dir, convs, &outcomes);
         if !defer_lexical_updates {
+            let rebuild_inline = !outcomes.is_empty()
+                && lexical_strategy == LexicalPopulationStrategy::InlineRebuildFromScan;
+            if rebuild_inline {
+                // A prior direct or batched incremental call may still have
+                // staged identities. Establish the published batch boundary
+                // before Quill resolves canonical replacements.
+                t_index
+                    .as_deref_mut()
+                    .expect("inline rebuild requires Tantivy writer")
+                    .commit()?;
+            }
             // ibuuh.32 / 5b9p0: route the serial-batched lexical sink
             // through the packet pipeline. Build each packet ONCE and
             // reuse it for both InlineRebuildFromScan (full message
             // set) and IncrementalInline (positional subset derived
             // from outcome.inserted_indices).
+            let mut rebuilt_conversation_ids = HashSet::new();
             let mut skip_inline_lexical_updates = false;
-            for (internal_conv, outcome) in internal_convs.iter().zip(outcomes.iter()) {
+            for outcome in &outcomes {
                 batch_outcome.record_insert_outcome(outcome);
                 // gh373/oeu5a: per-conversation liveness through the inline
                 // lexical sink (packet build + Tantivy add can be slow for a
@@ -32787,26 +32819,27 @@ pub mod persist {
                 match lexical_strategy {
                     LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild => continue,
                     LexicalPopulationStrategy::InlineRebuildFromScan => {
-                        let packet = lexical_packet_for_canonical_outcome(
-                            storage,
-                            internal_conv,
-                            outcome.conversation_id,
-                        )?;
-                        publish_canonical_packet_for_rebuild(
-                            t_index
-                                .as_deref_mut()
-                                .expect("inline rebuild requires Tantivy writer"),
-                            &packet,
-                            outcome.conversation_id,
-                            matches!(internal_conv.agent_slug.as_str(), "grok_bot" | "codebuff"),
-                        )?;
+                        // Coalesce only lexical replay; every persistence
+                        // outcome still contributes accounting and semantics.
+                        if rebuilt_conversation_ids.insert(outcome.conversation_id) {
+                            let packet = lexical_packet_for_canonical_outcome(
+                                storage,
+                                outcome.conversation_id,
+                            )?;
+                            publish_canonical_packet_for_rebuild(
+                                t_index
+                                    .as_deref_mut()
+                                    .expect("inline rebuild requires Tantivy writer"),
+                                &packet,
+                                outcome.conversation_id,
+                            )?;
+                        }
                     }
                     LexicalPopulationStrategy::IncrementalInline => {
                         let changed_indices = changed_message_indices(outcome);
                         if !changed_indices.is_empty() {
                             let packet = lexical_packet_for_canonical_outcome(
                                 storage,
-                                internal_conv,
                                 outcome.conversation_id,
                             )?;
                             let positional =
@@ -32841,6 +32874,11 @@ pub mod persist {
                         }
                     }
                 }
+            }
+            if rebuild_inline {
+                t_index
+                    .expect("inline rebuild requires Tantivy writer")
+                    .commit()?;
             }
         } else {
             for outcome in &outcomes {
@@ -33191,6 +33229,324 @@ pub mod persist {
             let reader = index.reader().expect("reader");
             crate::search::quill_bridge::refresh_reader(&reader).expect("reload");
             reader.doc_count().expect("doc count")
+        }
+
+        fn assert_gh466_canonical_prefix_cap(agent_slug: &str, route: usize, expand_prefix: bool) {
+            use crate::search::query::{FieldMask, SearchClient, SearchFilters};
+
+            let cap = if expand_prefix { 8 * 1024 * 1024 } else { 128 };
+            let _cap = set_env(
+                "CASS_LEXICAL_MAX_CONVERSATION_CONTENT_BYTES",
+                &cap.to_string(),
+            );
+            let _defer = set_env("CASS_DEFER_LEXICAL_UPDATES", "0");
+            let _begin = set_env(
+                "CASS_INDEXER_BEGIN_CONCURRENT",
+                if route == 2 { "1" } else { "0" },
+            );
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("agent_search.db");
+            let storage = create_franken_db(&db_path);
+            let index_path = crate::search::tantivy::index_dir(dir.path()).unwrap();
+            let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+            let make_message = |idx, content: String| NormalizedMessage {
+                idx,
+                role: "user".into(),
+                author: None,
+                created_at: Some(1_700_000_000_000 + idx),
+                content,
+                extra: serde_json::json!({"uuid": format!("stable-message-{idx}")}),
+                snippets: Vec::new(),
+                invocations: Vec::new(),
+            };
+            let mut conv = NormalizedConversation {
+                agent_slug: agent_slug.into(),
+                external_id: Some("canonical-prefix-cap".into()),
+                title: Some("Canonical prefix cap".into()),
+                workspace: Some(dir.path().join("workspace")),
+                source_path: dir.path().join("source.jsonl"),
+                started_at: Some(1_700_000_000_000),
+                ended_at: Some(1_700_000_000_001),
+                metadata: serde_json::Value::Null,
+                messages: vec![
+                    make_message(0, "original alpha".into()),
+                    make_message(1, "stable bravo".into()),
+                ],
+            };
+            let prefix = conv.clone();
+            let persist = |index: &mut TantivyIndex, conv: &NormalizedConversation| {
+                if route == 0 {
+                    persist_conversation(&storage, index, conv).unwrap();
+                    None
+                } else {
+                    Some(
+                        persist_conversations_batched(
+                            &storage,
+                            Some(index),
+                            std::slice::from_ref(conv),
+                            LexicalPopulationStrategy::IncrementalInline,
+                            false,
+                        )
+                        .unwrap(),
+                    )
+                }
+            };
+            persist(&mut index, &conv);
+            // Leave the direct/serial/begin-concurrent incremental additions
+            // pending, then enter rebuild twice without a caller commit or a
+            // count helper that could conceal the production batch boundary.
+            for _ in 0..2 {
+                let replay = persist_conversations_batched(
+                    &storage,
+                    Some(&mut index),
+                    std::slice::from_ref(&conv),
+                    LexicalPopulationStrategy::InlineRebuildFromScan,
+                    false,
+                )
+                .unwrap();
+                assert_eq!(replay.inserted_conversations, 0);
+                assert_eq!(replay.inserted_messages, 0);
+                assert_eq!(replay.updated_messages, 0);
+                assert!(!replay.lexical_update_deferred);
+            }
+            assert_eq!(tantivy_doc_count(&mut index), 2);
+            crate::indexer::refresh_completed_lexical_rebuild_checkpoint(
+                &storage,
+                &db_path,
+                dir.path(),
+            )
+            .unwrap();
+            let baseline_checkpoint = crate::indexer::load_lexical_rebuild_state(&index_path)
+                .unwrap()
+                .expect("baseline checkpoint");
+            assert!(baseline_checkpoint.completed);
+            let conversation_id: i64 = storage
+                .raw()
+                .query_row_map("SELECT id FROM conversations", &[], |row| row.get_typed(0))
+                .unwrap();
+            let baseline_ids: Vec<_> = storage
+                .fetch_messages(conversation_id)
+                .unwrap()
+                .into_iter()
+                .map(|message| (message.id, message.idx))
+                .collect();
+
+            if expand_prefix {
+                // Same identity and timestamp, but the newly parsed source
+                // exceeds the real default cap. Persistence retains the short
+                // canonical prefix, leaving room for both appended documents.
+                let fresh_prefix = "oversized fresh prefix ";
+                conv.messages[0].content = fresh_prefix.repeat(cap / fresh_prefix.len() + 1);
+                assert!(conv.messages[0].content.len() > cap);
+                conv.messages.push(make_message(2, "appended delta".into()));
+                conv.messages.push(make_message(3, "quartzcharlie".into()));
+            } else {
+                // The canonical prefix is unchanged. The first append crosses
+                // the budget; the final canonical row must remain unindexed.
+                conv.messages.push(make_message(
+                    2,
+                    format!("quartzcharlie {}", "bounded text ".repeat(cap)),
+                ));
+                conv.messages
+                    .push(make_message(3, "beyondcapneedle".into()));
+            }
+            conv.ended_at = Some(1_700_000_000_003);
+            if let Some(outcome) = persist(&mut index, &conv) {
+                assert_eq!(outcome.inserted_conversations, 0);
+                assert_eq!(outcome.inserted_messages, 2);
+                assert_eq!(outcome.updated_messages, 0);
+                assert!(!outcome.lexical_update_deferred);
+            }
+            let expected_docs = if expand_prefix { 4 } else { 3 };
+            assert_eq!(tantivy_doc_count(&mut index), expected_docs);
+            let stored = storage.fetch_messages(conversation_id).unwrap();
+            assert_eq!(stored.len(), 4);
+            assert_eq!(stored[0].content, "original alpha");
+            assert_eq!(stored[1].content, "stable bravo");
+            assert_eq!(
+                stored[..2]
+                    .iter()
+                    .map(|message| (message.id, message.idx))
+                    .collect::<Vec<_>>(),
+                baseline_ids,
+                "retained canonical rows keep their identities"
+            );
+            assert_eq!(stored[2].content, conv.messages[2].content);
+            assert_eq!(stored[3].content, conv.messages[3].content);
+            let packet = lexical_packet_for_canonical_outcome(&storage, conversation_id).unwrap();
+            assert_eq!(
+                packet
+                    .payload
+                    .messages
+                    .iter()
+                    .map(|message| message.idx)
+                    .collect::<Vec<_>>(),
+                vec![0, 1, 2, 3],
+                "capping must not erase indices needed by the insertion outcome"
+            );
+            assert_eq!(
+                positional_indices_for_inserted(&packet, &[2, 3]),
+                vec![2, 3]
+            );
+            assert_eq!(
+                packet.payload.metadata_json,
+                serde_json::json!({
+                    "cass": {
+                        "origin": {"source_id": "local", "kind": "local", "host": null}
+                    }
+                }),
+                "only the canonical origin envelope is needed by the lexical sink"
+            );
+            assert!(
+                packet
+                    .payload
+                    .messages
+                    .iter()
+                    .all(|message| message.extra_json.is_null())
+            );
+            let retained_bytes: usize = packet
+                .payload
+                .messages
+                .iter()
+                .map(|message| message.content.len())
+                .sum();
+            if expand_prefix {
+                assert!(retained_bytes < cap);
+                assert_eq!(packet.payload.messages[3].content, "quartzcharlie");
+            } else {
+                assert_eq!(retained_bytes, cap);
+                assert!(
+                    packet.payload.messages[2]
+                        .content
+                        .starts_with("quartzcharlie ")
+                );
+                assert!(packet.payload.messages[3].content.is_empty());
+            }
+            assert_eq!(
+                crate::indexer::expected_live_lexical_doc_count(&storage).unwrap(),
+                expected_docs as usize,
+                "the unchanged checkpoint guard must agree with actual indexed documents"
+            );
+            crate::indexer::refresh_completed_lexical_rebuild_checkpoint(
+                &storage,
+                &db_path,
+                dir.path(),
+            )
+            .unwrap();
+            let checkpoint = crate::indexer::load_lexical_rebuild_state(&index_path)
+                .unwrap()
+                .expect("appended checkpoint");
+            assert!(checkpoint.completed);
+            assert_ne!(
+                checkpoint.db.storage_fingerprint,
+                baseline_checkpoint.db.storage_fingerprint
+            );
+            assert_eq!(
+                checkpoint.db.storage_fingerprint,
+                crate::indexer::lexical_rebuild_content_fingerprint(&storage, 1).unwrap()
+            );
+
+            if let Some(outcome) = persist(&mut index, &conv) {
+                assert_eq!(outcome.inserted_messages, 0);
+                assert_eq!(outcome.updated_messages, 0);
+            }
+            assert_eq!(tantivy_doc_count(&mut index), expected_docs);
+            drop(index);
+            let marker_hit = |path: &Path| {
+                let client = SearchClient::open(path, None).unwrap().unwrap();
+                let hits = client
+                    .search(
+                        "quartzcharlie",
+                        SearchFilters::default(),
+                        10,
+                        0,
+                        FieldMask::FULL,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    hits.len(),
+                    1,
+                    "appended marker must be searchable exactly once"
+                );
+                for absent in ["beyondcapneedle", "oversized"] {
+                    assert!(
+                        client
+                            .search(absent, SearchFilters::default(), 10, 0, FieldMask::FULL)
+                            .unwrap()
+                            .is_empty()
+                    );
+                }
+                let hit = &hits[0];
+                assert_eq!(hit.agent, agent_slug);
+                (
+                    hit.content.clone(),
+                    hit.source_path.clone(),
+                    hit.line_number,
+                    hit.created_at,
+                )
+            };
+            let incremental_hit = marker_hit(&index_path);
+            let scan_index_path = dir.path().join("scan-index");
+            let mut scan_index = TantivyIndex::open_or_create(&scan_index_path).unwrap();
+            let overlap = persist_conversations_batched(
+                &storage,
+                Some(&mut scan_index),
+                &[prefix, conv.clone()],
+                LexicalPopulationStrategy::InlineRebuildFromScan,
+                false,
+            )
+            .unwrap();
+            assert_eq!(overlap.inserted_messages, 0);
+            assert_eq!(overlap.updated_messages, 0);
+            // These IDs were new to scan_index. Read the published snapshot
+            // directly, before any caller commit, to prove batch-exit visibility.
+            {
+                let reader = scan_index.reader().unwrap();
+                crate::search::quill_bridge::refresh_reader(&reader).unwrap();
+                assert_eq!(reader.doc_count().unwrap(), expected_docs);
+            }
+            assert_eq!(tantivy_doc_count(&mut scan_index), expected_docs);
+            persist_conversations_batched(
+                &storage,
+                Some(&mut scan_index),
+                std::slice::from_ref(&conv),
+                LexicalPopulationStrategy::InlineRebuildFromScan,
+                false,
+            )
+            .unwrap();
+            assert_eq!(tantivy_doc_count(&mut scan_index), expected_docs);
+            drop(scan_index);
+            assert_eq!(
+                marker_hit(&scan_index_path),
+                incremental_hit,
+                "overlapping inline scan packets must converge on canonical document identities"
+            );
+            let rebuilt =
+                crate::indexer::rebuild_tantivy_from_db(&db_path, dir.path(), 1, None).unwrap();
+            assert_eq!(rebuilt.indexed_docs, expected_docs as usize);
+            assert_eq!(
+                marker_hit(&index_path),
+                incremental_hit,
+                "incremental and canonical rebuild projections agree"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn gh466_incremental_lexical_cap_uses_retained_canonical_prefix_for_every_route() {
+            for agent in ["claude_code", "codex"] {
+                for route in 0..3 {
+                    assert_gh466_canonical_prefix_cap(agent, route, true);
+                }
+            }
+        }
+
+        #[test]
+        #[serial]
+        fn gh466_incremental_lexical_cap_preserves_ordinary_append_crossing() {
+            for route in 0..3 {
+                assert_gh466_canonical_prefix_cap("claude_code", route, false);
+            }
         }
 
         #[test]
@@ -36144,7 +36500,10 @@ pub mod persist {
                 ],
             };
 
-            let packet = lexical_packet_for_persist(&map_to_internal(&conv));
+            let packet = ConversationPacket::from_canonical_replay(
+                &map_to_internal(&conv),
+                ConversationPacketProvenance::local(),
+            );
             assert_eq!(
                 packet.payload.messages.len(),
                 3,

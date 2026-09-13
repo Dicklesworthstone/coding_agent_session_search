@@ -11909,7 +11909,13 @@ impl FrankenStorage {
                     usize::try_from(row.get_typed::<i64>(6)?.max(0)).unwrap_or(usize::MAX);
                 original_bytes = original_bytes.saturating_add(content_bytes);
                 let boundary = lexical_content_truncation_boundary(&content, remaining_bytes);
-                content.truncate(boundary);
+                if boundary < content.len() {
+                    // GH #466: truncate/clear would retain each projected cell's
+                    // allocation, including oversized rows after the budget is
+                    // exhausted. Keep only the bounded prefix allocation before
+                    // retaining this row; an empty prefix owns no text buffer.
+                    content = content[..boundary].to_owned();
+                }
                 remaining_bytes = remaining_bytes.saturating_sub(content.len());
                 messages.push(Message {
                     id: Some(row.get_typed(0)?),
@@ -25401,8 +25407,9 @@ mod tests {
         };
         let agent_id = storage.ensure_agent(&agent).unwrap();
 
-        // Three messages of 2 KiB each => 6 KiB total content, well over the
-        // 1 KiB cap. This models an image/base64-heavy conversation.
+        // Many messages of 2 KiB each model an image/base64-heavy conversation.
+        // Trailing empty projections must not retain one large buffer per row.
+        const MESSAGE_COUNT: i64 = 64;
         let big = "é".repeat(1024);
         let conversation = Conversation {
             id: None,
@@ -25415,7 +25422,7 @@ mod tests {
             ended_at: Some(1_700_000_000_100),
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
-            messages: (0..3)
+            messages: (0..MESSAGE_COUNT)
                 .map(|idx| Message {
                     id: None,
                     idx,
@@ -25423,7 +25430,7 @@ mod tests {
                     author: Some("assistant".into()),
                     created_at: Some(1_700_000_000_010 + idx),
                     content: big.clone(),
-                    extra_json: serde_json::Value::Null,
+                    extra_json: serde_json::json!({"canonical_metadata": "retained"}),
                     snippets: Vec::new(),
                 })
                 .collect(),
@@ -25471,9 +25478,13 @@ mod tests {
             .unwrap();
 
         // All message rows survive (count/structure intact) ...
-        assert_eq!(messages.len(), 3, "message rows preserved");
+        assert_eq!(
+            messages.len(),
+            MESSAGE_COUNT as usize,
+            "message rows preserved"
+        );
         // ... but the cumulative indexed content is capped on a UTF-8 boundary,
-        // never the raw 6 KiB. A 1,025-byte cap cannot split a two-byte `é`.
+        // never the raw 128 KiB. A 1,025-byte cap cannot split a two-byte `é`.
         let total: usize = messages.iter().map(|m| m.content.len()).sum();
         assert_eq!(
             total, 1024,
@@ -25486,6 +25497,32 @@ mod tests {
         assert_eq!(messages[0].content.len(), 1024);
         assert!(messages[1].content.is_empty());
         assert!(messages[2].content.is_empty());
+        let retained_capacity: usize = messages.iter().map(|m| m.content.capacity()).sum();
+        assert!(
+            retained_capacity <= 1025,
+            "retained content allocations must fit the cap, including all trailing rows: {retained_capacity}"
+        );
+        assert!(
+            messages[1..]
+                .iter()
+                .all(|message| message.content.capacity() == 0)
+        );
+        assert!(messages.iter().all(|message| message.extra_json.is_null()));
+        let stored = storage.fetch_messages(conversation_id).unwrap();
+        assert_eq!(stored.len(), MESSAGE_COUNT as usize);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| (message.id, message.idx))
+                .collect::<Vec<_>>(),
+            stored
+                .iter()
+                .map(|message| (message.id, message.idx))
+                .collect::<Vec<_>>(),
+            "bounded lexical hydration preserves canonical message identities"
+        );
+        assert!(stored.iter().all(|message| message.content == big));
+        assert!(stored.iter().all(|message| !message.extra_json.is_null()));
     }
 
     #[test]
