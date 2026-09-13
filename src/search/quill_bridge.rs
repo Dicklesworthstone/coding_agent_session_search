@@ -1984,6 +1984,88 @@ mod tests {
         assert_eq!(nested.expect("nested doc count"), 0);
     }
 
+    #[test]
+    fn lexical_round_trip_restores_full_and_restricted_callers() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("outer runtime");
+        runtime.block_on(async {
+            let parent = Cx::current().expect("outer runtime context");
+            for restricted in [false, true] {
+                let restriction =
+                    restricted.then(|| Cx::push_restriction(asupersync::cx::CapMask::none()));
+                let caller = Cx::current().expect("caller context");
+                let assert_caller = || {
+                    let current = Cx::current().expect("restored caller context");
+                    assert_eq!(current.task_id(), caller.task_id());
+                    assert_eq!(current.region_id(), caller.region_id());
+                    assert_eq!(current.capabilities(), caller.capabilities());
+                    if restricted {
+                        assert!(!current.capabilities().spawn);
+                        assert!(!current.capabilities().io);
+                    }
+                };
+                let directory = tempfile::tempdir().expect("bridge index directory").keep();
+                eprintln!(
+                    "retained lexical caller-restoration fixture: {}",
+                    directory.display()
+                );
+                let mut index = QuillCassIndex::open_or_create(&directory).expect("open index");
+                assert_caller();
+                let content = "migration preserves the caller and searchable content";
+                index
+                    .add_cass_documents(&[sample("bridge", 0, content)])
+                    .expect("stage document");
+                index.commit().expect("publish document");
+                assert_caller();
+
+                let nested = drive(|_cx| async {
+                    let mapping = Cx::current().expect("nested bridge context");
+                    let count = index.doc_count().expect("nested published count");
+                    let restored = Cx::current().expect("restored nested bridge context");
+                    assert_eq!(restored.task_id(), mapping.task_id());
+                    assert_eq!(restored.region_id(), mapping.region_id());
+                    assert_eq!(restored.capabilities(), mapping.capabilities());
+                    count
+                });
+                assert_eq!(nested, 1);
+                assert_caller();
+                let reader = index.reader().expect("published reader");
+                let parser =
+                    frankensearch::quill::query::CassQueryParser::new(CASS_SEMANTIC_SCHEMA)
+                        .expect("CASS query parser");
+                let parsed = parser.parse(
+                    "migration",
+                    &frankensearch::quill::query::CassQueryFilters::default(),
+                );
+                let page = search_paginated(&reader, &parsed.query, 10, 0, true)
+                    .expect("query published document");
+                assert_eq!(page.hits.len(), 1);
+                assert_eq!(page.total_count, Some(1));
+                assert_eq!(
+                    stored_text(
+                        &reader,
+                        QuillCassFields::compiled().content,
+                        page.hits[0].global_docid
+                    )
+                    .expect("hydrate content"),
+                    Some(content.to_owned())
+                );
+                assert_caller();
+                drop(reader);
+                drop(index);
+                assert_caller();
+                drop(restriction);
+                let restored = Cx::current().expect("restored outer runtime context");
+                assert_eq!(restored.task_id(), parent.task_id());
+                assert_eq!(restored.region_id(), parent.region_id());
+                assert_eq!(restored.capabilities(), parent.capabilities());
+            }
+        });
+        assert!(shutdown_driver(), "Quill bridge runtime must drain");
+        assert!(runtime.shutdown_timeout(Duration::from_secs(30)));
+    }
+
     /// #440: the engine must not publish a MANIFEST on its own visibility
     /// cadence. With the engine default (1 s) a second ingest call after a
     /// one-second pause seals and publishes everything staged so far, which

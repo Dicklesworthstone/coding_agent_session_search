@@ -561,6 +561,66 @@ pub mod migrate {
 mod tests {
     use super::compat::RowExt;
     use super::*;
+    use asupersync::{Cx, cx::CapMask};
+
+    #[test]
+    fn nested_sql_bridge_restores_full_and_restricted_callers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = RuntimeBuilder::current_thread().build()?;
+        runtime.block_on(async {
+            let parent = Cx::current().expect("outer runtime context");
+            for restricted in [false, true] {
+                let restriction = restricted.then(|| Cx::push_restriction(CapMask::none()));
+                let caller = Cx::current().expect("caller context");
+                let assert_caller = || {
+                    let current = Cx::current().expect("restored caller context");
+                    assert_eq!(current.task_id(), caller.task_id());
+                    assert_eq!(current.region_id(), caller.region_id());
+                    assert_eq!(current.capabilities(), caller.capabilities());
+                    if restricted {
+                        assert!(!current.capabilities().spawn);
+                        assert!(!current.capabilities().io);
+                    }
+                };
+
+                let conn = Connection::open(":memory:")?;
+                assert_caller();
+                conn.execute_batch(
+                    "CREATE TABLE bridge_values (value INTEGER); \
+                     INSERT INTO bridge_values VALUES (40);",
+                )?;
+                assert_caller();
+                let mut values = Vec::new();
+                conn.query_with_params_for_each("SELECT value FROM bridge_values", &[], |row| {
+                    // Streaming invokes this closure inside drive(). Exercise
+                    // a second bridge while that runtime is still polling.
+                    let mapping = Cx::current().expect("row callback context");
+                    let nested = Connection::open(":memory:")?;
+                    let extra = nested.query_row("SELECT 2")?.get_typed::<i64>(0)?;
+                    nested.close()?;
+                    let restored = Cx::current().expect("restored row callback context");
+                    assert_eq!(restored.task_id(), mapping.task_id());
+                    assert_eq!(restored.region_id(), mapping.region_id());
+                    assert_eq!(restored.capabilities(), mapping.capabilities());
+                    values.push(row.get_typed::<i64>(0)? + extra);
+                    Ok(())
+                })?;
+                assert_eq!(values, vec![42]);
+                assert_caller();
+                conn.close()?;
+                assert_caller();
+                drop(restriction);
+                let restored = Cx::current().expect("restored outer runtime context");
+                assert_eq!(restored.task_id(), parent.task_id());
+                assert_eq!(restored.region_id(), parent.region_id());
+                assert_eq!(restored.capabilities(), parent.capabilities());
+            }
+            Ok::<(), FrankenError>(())
+        })?;
+        assert!(shutdown_driver(), "SQLite bridge runtime must drain");
+        assert!(runtime.shutdown_timeout(std::time::Duration::from_secs(30)));
+        Ok(())
+    }
 
     #[test]
     fn multi_statement_execute_error_does_not_replay_prior_side_effects()
