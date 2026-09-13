@@ -1007,9 +1007,12 @@ commit/bead/release provenance); it carries no raw session text. The same
 
 Provenance correlation is **project-scoped and explicit-reference anchored**:
 for a hit from the project you are running `cass` in now, cass links it to a
-closed bead / commit / proof / release only when the hit's own indexed text
-references a known identifier (`bead:<id>`, `commit:<sha>`, `release:<tag>`),
-joined against that project's local beads and git history. A temporal or
+closed bead or commit only when the hit's own indexed text references a known
+identifier (`bead:<id>` or `commit:<sha>`), joined against that project's local
+beads and git history. A linked commit's containing release is resolved from
+Git. Release containment preserves provenance but does not establish proof of
+the excerpt's claim: a landed commit remains `proof_debt` and cannot become
+`trusted` from this correlation alone. A temporal or
 workspace coincidence is never enough, so an unrelated conversation never
 inherits another's trust. Off-project hits report `workspace_mismatch`, and a
 hit whose local source file no longer exists on disk reports `source_unhealthy`

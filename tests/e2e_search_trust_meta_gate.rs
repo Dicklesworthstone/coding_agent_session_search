@@ -476,15 +476,19 @@ fn cass_cmd_in(cwd: &Path, home: &Path, codex_home: &Path, args: &[String]) -> C
 
 /// Run a bounded git command, returning trimmed stdout on success.
 fn git_run(repo: &Path, args: &[&str]) -> Result<String, Box<dyn Error>> {
-    let out = Command::new("git")
+    let hooks = repo.join(".cass-test-hooks");
+    std::fs::create_dir_all(&hooks)?;
+    let mut cmd = Command::new("git");
+    cmd.arg("-c")
+        .arg(format!("core.hooksPath={}", hooks.display()))
         .arg("-C")
         .arg(repo)
         .args(args)
         .env("GIT_AUTHOR_NAME", "t")
         .env("GIT_AUTHOR_EMAIL", "t@t")
         .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t")
-        .output()?;
+        .env("GIT_COMMITTER_EMAIL", "t@t");
+    let out = spawn_with_timeout_or_diag(cmd, "trust_git_fixture", None, SEARCH_TIMEOUT);
     ensure(out.status.success(), || {
         format!(
             "git {:?} failed: {}",
@@ -610,7 +614,8 @@ fn search_source_probe_marks_deleted_source_unhealthy() -> TestResult {
 /// `.beads/issues.jsonl`), a hit from that same workspace whose indexed text
 /// references the bead id is correlated to it: the verdict reaches `likely` and
 /// carries a sanitized `bead:` provenance ref. Proves the live join + cwd-
-/// relative workspace match end to end.
+/// relative workspace match end to end. A containing release retains its
+/// provenance without proving the excerpt's explicitly untested claim (GH465).
 #[test]
 fn search_on_project_correlation_links_bead() -> TestResult {
     let (_tmp, home, data_dir) = isolated_home()?;
@@ -640,6 +645,26 @@ fn search_on_project_correlation_links_bead() -> TestResult {
         beads_dir.join("issues.jsonl"),
         format!("{}\n", serde_json::to_string(&bead_line)?),
     )?;
+    git_run(
+        &proj,
+        &[
+            "-c",
+            "user.name=CASS Test",
+            "-c",
+            "user.email=cass-test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            &format!("fix ({bead_id})"),
+        ],
+    )?;
+    let commit_sha = git_run(&proj, &["rev-parse", "HEAD"])?;
+    let release_tag = "v0.0.1";
+    git_run(&proj, &["-c", "tag.gpgsign=false", "tag", release_tag])?;
+    let commit_source_ref = format!("commit:{}", commit_sha.chars().take(12).collect::<String>());
+    let release_source_ref = format!("release:{release_tag}");
 
     // Resolve the actual lesson id from the real live lessons surface. Trust
     // must reuse this content-stable id, not synthesize a parallel identifier.
@@ -671,10 +696,13 @@ fn search_on_project_correlation_links_bead() -> TestResult {
     )?;
     let lesson_provenance_ref = format!("lesson:{lesson_id}");
 
-    // A session whose workspace is the project root and whose body references
-    // the closed bead alongside the search keyword.
+    // The release tag contains the background commit; it supplies no proof
+    // of this excerpt's proposal.
     let keyword = "corrfixtureuniqueword";
-    let body = format!("{keyword} — landed in {bead_id} closeout");
+    let body = format!(
+        "{keyword}: Untested proposal; do not rely on it. Background reference: \
+         commit:{commit_sha}, bead:{bead_id}."
+    );
     seed_codex_session_full(
         &codex_home,
         "rollout-2026-correlation.jsonl",
@@ -727,6 +755,11 @@ fn search_on_project_correlation_links_bead() -> TestResult {
         )
     })?;
     let trust = trust_of(hit, "correlation")?;
+    for provenance in [&commit_source_ref, &release_source_ref] {
+        ensure(has_provenance_ref(trust, provenance), || {
+            format!("search missing released provenance `{provenance}`: {trust}")
+        })?;
+    }
     let has_bead_ref = has_provenance_ref(trust, &bead_source_ref);
     ensure(has_bead_ref, || {
         format!(
@@ -796,6 +829,11 @@ fn search_on_project_correlation_links_bead() -> TestResult {
         )
     })?;
     let pack_trust = trust_of(pack_evidence, "correlation pack evidence")?;
+    for provenance in [&commit_source_ref, &release_source_ref] {
+        ensure(has_provenance_ref(pack_trust, provenance), || {
+            format!("pack missing released provenance `{provenance}`: {pack_trust}")
+        })?;
+    }
     ensure(has_provenance_ref(pack_trust, &bead_source_ref), || {
         format!(
             "pack evidence missing `{bead_source_ref}`: {}",

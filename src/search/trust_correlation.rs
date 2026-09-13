@@ -26,8 +26,9 @@
 //!    it. A temporal or workspace coincidence is never enough — we require an
 //!    explicit identifier match — so an unrelated conversation never inherits a
 //!    "trusted" verdict from work it merely happened near.
-//! 3. Release containment (and thus release-backed proof) is resolved lazily per
-//!    matched commit via `git tag --contains`, then cached.
+//! 3. Release containment is resolved lazily per matched commit via
+//!    `git tag --contains`, then cached. These facts establish provenance;
+//!    neither a release nor a closed bead proves the excerpt's claim.
 //!
 //! ## Pure vs. live
 //!
@@ -234,20 +235,19 @@ impl CorrelationIndex {
 }
 
 /// Whether `tag` looks like a release tag (`v` followed by a digit, e.g.
-/// `v0.6.15`). Conservative so non-release tags never imply release-backed proof.
+/// `v0.6.15`). Conservative so non-release tags never imply a published release.
 fn is_release_tag(tag: &str) -> bool {
     let mut chars = tag.chars();
     matches!(chars.next(), Some('v') | Some('V'))
         && matches!(chars.next(), Some(c) if c.is_ascii_digit())
 }
 
-/// Map a correlation result + resolved release containment to a proof status.
-/// Pure. Release-contained landed work is `Proven`; landed-but-unreleased work is
-/// `ProofDebt`; everything else is `Unknown` (an open bead or a bare bead
-/// reference with no commit carries provenance but no proof).
-pub fn proof_for(outcome: OutcomeMarker, has_commit: bool, has_release: bool) -> ProofStatus {
+/// Map correlated provenance to the proof status it can actually establish.
+/// A landed commit carries `ProofDebt` until claim-specific proof is available,
+/// including when a release contains it. A bare bead or release reference has
+/// no proof signal. This correlation layer does not produce `Proven`.
+pub fn proof_for(outcome: OutcomeMarker, has_commit: bool, _has_release: bool) -> ProofStatus {
     match outcome {
-        OutcomeMarker::Landed if has_release => ProofStatus::Proven,
         OutcomeMarker::Landed if has_commit => ProofStatus::ProofDebt,
         _ => ProofStatus::Unknown,
     }
@@ -868,10 +868,10 @@ mod tests {
     }
 
     #[test]
-    fn proof_for_release_backed_is_proven() {
+    fn proof_for_release_containment_retains_proof_debt() {
         assert_eq!(
             proof_for(OutcomeMarker::Landed, true, true),
-            ProofStatus::Proven
+            ProofStatus::ProofDebt
         );
     }
 
@@ -885,14 +885,26 @@ mod tests {
 
     #[test]
     fn proof_for_open_or_no_commit_is_unknown() {
-        assert_eq!(
-            proof_for(OutcomeMarker::Open, false, false),
-            ProofStatus::Unknown
-        );
-        assert_eq!(
-            proof_for(OutcomeMarker::Landed, false, false),
-            ProofStatus::Unknown
-        );
+        for has_release in [false, true] {
+            assert_eq!(
+                proof_for(OutcomeMarker::Landed, false, has_release),
+                ProofStatus::Unknown
+            );
+            for outcome in [
+                OutcomeMarker::Open,
+                OutcomeMarker::Unknown,
+                OutcomeMarker::Failed,
+                OutcomeMarker::Superseded,
+            ] {
+                for has_commit in [false, true] {
+                    assert_eq!(
+                        proof_for(outcome, has_commit, has_release),
+                        ProofStatus::Unknown,
+                        "{outcome:?}, commit={has_commit}, release={has_release}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
