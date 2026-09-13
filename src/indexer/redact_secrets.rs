@@ -337,7 +337,14 @@ pub fn fuzz_redact_json_with_memoizing_redactor(
 ///    for backward compatibility; `CASS_INDEX_REDACTION` wins when both
 ///    are set.
 pub fn redaction_enabled() -> bool {
-    if let Ok(val) = dotenvy::var("CASS_INDEX_REDACTION") {
+    redaction_enabled_from_values(
+        dotenvy::var("CASS_INDEX_REDACTION").ok().as_deref(),
+        dotenvy::var("CASS_REDACT_SECRETS").ok().as_deref(),
+    )
+}
+
+fn redaction_enabled_from_values(modern: Option<&str>, legacy: Option<&str>) -> bool {
+    if let Some(val) = modern {
         let normalized = val.trim().to_ascii_lowercase();
         match normalized.as_str() {
             "off" | "0" | "false" | "no" | "none" | "disabled" => return false,
@@ -353,10 +360,7 @@ pub fn redaction_enabled() -> bool {
             }
         }
     }
-    match dotenvy::var("CASS_REDACT_SECRETS") {
-        Ok(val) => !matches!(val.as_str(), "0" | "false" | "off" | "no"),
-        Err(_) => true,
-    }
+    !matches!(legacy, Some("0" | "false" | "off" | "no"))
 }
 
 /// Stable identifier for the compiled SECRET_PATTERNS list.
@@ -1049,25 +1053,34 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn redaction_enabled_default() {
-        // When env var is not set, should be enabled
-        // Safety: only called in single-threaded test context
-        unsafe { std::env::remove_var("CASS_REDACT_SECRETS") };
-        assert!(redaction_enabled());
+    fn redaction_enabled_default() -> Result<(), String> {
+        for modern in [None, Some(""), Some(" \t\n")] {
+            if !redaction_enabled_from_values(modern, None) {
+                return Err(format!("unset policy must enable redaction: {modern:?}"));
+            }
+        }
+        Ok(())
     }
 
     #[test]
-    #[serial]
-    fn redaction_can_be_disabled() {
-        unsafe { std::env::set_var("CASS_REDACT_SECRETS", "0") };
-        assert!(!redaction_enabled());
-
-        unsafe { std::env::set_var("CASS_REDACT_SECRETS", "false") };
-        assert!(!redaction_enabled());
-
-        // Restore for other tests
-        unsafe { std::env::remove_var("CASS_REDACT_SECRETS") };
+    fn redaction_can_be_disabled() -> Result<(), String> {
+        for modern in [None, Some(""), Some(" \t\n")] {
+            for legacy in ["0", "false", "off", "no"] {
+                if redaction_enabled_from_values(modern, Some(legacy)) {
+                    return Err(format!(
+                        "legacy disable was ignored: {modern:?}, {legacy:?}"
+                    ));
+                }
+            }
+            for legacy in ["", "1", "true", "OFF", " false ", "unknown"] {
+                if !redaction_enabled_from_values(modern, Some(legacy)) {
+                    return Err(format!(
+                        "legacy exact matching changed: {modern:?}, {legacy:?}"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `CASS_INDEX_REDACTION` is the documented operator switch for
@@ -1075,65 +1088,24 @@ mod tests {
     /// over the legacy `CASS_REDACT_SECRETS` toggle and a warn+default
     /// path for unrecognized values.
     #[test]
-    #[serial]
-    fn cass_index_redaction_switch_controls_and_overrides_legacy() {
-        // Safety: serial test context; single-threaded env mutation.
-        unsafe {
-            std::env::remove_var("CASS_INDEX_REDACTION");
-            std::env::remove_var("CASS_REDACT_SECRETS");
+    fn cass_index_redaction_switch_controls_and_overrides_legacy() -> Result<(), String> {
+        for legacy in [None, Some("0"), Some("1"), Some("unknown")] {
+            for modern in ["off", "0", "false", "no", "none", "disabled", " OFF \t"] {
+                if redaction_enabled_from_values(Some(modern), legacy) {
+                    return Err(format!(
+                        "modern disable lost precedence: {modern:?}, {legacy:?}"
+                    ));
+                }
+            }
+            for modern in ["full", "on", "1", "true", "yes", " FULL \t", "lazy", "無効"] {
+                if !redaction_enabled_from_values(Some(modern), legacy) {
+                    return Err(format!(
+                        "modern full/fallback lost precedence: {modern:?}, {legacy:?}"
+                    ));
+                }
+            }
         }
-        assert!(redaction_enabled(), "default must be full redaction");
-
-        unsafe { std::env::set_var("CASS_INDEX_REDACTION", "off") };
-        assert!(!redaction_enabled(), "off must disable redaction");
-        unsafe { std::env::set_var("CASS_INDEX_REDACTION", "OFF") };
-        assert!(!redaction_enabled(), "value must be case-insensitive");
-        unsafe { std::env::set_var("CASS_INDEX_REDACTION", "full") };
-        assert!(redaction_enabled(), "full must enable redaction");
-
-        // Precedence: CASS_INDEX_REDACTION wins over the legacy switch
-        // in BOTH directions.
-        unsafe {
-            std::env::set_var("CASS_INDEX_REDACTION", "full");
-            std::env::set_var("CASS_REDACT_SECRETS", "0");
-        }
-        assert!(
-            redaction_enabled(),
-            "explicit full must override legacy disable"
-        );
-        unsafe {
-            std::env::set_var("CASS_INDEX_REDACTION", "off");
-            std::env::set_var("CASS_REDACT_SECRETS", "1");
-        }
-        assert!(
-            !redaction_enabled(),
-            "explicit off must override legacy enable"
-        );
-
-        // Unrecognized value: fail safe to full redaction.
-        unsafe {
-            std::env::set_var("CASS_INDEX_REDACTION", "lazy");
-            std::env::remove_var("CASS_REDACT_SECRETS");
-        }
-        assert!(
-            redaction_enabled(),
-            "unrecognized value must default to full redaction"
-        );
-
-        // Empty value behaves as unset: legacy switch applies again.
-        unsafe {
-            std::env::set_var("CASS_INDEX_REDACTION", "");
-            std::env::set_var("CASS_REDACT_SECRETS", "0");
-        }
-        assert!(
-            !redaction_enabled(),
-            "empty CASS_INDEX_REDACTION must fall through to legacy switch"
-        );
-
-        unsafe {
-            std::env::remove_var("CASS_INDEX_REDACTION");
-            std::env::remove_var("CASS_REDACT_SECRETS");
-        }
+        Ok(())
     }
 
     #[test]
