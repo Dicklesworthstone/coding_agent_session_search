@@ -474,6 +474,306 @@ fn schedule_run_nightly_no_semantic_skips_backfill_entirely() {
     );
 }
 
+// Optional Linux measurement is evidence, not a performance pass threshold.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires CASS_NATIVE_REUSE_MODEL_DIR, /usr/bin/time and /usr/bin/timeout; no downloads"]
+fn gh471_schedule_quality_worker_has_one_native_constructor_and_two_durable_boundaries() {
+    use coding_agent_search::search::fastembed_embedder::{
+        FastEmbedder, MINILM_VECTOR_SPACE_REVISION,
+    };
+    use coding_agent_search::search::model_download::{ModelManifest, model_file_path};
+    use coding_agent_search::search::semantic_manifest::SemanticManifest;
+    use coding_agent_search::search::vector_index::{
+        VectorIndex, parse_semantic_doc_id, vector_index_path,
+    };
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+
+    let supplied = std::path::PathBuf::from(
+        dotenvy::var("CASS_NATIVE_REUSE_MODEL_DIR").expect("explicit attested native bundle"),
+    )
+    .canonicalize()
+    .expect("existing native bundle");
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let data_dir = temp.path().join("data");
+    let project = home.join(".claude/projects/-native-lifetime");
+    std::fs::create_dir_all(&project).unwrap();
+    for ordinal in 0..2 {
+        let record = serde_json::json!({
+            "parentUuid": null, "cwd": "/test/native-lifetime",
+            "sessionId": format!("native-lifetime-{ordinal}"),
+            "version": "2.0.37", "gitBranch": "main", "type": "user",
+            "message": {"role": "user", "content": format!("Distinct native schedule evidence {ordinal}")},
+            "uuid": format!("native-message-{ordinal}"),
+            "timestamp": "2025-11-12T18:31:18.697Z"
+        });
+        std::fs::write(
+            project.join(format!("native-lifetime-{ordinal}.jsonl")),
+            format!("{record}\n"),
+        )
+        .unwrap();
+    }
+    let model_dir = FastEmbedder::default_model_dir(&data_dir);
+    std::fs::create_dir_all(&model_dir).unwrap();
+    let model_manifest = ModelManifest::minilm_v2();
+    assert_eq!(model_manifest.files.len(), 5);
+    for file in &model_manifest.files {
+        let source = model_file_path(&supplied, file).expect("supplied manifest file");
+        assert_eq!(
+            std::fs::copy(source, model_dir.join(file.local_name())).unwrap(),
+            file.size
+        );
+    }
+    let parent_trace = temp.path().join("schedule-parent.jsonl");
+    let child_trace = temp.path().join("schedule-children.jsonl");
+    let progress = temp.path().join("semantic-progress.jsonl");
+    let usage_path = temp.path().join("schedule-usage.txt");
+    let mut cass = cass_cmd(&home);
+    cass.arg("--trace-file")
+        .arg(&parent_trace)
+        .args([
+            "schedule",
+            "run",
+            "--job",
+            "nightly",
+            "--force",
+            "--json",
+            "--data-dir",
+        ])
+        .arg(&data_dir)
+        .env("CASS_TRACE_FILE", &child_trace)
+        .env(
+            "CASS_TRACE_FILTER",
+            "warn,frankensearch_rerank::native_embedder=info",
+        )
+        .env("CASS_TRACE_TEST_ID", "gh471-native-schedule")
+        .env("CASS_SEMANTIC_PROGRESS_JSONL", &progress)
+        .env("CASS_SCHEDULE_MAX_BACKFILL_BATCHES", "4")
+        .env("CASS_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT", "1")
+        .env("CASS_SEMANTIC_BACKFILL_FORCE", "1");
+
+    // The clock encloses the actual whole scheduled job, not cargo or test setup.
+    // GNU time's Linux %M is maximum individual-process RSS, including reaped
+    // descendants. It is not a simultaneous process-tree/model+batch memory bound.
+    // timeout owns a process group and bounds the actual schedule and its children.
+    assert!(Path::new("/usr/bin/time").is_file());
+    assert!(Path::new("/usr/bin/timeout").is_file());
+    let mut measured = Command::new("/usr/bin/time");
+    measured
+        .env_clear()
+        .current_dir(&home)
+        .envs(
+            cass.get_envs()
+                .filter_map(|(key, value)| value.map(|value| (key, value))),
+        )
+        .args(["-f", "%e %M", "-o"])
+        .arg(&usage_path)
+        .args([
+            "/usr/bin/timeout",
+            "--signal=TERM",
+            "--kill-after=10s",
+            "1200s",
+        ])
+        .arg(cass.get_program())
+        .args(cass.get_args());
+    let output = measured.output().expect("run bounded actual scheduled job");
+    assert!(
+        output.status.success(),
+        "stdout={}; stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = parse_single_json_document(&output.stdout);
+    assert_eq!(report["ok"], true, "{report}");
+    let workers: Vec<_> = report["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|step| {
+            step["argv"]
+                .as_array()
+                .is_some_and(|args| args.iter().any(|arg| arg == "backfill"))
+        })
+        .collect();
+    assert_eq!(workers.len(), 2, "one fast and one quality child: {report}");
+    for (ordinal, tier) in ["fast", "quality"].iter().enumerate() {
+        let worker = workers[ordinal];
+        assert_eq!(worker["ok"], true, "{worker}");
+        let args = worker["argv"].as_array().unwrap();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--tier" && pair[1] == *tier)
+        );
+        let remaining = if ordinal == 0 { "4" } else { "2" };
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--max-batches" && pair[1] == remaining)
+        );
+        let result = &worker["result"];
+        assert_eq!(result["batches_attempted"], 2, "{result}");
+        assert_eq!(result["batches_completed"], 2, "{result}");
+        assert_eq!(result["model_initializations"], 1, "{result}");
+        assert_eq!(result["status"], "published", "{result}");
+        assert_eq!(result["total_conversations"], 2, "{result}");
+    }
+    let read_jsonl = |path: &Path| -> Vec<Value> {
+        let text = std::fs::read_to_string(path).expect("actual trace/progress output");
+        let rows: Vec<Value> = text
+            .lines()
+            .enumerate()
+            .map(|(ordinal, line)| {
+                serde_json::from_str(line).unwrap_or_else(|error| {
+                    panic!("{}:{}: {error}; record={line}", path.display(), ordinal + 1)
+                })
+            })
+            .collect();
+        assert!(!rows.is_empty(), "{}", path.display());
+        for row in &rows {
+            assert_ne!(row["event"], "trace_truncated", "{row}");
+            assert_ne!(row["fields"]["event"], "trace_truncated", "{row}");
+        }
+        rows
+    };
+    let parents = read_jsonl(&parent_trace);
+    let children = read_jsonl(&child_trace);
+    let is_constructor = |row: &&Value| {
+        row["target"] == "frankensearch_rerank::native_embedder"
+            && row["fields"]["message"]
+                == "native frankentorch MiniLM embedder loaded (mean-pool + L2)"
+    };
+    assert_eq!(parents.iter().filter(is_constructor).count(), 0);
+    let constructors: Vec<_> = children.iter().filter(is_constructor).collect();
+    assert_eq!(
+        constructors.len(),
+        1,
+        "actual native constructors: {children:?}"
+    );
+    assert_eq!(constructors[0]["fields"]["dimension"], 384);
+    // Neither producer trace nor progress schema exposes a PID. Sequential
+    // child command summaries delimit the actual quality worker's trace block.
+    let mut pending_constructors = 0;
+    let mut quality_blocks = 0;
+    for row in &children {
+        if is_constructor(&row) {
+            pending_constructors += 1;
+        }
+        if row["fields"]["event"] == "command_summary" {
+            let args = row["fields"]["args"]
+                .as_array()
+                .expect("actual child arguments");
+            let quality = args.iter().any(|arg| arg == "backfill")
+                && args
+                    .windows(2)
+                    .any(|pair| pair[0] == "--tier" && pair[1] == "quality");
+            if quality {
+                quality_blocks += 1;
+                assert_eq!(
+                    pending_constructors, 1,
+                    "quality child must load exactly once"
+                );
+            } else {
+                assert_eq!(
+                    pending_constructors, 0,
+                    "non-quality child constructed a model: {row}"
+                );
+            }
+            pending_constructors = 0;
+        }
+    }
+    assert_eq!(quality_blocks, 1, "one completed actual quality child");
+    assert_eq!(
+        pending_constructors, 0,
+        "constructor missing its child completion summary"
+    );
+    let events = read_jsonl(&progress);
+    let durable: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event["tier"] == "quality"
+                && matches!(
+                    event["event"].as_str(),
+                    Some("checkpoint_save_done" | "publish_done")
+                )
+        })
+        .collect();
+    assert_eq!(durable.len(), 2, "{events:?}");
+    assert_eq!(durable[0]["event"], "checkpoint_save_done");
+    assert_eq!(durable[1]["event"], "publish_done");
+    for (ordinal, event) in durable.iter().enumerate() {
+        assert_eq!(event["embedder_id"], "minilm-384");
+        assert_eq!(event["rows_processed"], ordinal + 1);
+        assert_eq!(event["rows_total"], 2);
+    }
+    let storage = FrankenStorage::open(&data_dir.join("agent_search.db")).unwrap();
+    let conversations = storage.list_conversations(i64::MAX, 0).unwrap();
+    assert_eq!(conversations.len(), 2);
+    let mut source_paths: Vec<_> = conversations
+        .iter()
+        .map(|row| row.source_path.clone())
+        .collect();
+    source_paths.sort();
+    assert_eq!(
+        source_paths,
+        (0..2)
+            .map(|ordinal| project.join(format!("native-lifetime-{ordinal}.jsonl")))
+            .collect::<Vec<_>>()
+    );
+    let mut message_ids = Vec::new();
+    for conversation in &conversations {
+        assert_eq!(conversation.agent_slug, "claude_code");
+        let messages = storage.fetch_messages(conversation.id.unwrap()).unwrap();
+        assert_eq!(messages.len(), 1);
+        message_ids.push(u64::try_from(messages[0].id.unwrap()).unwrap());
+    }
+    message_ids.sort();
+    let index = VectorIndex::open(&vector_index_path(&data_dir, "minilm-384")).unwrap();
+    assert_eq!(index.embedder_id(), "minilm-384");
+    assert_eq!(index.embedder_revision(), MINILM_VECTOR_SPACE_REVISION);
+    assert_eq!(index.dimension(), 384);
+    assert_eq!(index.record_count(), 2);
+    let mut published_ids = Vec::new();
+    for ordinal in 0..2 {
+        assert!(!index.is_deleted(ordinal));
+        let doc = parse_semantic_doc_id(index.doc_id_at(ordinal).unwrap()).unwrap();
+        published_ids.push(doc.message_id);
+        assert_eq!(doc.chunk_idx, 0);
+        assert!(doc.content_hash.is_some());
+        let vector = index.vector_at_f32(ordinal).unwrap();
+        assert_eq!(vector.len(), 384);
+        assert!(vector.iter().all(|value| value.is_finite()));
+    }
+    published_ids.sort();
+    assert_eq!(published_ids, message_ids);
+    let manifest = SemanticManifest::load(&data_dir)
+        .unwrap()
+        .expect("durable publication");
+    assert!(manifest.checkpoint.is_none());
+    let quality = manifest.quality_tier.expect("actual quality tier");
+    assert!(quality.ready);
+    assert_eq!((quality.doc_count, quality.conversation_count), (2, 2));
+
+    let raw_usage = std::fs::read_to_string(&usage_path).unwrap();
+    let columns: Vec<_> = raw_usage.split_whitespace().collect();
+    assert_eq!(columns.len(), 2, "GNU time output: {raw_usage}");
+    let elapsed_seconds: f64 = columns[0].parse().expect("elapsed seconds");
+    let maximum_process_rss_kib: u64 = columns[1].parse().expect("maximum process RSS");
+    assert!(elapsed_seconds.is_finite() && elapsed_seconds > 0.0);
+    assert!(maximum_process_rss_kib > 0);
+    eprintln!(
+        "gh471_native_schedule_observation={}",
+        serde_json::json!({
+            "elapsed_seconds": elapsed_seconds,
+            "gnu_time_maximum_process_rss_kib": maximum_process_rss_kib,
+            "scope": "whole schedule invocation; maximum individual-process RSS including reaped descendants",
+            "performance_certification": false,
+            "simultaneous_process_tree_peak": null,
+            "constructors": constructors, "quality_durable_boundaries": durable,
+            "report": report, "stderr": String::from_utf8_lossy(&output.stderr)
+        })
+    );
+}
+
 #[test]
 fn schedule_run_json_failure_stays_a_single_document_with_exit_9() {
     let tmp = tempfile::tempdir().unwrap();
