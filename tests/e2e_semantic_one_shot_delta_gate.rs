@@ -216,3 +216,199 @@ fn check() -> Result<(), String> {
 fn one_shot_semantic_index_embeds_only_the_delta_when_watermark_trails() -> Result<(), String> {
     check()
 }
+
+#[test]
+fn gh470_covered_watermark_rebuilds_old_prefix_and_reuses_current_passages()
+-> Result<(), Box<dyn std::error::Error>> {
+    use coding_agent_search::indexer::semantic::HASH_VECTOR_SPACE_REVISION;
+    use coding_agent_search::search::canonicalize::{canonicalize_for_embedding, content_hash};
+    use coding_agent_search::search::embedder::Embedder;
+    use coding_agent_search::search::hash_embedder::HashEmbedder;
+    use coding_agent_search::search::policy::CHUNKING_STRATEGY_VERSION;
+    use coding_agent_search::search::semantic_manifest::SemanticManifest;
+    use coding_agent_search::search::vector_index::{
+        Quantization, SemanticDocId, VectorIndex, parse_semantic_doc_id, vector_index_path,
+    };
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+
+    type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
+    const SKIP_MARKER: &str = "skipping bulk semantic re-embed: watermark already covers";
+    const SOURCE_NAME: &str = "rollout-2026-04-23T10-00-00-passage-migration.jsonl";
+
+    let home = tempfile::tempdir()?;
+    let home_path = home.path().to_path_buf();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(home_path.join(".env"))?;
+    let fixture = Fixture {
+        _home: home,
+        data_dir: home_path.join("cass-data"),
+        codex_home: home_path.join(".codex"),
+        home: home_path,
+    };
+    std::fs::create_dir_all(&fixture.data_dir)?;
+    let source = format!(
+        "{} The antimeridian longitude correction preserves crossing route geometry.",
+        "Review Unicode café diagnostics and retain every original source location. ".repeat(100)
+    );
+    util::seed_codex_session(&fixture.codex_home, SOURCE_NAME, &source, false);
+    let source_path = fixture
+        .codex_home
+        .join("sessions/2026/04/23")
+        .join(SOURCE_NAME);
+    let source_bytes = std::fs::read(&source_path)?;
+    let run_index = |label: &str, full: bool| -> TestResult<String> {
+        let mut args = vec![
+            "index",
+            "--semantic",
+            "--embedder",
+            "hash",
+            "--no-progress-events",
+        ];
+        if full {
+            args.push("--full");
+        }
+        let mut command = cass(&fixture, &args, &[]);
+        command.env_clear();
+        for key in ["PATH", "SystemRoot", "WINDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        command
+            .env("HOME", &fixture.home)
+            .env("USERPROFILE", &fixture.home)
+            .env("XDG_CONFIG_HOME", fixture.home.join("xdg-config"))
+            .env("XDG_DATA_HOME", fixture.home.join("xdg-data"))
+            .env("XDG_CACHE_HOME", fixture.home.join("xdg-cache"))
+            .env("CLAUDE_CONFIG_DIR", fixture.home.join(".claude"))
+            .env("CODEX_HOME", &fixture.codex_home)
+            .env("TUI_HEADLESS", "1")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("CASS_RESPONSIVENESS_DISABLE", "1")
+            .env("RUST_MIN_STACK", "134217728")
+            .env("NO_COLOR", "1")
+            .env("RUST_LOG", "info");
+        let output =
+            spawn_with_timeout_or_diag(command, label, Some(&fixture.data_dir), INDEX_TIMEOUT);
+        assert!(
+            output.status.success(),
+            "{label}: stdout: {}\nstderr: {}",
+            text(&output.stdout),
+            text(&output.stderr)
+        );
+        Ok(text(&output.stderr))
+    };
+    run_index("gh470_migration_initial_build", true)?;
+
+    let db_path = fixture.data_dir.join("agent_search.db");
+    let canonical_snapshot = || -> TestResult<(Value, Option<i64>)> {
+        let storage = FrankenStorage::open_readonly(&db_path)?;
+        let mut conversations = storage.list_conversations(i64::MAX, 0)?;
+        for conversation in &mut conversations {
+            conversation.messages = storage
+                .fetch_messages(conversation.id.ok_or("missing canonical conversation ID")?)?;
+        }
+        Ok((
+            serde_json::to_value(conversations)?,
+            storage.get_last_embedded_message_id()?,
+        ))
+    };
+    let before = canonical_snapshot()?;
+    assert_eq!(before.0.as_array().ok_or("conversation array")?.len(), 1);
+    let messages = before.0[0]["messages"].as_array().ok_or("message array")?;
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["content"], source);
+    let message_id = messages[0]["id"].as_u64().ok_or("canonical message ID")?;
+    assert_eq!(before.1, Some(i64::try_from(message_id)?));
+
+    let fsvi_path = vector_index_path(&fixture.data_dir, "fnv1a-384");
+    let vector_snapshot = || -> TestResult<Vec<(SemanticDocId, Vec<u32>)>> {
+        let index = VectorIndex::open(&fsvi_path)?;
+        assert_eq!(index.embedder_id(), "fnv1a-384");
+        assert_eq!(index.embedder_revision(), HASH_VECTOR_SPACE_REVISION);
+        assert_eq!(index.dimension(), 384);
+        assert_eq!(index.wal_record_count(), 0);
+        assert_eq!(index.tombstone_count(), 0);
+        let mut records = Vec::new();
+        for ordinal in 0..index.record_count() {
+            let id = parse_semantic_doc_id(index.doc_id_at(ordinal)?)
+                .ok_or("invalid semantic document ID")?;
+            assert_eq!(id.message_id, message_id);
+            let vector = index.vector_at_f32(ordinal)?;
+            assert!(vector.iter().all(|value| value.is_finite()));
+            records.push((id, vector.into_iter().map(f32::to_bits).collect()));
+        }
+        records.sort_by_key(|(id, _)| id.chunk_idx);
+        Ok(records)
+    };
+    let expected = vector_snapshot()?;
+    assert_eq!(expected.len(), 8);
+    assert_eq!(
+        expected
+            .iter()
+            .map(|(id, _)| id.chunk_idx)
+            .collect::<Vec<_>>(),
+        (0..8).collect::<Vec<u8>>()
+    );
+
+    // Replace only the derived artifact with an actual historical prefix
+    // embedding. The canonical source and covered watermark remain intact.
+    let prefix = canonicalize_for_embedding(&source);
+    assert!(!prefix.contains("antimeridian"));
+    let legacy_id = SemanticDocId {
+        content_hash: Some(content_hash(&prefix)),
+        ..expected[0].0
+    };
+    let legacy_vector = HashEmbedder::default().embed_sync(&prefix)?;
+    let mut legacy = VectorIndex::create_with_revision(
+        &fsvi_path,
+        "fnv1a-384",
+        "hash-fnv1a-modular-v1",
+        384,
+        Quantization::F16,
+    )?;
+    legacy.write_record(&legacy_id.to_doc_id_string(), &legacy_vector)?;
+    legacy.finish()?;
+    let mut manifest = SemanticManifest::load(&fixture.data_dir)?.ok_or("missing manifest")?;
+    let artifact = manifest.fast_tier.as_mut().ok_or("missing fast artifact")?;
+    artifact.chunking_version = 1;
+    artifact.doc_count = 1;
+    artifact.size_bytes = std::fs::metadata(&fsvi_path)?.len();
+    manifest.save(&fixture.data_dir)?;
+    let old = VectorIndex::open(&fsvi_path)?;
+    assert_eq!(old.embedder_revision(), "hash-fnv1a-modular-v1");
+    assert_eq!(old.record_count(), 1);
+    assert_eq!(old.doc_id_at(0)?, legacy_id.to_doc_id_string());
+    drop(old);
+    assert_eq!(canonical_snapshot()?, before);
+    assert_eq!(std::fs::read(&source_path)?, source_bytes);
+
+    let migrated = run_index("gh470_migration_covered_watermark", false)?;
+    assert!(
+        migrated.contains("starting semantic indexing"),
+        "{migrated}"
+    );
+    assert!(!migrated.contains(SKIP_MARKER), "{migrated}");
+    assert_eq!(vector_snapshot()?, expected);
+    let manifest = SemanticManifest::load(&fixture.data_dir)?.ok_or("missing new manifest")?;
+    let artifact = manifest.fast_tier.ok_or("missing new fast artifact")?;
+    assert_eq!(artifact.chunking_version, CHUNKING_STRATEGY_VERSION);
+    assert_eq!(artifact.doc_count, 8);
+    assert!(artifact.ready);
+    assert_eq!(canonical_snapshot()?, before);
+    assert_eq!(std::fs::read(&source_path)?, source_bytes);
+
+    let current_bytes = std::fs::read(&fsvi_path)?;
+    let unchanged = run_index("gh470_migration_current_unchanged", false)?;
+    assert!(unchanged.contains(SKIP_MARKER), "{unchanged}");
+    assert!(
+        !unchanged.contains("starting semantic indexing"),
+        "{unchanged}"
+    );
+    assert_eq!(std::fs::read(&fsvi_path)?, current_bytes);
+    assert_eq!(canonical_snapshot()?, before);
+    assert_eq!(std::fs::read(&source_path)?, source_bytes);
+    Ok(())
+}

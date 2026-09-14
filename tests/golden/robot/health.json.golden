@@ -240,14 +240,14 @@
       {
         "controller_id": "semantic_search",
         "policy_id": "semantic.hybrid_preferred.v1",
-        "policy_version": "semantic_schema_1+chunking_1",
+        "policy_version": "semantic_schema_1+chunking_2",
         "status": "fallback",
         "fallback_state": "conservative",
         "conservative_fallback": true,
         "decision_reason": "semantic unavailable; lexical fallback remains active",
         "inputs": {
           "chunk_timeout_seconds": "120",
-          "chunking_strategy_version": "1",
+          "chunking_strategy_version": "2",
           "download_policy": "opt_in",
           "fast_dimension": "256",
           "fast_tier_embedder": "hash",
@@ -567,14 +567,14 @@
         {
           "controller_id": "semantic_search",
           "policy_id": "semantic.hybrid_preferred.v1",
-          "policy_version": "semantic_schema_1+chunking_1",
+          "policy_version": "semantic_schema_1+chunking_2",
           "status": "fallback",
           "fallback_state": "conservative",
           "conservative_fallback": true,
           "decision_reason": "semantic unavailable; lexical fallback remains active",
           "inputs": {
             "chunk_timeout_seconds": "120",
-            "chunking_strategy_version": "1",
+            "chunking_strategy_version": "2",
             "download_policy": "opt_in",
             "fast_dimension": "256",
             "fast_tier_embedder": "hash",

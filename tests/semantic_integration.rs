@@ -1446,3 +1446,985 @@ fn test_introspect_includes_models_command() {
         );
     }
 }
+
+mod gh470_native_long_messages {
+    use anyhow::{Context, Result};
+    use coding_agent_search::indexer::semantic::{EmbeddingInput, SemanticIndexer};
+    use coding_agent_search::search::canonicalize::{
+        MAX_EMBED_CHARS, canonicalize_for_embedding, content_hash, embedding_passages,
+    };
+    use coding_agent_search::search::embedder::Embedder;
+    use coding_agent_search::search::fastembed_embedder::{
+        FastEmbedder, MINILM_VECTOR_SPACE_REVISION, model_dir_override,
+    };
+    use coding_agent_search::search::model_download::{
+        ModelManifest, compute_sha256, model_file_path,
+    };
+    use coding_agent_search::search::vector_index::{
+        SemanticDocId, parse_semantic_doc_id, vector_index_path,
+    };
+    use frankensearch::{Canonicalizer, DefaultCanonicalizer};
+    use serde_json::{Value, json};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::Instant;
+    use tokenizers::{Tokenizer, TruncationParams};
+
+    // Reserve two native-token positions for CLS/SEP; verify the actual token
+    // bound for every candidate window in this finite corpus below.
+    const WINDOW_CHARS: usize = 510;
+    const MAX_WINDOWS: usize = 4;
+    const NATIVE_MAX_TOKENS: usize = 512;
+    const CORPUS_REVISION: &str = "gh470-19-messages-cjk-tail-v2";
+
+    fn copy_attested_model(data_dir: &std::path::Path) -> Result<(ModelManifest, PathBuf, f64)> {
+        assert!(
+            model_dir_override().is_none(),
+            "use the supplied managed model bundle"
+        );
+        let supplied = PathBuf::from(
+            dotenvy::var("CASS_NATIVE_REUSE_MODEL_DIR")
+                .context("supply an existing attested MiniLM bundle; this test never downloads")?,
+        );
+        let model_dir = FastEmbedder::default_model_dir(data_dir);
+        fs::create_dir_all(&model_dir)?;
+        let manifest = ModelManifest::minilm_v2();
+        assert_eq!(manifest.files.len(), 5);
+        let started = Instant::now();
+        for file in &manifest.files {
+            let source = model_file_path(&supplied, file)
+                .with_context(|| format!("missing supplied model file {}", file.name))?;
+            assert_eq!(compute_sha256(&source)?, file.sha256);
+            assert_eq!(
+                fs::copy(source, model_dir.join(file.local_name()))?,
+                file.size
+            );
+        }
+        Ok((
+            manifest,
+            model_dir,
+            started.elapsed().as_secs_f64() * 1000.0,
+        ))
+    }
+
+    struct Query {
+        name: &'static str,
+        text: &'static str,
+        target: Option<u64>,
+        evidence: Option<&'static str>,
+    }
+
+    fn corpus() -> (Vec<EmbeddingInput>, Vec<Query>) {
+        // Repeated work-log structure is intentional: the useful resolution is
+        // late in a realistic session, after several unrelated investigation steps.
+        let mut prose = String::new();
+        let mut code = String::from("```rust\n");
+        let mut unicode = String::new();
+        for step in 0..12 {
+            prose.push_str(&format!(
+                "Review step {step}: the deployment dashboard shows stable worker counts. \
+                 We checked the staging configuration, compared the release checklist with \
+                 yesterday's notes, and recorded the request latency histogram. The team \
+                 deferred a cosmetic dashboard change until the next maintenance window.\n"
+            ));
+            code.push_str(&format!(
+                "fn inspect_worker_{step}(worker: &Worker) -> Report {{\n\
+                 let pending = worker.pending_jobs();\n\
+                 let completed = worker.completed_jobs();\n\
+                 let elapsed = worker.elapsed_millis();\n\
+                 Report {{ pending, completed, elapsed, healthy: worker.is_ready() }}\n\
+                 }}\n\
+                 // This routine reports scheduler activity without changing the work queue.\n"
+            ));
+            if step == 8 {
+                // Middle-only evidence makes head/tail loss visible; later work
+                // continues far enough that the tail cannot retain this section.
+                code.push_str(
+                    "// The dependency resolver needs Tarjan strongly connected components. \
+                     Maintain a discovery index and lowlink per vertex, push active vertices \
+                     on a stack, and pop one component when lowlink equals its discovery index.\n\
+                     fn component_root(index: usize, lowlink: usize) -> bool { index == lowlink }\n",
+                );
+            }
+            unicode.push_str(&format!(
+                "Équipe de Montréal, revue {step}: the café dashboard renders 東京 and \
+                 résumé correctly in its activity table. We checked translations, date \
+                 labels, column widths, and keyboard navigation. The same review also \
+                 covered the English release notes and ordinary application preferences.\n"
+            ));
+        }
+        code.push_str("```\n");
+        prose.push_str(
+            "The final geographic defect was an antimeridian crossing: a viewport from \
+             170 degrees east to 170 degrees west needs two longitude intervals. Split \
+             the bounding box at the international date line before the spatial lookup.",
+        );
+        unicode.push_str(
+            "The remaining editor bug concerns grapheme clusters: the cursor must not \
+             split e\u{301} or the family emoji 👩‍👩‍👧‍👦 into visible fragments. \
+             Move across extended grapheme boundaries instead of individual Unicode \
+             scalar values; byte offsets alone do not describe displayed characters.",
+        );
+        let mut dense_unicode = "中".repeat(2400);
+        dense_unicode.push_str(
+            " Red-black tree insertions preserve balance by recoloring a red parent \
+             and uncle, then applying left or right rotations when the uncle is black. \
+             Keep the root black and equal black heights on every root-to-leaf path.",
+        );
+        let contents = vec![
+            prose,
+            code,
+            unicode,
+            "Certificate renewal failed because the TLS certificate expired. Renew it, \
+             reload the listener, and verify the new certificate expiration date."
+                .into(),
+            "A database deadlock occurs when transactions acquire row locks in opposite \
+             orders. Use a consistent lock order and retry the aborted transaction."
+                .into(),
+            "The CSS grid overflows on narrow screens. Set min-width to zero on the grid \
+             children so long labels can shrink within their assigned columns."
+                .into(),
+            "The map renderer uses a tile cache and zoom-dependent simplification. \
+             Evict old tiles when the cache reaches its memory budget."
+                .into(),
+            "A geographic dashboard converts kilometers to miles for distance labels. \
+             Its legend also explains the color scale used for elevation."
+                .into(),
+            "The dependency resolver uses a priority queue to run ready packages. \
+             Each finished package releases the dependents waiting for compilation."
+                .into(),
+            "A graph traversal visits neighbors in breadth-first order and records the \
+             shortest number of edges from the chosen starting vertex."
+                .into(),
+            "The editor stores text as UTF-8 and saves the document atomically. A \
+             temporary file protects the previous contents from interrupted writes."
+                .into(),
+            "The translation catalog contains French and Japanese labels. Missing \
+             translations fall back to English while preserving the selected locale."
+                .into(),
+            "The TLS client validates the server hostname against its certificate. \
+             The trust store contains the certificate authorities permitted by policy."
+                .into(),
+            "A database index speeds up lookups by customer identifier. The query \
+             planner chooses a sequential scan when most rows match the predicate."
+                .into(),
+            "A stylesheet assigns typography and spacing to the dashboard. The design \
+             uses a monospace font for identifiers and a separate color for warnings."
+                .into(),
+            "The deployment queue records completed work and retries failed jobs. \
+             Operators inspect latency charts before increasing worker capacity."
+                .into(),
+            "A filesystem watcher coalesces rapid saves before rebuilding the preview. \
+             It retains the previous preview when the compiler reports an error."
+                .into(),
+            "The backup service verifies checksums before restoring archived documents. \
+             Retention settings keep the latest successful backup available."
+                .into(),
+            dense_unicode,
+        ];
+        let messages = contents
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, content)| EmbeddingInput {
+                message_id: ordinal as u64 + 1,
+                created_at_ms: 1_700_000_000_000 + ordinal as i64,
+                agent_id: ordinal as u32 % 3 + 1,
+                workspace_id: ordinal as u32 % 4 + 10,
+                source_id: ordinal as u32 % 2 + 20,
+                role: ordinal as u8 % 4,
+                chunk_idx: 0,
+                content,
+            })
+            .collect();
+        let queries = vec![
+            Query {
+                name: "long_prose",
+                text: "How should a map bounding box cross the international date line?",
+                target: Some(1),
+                evidence: Some("antimeridian"),
+            },
+            Query {
+                name: "long_code",
+                text: "Find strongly connected components using discovery indices and lowlinks.",
+                target: Some(2),
+                evidence: Some("Tarjan"),
+            },
+            Query {
+                name: "long_unicode",
+                text: "Prevent cursor movement from splitting a family emoji or a combining accent.",
+                target: Some(3),
+                evidence: Some("grapheme"),
+            },
+            Query {
+                name: "short_certificate",
+                text: "How do we fix an expired TLS certificate?",
+                target: Some(4),
+                evidence: None,
+            },
+            Query {
+                name: "short_deadlock",
+                text: "Why do opposite row lock orders cause a database deadlock?",
+                target: Some(5),
+                evidence: None,
+            },
+            Query {
+                name: "short_layout",
+                text: "How do CSS grid children shrink on narrow screens?",
+                target: Some(6),
+                evidence: None,
+            },
+            Query {
+                name: "absent_topic",
+                text: "What isotope ratios identify the origin of lunar basalt?",
+                target: None,
+                evidence: None,
+            },
+            Query {
+                name: "long_dense_unicode",
+                text: "How do red-black tree insertions use recoloring and rotations to stay balanced?",
+                target: Some(19),
+                evidence: Some("Red-black"),
+            },
+        ];
+        (messages, queries)
+    }
+
+    fn identity(input: &EmbeddingInput) -> SemanticDocId {
+        SemanticDocId {
+            message_id: input.message_id,
+            chunk_idx: input.chunk_idx,
+            agent_id: input.agent_id,
+            workspace_id: input.workspace_id,
+            source_id: input.source_id,
+            role: input.role,
+            created_at_ms: input.created_at_ms,
+            content_hash: Some(content_hash(&canonicalize_for_embedding(&input.content))),
+        }
+    }
+
+    fn representation(
+        messages: &[EmbeddingInput],
+        windows: usize,
+    ) -> (Vec<EmbeddingInput>, Vec<Value>) {
+        let mut inputs = Vec::new();
+        let mut selections = Vec::new();
+        for message in messages {
+            let production_passages = (windows == 8).then(|| embedding_passages(&message.content));
+            // Select raw spans before character truncation or fenced-code
+            // collapse. Canonicalization still runs inside the real indexer.
+            let chars: Vec<_> = message.content.chars().collect();
+            if windows == 1 || chars.len() <= MAX_EMBED_CHARS {
+                if let Some(passages) = production_passages {
+                    assert_eq!(passages, [message.content.as_str()]);
+                }
+                inputs.push(message.clone());
+                selections.push(json!({
+                    "message_id": message.message_id, "raw_chars": chars.len(),
+                    "selected_raw_char_spans": [[0, chars.len()]],
+                    "unselected_raw_char_spans": [],
+                    "projection": "unchanged raw input; production canonical and native caps still apply",
+                }));
+                continue;
+            }
+            let mut selected = Vec::new();
+            let mut unselected = Vec::new();
+            let mut covered_until = 0;
+            let count = if windows == 0 {
+                chars.len().div_ceil(WINDOW_CHARS)
+            } else {
+                windows.min(chars.len().div_ceil(WINDOW_CHARS))
+            };
+            assert!(count > 1);
+            if let Some(passages) = production_passages.as_ref() {
+                assert_eq!(passages.len(), count);
+            }
+            for chunk_idx in 0..count {
+                let start = if windows == 0 {
+                    chunk_idx * WINDOW_CHARS
+                } else {
+                    chunk_idx * (chars.len() - WINDOW_CHARS) / (count - 1)
+                };
+                let end = (start + WINDOW_CHARS).min(chars.len());
+                if start > covered_until {
+                    unselected.push([covered_until, start]);
+                }
+                covered_until = covered_until.max(end);
+                selected.push([start, end]);
+                let expected_content: String = chars[start..end].iter().collect();
+                let content = if let Some(passages) = production_passages.as_ref() {
+                    assert_eq!(passages[chunk_idx], expected_content);
+                    passages[chunk_idx].to_owned()
+                } else {
+                    expected_content
+                };
+                let input = EmbeddingInput {
+                    message_id: message.message_id,
+                    created_at_ms: message.created_at_ms,
+                    agent_id: message.agent_id,
+                    workspace_id: message.workspace_id,
+                    source_id: message.source_id,
+                    role: message.role,
+                    chunk_idx: u8::try_from(chunk_idx)
+                        .expect("this finite fixture must fit the persisted chunk identifier"),
+                    content,
+                };
+                assert!(input.content.chars().count() <= WINDOW_CHARS);
+                inputs.push(input);
+            }
+            assert_eq!(covered_until, chars.len());
+            if windows == 0 {
+                assert!(
+                    unselected.is_empty(),
+                    "sequential windows must cover the entire raw message"
+                );
+            }
+            selections.push(json!({
+                "message_id": message.message_id, "raw_chars": chars.len(),
+                "selected_raw_char_spans": selected, "unselected_raw_char_spans": unselected,
+                "projection": "raw windows before production canonicalization",
+            }));
+        }
+        (inputs, selections)
+    }
+
+    fn token_counts(full: &Tokenizer, visible: &Tokenizer, text: &str) -> Result<(usize, usize)> {
+        let full = full
+            .encode(text, true)
+            .map_err(|error| anyhow::anyhow!("untruncated tokenization: {error}"))?;
+        let visible = visible
+            .encode(text, true)
+            .map_err(|error| anyhow::anyhow!("native-visible tokenization: {error}"))?;
+        assert!(visible.get_ids().len() <= NATIVE_MAX_TOKENS);
+        assert_eq!(
+            visible.get_ids().len(),
+            full.get_ids().len().min(NATIVE_MAX_TOKENS)
+        );
+        Ok((full.get_ids().len(), visible.get_ids().len()))
+    }
+
+    fn cosine(left: &[f32], right: &[f32]) -> f64 {
+        assert_eq!(left.len(), right.len());
+        let dot: f64 = left
+            .iter()
+            .zip(right)
+            .map(|(&a, &b)| f64::from(a) * f64::from(b))
+            .sum();
+        let left_norm: f64 = left.iter().map(|&v| f64::from(v).powi(2)).sum();
+        let right_norm: f64 = right.iter().map(|&v| f64::from(v).powi(2)).sum();
+        assert!(left_norm > 0.0 && right_norm > 0.0);
+        let score = dot / (left_norm * right_norm).sqrt();
+        assert!(score.is_finite());
+        score
+    }
+
+    /// This is a representation experiment, not the hydrated query pipeline or
+    /// a retrieval/performance certification. Every rank, including losses and
+    /// the no-relevant-message control, is retained for independent review.
+    #[test]
+    #[ignore = "requires CASS_NATIVE_REUSE_MODEL_DIR with the attested five-file MiniLM bundle; never downloads"]
+    fn gh470_native_long_message_representation_measurements() -> Result<()> {
+        let data = tempfile::tempdir()?;
+        let (manifest, model_dir, copy_ms) = copy_attested_model(data.path())?;
+        // tokenizer.json has historical truncation/padding defaults. Match the
+        // pinned native backend explicitly, and separately count untruncated IDs.
+        let mut full_tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
+            .map_err(|error| anyhow::anyhow!("load attested tokenizer: {error}"))?;
+        full_tokenizer
+            .with_truncation(None)
+            .map_err(|error| anyhow::anyhow!("disable tokenizer truncation: {error}"))?;
+        full_tokenizer.with_padding(None);
+        let mut visible_tokenizer = full_tokenizer.clone();
+        visible_tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: NATIVE_MAX_TOKENS,
+                ..Default::default()
+            }))
+            .map_err(|error| anyhow::anyhow!("configure native tokenizer limit: {error}"))?;
+        visible_tokenizer.with_padding(None);
+        let (messages, queries) = corpus();
+        // This uncapped view is an oracle for fixture placement only. Candidate
+        // projection never consumes it or inherits its fenced-code collapse.
+        let uncapped = DefaultCanonicalizer {
+            max_length: usize::MAX,
+            ..Default::default()
+        };
+        let full: Vec<_> = messages
+            .iter()
+            .map(|m| uncapped.canonicalize(&m.content))
+            .collect();
+        let mut loss_placement = Vec::new();
+        for query in &queries {
+            if let (Some(target), Some(evidence)) = (query.target, query.evidence) {
+                let ordinal = messages
+                    .iter()
+                    .position(|m| m.message_id == target)
+                    .context("target")?;
+                let raw = &messages[ordinal].content;
+                let raw_offset = raw.find(evidence).context("raw evidence")?;
+                let raw_char_offset = raw[..raw_offset].chars().count();
+                assert!(raw_char_offset > MAX_EMBED_CHARS);
+                let canonical_char_offset = full[ordinal]
+                    .find(evidence)
+                    .map(|offset| full[ordinal][..offset].chars().count());
+                if query.name == "long_code" {
+                    assert!(raw.starts_with("```rust\n") && raw.lines().count() > 30);
+                    assert!(
+                        canonical_char_offset.is_none(),
+                        "fenced-code collapse must remove the middle evidence before the character cap"
+                    );
+                } else {
+                    assert!(
+                        canonical_char_offset.context("late canonical evidence")? > MAX_EMBED_CHARS
+                    );
+                }
+                assert!(!canonicalize_for_embedding(&messages[ordinal].content).contains(evidence));
+                loss_placement.push(json!({
+                    "query": query.name, "evidence": evidence,
+                    "raw_char_offset": raw_char_offset,
+                    "uncapped_canonical_char_offset": canonical_char_offset,
+                    "loss_stage": if query.name == "long_code" { "fenced_code_collapse" } else { "canonical_character_cap" },
+                }));
+            }
+        }
+        // An 800-character window is not a 512-token bound. The attested
+        // tokenizer splits this known Chinese character into individual tokens,
+        // hiding the English resolution even though it is in the selected tail.
+        assert_eq!(messages.len(), 19);
+        let dense = messages.last().context("appended token-density control")?;
+        assert_eq!(dense.message_id, 19);
+        let dense_character_id = full_tokenizer
+            .token_to_id("中")
+            .context("token-density control must use a known Chinese vocabulary entry")?;
+        let dense_character = full_tokenizer
+            .encode("中", false)
+            .map_err(|error| anyhow::anyhow!("tokenize density-control character: {error}"))?;
+        assert_eq!(dense_character.get_ids(), &[dense_character_id]);
+        let dense_chars: Vec<_> = dense.content.chars().collect();
+        assert!(dense_chars.len() >= 800);
+        let old_tail: String = dense_chars[dense_chars.len() - 800..].iter().collect();
+        let canonical_tail = canonicalize_for_embedding(&old_tail);
+        let evidence_byte_offset = canonical_tail
+            .find("Red-black")
+            .context("800-character tail must contain the English evidence before tokenization")?;
+        let (old_tail_tokens, old_tail_visible_tokens) =
+            token_counts(&full_tokenizer, &visible_tokenizer, &canonical_tail)?;
+        assert!(old_tail_tokens > NATIVE_MAX_TOKENS);
+        assert_eq!(old_tail_visible_tokens, NATIVE_MAX_TOKENS);
+        let old_tail_visible = visible_tokenizer
+            .encode(canonical_tail.as_str(), true)
+            .map_err(|error| anyhow::anyhow!("tokenize truncated 800-character tail: {error}"))?;
+        let visible_end = old_tail_visible
+            .get_offsets()
+            .iter()
+            .zip(old_tail_visible.get_special_tokens_mask())
+            .filter_map(|(&(start, end), &special)| (special == 0 && start < end).then_some(end))
+            .max()
+            .context("native-visible tail must contain non-special tokens")?;
+        assert!(
+            visible_end < evidence_byte_offset,
+            "the old 800-character tail must lose all English evidence at the native token cap"
+        );
+        let old_tail_token_loss = json!({
+            "message_id": dense.message_id, "selected_raw_tail_chars": 800,
+            "canonical_tail_chars": canonical_tail.chars().count(),
+            "untruncated_tokens_including_specials": old_tail_tokens,
+            "native_visible_tokens_including_specials": old_tail_visible_tokens,
+            "canonical_evidence_byte_offset": evidence_byte_offset,
+            "native_visible_end_byte_offset": visible_end,
+            "native_visible_end_char_offset": canonical_tail
+                .get(..visible_end).context("native offsets must bound valid UTF-8")?.chars().count(),
+            "loss_stage": "native_token_cap_after_800_character_tail_selection",
+        });
+        let (head_tail, _) = representation(&messages, 2);
+        assert!(
+            head_tail
+                .iter()
+                .filter(|m| m.message_id == 2)
+                .all(|m| !m.content.contains("Tarjan")),
+            "middle-only control must defeat head/tail selection"
+        );
+        let query_tokens: Vec<_> = queries
+            .iter()
+            .map(|query| {
+                let canonical = canonicalize_for_embedding(query.text);
+                let (full, visible) =
+                    token_counts(&full_tokenizer, &visible_tokenizer, &canonical)?;
+                Ok(
+                    json!({"query": query.name, "canonical_chars": canonical.chars().count(),
+                    "untruncated_tokens_including_specials": full,
+                    "native_visible_tokens_including_specials": visible}),
+                )
+            })
+            .collect::<Result<_>>()?;
+        let query_constructor_started = Instant::now();
+        let query_model = FastEmbedder::load_from_dir(&model_dir)?;
+        let query_constructor_ms = query_constructor_started.elapsed().as_secs_f64() * 1000.0;
+        assert!(query_model.is_semantic());
+        assert_eq!(query_model.id(), "minilm-384");
+        let query_started = Instant::now();
+        let query_vectors: Vec<_> = queries
+            .iter()
+            .map(|q| query_model.embed_sync(&canonicalize_for_embedding(q.text)))
+            .collect::<std::result::Result<_, _>>()?;
+        let query_embedding_ms = query_started.elapsed().as_secs_f64() * 1000.0;
+        drop(query_model);
+        let document_constructor_started = Instant::now();
+        let indexer = SemanticIndexer::new("minilm", Some(data.path()))?.with_batch_size(1)?;
+        let document_constructor_ms = document_constructor_started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(indexer.embedder_id(), "minilm-384");
+        assert_eq!(indexer.embedder_dimension(), 384);
+        let mut baseline_chars = 0;
+        let mut baseline_bytes = 0;
+        let mut baseline_tokens = 0;
+        let mut baseline_short_vectors = BTreeMap::new();
+        for (name, windows) in [
+            ("legacy_prefix", 1),
+            ("head_tail", 2),
+            ("distributed_windows", MAX_WINDOWS),
+            ("distributed_eight", 8),
+            ("sequential_full_coverage", 0),
+        ] {
+            let preparation_started = Instant::now();
+            let (inputs, selected_spans) = representation(&messages, windows);
+            let window_limit = if windows == 0 {
+                messages
+                    .iter()
+                    .map(|m| m.content.chars().count().div_ceil(WINDOW_CHARS))
+                    .max()
+                    .context("nonempty corpus")?
+            } else {
+                windows
+            };
+            assert!(inputs.len() <= messages.len() * window_limit);
+            let expected: BTreeMap<_, _> = inputs
+                .iter()
+                .map(|m| ((m.message_id, m.chunk_idx), identity(m)))
+                .collect();
+            assert_eq!(expected.len(), inputs.len());
+            let canonical_inputs: Vec<_> = inputs
+                .iter()
+                .map(|m| canonicalize_for_embedding(&m.content))
+                .collect();
+            let input_chars: usize = canonical_inputs
+                .iter()
+                .map(|text| text.chars().count())
+                .sum();
+            let mut input_tokens = 0;
+            let mut visible_tokens = 0;
+            let mut input_measurements = Vec::new();
+            for (input, canonical) in inputs.iter().zip(&canonical_inputs) {
+                let (full_count, visible_count) =
+                    token_counts(&full_tokenizer, &visible_tokenizer, canonical)?;
+                input_tokens += full_count;
+                visible_tokens += visible_count;
+                if windows != 1 && input.content.chars().count() <= WINDOW_CHARS {
+                    assert_eq!(
+                        full_count, visible_count,
+                        "this fixture's candidate window must fit the real native tokenizer"
+                    );
+                }
+                let retained_evidence: Vec<_> = queries
+                    .iter()
+                    .filter(|q| q.target == Some(input.message_id))
+                    .filter_map(|q| q.evidence.filter(|evidence| canonical.contains(*evidence)))
+                    .collect();
+                input_measurements.push(json!({
+                    "message_id": input.message_id, "chunk_idx": input.chunk_idx,
+                    "canonical_chars": canonical.chars().count(),
+                    "untruncated_tokens_including_specials": full_count,
+                    "native_visible_tokens_including_specials": visible_count,
+                    "evidence_in_canonical_input": retained_evidence,
+                }));
+            }
+            let preparation_ms = preparation_started.elapsed().as_secs_f64() * 1000.0;
+            let embedding_started = Instant::now();
+            let embedded = indexer.embed_messages(&inputs)?;
+            let embedding_ms = embedding_started.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(embedded.len(), inputs.len());
+            let index_started = Instant::now();
+            let output_dir = data.path().join(name);
+            let index = indexer.build_and_save_index(embedded, &output_dir)?;
+            let index_write_open_ms = index_started.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(index.embedder_revision(), MINILM_VECTOR_SPACE_REVISION);
+            let index_bytes =
+                fs::metadata(vector_index_path(&output_dir, indexer.embedder_id()))?.len();
+            assert_eq!(index.record_count(), inputs.len());
+            let mut vectors = Vec::new();
+            let mut seen = BTreeSet::new();
+            for ordinal in 0..index.record_count() {
+                assert!(!index.is_deleted(ordinal));
+                let metadata = parse_semantic_doc_id(index.doc_id_at(ordinal)?)
+                    .context("persisted source identity")?;
+                let key = (metadata.message_id, metadata.chunk_idx);
+                assert!(seen.insert(key));
+                assert_eq!(Some(&metadata), expected.get(&key));
+                let vector = index.vector_at_f32(ordinal)?;
+                assert_eq!(vector.len(), 384);
+                assert!(vector.iter().all(|v| v.is_finite()));
+                let authority = messages
+                    .iter()
+                    .find(|m| m.message_id == metadata.message_id)
+                    .context("vector must resolve to an authoritative fixture message")?;
+                let mut source_identity = identity(authority);
+                source_identity.chunk_idx = metadata.chunk_idx;
+                source_identity.content_hash = metadata.content_hash;
+                assert_eq!(metadata, source_identity);
+                if authority.content.chars().count() <= MAX_EMBED_CHARS {
+                    assert_eq!(metadata.chunk_idx, 0);
+                    let bits: Vec<_> = vector.iter().map(|value| value.to_bits()).collect();
+                    if windows == 1 {
+                        baseline_short_vectors.insert(metadata.message_id, bits);
+                    } else {
+                        assert_eq!(
+                            Some(&bits),
+                            baseline_short_vectors.get(&metadata.message_id)
+                        );
+                    }
+                }
+                vectors.push((metadata.message_id, vector));
+            }
+            assert_eq!(seen.len(), expected.len());
+            let ranking_started = Instant::now();
+            let mut retrieval = Vec::new();
+            for (query, vector) in queries.iter().zip(&query_vectors) {
+                let mut collapsed = BTreeMap::<u64, f64>::new();
+                for (message_id, candidate) in &vectors {
+                    let score = cosine(vector, candidate);
+                    collapsed
+                        .entry(*message_id)
+                        .and_modify(|best| *best = best.max(score))
+                        .or_insert(score);
+                }
+                assert_eq!(collapsed.len(), messages.len());
+                let mut ranked: Vec<_> = collapsed.into_iter().collect();
+                ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+                let rank = query.target.and_then(|id| {
+                    ranked
+                        .iter()
+                        .position(|(candidate, _)| *candidate == id)
+                        .map(|i| i + 1)
+                });
+                assert_eq!(rank.is_some(), query.target.is_some());
+                retrieval.push(json!({
+                    "query": query.name, "text": query.text, "target_message_id": query.target,
+                    "target_rank": rank, "recall_at_1": rank.map(|r| u8::from(r <= 1)),
+                    "target_cosine": query.target.and_then(|id| ranked.iter().find(|(candidate, _)| *candidate == id).map(|(_, score)| *score)),
+                    "recall_at_3": rank.map(|r| u8::from(r <= 3)),
+                    "recall_at_5": rank.map(|r| u8::from(r <= 5)),
+                    "top_five": ranked.iter().take(5).collect::<Vec<_>>(),
+                }));
+            }
+            let ranking_ms = ranking_started.elapsed().as_secs_f64() * 1000.0;
+            if windows == 1 {
+                baseline_chars = input_chars;
+                baseline_bytes = index_bytes;
+                baseline_tokens = visible_tokens;
+            }
+            println!(
+                "GH470_MEASUREMENT {}",
+                json!({
+                    "corpus_revision": CORPUS_REVISION, "query_count": queries.len(),
+                    "representation": name, "max_windows_per_message_for_this_corpus": window_limit,
+                    "candidate_window_chars": WINDOW_CHARS, "authoritative_messages": messages.len(),
+                    "stored_vectors": inputs.len(), "vector_multiplier": inputs.len() as f64 / messages.len() as f64,
+                    "canonical_input_chars": input_chars, "input_character_multiplier": input_chars as f64 / baseline_chars as f64,
+                    "untruncated_input_tokens_including_specials": input_tokens,
+                    "native_visible_input_tokens_including_specials": visible_tokens,
+                    "native_visible_token_multiplier": visible_tokens as f64 / baseline_tokens as f64,
+                    "fsvi_file_bytes": index_bytes, "fsvi_file_byte_multiplier": index_bytes as f64 / baseline_bytes as f64,
+                    "projection_and_diagnostic_preparation_ms": preparation_ms, "document_embedding_ms": embedding_ms,
+                    "index_write_and_open_ms": index_write_open_ms, "exhaustive_cosine_ranking_ms": ranking_ms,
+                    "retrieval": retrieval,
+                    "raw_span_selections": selected_spans, "inputs": input_measurements,
+                })
+            );
+        }
+        println!(
+            "GH470_SCOPE {}",
+            json!({
+                "corpus_revision": CORPUS_REVISION, "authoritative_messages": messages.len(),
+                "query_count": queries.len(), "original_message_id_range_unchanged": [1, 18],
+                "appended_message_id": 19,
+                "comparison_scope": "all multipliers and rankings use this 19-message corpus only; do not pool with the prior 18-message experiment",
+                "model": manifest.id, "manifest_revision": manifest.revision,
+                "vector_space_revision": MINILM_VECTOR_SPACE_REVISION, "dimension": 384,
+                "model_files": manifest.files.iter().map(|f| json!({"name": f.name, "sha256": f.sha256, "bytes": f.size})).collect::<Vec<_>>(),
+                "verified_bundle_copy_ms": copy_ms, "query_model_constructor_ms": query_constructor_ms,
+                "document_model_constructor_ms": document_constructor_ms, "query_embedding_ms": query_embedding_ms,
+                "constructors": 2, "document_batch_size": 1, "quantization": "f16",
+                "native_max_tokens_including_specials": NATIVE_MAX_TOKENS,
+                "candidate_window_chars": WINDOW_CHARS,
+                "query_token_measurements": query_tokens,
+                "fixture_loss_placement": loss_placement,
+                "old_800_character_tail_token_loss": old_tail_token_loss,
+                "authoritative_fixture_messages": messages.iter().zip(&full).map(|(m, canonical)| json!({
+                    "message_id": m.message_id, "source_id": m.source_id,
+                    "workspace_id": m.workspace_id, "agent_id": m.agent_id,
+                    "created_at_ms": m.created_at_ms, "role": m.role,
+                    "raw_content_sha256": content_hash(&m.content),
+                    "raw_chars": m.content.chars().count(), "uncapped_canonical_chars": canonical.chars().count(),
+                })).collect::<Vec<_>>(),
+                "scoring": "exhaustive cosine over persisted F16-expanded native vectors; maximum per message",
+                "limits": "fixed-order single observations; sampled windows may miss evidence; 510-character token bounds are checked for this corpus only; no SQLite hydration, ANN, whole-query latency, RSS bound, or speedup certification",
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CASS_NATIVE_REUSE_MODEL_DIR with the attested five-file MiniLM bundle; never downloads"]
+    fn gh470_native_backfill_hydrates_passages_without_duplicate_messages() -> Result<()> {
+        use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
+        use coding_agent_search::model::types::{
+            Agent, AgentKind, Conversation, Message, MessageRole,
+        };
+        use coding_agent_search::search::query::{FieldMask, SearchClient, SearchFilters};
+        use coding_agent_search::search::semantic_manifest::SemanticManifest;
+        use coding_agent_search::search::vector_index::{
+            SemanticFilterMaps, SemanticIndexArtifact,
+        };
+        use coding_agent_search::storage::sqlite::FrankenStorage;
+        use std::sync::Arc;
+
+        let temp = tempfile::tempdir()?;
+        let data_dir = temp.path().join("data");
+        let db_path = temp.path().join("archive.db");
+        let (_, model_dir, _) = copy_attested_model(&data_dir)?;
+        let (messages, queries) = corpus();
+        let storage = FrankenStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let workspace = temp.path().join("workspace");
+        let workspace_id = storage.ensure_workspace(&workspace, None)?;
+        let mut paths = Vec::new();
+        for message in &messages {
+            let path = temp
+                .path()
+                .join(format!("message-{}.jsonl", message.message_id));
+            paths.push(path.to_string_lossy().into_owned());
+            storage.insert_conversation_tree(
+                agent_id,
+                Some(workspace_id),
+                &Conversation {
+                    id: None,
+                    agent_slug: "codex".into(),
+                    workspace: Some(workspace.clone()),
+                    external_id: Some(format!("gh470-{}", message.message_id)),
+                    title: Some(format!("source {}", message.message_id)),
+                    source_path: path,
+                    started_at: Some(message.created_at_ms),
+                    ended_at: Some(message.created_at_ms),
+                    approx_tokens: None,
+                    metadata_json: json!({}),
+                    messages: vec![Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: Some(message.created_at_ms),
+                        content: message.content.clone(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    }],
+                    source_id: "local".into(),
+                    origin_host: None,
+                },
+            )?;
+        }
+        let rows: Vec<(i64, i64, String)> = storage.raw().query_map_collect(
+            "SELECT id, conversation_id, content FROM messages ORDER BY id",
+            &[],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+        )?;
+        assert_eq!(rows.len(), messages.len());
+        for (row, message) in rows.iter().zip(&messages) {
+            assert_eq!(row.2, message.content);
+        }
+        drop(storage);
+
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home)?;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(home.join(".env"))?;
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        command.env_clear().current_dir(&home);
+        for key in ["PATH", "SystemRoot", "WINDIR"] {
+            if let Ok(value) = dotenvy::var(key) {
+                command.env(key, value);
+            }
+        }
+        command
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("CASS_DATA_DIR", &data_dir)
+            .env("TUI_HEADLESS", "1")
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CASS_RESPONSIVENESS_DISABLE", "1")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("RUST_MIN_STACK", "134217728")
+            .arg("--db")
+            .arg(&db_path)
+            .args([
+                "models",
+                "backfill",
+                "--tier",
+                "quality",
+                "--embedder",
+                "minilm",
+                "--batch-conversations",
+                "19",
+                "--max-batches",
+                "1",
+                "--json",
+                "--data-dir",
+            ])
+            .arg(&data_dir);
+        let output = assert_cmd::Command::from_std(command)
+            .timeout(std::time::Duration::from_secs(1200))
+            .output()?;
+        assert!(
+            output.status.success(),
+            "stdout={}; stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(report["status"], "published", "{report}");
+        let manifest = SemanticManifest::load(&data_dir)?.context("published manifest")?;
+        let tier = manifest.quality_tier.context("quality artifact")?;
+        assert!(tier.ready);
+        assert_eq!((tier.doc_count, tier.conversation_count), (44, 19));
+
+        let storage = FrankenStorage::open_readonly(&db_path)?;
+        let filters = SemanticFilterMaps::from_storage(&storage)?;
+        let artifact =
+            SemanticIndexArtifact::open(vector_index_path(&data_dir, "minilm-384"), None)?;
+        assert_eq!(
+            artifact.index().embedder_revision(),
+            MINILM_VECTOR_SPACE_REVISION
+        );
+        let mut chunk_counts = BTreeMap::<u64, BTreeSet<u8>>::new();
+        for ordinal in 0..artifact.index().record_count() {
+            let id = parse_semantic_doc_id(artifact.index().doc_id_at(ordinal)?)
+                .context("canonical passage identity")?;
+            let row = rows
+                .iter()
+                .find(|row| u64::try_from(row.0).ok() == Some(id.message_id))
+                .context("passage must resolve to a stored message")?;
+            let passages = embedding_passages(&row.2);
+            assert_eq!(
+                id.content_hash,
+                Some(content_hash(&canonicalize_for_embedding(
+                    passages[usize::from(id.chunk_idx)]
+                )))
+            );
+            assert!(
+                chunk_counts
+                    .entry(id.message_id)
+                    .or_default()
+                    .insert(id.chunk_idx)
+            );
+        }
+        assert_eq!(chunk_counts.len(), 19);
+        for row in &rows {
+            assert_eq!(
+                chunk_counts[&u64::try_from(row.0)?].len(),
+                embedding_passages(&row.2).len()
+            );
+        }
+        drop(storage);
+        let client = SearchClient::open(&data_dir.join("lexical"), Some(&db_path))?
+            .context("archive-backed query client")?;
+        client.set_semantic_context(
+            Arc::new(FastEmbedder::load_from_dir(&model_dir)?),
+            artifact,
+            None,
+            filters,
+            None,
+        )?;
+        let mut retrieval = Vec::new();
+        for query in &queries {
+            let (hits, _) = client.search_semantic(
+                query.text,
+                SearchFilters::default(),
+                19,
+                0,
+                FieldMask::FULL,
+                false,
+            )?;
+            let unique = hits
+                .iter()
+                .map(|hit| hit.conversation_id)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                unique.len(),
+                hits.len(),
+                "one public hit per canonical message"
+            );
+            for hit in &hits {
+                let ordinal = paths
+                    .iter()
+                    .position(|path| path == &hit.source_path)
+                    .context("source path")?;
+                assert_eq!(hit.content, rows[ordinal].2);
+                assert_eq!(hit.conversation_id, Some(rows[ordinal].1));
+                assert_eq!(hit.agent, "codex");
+                assert_eq!(hit.workspace, workspace.to_string_lossy());
+                assert_eq!(hit.created_at, Some(messages[ordinal].created_at_ms));
+                assert_eq!(hit.source_id, "local");
+                assert_eq!(hit.line_number, Some(1));
+            }
+            if let Some(target) = query.target {
+                let path = &paths[usize::try_from(target - 1)?];
+                let rank = hits
+                    .iter()
+                    .position(|hit| &hit.source_path == path)
+                    .context("known-relevant source retrieved")?
+                    + 1;
+                assert!(rank <= 3, "{}: rank={rank}", query.name);
+                let restricted = SearchFilters {
+                    session_paths: [path.clone()].into_iter().collect(),
+                    ..Default::default()
+                };
+                let (filtered, _) =
+                    client.search_semantic(query.text, restricted, 1, 0, FieldMask::FULL, false)?;
+                assert_eq!(filtered.len(), 1);
+                assert_eq!(&filtered[0].source_path, path);
+                retrieval.push(json!({"query":query.name,"rank":rank,"source_path":path}));
+            }
+            let (page, _) = client.search_semantic(
+                query.text,
+                SearchFilters::default(),
+                2,
+                1,
+                FieldMask::FULL,
+                false,
+            )?;
+            assert_eq!(
+                page.iter().map(|hit| &hit.source_path).collect::<Vec<_>>(),
+                hits.iter()
+                    .skip(1)
+                    .take(2)
+                    .map(|hit| &hit.source_path)
+                    .collect::<Vec<_>>()
+            );
+        }
+        println!(
+            "GH470_HYDRATION {}",
+            json!({"corpus_revision":CORPUS_REVISION,
+                "authoritative_messages":19,"stored_vectors":44,"backfill":report,"retrieval":retrieval,
+                "limits":"real CLI backfill and native exact search with SQLite hydration; no ANN or performance certification"})
+        );
+        Ok(())
+    }
+}
