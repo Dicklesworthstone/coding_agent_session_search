@@ -117238,6 +117238,33 @@ fn gather_source_sync_evidence(
     }
 }
 
+fn sources_sync_will_reindex(
+    no_index: bool,
+    dry_run: bool,
+    total_files: u64,
+    total_bytes: u64,
+) -> bool {
+    !no_index && !dry_run && (total_files > 0 || total_bytes > 0)
+}
+
+#[cfg(test)]
+mod sources_sync_reindex_tests {
+    use super::sources_sync_will_reindex;
+
+    #[test]
+    fn transferred_files_or_payload_bytes_require_indexing_unless_disabled() {
+        for (files, bytes) in [(252, 73_703_557), (1, 0), (0, 16)] {
+            assert!(sources_sync_will_reindex(false, false, files, bytes));
+            assert!(!sources_sync_will_reindex(true, false, files, bytes));
+            assert!(!sources_sync_will_reindex(false, true, files, bytes));
+            assert!(!sources_sync_will_reindex(true, true, files, bytes));
+        }
+        for (no_index, dry_run) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert!(!sources_sync_will_reindex(no_index, dry_run, 0, 0));
+        }
+    }
+}
+
 /// Sync sessions from remote sources (P5.5)
 fn run_sources_sync(
     source_filter: Option<Vec<String>>,
@@ -117519,7 +117546,7 @@ fn run_sources_sync(
         } else {
             for result in &report.path_results {
                 if result.success {
-                    if verbose || result.files_transferred > 0 {
+                    if verbose || result.files_transferred > 0 || result.bytes_transferred > 0 {
                         println!(
                             "  {}: {} files ({} bytes)",
                             result.remote_path.dimmed(),
@@ -117606,8 +117633,12 @@ fn run_sources_sync(
 
     // Capture nested indexing so structured sync emits one final document,
     // including failure, rather than a premature success plus a second JSON.
+    // Empty files count as changes too; payload bytes remain useful evidence if
+    // a client's file-count statistic is unavailable. Reuse this exact decision
+    // in the JSON summary so the advertised action matches the executed branch.
+    let will_reindex = sources_sync_will_reindex(no_index, dry_run, total_files, total_bytes);
     let mut indexing_result = None;
-    let indexing = if !no_index && !dry_run && total_files > 0 {
+    let indexing = if will_reindex {
         if !is_robot {
             println!(
                 "{} {} new files...",
@@ -117660,7 +117691,7 @@ fn run_sources_sync(
             "sources_fully_failed": sources_fully_failed,
             "total_files": total_files,
             "total_bytes": total_bytes,
-            "will_reindex": !no_index && !dry_run && total_files > 0,
+            "will_reindex": will_reindex,
         });
         if let Some(result) = indexing_result {
             payload["indexing"] = result;

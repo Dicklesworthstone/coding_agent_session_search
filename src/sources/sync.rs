@@ -2566,9 +2566,10 @@ fn parse_rsync_stats(output: &str) -> RsyncStats {
     for line in output.lines() {
         let line = line.trim();
 
-        // Parse "Number of regular files transferred: N"
-        if line.starts_with("Number of regular files transferred:")
-            && let Some(num_str) = line.split(':').nth(1)
+        // GNU rsync includes "regular"; the local openrsync client omits it.
+        if let Some(num_str) = line
+            .strip_prefix("Number of regular files transferred:")
+            .or_else(|| line.strip_prefix("Number of files transferred:"))
         {
             stats.files_transferred = num_str.trim().replace(',', "").parse().unwrap_or(0);
         }
@@ -3694,6 +3695,135 @@ Total transferred file size: 1,234 bytes
         let stats = parse_rsync_stats("");
         assert_eq!(stats.files_transferred, 0);
         assert_eq!(stats.bytes_transferred, 0);
+    }
+
+    #[test]
+    fn test_parse_rsync_stats_openrsync_reported_output() {
+        // Captured local macOS output from GH468, not a live macOS execution.
+        let output = "Number of files: 3\nNumber of files transferred: 2\n\
+                      Total file size: 16 B\nTotal transferred file size: 16 B\n\
+                      Total sent: 231 B\nTotal received: 70 B\n";
+        let stats = parse_rsync_stats(output);
+        assert_eq!((stats.files_transferred, stats.bytes_transferred), (2, 16));
+
+        // Also preserve the reporter's full sync scale and persisted counters.
+        let stats = parse_rsync_stats(
+            "Number of files transferred: 252\nTotal transferred file size: 73,703,557 B\n",
+        );
+        let mut report = SyncReport::new("gh468", SyncMethod::Rsync);
+        report.add_path_result(PathSyncResult {
+            files_transferred: stats.files_transferred,
+            bytes_transferred: stats.bytes_transferred,
+            success: true,
+            ..Default::default()
+        });
+        let temp = TempDir::new().expect("status tempdir");
+        let mut status = SyncStatus::default();
+        status.update("gh468", &report);
+        status.save(temp.path()).expect("save sync counters");
+        let loaded = SyncStatus::load(temp.path()).expect("reload sync counters");
+        assert_eq!(loaded.sources["gh468"].files_synced, 252);
+        assert_eq!(loaded.sources["gh468"].bytes_transferred, 73_703_557);
+    }
+
+    #[test]
+    fn test_parse_rsync_stats_variants_empty_files_and_invalid_counts() {
+        for label in [
+            "Number of regular files transferred:",
+            "Number of files transferred:",
+        ] {
+            for (value, expected) in [
+                ("0", 0),
+                ("1", 1),
+                ("1,234", 1234),
+                ("", 0),
+                ("unknown", 0),
+                ("-1", 0),
+                ("18446744073709551616", 0),
+            ] {
+                let output = format!(
+                    "Number of files: 9000\n {label} {value}\n\
+                     Total file size: 999 bytes\nTotal transferred file size: 0 B\n\
+                     Total sent: 200 B\nTotal received: 100 B\n"
+                );
+                let stats = parse_rsync_stats(&output);
+                assert_eq!(stats.files_transferred, expected, "{output}");
+                assert_eq!(stats.bytes_transferred, 0, "{output}");
+            }
+        }
+        for output in [
+            "Number of files: 252\nTotal file size: 73,703,557 B\n",
+            "Number of files transferred unexpectedly: 252\n",
+            "Total transferred file size: unknown bytes\n",
+            "Total transferred file size: 18446744073709551616 B\n",
+        ] {
+            let stats = parse_rsync_stats(output);
+            assert_eq!((stats.files_transferred, stats.bytes_transferred), (0, 0));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a real rsync executable"]
+    fn test_parse_rsync_stats_real_transfers_and_noop() {
+        let temp = TempDir::new().expect("rsync tempdir");
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        std::fs::create_dir_all(&source).expect("source directory");
+        std::fs::create_dir_all(&destination).expect("destination directory");
+        std::fs::write(source.join("first.txt"), b"first\n").expect("first source");
+        std::fs::write(source.join("second.txt"), b"second\n").expect("second source");
+        let transfer = || {
+            let output = assert_cmd::Command::new("rsync")
+                .args(["-a", "--stats"])
+                .arg(format!("{}/", source.display()))
+                .arg(&destination)
+                .env("LC_ALL", "C")
+                .timeout(std::time::Duration::from_secs(30))
+                .output()
+                .expect("execute real rsync");
+            assert!(
+                output.status.success(),
+                "rsync failed: {:?}\nstdout={}\nstderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            parse_rsync_stats(&String::from_utf8(output.stdout).expect("rsync UTF-8 stats"))
+        };
+
+        let first = transfer();
+        assert_eq!((first.files_transferred, first.bytes_transferred), (2, 13));
+        assert_eq!(
+            std::fs::read(destination.join("first.txt")).unwrap(),
+            b"first\n"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("second.txt")).unwrap(),
+            b"second\n"
+        );
+        let unchanged = transfer();
+        assert_eq!(
+            (unchanged.files_transferred, unchanged.bytes_transferred),
+            (0, 0)
+        );
+
+        std::fs::write(source.join("empty.jsonl"), b"").expect("empty source");
+        let empty_file = transfer();
+        assert_eq!(
+            (empty_file.files_transferred, empty_file.bytes_transferred),
+            (1, 0)
+        );
+        assert_eq!(
+            std::fs::metadata(destination.join("empty.jsonl"))
+                .unwrap()
+                .len(),
+            0
+        );
+        let unchanged = transfer();
+        assert_eq!(
+            (unchanged.files_transferred, unchanged.bytes_transferred),
+            (0, 0)
+        );
     }
 
     #[test]

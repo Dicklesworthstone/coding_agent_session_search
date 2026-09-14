@@ -567,7 +567,7 @@ fn test_list_remote_files() {
     );
 }
 
-/// Integration test: Check rsync stats parsing.
+/// GH468: real rsync/SSH counters must drive the public indexing contract.
 #[test]
 #[ignore = "requires Docker"]
 fn test_rsync_stats_parsing() {
@@ -576,29 +576,141 @@ fn test_rsync_stats_parsing() {
     let server = SshTestServer::start().expect("SSH server should start");
     let tmp = tempfile::TempDir::new().unwrap();
 
-    let ssh_opts = server.rsync_ssh_opts();
-    let remote_path = format!("{}:/root/.claude/", server.ssh_target());
+    let home_dir = tmp.path().join("home");
+    let config_dir = tmp.path().join("config");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(home_dir.join(".ssh")).expect("ssh directory");
+    std::fs::create_dir_all(config_dir.join("cass")).expect("config directory");
+    std::fs::create_dir_all(&data_dir).expect("data directory");
+    let ssh_config_path = home_dir.join(".ssh/config");
+    let known_hosts_path = home_dir.join(".ssh/known_hosts");
+    std::fs::write(
+        &ssh_config_path,
+        format!(
+            "Host cass-stats\n  HostName 127.0.0.1\n  User root\n  Port {}\n  IdentityFile {}\n  IdentitiesOnly yes\n  HostKeyAlias cass-stats\n  UserKnownHostsFile {}\n",
+            server.port(),
+            server.private_key_path().display(),
+            known_hosts_path.display()
+        ),
+    )
+    .expect("write ssh config");
+    write_known_hosts_for_test_server(&known_hosts_path, &server, "cass-stats");
+    std::fs::write(
+        config_dir.join("cass/sources.toml"),
+        "[[sources]]\nname = \"cass-stats\"\ntype = \"ssh\"\n\
+         host = \"root@cass-stats\"\n\
+         paths = [\"/root/.claude/projects/gh468\"]\nsync_schedule = \"manual\"\n",
+    )
+    .expect("write source config");
+    let session = "{\"type\":\"user\",\"message\":{\"content\":\"gh468searchmarker\"}}\n";
+    server
+        .ssh_exec_with_stdin(&format!(
+            "mkdir -p /root/.claude/projects/gh468\n\
+             cat > /root/.claude/projects/gh468/session.jsonl <<'SESSION'\n\
+             {session}SESSION\n"
+        ))
+        .expect("write real remote session");
 
-    let output = std::process::Command::new("rsync")
-        .args([
-            "-avz",
-            "--stats",
-            "-e",
-            &ssh_opts,
-            &remote_path,
-            tmp.path().to_str().unwrap(),
-        ])
-        .output()
-        .expect("rsync should execute");
+    let run = |args: &[&str]| {
+        let output = cargo_bin_cmd!("cass")
+            .args(args)
+            .current_dir(&home_dir)
+            .env("HOME", &home_dir)
+            .env("XDG_CONFIG_HOME", &config_dir)
+            .env("XDG_DATA_HOME", &data_dir)
+            .env("CASS_DATA_DIR", &data_dir)
+            .env("CASS_SSH_CONFIG", &ssh_config_path)
+            .env("LC_ALL", "C")
+            .timeout(std::time::Duration::from_secs(180))
+            .output()
+            .expect("execute real cass CLI");
+        assert!(
+            output.status.success(),
+            "cass {args:?}: {:?}\nstdout={}\nstderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "cass {args:?} invalid JSON: {error}\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+    };
+    let assert_sync = |payload: &serde_json::Value, files: u64, bytes: u64, indexed: bool| {
+        assert_eq!(payload["status"], "complete", "{payload}");
+        assert_eq!(payload["total_files"], files, "{payload}");
+        assert_eq!(payload["total_bytes"], bytes, "{payload}");
+        assert_eq!(payload["will_reindex"], indexed, "{payload}");
+        assert_eq!(payload.get("indexing").is_some(), indexed, "{payload}");
+        assert_eq!(payload["sources"][0]["total_files"], files, "{payload}");
+        assert_eq!(
+            payload["sources"][0]["paths"][0]["files"], files,
+            "{payload}"
+        );
+        assert_eq!(
+            payload["sources"][0]["paths"][0]["bytes"], bytes,
+            "{payload}"
+        );
+    };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Verify stats are present in output
-    assert!(
-        stdout.contains("Number of") || stdout.contains("files transferred"),
-        "rsync output should contain stats: {}",
-        stdout
+    let first = run(&["sources", "sync", "--json", "--no-index"]);
+    assert_sync(&first, 1, session.len() as u64, false);
+    assert_eq!(first["sources"][0]["method"], "rsync", "{first}");
+    let saved = coding_agent_search::sources::sync::SyncStatus::load(&data_dir)
+        .expect("read actual saved sync status");
+    assert_eq!(saved.sources["cass-stats"].files_synced, 1);
+    assert_eq!(
+        saved.sources["cass-stats"].bytes_transferred,
+        session.len() as u64
     );
+    // The configured directory has no trailing slash, so rsync retains its
+    // basename inside the per-source path container.
+    let mirror = data_dir
+        .join("remotes/cass-stats/mirror")
+        .join(coding_agent_search::sources::sync::path_to_safe_dirname(
+            "/root/.claude/projects/gh468",
+        ))
+        .join("gh468");
+    assert_eq!(
+        std::fs::read_to_string(mirror.join("session.jsonl")).expect("transferred session"),
+        session
+    );
+    assert!(!data_dir.join("agent_search.db").exists());
+    let unchanged = run(&["sources", "sync", "--json"]);
+    assert_sync(&unchanged, 0, 0, false);
+    assert!(!data_dir.join("agent_search.db").exists());
+
+    server
+        .ssh_exec("touch /root/.claude/projects/gh468/empty.jsonl")
+        .expect("add zero-byte file on real server");
+    let status_before = std::fs::read(data_dir.join("sync_status.json")).expect("saved status");
+    let dry = run(&["sources", "sync", "--json", "--dry-run"]);
+    assert_sync(&dry, 0, 0, false);
+    assert_eq!(dry["sources"][0]["method"], "not_run");
+    assert_eq!(
+        std::fs::read(data_dir.join("sync_status.json")).unwrap(),
+        status_before
+    );
+    assert!(!mirror.join("empty.jsonl").exists());
+    assert!(!data_dir.join("agent_search.db").exists());
+
+    // A new empty file must still enter indexing, which also indexes the earlier
+    // deferred session. The search verifies actual publication, not just a flag.
+    let empty_file = run(&["sources", "sync", "--json"]);
+    assert_sync(&empty_file, 1, 0, true);
+    assert_eq!(
+        std::fs::metadata(mirror.join("empty.jsonl")).unwrap().len(),
+        0
+    );
+    let search = run(&["search", "gh468searchmarker", "--json", "--mode", "lexical"]);
+    let hits = search["hits"].as_array().expect("search hits array");
+    assert_eq!(hits.len(), 1, "{search}");
+    assert_eq!(hits[0]["content"], "gh468searchmarker", "{search}");
+    let unchanged = run(&["sources", "sync", "--json"]);
+    assert_sync(&unchanged, 0, 0, false);
 }
 
 /// Integration test: Verify container cleanup on drop.
