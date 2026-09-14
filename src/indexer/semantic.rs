@@ -27,7 +27,7 @@ use crate::indexer::semantic_progress::{
 };
 use crate::model::conversation_packet::{ConversationPacket, ConversationPacketProvenance};
 use crate::model::types::{Conversation, Message};
-use crate::search::canonicalize::{canonicalize_for_embedding, content_hash};
+use crate::search::canonicalize::{canonicalize_for_embedding, content_hash, embedding_passages};
 use crate::search::embedder::Embedder;
 use crate::search::fastembed_embedder::{
     FastEmbedder, MINILM_VECTOR_SPACE_REVISION, MULTILINGUAL_MINILM_VECTOR_SPACE_REVISION,
@@ -72,7 +72,7 @@ const DEFAULT_SEMANTIC_MAX_BYTES_PER_CHECKPOINT: u64 = 8 * 1024 * 1024;
 const DEFAULT_SEMANTIC_RECONCILIATION_SCAN_CONVERSATIONS: usize = 64;
 const SEMANTIC_PREP_MEMO_ALGORITHM: &str = "semantic_prepare_window";
 const SEMANTIC_PREP_MEMO_VERSION: &str = "canonicalize_for_embedding:v2:stable-content-hash";
-pub const HASH_VECTOR_SPACE_REVISION: &str = "hash-fnv1a-modular-v1";
+pub const HASH_VECTOR_SPACE_REVISION: &str = "hash-fnv1a-modular-v1:passages-v2";
 
 /// Return the exact vector-space revision that is safe for a current embedder.
 /// ID and dimension alone are insufficient because inference-engine changes
@@ -1372,20 +1372,20 @@ fn canonical_embedding_conversation(
     }
 }
 
-fn embedding_input_from_packet_message(
+fn embedding_inputs_from_packet_message(
     conversation_id: i64,
     agent_id: u32,
     workspace_id: u32,
     source_id_hash: u32,
     message: &crate::model::conversation_packet::ConversationPacketMessage,
-) -> Option<EmbeddingInput> {
+) -> Vec<EmbeddingInput> {
     let Some(raw_message_id) = message.message_id else {
         tracing::warn!(
             conversation_id,
             message_idx = message.idx,
             "skipping semantic backfill message without canonical id in ConversationPacket replay"
         );
-        return None;
+        return Vec::new();
     };
     let Some(message_id) = message_id_from_db(raw_message_id) else {
         tracing::warn!(
@@ -1393,18 +1393,23 @@ fn embedding_input_from_packet_message(
             raw_message_id,
             "skipping out-of-range id during semantic backfill"
         );
-        return None;
+        return Vec::new();
     };
-    Some(EmbeddingInput {
-        message_id,
-        created_at_ms: canonical_embedding_created_at_ms(message_id, message.created_at),
-        agent_id,
-        workspace_id,
-        source_id: source_id_hash,
-        role: role_code_from_str(&message.role).unwrap_or(ROLE_USER),
-        chunk_idx: 0,
-        content: message.content.clone(),
-    })
+    let created_at_ms = canonical_embedding_created_at_ms(message_id, message.created_at);
+    embedding_passages(&message.content)
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, content)| EmbeddingInput {
+            message_id,
+            created_at_ms,
+            agent_id,
+            workspace_id,
+            source_id: source_id_hash,
+            role: role_code_from_str(&message.role).unwrap_or(ROLE_USER),
+            chunk_idx: ordinal as u8,
+            content: content.to_owned(),
+        })
+        .collect()
 }
 
 fn embedding_inputs_from_conversation_packet(
@@ -1419,13 +1424,13 @@ fn embedding_inputs_from_conversation_packet(
         .semantic
         .message_indices
         .iter()
-        .filter_map(|message_index| {
+        .flat_map(|message_index| {
             packet
                 .payload
                 .messages
                 .get(*message_index)
-                .and_then(|message| {
-                    embedding_input_from_packet_message(
+                .map(|message| {
+                    embedding_inputs_from_packet_message(
                         row.conversation_id,
                         agent_id,
                         workspace_id,
@@ -1433,6 +1438,7 @@ fn embedding_inputs_from_conversation_packet(
                         message,
                     )
                 })
+                .unwrap_or_default()
         })
         .collect()
 }
@@ -1557,15 +1563,13 @@ pub(crate) fn semantic_inputs_from_packets(
                     packet.payload.messages.len()
                 );
             };
-            if let Some(input) = embedding_input_from_packet_message(
+            inputs.extend(embedding_inputs_from_packet_message(
                 context.conversation_id,
                 context.agent_id,
                 context.workspace_id,
                 source_id_hash,
                 message,
-            ) {
-                inputs.push(input);
-            }
+            ));
         }
     }
     tracing::debug!(
@@ -2506,7 +2510,7 @@ impl SemanticIndexer {
         let pb = ProgressBar::new(saturating_u64_from_usize(messages.len()));
         if show_progress {
             let style = ProgressStyle::default_bar()
-                .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} messages embedded")
+                .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} passages embedded")
                 .unwrap_or_else(|_| ProgressStyle::default_bar());
             pb.set_style(style);
         } else {
@@ -3033,7 +3037,7 @@ impl SemanticIndexer {
 
     fn reconcile_index_at_paths(
         &self,
-        embedded_messages: Vec<EmbeddedMessage>,
+        mut embedded_messages: Vec<EmbeddedMessage>,
         index_path: &Path,
         final_index_path: &Path,
         tier: TierKind,
@@ -3113,12 +3117,28 @@ impl SemanticIndexer {
             )?;
         }
 
-        let mut staged = FsVectorIndex::open(&staging_path).map_err(|err| {
-            anyhow::anyhow!(
-                "open semantic reconciliation snapshot {}: {err}",
-                staging_path.display()
-            )
-        })?;
+        let embedded_docs = embedded_messages.len();
+        let mut staged = if replacement_doc_ids.eq(current_doc_ids) {
+            // A complete, validated replacement needs no vectors from the old
+            // input contract. Keep its snapshot/WAL private and build a fresh
+            // generation; never relabel prefix vectors or truncate live data.
+            fs::rename(&staging_path, staging_dir.path().join("prior.fsvi"))?;
+            let staged_wal = fsvi_wal_path_for(&staging_path);
+            if staged_wal.exists() {
+                fs::rename(staged_wal, staging_dir.path().join("prior.wal"))?;
+            }
+            self.build_and_save_index_at_path(
+                std::mem::take(&mut embedded_messages),
+                &staging_path,
+            )?
+        } else {
+            FsVectorIndex::open(&staging_path).map_err(|err| {
+                anyhow::anyhow!(
+                    "open semantic reconciliation snapshot {}: {err}",
+                    staging_path.display()
+                )
+            })?
+        };
         if staged.embedder_id() != self.embedder_id()
             || staged.dimension() != self.embedder_dimension()
             || staged.embedder_revision() != self.vector_space_revision()?
@@ -3162,8 +3182,7 @@ impl SemanticIndexer {
                 .map_err(|err| anyhow::anyhow!("remove stale semantic documents: {err}"))?
         };
 
-        let embedded_docs = embedded_messages.len();
-        if embedded_docs > 0 {
+        if !embedded_messages.is_empty() {
             let replacement_entries = embedded_messages
                 .into_iter()
                 .map(|embedded| (semantic_doc_id_for_embedded(&embedded), embedded.embedding))
@@ -3748,6 +3767,7 @@ impl SemanticIndexer {
         let mut selected_ids = HashSet::new();
         let mut inputs = Vec::new();
         let mut selected_conversations = 0usize;
+        let mut selected_messages = 0usize;
         let mut selected_bytes = 0u64;
         let mut covered_conversations = 0u64;
         let mut after_conversation_id = 0i64;
@@ -3800,13 +3820,19 @@ impl SemanticIndexer {
                 let missing_bytes = missing.iter().fold(0u64, |bytes, input| {
                     bytes.saturating_add(saturating_u64_from_usize(input.content.len()))
                 });
+                let missing_messages = missing
+                    .iter()
+                    .map(|input| input.message_id)
+                    .collect::<HashSet<_>>()
+                    .len();
                 // Match the existing whole-conversation exception: the first
                 // missing conversation may exceed a message/byte cap by itself.
                 let select = !missing.is_empty()
                     && selected_conversations < plan.max_conversations.max(1)
                     && (selected_conversations == 0
                         || ((!caps.message_limited()
-                            || inputs.len().saturating_add(missing.len()) <= caps.max_messages)
+                            || selected_messages.saturating_add(missing_messages)
+                                <= caps.max_messages)
                             && (!caps.byte_limited()
                                 || selected_bytes.saturating_add(missing_bytes)
                                     <= caps.max_bytes)));
@@ -3816,6 +3842,7 @@ impl SemanticIndexer {
                 }
                 if select {
                     selected_conversations = selected_conversations.saturating_add(1);
+                    selected_messages = selected_messages.saturating_add(missing_messages);
                     selected_bytes = selected_bytes.saturating_add(missing_bytes);
                     for input in &missing {
                         let id = i64::try_from(input.message_id).unwrap_or(i64::MAX);
@@ -6916,6 +6943,139 @@ mod tests {
         assert!(!recovered.unchanged && recovered.published);
         assert_eq!(recovered.embedded_docs, 0);
         assert!(run(&mut manifest)?.unchanged);
+        Ok(())
+    }
+
+    #[test]
+    fn gh470_prefix_checkpoint_restarts_complete_passage_coverage() -> Result<()> {
+        let temp = tempdir()?;
+        let storage = FrankenStorage::open(&temp.path().join("agent_search.db"))?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let long = format!(
+            "{} final antimeridian resolution",
+            "deployment log ".repeat(400)
+        );
+        for (name, body) in [
+            ("long", long.as_str()),
+            ("short", "certificate renewal"),
+            ("last", "database locks"),
+        ] {
+            storage.insert_conversation_tree(agent_id, None, &test_conversation(name, body))?;
+        }
+        let indexer = SemanticIndexer::new("hash", None)?;
+        let mut manifest = SemanticManifest::default();
+        let fingerprint = crate::indexer::lexical_storage_fingerprint_for_storage(&storage)?;
+        let plan = |max_conversations| SemanticBackfillStoragePlan {
+            tier: TierKind::Fast,
+            db_fingerprint: fingerprint.clone(),
+            model_revision: "hash".into(),
+            max_conversations,
+        };
+        let initial =
+            indexer.run_backfill_from_storage(&storage, temp.path(), &mut manifest, plan(3))?;
+        assert!(initial.published);
+        let current_inputs = packet_embedding_inputs_from_storage(&storage)?;
+        let long_id = current_inputs[0].message_id;
+        let expected = current_inputs
+            .iter()
+            .filter_map(semantic_doc_id_for_input)
+            .collect::<HashSet<_>>();
+        let mut legacy_inputs = Vec::new();
+        for input in &current_inputs {
+            if input.chunk_idx == 0 {
+                let mut old = input.clone();
+                if input.message_id == long_id {
+                    old.content = long.clone();
+                }
+                legacy_inputs.push(old);
+            }
+        }
+        // Produce actual old-prefix vectors with the unchanged hash embedder.
+        // The old header and cursor are historical input-contract metadata.
+        let legacy_vectors = indexer.embed_messages(&legacy_inputs)?;
+        let staging = semantic_staging_index_path(
+            temp.path(),
+            TierKind::Fast,
+            indexer.embedder_id(),
+            &fingerprint,
+        );
+        for (path, records) in [
+            (&initial.index_path, legacy_vectors.as_slice()),
+            (&staging, &legacy_vectors[..1]),
+        ] {
+            fs::create_dir_all(path.parent().context("index parent")?)?;
+            let mut writer = FsVectorIndex::create_with_revision(
+                path,
+                indexer.embedder_id(),
+                "hash-fnv1a-modular-v1",
+                indexer.embedder_dimension(),
+                FsQuantization::F16,
+            )?;
+            for record in records {
+                writer.write_record(&semantic_doc_id_for_embedded(record), &record.embedding)?;
+            }
+            writer.finish()?;
+        }
+        let prior_live = fs::read(&initial.index_path)?;
+        manifest
+            .fast_tier
+            .as_mut()
+            .context("initial artifact")?
+            .chunking_version = 1;
+        manifest.checkpoint = Some(BuildCheckpoint {
+            tier: TierKind::Fast,
+            embedder_id: indexer.embedder_id().into(),
+            last_offset: 1,
+            docs_embedded: 1,
+            conversations_processed: 1,
+            total_conversations: 3,
+            db_fingerprint: fingerprint.clone(),
+            schema_version: SEMANTIC_SCHEMA_VERSION,
+            chunking_version: 1,
+            saved_at_ms: now_ms(),
+            last_message_id: Some(i64::try_from(long_id)?),
+            cursor_exhausted: false,
+        });
+        manifest.save(temp.path())?;
+        let first =
+            indexer.run_backfill_from_storage(&storage, temp.path(), &mut manifest, plan(1))?;
+        assert!(!first.unchanged && !first.published && first.checkpoint_saved);
+        let checkpoint = manifest.checkpoint.as_ref().context("new checkpoint")?;
+        assert_eq!(checkpoint.chunking_version, CHUNKING_STRATEGY_VERSION);
+        assert_eq!(checkpoint.conversations_processed, 1);
+        assert_eq!(checkpoint.last_message_id, Some(i64::try_from(long_id)?));
+        assert_eq!(checkpoint.docs_embedded, 8);
+        assert!(
+            !manifest
+                .fast_tier
+                .as_ref()
+                .context("revoked artifact")?
+                .ready
+        );
+        assert_eq!(fs::read(&initial.index_path)?, prior_live);
+        let staged = FsVectorIndex::open(&staging)?;
+        assert_eq!(staged.embedder_revision(), HASH_VECTOR_SPACE_REVISION);
+        assert_eq!(staged.record_count(), 8);
+        drop(staged);
+        let mut resumed = SemanticManifest::load(temp.path())?.context("durable checkpoint")?;
+        let second =
+            indexer.run_backfill_from_storage(&storage, temp.path(), &mut resumed, plan(1))?;
+        assert!(!second.published);
+        let done =
+            indexer.run_backfill_from_storage(&storage, temp.path(), &mut resumed, plan(1))?;
+        assert!(done.published && !done.unchanged);
+        let actual = FsVectorIndex::open(&done.index_path)?;
+        assert_eq!(actual.embedder_revision(), HASH_VECTOR_SPACE_REVISION);
+        assert_eq!(validated_semantic_index_ids(&actual)?, expected);
+        assert_eq!(actual.record_count(), 10);
+        assert_eq!(actual.tombstone_count(), 0);
+        assert_eq!(actual.wal_record_count(), 0);
         Ok(())
     }
 

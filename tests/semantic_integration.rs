@@ -1451,7 +1451,7 @@ mod gh470_native_long_messages {
     use anyhow::{Context, Result};
     use coding_agent_search::indexer::semantic::{EmbeddingInput, SemanticIndexer};
     use coding_agent_search::search::canonicalize::{
-        MAX_EMBED_CHARS, canonicalize_for_embedding, content_hash,
+        MAX_EMBED_CHARS, canonicalize_for_embedding, content_hash, embedding_passages,
     };
     use coding_agent_search::search::embedder::Embedder;
     use coding_agent_search::search::fastembed_embedder::{
@@ -1477,6 +1477,36 @@ mod gh470_native_long_messages {
     const MAX_WINDOWS: usize = 4;
     const NATIVE_MAX_TOKENS: usize = 512;
     const CORPUS_REVISION: &str = "gh470-19-messages-cjk-tail-v2";
+
+    fn copy_attested_model(data_dir: &std::path::Path) -> Result<(ModelManifest, PathBuf, f64)> {
+        assert!(
+            model_dir_override().is_none(),
+            "use the supplied managed model bundle"
+        );
+        let supplied = PathBuf::from(
+            dotenvy::var("CASS_NATIVE_REUSE_MODEL_DIR")
+                .context("supply an existing attested MiniLM bundle; this test never downloads")?,
+        );
+        let model_dir = FastEmbedder::default_model_dir(data_dir);
+        fs::create_dir_all(&model_dir)?;
+        let manifest = ModelManifest::minilm_v2();
+        assert_eq!(manifest.files.len(), 5);
+        let started = Instant::now();
+        for file in &manifest.files {
+            let source = model_file_path(&supplied, file)
+                .with_context(|| format!("missing supplied model file {}", file.name))?;
+            assert_eq!(compute_sha256(&source)?, file.sha256);
+            assert_eq!(
+                fs::copy(source, model_dir.join(file.local_name()))?,
+                file.size
+            );
+        }
+        Ok((
+            manifest,
+            model_dir,
+            started.elapsed().as_secs_f64() * 1000.0,
+        ))
+    }
 
     struct Query {
         name: &'static str,
@@ -1680,10 +1710,14 @@ mod gh470_native_long_messages {
         let mut inputs = Vec::new();
         let mut selections = Vec::new();
         for message in messages {
+            let production_passages = (windows == 8).then(|| embedding_passages(&message.content));
             // Select raw spans before character truncation or fenced-code
             // collapse. Canonicalization still runs inside the real indexer.
             let chars: Vec<_> = message.content.chars().collect();
             if windows == 1 || chars.len() <= MAX_EMBED_CHARS {
+                if let Some(passages) = production_passages {
+                    assert_eq!(passages, [message.content.as_str()]);
+                }
                 inputs.push(message.clone());
                 selections.push(json!({
                     "message_id": message.message_id, "raw_chars": chars.len(),
@@ -1702,6 +1736,9 @@ mod gh470_native_long_messages {
                 windows.min(chars.len().div_ceil(WINDOW_CHARS))
             };
             assert!(count > 1);
+            if let Some(passages) = production_passages.as_ref() {
+                assert_eq!(passages.len(), count);
+            }
             for chunk_idx in 0..count {
                 let start = if windows == 0 {
                     chunk_idx * WINDOW_CHARS
@@ -1714,6 +1751,13 @@ mod gh470_native_long_messages {
                 }
                 covered_until = covered_until.max(end);
                 selected.push([start, end]);
+                let expected_content: String = chars[start..end].iter().collect();
+                let content = if let Some(passages) = production_passages.as_ref() {
+                    assert_eq!(passages[chunk_idx], expected_content);
+                    passages[chunk_idx].to_owned()
+                } else {
+                    expected_content
+                };
                 let input = EmbeddingInput {
                     message_id: message.message_id,
                     created_at_ms: message.created_at_ms,
@@ -1723,7 +1767,7 @@ mod gh470_native_long_messages {
                     role: message.role,
                     chunk_idx: u8::try_from(chunk_idx)
                         .expect("this finite fixture must fit the persisted chunk identifier"),
-                    content: chars[start..end].iter().collect(),
+                    content,
                 };
                 assert!(input.content.chars().count() <= WINDOW_CHARS);
                 inputs.push(input);
@@ -1780,30 +1824,8 @@ mod gh470_native_long_messages {
     #[test]
     #[ignore = "requires CASS_NATIVE_REUSE_MODEL_DIR with the attested five-file MiniLM bundle; never downloads"]
     fn gh470_native_long_message_representation_measurements() -> Result<()> {
-        assert!(
-            model_dir_override().is_none(),
-            "use the supplied managed model bundle"
-        );
-        let supplied = PathBuf::from(
-            dotenvy::var("CASS_NATIVE_REUSE_MODEL_DIR")
-                .context("supply an existing attested MiniLM bundle; this test never downloads")?,
-        );
         let data = tempfile::tempdir()?;
-        let model_dir = FastEmbedder::default_model_dir(data.path());
-        fs::create_dir_all(&model_dir)?;
-        let manifest = ModelManifest::minilm_v2();
-        assert_eq!(manifest.files.len(), 5);
-        let copy_started = Instant::now();
-        for file in &manifest.files {
-            let source = model_file_path(&supplied, file)
-                .with_context(|| format!("missing supplied model file {}", file.name))?;
-            assert_eq!(compute_sha256(&source)?, file.sha256);
-            assert_eq!(
-                fs::copy(source, model_dir.join(file.local_name()))?,
-                file.size
-            );
-        }
-        let copy_ms = copy_started.elapsed().as_secs_f64() * 1000.0;
+        let (manifest, model_dir, copy_ms) = copy_attested_model(data.path())?;
         // tokenizer.json has historical truncation/padding defaults. Match the
         // pinned native backend explicitly, and separately count untruncated IDs.
         let mut full_tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
@@ -1957,7 +1979,7 @@ mod gh470_native_long_messages {
         let mut baseline_tokens = 0;
         let mut baseline_short_vectors = BTreeMap::new();
         for (name, windows) in [
-            ("production_prefix", 1),
+            ("legacy_prefix", 1),
             ("head_tail", 2),
             ("distributed_windows", MAX_WINDOWS),
             ("distributed_eight", 8),
@@ -2146,6 +2168,262 @@ mod gh470_native_long_messages {
                 "scoring": "exhaustive cosine over persisted F16-expanded native vectors; maximum per message",
                 "limits": "fixed-order single observations; sampled windows may miss evidence; 510-character token bounds are checked for this corpus only; no SQLite hydration, ANN, whole-query latency, RSS bound, or speedup certification",
             })
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CASS_NATIVE_REUSE_MODEL_DIR with the attested five-file MiniLM bundle; never downloads"]
+    fn gh470_native_backfill_hydrates_passages_without_duplicate_messages() -> Result<()> {
+        use coding_agent_search::franken_sync::compat::{ConnectionExt, RowExt};
+        use coding_agent_search::model::types::{
+            Agent, AgentKind, Conversation, Message, MessageRole,
+        };
+        use coding_agent_search::search::query::{FieldMask, SearchClient, SearchFilters};
+        use coding_agent_search::search::semantic_manifest::SemanticManifest;
+        use coding_agent_search::search::vector_index::{
+            SemanticFilterMaps, SemanticIndexArtifact,
+        };
+        use coding_agent_search::storage::sqlite::FrankenStorage;
+        use std::sync::Arc;
+
+        let temp = tempfile::tempdir()?;
+        let data_dir = temp.path().join("data");
+        let db_path = temp.path().join("archive.db");
+        let (_, model_dir, _) = copy_attested_model(&data_dir)?;
+        let (messages, queries) = corpus();
+        let storage = FrankenStorage::open(&db_path)?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let workspace = temp.path().join("workspace");
+        let workspace_id = storage.ensure_workspace(&workspace, None)?;
+        let mut paths = Vec::new();
+        for message in &messages {
+            let path = temp
+                .path()
+                .join(format!("message-{}.jsonl", message.message_id));
+            paths.push(path.to_string_lossy().into_owned());
+            storage.insert_conversation_tree(
+                agent_id,
+                Some(workspace_id),
+                &Conversation {
+                    id: None,
+                    agent_slug: "codex".into(),
+                    workspace: Some(workspace.clone()),
+                    external_id: Some(format!("gh470-{}", message.message_id)),
+                    title: Some(format!("source {}", message.message_id)),
+                    source_path: path,
+                    started_at: Some(message.created_at_ms),
+                    ended_at: Some(message.created_at_ms),
+                    approx_tokens: None,
+                    metadata_json: json!({}),
+                    messages: vec![Message {
+                        id: None,
+                        idx: 0,
+                        role: MessageRole::User,
+                        author: None,
+                        created_at: Some(message.created_at_ms),
+                        content: message.content.clone(),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    }],
+                    source_id: "local".into(),
+                    origin_host: None,
+                },
+            )?;
+        }
+        let rows: Vec<(i64, i64, String)> = storage.raw().query_map_collect(
+            "SELECT id, conversation_id, content FROM messages ORDER BY id",
+            &[],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+        )?;
+        assert_eq!(rows.len(), messages.len());
+        for (row, message) in rows.iter().zip(&messages) {
+            assert_eq!(row.2, message.content);
+        }
+        drop(storage);
+
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home)?;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(home.join(".env"))?;
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        command.env_clear().current_dir(&home);
+        for key in ["PATH", "SystemRoot", "WINDIR"] {
+            if let Ok(value) = dotenvy::var(key) {
+                command.env(key, value);
+            }
+        }
+        command
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("CASS_DATA_DIR", &data_dir)
+            .env("TUI_HEADLESS", "1")
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CASS_RESPONSIVENESS_DISABLE", "1")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("RUST_MIN_STACK", "134217728")
+            .arg("--db")
+            .arg(&db_path)
+            .args([
+                "models",
+                "backfill",
+                "--tier",
+                "quality",
+                "--embedder",
+                "minilm",
+                "--batch-conversations",
+                "19",
+                "--max-batches",
+                "1",
+                "--json",
+                "--data-dir",
+            ])
+            .arg(&data_dir);
+        let output = assert_cmd::Command::from_std(command)
+            .timeout(std::time::Duration::from_secs(1200))
+            .output()?;
+        assert!(
+            output.status.success(),
+            "stdout={}; stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(report["status"], "published", "{report}");
+        let manifest = SemanticManifest::load(&data_dir)?.context("published manifest")?;
+        let tier = manifest.quality_tier.context("quality artifact")?;
+        assert!(tier.ready);
+        assert_eq!((tier.doc_count, tier.conversation_count), (44, 19));
+
+        let storage = FrankenStorage::open_readonly(&db_path)?;
+        let filters = SemanticFilterMaps::from_storage(&storage)?;
+        let artifact =
+            SemanticIndexArtifact::open(vector_index_path(&data_dir, "minilm-384"), None)?;
+        assert_eq!(
+            artifact.index().embedder_revision(),
+            MINILM_VECTOR_SPACE_REVISION
+        );
+        let mut chunk_counts = BTreeMap::<u64, BTreeSet<u8>>::new();
+        for ordinal in 0..artifact.index().record_count() {
+            let id = parse_semantic_doc_id(artifact.index().doc_id_at(ordinal)?)
+                .context("canonical passage identity")?;
+            let row = rows
+                .iter()
+                .find(|row| u64::try_from(row.0).ok() == Some(id.message_id))
+                .context("passage must resolve to a stored message")?;
+            let passages = embedding_passages(&row.2);
+            assert_eq!(
+                id.content_hash,
+                Some(content_hash(&canonicalize_for_embedding(
+                    passages[usize::from(id.chunk_idx)]
+                )))
+            );
+            assert!(
+                chunk_counts
+                    .entry(id.message_id)
+                    .or_default()
+                    .insert(id.chunk_idx)
+            );
+        }
+        assert_eq!(chunk_counts.len(), 19);
+        for row in &rows {
+            assert_eq!(
+                chunk_counts[&u64::try_from(row.0)?].len(),
+                embedding_passages(&row.2).len()
+            );
+        }
+        drop(storage);
+        let client = SearchClient::open(&data_dir.join("lexical"), Some(&db_path))?
+            .context("archive-backed query client")?;
+        client.set_semantic_context(
+            Arc::new(FastEmbedder::load_from_dir(&model_dir)?),
+            artifact,
+            None,
+            filters,
+            None,
+        )?;
+        let mut retrieval = Vec::new();
+        for query in &queries {
+            let (hits, _) = client.search_semantic(
+                query.text,
+                SearchFilters::default(),
+                19,
+                0,
+                FieldMask::FULL,
+                false,
+            )?;
+            let unique = hits
+                .iter()
+                .map(|hit| hit.conversation_id)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                unique.len(),
+                hits.len(),
+                "one public hit per canonical message"
+            );
+            for hit in &hits {
+                let ordinal = paths
+                    .iter()
+                    .position(|path| path == &hit.source_path)
+                    .context("source path")?;
+                assert_eq!(hit.content, rows[ordinal].2);
+                assert_eq!(hit.conversation_id, Some(rows[ordinal].1));
+                assert_eq!(hit.agent, "codex");
+                assert_eq!(hit.workspace, workspace.to_string_lossy());
+                assert_eq!(hit.created_at, Some(messages[ordinal].created_at_ms));
+                assert_eq!(hit.source_id, "local");
+                assert_eq!(hit.line_number, Some(1));
+            }
+            if let Some(target) = query.target {
+                let path = &paths[usize::try_from(target - 1)?];
+                let rank = hits
+                    .iter()
+                    .position(|hit| &hit.source_path == path)
+                    .context("known-relevant source retrieved")?
+                    + 1;
+                assert!(rank <= 3, "{}: rank={rank}", query.name);
+                let restricted = SearchFilters {
+                    session_paths: [path.clone()].into_iter().collect(),
+                    ..Default::default()
+                };
+                let (filtered, _) =
+                    client.search_semantic(query.text, restricted, 1, 0, FieldMask::FULL, false)?;
+                assert_eq!(filtered.len(), 1);
+                assert_eq!(&filtered[0].source_path, path);
+                retrieval.push(json!({"query":query.name,"rank":rank,"source_path":path}));
+            }
+            let (page, _) = client.search_semantic(
+                query.text,
+                SearchFilters::default(),
+                2,
+                1,
+                FieldMask::FULL,
+                false,
+            )?;
+            assert_eq!(
+                page.iter().map(|hit| &hit.source_path).collect::<Vec<_>>(),
+                hits.iter()
+                    .skip(1)
+                    .take(2)
+                    .map(|hit| &hit.source_path)
+                    .collect::<Vec<_>>()
+            );
+        }
+        println!(
+            "GH470_HYDRATION {}",
+            json!({"corpus_revision":CORPUS_REVISION,
+                "authoritative_messages":19,"stored_vectors":44,"backfill":report,"retrieval":retrieval,
+                "limits":"real CLI backfill and native exact search with SQLite hydration; no ANN or performance certification"})
         );
         Ok(())
     }

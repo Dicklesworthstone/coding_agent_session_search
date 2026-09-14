@@ -9520,7 +9520,7 @@ fn system_time_to_epoch_millis(time: SystemTime) -> Option<i64> {
 
 fn semantic_tier_for_embedder_id(embedder_id: &str) -> Option<SemanticTierKind> {
     match embedder_id {
-        "minilm-384" => Some(SemanticTierKind::Quality),
+        "minilm-384" | "multilingual-minilm-384" => Some(SemanticTierKind::Quality),
         "fnv1a-384" => Some(SemanticTierKind::Fast),
         _ => None,
     }
@@ -9545,10 +9545,65 @@ fn semantic_model_revision_for_embedder_id(embedder_id: &str) -> String {
     if embedder_id == "fnv1a-384" {
         "hash".to_string()
     } else {
-        crate::search::model_download::ModelManifest::minilm_v2()
-            .revision
-            .clone()
+        crate::search::fastembed_embedder::FastEmbedder::canonical_name(embedder_id)
+            .and_then(crate::search::model_download::ModelManifest::for_embedder)
+            .map(|manifest| manifest.revision)
+            .unwrap_or_default()
     }
+}
+
+fn semantic_vector_matches_current_contract(
+    index: &FsVectorIndex,
+    embedder_id: &str,
+    dimension: usize,
+) -> bool {
+    index.embedder_id() == embedder_id
+        && index.dimension() == dimension
+        && crate::indexer::semantic::expected_vector_space_revision(embedder_id)
+            == Some(index.embedder_revision())
+}
+
+/// A watermark proves row coverage only for the requested input contract.
+/// Inspect metadata without initializing or downloading the native model.
+fn semantic_index_has_current_contract(data_dir: &Path, requested_embedder: &str) -> bool {
+    let (embedder_id, dimension) = if requested_embedder == "hash" {
+        ("fnv1a-384".to_string(), 384)
+    } else {
+        let Some(config) =
+            crate::search::fastembed_embedder::FastEmbedder::config_for(requested_embedder)
+        else {
+            return false;
+        };
+        (config.embedder_id, config.dimension)
+    };
+    let Some(tier) = semantic_tier_for_embedder_id(&embedder_id) else {
+        return false;
+    };
+    let Ok(Some(manifest)) = SemanticManifest::load(data_dir) else {
+        return false;
+    };
+    let Some(artifact) = semantic_artifact_for_tier(&manifest, tier) else {
+        return false;
+    };
+    if !artifact.ready
+        || artifact.tier != tier
+        || artifact.embedder_id != embedder_id
+        || artifact.dimension != dimension
+        || artifact.schema_version != SEMANTIC_SCHEMA_VERSION
+        || artifact.chunking_version != CHUNKING_STRATEGY_VERSION
+        || artifact.model_revision != semantic_model_revision_for_embedder_id(&embedder_id)
+    {
+        return false;
+    }
+    let Ok(index_path) = semantic_artifact_index_path(data_dir, artifact) else {
+        return false;
+    };
+    if index_path != vector_index_path(data_dir, &embedder_id) {
+        return false;
+    }
+    FsVectorIndex::open_read_only(&index_path).is_ok_and(|index| {
+        semantic_vector_matches_current_contract(&index, &embedder_id, dimension)
+    })
 }
 
 /// Republish the semantic manifest after a direct `cass index --semantic`
@@ -17139,20 +17194,14 @@ fn run_index_inner(
         let semantic_identity_rebuild_required = storage
             .semantic_identity_rebuild_required(semantic_identity_tier)
             .with_context(|| "checking whether canonical semantic filter identity changed")?;
-        // In watch mode, skip the expensive bulk re-embed if a vector index and
-        // watermark already exist. The incremental path in the watch callback
-        // will pick up any new messages via WAL append.
+        // A watermark from a prior input contract cannot certify the current
+        // passage coverage. Only the requested, current artifact may use the
+        // unchanged or incremental fast paths, including watch startup.
         let vi_dir = opts
             .data_dir
             .join(crate::search::vector_index::VECTOR_INDEX_DIR);
-        let has_existing_index = vi_dir.is_dir()
-            && std::fs::read_dir(&vi_dir)
-                .map(|entries| {
-                    entries
-                        .filter_map(|e| e.ok())
-                        .any(|e| e.path().extension().is_some_and(|ext| ext == "fsvi"))
-                })
-                .unwrap_or(false);
+        let has_existing_index =
+            semantic_index_has_current_contract(&opts.data_dir, &opts.embedder);
         let last_embedded = storage.get_last_embedded_message_id()?;
         let has_watermark = last_embedded.is_some();
         // #394: a one-shot `index --semantic` used to ignore the watermark
@@ -17327,7 +17376,7 @@ fn run_index_inner(
                 },
             )?;
             tracing::info!(
-                message_count = embedding_inputs.len(),
+                passage_count = embedding_inputs.len(),
                 packet_driven = true,
                 "built semantic inputs from canonical ConversationPacket replay"
             );
@@ -18970,6 +19019,13 @@ fn validate_semantic_watch_once_artifact(
             index_path.display()
         )
     })?;
+    if !semantic_vector_matches_current_contract(
+        &index,
+        indexer.embedder_id(),
+        indexer.embedder_dimension(),
+    ) {
+        anyhow::bail!("semantic watch-once cannot reuse an incompatible vector input contract");
+    }
     drop(index);
     Ok(index_path)
 }
@@ -37922,6 +37978,10 @@ mod tests {
             super::semantic_tier_for_embedder_id("fnv1a-384"),
             Some(super::SemanticTierKind::Fast)
         );
+        assert_eq!(
+            super::semantic_tier_for_embedder_id("multilingual-minilm-384"),
+            Some(super::SemanticTierKind::Quality)
+        );
         assert_eq!(super::semantic_tier_for_embedder_id("unknown"), None);
     }
 
@@ -37934,10 +37994,90 @@ mod tests {
             super::semantic_model_revision_for_embedder_id("fnv1a-384"),
             "hash"
         );
-        assert!(
-            !super::semantic_model_revision_for_embedder_id("minilm-384").is_empty(),
-            "minilm revision should resolve to ModelManifest::minilm_v2().revision"
+        assert_eq!(
+            super::semantic_model_revision_for_embedder_id("minilm-384"),
+            crate::search::model_download::ModelManifest::minilm_v2().revision
         );
+        assert_eq!(
+            super::semantic_model_revision_for_embedder_id("multilingual-minilm-384"),
+            crate::search::model_download::ModelManifest::multilingual_minilm_l12_v2().revision
+        );
+    }
+
+    #[test]
+    fn gh470_native_watermark_admission_checks_artifacts_without_loading_models() -> Result<()> {
+        for (requested, embedder_id, legacy_revision) in [
+            (
+                "all-MiniLM-L6-v2",
+                "minilm-384",
+                "native-minilm-v1:c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+            ),
+            (
+                "multilingual",
+                "multilingual-minilm-384",
+                "native-multilingual-minilm-v1:59160d9e43d396d05b4139c99f9feb7922da14868587fca7e33d379821a41405",
+            ),
+        ] {
+            let temp = tempfile::tempdir()?;
+            let index_path = vector_index_path(temp.path(), embedder_id);
+            fs::create_dir_all(index_path.parent().context("vector parent")?)?;
+            let revision = crate::indexer::semantic::expected_vector_space_revision(embedder_id)
+                .context("registered input contract")?;
+            // Empty valid FSVIs exercise admission metadata only. No synthetic
+            // model vectors or model files stand in for native inference.
+            let write_header = |revision: &str| -> Result<()> {
+                let writer = FsVectorIndex::create_with_revision(
+                    &index_path,
+                    embedder_id,
+                    revision,
+                    384,
+                    frankensearch::index::Quantization::F16,
+                )?;
+                writer.finish()?;
+                Ok(())
+            };
+            write_header(revision)?;
+            assert!(!semantic_index_has_current_contract(temp.path(), requested));
+            let mut manifest = SemanticManifest::default();
+            manifest.publish_artifact(ArtifactRecord {
+                tier: SemanticTierKind::Quality,
+                embedder_id: embedder_id.to_string(),
+                model_revision: semantic_model_revision_for_embedder_id(embedder_id),
+                schema_version: SEMANTIC_SCHEMA_VERSION,
+                chunking_version: CHUNKING_STRATEGY_VERSION,
+                dimension: 384,
+                doc_count: 0,
+                conversation_count: 0,
+                db_fingerprint: "content-v1:0:0:0".to_string(),
+                index_path: index_path
+                    .strip_prefix(temp.path())?
+                    .to_string_lossy()
+                    .into_owned(),
+                size_bytes: fs::metadata(&index_path)?.len(),
+                started_at_ms: 1,
+                completed_at_ms: 2,
+                ready: true,
+            });
+            manifest.save(temp.path())?;
+            assert!(semantic_index_has_current_contract(temp.path(), requested));
+            assert!(semantic_index_has_current_contract(
+                temp.path(),
+                embedder_id
+            ));
+            assert!(!semantic_index_has_current_contract(temp.path(), "hash"));
+            write_header(legacy_revision)?;
+            assert!(!semantic_index_has_current_contract(temp.path(), requested));
+            write_header(revision)?;
+            manifest
+                .quality_tier
+                .as_mut()
+                .context("quality artifact")?
+                .chunking_version = 1;
+            manifest.save(temp.path())?;
+            assert!(!semantic_index_has_current_contract(temp.path(), requested));
+            assert!(!temp.path().join("models").exists());
+        }
+        Ok(())
     }
 
     /// Regression test for issue #201: `staged_*` progress fields must

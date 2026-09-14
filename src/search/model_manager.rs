@@ -1943,15 +1943,20 @@ mod tests {
         };
         std::fs::create_dir_all(parent)?;
 
-        let writer = VectorIndex::create_with_revision(
-            &index_path,
-            FastEmbedder::embedder_id_static(),
+        for legacy in [
             "1.0",
-            384,
-            frankensearch::index::Quantization::F16,
-        )?;
-        writer.finish()?;
-        assert!(needs_index_rebuild(tmp.path()));
+            "native-minilm-v1:c9745ed1d9f207416be6d2e6f8de32d1f16199bf",
+        ] {
+            let writer = VectorIndex::create_with_revision(
+                &index_path,
+                FastEmbedder::embedder_id_static(),
+                legacy,
+                384,
+                frankensearch::index::Quantization::F16,
+            )?;
+            writer.finish()?;
+            assert!(needs_index_rebuild(tmp.path()));
+        }
 
         let expected_revision = expected_vector_space_revision(FastEmbedder::embedder_id_static())
             .ok_or_else(|| anyhow::anyhow!("MiniLM vector-space revision is not registered"))?;
