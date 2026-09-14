@@ -2086,6 +2086,35 @@ struct Prepared<'a> {
     hash: [u8; 32],
 }
 
+/// An invocation owns its reuse table. Vectors stay in the required output
+/// records; entries borrow the original input text and retain an output index.
+/// A content hash selects a bucket, never establishes text equality.
+#[derive(Default)]
+struct ExactEmbeddingReuse<'a> {
+    by_hash: HashMap<[u8; 32], Vec<(&'a str, usize)>>,
+}
+
+impl<'a> ExactEmbeddingReuse<'a> {
+    fn lookup(&self, prepared: &Prepared<'_>) -> Option<usize> {
+        self.by_hash
+            .get(&prepared.hash)?
+            .iter()
+            .find_map(|(raw, output_index)| {
+                // Recheck exact canonical equality only on a hash hit. Borrowing
+                // the input avoids retaining a second corpus of canonical text
+                // when a full index passes the entire archive in one invocation.
+                (canonicalize_for_embedding(raw) == prepared.canonical).then_some(*output_index)
+            })
+    }
+
+    fn insert(&mut self, prepared: &Prepared<'a>, output_index: usize) {
+        self.by_hash
+            .entry(prepared.hash)
+            .or_default()
+            .push((prepared.msg.content.as_str(), output_index));
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MemoizedPreparedMessage {
     canonical: String,
@@ -2247,31 +2276,87 @@ fn length_aware_batches<'p, 'a>(
     batches
 }
 
-fn flush_prepared_batch(
-    batch: &[Prepared<'_>],
+fn flush_prepared_batch<'a>(
+    batch: &[Prepared<'a>],
     embeddings: &mut Vec<EmbeddedMessage>,
     pb: &ProgressBar,
     embedder: &dyn Embedder,
+    mut reuse: Option<&mut ExactEmbeddingReuse<'a>>,
 ) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
     }
 
-    let texts: Vec<&str> = batch.iter().map(|p| p.canonical.as_str()).collect();
-    let vectors = embedder
-        .embed_batch_sync(&texts)
-        .map_err(|e| anyhow::anyhow!("embedding failed: {e}"))?;
+    enum VectorSource {
+        PriorOutput(usize),
+        Fresh(usize),
+    }
 
-    if vectors.len() != batch.len() {
+    let mut plan = Vec::with_capacity(batch.len());
+    let mut fresh: Vec<&Prepared<'_>> = Vec::new();
+    let mut fresh_by_text: HashMap<&str, usize> = HashMap::new();
+    for prepared in batch {
+        if let Some(output_index) = reuse.as_ref().and_then(|cache| cache.lookup(prepared)) {
+            plan.push(VectorSource::PriorOutput(output_index));
+        } else if let Some(fresh_index) = reuse
+            .as_ref()
+            .and_then(|_| fresh_by_text.get(prepared.canonical.as_str()))
+        {
+            plan.push(VectorSource::Fresh(*fresh_index));
+        } else {
+            let fresh_index = fresh.len();
+            if reuse.is_some() {
+                fresh_by_text.insert(prepared.canonical.as_str(), fresh_index);
+            }
+            fresh.push(prepared);
+            plan.push(VectorSource::Fresh(fresh_index));
+        }
+    }
+    let texts: Vec<&str> = fresh.iter().map(|p| p.canonical.as_str()).collect();
+    let vectors = if texts.is_empty() {
+        Vec::new()
+    } else {
+        embedder
+            .embed_batch_sync(&texts)
+            .map_err(|e| anyhow::anyhow!("embedding failed: {e}"))?
+    };
+
+    if vectors.len() != fresh.len() {
         bail!(
             "embedder returned {} embeddings for {} inputs",
             vectors.len(),
-            batch.len()
+            fresh.len()
         );
     }
 
-    for (prepared, vector) in batch.iter().zip(vectors) {
-        validate_embedding_vector(&vector, embedder.dimension(), prepared.msg.message_id)?;
+    // Admit every fresh vector before extending either the outputs or reuse
+    // table. A malformed batch cannot supply a cached result to a later row.
+    for (prepared, vector) in fresh.iter().zip(&vectors) {
+        validate_embedding_vector(vector, embedder.dimension(), prepared.msg.message_id)?;
+    }
+    let mut vectors: Vec<_> = vectors.into_iter().map(Some).collect();
+    let mut fresh_outputs = vec![0usize; fresh.len()];
+    for (prepared, source) in batch.iter().zip(plan) {
+        let (vector, first_occurrence) = match source {
+            VectorSource::PriorOutput(output_index) => {
+                (embeddings[output_index].embedding.clone(), false)
+            }
+            VectorSource::Fresh(fresh_index) => match vectors[fresh_index].take() {
+                Some(vector) => {
+                    fresh_outputs[fresh_index] = embeddings.len();
+                    (vector, true)
+                }
+                None => (
+                    embeddings[fresh_outputs[fresh_index]].embedding.clone(),
+                    false,
+                ),
+            },
+        };
+        if let Some(cache) = reuse.as_mut()
+            && first_occurrence
+        {
+            cache.insert(prepared, embeddings.len());
+        }
         embeddings.push(EmbeddedMessage {
             message_id: prepared.msg.message_id,
             created_at_ms: prepared.msg.created_at_ms,
@@ -2310,6 +2395,9 @@ fn validate_embedding_vector(
 pub struct SemanticIndexer {
     embedder: Box<dyn Embedder>,
     batch_size: usize,
+    // Set by the concrete CASS producer factory, never by an arbitrary
+    // SyncEmbed ID. Native batch-invariance qualification is still pending.
+    exact_reuse: bool,
 }
 
 impl SemanticIndexer {
@@ -2331,6 +2419,7 @@ impl SemanticIndexer {
         Ok(Self {
             embedder,
             batch_size: resolved_default_batch_size(),
+            exact_reuse: embedder_type == "hash",
         })
     }
 
@@ -2423,6 +2512,7 @@ impl SemanticIndexer {
         }
 
         let mut embeddings = Vec::with_capacity(messages.len());
+        let mut exact_reuse = self.exact_reuse.then(ExactEmbeddingReuse::default);
 
         // Process the corpus in windows of ~4 batches. Within each window,
         // rayon parallelizes the canonicalize + hash prep across cores; the
@@ -2499,7 +2589,13 @@ impl SemanticIndexer {
                     );
                 }
                 let batch_started = Instant::now();
-                flush_prepared_batch(batch, &mut embeddings, &pb, self.embedder.as_ref())?;
+                flush_prepared_batch(
+                    batch,
+                    &mut embeddings,
+                    &pb,
+                    self.embedder.as_ref(),
+                    exact_reuse.as_mut(),
+                )?;
                 let elapsed_ms = saturating_u64_from_millis(batch_started.elapsed().as_millis());
                 rows_processed = rows_processed.saturating_add(batch_rows);
                 on_progress(
@@ -4279,6 +4375,373 @@ mod tests {
     use serde_json::json;
     use std::path::Path;
     use tempfile::tempdir;
+
+    /// Counts inference inputs while executing the real hash producer.
+    struct MeasuredHashEmbedder {
+        inner: HashEmbedder,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+        fault: Option<EmbeddingFault>,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum EmbeddingFault {
+        Inference,
+        Count,
+        Dimension,
+        NonFinite,
+    }
+
+    impl Embedder for MeasuredHashEmbedder {
+        fn embed_sync(&self, text: &str) -> crate::search::embedder::EmbedderResult<Vec<f32>> {
+            self.inner.embed_sync(text)
+        }
+
+        fn embed_batch_sync(
+            &self,
+            texts: &[&str],
+        ) -> crate::search::embedder::EmbedderResult<Vec<Vec<f32>>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(texts.iter().map(|text| (*text).to_owned()).collect());
+            let mut vectors = self.inner.embed_batch_sync(texts)?;
+            match self.fault {
+                Some(EmbeddingFault::Inference) => {
+                    return Err(crate::search::embedder::EmbedderError::EmbeddingFailed {
+                        model: self.inner.id().to_owned(),
+                        source: Box::new(std::io::Error::other("injected inference failure")),
+                    });
+                }
+                Some(EmbeddingFault::Count) => {
+                    vectors.pop();
+                }
+                Some(EmbeddingFault::Dimension) => {
+                    vectors.last_mut().unwrap().pop();
+                }
+                Some(EmbeddingFault::NonFinite) => {
+                    vectors.last_mut().unwrap()[0] = f32::NAN;
+                }
+                None => {}
+            }
+            Ok(vectors)
+        }
+
+        fn dimension(&self) -> usize {
+            self.inner.dimension()
+        }
+
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+
+        fn is_semantic(&self) -> bool {
+            self.inner.is_semantic()
+        }
+
+        fn category(&self) -> frankensearch::ModelCategory {
+            self.inner.category()
+        }
+
+        fn tier(&self) -> frankensearch::ModelTier {
+            self.inner.tier()
+        }
+    }
+
+    fn assert_embedding_outputs_bitwise_equal(
+        actual: &[EmbeddedMessage],
+        expected: &[EmbeddedMessage],
+    ) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(actual.message_id, expected.message_id);
+            assert_eq!(actual.created_at_ms, expected.created_at_ms);
+            assert_eq!(actual.agent_id, expected.agent_id);
+            assert_eq!(actual.workspace_id, expected.workspace_id);
+            assert_eq!(actual.source_id, expected.source_id);
+            assert_eq!(actual.role, expected.role);
+            assert_eq!(actual.chunk_idx, expected.chunk_idx);
+            assert_eq!(actual.content_hash, expected.content_hash);
+            assert_eq!(
+                actual
+                    .embedding
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .embedding
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn exact_embedding_reuse_preserves_rows_across_batches_windows_and_invocations() -> Result<()> {
+        let messages: Vec<_> = [
+            "**repeat alpha**",
+            "repeat alpha",
+            "repeat beta",
+            "repeat alpha",
+            "",
+            "caf\u{e9} evidence",
+            "cafe\u{301} evidence",
+            "repeat beta",
+            "repeat alpha",
+            "repeat beta",
+            "caf\u{e9} evidence",
+            "repeat alpha",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, content)| EmbeddingInput {
+            message_id: i as u64 + 1,
+            created_at_ms: -(i as i64),
+            agent_id: i as u32 + 10,
+            workspace_id: i as u32 + 20,
+            source_id: i as u32 + 30,
+            role: (i % 3) as u8,
+            chunk_idx: i as u8,
+            content: content.to_owned(),
+        })
+        .collect();
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut indexer = SemanticIndexer::new("hash", None)?.with_batch_size(2)?;
+        assert!(
+            indexer.exact_reuse,
+            "the concrete hash factory admits reuse"
+        );
+        indexer.embedder = Box::new(MeasuredHashEmbedder {
+            inner: HashEmbedder::default(),
+            calls: calls.clone(),
+            fault: None,
+        });
+        let mut progress = Vec::new();
+        let actual = indexer.embed_messages_with_progress(&messages, |done, total| {
+            progress.push((done, total));
+        })?;
+        let first_calls = calls.lock().unwrap().clone();
+        assert_eq!(
+            first_calls.concat(),
+            ["repeat alpha", "repeat beta", "caf\u{e9} evidence"]
+        );
+        assert!(
+            first_calls
+                .iter()
+                .all(|batch| !batch.is_empty() && batch.len() <= 2)
+        );
+        assert_eq!(actual.len(), 11, "only the empty canonical row is omitted");
+        assert_eq!(progress.last(), Some(&(messages.len(), messages.len())));
+        assert!(progress.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+
+        let again = indexer.embed_messages(&messages)?;
+        assert_embedding_outputs_bitwise_equal(&again, &actual);
+        assert_eq!(calls.lock().unwrap().concat().len(), 6);
+
+        // The same concrete producer without admission takes the original
+        // per-row inference path, even though its ID still says fnv1a-384.
+        indexer.exact_reuse = false;
+        calls.lock().unwrap().clear();
+        let incumbent = indexer.embed_messages(&messages)?;
+        assert_eq!(calls.lock().unwrap().concat().len(), 11);
+        assert_embedding_outputs_bitwise_equal(&actual, &incumbent);
+        let tmp = tempdir()?;
+        let index = indexer.build_and_save_index(actual, tmp.path())?;
+        assert_eq!(
+            index.record_count(),
+            11,
+            "reuse must not deduplicate messages"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_embedding_reuse_checks_full_text_in_colliding_hash_buckets() -> Result<()> {
+        let messages = [
+            EmbeddingInput::new(1, "alpha distinctive evidence"),
+            EmbeddingInput::new(2, "beta unrelated evidence"),
+            EmbeddingInput::new(3, "alpha distinctive evidence"),
+        ];
+        let mut prepared = prepare_window(&messages, true);
+        for item in &mut prepared {
+            item.hash = [7; 32];
+        }
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let embedder = MeasuredHashEmbedder {
+            inner: HashEmbedder::default(),
+            calls: calls.clone(),
+            fault: None,
+        };
+        let mut outputs = Vec::new();
+        let mut reuse = ExactEmbeddingReuse::default();
+        for item in &prepared {
+            flush_prepared_batch(
+                std::slice::from_ref(item),
+                &mut outputs,
+                &ProgressBar::hidden(),
+                &embedder,
+                Some(&mut reuse),
+            )?;
+        }
+        assert_eq!(calls.lock().unwrap().concat().len(), 2);
+        assert_eq!(reuse.by_hash.len(), 1);
+        assert_eq!(reuse.by_hash[&[7; 32]].len(), 2);
+        for (output, item) in outputs.iter().zip(&prepared) {
+            assert_eq!(output.message_id, item.msg.message_id);
+            assert_eq!(
+                output.embedding,
+                embedder.inner.embed_sync(&item.canonical)?
+            );
+        }
+        assert_ne!(outputs[0].embedding, outputs[1].embedding);
+        assert_eq!(outputs[0].embedding, outputs[2].embedding);
+        Ok(())
+    }
+
+    #[test]
+    fn exact_embedding_reuse_failed_batch_preserves_state_and_can_retry() -> Result<()> {
+        let messages = [
+            EmbeddingInput::new(1, "existing canonical evidence"),
+            EmbeddingInput::new(2, "existing canonical evidence"),
+            EmbeddingInput::new(3, "new beta evidence"),
+            EmbeddingInput::new(4, "new gamma evidence"),
+        ];
+        let prepared = prepare_window(&messages, true);
+        for fault in [
+            EmbeddingFault::Inference,
+            EmbeddingFault::Count,
+            EmbeddingFault::Dimension,
+            EmbeddingFault::NonFinite,
+        ] {
+            let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut embedder = MeasuredHashEmbedder {
+                inner: HashEmbedder::default(),
+                calls: calls.clone(),
+                fault: None,
+            };
+            let mut outputs = Vec::new();
+            let mut reuse = ExactEmbeddingReuse::default();
+            let progress = ProgressBar::hidden();
+            flush_prepared_batch(
+                &prepared[..1],
+                &mut outputs,
+                &progress,
+                &embedder,
+                Some(&mut reuse),
+            )?;
+            let prior_outputs = outputs.clone();
+            let prior_cache = reuse.by_hash.clone();
+            let prior_progress = progress.position();
+            embedder.fault = Some(fault);
+            let error = flush_prepared_batch(
+                &prepared[1..],
+                &mut outputs,
+                &progress,
+                &embedder,
+                Some(&mut reuse),
+            )
+            .expect_err("an invalid producer batch must fail before output or cache mutation");
+            let expected_error = match fault {
+                EmbeddingFault::Inference => "injected inference failure",
+                EmbeddingFault::Count => "embedder returned 1 embeddings for 2 inputs",
+                EmbeddingFault::Dimension => "embedding dimension mismatch",
+                EmbeddingFault::NonFinite => "contains a non-finite value",
+            };
+            assert!(error.to_string().contains(expected_error), "{error:#}");
+            assert_embedding_outputs_bitwise_equal(&outputs, &prior_outputs);
+            assert_eq!(reuse.by_hash, prior_cache, "{fault:?}");
+            assert_eq!(progress.position(), prior_progress, "{fault:?}");
+
+            embedder.fault = None;
+            flush_prepared_batch(
+                &prepared[1..],
+                &mut outputs,
+                &progress,
+                &embedder,
+                Some(&mut reuse),
+            )?;
+            assert_eq!(outputs.len(), 4);
+            assert_eq!(progress.position(), 4);
+            assert_eq!(reuse.by_hash.len(), 3);
+            assert_eq!(
+                calls.lock().unwrap().as_slice(),
+                &[
+                    vec!["existing canonical evidence".to_owned()],
+                    vec![
+                        "new beta evidence".to_owned(),
+                        "new gamma evidence".to_owned()
+                    ],
+                    vec![
+                        "new beta evidence".to_owned(),
+                        "new gamma evidence".to_owned()
+                    ],
+                ]
+            );
+            for (output, input) in outputs.iter().zip(&prepared) {
+                assert_eq!(output.message_id, input.msg.message_id);
+                assert_eq!(
+                    output.embedding,
+                    embedder.inner.embed_sync(&input.canonical)?
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an attested native MiniLM bundle in CASS_NATIVE_REUSE_MODEL_DIR; never downloads"]
+    fn exact_embedding_reuse_native_model_preserves_batch_composition_bits() -> Result<()> {
+        let model_dir = PathBuf::from(
+            dotenvy::var("CASS_NATIVE_REUSE_MODEL_DIR")
+                .context("set CASS_NATIVE_REUSE_MODEL_DIR to an existing attested model bundle")?,
+        );
+        let mut indexer = SemanticIndexer {
+            embedder: Box::new(FastEmbedder::load_from_dir(&model_dir)?),
+            batch_size: 1,
+            exact_reuse: false,
+        };
+        assert!(indexer.embedder.is_semantic());
+        assert_eq!(indexer.embedder_dimension(), 384);
+        let short = "The database transaction recovered from its durable checkpoint.";
+        let long = "A compiler investigation compares generated machine instructions. ".repeat(28);
+        let unicode = "Unicode normalization preserves caf\u{e9} and \u{6771}\u{4eac} evidence.";
+        let messages: Vec<_> = [
+            short,
+            long.as_str(),
+            short,
+            unicode,
+            long.as_str(),
+            short,
+            unicode,
+            "A separate source message retains its own workspace provenance.",
+            short,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, content)| EmbeddingInput {
+            message_id: i as u64 + 1,
+            created_at_ms: i as i64,
+            agent_id: i as u32,
+            workspace_id: i as u32 + 1,
+            source_id: i as u32 + 2,
+            role: ROLE_USER,
+            chunk_idx: 0,
+            content: content.to_owned(),
+        })
+        .collect();
+        let singleton_incumbent = indexer.embed_messages(&messages)?;
+        assert_eq!(singleton_incumbent.len(), messages.len());
+        for batch_size in [1, 2, 8] {
+            indexer.batch_size = batch_size;
+            indexer.exact_reuse = false;
+            let incumbent = indexer.embed_messages(&messages)?;
+            assert_embedding_outputs_bitwise_equal(&incumbent, &singleton_incumbent);
+            indexer.exact_reuse = true;
+            let reused = indexer.embed_messages(&messages)?;
+            assert_embedding_outputs_bitwise_equal(&reused, &incumbent);
+        }
+        Ok(())
+    }
 
     #[test]
     fn multilingual_model_has_a_distinct_registered_vector_space_revision() {
