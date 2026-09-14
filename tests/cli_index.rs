@@ -118,6 +118,30 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
 
     let tmp = TempDir::new().unwrap();
     let home = tmp.path();
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(home.join(".env"))
+        .expect("stop dotenv discovery at this isolated fixture home");
+    let isolated_cmd = || {
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        cmd.env_clear();
+        for key in ["PATH", "SystemRoot", "WINDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+        cmd.current_dir(home)
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("CODEX_HOME", home.join(".codex"))
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("RUST_MIN_STACK", "134217728");
+        cmd
+    };
     let data_dir = home.join("cass-data");
     fs::create_dir_all(&data_dir).unwrap();
     let correct = home.join("parent-project/my-app");
@@ -253,7 +277,7 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
     let original_analytics = analytics_snapshot(Some(workspace_id));
 
     let run_index = |canonical_only: bool, semantic: bool| {
-        let mut cmd = base_cmd(home);
+        let mut cmd = isolated_cmd();
         cmd.env("CASS_AUTO_REFRESH", "0")
             .env("CASS_IGNORE_SOURCES_CONFIG", "1")
             .args(["index", "--full", "--json", "--data-dir"])
@@ -274,7 +298,7 @@ fn gh459_full_scan_repairs_cursor_workspace_without_reinserting_messages() {
         );
     };
     let search_payload = |mode: &str, workspace: Option<&std::path::Path>| {
-        let mut cmd = base_cmd(home);
+        let mut cmd = isolated_cmd();
         cmd.env("CASS_AUTO_REFRESH", "0")
             .env("CASS_SEMANTIC_EMBEDDER", "hash")
             .args([
