@@ -216,7 +216,7 @@ pub const SEMANTIC_SCHEMA_VERSION: u32 = 1;
 
 /// Changing the chunking strategy (e.g., max tokens per chunk, overlap)
 /// invalidates all existing vectors even if the model is unchanged.
-pub const CHUNKING_STRATEGY_VERSION: u32 = 1;
+pub const CHUNKING_STRATEGY_VERSION: u32 = 2;
 
 // ─── The policy struct ─────────────────────────────────────────────────────
 

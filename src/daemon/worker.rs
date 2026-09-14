@@ -15,7 +15,7 @@ use crate::indexer::semantic::{
     EmbeddingInput, SemanticIndexer, expected_vector_space_revision, message_id_from_db,
     saturating_u32_from_i64, semantic_doc_id_for_input,
 };
-use crate::search::canonicalize::canonicalize_for_embedding;
+use crate::search::canonicalize::embedding_passages;
 use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::semantic_manifest::TierKind;
 use crate::search::vector_index::{VectorIndex, role_code_from_str, vector_index_path};
@@ -392,18 +392,13 @@ impl EmbeddingWorker {
         // metadata, duplicate live records are possible, and an edited row's
         // old identity must be removed rather than merely appended around.
         let mut canonical_inputs: Vec<(String, EmbeddingInput)> = Vec::new();
+        let mut pending_passages: HashMap<u64, usize> = HashMap::new();
         let mut skipped_count = 0usize;
         let mut completed = 0i64;
 
         for msg in messages {
             if self.cancel_flag.load(Ordering::SeqCst) {
                 return Ok(EmbeddingPassOutcome::Cancelled);
-            }
-
-            let canonical = canonicalize_for_embedding(&msg.content);
-            if canonical.is_empty() {
-                completed += 1;
-                continue;
             }
 
             let role = role_code_from_str(&msg.role).unwrap_or(0);
@@ -422,21 +417,27 @@ impl EmbeddingWorker {
             let agent_id = saturating_u32_from_i64(msg.agent_id);
             let workspace_id = saturating_u32_from_i64(msg.workspace_id.unwrap_or(0));
 
-            let input = EmbeddingInput {
-                message_id,
-                created_at_ms: msg.created_at.unwrap_or(0),
-                agent_id,
-                workspace_id,
-                source_id: msg.source_id_hash,
-                role,
-                chunk_idx: 0,
-                content: canonical,
-            };
-            let Some(doc_id) = semantic_doc_id_for_input(&input) else {
+            let first_input = canonical_inputs.len();
+            for (ordinal, passage) in embedding_passages(&msg.content).into_iter().enumerate() {
+                let input = EmbeddingInput {
+                    message_id,
+                    created_at_ms: msg.created_at.unwrap_or(0),
+                    agent_id,
+                    workspace_id,
+                    source_id: msg.source_id_hash,
+                    role,
+                    chunk_idx: u8::try_from(ordinal)?,
+                    content: passage.to_owned(),
+                };
+                let Some(doc_id) = semantic_doc_id_for_input(&input) else {
+                    continue;
+                };
+                *pending_passages.entry(message_id).or_default() += 1;
+                canonical_inputs.push((doc_id, input));
+            }
+            if canonical_inputs.len() == first_input {
                 completed += 1;
-                continue;
-            };
-            canonical_inputs.push((doc_id, input));
+            }
         }
 
         let current_doc_ids = canonical_inputs
@@ -459,24 +460,25 @@ impl EmbeddingWorker {
             return Ok(EmbeddingPassOutcome::Completed);
         }
 
-        let inputs = canonical_inputs
-            .into_iter()
-            .filter_map(|(doc_id, input)| {
-                if existing_state.active_count(&doc_id) == 1 {
-                    skipped_count += 1;
+        let mut inputs = Vec::new();
+        for (doc_id, input) in canonical_inputs {
+            if existing_state.active_count(&doc_id) == 1 {
+                skipped_count += 1;
+                let pending = pending_passages.get_mut(&input.message_id).ok_or_else(|| {
+                    anyhow::anyhow!("cached passage has no canonical message progress entry")
+                })?;
+                *pending -= 1;
+                if *pending == 0 {
                     completed += 1;
-                    None
-                } else {
-                    Some(input)
                 }
-            })
-            .collect::<Vec<_>>();
+            } else {
+                inputs.push(input);
+            }
+        }
 
-        // `completed` so far counts only documents that are genuinely done
-        // (empty, invalid, or unchanged). Documents queued for embedding are
-        // counted as their chunk finishes, so job progress reflects the
-        // expensive embedding work instead of racing to ~100% during the
-        // cheap scan phase.
+        // Job totals are canonical messages, not vector passages. A message
+        // with both reused and missing passages completes only after its last
+        // missing passage finishes, even across progress chunk boundaries.
         let _ = storage.update_job_progress(job_id, completed);
 
         if inputs.is_empty() && !existing_state.path_exists {
@@ -514,7 +516,15 @@ impl EmbeddingWorker {
                 return Ok(EmbeddingPassOutcome::Cancelled);
             }
             embedded.extend(indexer.embed_messages(chunk)?);
-            completed += saturating_i64_from_usize(chunk.len());
+            for input in chunk {
+                let pending = pending_passages.get_mut(&input.message_id).ok_or_else(|| {
+                    anyhow::anyhow!("embedded passage has no canonical message progress entry")
+                })?;
+                *pending -= 1;
+                if *pending == 0 {
+                    completed += 1;
+                }
+            }
             let _ = storage.update_job_progress(job_id, completed);
             debug!(job_id, completed, "Embedding progress");
         }
@@ -868,6 +878,253 @@ mod tests {
         assert_eq!(emptied.record_count(), 0);
         assert_eq!(emptied.tombstone_count(), 0);
         assert_eq!(emptied.wal_record_count(), 0);
+    }
+
+    #[test]
+    fn gh470_daemon_passages_reconcile_tail_edits_shrink_and_unchanged() -> anyhow::Result<()> {
+        use crate::search::canonicalize::{canonicalize_for_embedding, content_hash};
+        use crate::search::embedder::Embedder;
+        use crate::search::hash_embedder::HashEmbedder;
+        use crate::search::vector_index::{SemanticDocId, parse_semantic_doc_id};
+
+        let temp = tempfile::tempdir()?;
+        let db_path = temp.path().join("archive.db");
+        let index_path = temp.path().join("semantic");
+        let storage = FrankenStorage::open(&db_path)?;
+        let (worker, _) = EmbeddingWorker::new();
+        let job_id = storage.upsert_embedding_job(&db_path.to_string_lossy(), "hash", 1)?;
+        storage.start_embedding_job(job_id)?;
+        let mut message = crate::storage::sqlite::MessageForEmbedding {
+            message_id: 41,
+            created_at: Some(1_700_000_000_000),
+            agent_id: 7,
+            workspace_id: Some(9),
+            source_id_hash: 11,
+            role: "assistant".into(),
+            content: format!(
+                "{}old tail",
+                "Review the Unicode résumé and preserve each diagnostic source location. "
+                    .repeat(100)
+            ),
+        };
+        let run = |message: &crate::storage::sqlite::MessageForEmbedding, path: &Path| {
+            worker.generate_embeddings_and_save(
+                &storage,
+                std::slice::from_ref(message),
+                "hash",
+                false,
+                job_id,
+                path,
+                &db_path,
+            )
+        };
+        let snapshot = |path: &Path| -> anyhow::Result<Vec<(SemanticDocId, Vec<u32>)>> {
+            let index = VectorIndex::open(&vector_index_path(path, "fnv1a-384"))?;
+            assert_eq!(index.wal_record_count(), 0);
+            assert_eq!(index.tombstone_count(), 0);
+            let mut records = Vec::new();
+            for ordinal in 0..index.record_count() {
+                let id = parse_semantic_doc_id(index.doc_id_at(ordinal)?)
+                    .ok_or_else(|| anyhow::anyhow!("invalid passage identity"))?;
+                assert_eq!((id.message_id, id.agent_id, id.workspace_id), (41, 7, 9));
+                assert_eq!(
+                    (id.source_id, id.role, id.created_at_ms),
+                    (11, 1, 1_700_000_000_000)
+                );
+                let vector = index.vector_at_f32(ordinal)?;
+                assert!(vector.iter().all(|value| value.is_finite()));
+                records.push((id, vector.into_iter().map(f32::to_bits).collect()));
+            }
+            records.sort_by_key(|(id, _)| id.chunk_idx);
+            Ok(records)
+        };
+
+        assert_eq!(run(&message, &index_path)?, EmbeddingPassOutcome::Completed);
+        let original = snapshot(&index_path)?;
+        assert_eq!(original.len(), 8);
+        assert_eq!(
+            original
+                .iter()
+                .map(|(id, _)| id.chunk_idx)
+                .collect::<Vec<_>>(),
+            (0..8).collect::<Vec<_>>()
+        );
+        let expected_head: String = message.content.chars().take(510).collect();
+        assert_eq!(
+            original[0].0.content_hash,
+            Some(content_hash(&canonicalize_for_embedding(&expected_head)))
+        );
+        let before = std::fs::read(vector_index_path(&index_path, "fnv1a-384"))?;
+        assert_eq!(run(&message, &index_path)?, EmbeddingPassOutcome::Completed);
+        assert_eq!(
+            std::fs::read(vector_index_path(&index_path, "fnv1a-384"))?,
+            before
+        );
+        assert_eq!(snapshot(&index_path)?, original);
+
+        // A real old producer embedded the canonical prefix once. Its header
+        // and actual hash vector must be rebuilt, never relabeled as passages.
+        let legacy_path = temp.path().join("legacy");
+        let legacy_fsvi = vector_index_path(&legacy_path, "fnv1a-384");
+        std::fs::create_dir_all(
+            legacy_fsvi
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("missing vector parent"))?,
+        )?;
+        let prefix = canonicalize_for_embedding(&message.content);
+        let legacy_id = SemanticDocId {
+            content_hash: Some(content_hash(&prefix)),
+            ..original[0].0
+        };
+        let legacy_vector = HashEmbedder::default().embed_sync(&prefix)?;
+        let mut legacy = VectorIndex::create_with_revision(
+            &legacy_fsvi,
+            "fnv1a-384",
+            "hash-fnv1a-modular-v1",
+            384,
+            frankensearch::index::Quantization::F16,
+        )?;
+        legacy.write_record(&legacy_id.to_doc_id_string(), &legacy_vector)?;
+        legacy.finish()?;
+        let source_before = message.content.clone();
+        assert_eq!(
+            run(&message, &legacy_path)?,
+            EmbeddingPassOutcome::Completed
+        );
+        assert_eq!(message.content, source_before);
+        assert_eq!(snapshot(&legacy_path)?, original);
+        assert_eq!(
+            VectorIndex::open(&legacy_fsvi)?.embedder_revision(),
+            expected_vector_space_revision("fnv1a-384")
+                .ok_or_else(|| anyhow::anyhow!("missing hash revision"))?
+        );
+
+        let old_tail = message.content.len() - "old tail".len();
+        message.content.replace_range(old_tail.., "new tail");
+        assert_eq!(run(&message, &index_path)?, EmbeddingPassOutcome::Completed);
+        let edited = snapshot(&index_path)?;
+        assert_eq!(edited.len(), 8);
+        assert_eq!(
+            &edited[..7],
+            &original[..7],
+            "unchanged passages retain exact metadata and vector bits"
+        );
+        assert_ne!(edited[7].0.content_hash, original[7].0.content_hash);
+        assert_ne!(
+            edited[7].1, original[7].1,
+            "the changed tail must be embedded"
+        );
+        let fresh = temp.path().join("fresh");
+        assert_eq!(run(&message, &fresh)?, EmbeddingPassOutcome::Completed);
+        assert_eq!(
+            snapshot(&fresh)?,
+            edited,
+            "reconciliation must equal a complete fresh embedding"
+        );
+
+        message.content = "short replacement retains the canonical message identity".into();
+        assert_eq!(run(&message, &index_path)?, EmbeddingPassOutcome::Completed);
+        let shrunk = snapshot(&index_path)?;
+        assert_eq!(
+            shrunk.len(),
+            1,
+            "obsolete long-message passages must be removed"
+        );
+        assert_eq!(shrunk[0].0.chunk_idx, 0);
+        assert_eq!(
+            shrunk[0].0.content_hash,
+            Some(content_hash(&message.content))
+        );
+        let jobs = storage.get_embedding_jobs(&db_path.to_string_lossy())?;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!((jobs[0].completed_docs, jobs[0].total_docs), (1, 1));
+        Ok(())
+    }
+
+    #[test]
+    fn gh470_daemon_progress_waits_for_the_last_passage_of_each_message() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db_path = temp.path().join("archive.db");
+        let storage = FrankenStorage::open(&db_path)?;
+        let index_path = temp.path().join("semantic");
+        let (worker, _) = EmbeddingWorker::new();
+        let make_message =
+            |message_id, content: String| crate::storage::sqlite::MessageForEmbedding {
+                message_id,
+                created_at: Some(1_700_000_000_000),
+                agent_id: 1,
+                workspace_id: None,
+                source_id_hash: 2,
+                role: "user".into(),
+                content,
+            };
+        let mut messages = vec![make_message(1, "short leading message".into())];
+        for id in 2..=17 {
+            messages.push(make_message(
+                id,
+                format!("message {id}: Unicode café source evidence. ").repeat(150),
+            ));
+        }
+        messages.push(make_message(18, " \n\t ".into()));
+        messages.push(make_message(-1, "invalid canonical identity".into()));
+        let job_id = storage.upsert_embedding_job(&db_path.to_string_lossy(), "hash", 19)?;
+        storage.start_embedding_job(job_id)?;
+        let trace_path = temp.path().join("worker-progress.jsonl");
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(Mutex::new(std::fs::File::create(&trace_path)?))
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, || {
+            worker.generate_embeddings_and_save(
+                &storage,
+                &messages,
+                "hash",
+                false,
+                job_id,
+                &index_path,
+                &db_path,
+            )
+        })?;
+        assert_eq!(result, EmbeddingPassOutcome::Completed);
+        let events = std::fs::read_to_string(&trace_path)?;
+        let completed = events
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|event| event["fields"]["message"] == "Embedding progress")
+            .map(|event| {
+                event["fields"]["completed"]
+                    .as_i64()
+                    .ok_or_else(|| anyhow::anyhow!("missing completed count: {event}"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        // At 128 inputs, one short and 15 long messages are complete; the last
+        // long message still has one pending passage. Empty/invalid rows add 2.
+        assert_eq!(completed, [18, 19], "actual worker trace: {events}");
+        let index = VectorIndex::open(&vector_index_path(&index_path, "fnv1a-384"))?;
+        assert_eq!(index.record_count(), 129);
+        drop(index);
+        let jobs = storage.get_embedding_jobs(&db_path.to_string_lossy())?;
+        assert_eq!((jobs[0].completed_docs, jobs[0].total_docs), (19, 19));
+        assert_eq!(
+            worker.generate_embeddings_and_save(
+                &storage,
+                &messages,
+                "hash",
+                false,
+                job_id,
+                &index_path,
+                &db_path,
+            )?,
+            EmbeddingPassOutcome::Completed
+        );
+        assert_eq!(
+            storage.get_embedding_jobs(&db_path.to_string_lossy())?[0].completed_docs,
+            19
+        );
+        Ok(())
     }
 
     #[test]

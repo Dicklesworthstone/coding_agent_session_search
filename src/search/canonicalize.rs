@@ -22,6 +22,61 @@ use ring::digest::{self, SHA256};
 /// Maximum characters to keep after canonicalization.
 pub const MAX_EMBED_CHARS: usize = 2000;
 
+/// Raw Unicode scalar values per passage for messages exceeding the legacy
+/// prefix. This fits the measured MiniLM corpus's token budget; it is not a
+/// universal tokenizer bound.
+pub const EMBEDDING_PASSAGE_CHARS: usize = 510;
+/// Bound vector growth independently of the size of a source message.
+pub const MAX_EMBEDDING_PASSAGES: usize = 8;
+
+/// Select deterministic raw passages before markdown collapse or truncation.
+///
+/// Short messages retain their exact input and chunk-zero identity. Long
+/// messages include both ends and evenly spaced interior windows. Windows can
+/// overlap; messages longer than the bounded coverage can have unsampled gaps.
+/// Returned slices borrow the source, so even a very large message requires
+/// only a fixed amount of boundary bookkeeping, not a character-sized copy.
+/// Changing this policy also requires new chunking and FSVI input revisions.
+pub fn embedding_passages(text: &str) -> Vec<&str> {
+    let char_count = text.chars().count();
+    if char_count <= MAX_EMBED_CHARS {
+        return vec![text];
+    }
+    let count = char_count
+        .div_ceil(EMBEDDING_PASSAGE_CHARS)
+        .min(MAX_EMBEDDING_PASSAGES);
+    let distance = char_count - EMBEDDING_PASSAGE_CHARS;
+    let steps = count - 1;
+    let mut starts = [0; MAX_EMBEDDING_PASSAGES];
+    let mut ends = [0; MAX_EMBEDDING_PASSAGES];
+    for ordinal in 0..count {
+        // Quotient/remainder form avoids multiplying a source-sized value.
+        starts[ordinal] = distance / steps * ordinal + distance % steps * ordinal / steps;
+        ends[ordinal] = starts[ordinal] + EMBEDDING_PASSAGE_CHARS;
+    }
+    let mut start_bytes = [0; MAX_EMBEDDING_PASSAGES];
+    let mut end_bytes = [0; MAX_EMBEDDING_PASSAGES];
+    let mut next_start = 0;
+    let mut next_end = 0;
+    for (position, (byte, _)) in text
+        .char_indices()
+        .chain(std::iter::once((text.len(), '\0')))
+        .enumerate()
+    {
+        while next_start < count && starts[next_start] == position {
+            start_bytes[next_start] = byte;
+            next_start += 1;
+        }
+        while next_end < count && ends[next_end] == position {
+            end_bytes[next_end] = byte;
+            next_end += 1;
+        }
+    }
+    (0..count)
+        .map(|ordinal| &text[start_bytes[ordinal]..end_bytes[ordinal]])
+        .collect()
+}
+
 /// Maximum lines to keep from the beginning of a code block.
 pub const CODE_HEAD_LINES: usize = 20;
 
@@ -315,6 +370,76 @@ pub fn is_search_noise_text(text: &str, query: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gh470_short_passages_preserve_source_and_canonical_input() {
+        for source in [
+            String::new(),
+            "OK".into(),
+            "**café** and 東京\n```rust\nlet answer = 42;\n```".into(),
+            "中".repeat(MAX_EMBED_CHARS),
+        ] {
+            let passages = embedding_passages(&source);
+            assert_eq!(passages, [source.as_str()]);
+            assert_eq!(passages[0].as_ptr(), source.as_ptr());
+            assert_eq!(
+                canonicalize_for_embedding(passages[0]),
+                canonicalize_for_embedding(&source)
+            );
+        }
+    }
+
+    #[test]
+    fn gh470_passages_bound_large_unicode_inputs_and_retain_both_ends() {
+        for chars in [2001, 4079, 4080, 4081, 100_000] {
+            let source: String = ['中', '🦀', 'é', '\u{301}', 'x']
+                .into_iter()
+                .cycle()
+                .take(chars)
+                .collect();
+            let passages = embedding_passages(&source);
+            assert!(passages.len() <= MAX_EMBEDDING_PASSAGES);
+            let mut previous_start = None;
+            let mut covered_until = 0;
+            let mut has_gap = false;
+            for passage in &passages {
+                assert_eq!(passage.chars().count(), EMBEDDING_PASSAGE_CHARS);
+                let start = passage.as_ptr() as usize - source.as_ptr() as usize;
+                let end = start + passage.len();
+                assert!(source.is_char_boundary(start) && source.is_char_boundary(end));
+                assert_eq!(source.get(start..end), Some(*passage));
+                assert!(previous_start.is_none_or(|previous| start > previous));
+                has_gap |= start > covered_until;
+                covered_until = end;
+                previous_start = Some(start);
+            }
+            assert_eq!(passages[0].as_ptr(), source.as_ptr());
+            assert_eq!(covered_until, source.len());
+            assert_eq!(
+                has_gap,
+                chars > MAX_EMBEDDING_PASSAGES * EMBEDDING_PASSAGE_CHARS
+            );
+        }
+    }
+
+    #[test]
+    fn gh470_raw_passages_recover_evidence_removed_by_code_collapse() {
+        let mut source = String::from("```rust\n");
+        for line in 0..40 {
+            source.push_str(&format!("// line {line}: {}\n", "x".repeat(80)));
+            if line == 26 {
+                source.push_str("// Tarjan lowlink identifies strongly connected components.\n");
+            }
+        }
+        source.push_str("```\n");
+        assert!(source.find("Tarjan").unwrap() > MAX_EMBED_CHARS);
+        assert!(!canonicalize_for_embedding(&source).contains("Tarjan"));
+        assert!(
+            embedding_passages(&source)
+                .iter()
+                .any(|passage| canonicalize_for_embedding(passage).contains("Tarjan"))
+        );
+    }
 
     #[test]
     fn canonicalize_fast_path_matches_slow_path_for_pure_ascii_inputs() {

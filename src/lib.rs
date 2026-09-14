@@ -120848,6 +120848,7 @@ fn run_models_backfill_batch(
 #[cfg(test)]
 mod semantic_identity_backfill_checkpoint_tests {
     use super::semantic_identity_backfill_fingerprint;
+    use crate::search::policy::{CHUNKING_STRATEGY_VERSION, SEMANTIC_SCHEMA_VERSION};
     use crate::search::semantic_manifest::{BuildCheckpoint, TierKind};
 
     fn fast_checkpoint() -> BuildCheckpoint {
@@ -120859,8 +120860,8 @@ mod semantic_identity_backfill_checkpoint_tests {
             conversations_processed: 41,
             total_conversations: 82,
             db_fingerprint: "content-v1:82:82:820".to_string(),
-            schema_version: 1,
-            chunking_version: 1,
+            schema_version: SEMANTIC_SCHEMA_VERSION,
+            chunking_version: CHUNKING_STRATEGY_VERSION,
             saved_at_ms: 1,
             last_message_id: Some(410),
             cursor_exhausted: false,
