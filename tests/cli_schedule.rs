@@ -16,20 +16,37 @@ fn cass_bin_path() -> &'static str {
 
 /// A cass invocation isolated from the developer's real environment.
 fn cass_cmd(home: &Path) -> Command {
+    // Stop dotenvy's ancestor search at this disposable fixture home, even
+    // when the test runner places it underneath the repository's .rch-tmp.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(home.join(".env"))
+    {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => panic!("create isolated fixture .env: {error}"),
+    }
     let mut cmd = Command::new(cass_bin_path());
+    cmd.env_clear();
+    for key in ["PATH", "SystemRoot", "WINDIR"] {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
+    cmd.current_dir(home);
     cmd.env("HOME", home);
+    cmd.env("USERPROFILE", home);
+    cmd.env("XDG_CONFIG_HOME", home.join(".config"));
+    cmd.env("XDG_DATA_HOME", home.join(".local/share"));
+    cmd.env("CLAUDE_CONFIG_DIR", home.join(".claude"));
+    cmd.env("CODEX_HOME", home.join(".codex"));
+    cmd.env("RUST_MIN_STACK", "134217728");
     cmd.env("TUI_HEADLESS", "1");
     cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
     cmd.env("CASS_IGNORE_SOURCES_CONFIG", "1");
     // Deterministic gates: never load-gate or idle-gate a test run.
     cmd.env("CASS_RESPONSIVENESS_DISABLE", "1");
-    cmd.env_remove("CASS_DATA_DIR");
-    cmd.env_remove("CASS_DB_PATH");
-    cmd.env_remove("XDG_CONFIG_HOME");
-    cmd.env_remove("XDG_DATA_HOME");
-    cmd.env_remove("CASS_AUTO_REFRESH");
-    cmd.env_remove("CASS_SCHEDULE_MAX_BACKFILL_BATCHES");
-    cmd.env_remove("CASS_RESPONSIVENESS_MIN_USER_IDLE_SECS");
     cmd
 }
 
@@ -272,6 +289,7 @@ fn schedule_run_nightly_skips_semantic_tiers_it_cannot_serve() {
 fn gh471_schedule_nightly_bounds_one_fast_worker_to_global_batch_allowance() {
     use coding_agent_search::search::semantic_manifest::SemanticManifest;
     use coding_agent_search::search::vector_index::{VectorIndex, vector_index_path};
+    use coding_agent_search::storage::sqlite::FrankenStorage;
 
     for limit in [0u32, 1, 2] {
         let tmp = tempfile::tempdir().unwrap();
@@ -328,6 +346,32 @@ fn gh471_schedule_nightly_bounds_one_fast_worker_to_global_batch_allowance() {
         );
         let report = parse_single_json_document(&output.stdout);
         assert_eq!(report["ok"], true, "{report}");
+        let storage = FrankenStorage::open_readonly(&data_dir.join("agent_search.db"))
+            .expect("read the actual nightly canonical archive");
+        let conversations = storage.list_conversations(i64::MAX, 0).unwrap();
+        let mut actual_sources: Vec<_> = conversations
+            .iter()
+            .map(|conversation| conversation.source_path.clone())
+            .collect();
+        actual_sources.sort();
+        let expected_sources: Vec<_> = (0..2)
+            .map(|ordinal| project.join(format!("scheduled-session-{ordinal}.jsonl")))
+            .collect();
+        assert_eq!(
+            actual_sources, expected_sources,
+            "nightly discovery must contain exactly the seeded sources; limit={limit}"
+        );
+        for conversation in conversations {
+            assert_eq!(conversation.agent_slug, "claude_code");
+            let messages = storage.fetch_messages(conversation.id.unwrap()).unwrap();
+            assert_eq!(messages.len(), 1, "{}", conversation.source_path.display());
+            assert!(
+                messages[0]
+                    .content
+                    .contains("scheduled checkpoint evidence")
+            );
+        }
+        drop(storage);
         let steps = report["steps"].as_array().expect("steps");
         let workers: Vec<_> = steps
             .iter()
