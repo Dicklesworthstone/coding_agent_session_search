@@ -2395,13 +2395,15 @@ fn validate_embedding_vector(
 pub struct SemanticIndexer {
     embedder: Box<dyn Embedder>,
     batch_size: usize,
-    // Set by the concrete CASS producer factory, never by an arbitrary
-    // SyncEmbed ID. Native batch-invariance qualification is still pending.
+    // Only the concrete CASS factory admits the hash and English native
+    // MiniLM producers. Multilingual retains uncached batches until qualified.
     exact_reuse: bool,
 }
 
 impl SemanticIndexer {
     pub fn new(embedder_type: &str, data_dir: Option<&Path>) -> Result<Self> {
+        let exact_reuse = embedder_type == "hash"
+            || FastEmbedder::canonical_name(embedder_type) == Some("minilm");
         let embedder: Box<dyn Embedder> = match embedder_type {
             "hash" => Box::new(HashEmbedder::default()),
             other => {
@@ -2419,7 +2421,7 @@ impl SemanticIndexer {
         Ok(Self {
             embedder,
             batch_size: resolved_default_batch_size(),
-            exact_reuse: embedder_type == "hash",
+            exact_reuse,
         })
     }
 
@@ -4695,11 +4697,29 @@ mod tests {
             dotenvy::var("CASS_NATIVE_REUSE_MODEL_DIR")
                 .context("set CASS_NATIVE_REUSE_MODEL_DIR to an existing attested model bundle")?,
         );
-        let mut indexer = SemanticIndexer {
-            embedder: Box::new(FastEmbedder::load_from_dir(&model_dir)?),
-            batch_size: 1,
-            exact_reuse: false,
-        };
+        assert!(
+            crate::search::fastembed_embedder::model_dir_override().is_none(),
+            "the factory proof must use its supplied managed model directory"
+        );
+        let data_dir = tempfile::tempdir()?;
+        let managed_model_dir = FastEmbedder::default_model_dir(data_dir.path());
+        fs::create_dir_all(&managed_model_dir)?;
+        let manifest = crate::search::model_download::ModelManifest::minilm_v2();
+        for file in &manifest.files {
+            let source = crate::search::model_download::model_file_path(&model_dir, file)
+                .with_context(|| format!("missing supplied model file: {}", file.name))?;
+            assert_eq!(
+                fs::copy(source, managed_model_dir.join(file.local_name()))?,
+                file.size
+            );
+        }
+        let mut indexer =
+            SemanticIndexer::new("minilm", Some(data_dir.path()))?.with_batch_size(1)?;
+        assert!(
+            indexer.exact_reuse,
+            "the real English MiniLM factory admits exact reuse"
+        );
+        indexer.exact_reuse = false;
         assert!(indexer.embedder.is_semantic());
         assert_eq!(indexer.embedder_dimension(), 384);
         let short = "The database transaction recovered from its durable checkpoint.";
