@@ -242,6 +242,9 @@ arbitrary = { version = "1", features = ["derive"] }
 serde_yaml = "0.9.34"
 rand = "0.10"
 rand_chacha = "0.10"
+# GH470 measures native model input tokens without padding or silent truncation.
+# Reuse the tokenizer and regex backend already resolved by native MiniLM.
+tokenizers = { version = "*", default-features = false, features = ["fancy-regex"] }
 # rusqlite is retained only for C-SQLite interop fixtures in tests; production
 # storage and historical salvage paths use frankensqlite.
 rusqlite = { version = "0.40.2", features = ["bundled", "modern_sqlite"] }

@@ -891,6 +891,7 @@ dependencies = [
  "strsim",
  "tempfile",
  "thiserror 2.0.20",
+ "tokenizers",
  "toml",
  "tracing",
  "tracing-appender",
