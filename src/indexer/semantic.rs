@@ -2315,21 +2315,17 @@ pub struct SemanticIndexer {
 impl SemanticIndexer {
     pub fn new(embedder_type: &str, data_dir: Option<&Path>) -> Result<Self> {
         let embedder: Box<dyn Embedder> = match embedder_type {
-            "fastembed" | "minilm" => {
+            "hash" => Box::new(HashEmbedder::default()),
+            other => {
+                let embedder_name = FastEmbedder::canonical_name(other)
+                    .ok_or_else(|| anyhow::anyhow!("unknown embedder: {other}"))?;
                 let dir = data_dir
-                    .ok_or_else(|| anyhow::anyhow!("data_dir required for fastembed embedder"))?;
-                let embedder_name = if embedder_type == "fastembed" {
-                    "minilm"
-                } else {
-                    embedder_type
-                };
+                    .ok_or_else(|| anyhow::anyhow!("data_dir required for native embedder"))?;
                 Box::new(
                     FastEmbedder::load_by_name(dir, embedder_name)
-                        .map_err(|e| anyhow::anyhow!("fastembed unavailable: {e}"))?,
+                        .map_err(|e| anyhow::anyhow!("native embedder unavailable: {e}"))?,
                 )
             }
-            "hash" => Box::new(HashEmbedder::default()),
-            other => bail!("unknown embedder: {other}"),
         };
 
         Ok(Self {

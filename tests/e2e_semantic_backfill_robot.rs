@@ -810,6 +810,97 @@ fn gh458_robot_unchanged_maintenance_skips_packet_replay_and_publication() -> Te
 }
 
 #[test]
+fn gh467_robot_quality_backfill_resolves_native_aliases_before_loading_models() -> TestResult {
+    use fs2::FileExt;
+
+    let temp = tempfile::tempdir()?;
+    let data_dir = temp.path().join("cass-data");
+    let db_path = temp.path().join("agent_search.db");
+    seed_canonical_db(&db_path)?;
+    let before = canonical_bundle_snapshot(&db_path)?;
+    let multilingual = "paraphrase-multilingual-MiniLM-L12-v2";
+
+    let run = |name: &str| {
+        cargo_bin_cmd!("cass")
+            .current_dir(temp.path())
+            .arg("--db")
+            .arg(&db_path)
+            .args([
+                "models",
+                "backfill",
+                "--tier",
+                "quality",
+                "--embedder",
+                name,
+                "--batch-conversations",
+                "1",
+                "--data-dir",
+            ])
+            .arg(&data_dir)
+            .arg("--json")
+            .env("HOME", temp.path())
+            .env("XDG_CONFIG_HOME", temp.path().join("config"))
+            .env("CASS_SEMANTIC_EMBEDDER", "minilm")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env_remove("FRANKENSEARCH_MODEL_DIR")
+            .timeout(Duration::from_secs(20))
+            .output()
+    };
+
+    fs::create_dir_all(&data_dir)?;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(data_dir.join("index-run.lock"))?;
+    lock.lock_exclusive()?;
+    assert_backfill_busy(&run("minilm")?)?;
+    assert!(
+        canonical_bundle_snapshot(&db_path)? == before,
+        "busy-index refusal must preserve database bundle bytes and timestamps"
+    );
+    FileExt::unlock(&lock)?;
+
+    for (name, model_directory) in [
+        ("minilm", "all-MiniLM-L6-v2"),
+        ("fastembed", "all-MiniLM-L6-v2"),
+        ("multilingual-minilm", multilingual),
+        ("multilingual-minilm-384", multilingual),
+        ("paraphrase-multilingual-minilm-l12-v2", multilingual),
+    ] {
+        let output = run(name)?;
+        assert_eq!(output.status.code(), Some(20), "{name}: {output:?}");
+        assert!(output.stdout.is_empty(), "{name}: {output:?}");
+        let report: Value = serde_json::from_slice(&output.stderr)?;
+        assert_eq!(report["error"]["kind"], "model", "{name}: {report}");
+        assert_eq!(report["error"]["retryable"], true, "{name}: {report}");
+        let message = report["error"]["message"].as_str().unwrap_or_default();
+        let selected_directory = data_dir.join("models").join(model_directory);
+        assert!(
+            message.contains("model directory not found"),
+            "{name}: {report}"
+        );
+        assert!(
+            message.contains(selected_directory.to_string_lossy().as_ref()),
+            "{name}: {report}"
+        );
+        assert!(!message.contains("unknown embedder"), "{name}: {report}");
+        assert!(
+            !data_dir.join("models").exists(),
+            "{name}: no automatic acquisition"
+        );
+        assert!(SemanticManifest::load(&data_dir)?.is_none(), "{name}");
+        assert!(
+            canonical_bundle_snapshot(&db_path)? == before,
+            "{name}: unavailable model must preserve database bundle bytes and timestamps"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn robot_models_backfill_checkpoints_then_publishes_fast_tier() -> TestResult {
     let temp = tempfile::tempdir()?;
     let data_dir = temp.path().join("cass-data");

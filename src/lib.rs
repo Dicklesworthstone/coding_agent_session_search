@@ -119559,7 +119559,10 @@ fn run_models_install(
     // (bead coding_agent_session_search-odbnh).
     let state = check_model_installed(&model_dir, &manifest);
     if state.is_ready() {
-        println!("{} Model is already installed and verified.", "✓".green());
+        println!(
+            "{} Model files are already installed and verified.",
+            "✓".green()
+        );
         println!("  Location: {}", model_dir.display());
         return Ok(());
     }
@@ -119655,7 +119658,9 @@ fn run_models_install(
             println!("{} Model installed successfully!", "✓".green());
             println!("  Location: {}", model_dir.display());
             println!();
-            println!("Semantic search is now available. Run 'cass search' to try it out.");
+            println!(
+                "Model files are verified. Semantic search also requires a working embedder and a completed backfill."
+            );
             Ok(())
         }
         Err(e) => {
@@ -120420,6 +120425,21 @@ fn run_models_backfill(
             }
         })?;
 
+    // Refuse unavailable models before opening the archive: even a current-
+    // schema storage open can change its shared-memory sidecar. Keep model
+    // admission inside the maintenance lock so index-busy retains precedence.
+    let indexer = SemanticIndexer::new(&embedder_type, Some(&data_dir)).map_err(|e| CliError {
+        code: 20,
+        kind: CliErrorKind::Model.kind_str(),
+        message: format!("Failed to initialize semantic embedder '{embedder_type}': {e}"),
+        hint: Some(if embedder_type == "fastembed" {
+            "Run 'cass models install -y' or retry with --embedder hash".into()
+        } else {
+            "Use --embedder hash or install the selected embedder model".into()
+        }),
+        retryable: embedder_type != "hash",
+    })?;
+
     let storage = crate::storage::sqlite::open_current_schema_storage_with_timeout(
         &db_path,
         std::time::Duration::from_secs(10),
@@ -120451,17 +120471,6 @@ fn run_models_backfill(
     } else {
         model_manifest.revision.clone()
     };
-    let indexer = SemanticIndexer::new(&embedder_type, Some(&data_dir)).map_err(|e| CliError {
-        code: 20,
-        kind: CliErrorKind::Model.kind_str(),
-        message: format!("Failed to initialize semantic embedder '{embedder_type}': {e}"),
-        hint: Some(if embedder_type == "fastembed" {
-            "Run 'cass models install -y' or retry with --embedder hash".into()
-        } else {
-            "Use --embedder hash or install the selected embedder model".into()
-        }),
-        retryable: embedder_type != "hash",
-    })?;
     // GH458: a fully unchanged archive must not pay a canonical count scan
     // just to discover that no backfill work is needed. The completed cache
     // binds the open descriptor, real WAL, artifact and producer; any mismatch
