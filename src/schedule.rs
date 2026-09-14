@@ -10,7 +10,8 @@
 //!   "daily"` never had.
 //! * **nightly** (default 03:00 local): remote syncs that are due, a full
 //!   `cass index --full --background`, then bounded semantic backfill batches
-//!   (`cass models backfill --scheduled`) — first the fast (hash) tier, then
+//!   (`cass models backfill --scheduled --max-batches N`) in one worker per
+//!   tier — first the fast (hash) tier, then
 //!   the quality (MiniLM) tier when the model is installed — until the
 //!   backlog drains or the scheduler gates (load, console idle) say stop.
 //!
@@ -1052,42 +1053,61 @@ fn run_job_with_gate(
                     ));
                 }
                 let mut batches = 0u32;
-                'tiers: for tier in tiers {
-                    loop {
-                        if batches >= cfg.max_backfill_batches {
-                            steps.push(skipped_step(
-                                "semantic-backfill",
-                                format!("stopped after {batches} batches (CASS_SCHEDULE_MAX_BACKFILL_BATCHES)"),
-                            ));
-                            break 'tiers;
-                        }
-                        let args = vec![
-                            "--db".to_string(),
-                            cfg.db_path.display().to_string(),
-                            "--color=never".to_string(),
-                            "models".to_string(),
-                            "backfill".to_string(),
-                            "--tier".to_string(),
-                            tier.to_string(),
-                            "--scheduled".to_string(),
-                            "--data-dir".to_string(),
-                            cfg.data_dir.display().to_string(),
-                            "--json".to_string(),
-                        ];
-                        batches += 1;
-                        let mut step = run_step(
-                            &format!("semantic-backfill:{tier}:{batches}"),
-                            &cfg.binary,
-                            &cfg.data_dir,
-                            &args,
-                            log.as_mut(),
-                        );
-                        let model_unavailable = soften_model_unavailable_backfill_step(&mut step);
-                        let stop = model_unavailable || backfill_batch_should_stop(&step);
+                for tier in tiers {
+                    let remaining = cfg.max_backfill_batches - batches;
+                    if remaining == 0 {
+                        steps.push(skipped_step(
+                            "semantic-backfill",
+                            format!("stopped after {batches} batches (CASS_SCHEDULE_MAX_BACKFILL_BATCHES)"),
+                        ));
+                        break;
+                    }
+                    let args = vec![
+                        "--db".to_string(),
+                        cfg.db_path.display().to_string(),
+                        "--color=never".to_string(),
+                        "models".to_string(),
+                        "backfill".to_string(),
+                        "--tier".to_string(),
+                        tier.to_string(),
+                        "--max-batches".to_string(),
+                        remaining.to_string(),
+                        "--scheduled".to_string(),
+                        "--data-dir".to_string(),
+                        cfg.data_dir.display().to_string(),
+                        "--json".to_string(),
+                    ];
+                    let mut step = run_step(
+                        &format!("semantic-backfill:{tier}:{}", batches + 1),
+                        &cfg.binary,
+                        &cfg.data_dir,
+                        &args,
+                        log.as_mut(),
+                    );
+                    let model_unavailable = soften_model_unavailable_backfill_step(&mut step);
+                    if model_unavailable || !step.ok {
                         steps.push(step);
-                        if stop {
-                            break;
-                        }
+                        break;
+                    }
+                    let Some(attempted) = backfill_worker_attempts(&step, remaining) else {
+                        step.ok = false;
+                        step.stderr_tail = Some(
+                            "backfill worker returned missing or invalid batch accounting; no further tiers were launched"
+                                .to_string(),
+                        );
+                        steps.push(step);
+                        break;
+                    };
+                    batches += attempted;
+                    let paused = step.result.as_ref().is_some_and(|result| {
+                        matches!(
+                            result.get("status").and_then(serde_json::Value::as_str),
+                            Some("paused" | "disabled")
+                        )
+                    });
+                    steps.push(step);
+                    if paused {
+                        break;
                     }
                 }
             }
@@ -1187,32 +1207,25 @@ fn minilm_model_probe(
     (step, installed)
 }
 
-/// Stop looping `models backfill --scheduled` when the batch failed, the
-/// scheduler paused/disabled, nothing was processed, or the tier published.
-pub fn backfill_batch_should_stop(step: &StepReport) -> bool {
+/// Accept only exact, bounded worker accounting before spending the remainder
+/// of the global nightly allowance on another tier.
+fn backfill_worker_attempts(step: &StepReport, remaining: u32) -> Option<u32> {
     if !step.ok {
-        return true;
+        return None;
     }
-    let Some(result) = &step.result else {
-        return true;
-    };
-    let scheduler_state = result
-        .get("scheduler")
-        .and_then(|s| s.get("state"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("running");
-    if scheduler_state != "running" {
-        return true;
-    }
-    let processed = result
-        .get("conversations_processed")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let published = result
-        .get("published")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    processed == 0 || published
+    let result = step.result.as_ref()?;
+    let attempted = u32::try_from(result.get("batches_attempted")?.as_u64()?).ok()?;
+    let completed = u32::try_from(result.get("batches_completed")?.as_u64()?).ok()?;
+    let uncompleted = attempted.checked_sub(completed)?;
+    let initializations = result.get("model_initializations")?.as_u64()?;
+    let status = result.get("status")?.as_str()?;
+    let admitted = matches!(status, "checkpointed" | "published" | "unchanged" | "idle");
+    (attempted > 0
+        && attempted <= remaining
+        && initializations == u64::from(completed > 0)
+        && (admitted || matches!(status, "paused" | "disabled"))
+        && uncompleted == u32::from(!admitted))
+    .then_some(attempted)
 }
 
 // ---------------------------------------------------------------------------
@@ -1434,7 +1447,7 @@ mod tests {
     }
 
     #[test]
-    fn backfill_loop_stops_on_pause_publish_or_empty_batch() {
+    fn backfill_worker_accounting_rejects_missing_or_unbounded_counts() {
         let step = |ok: bool, result: Option<serde_json::Value>| StepReport {
             name: "b".into(),
             argv: vec![],
@@ -1445,22 +1458,55 @@ mod tests {
             result,
             stderr_tail: None,
         };
-        assert!(backfill_batch_should_stop(&step(false, None)));
-        assert!(backfill_batch_should_stop(&step(true, None)));
-        let running_more = serde_json::json!({
-            "scheduler": {"state": "running"},
-            "conversations_processed": 64,
-            "published": false
-        });
-        assert!(!backfill_batch_should_stop(&step(true, Some(running_more))));
-        let paused =
-            serde_json::json!({"scheduler": {"state": "paused"}, "conversations_processed": 64});
-        assert!(backfill_batch_should_stop(&step(true, Some(paused))));
-        let published = serde_json::json!({"scheduler": {"state": "running"}, "conversations_processed": 10, "published": true});
-        assert!(backfill_batch_should_stop(&step(true, Some(published))));
-        let empty =
-            serde_json::json!({"scheduler": {"state": "running"}, "conversations_processed": 0});
-        assert!(backfill_batch_should_stop(&step(true, Some(empty))));
+        assert_eq!(backfill_worker_attempts(&step(false, None), 2), None);
+        assert_eq!(backfill_worker_attempts(&step(true, None), 2), None);
+        let counts = |attempted: serde_json::Value, completed, models| {
+            serde_json::json!({
+                "status": if completed > 0 { "checkpointed" } else { "paused" },
+                "batches_attempted": attempted,
+                "batches_completed": completed,
+                "model_initializations": models,
+            })
+        };
+        for invalid in [
+            counts(0.into(), 0, 0),
+            counts(3.into(), 2, 1),
+            counts(1.into(), 2, 1),
+            counts(2.into(), 1, 1),
+            counts(1.into(), 1, 0),
+            counts(2.into(), 2, 2),
+            counts(serde_json::json!(1.5), 1, 1),
+            counts(serde_json::json!(-1), 0, 0),
+            counts(serde_json::json!(u64::MAX), 0, 0),
+        ] {
+            assert_eq!(
+                backfill_worker_attempts(&step(true, Some(invalid)), 2),
+                None
+            );
+        }
+        for valid in [counts(1.into(), 0, 0), counts(2.into(), 2, 1)] {
+            let expected = valid["batches_attempted"].as_u64().unwrap() as u32;
+            assert_eq!(
+                backfill_worker_attempts(&step(true, Some(valid)), 2),
+                Some(expected)
+            );
+        }
+        for invalid_status in [serde_json::Value::Null, "failed".into(), "cancelled".into()] {
+            let mut report = counts(1.into(), 1, 1);
+            report["status"] = invalid_status;
+            assert_eq!(backfill_worker_attempts(&step(true, Some(report)), 2), None);
+        }
+        for (attempted, completed, models) in [(2, 2, 1), (2, 0, 0), (1, 0, 1)] {
+            let mut report = counts(attempted.into(), completed, models);
+            report["status"] = "paused".into();
+            assert_eq!(backfill_worker_attempts(&step(true, Some(report)), 2), None);
+        }
+        let mut paused_after_checkpoint = counts(2.into(), 1, 1);
+        paused_after_checkpoint["status"] = "paused".into();
+        assert_eq!(
+            backfill_worker_attempts(&step(true, Some(paused_after_checkpoint)), 2),
+            Some(2)
+        );
     }
 
     #[test]

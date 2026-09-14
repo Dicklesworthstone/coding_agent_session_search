@@ -269,6 +269,127 @@ fn schedule_run_nightly_skips_semantic_tiers_it_cannot_serve() {
 }
 
 #[test]
+fn gh471_schedule_nightly_bounds_one_fast_worker_to_global_batch_allowance() {
+    use coding_agent_search::search::semantic_manifest::SemanticManifest;
+    use coding_agent_search::search::vector_index::{VectorIndex, vector_index_path};
+
+    for limit in [0u32, 1, 2] {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let data_dir = tmp.path().join("data");
+        let project = home.join(".claude/projects/-schedule-backfill");
+        std::fs::create_dir_all(&project).unwrap();
+        for ordinal in 0..2 {
+            let record = serde_json::json!({
+                "parentUuid": null,
+                "cwd": "/test/scheduled-backfill",
+                "sessionId": format!("scheduled-session-{ordinal}"),
+                "version": "2.0.37",
+                "gitBranch": "main",
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": format!("Investigate scheduled checkpoint evidence for distinct session {ordinal}")
+                },
+                "uuid": format!("scheduled-message-{ordinal}"),
+                "timestamp": "2025-11-12T18:31:18.697Z"
+            });
+            std::fs::write(
+                project.join(format!("scheduled-session-{ordinal}.jsonl")),
+                format!("{record}\n"),
+            )
+            .unwrap();
+        }
+        let mut command = cass_cmd(&home);
+        command
+            .args([
+                "schedule",
+                "run",
+                "--job",
+                "nightly",
+                "--force",
+                "--json",
+                "--data-dir",
+            ])
+            .arg(&data_dir)
+            .env("CASS_SCHEDULE_MAX_BACKFILL_BATCHES", limit.to_string())
+            .env("CASS_SEMANTIC_MAX_MESSAGES_PER_CHECKPOINT", "1")
+            .env("CASS_SEMANTIC_BACKFILL_FORCE", "1")
+            .env("RUST_MIN_STACK", "134217728");
+        let output = assert_cmd::Command::from_std(command)
+            .timeout(std::time::Duration::from_secs(120))
+            .output()
+            .expect("run bounded real nightly worker");
+        assert!(
+            output.status.success(),
+            "limit={limit}; stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report = parse_single_json_document(&output.stdout);
+        assert_eq!(report["ok"], true, "{report}");
+        let steps = report["steps"].as_array().expect("steps");
+        let workers: Vec<_> = steps
+            .iter()
+            .filter(|step| {
+                step["argv"]
+                    .as_array()
+                    .is_some_and(|args| args.iter().any(|arg| arg.as_str() == Some("backfill")))
+            })
+            .collect();
+        let manifest = SemanticManifest::load(&data_dir).expect("read actual worker manifest");
+        if limit == 0 {
+            assert!(
+                workers.is_empty(),
+                "zero global budget must start no worker: {report}"
+            );
+            assert!(
+                manifest.is_none(),
+                "zero budget must not start semantic publication"
+            );
+            continue;
+        }
+        assert_eq!(
+            workers.len(),
+            1,
+            "one real child serves every admitted fast batch: {report}"
+        );
+        let worker = workers[0];
+        assert_eq!(worker["ok"], true, "{worker}");
+        let args = worker["argv"].as_array().expect("actual child argv");
+        let bound = args
+            .windows(2)
+            .find(|pair| pair[0] == "--max-batches")
+            .expect("worker must receive its remaining allowance");
+        assert_eq!(bound[1], limit.to_string());
+        let result = &worker["result"];
+        assert_eq!(result["batches_attempted"], limit, "{result}");
+        assert_eq!(result["batches_completed"], limit, "{result}");
+        assert_eq!(result["model_initializations"], 1, "{result}");
+        assert_eq!(result["conversations_processed"], limit, "{result}");
+        assert_eq!(result["total_conversations"], 2, "{result}");
+        let manifest = manifest.expect("admitted worker must persist progress");
+        if limit == 1 {
+            assert_eq!(result["status"], "checkpointed", "{result}");
+            let checkpoint = manifest.checkpoint.expect("bounded first checkpoint");
+            assert_eq!(checkpoint.conversations_processed, 1);
+            assert_eq!(checkpoint.docs_embedded, 1);
+            assert!(manifest.fast_tier.is_none());
+        } else {
+            assert_eq!(result["status"], "published", "{result}");
+            assert!(manifest.checkpoint.is_none());
+            let tier = manifest.fast_tier.expect("published fast tier");
+            assert!(tier.ready);
+            assert_eq!((tier.doc_count, tier.conversation_count), (2, 2));
+            let index = VectorIndex::open(&vector_index_path(&data_dir, "fnv1a-384"))
+                .expect("open actually published vectors");
+            assert_eq!(index.record_count(), 2);
+            assert_ne!(index.doc_id_at(0).unwrap(), index.doc_id_at(1).unwrap());
+        }
+    }
+}
+
+#[test]
 fn schedule_run_nightly_no_semantic_skips_backfill_entirely() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
