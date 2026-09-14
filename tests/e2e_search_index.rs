@@ -37,6 +37,947 @@ use util::e2e_log::{E2ePerformanceMetrics, PhaseTracker};
 // E2E Logger Support
 // =============================================================================
 
+// GH472: full source coverage with conditional lexical rebuilding.
+mod gh472 {
+    use super::*;
+    use serde_json::{Value, json};
+    use std::cell::Cell;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    type Archive = BTreeMap<PathBuf, Value>;
+
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        home: PathBuf,
+        tracker: PhaseTracker,
+        streaming: &'static str,
+        invocation: Cell<usize>,
+    }
+
+    struct Run {
+        report: Value,
+        events: Vec<Value>,
+    }
+
+    impl Run {
+        fn rebuild_entries(&self) -> usize {
+            self.events
+                .iter()
+                .filter(|event| {
+                    event["fields"]["message"] == "lexical rebuild prep profile"
+                        && event["fields"]["component"] == "main"
+                        && event["fields"]["step"] == "open_readonly"
+                })
+                .count()
+        }
+
+        fn assert_no_rebuild(&self) {
+            assert_eq!(self.rebuild_entries(), 0, "{:?}", self.events);
+            assert!(
+                self.events.iter().all(|event| {
+                    event["fields"]["message"]
+                        != "lexical rebuild authoritative equivalence evidence"
+                }),
+                "{:?}",
+                self.events
+            );
+        }
+
+        fn assert_inline(&self) {
+            assert_eq!(
+                self.report["indexing_stats"]["lexical_strategy"], "incremental_inline",
+                "{}",
+                self.report
+            );
+            assert_eq!(
+                self.report["indexing_stats"]["lexical_strategy_reason"],
+                "incremental_scan_applies_inline_lexical_updates_only_for_new_messages",
+                "{}",
+                self.report
+            );
+            assert!(
+                self.report["indexing_stats"]
+                    .get("lexical_repair")
+                    .is_none()
+            );
+            assert_eq!(self.report["lexical_update_deferred"], false);
+            self.assert_no_rebuild();
+        }
+
+        fn assert_codex_observations(&self, skipped: usize, parsed: usize) {
+            // Mutable path dependencies deliberately cannot certify parser
+            // identity. Those builds must parse every source; pinned builds
+            // must demonstrate the exact durable-observation reuse below.
+            let (skipped, parsed) = if env!("CASS_SOURCE_INGEST_REUSE") == "true" {
+                (skipped, parsed)
+            } else {
+                (0, skipped + parsed)
+            };
+            let observations = self
+                .events
+                .iter()
+                .filter(|event| {
+                    event["fields"]["message"] == "source_ingest_observation"
+                        && event["fields"]["connector"] == "codex"
+                })
+                .map(|event| {
+                    event["fields"]["skipped"]
+                        .as_bool()
+                        .expect("source observation includes an explicit skip decision")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                observations.iter().filter(|&&value| value).count(),
+                skipped,
+                "{:?}",
+                self.events
+            );
+            assert_eq!(
+                observations.iter().filter(|&&value| !value).count(),
+                parsed,
+                "{:?}",
+                self.events
+            );
+        }
+
+        fn assert_totals(&self, conversations: usize, messages: usize) {
+            assert_eq!(
+                self.report["conversations"], conversations,
+                "{}",
+                self.report
+            );
+            assert_eq!(self.report["messages"], messages, "{}", self.report);
+            assert_eq!(
+                self.report["indexing_stats"]["total_conversations"], conversations,
+                "{}",
+                self.report
+            );
+            assert_eq!(
+                self.report["indexing_stats"]["total_messages"], messages,
+                "{}",
+                self.report
+            );
+        }
+    }
+
+    impl Fixture {
+        fn new(name: &str, streaming: &'static str) -> Self {
+            let temp = tempfile::TempDir::new().expect("create isolated GH472 home");
+            let home = fs::canonicalize(temp.path()).expect("canonical fixture home");
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(home.join(".env"))
+                .expect("stop dotenv discovery before reaching an ancestor checkout");
+            for directory in [
+                ".codex",
+                ".claude",
+                ".config",
+                ".local/share",
+                "data",
+                "aider",
+                "traces",
+            ] {
+                fs::create_dir_all(home.join(directory)).expect("create fixture directory");
+            }
+            let fixture_name = home.file_name().unwrap().to_str().unwrap();
+            let tracker = tracker_for(&format!(
+                "gh472_{name}_streaming_{streaming}_{fixture_name}"
+            ));
+            Self {
+                _temp: temp,
+                home,
+                tracker,
+                streaming,
+                invocation: Cell::new(0),
+            }
+        }
+
+        fn data(&self) -> PathBuf {
+            self.home.join("data")
+        }
+
+        fn index(&self) -> PathBuf {
+            expected_index_dir(&self.data())
+        }
+
+        fn checkpoint_path(&self) -> PathBuf {
+            self.index().join(".lexical-rebuild-state.json")
+        }
+
+        fn checkpoint(&self) -> Value {
+            let path = self.checkpoint_path();
+            let bytes = fs::read(&path).expect("read real lexical checkpoint");
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|error| panic!("invalid checkpoint {}: {error}", path.display()))
+        }
+
+        fn run(&self, args: &[&str], overrides: &[(&str, &str)]) -> Run {
+            let number = self.invocation.get();
+            self.invocation.set(number + 1);
+            let trace = self.home.join("traces").join(format!("run-{number}.jsonl"));
+            assert!(!trace.exists(), "each child must use a fresh trace");
+            let environment = self
+                .tracker
+                .command_environment()
+                .with_home(&self.home)
+                .with_codex_home(self.home.join(".codex"));
+            let mut command = environment.cass_assert_command();
+            command.env_clear();
+            for key in ["PATH", "SystemRoot", "WINDIR"] {
+                if let Some(value) = std::env::var_os(key) {
+                    command.env(key, value);
+                }
+            }
+            environment.apply_to_assert(&mut command);
+            command
+                .current_dir(&self.home)
+                .env("USERPROFILE", &self.home)
+                .env("XDG_CONFIG_HOME", self.home.join(".config"))
+                .env("XDG_DATA_HOME", self.home.join(".local/share"))
+                .env("CLAUDE_CONFIG_DIR", self.home.join(".claude"))
+                .env("CASS_AIDER_DATA_ROOT", self.home.join("aider"))
+                .env("CASS_DATA_DIR", self.data())
+                .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+                .env("CASS_STREAMING_INDEX", self.streaming)
+                .env("CASS_AUTO_REFRESH", "0")
+                .env("CASS_RESPONSIVENESS_DISABLE", "1")
+                .env("CASS_PREP_PROFILE", "1")
+                .env("CASS_INDEX_NO_PROGRESS_EVENTS", "1")
+                .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+                .env("RUST_MIN_STACK", "134217728")
+                .env("TUI_HEADLESS", "1")
+                .env("NO_COLOR", "1")
+                .env("CASS_TRACE_FILE", &trace)
+                .env(
+                    "CASS_TRACE_FILTER",
+                    "warn,coding_agent_search::indexer=debug",
+                )
+                .env("CASS_TRACE_MAX_BYTES", "8388608")
+                .env("CASS_TRACE_MAX_EVENTS", "65536")
+                .args(["--color", "never"]);
+            if args.first() == Some(&"schedule") {
+                // The trace sink holds an exclusive file lock. Override only
+                // the scheduler parent's CLI path; its one index child must
+                // inherit CASS_TRACE_FILE and produce the asserted trace.
+                let parent_trace = self
+                    .home
+                    .join("traces")
+                    .join(format!("run-{number}-parent.jsonl"));
+                assert!(!parent_trace.exists(), "fresh scheduler parent trace");
+                command.arg("--trace-file").arg(parent_trace);
+            }
+            command.args(args).timeout(Duration::from_secs(180));
+            for (key, value) in overrides {
+                command.env(key, value);
+            }
+            let output = command.output().expect("run actual GH472 cass child");
+            assert!(
+                output.status.success(),
+                "args={args:?} overrides={overrides:?}\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let report = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                panic!(
+                    "invalid JSON for {args:?}: {error}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+            let log = fs::read_to_string(&trace).unwrap_or_else(|error| {
+                panic!(
+                    "missing trace {}: {error}\nstderr:\n{}",
+                    trace.display(),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+            let events = log
+                .lines()
+                .map(|line| {
+                    let event: Value = serde_json::from_str(line)
+                        .unwrap_or_else(|error| panic!("invalid trace record {line:?}: {error}"));
+                    assert_ne!(event["event"], "trace_truncated", "{log}");
+                    assert_ne!(event["fields"]["event"], "trace_truncated", "{log}");
+                    event
+                })
+                .collect::<Vec<_>>();
+            assert!(!events.is_empty(), "trace must contain real child events");
+            Run { report, events }
+        }
+
+        fn nightly(&self, overrides: &[(&str, &str)]) -> Run {
+            let mut run = self.run(
+                &[
+                    "schedule",
+                    "run",
+                    "--job",
+                    "nightly",
+                    "--force",
+                    "--no-semantic",
+                    "--json",
+                ],
+                overrides,
+            );
+            assert_eq!(run.report["ok"], true, "{}", run.report);
+            let index_steps = run.report["steps"]
+                .as_array()
+                .expect("schedule steps")
+                .iter()
+                .filter(|step| {
+                    step["argv"]
+                        .as_array()
+                        .is_some_and(|argv| argv.iter().any(|arg| arg == "index"))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(index_steps.len(), 1, "{}", run.report);
+            let step = index_steps[0];
+            assert_eq!(step["ok"], true, "{step}");
+            assert_eq!(step["exit_code"], 0, "{step}");
+            assert!(
+                step["argv"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|arg| arg == "--full"),
+                "nightly must retain full source census: {step}"
+            );
+            let result = step["result"].clone();
+            assert_eq!(result["success"], true, "{result}");
+            assert_eq!(result["full"], true, "{result}");
+            run.report = result;
+            run
+        }
+
+        fn seed(&self, day: &str, name: &str, needle: &str) -> PathBuf {
+            let filename = format!("rollout-{name}.jsonl");
+            make_codex_session(
+                &self.home.join(".codex"),
+                day,
+                &filename,
+                needle,
+                1_732_118_400_000,
+            );
+            self.home.join(".codex/sessions").join(day).join(filename)
+        }
+
+        fn archive(&self) -> Archive {
+            let storage = SqliteStorage::open_readonly(&self.data().join("agent_search.db"))
+                .expect("read canonical archive without changing its checkpoint fingerprint");
+            let mut archive = Archive::new();
+            for conversation in storage.list_conversations(100, 0).unwrap() {
+                let id = conversation.id.expect("canonical conversation ID");
+                let messages = storage
+                    .fetch_messages(id)
+                    .unwrap()
+                    .into_iter()
+                    .map(|message| {
+                        json!({
+                            "id": message.id.expect("canonical message ID"),
+                            "idx": message.idx,
+                            "role": message.role,
+                            "content": message.content
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    archive
+                        .insert(
+                            conversation.source_path,
+                            json!({
+                                "id": id,
+                                "agent": conversation.agent_slug,
+                                "external_id": conversation.external_id,
+                                "title": conversation.title,
+                                "workspace": conversation.workspace,
+                                "source_id": conversation.source_id,
+                                "origin_host": conversation.origin_host,
+                                "messages": messages
+                            })
+                        )
+                        .is_none(),
+                    "fixture must not collapse distinct canonical source identities"
+                );
+            }
+            archive
+        }
+
+        fn baseline(&self) -> Archive {
+            let first = self.seed("2024/11/20", "first", "gh472firstanchorz");
+            let second = self.seed("2024/11/21", "second", "gh472secondanchorz");
+            let run = self.run(&["index", "--full", "--json"], &[]);
+            assert!(
+                run.rebuild_entries() > 0,
+                "positive trace control: {:?}",
+                run.events
+            );
+            run.assert_totals(2, 4);
+            let archive = self.archive();
+            assert_eq!(
+                archive.keys().cloned().collect::<Vec<_>>(),
+                vec![first.clone(), second.clone()],
+                "only the two generated sources may be admitted"
+            );
+            assert_codex_pair(&archive, &first, "gh472firstanchorz");
+            assert_codex_pair(&archive, &second, "gh472secondanchorz");
+            let storage =
+                SqliteStorage::open_readonly(&self.data().join("agent_search.db")).unwrap();
+            assert_eq!(storage.source_ingest_ledger_entries().unwrap().len(), 2);
+            drop(storage);
+            assert_eq!(self.checkpoint()["completed"], true);
+            assert_eq!(self.checkpoint()["indexed_docs"], 4);
+            archive
+        }
+
+        fn receipts(&self) -> Vec<Vec<u8>> {
+            [
+                ".lexical-rebuild-equivalence.json",
+                ".lexical-refresh-ledger.json",
+            ]
+            .map(|name| fs::read(self.index().join(name)).expect("authoritative publish receipt"))
+            .into_iter()
+            .collect()
+        }
+
+        fn assert_search(&self, needle: &str, archive: &Archive) {
+            // These unique literal needles query both indexed title and content.
+            // Match canonical rows independently of search order, scores, or previews.
+            let mut expected = Vec::new();
+            for (source, conversation) in archive {
+                let title_matches = conversation["title"]
+                    .as_str()
+                    .is_some_and(|title| title.contains(needle));
+                for message in conversation["messages"].as_array().unwrap() {
+                    if title_matches || message["content"].as_str().unwrap().contains(needle) {
+                        expected.push(
+                            json!({
+                                "source_path": source,
+                                "line_number": message["idx"].as_i64().unwrap() + 1,
+                                "title": conversation["title"].as_str().unwrap_or(""),
+                                "content": message["content"],
+                                "agent": conversation["agent"],
+                                "workspace": conversation["workspace"].as_str().unwrap_or(""),
+                                "source_id": conversation["source_id"],
+                                "origin_kind": "local",
+                                "origin_host": conversation["origin_host"]
+                            })
+                            .to_string(),
+                        );
+                    }
+                }
+            }
+            let run = self.run(
+                &[
+                    "search",
+                    needle,
+                    "--json",
+                    "--mode",
+                    "lexical",
+                    "--no-maintenance",
+                    "--limit",
+                    "100",
+                ],
+                &[],
+            );
+            assert_ne!(run.report.pointer("/budget/timed_out"), Some(&json!(true)));
+            let mut actual = run.report["hits"]
+                .as_array()
+                .expect("actual lexical hits")
+                .iter()
+                .map(|hit| {
+                    json!({
+                        "source_path": hit["source_path"],
+                        "line_number": hit["line_number"],
+                        "title": hit["title"],
+                        "content": hit["content"],
+                        "agent": hit["agent"],
+                        "workspace": hit["workspace"],
+                        "source_id": hit["source_id"],
+                        "origin_kind": hit["origin_kind"],
+                        "origin_host": hit["origin_host"]
+                    })
+                    .to_string()
+                })
+                .collect::<Vec<_>>();
+            expected.sort();
+            actual.sort();
+            assert_eq!(
+                actual, expected,
+                "missing/duplicate/misattributed hits: {}",
+                run.report
+            );
+        }
+
+        fn replace_with_sparse_donor(&self) {
+            let donor = Self::new("sparse_donor", self.streaming);
+            let source = donor.seed("2024/11/22", "donor", "gh472donoranchorz");
+            append_jsonl_lines(
+                &source,
+                &[json!({
+                    "timestamp": "2024-11-20T12:00:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "gh472donoranchorz third message"}]
+                    }
+                })],
+            );
+            let run = donor.run(&["index", "--full", "--json"], &[]);
+            run.assert_totals(1, 3);
+            assert!(run.rebuild_entries() > 0);
+            assert_eq!(
+                raw_lexical_total_matches(&donor.index(), "gh472donoranchorz"),
+                3
+            );
+            let backup = self.data().join("before-sparse-donor");
+            fs::rename(self.index(), &backup).expect("retain original real generation");
+            fs::rename(donor.index(), self.index()).expect("install real three-document donor");
+            // This is the original archive's completed state, not the donor's
+            // unrelated checkpoint. Thus the sparse planner is admitted with
+            // expected=4/observed=3, above the separate 50% hollow threshold.
+            fs::copy(
+                backup.join(".lexical-rebuild-state.json"),
+                self.checkpoint_path(),
+            )
+            .expect("restore matching original archive checkpoint");
+            assert_eq!(self.checkpoint()["completed"], true);
+            assert_eq!(self.checkpoint()["indexed_docs"], 4);
+            assert_eq!(
+                raw_lexical_total_matches(&self.index(), "gh472firstanchorz"),
+                0
+            );
+            assert_eq!(
+                raw_lexical_total_matches(&self.index(), "gh472donoranchorz"),
+                3
+            );
+        }
+    }
+
+    fn assert_retained(before: &Archive, after: &Archive) {
+        for (source, original) in before {
+            assert_eq!(
+                after.get(source),
+                Some(original),
+                "canonical identity/content changed: {source:?}"
+            );
+        }
+    }
+
+    fn assert_codex_pair(archive: &Archive, source: &Path, needle: &str) {
+        let conversation = &archive[source];
+        assert_eq!(conversation["agent"], "codex");
+        assert_eq!(conversation["source_id"], "local");
+        assert!(conversation["id"].as_i64().unwrap() > 0);
+        let messages = conversation["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["idx"], 0);
+        assert_eq!(messages[1]["idx"], 1);
+        assert_eq!(messages[0]["content"], needle);
+        assert_eq!(messages[1]["content"], format!("{needle}_response"));
+        assert!(
+            messages
+                .iter()
+                .all(|message| message["id"].as_i64().unwrap() > 0)
+        );
+        assert_ne!(messages[0]["id"], messages[1]["id"]);
+    }
+
+    #[test]
+    fn nightly_healthy_reconciliation_preserves_ids_and_appends_inline() {
+        for streaming in ["0", "1"] {
+            let fixture = Fixture::new("healthy", streaming);
+            let original = fixture.baseline();
+            let receipts = fixture.receipts();
+            let checkpoint = fs::read(fixture.checkpoint_path()).unwrap();
+            let noop = fixture.nightly(&[]);
+            noop.assert_inline();
+            noop.assert_totals(2, 4);
+            noop.assert_codex_observations(2, 0);
+            assert_eq!(fixture.archive(), original);
+            assert_eq!(fs::read(fixture.checkpoint_path()).unwrap(), checkpoint);
+
+            let new_source = fixture.seed("2024/11/23", "third", "gh472thirdanchorz");
+            let appended = fixture.nightly(&[]);
+            appended.assert_inline();
+            appended.assert_codex_observations(2, 1);
+            let archive = fixture.archive();
+            assert_retained(&original, &archive);
+            assert_eq!(archive.len(), 3);
+            assert_codex_pair(&archive, &new_source, "gh472thirdanchorz");
+            assert_eq!(fixture.receipts(), receipts);
+            for needle in [
+                "gh472firstanchorz",
+                "gh472secondanchorz",
+                "gh472thirdanchorz",
+            ] {
+                fixture.assert_search(needle, &archive);
+            }
+
+            // Growing a known source must preserve its old row IDs as well.
+            let first = original.keys().next().unwrap();
+            append_codex_session(first, "gh472tailanchorz", 1_732_118_500_000);
+            let grown = fixture.nightly(&[]);
+            grown.assert_inline();
+            grown.assert_codex_observations(2, 1);
+            let after_growth = fixture.archive();
+            let old = &archive[first];
+            let new = &after_growth[first];
+            assert_eq!(new["id"], old["id"]);
+            assert_eq!(new["messages"].as_array().unwrap().len(), 4);
+            assert_eq!(
+                &new["messages"].as_array().unwrap()[..2],
+                old["messages"].as_array().unwrap().as_slice()
+            );
+            assert_eq!(new["messages"][2]["content"], "gh472tailanchorz");
+            assert_eq!(new["messages"][3]["content"], "gh472tailanchorz_response");
+            for (source, row) in &archive {
+                if source != first {
+                    assert_eq!(after_growth.get(source), Some(row));
+                }
+            }
+            fixture.assert_search("gh472tailanchorz", &after_growth);
+            fixture.assert_search("gh472firstanchorz", &after_growth);
+            let final_noop = fixture.nightly(&[]);
+            final_noop.assert_inline();
+            final_noop.assert_totals(3, 8);
+            final_noop.assert_codex_observations(3, 0);
+            assert_eq!(fixture.archive(), after_growth);
+            assert_eq!(fixture.receipts(), receipts);
+        }
+    }
+
+    #[test]
+    fn nightly_sparse_reconciliation_recounts_after_skipped_scan() {
+        for streaming in ["0", "1"] {
+            for add_source in [false, true] {
+                let fixture = Fixture::new(
+                    if add_source {
+                        "sparse_plus_new"
+                    } else {
+                        "sparse_no_new"
+                    },
+                    streaming,
+                );
+                let original = fixture.baseline();
+                fixture.replace_with_sparse_donor();
+                let new_source =
+                    add_source.then(|| fixture.seed("2024/11/23", "third", "gh472thirdanchorz"));
+                let repaired = fixture.nightly(&[]);
+                assert_eq!(repaired.rebuild_entries(), 1, "{:?}", repaired.events);
+                let repair = &repaired.report["indexing_stats"]["lexical_repair"];
+                assert_eq!(
+                    repair["kind"], "authoritative_canonical_db_rebuild",
+                    "{repair}"
+                );
+                assert_eq!(
+                    repair["reason"],
+                    "incremental_index_repairs_sparse_tantivy_from_authoritative_canonical_db_before_scan",
+                    "{repair}"
+                );
+                assert_eq!(repair["canonical_conversations"], 2);
+                assert_eq!(repair["canonical_messages"], 4);
+                assert_eq!(repair["observed_tantivy_docs"], 3);
+                repaired.assert_codex_observations(2, usize::from(add_source));
+                let conversations = 2 + usize::from(add_source);
+                let messages = 4 + 2 * usize::from(add_source);
+                repaired.assert_totals(conversations, messages);
+                let archive = fixture.archive();
+                assert_eq!(archive.len(), conversations);
+                assert_retained(&original, &archive);
+                if let Some(source) = &new_source {
+                    assert_codex_pair(&archive, source, "gh472thirdanchorz");
+                }
+                let checkpoint = fixture.checkpoint();
+                assert_eq!(checkpoint["completed"], true);
+                assert_eq!(checkpoint["db"]["total_conversations"], conversations);
+                assert_eq!(checkpoint["db"]["total_messages"], messages);
+                assert_eq!(checkpoint["indexed_docs"], messages);
+                assert_eq!(
+                    raw_lexical_total_matches(&fixture.index(), "gh472donoranchorz"),
+                    0
+                );
+                for needle in [
+                    "gh472firstanchorz",
+                    "gh472secondanchorz",
+                    "gh472thirdanchorz",
+                ] {
+                    fixture.assert_search(needle, &archive);
+                }
+                let unchanged = fixture.nightly(&[]);
+                unchanged.assert_inline();
+                unchanged.assert_totals(conversations, messages);
+                unchanged.assert_codex_observations(conversations, 0);
+                assert_eq!(fixture.archive(), archive);
+            }
+        }
+    }
+
+    #[test]
+    fn nightly_reconciliation_censuses_old_mtime_fallback_sources() {
+        let fixture = Fixture::new("fallback_census", "1");
+        let original = fixture.baseline();
+        let initial = fixture.home.join("aider/initial/.aider.chat.history.md");
+        fs::create_dir_all(initial.parent().unwrap()).unwrap();
+        let history = include_str!("fixtures/aider/.aider.chat.history.md");
+        fs::write(
+            &initial,
+            format!("{history}\n> gh472aiderinitialz\n\nRetain gh472aiderinitialz discussion.\n"),
+        )
+        .unwrap();
+        fixture.run(&["index", "--json"], &[]);
+        let with_aider = fixture.archive();
+        assert_retained(&original, &with_aider);
+        assert_eq!(with_aider.len(), 3);
+        assert_eq!(with_aider[&initial]["agent"], "aider");
+        fixture.assert_search("gh472aiderinitialz", &with_aider);
+        let storage =
+            SqliteStorage::open_readonly(&fixture.data().join("agent_search.db")).unwrap();
+        assert!(
+            storage
+                .get_connector_last_scan_ts("aider")
+                .unwrap()
+                .is_some_and(|watermark| watermark > 101_000),
+            "establish this fallback provider's own watermark before adding an old file"
+        );
+        drop(storage);
+
+        let old_source = fixture.home.join("aider/late/.aider.chat.history.md");
+        fs::create_dir_all(old_source.parent().unwrap()).unwrap();
+        fs::write(
+            &old_source,
+            format!("{history}\n> gh472aideroldz\n\nRecover gh472aideroldz discussion.\n"),
+        )
+        .unwrap();
+        let old_time = std::time::UNIX_EPOCH + Duration::from_secs(100);
+        fs::File::open(&old_source)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old_time))
+            .unwrap();
+        assert_eq!(
+            fs::metadata(&old_source).unwrap().modified().unwrap(),
+            old_time
+        );
+
+        let incremental = fixture.run(&["index", "--json"], &[]);
+        incremental.assert_codex_observations(2, 0);
+        assert_eq!(fixture.archive(), with_aider);
+        assert_eq!(
+            raw_lexical_total_matches(&fixture.index(), "gh472aideroldz"),
+            0,
+            "ordinary timestamp-filtered discovery must demonstrate the negative branch"
+        );
+        let nightly = fixture.nightly(&[]);
+        nightly.assert_inline();
+        nightly.assert_codex_observations(2, 0);
+        let archive = fixture.archive();
+        assert_retained(&with_aider, &archive);
+        assert_eq!(archive.len(), 4);
+        assert_eq!(archive[&old_source]["agent"], "aider");
+        assert!(
+            archive[&old_source]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| message["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("gh472aideroldz"))
+        );
+        fixture.assert_search("gh472aideroldz", &archive);
+        fixture.assert_search("gh472firstanchorz", &archive);
+        assert_eq!(
+            fs::metadata(&old_source).unwrap().modified().unwrap(),
+            old_time
+        );
+        let noop = fixture.nightly(&[]);
+        noop.assert_inline();
+        assert_eq!(fixture.archive(), archive);
+        fixture.assert_search("gh472aideroldz", &archive);
+    }
+
+    #[test]
+    fn nightly_reconciliation_uncertain_admission_keeps_full_repair() {
+        for case in [
+            "deferred",
+            "count_skipped",
+            "checkpoint_missing",
+            "checkpoint_malformed",
+            "checkpoint_foreign",
+        ] {
+            let fixture = Fixture::new(case, "1");
+            let original = fixture.baseline();
+            let checkpoint = fixture.checkpoint_path();
+            let mut overrides = Vec::new();
+            match case {
+                "deferred" => overrides.push(("CASS_DEFER_LEXICAL_UPDATES", "1")),
+                "count_skipped" => {
+                    fixture.replace_with_sparse_donor();
+                    overrides.push(("CASS_SKIP_PREFLIGHT_COUNT_TOTAL_MESSAGES", "1"));
+                }
+                "checkpoint_missing" => {
+                    fs::rename(&checkpoint, fixture.data().join("retained-checkpoint.json"))
+                        .unwrap();
+                }
+                "checkpoint_malformed" => {
+                    fs::rename(&checkpoint, fixture.data().join("retained-checkpoint.json"))
+                        .unwrap();
+                    fs::write(&checkpoint, b"{incomplete checkpoint").unwrap();
+                }
+                "checkpoint_foreign" => {
+                    let mut state = fixture.checkpoint();
+                    state["db"]["db_path"] = json!(fixture.home.join("foreign/agent_search.db"));
+                    fs::rename(&checkpoint, fixture.data().join("retained-checkpoint.json"))
+                        .unwrap();
+                    fs::write(&checkpoint, serde_json::to_vec(&state).unwrap()).unwrap();
+                }
+                _ => unreachable!("closed table of admission controls"),
+            }
+            // Keep the count-skip case at 3/4 with no new rows, so the
+            // test cannot pass merely because an unrelated append repaired it.
+            let new_source = (case != "count_skipped")
+                .then(|| fixture.seed("2024/11/23", "third", "gh472thirdanchorz"));
+            let repaired = fixture.nightly(&overrides);
+            assert!(
+                repaired.rebuild_entries() > 0,
+                "uncertain admission must retain authoritative repair: case={case}, {:?}",
+                repaired.events
+            );
+            assert_eq!(
+                repaired.report["indexing_stats"]["lexical_strategy"],
+                "deferred_authoritative_db_rebuild",
+                "case={case}, {}",
+                repaired.report
+            );
+            assert_eq!(
+                repaired.report["indexing_stats"]["lexical_strategy_reason"],
+                "full_refresh_defers_inline_lexical_writes_to_authoritative_db_rebuild",
+                "case={case}, {}",
+                repaired.report
+            );
+            let conversations = if case == "count_skipped" { 2 } else { 3 };
+            repaired.assert_totals(conversations, conversations * 2);
+            let archive = fixture.archive();
+            assert_eq!(archive.len(), conversations, "case={case}");
+            assert_retained(&original, &archive);
+            if let Some(source) = &new_source {
+                assert_codex_pair(&archive, source, "gh472thirdanchorz");
+            }
+            assert_eq!(fixture.checkpoint()["completed"], true);
+            assert_eq!(fixture.checkpoint()["indexed_docs"], conversations * 2);
+            assert_eq!(
+                raw_lexical_total_matches(&fixture.index(), "gh472donoranchorz"),
+                0
+            );
+            for needle in [
+                "gh472firstanchorz",
+                "gh472secondanchorz",
+                "gh472thirdanchorz",
+            ] {
+                fixture.assert_search(needle, &archive);
+            }
+            // Removing the child-only override permits healthy reconciliation
+            // after repair; no inherited env or persistent config is changed.
+            let healthy = fixture.nightly(&[]);
+            healthy.assert_inline();
+            assert_eq!(fixture.archive(), archive);
+        }
+    }
+
+    #[test]
+    fn operator_full_and_force_ignore_nightly_optimization() {
+        let fixture = Fixture::new("operator_controls", "1");
+        let original = fixture.baseline();
+        let staged = fixture.seed("2024/11/23", "third", "gh472thirdanchorz");
+        let force = fixture.run(
+            &["index", "--full", "--force-rebuild", "--json"],
+            &[("CASS_NIGHTLY_RECONCILIATION", "1")],
+        );
+        assert_eq!(force.report["force_rebuild"], true);
+        assert_eq!(force.report["full"], true);
+        assert!(force.rebuild_entries() > 0, "{:?}", force.events);
+        force.assert_totals(2, 4);
+        force.assert_codex_observations(0, 0);
+        assert_eq!(fixture.archive(), original);
+        assert!(!fixture.archive().contains_key(&staged));
+        assert_eq!(
+            raw_lexical_total_matches(&fixture.index(), "gh472thirdanchorz"),
+            0,
+            "force-rebuild intentionally rebuilds the canonical archive without rescanning raw logs"
+        );
+        fixture.assert_search("gh472firstanchorz", &original);
+
+        // Fixture::run clears the environment, so this operator invocation
+        // has no nightly marker. A real append defeats the legitimate noop
+        // optimization already present in ordinary unchanged --full runs.
+        let full = fixture.run(&["index", "--full", "--json"], &[]);
+        assert_eq!(full.report["force_rebuild"], false);
+        assert!(full.rebuild_entries() > 0, "{:?}", full.events);
+        full.assert_totals(3, 6);
+        let archive = fixture.archive();
+        assert_retained(&original, &archive);
+        assert_eq!(archive.len(), 3);
+        assert_codex_pair(&archive, &staged, "gh472thirdanchorz");
+        fixture.assert_search("gh472thirdanchorz", &archive);
+        fixture.assert_search("gh472firstanchorz", &archive);
+    }
+
+    #[test]
+    fn nightly_truncated_and_disappeared_sources_preserve_canonical_history() {
+        for streaming in ["0", "1"] {
+            let fixture = Fixture::new("retained_history", streaming);
+            let original = fixture.baseline();
+            let source = original.keys().next().unwrap();
+            append_codex_session(source, "gh472retainedtailz", 1_732_118_500_000);
+            fixture.nightly(&[]).assert_inline();
+            let grown = fixture.archive();
+            assert_eq!(grown[source]["id"], original[source]["id"]);
+            assert_eq!(grown[source]["messages"].as_array().unwrap().len(), 4);
+            assert_eq!(
+                grown[source]["messages"][2]["content"],
+                "gh472retainedtailz"
+            );
+            assert_eq!(
+                grown[source]["messages"][3]["content"],
+                "gh472retainedtailz_response"
+            );
+            let receipts = fixture.receipts();
+            // Retain the original raw bytes outside discovery; truncating an
+            // append-oriented log must not delete already-canonical history.
+            let raw = fs::read_to_string(source).unwrap();
+            fs::write(fixture.home.join("retained-original-source.txt"), &raw).unwrap();
+            let short = raw.lines().take(2).collect::<Vec<_>>().join("\n") + "\n";
+            fs::write(source, short).unwrap();
+            fs::File::open(source)
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(100)),
+                )
+                .unwrap();
+            let truncated = fixture.nightly(&[]);
+            truncated.assert_inline();
+            truncated.assert_codex_observations(1, 1);
+            truncated.assert_totals(2, 6);
+            assert_eq!(fixture.archive(), grown);
+            fixture.assert_search("gh472retainedtailz", &grown);
+
+            // Disappearance is archival retention, not a request to erase
+            // canonical messages. Rename rather than delete the fixture.
+            fs::rename(source, fixture.home.join("disappeared-source.jsonl")).unwrap();
+            let absent = fixture.nightly(&[]);
+            absent.assert_inline();
+            absent.assert_codex_observations(1, 0);
+            absent.assert_totals(2, 6);
+            assert_eq!(fixture.archive(), grown);
+            assert_eq!(fixture.receipts(), receipts);
+            fixture.assert_search("gh472retainedtailz", &grown);
+            fixture.assert_search("gh472firstanchorz", &grown);
+        }
+    }
+}
+
 fn tracker_for(test_name: &str) -> PhaseTracker {
     PhaseTracker::new("e2e_search_index", test_name)
 }

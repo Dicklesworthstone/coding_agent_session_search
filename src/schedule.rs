@@ -825,6 +825,7 @@ fn run_step(
     binary: &Path,
     data_dir: &Path,
     args: &[String],
+    environment: &[(&str, &str)],
     log: Option<&mut File>,
 ) -> StepReport {
     let started = Instant::now();
@@ -839,6 +840,7 @@ fn run_step(
     // the wrong archive when `schedule run --data-dir` names a custom one.
     let output = Command::new(binary)
         .args(args)
+        .envs(environment.iter().copied())
         .stdin(Stdio::null())
         .env("CASS_INDEX_NO_PROGRESS_EVENTS", "1")
         .env("CASS_AUTO_REFRESH", "0")
@@ -1000,6 +1002,7 @@ fn run_job_with_gate(
                     &cfg.binary,
                     &cfg.data_dir,
                     &args,
+                    &[],
                     log.as_mut(),
                 ));
             }
@@ -1009,6 +1012,14 @@ fn run_job_with_gate(
         // index lock) is an expected outcome for a scheduled run, not a
         // failure — the next timer firing simply tries again.
         let full = matches!(job, ScheduleJob::Nightly);
+        // Retain the full source census: timestamp-only connectors can miss
+        // restored historical files. The indexer may reconcile a verified
+        // lexical generation inline instead of rebuilding the whole archive.
+        let index_environment: &[(&str, &str)] = if full {
+            &[("CASS_NIGHTLY_RECONCILIATION", "1")]
+        } else {
+            &[]
+        };
         let args: Vec<String> = background_index_args(&cfg.data_dir, &cfg.db_path, full)
             .into_iter()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1018,6 +1029,7 @@ fn run_job_with_gate(
             &cfg.binary,
             &cfg.data_dir,
             &args,
+            index_environment,
             log.as_mut(),
         );
         let index_busy = soften_busy_index_step(&mut index_step);
@@ -1082,6 +1094,7 @@ fn run_job_with_gate(
                         &cfg.binary,
                         &cfg.data_dir,
                         &args,
+                        &[],
                         log.as_mut(),
                     );
                     let model_unavailable = soften_model_unavailable_backfill_step(&mut step);
@@ -1191,7 +1204,7 @@ fn minilm_model_probe(
         "status".to_string(),
         "--json".to_string(),
     ];
-    let mut step = run_step("models-status", binary, data_dir, &args, log);
+    let mut step = run_step("models-status", binary, data_dir, &args, &[], log);
     let installed = step
         .result
         .as_ref()

@@ -3127,25 +3127,17 @@ fn should_skip_noop_final_lexical_checkpoint_refresh(
 ///
 /// The pre-scan repair (`choose_incremental_canonical_lexical_repair_plan`)
 /// rebuilds the lexical index from the authoritative database and persists an
-/// exact completed checkpoint, and the run *then* continues into the
-/// incremental source scan. That ordering is unique to this path: the
-/// canonical-only full rebuild performs no scan, and the post-scan rebuilds
-/// run after ingest. So the checkpoint written by the repair is the only one a
-/// run can invalidate by itself — and only when the follow-up scan actually
-/// ingested canonical rows, which is what moves the `COUNT`/`MAX(id)` content
-/// fingerprint the checkpoint carries.
-///
-/// The resume-an-interrupted-rebuild arm also rebuilds before anything else,
-/// but it returns without ever entering the scan, so its `scan_canonical_mutations`
-/// stay zero. The mutation term is what makes that safe without the caller
-/// having to know it: any path whose scan changed nothing is left on the
-/// cheaper skip, because the fingerprint the rebuild certified is still exactly
-/// the database's.
+/// exact completed checkpoint, and the run *then* continues into the source
+/// scan. Even a scan that skips every unchanged source overwrites the progress
+/// counts while leaving `total_counts_exact` set. Recount after any such scan
+/// so reports and the final checkpoint describe the archive, not just the
+/// discovered delta. Resume-only and canonical-only rebuilds perform no scan;
+/// healthy scans without a preceding repair retain their existing fast path.
 fn should_redrive_final_lexical_checkpoint_refresh_after_pre_scan_repair(
     exact_completed_checkpoint_predates_scan: bool,
-    scan_canonical_mutations: CanonicalMutationCounts,
+    performed_scan: bool,
 ) -> bool {
-    exact_completed_checkpoint_predates_scan && scan_canonical_mutations.changed()
+    exact_completed_checkpoint_predates_scan && performed_scan
 }
 
 fn should_skip_post_full_scan_authoritative_rebuild(
@@ -16025,6 +16017,17 @@ fn run_index_inner(
     } else {
         false
     };
+    // GH #472: nightly still needs the full source census and archive safety
+    // preflight. Only a matching completed checkpoint admits incremental
+    // lexical publication. Missing evidence and explicit repair/deferral
+    // requests retain the ordinary full rebuild path.
+    let reconcile_nightly_lexical = opts.full
+        && !opts.force_rebuild
+        && !resume_lexical_rebuild
+        && dotenvy_truthy("CASS_NIGHTLY_RECONCILIATION")
+        && initial_matching_lexical_checkpoint.has_completed_checkpoint
+        && !persist::defer_lexical_updates_enabled()
+        && !preflight_skip("watch_startup:count_total_messages");
     let preserve_matching_completed_checkpoint_during_full_scan =
         should_preserve_matching_completed_lexical_checkpoint_during_full_scan(
             opts.full,
@@ -16089,7 +16092,10 @@ fn run_index_inner(
     let mut tantivy_requires_rebuild = false;
     let mut observed_tantivy_docs = None;
     preflight_phase!("watch_startup:tantivy_reader_preflight");
-    if should_preflight_existing_tantivy_reader(resume_lexical_rebuild, opts.full) {
+    if should_preflight_existing_tantivy_reader(
+        resume_lexical_rebuild,
+        opts.full && !reconcile_nightly_lexical,
+    ) {
         // Detect if we are rebuilding due to missing meta/schema mismatch/index corruption.
         // IMPORTANT: This must stay aligned with TantivyIndex::open_or_create() rebuild triggers.
         let schema_hash_path = index_path.join("schema_hash.json");
@@ -16428,7 +16434,7 @@ fn run_index_inner(
         let rebuild_from_canonical_only =
             canonical_only_full_rebuild && historical_salvage.conversations_imported == 0;
         let repair_context = IncrementalCanonicalLexicalRepairContext {
-            full_refresh: opts.full,
+            full_refresh: opts.full && !reconcile_nightly_lexical,
             force_rebuild: opts.force_rebuild,
             resume_lexical_rebuild,
             targeted_watch_once_only,
@@ -16666,7 +16672,7 @@ fn run_index_inner(
                     } else {
                         resolve_lexical_population_strategy(
                             needs_rebuild,
-                            opts.full,
+                            opts.full && (!reconcile_nightly_lexical || needs_rebuild),
                             historical_salvage.messages_imported,
                         )
                     };
@@ -16982,7 +16988,12 @@ fn run_index_inner(
                             exact_total_messages,
                         );
                         skipped_noop_full_scan_authoritative_rebuild = true;
-                    } else {
+                    } else if !reconcile_nightly_lexical
+                        || matches!(
+                            lexical_strategy,
+                            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild
+                        )
+                    {
                         drop(t_index.take());
                         ensure_authoritative_lexical_rebuild_storage_headroom(
                             &opts.data_dir,
@@ -17592,8 +17603,8 @@ fn run_index_inner(
     }
     // GH #457 follow-on: the pre-scan authoritative repair rebuilt the lexical
     // index from SQLite and persisted an exact completed checkpoint, and this
-    // run then continued into the incremental source scan. If that scan
-    // ingested anything, both the checkpoint's storage fingerprint and the
+    // run then continued into the source scan. If that scan ingested
+    // anything, both the checkpoint's storage fingerprint and the
     // exact row counts the rebuild recorded in progress describe the PRE-scan
     // database. Leaving them alone is the bug this branch exists to prevent:
     // the skip below would keep the stale fingerprint on disk, so search's
@@ -17605,14 +17616,15 @@ fn run_index_inner(
     // half of the fix. `total_counts_exact` is sticky once the rebuild sets
     // it, but the scan that follows overwrites the counts beside it with what
     // it discovered — so at this point `exact_total_counts` is neither the
-    // rebuild's totals nor the database's: on the covering regression fixture
-    // it reads (1, 2), the one new session, against a database holding
+    // rebuild's totals nor the database's, even if every source was skipped:
+    // such a scan can replace nonzero archive totals with zero. On the append
+    // fixture it reads (1, 2), the one new session, against a database holding
     // (3, 6). The final refresh consumes those numbers verbatim to build the
     // `COUNT`/`MAX(id)` fingerprint, so running it on them would replace a
     // stale fingerprint with a wrong one.
     if should_redrive_final_lexical_checkpoint_refresh_after_pre_scan_repair(
         exact_completed_lexical_checkpoint_predates_scan,
-        scan_canonical_mutations,
+        performed_scan,
     ) {
         let post_scan_conversations = count_total_conversations_exact(&storage)?;
         let post_scan_messages = count_total_messages_exact(&storage)?;
@@ -17622,7 +17634,7 @@ fn run_index_inner(
             inserted_messages = scan_canonical_mutations.inserted_messages,
             post_scan_conversations,
             post_scan_messages,
-            "re-deriving exact canonical totals after the pre-scan authoritative lexical repair because this run's follow-up scan ingested new rows; the rebuild's checkpoint predates them"
+            "re-deriving exact canonical totals after the pre-scan authoritative lexical repair because the follow-up source scan replaced its progress counts"
         );
         record_exact_total_counts_in_progress(
             opts.progress.as_ref(),
@@ -62662,22 +62674,11 @@ mod tests {
         );
     }
 
-    /// GH #457 follow-on: only the PRE-scan authoritative repair can be
-    /// outrun by the rest of its own run, and only when that run's scan
-    /// actually moved the canonical `COUNT`/`MAX(id)` content fingerprint.
+    /// A source scan replaces progress totals even when it skips every source.
+    /// Resume-only and post-scan repairs must retain their exact-count shortcut.
     #[test]
-    fn redrive_final_checkpoint_refresh_only_when_a_pre_scan_repair_is_outrun_by_its_own_scan() {
+    fn redrive_final_checkpoint_refresh_after_any_scan_following_a_pre_scan_repair() {
         let unchanged = CanonicalMutationCounts::default();
-        let inserted_messages = CanonicalMutationCounts {
-            inserted_conversations: 0,
-            inserted_messages: 1,
-            updated_messages: 0,
-        };
-        let inserted_conversations = CanonicalMutationCounts {
-            inserted_conversations: 1,
-            inserted_messages: 0,
-            updated_messages: 0,
-        };
         let revised_messages = CanonicalMutationCounts {
             inserted_conversations: 0,
             inserted_messages: 0,
@@ -62685,44 +62686,16 @@ mod tests {
         };
 
         assert!(revised_messages.changed());
-        assert!(
-            should_redrive_final_lexical_checkpoint_refresh_after_pre_scan_repair(
-                true,
-                revised_messages
-            )
-        );
         assert_eq!(unchanged.accumulate(revised_messages), revised_messages);
-
+        assert!(should_redrive_final_lexical_checkpoint_refresh_after_pre_scan_repair(true, true));
         assert!(
-            should_redrive_final_lexical_checkpoint_refresh_after_pre_scan_repair(
-                true,
-                inserted_messages
-            )
+            !should_redrive_final_lexical_checkpoint_refresh_after_pre_scan_repair(true, false)
         );
         assert!(
-            should_redrive_final_lexical_checkpoint_refresh_after_pre_scan_repair(
-                true,
-                inserted_conversations
-            )
-        );
-        // A pre-scan repair whose follow-up scan ingested nothing still
-        // certifies the live database, so the cheaper skip stays correct.
-        assert!(
-            !should_redrive_final_lexical_checkpoint_refresh_after_pre_scan_repair(true, unchanged)
-        );
-        // The canonical-only full rebuild runs no scan and the post-scan
-        // rebuilds run after ingest, so neither is ever redriven regardless of
-        // what the scan did.
-        assert!(
-            !should_redrive_final_lexical_checkpoint_refresh_after_pre_scan_repair(
-                false,
-                inserted_messages
-            )
+            !should_redrive_final_lexical_checkpoint_refresh_after_pre_scan_repair(false, true)
         );
         assert!(
-            !should_redrive_final_lexical_checkpoint_refresh_after_pre_scan_repair(
-                false, unchanged
-            )
+            !should_redrive_final_lexical_checkpoint_refresh_after_pre_scan_repair(false, false)
         );
     }
 
