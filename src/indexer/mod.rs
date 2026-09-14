@@ -9978,8 +9978,8 @@ fn should_skip_unchanged_explicit_watch_once_paths(
         return Ok(true);
     }
 
-    for (_, root, _, _) in triggers {
-        if !explicit_watch_once_root_unchanged_after_last_index(storage, &root)? {
+    for (kind, root, _, _) in triggers {
+        if !explicit_watch_once_root_unchanged_after_last_index(storage, kind, &root)? {
             return Ok(false);
         }
     }
@@ -25947,6 +25947,30 @@ enum WatchOomIngestMode {
     SoloIsolatedRetry,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WatchLexicalTestFault {
+    PublicationAfter(usize),
+    SplitAt(usize),
+    DebtWrite,
+    DebtClear,
+    Commit,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static WATCH_LEXICAL_TEST_FAULT: std::cell::Cell<Option<WatchLexicalTestFault>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn inject_watch_lexical_test_failure(expected: WatchLexicalTestFault) -> Result<()> {
+    if WATCH_LEXICAL_TEST_FAULT.with(|fault| fault.get() == Some(expected)) {
+        anyhow::bail!("injected watch lexical persistence failure");
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn ingest_watch_batch_with_oom_split(
     storage: &FrankenStorage,
@@ -25966,6 +25990,7 @@ fn ingest_watch_batch_with_oom_split(
         defer_checkpoints,
         capture_semantic_delta,
         WatchOomIngestMode::Standard,
+        false,
     )
 }
 
@@ -25979,6 +26004,7 @@ fn ingest_watch_batch_with_oom_split_inner(
     defer_checkpoints: bool,
     capture_semantic_delta: bool,
     mode: WatchOomIngestMode,
+    replay_canonical: bool,
 ) -> Result<WatchIngestBatchOutcome> {
     debug_assert!(!convs.is_empty());
 
@@ -25999,7 +26025,14 @@ fn ingest_watch_batch_with_oom_split_inner(
             data_dir,
             convs,
             progress,
-            LexicalPopulationStrategy::IncrementalInline,
+            if replay_canonical {
+                // Preserve mutation accounting and semantic deltas while
+                // replaying selected canonical identities below, including
+                // outcomes whose unchanged persistence wrote no rows.
+                LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild
+            } else {
+                LexicalPopulationStrategy::IncrementalInline
+            },
             defer_checkpoints,
             capture_semantic_delta.then_some(&mut semantic_delta),
         )
@@ -26031,6 +26064,7 @@ fn ingest_watch_batch_with_oom_split_inner(
                 defer_checkpoints,
                 capture_semantic_delta,
                 mode,
+                replay_canonical,
             )?;
             let right = ingest_watch_batch_with_oom_split_inner(
                 storage,
@@ -26041,6 +26075,7 @@ fn ingest_watch_batch_with_oom_split_inner(
                 defer_checkpoints,
                 capture_semantic_delta,
                 mode,
+                replay_canonical,
             )?;
             merged.merge(right);
             Ok(merged)
@@ -26088,6 +26123,7 @@ fn ingest_watch_batch_with_oom_split_inner(
                     defer_checkpoints,
                     capture_semantic_delta,
                     WatchOomIngestMode::SoloIsolatedRetry,
+                    replay_canonical,
                 )
             };
 
@@ -27776,6 +27812,11 @@ fn ingest_quarantine_circuit_limit() -> usize {
 
 #[cfg(test)]
 fn should_inject_watch_ingest_test_oom(convs: &[NormalizedConversation]) -> bool {
+    if WATCH_LEXICAL_TEST_FAULT.with(|fault| {
+        matches!(fault.get(), Some(WatchLexicalTestFault::SplitAt(min)) if convs.len() >= min)
+    }) {
+        return true;
+    }
     dotenvy::var("CASS_TEST_WATCH_INGEST_OOM_MIN_CONVS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -28449,12 +28490,19 @@ fn reindex_paths_with_semantic_delta(
             LexicalPopulationStrategy::IncrementalInline,
             lexical_strategy_reason,
         );
+        let pending_lexical_debt = {
+            let storage = storage
+                .lock()
+                .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+            watch_lexical_replay_debt_for_root(&storage, kind, &root)?
+        };
+        let replay_canonical = !pending_lexical_debt.is_empty();
         if explicit_watch_once && !force_full && semantic_delta.is_none() {
             let unchanged = {
                 let storage = storage
                     .lock()
                     .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
-                explicit_watch_once_root_unchanged_after_last_index(&storage, &root)?
+                explicit_watch_once_root_unchanged_after_last_index(&storage, kind, &root)?
             };
             if unchanged {
                 tracing::info!(
@@ -28466,7 +28514,7 @@ fn reindex_paths_with_semantic_delta(
             }
         }
 
-        let since_ts = if force_full || explicit_watch_once {
+        let since_ts = if force_full || explicit_watch_once || replay_canonical {
             None
         } else {
             let guard = state
@@ -28612,6 +28660,7 @@ fn reindex_paths_with_semantic_delta(
         let mut processed_conversations = 0usize;
         let mut quarantined_conversations = 0usize;
         let mut deferred_conversations = 0usize;
+        let mut lexical_replay_deferred = false;
         {
             let storage = storage
                 .lock()
@@ -28619,6 +28668,16 @@ fn reindex_paths_with_semantic_delta(
             let mut t_index_guard = t_index
                 .lock()
                 .map_err(|_| anyhow::anyhow!("index lock poisoned"))?;
+            // Establish recovery debt BEFORE any canonical transaction. It
+            // covers the whole selected source, including earlier successful
+            // additions lost when a later addition discards this writer.
+            let current_debt = WatchLexicalReplayDebt::for_root(kind, &root);
+            persist_watch_lexical_replay_debt(&storage, &current_debt)?;
+            if replay_canonical {
+                // A prior failed callback may still own uncommitted additions.
+                // Reconciliation must start from the published generation.
+                *t_index_guard = None;
+            }
             let ingest_chunk_size = if explicit_watch_once {
                 conv_count.max(1)
             } else {
@@ -28655,11 +28714,11 @@ fn reindex_paths_with_semantic_delta(
                     );
                     *t_index_guard = Some(TantivyIndex::open_or_create(index_path)?);
                 }
-                let chunk_outcome = {
+                let mut chunk_outcome = {
                     let t_index = t_index_guard
                         .as_mut()
                         .expect("lazy watch index must be open before ingest");
-                    ingest_watch_batch_with_oom_split(
+                    ingest_watch_batch_with_oom_split_inner(
                         &storage,
                         t_index,
                         &opts.data_dir,
@@ -28667,8 +28726,41 @@ fn reindex_paths_with_semantic_delta(
                         &opts.progress,
                         !opts.watch,
                         capture_semantic_delta,
+                        WatchOomIngestMode::Standard,
+                        replay_canonical,
                     )?
                 };
+                if persist::defer_lexical_updates_enabled() {
+                    chunk_outcome
+                        .batch_outcome
+                        .record_deferred_lexical_update(&anyhow::anyhow!(
+                            "watch lexical publication is disabled by configuration"
+                        ));
+                } else if replay_canonical {
+                    // Reconcile once after the splitter has combined all IDs.
+                    // Overlapping packets must not stage the same replacement
+                    // twice against Quill's still-uncommitted snapshot.
+                    let replay = chunk_outcome
+                        .batch_outcome
+                        .canonical_conversation_ids
+                        .iter()
+                        .try_for_each(|id| {
+                            persist::replay_watch_canonical_conversation(
+                                &storage,
+                                t_index_guard.as_mut().expect("watch writer is open"),
+                                *id,
+                            )
+                        });
+                    if let Err(error) = replay {
+                        if error_is_out_of_memory(&error) {
+                            chunk_outcome
+                                .batch_outcome
+                                .record_deferred_lexical_update(&error);
+                        } else {
+                            return Err(error);
+                        }
+                    }
+                }
                 inserted_messages =
                     inserted_messages.saturating_add(chunk_outcome.batch_outcome.inserted_messages);
                 processed_conversations =
@@ -28704,12 +28796,15 @@ fn reindex_paths_with_semantic_delta(
                     lexical_update_deferred = false;
                 }
                 if lexical_update_deferred {
+                    lexical_replay_deferred = true;
                     tracing::warn!(
                         error = ?chunk_outcome.batch_outcome.lexical_update_error,
                         "dropping uncommitted watch Tantivy writer after deferred lexical update"
                     );
                     *t_index_guard = None;
                 } else {
+                    #[cfg(test)]
+                    inject_watch_lexical_test_failure(WatchLexicalTestFault::Commit)?;
                     t_index_guard
                         .as_mut()
                         .expect("watch Tantivy writer must still be open before commit")
@@ -28717,7 +28812,7 @@ fn reindex_paths_with_semantic_delta(
                 }
 
                 // Keep last_indexed_at current so `cass status` doesn't report stale during watch mode.
-                if lexical_update_deferred {
+                if lexical_replay_deferred {
                     tracing::warn!(
                         "skipping watch last_indexed_at update after deferred lexical update so health/status report stale lexical assets"
                     );
@@ -28732,6 +28827,7 @@ fn reindex_paths_with_semantic_delta(
 
                 if !explicit_watch_once
                     && !preserve_this_watch_watermark
+                    && !lexical_replay_deferred
                     && chunk_outcome.quarantined_conversations == 0
                     && chunk_outcome.deferred_conversations == 0
                     && let Some(ts_val) = chunk_outcome.max_payload_watermark_ms
@@ -28752,6 +28848,22 @@ fn reindex_paths_with_semantic_delta(
                         active_sources_skipped,
                         "preserving partial watch watermark because scan exclusions or active source skips are active"
                     );
+                }
+            }
+            if !lexical_replay_deferred
+                && quarantined_conversations == 0
+                && deferred_conversations == 0
+                && !preserve_this_watch_watermark
+            {
+                // A child-only retry must not discharge a failed parent's
+                // sibling work. Broader repair checkpoints are never touched.
+                let selected_path = crate::normalize_path_identity(&root.path);
+                for debt in pending_lexical_debt
+                    .iter()
+                    .chain(std::iter::once(&current_debt))
+                    .filter(|debt| debt.path.starts_with(&selected_path))
+                {
+                    clear_watch_lexical_replay_debt(&storage, debt)?;
                 }
             }
         }
@@ -28806,6 +28918,7 @@ fn reindex_paths_with_semantic_delta(
             && !preserve_this_watch_watermark
             && quarantined_conversations == 0
             && deferred_conversations == 0
+            && !lexical_replay_deferred
             && let Some(ts_val) = max_ts
         {
             // Once every chunk for this trigger has persisted without poison
@@ -28840,8 +28953,12 @@ fn reindex_paths_with_semantic_delta(
 
 fn explicit_watch_once_root_unchanged_after_last_index(
     storage: &FrankenStorage,
+    kind: ConnectorKind,
     root: &ScanRoot,
 ) -> Result<bool> {
+    if !watch_lexical_replay_debt_for_root(storage, kind, root)?.is_empty() {
+        return Ok(false);
+    }
     let metadata = match fs::metadata(&root.path) {
         Ok(metadata) if metadata.is_file() => metadata,
         _ => return Ok(false),
@@ -28881,6 +28998,108 @@ fn explicit_watch_once_root_unchanged_after_last_index(
             )
         })?;
     Ok(!matches.is_empty())
+}
+
+const WATCH_LEXICAL_REPLAY_DEBT_PREFIX: &str = "watch_lexical_replay_v1:";
+
+/// One connector's selected source may have canonical rows newer than its
+/// published lexical documents. Shared scan roots serve several connectors;
+/// completing one connector must not discharge another connector's debt.
+/// Keep this separate from archive-wide rebuild state.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct WatchLexicalReplayDebt {
+    connector: ConnectorKind,
+    source_id: String,
+    path: PathBuf,
+}
+
+impl WatchLexicalReplayDebt {
+    fn for_root(kind: ConnectorKind, root: &ScanRoot) -> Self {
+        Self {
+            connector: kind,
+            source_id: root.origin.source_id.clone(),
+            path: crate::normalize_path_identity(&root.path),
+        }
+    }
+
+    fn metadata(&self) -> Result<(String, String)> {
+        let value = serde_json::to_string(self)?;
+        let key = format!(
+            "{WATCH_LEXICAL_REPLAY_DEBT_PREFIX}{}",
+            blake3::hash(value.as_bytes()).to_hex()
+        );
+        Ok((key, value))
+    }
+}
+
+fn watch_lexical_replay_debt_for_root(
+    storage: &FrankenStorage,
+    kind: ConnectorKind,
+    root: &ScanRoot,
+) -> Result<Vec<WatchLexicalReplayDebt>> {
+    let rows: Vec<String> = storage.raw().query_map_collect(
+        "SELECT value FROM meta WHERE key >= ?1 AND key < ?2",
+        &[
+            ParamValue::from(WATCH_LEXICAL_REPLAY_DEBT_PREFIX),
+            ParamValue::from("watch_lexical_replay_v1;"),
+        ],
+        |row| row.get_typed(0),
+    )?;
+    let selected_path = crate::normalize_path_identity(&root.path);
+    let mut pending = Vec::new();
+    for row in rows {
+        let debt: WatchLexicalReplayDebt =
+            serde_json::from_str(&row).context("reading durable watch lexical replay debt")?;
+        if debt.connector == kind
+            && debt.source_id == root.origin.source_id
+            && (debt.path.starts_with(&selected_path) || selected_path.starts_with(&debt.path))
+        {
+            pending.push(debt);
+        }
+    }
+    Ok(pending)
+}
+
+fn persist_watch_lexical_replay_debt(
+    storage: &FrankenStorage,
+    debt: &WatchLexicalReplayDebt,
+) -> Result<()> {
+    #[cfg(test)]
+    inject_watch_lexical_test_failure(WatchLexicalTestFault::DebtWrite)?;
+    let (key, value) = debt.metadata()?;
+    persist::with_ephemeral_writer(
+        storage,
+        false,
+        "recording watch lexical replay debt",
+        |writer| {
+            writer.raw().execute_compat(
+                "INSERT OR IGNORE INTO meta(key, value) VALUES(?1, ?2)",
+                &[ParamValue::from(key), ParamValue::from(value)],
+            )?;
+            Ok(())
+        },
+    )
+}
+
+fn clear_watch_lexical_replay_debt(
+    storage: &FrankenStorage,
+    debt: &WatchLexicalReplayDebt,
+) -> Result<()> {
+    #[cfg(test)]
+    inject_watch_lexical_test_failure(WatchLexicalTestFault::DebtClear)?;
+    let (key, value) = debt.metadata()?;
+    persist::with_ephemeral_writer(
+        storage,
+        false,
+        "completing watch lexical replay debt",
+        |writer| {
+            writer.raw().execute_compat(
+                "DELETE FROM meta WHERE key = ?1 AND value = ?2",
+                &[ParamValue::from(key), ParamValue::from(value)],
+            )?;
+            Ok(())
+        },
+    )
 }
 
 /// #372: fingerprint the current on-disk state of a remote mirror directory as
@@ -30646,8 +30865,10 @@ pub fn apply_workspace_rewrite(conv: &mut NormalizedConversation, root: &ScanRoo
 }
 
 pub mod persist {
+    #[cfg(test)]
+    use super::WatchLexicalTestFault;
     use super::{LexicalPopulationStrategy, lexical_population_strategy_requires_inline_tantivy};
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use std::ops::Range;
     use std::path::Path;
     use std::sync::Arc;
@@ -30810,6 +31031,18 @@ pub mod persist {
         index.reconcile_messages_from_packet(packet, &positions, Some(conversation_id))
     }
 
+    pub(super) fn replay_watch_canonical_conversation(
+        storage: &FrankenStorage,
+        index: &mut TantivyIndex,
+        conversation_id: i64,
+    ) -> Result<()> {
+        if should_inject_incremental_lexical_update_oom() {
+            anyhow::bail!("out of memory");
+        }
+        let packet = lexical_packet_for_canonical_outcome(storage, conversation_id)?;
+        publish_canonical_packet_for_rebuild(index, &packet, conversation_id)
+    }
+
     #[cfg(test)]
     #[derive(Debug, Clone, Default)]
     struct PersistConversationPerfProfile {
@@ -30866,6 +31099,9 @@ pub mod persist {
 
     #[derive(Debug, Clone, Default)]
     pub(super) struct PersistBatchOutcome {
+        /// All successfully persisted identities, including unchanged replay.
+        /// Watch recovery cannot infer this set from inserted/revised counts.
+        pub canonical_conversation_ids: BTreeSet<i64>,
         pub inserted_conversations: usize,
         pub inserted_messages: usize,
         pub updated_messages: usize,
@@ -30878,6 +31114,8 @@ pub mod persist {
 
     impl PersistBatchOutcome {
         fn record_insert_outcome(&mut self, outcome: &InsertOutcome) {
+            self.canonical_conversation_ids
+                .insert(outcome.conversation_id);
             self.inserted_conversations = self
                 .inserted_conversations
                 .saturating_add(usize::from(outcome.conversation_inserted));
@@ -30909,7 +31147,7 @@ pub mod persist {
             }
         }
 
-        fn record_deferred_lexical_update(&mut self, error: &anyhow::Error) {
+        pub(super) fn record_deferred_lexical_update(&mut self, error: &anyhow::Error) {
             self.lexical_update_deferred = true;
             if self.lexical_update_error.is_none() {
                 self.lexical_update_error = Some(error.to_string());
@@ -30917,6 +31155,8 @@ pub mod persist {
         }
 
         pub(super) fn merge(&mut self, other: Self) {
+            self.canonical_conversation_ids
+                .extend(other.canonical_conversation_ids);
             self.updated_messages = self.updated_messages.saturating_add(other.updated_messages);
             self.workspace_changes = self
                 .workspace_changes
@@ -30946,7 +31186,14 @@ pub mod persist {
 
     #[cfg(test)]
     fn should_inject_incremental_lexical_update_oom() -> bool {
-        dotenvy::var("CASS_TEST_INCREMENTAL_LEXICAL_UPDATE_OOM").is_ok()
+        super::WATCH_LEXICAL_TEST_FAULT.with(|fault| match fault.get() {
+            Some(WatchLexicalTestFault::PublicationAfter(0)) => true,
+            Some(WatchLexicalTestFault::PublicationAfter(remaining)) => {
+                fault.set(Some(WatchLexicalTestFault::PublicationAfter(remaining - 1)));
+                false
+            }
+            _ => dotenvy::var("CASS_TEST_INCREMENTAL_LEXICAL_UPDATE_OOM").is_ok(),
+        })
     }
 
     #[cfg(not(test))]
@@ -31206,7 +31453,7 @@ pub mod persist {
             })
     }
 
-    fn defer_lexical_updates_enabled() -> bool {
+    pub(super) fn defer_lexical_updates_enabled() -> bool {
         dotenvy::var("CASS_DEFER_LEXICAL_UPDATES")
             .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
             .unwrap_or(false)
@@ -32043,7 +32290,9 @@ pub mod persist {
             // persist_packet_pipeline_matches_legacy_for_incremental_inline
             // pins both paths produce identical CassDocuments.
             match lexical_strategy {
-                LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild => continue,
+                // Targeted watch recovery replays lexical packets after this
+                // batch, but still needs the actual semantic mutation delta.
+                LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild => {}
                 LexicalPopulationStrategy::InlineRebuildFromScan => {
                     // All outcomes are already persisted, so the first read
                     // for this identity contains its final canonical snapshot.
@@ -57654,11 +57903,618 @@ mod tests {
             "dirty Tantivy writer should be dropped after deferred lexical update"
         );
 
+        let canonical_before = watch_lexical_canonical_rows(&storage.lock().unwrap());
+        assert_eq!(canonical_before.len(), 1);
+        assert_eq!(canonical_before[0].3, "persist me");
+        assert_eq!(
+            watch_lexical_replay_debt_for_root(
+                &storage.lock().unwrap(),
+                ConnectorKind::Amp,
+                &roots[0].1,
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        drop(_lexical_oom_guard);
+        // Reopen the canonical handle and writer state, as a fresh process
+        // would. A newer global timestamp must not hide this source's debt.
+        let original_storage = storage.into_inner().unwrap();
+        original_storage.close().unwrap();
+        let storage = Mutex::new(FrankenStorage::open(&opts.db_path).unwrap());
+        storage
+            .lock()
+            .unwrap()
+            .set_last_indexed_at(FrankenStorage::now_millis().saturating_add(10_000))
+            .unwrap();
+        let t_index = Mutex::new(None);
+        let state = Mutex::new(HashMap::new());
+        let expected_id = frankensearch::quill::cass::cass_document_identity(
+            "local",
+            frankensearch::quill::cass::CassConversationKey {
+                source_path: &amp_file.to_string_lossy(),
+                id: Some(canonical_before[0].0),
+            },
+            canonical_before[0].2 as u64,
+        );
+        for (attempt, fail) in [true, false, false].into_iter().enumerate() {
+            let fault = fail
+                .then(|| WatchLexicalFaultGuard::set(WatchLexicalTestFault::PublicationAfter(0)));
+            let indexed = reindex_paths(
+                &opts,
+                vec![amp_file.clone()],
+                &roots,
+                &state,
+                &storage,
+                &t_index,
+                &index_path,
+                false,
+            )
+            .unwrap();
+            drop(fault);
+            assert_eq!(indexed, [1, 1, 0][attempt]);
+            assert_eq!(
+                watch_lexical_canonical_rows(&storage.lock().unwrap()),
+                canonical_before
+            );
+            let hits = watch_lexical_search_ids(&index_path, "persist");
+            assert_eq!(hits.len(), usize::from(!fail));
+            if !fail {
+                assert_eq!(hits, BTreeSet::from([expected_id.clone()]));
+            }
+            assert_eq!(
+                watch_lexical_replay_debt_for_root(
+                    &storage.lock().unwrap(),
+                    ConnectorKind::Amp,
+                    &roots[0].1,
+                )
+                .unwrap()
+                .is_empty(),
+                !fail
+            );
+            assert!(
+                !data_dir
+                    .join("quarantine/watch_ingest_poison.jsonl")
+                    .exists()
+            );
+        }
+
         if let Some(prev) = prev {
             unsafe { std::env::set_var("XDG_DATA_HOME", prev) };
         } else {
             unsafe { std::env::remove_var("XDG_DATA_HOME") };
         }
+    }
+
+    struct WatchLexicalFaultGuard(Option<WatchLexicalTestFault>);
+
+    impl WatchLexicalFaultGuard {
+        fn set(fault: WatchLexicalTestFault) -> Self {
+            Self(WATCH_LEXICAL_TEST_FAULT.with(|slot| slot.replace(Some(fault))))
+        }
+    }
+
+    impl Drop for WatchLexicalFaultGuard {
+        fn drop(&mut self) {
+            WATCH_LEXICAL_TEST_FAULT.with(|slot| slot.set(self.0));
+        }
+    }
+
+    fn watch_lexical_canonical_rows(storage: &FrankenStorage) -> Vec<(i64, i64, i64, String)> {
+        storage
+            .raw()
+            .query_map_collect(
+                "SELECT conversation_id, id, idx, content FROM messages ORDER BY id",
+                &[],
+                |row| {
+                    Ok((
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                    ))
+                },
+            )
+            .unwrap()
+    }
+
+    fn watch_lexical_search_ids(index_path: &Path, term: &str) -> BTreeSet<String> {
+        let reader = crate::search::quill_bridge::open_cass_reader(index_path).unwrap();
+        let parser = frankensearch::quill::query::CassQueryParser::new(
+            frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
+        )
+        .unwrap();
+        let query = parser.parse(
+            term,
+            &frankensearch::quill::query::CassQueryFilters::default(),
+        );
+        let page =
+            crate::search::quill_bridge::search_paginated(&reader, &query.query, 32, 0, true)
+                .unwrap();
+        let ids: BTreeSet<_> = page
+            .hits
+            .iter()
+            .map(|hit| hit.document_id.clone())
+            .collect();
+        assert_eq!(
+            ids.len(),
+            page.hits.len(),
+            "no duplicate lexical identities"
+        );
+        assert_eq!(page.total_count, Some(ids.len()));
+        ids
+    }
+
+    fn write_watch_lexical_source(path: &Path, id: &str, marker: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            path,
+            serde_json::to_vec(&serde_json::json!({
+                "id": id,
+                "messages": [{"role": "user", "text": marker, "createdAt": 1700000000100_i64}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn watch_lexical_options(data_dir: &Path) -> IndexOptions {
+        IndexOptions {
+            full: false,
+            watch: false,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.to_path_buf(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".into(),
+            progress: None,
+            watch_once_paths: None,
+            watch_interval_secs: 30,
+        }
+    }
+
+    fn run_watch_lexical_selection(
+        opts: &IndexOptions,
+        selected: &Path,
+        storage: &Mutex<FrankenStorage>,
+        index: &Mutex<Option<TantivyIndex>>,
+    ) -> Result<usize> {
+        let mut opts = opts.clone();
+        opts.watch_once_paths = Some(vec![selected.to_path_buf()]);
+        reindex_paths(
+            &opts,
+            vec![selected.to_path_buf()],
+            &[(ConnectorKind::Amp, ScanRoot::local(selected.to_path_buf()))],
+            &Mutex::new(HashMap::new()),
+            storage,
+            index,
+            &index_dir(&opts.data_dir)?,
+            false,
+        )
+    }
+
+    #[test]
+    #[serial]
+    fn watch_lexical_oom_retry_preserves_child_scope_and_unrelated_documents() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("cass");
+        fs::create_dir_all(&data_dir).unwrap();
+        let selected = tmp.path().join("selected/amp");
+        let first = selected.join("thread-first.json");
+        let second = selected.join("thread-second.json");
+        let unrelated = tmp.path().join("unrelated/amp/thread-other.json");
+        write_watch_lexical_source(&first, "thread-first", "amberneedle");
+        write_watch_lexical_source(&second, "thread-second", "bronzeneedle");
+        write_watch_lexical_source(&unrelated, "thread-other", "copperneedle");
+        let opts = watch_lexical_options(&data_dir);
+        let storage = Mutex::new(FrankenStorage::open(&opts.db_path).unwrap());
+        let index_path = index_dir(&data_dir).unwrap();
+        let index = Mutex::new(Some(TantivyIndex::open_or_create(&index_path).unwrap()));
+        assert_eq!(
+            run_watch_lexical_selection(&opts, &unrelated, &storage, &index).unwrap(),
+            1
+        );
+        let unrelated_ids = watch_lexical_search_ids(&index_path, "copperneedle");
+        assert_eq!(unrelated_ids.len(), 1);
+        refresh_completed_lexical_rebuild_checkpoint(
+            &storage.lock().unwrap(),
+            &opts.db_path,
+            &data_dir,
+        )
+        .unwrap();
+        let checkpoint = lexical_rebuild_state_path(&index_path);
+        let checkpoint_before = fs::read(&checkpoint).unwrap();
+
+        // The first conversation reaches the real sink; a later OOM drops
+        // its uncommitted work too. Both canonical conversations need replay.
+        {
+            let _fault = WatchLexicalFaultGuard::set(WatchLexicalTestFault::PublicationAfter(1));
+            assert_eq!(
+                run_watch_lexical_selection(&opts, &selected, &storage, &index).unwrap(),
+                2
+            );
+        }
+        assert!(index.lock().unwrap().is_none());
+        assert!(watch_lexical_search_ids(&index_path, "amberneedle").is_empty());
+        assert!(watch_lexical_search_ids(&index_path, "bronzeneedle").is_empty());
+        assert_eq!(
+            watch_lexical_search_ids(&index_path, "copperneedle"),
+            unrelated_ids
+        );
+        let canonical_before = watch_lexical_canonical_rows(&storage.lock().unwrap());
+        assert_eq!(canonical_before.len(), 3);
+        assert_eq!(fs::read(&checkpoint).unwrap(), checkpoint_before);
+
+        storage.into_inner().unwrap().close().unwrap();
+        let storage = Mutex::new(FrankenStorage::open(&opts.db_path).unwrap());
+        let index = Mutex::new(None);
+        assert_eq!(
+            run_watch_lexical_selection(&opts, &first, &storage, &index).unwrap(),
+            1
+        );
+        let first_ids = watch_lexical_search_ids(&index_path, "amberneedle");
+        assert_eq!(first_ids.len(), 1);
+        assert!(watch_lexical_search_ids(&index_path, "bronzeneedle").is_empty());
+        assert_eq!(
+            watch_lexical_search_ids(&index_path, "copperneedle"),
+            unrelated_ids
+        );
+        let parent_root = ScanRoot::local(selected.clone());
+        let parent_debt = watch_lexical_replay_debt_for_root(
+            &storage.lock().unwrap(),
+            ConnectorKind::Amp,
+            &parent_root,
+        )
+        .unwrap();
+        assert_eq!(parent_debt.len(), 1, "child retry must retain sibling debt");
+        assert_eq!(
+            parent_debt[0].path,
+            crate::normalize_path_identity(&selected)
+        );
+
+        for fault in [
+            WatchLexicalTestFault::PublicationAfter(1),
+            WatchLexicalTestFault::Commit,
+        ] {
+            let _fault = WatchLexicalFaultGuard::set(fault);
+            let result = run_watch_lexical_selection(&opts, &selected, &storage, &index);
+            if fault == WatchLexicalTestFault::Commit {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("injected watch lexical")
+                );
+            } else {
+                assert_eq!(result.unwrap(), 2);
+            }
+            // A failed commit may leave staged work in the handle. Reopening
+            // must still recover from durable debt and published documents.
+            *index.lock().unwrap() = None;
+            assert_eq!(
+                watch_lexical_search_ids(&index_path, "amberneedle"),
+                first_ids
+            );
+            assert!(watch_lexical_search_ids(&index_path, "bronzeneedle").is_empty());
+            assert_eq!(
+                watch_lexical_search_ids(&index_path, "copperneedle"),
+                unrelated_ids
+            );
+            assert_eq!(
+                watch_lexical_canonical_rows(&storage.lock().unwrap()),
+                canonical_before
+            );
+            assert_eq!(
+                watch_lexical_replay_debt_for_root(
+                    &storage.lock().unwrap(),
+                    ConnectorKind::Amp,
+                    &parent_root,
+                )
+                .unwrap()
+                .len(),
+                1
+            );
+        }
+
+        {
+            let _fault = WatchLexicalFaultGuard::set(WatchLexicalTestFault::DebtClear);
+            assert!(run_watch_lexical_selection(&opts, &selected, &storage, &index).is_err());
+        }
+        let second_ids = watch_lexical_search_ids(&index_path, "bronzeneedle");
+        assert_eq!(second_ids.len(), 1, "commit precedes debt clearing");
+        assert_eq!(
+            watch_lexical_replay_debt_for_root(
+                &storage.lock().unwrap(),
+                ConnectorKind::Amp,
+                &parent_root,
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        {
+            // Forced typed OOM splits the real persistence batch. Every leaf
+            // has unchanged canonical rows, so recovery needs their merged IDs.
+            let _fault = WatchLexicalFaultGuard::set(WatchLexicalTestFault::SplitAt(2));
+            assert_eq!(
+                run_watch_lexical_selection(&opts, &selected, &storage, &index).unwrap(),
+                2
+            );
+        }
+        assert!(
+            watch_lexical_replay_debt_for_root(
+                &storage.lock().unwrap(),
+                ConnectorKind::Amp,
+                &parent_root,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            watch_lexical_search_ids(&index_path, "amberneedle"),
+            first_ids
+        );
+        assert_eq!(
+            watch_lexical_search_ids(&index_path, "bronzeneedle"),
+            second_ids
+        );
+        assert_eq!(
+            watch_lexical_search_ids(&index_path, "copperneedle"),
+            unrelated_ids
+        );
+        assert_eq!(
+            watch_lexical_canonical_rows(&storage.lock().unwrap()),
+            canonical_before
+        );
+        assert_eq!(fs::read(&checkpoint).unwrap(), checkpoint_before);
+        assert!(
+            !data_dir
+                .join("quarantine/watch_ingest_poison.jsonl")
+                .exists()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn watch_lexical_oom_retry_preserves_other_connector_debt_on_shared_root() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("cass");
+        let selected = tmp.path().join("selected");
+        let amp_file = selected.join("thread-shared.json");
+        let claude_file = selected.join("projects/demo/session.jsonl");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(claude_file.parent().unwrap()).unwrap();
+        // The nested Amp shape is a real provider format; Claude's generic
+        // top-level messages parser must not reinterpret it as a Claude log.
+        fs::write(
+            &amp_file,
+            serde_json::to_vec(&serde_json::json!({
+                "thread": {
+                    "id": "thread-shared",
+                    "messages": [{
+                        "role": "user",
+                        "content": "ampconnectorneedle",
+                        "createdAt": 1700000000100_i64
+                    }]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &claude_file,
+            concat!(
+                r#"{"type":"user","cwd":"/workspace","sessionId":"shared-claude","message":{"role":"user","content":"claudeconnectorneedle"},"timestamp":"2025-11-12T18:31:18.000Z"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let mut opts = watch_lexical_options(&data_dir);
+        opts.watch_once_paths = Some(vec![selected.clone()]);
+        let root = ScanRoot::local(selected.clone());
+        let roots = [
+            (ConnectorKind::Amp, root.clone()),
+            (ConnectorKind::Claude, root.clone()),
+        ];
+        let kinds: HashSet<_> = classify_paths(vec![selected.clone()], &roots, true)
+            .into_iter()
+            .map(|(kind, _, _, _)| kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            HashSet::from([ConnectorKind::Amp, ConnectorKind::Claude])
+        );
+        let storage = Mutex::new(FrankenStorage::open(&opts.db_path).unwrap());
+        let index_path = index_dir(&data_dir).unwrap();
+        let index = Mutex::new(Some(TantivyIndex::open_or_create(&index_path).unwrap()));
+        {
+            let _fault = WatchLexicalFaultGuard::set(WatchLexicalTestFault::PublicationAfter(0));
+            assert_eq!(
+                run_watch_lexical_selection(&opts, &selected, &storage, &index).unwrap(),
+                1
+            );
+        }
+        assert!(index.lock().unwrap().is_none());
+        let amp_rows = watch_lexical_canonical_rows(&storage.lock().unwrap());
+        assert_eq!(amp_rows.len(), 1);
+        assert_eq!(amp_rows[0].3, "ampconnectorneedle");
+        assert!(watch_lexical_search_ids(&index_path, "ampconnectorneedle").is_empty());
+        // These scans create the final v1 schema, including connector identity;
+        // this test does not fabricate or claim migration of older debt rows.
+        let amp_debt =
+            watch_lexical_replay_debt_for_root(&storage.lock().unwrap(), ConnectorKind::Amp, &root)
+                .unwrap();
+        assert_eq!(amp_debt.len(), 1);
+        assert_eq!(amp_debt[0].connector, ConnectorKind::Amp);
+        let amp_metadata = amp_debt[0].metadata().unwrap();
+        assert!(
+            watch_lexical_replay_debt_for_root(
+                &storage.lock().unwrap(),
+                ConnectorKind::Claude,
+                &root,
+            )
+            .unwrap()
+            .is_empty()
+        );
+
+        // Configured roots trigger every connector. Fix the order here so a
+        // healthy Claude publication follows Amp's failed publication exactly.
+        assert_eq!(
+            reindex_paths(
+                &opts,
+                vec![selected.clone()],
+                &[(ConnectorKind::Claude, root.clone())],
+                &Mutex::new(HashMap::new()),
+                &storage,
+                &index,
+                &index_path,
+                false,
+            )
+            .unwrap(),
+            1
+        );
+        let canonical_before = watch_lexical_canonical_rows(&storage.lock().unwrap());
+        assert_eq!(canonical_before.len(), 2);
+        assert_eq!(canonical_before[0], amp_rows[0]);
+        assert_eq!(canonical_before[1].3, "claudeconnectorneedle");
+        let expected_id = |source: &Path, row: &(i64, i64, i64, String)| {
+            frankensearch::quill::cass::cass_document_identity(
+                "local",
+                frankensearch::quill::cass::CassConversationKey {
+                    source_path: &source.to_string_lossy(),
+                    id: Some(row.0),
+                },
+                row.2 as u64,
+            )
+        };
+        let amp_ids = BTreeSet::from([expected_id(&amp_file, &canonical_before[0])]);
+        let claude_ids = BTreeSet::from([expected_id(&claude_file, &canonical_before[1])]);
+        assert!(watch_lexical_search_ids(&index_path, "ampconnectorneedle").is_empty());
+        assert_eq!(
+            watch_lexical_search_ids(&index_path, "claudeconnectorneedle"),
+            claude_ids
+        );
+        let remaining =
+            watch_lexical_replay_debt_for_root(&storage.lock().unwrap(), ConnectorKind::Amp, &root)
+                .unwrap();
+        assert_eq!(remaining.len(), 1, "Claude must not discharge Amp's debt");
+        assert_eq!(remaining[0].metadata().unwrap(), amp_metadata);
+        assert!(
+            watch_lexical_replay_debt_for_root(
+                &storage.lock().unwrap(),
+                ConnectorKind::Claude,
+                &root,
+            )
+            .unwrap()
+            .is_empty()
+        );
+
+        drop(index);
+        storage.into_inner().unwrap().close().unwrap();
+        let storage = Mutex::new(FrankenStorage::open(&opts.db_path).unwrap());
+        storage
+            .lock()
+            .unwrap()
+            .set_last_indexed_at(FrankenStorage::now_millis().saturating_add(10_000))
+            .unwrap();
+        let index = Mutex::new(None);
+        let mut file_selection = opts.clone();
+        file_selection.watch_once_paths = Some(vec![amp_file.clone()]);
+        assert!(
+            !should_skip_unchanged_explicit_watch_once_paths(
+                &file_selection,
+                &storage.lock().unwrap(),
+                &roots,
+            )
+            .unwrap(),
+            "the outer unchanged-file fast path must preserve Amp's debt"
+        );
+        for _ in 0..2 {
+            // Both packets are unchanged. Only Amp's durable debt permits
+            // recovery on the first retry; the second must remain idempotent.
+            assert_eq!(
+                run_watch_lexical_selection(&opts, &selected, &storage, &index).unwrap(),
+                1
+            );
+            assert_eq!(
+                watch_lexical_canonical_rows(&storage.lock().unwrap()),
+                canonical_before
+            );
+            assert_eq!(
+                watch_lexical_search_ids(&index_path, "ampconnectorneedle"),
+                amp_ids
+            );
+            assert_eq!(
+                watch_lexical_search_ids(&index_path, "claudeconnectorneedle"),
+                claude_ids
+            );
+            for kind in [ConnectorKind::Amp, ConnectorKind::Claude] {
+                assert!(
+                    watch_lexical_replay_debt_for_root(&storage.lock().unwrap(), kind, &root)
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+        assert!(
+            !data_dir
+                .join("quarantine/watch_ingest_poison.jsonl")
+                .exists()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn watch_lexical_oom_debt_write_failure_precedes_canonical_mutation() {
+        let tmp = TempDir::new().unwrap();
+        let opts = watch_lexical_options(tmp.path());
+        let source = tmp.path().join("amp/thread-debt-write.json");
+        write_watch_lexical_source(&source, "thread-debt-write", "debtwriteneedle");
+        let storage = Mutex::new(FrankenStorage::open(&opts.db_path).unwrap());
+        let index_path = index_dir(tmp.path()).unwrap();
+        let index = Mutex::new(Some(TantivyIndex::open_or_create(&index_path).unwrap()));
+        let prior_root = ScanRoot::local(tmp.path().join("prior/amp"));
+        let prior_debt = WatchLexicalReplayDebt::for_root(ConnectorKind::Amp, &prior_root);
+        persist_watch_lexical_replay_debt(&storage.lock().unwrap(), &prior_debt).unwrap();
+        let mut broad_pending = LexicalRebuildState::new(
+            deferred_lexical_rebuild_db_state(&opts.db_path, 0),
+            LEXICAL_REBUILD_PAGE_SIZE,
+        );
+        broad_pending.set_execution_mode(LexicalRebuildExecutionMode::CanonicalMetadataRepair);
+        persist_lexical_rebuild_state(&index_path, &broad_pending).unwrap();
+        let checkpoint_before = fs::read(lexical_rebuild_state_path(&index_path)).unwrap();
+        {
+            let _fault = WatchLexicalFaultGuard::set(WatchLexicalTestFault::DebtWrite);
+            let error = run_watch_lexical_selection(&opts, &source, &storage, &index).unwrap_err();
+            assert!(error.to_string().contains("injected watch lexical"));
+        }
+        assert!(watch_lexical_canonical_rows(&storage.lock().unwrap()).is_empty());
+        let conversations: i64 = storage
+            .lock()
+            .unwrap()
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(conversations, 0);
+        assert!(watch_lexical_search_ids(&index_path, "debtwriteneedle").is_empty());
+        let prior_after = watch_lexical_replay_debt_for_root(
+            &storage.lock().unwrap(),
+            ConnectorKind::Amp,
+            &prior_root,
+        )
+        .unwrap();
+        assert_eq!(prior_after.len(), 1);
+        assert_eq!(
+            prior_after[0].metadata().unwrap(),
+            prior_debt.metadata().unwrap()
+        );
+        assert_eq!(
+            fs::read(lexical_rebuild_state_path(&index_path)).unwrap(),
+            checkpoint_before
+        );
     }
 
     #[test]
