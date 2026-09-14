@@ -7,6 +7,9 @@ use assert_cmd::cargo::cargo_bin_cmd;
 use coding_agent_search::default_data_dir;
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use coding_agent_search::search::semantic_manifest::SemanticManifest;
+use coding_agent_search::search::vector_index::{
+    SemanticDocId, VectorIndex, parse_semantic_doc_id, vector_index_path,
+};
 use coding_agent_search::storage::sqlite::FrankenStorage;
 use serde_json::{Value, json};
 
@@ -77,6 +80,72 @@ fn seed_zero_doc_first_canonical_db(db_path: &Path) -> TestResult {
     Ok(())
 }
 
+fn seed_distinct_backfill_db(db_path: &Path) -> TestResult<Vec<SemanticDocId>> {
+    let storage = FrankenStorage::open(db_path)?;
+    let mut expected = Vec::new();
+    for (ordinal, slug, source_id, role) in [
+        (0, "codex", "local", MessageRole::User),
+        (1, "claude_code", "work-laptop", MessageRole::Agent),
+    ] {
+        let mut agent = sample_agent();
+        agent.slug = slug.into();
+        agent.name = slug.into();
+        let agent_id = storage.ensure_agent(&agent)?;
+        let workspace = PathBuf::from(format!("/tmp/cass-lifetime/workspace-{ordinal}"));
+        let workspace_id = storage.ensure_workspace(&workspace, None)?;
+        let mut conversation = sample_conversation(
+            &format!("lifetime-{ordinal}"),
+            "duplicate canonical evidence retains distinct source provenance",
+        );
+        conversation.agent_slug = slug.into();
+        conversation.workspace = Some(workspace);
+        conversation.source_id = source_id.into();
+        conversation.messages[0].role = role;
+        conversation.messages[0].created_at = Some(1_700_000_000_500 + ordinal);
+        let outcome =
+            storage.insert_conversation_tree(agent_id, Some(workspace_id), &conversation)?;
+        let messages = storage.fetch_messages(outcome.conversation_id)?;
+        assert_eq!(messages.len(), 1);
+        expected.push(SemanticDocId {
+            message_id: messages[0]
+                .id
+                .ok_or("persisted message missing id")?
+                .try_into()?,
+            chunk_idx: 0,
+            agent_id: agent_id.try_into()?,
+            workspace_id: workspace_id.try_into()?,
+            source_id: crc32fast::hash(source_id.as_bytes()),
+            role: ordinal.try_into()?,
+            created_at_ms: 1_700_000_000_500 + ordinal,
+            content_hash: Some(coding_agent_search::search::canonicalize::content_hash(
+                &conversation.messages[0].content,
+            )),
+        });
+    }
+    Ok(expected)
+}
+
+fn ordered_backfill_vectors(data_dir: &Path) -> TestResult<Vec<(SemanticDocId, Vec<u32>)>> {
+    let index = VectorIndex::open(&vector_index_path(data_dir, "fnv1a-384"))?;
+    assert_eq!(index.embedder_id(), "fnv1a-384");
+    assert_eq!(index.dimension(), 384);
+    assert_eq!(
+        index.embedder_revision(),
+        coding_agent_search::indexer::semantic::HASH_VECTOR_SPACE_REVISION
+    );
+    let mut records = Vec::new();
+    for ordinal in 0..index.record_count() {
+        assert!(!index.is_deleted(ordinal));
+        let metadata = parse_semantic_doc_id(index.doc_id_at(ordinal)?)
+            .ok_or("published vector has an invalid semantic identity")?;
+        let vector = index.vector_at_f32(ordinal)?;
+        assert_eq!(vector.len(), 384);
+        assert!(vector.iter().all(|value| value.is_finite()));
+        records.push((metadata, vector.into_iter().map(f32::to_bits).collect()));
+    }
+    Ok(records)
+}
+
 fn robot_backfill_process(data_dir: &Path, db_path: &Path) -> std::process::Command {
     let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
     command
@@ -120,6 +189,24 @@ fn run_robot_backfill(data_dir: &Path, db_path: &Path) -> TestResult<Value> {
 
     let stdout = String::from_utf8(output.stdout)?;
     Ok(serde_json::from_str(stdout.trim())?)
+}
+
+fn run_robot_backfill_batches(
+    data_dir: &Path,
+    db_path: &Path,
+    max_batches: u32,
+) -> TestResult<Value> {
+    let output = robot_backfill_command(data_dir, db_path)
+        .arg("--max-batches")
+        .arg(max_batches.to_string())
+        .output()?;
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(serde_json::from_slice(&output.stdout)?)
 }
 
 fn assert_backfill_busy(output: &std::process::Output) -> TestResult {
@@ -977,6 +1064,336 @@ fn robot_models_backfill_checkpoints_then_publishes_fast_tier() -> TestResult {
 }
 
 #[test]
+fn gh471_robot_backfill_retains_one_model_and_matches_restarted_batches() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let mut published = Vec::new();
+    for (name, retained) in [("single-process", true), ("restarted", false)] {
+        let root = temp.path().join(name);
+        fs::create_dir_all(&root)?;
+        let data_dir = root.join("data");
+        let db_path = root.join("archive.db");
+        let expected = seed_distinct_backfill_db(&db_path)?;
+        let report = if retained {
+            let report = run_robot_backfill_batches(&data_dir, &db_path, 2)?;
+            assert_eq!(report["batches_attempted"], 2, "{report}");
+            assert_eq!(report["batches_completed"], 2, "{report}");
+            assert_eq!(report["model_initializations"], 1, "{report}");
+            report
+        } else {
+            let first = run_robot_backfill_batches(&data_dir, &db_path, 1)?;
+            assert_eq!(first["status"], "checkpointed", "{first}");
+            assert_eq!(first["batches_attempted"], 1);
+            assert_eq!(first["batches_completed"], 1);
+            assert_eq!(first["model_initializations"], 1);
+            let manifest = SemanticManifest::load(&data_dir)?.ok_or("missing checkpoint")?;
+            let checkpoint = manifest.checkpoint.ok_or("first batch must be durable")?;
+            assert_eq!(checkpoint.conversations_processed, 1);
+            assert_eq!(checkpoint.docs_embedded, 1);
+            let second = run_robot_backfill(&data_dir, &db_path)?;
+            assert_eq!(second["batches_attempted"], 1);
+            assert_eq!(second["batches_completed"], 1);
+            assert_eq!(second["model_initializations"], 1);
+            second
+        };
+        assert_eq!(report["status"], "published", "{report}");
+        assert_eq!(report["conversations_processed"], 2);
+        assert_eq!(
+            report["embedded_docs"], 1,
+            "last batch fields stay top-level"
+        );
+        let vectors = ordered_backfill_vectors(&data_dir)?;
+        assert_eq!(
+            vectors.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(vectors.len(), 2);
+        assert_eq!(
+            vectors[0].1, vectors[1].1,
+            "equal content keeps both source rows"
+        );
+        let manifest = SemanticManifest::load(&data_dir)?.ok_or("missing publication")?;
+        assert!(manifest.checkpoint.is_none());
+        let tier = manifest.fast_tier.ok_or("missing fast tier")?;
+        assert!(tier.ready);
+        assert_eq!((tier.doc_count, tier.conversation_count), (2, 2));
+        published.push(vectors);
+
+        let before = vector_files_snapshot(&data_dir)?;
+        let unchanged = run_robot_backfill_batches(&data_dir, &db_path, 4)?;
+        assert_eq!(unchanged["status"], "unchanged", "{unchanged}");
+        assert_eq!(unchanged["batches_attempted"], 1);
+        assert_eq!(unchanged["batches_completed"], 1);
+        assert_eq!(unchanged["model_initializations"], 1);
+        assert_eq!(vector_files_snapshot(&data_dir)?, before);
+    }
+    assert_eq!(
+        published[0], published[1],
+        "complete ordered vector and metadata parity"
+    );
+    Ok(())
+}
+
+#[test]
+fn gh471_robot_backfill_zero_doc_batch_continues_with_retained_model() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let data_dir = temp.path().join("data");
+    let db_path = temp.path().join("archive.db");
+    seed_zero_doc_first_canonical_db(&db_path)?;
+    let report = run_robot_backfill_batches(&data_dir, &db_path, 2)?;
+    assert_eq!(report["status"], "published", "{report}");
+    assert_eq!(report["batches_attempted"], 2);
+    assert_eq!(report["batches_completed"], 2);
+    assert_eq!(report["model_initializations"], 1);
+    assert_eq!(report["conversations_processed"], 2);
+    assert_eq!(report["embedded_docs"], 1);
+    let vectors = ordered_backfill_vectors(&data_dir)?;
+    assert_eq!(vectors.len(), 1);
+    assert_eq!(vectors[0].0.message_id, 2);
+    let manifest = SemanticManifest::load(&data_dir)?.ok_or("missing publication")?;
+    assert!(manifest.checkpoint.is_none());
+    let tier = manifest.fast_tier.ok_or("missing fast tier")?;
+    assert_eq!((tier.doc_count, tier.conversation_count), (1, 2));
+    Ok(())
+}
+
+#[test]
+fn gh471_robot_backfill_rejects_invalid_batch_limits_without_mutation() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let data_dir = temp.path().join("data");
+    let db_path = temp.path().join("archive.db");
+    seed_canonical_db(&db_path)?;
+    let before = canonical_bundle_snapshot(&db_path)?;
+    for invalid in ["0", "-1", "4294967296", "not-a-number"] {
+        let output = robot_backfill_command(&data_dir, &db_path)
+            .arg(format!("--max-batches={invalid}"))
+            .output()?;
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{invalid}: stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "invalid limits cannot report success"
+        );
+        assert_eq!(canonical_bundle_snapshot(&db_path)?, before);
+        assert!(!SemanticManifest::path(&data_dir).exists());
+        assert!(!data_dir.join("vector_index").exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn gh471_robot_backfill_later_storage_failure_preserves_checkpoint_and_retries() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let data_dir = temp.path().join("data");
+    let db_path = temp.path().join("archive.db");
+    seed_canonical_db(&db_path)?;
+    {
+        let storage = FrankenStorage::open(&db_path)?;
+        // SQLite accepts this dynamic type, but the real canonical Message
+        // hydration requires Option<i64>. Only the second selected batch fails.
+        storage.raw().execute(
+            "UPDATE messages SET created_at = 'invalid-timestamp' WHERE conversation_id = 2",
+        )?;
+    }
+    let output = robot_backfill_command(&data_dir, &db_path)
+        .args(["--max-batches", "2"])
+        .output()?;
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let failed: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(failed["status"], "failed", "{failed}");
+    assert_eq!(failed["error"]["code"], 5);
+    assert_eq!(failed["error"]["kind"], "semantic-backfill");
+    assert_eq!(failed["batches_attempted"], 2);
+    assert_eq!(failed["batches_completed"], 1);
+    assert_eq!(failed["model_initializations"], 1);
+    let prior = &failed["last_completed_batch"];
+    assert_eq!(prior["status"], "checkpointed");
+    assert_eq!(prior["checkpoint_saved"], true);
+    assert_eq!(prior["conversations_processed"], 1);
+    let manifest = SemanticManifest::load(&data_dir)?.ok_or("lost first checkpoint")?;
+    let checkpoint = manifest.checkpoint.ok_or("lost durable checkpoint")?;
+    assert_eq!(
+        (checkpoint.docs_embedded, checkpoint.conversations_processed),
+        (1, 1)
+    );
+    assert!(!vector_index_path(&data_dir, "fnv1a-384").is_file());
+    {
+        let storage = FrankenStorage::open(&db_path)?;
+        storage
+            .raw()
+            .execute("UPDATE messages SET created_at = 1700000000500 WHERE conversation_id = 2")?;
+    }
+    let resumed = run_robot_backfill_batches(&data_dir, &db_path, 2)?;
+    assert_eq!(resumed["status"], "published", "{resumed}");
+    assert_eq!(resumed["batches_attempted"], 1);
+    assert_eq!(resumed["batches_completed"], 1);
+    assert_eq!(resumed["model_initializations"], 1);
+    assert_eq!(
+        resumed["embedded_docs"], 1,
+        "already durable source must be reused"
+    );
+    let control = temp.path().join("control");
+    fs::create_dir_all(&control)?;
+    let control_db = control.join("archive.db");
+    let control_data = control.join("data");
+    seed_canonical_db(&control_db)?;
+    assert_eq!(
+        run_robot_backfill(&control_data, &control_db)?["status"],
+        "checkpointed"
+    );
+    assert_eq!(
+        run_robot_backfill(&control_data, &control_db)?["status"],
+        "published"
+    );
+    assert_eq!(
+        ordered_backfill_vectors(&data_dir)?,
+        ordered_backfill_vectors(&control_data)?
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn gh471_robot_backfill_cancel_finishes_current_checkpoint_and_resumes() -> TestResult {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    let temp = tempfile::tempdir()?;
+    let data_dir = temp.path().join("data");
+    let db_path = temp.path().join("archive.db");
+    seed_canonical_db(&db_path)?;
+    let fifo = temp.path().join("cancel-progress.fifo");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()?
+            .success()
+    );
+    let mut command = robot_backfill_process(&data_dir, &db_path);
+    command
+        .args(["--max-batches", "2"])
+        .env("CASS_SEMANTIC_PROGRESS_JSONL", &fifo)
+        .env("CASS_INDEX_RUN_LOCK_HEARTBEAT_EVERY_MS", "20");
+    let mut owner = BackfillChild(
+        command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    );
+    wait_for_backfill_owner_heartbeat(&mut owner.0, &data_dir.join("index-run.lock"))?;
+    // The real sink's open blocks inside the first admitted batch. Request
+    // cancellation there, then release it: this batch must checkpoint, and
+    // the retained worker must stop before admitting the second batch.
+    assert!(
+        std::process::Command::new("kill")
+            .arg("-INT")
+            .arg(owner.0.id().to_string())
+            .status()?
+            .success()
+    );
+    let mut reader = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo)?;
+    let mut progress = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        drain_progress_pipe(&mut reader, &mut progress)?;
+        if let Some(status) = owner.0.try_wait()? {
+            drain_progress_pipe(&mut reader, &mut progress)?;
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cancelled backfill did not stop after its durable batch"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    owner
+        .0
+        .stdout
+        .take()
+        .ok_or("missing stdout")?
+        .read_to_string(&mut stdout)?;
+    owner
+        .0
+        .stderr
+        .take()
+        .ok_or("missing stderr")?
+        .read_to_string(&mut stderr)?;
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    let cancelled: Value = serde_json::from_str(stdout.trim())?;
+    assert_eq!(cancelled["status"], "cancelled", "{cancelled}");
+    assert_eq!(cancelled["error"]["code"], 130);
+    assert_eq!(cancelled["error"]["kind"], "semantic-backfill");
+    assert_eq!(cancelled["error"]["retryable"], true);
+    assert_eq!(cancelled["batches_attempted"], 1);
+    assert_eq!(cancelled["batches_completed"], 1);
+    assert_eq!(cancelled["model_initializations"], 1);
+    let prior = &cancelled["last_completed_batch"];
+    assert_eq!(prior["status"], "checkpointed");
+    assert_eq!(prior["checkpoint_saved"], true);
+    assert_eq!(prior["conversations_processed"], 1);
+    let manifest = SemanticManifest::load(&data_dir)?.ok_or("cancel lost manifest")?;
+    let checkpoint = manifest
+        .checkpoint
+        .ok_or("cancel lost durable checkpoint")?;
+    assert_eq!(checkpoint.conversations_processed, 1);
+    assert_eq!(checkpoint.docs_embedded, 1);
+    assert!(!vector_index_path(&data_dir, "fnv1a-384").is_file());
+    let progress = String::from_utf8(progress)?;
+    let events: Vec<Value> = progress
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "checkpoint_save_done")
+            .count(),
+        1,
+        "the cancelled process must save exactly its admitted batch: {events:?}"
+    );
+    assert!(events.iter().all(|event| event["event"] != "publish_done"));
+    let resumed = run_robot_backfill_batches(&data_dir, &db_path, 2)?;
+    assert_eq!(resumed["status"], "published", "{resumed}");
+    assert_eq!(resumed["batches_attempted"], 1);
+    assert_eq!(resumed["batches_completed"], 1);
+    assert_eq!(resumed["model_initializations"], 1);
+    assert_eq!(resumed["embedded_docs"], 1);
+    let records = ordered_backfill_vectors(&data_dir)?;
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].0.message_id, 1);
+    assert_eq!(records[1].0.message_id, 2);
+    assert!(
+        SemanticManifest::load(&data_dir)?
+            .ok_or("resume lost manifest")?
+            .checkpoint
+            .is_none()
+    );
+    Ok(())
+}
+
+#[test]
 fn robot_models_backfill_zero_doc_batch_still_reports_checkpointed() -> TestResult {
     let temp = tempfile::tempdir()?;
     let data_dir = temp.path().join("cass-data");
@@ -1038,6 +1455,9 @@ fn robot_models_backfill_scheduled_yields_to_foreground_pressure() -> TestResult
 
     let paused = run_robot_scheduled_backfill_paused(&data_dir, &db_path)?;
     assert_eq!(paused["status"], "paused");
+    assert_eq!(paused["batches_attempted"], 1);
+    assert_eq!(paused["batches_completed"], 0);
+    assert_eq!(paused["model_initializations"], 0);
     assert_eq!(
         paused["next_step"],
         "foreground pressure is present; retry after the idle delay"

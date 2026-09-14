@@ -2535,7 +2535,7 @@ pub enum ModelsCommand {
         #[arg(long, visible_alias = "robot")]
         json: bool,
     },
-    /// Run one bounded semantic backfill batch from the canonical DB
+    /// Run bounded semantic backfill batches from the canonical DB
     Backfill {
         /// Semantic tier to backfill: fast or quality
         #[arg(long, default_value = "fast")]
@@ -2546,6 +2546,9 @@ pub enum ModelsCommand {
         /// Maximum canonical conversations to process in this batch
         #[arg(long, default_value_t = 64)]
         batch_conversations: usize,
+        /// Maximum batches to run while retaining one loaded embedder
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        max_batches: u32,
         /// Apply idle/load scheduler gates before running this batch
         #[arg(long, visible_alias = "background")]
         scheduled: bool,
@@ -102810,7 +102813,7 @@ impl IndexShutdownSignals {
         })
     }
 
-    fn poll(&mut self, progress: &indexer::IndexingProgress) {
+    fn poll_exit_code(&mut self) -> Option<i32> {
         use std::future::Future;
         use std::task::{Context, Poll, Waker};
         let mut context = Context::from_waker(Waker::noop());
@@ -102818,8 +102821,14 @@ impl IndexShutdownSignals {
             let mut receive = std::pin::pin!(signal.recv());
             if matches!(receive.as_mut().poll(&mut context), Poll::Ready(Some(()))) {
                 self.received.get_or_insert(*code);
-                progress.request_stop();
             }
+        }
+        self.received
+    }
+
+    fn poll(&mut self, progress: &indexer::IndexingProgress) {
+        if self.poll_exit_code().is_some() {
+            progress.request_stop();
         }
     }
 }
@@ -118254,6 +118263,7 @@ fn run_models_command(cmd: ModelsCommand, cli: &Cli) -> CliResult<()> {
             tier,
             embedder,
             batch_conversations,
+            max_batches,
             scheduled,
             data_dir,
             db,
@@ -118264,7 +118274,10 @@ fn run_models_command(cmd: ModelsCommand, cli: &Cli) -> CliResult<()> {
                 &tier,
                 embedder.as_deref(),
                 batch_conversations,
-                scheduled,
+                ModelsBackfillRunOptions {
+                    scheduled,
+                    max_batches,
+                },
                 data_dir,
                 db.or_else(|| cli.db.clone()),
                 structured_format,
@@ -120304,15 +120317,174 @@ fn semantic_identity_backfill_fingerprint(
     )
 }
 
+struct ModelsBackfillRunOptions {
+    scheduled: bool,
+    max_batches: u32,
+}
+
 fn run_models_backfill(
+    tier_raw: &str,
+    embedder_override: Option<&str>,
+    batch_conversations: usize,
+    options: ModelsBackfillRunOptions,
+    data_dir_override: Option<PathBuf>,
+    db_override: Option<PathBuf>,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+    let mut shutdown = IndexShutdownSignals::new(true).map_err(|error| CliError {
+        code: 5,
+        kind: CliErrorKind::SemanticBackfill.kind_str(),
+        message: format!("Failed to install backfill shutdown signals: {error}"),
+        hint: None,
+        retryable: true,
+    })?;
+    let mut indexer = None;
+    let mut attempted = 0u32;
+    let mut completed = 0u32;
+    let mut last_report = None;
+    let mut last_completed_batch: Option<serde_json::Value> = None;
+    let mut failure = None;
+
+    loop {
+        // A received signal stops at a durable batch boundary. Each completed
+        // helper call has already dropped its archive, manifest and lock.
+        if let Some(code) = shutdown.poll_exit_code() {
+            failure = Some(CliError {
+                code,
+                kind: CliErrorKind::SemanticBackfill.kind_str(),
+                message: "Semantic backfill cancelled at a batch boundary".to_string(),
+                hint: Some("Rerun the command to resume from the saved checkpoint".into()),
+                retryable: true,
+            });
+            break;
+        }
+        if attempted >= options.max_batches {
+            break;
+        }
+        attempted += 1;
+        let result = run_models_backfill_batch(
+            tier_raw,
+            embedder_override,
+            batch_conversations,
+            options.scheduled,
+            data_dir_override.clone(),
+            db_override.clone(),
+            &mut indexer,
+        );
+        match result {
+            Ok(report) => {
+                let made_progress = last_completed_batch.as_ref().is_none_or(|previous| {
+                    previous.get("last_offset") != report.get("last_offset")
+                        || previous.get("conversations_processed")
+                            != report.get("conversations_processed")
+                });
+                // Paused/disabled scheduler reports have no admitted batch.
+                if report.get("conversations_processed").is_some() {
+                    completed += 1;
+                    last_completed_batch = Some(report.clone());
+                }
+                let continue_backfill = report.get("checkpoint_saved")
+                    == Some(&serde_json::Value::Bool(true))
+                    && report.get("published") != Some(&serde_json::Value::Bool(true))
+                    && report.get("unchanged") != Some(&serde_json::Value::Bool(true))
+                    && made_progress;
+                last_report = Some(report);
+                // Still honor a signal delivered during the final batch.
+                if !continue_backfill && shutdown.poll_exit_code().is_none() {
+                    break;
+                }
+            }
+            Err(error) if last_report.is_none() => return Err(error),
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
+        }
+    }
+
+    let mut report = if let Some(error) = failure.as_ref() {
+        serde_json::json!({
+            "status": if matches!(error.code, 130 | 143) { "cancelled" } else { "failed" },
+            "tier": tier_raw,
+            "last_completed_batch": last_completed_batch,
+            "error": {
+                "code": error.code,
+                "kind": error.kind,
+                "message": error.message,
+                "hint": error.hint,
+                "retryable": error.retryable,
+            },
+        })
+    } else {
+        let mut report =
+            last_report.unwrap_or_else(|| serde_json::json!({"status": "idle", "tier": tier_raw}));
+        if report.get("conversations_processed").is_none()
+            && let Some(completed_batch) = last_completed_batch
+        {
+            report["last_completed_batch"] = completed_batch;
+        }
+        report
+    };
+    report["batches_attempted"] = attempted.into();
+    report["batches_completed"] = completed.into();
+    report["model_initializations"] = u32::from(indexer.is_some()).into();
+
+    if let Some(fmt) = structured_format {
+        output_structured_value(report, fmt)?;
+    } else {
+        use colored::Colorize;
+        println!("{}", "Semantic backfill".bold());
+        println!(
+            "  Status: {}",
+            report["status"].as_str().unwrap_or("unknown")
+        );
+        println!("  Tier: {}", tier_raw);
+        println!("  Batches: {completed} completed / {attempted} attempted");
+        let batch = report.get("last_completed_batch").unwrap_or(&report);
+        for (label, key) in [
+            ("Embedder", "embedder_id"),
+            ("Embedded docs", "embedded_docs"),
+            ("Conversations processed", "conversations_processed"),
+            ("Total conversations", "total_conversations"),
+            ("Last offset", "last_offset"),
+            ("Index", "index_path"),
+            ("Manifest", "manifest_path"),
+        ] {
+            if let Some(value) = batch.get(key) {
+                if let Some(text) = value.as_str() {
+                    println!("  {label}: {text}");
+                } else {
+                    println!("  {label}: {value}");
+                }
+            }
+        }
+        if let Some(next_step) = report.get("next_step").and_then(serde_json::Value::as_str) {
+            println!("  {next_step}");
+        }
+    }
+    match failure {
+        Some(error) if structured_format.is_some() => Err(CliError::already_reported_from(&error)),
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn run_models_backfill_batch(
     tier_raw: &str,
     embedder_override: Option<&str>,
     batch_conversations: usize,
     scheduled: bool,
     data_dir_override: Option<PathBuf>,
     db_override: Option<PathBuf>,
-    output_format: Option<RobotFormat>,
-) -> CliResult<()> {
+    retained_indexer: &mut Option<crate::indexer::semantic::SemanticIndexer>,
+) -> CliResult<serde_json::Value> {
     use crate::indexer::semantic::{
         SemanticBackfillSchedulerSignals, SemanticBackfillStoragePlan, SemanticIndexer,
         semantic_backfill_scheduler_decision,
@@ -120321,7 +120493,6 @@ fn run_models_backfill(
     use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
     use crate::search::semantic_manifest::{SemanticManifest, TierKind};
     use crate::storage::sqlite::{FrankenStorage, SemanticIdentityTier};
-    use colored::Colorize;
 
     if batch_conversations == 0 {
         return Err(CliError {
@@ -120388,44 +120559,16 @@ fn run_models_backfill(
     {
         let status = decision.state.as_str();
         let next_step = decision.reason.next_step();
-        let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
-            if matches!(fmt, RobotFormat::Sessions) {
-                RobotFormat::Compact
-            } else {
-                fmt
-            }
-        });
-
-        if let Some(_fmt) = structured_format {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "status": status,
-                    "next_step": next_step,
-                    "tier": tier.as_str(),
-                    "embedder_id": embedder_type,
-                    "data_dir": data_dir.display().to_string(),
-                    "db_path": db_path.display().to_string(),
-                    "batch_conversations_limit": batch_conversations,
-                    "scheduler": decision,
-                }))
-                .unwrap_or_default()
-            );
-        } else {
-            println!("{}", "Semantic backfill scheduler".bold());
-            println!("  Status: {}", status);
-            println!("  Tier: {}", tier.as_str());
-            println!("  Embedder: {}", embedder_type);
-            println!("  Capacity: {}%", decision.current_capacity_pct);
-            println!(
-                "  Next eligible after: {} ms",
-                decision.next_eligible_after_ms
-            );
-            println!();
-            println!("{}", next_step);
-        }
-
-        return Ok(());
+        return Ok(serde_json::json!({
+            "status": status,
+            "next_step": next_step,
+            "tier": tier.as_str(),
+            "embedder_id": embedder_type,
+            "data_dir": data_dir.display().to_string(),
+            "db_path": db_path.display().to_string(),
+            "batch_conversations_limit": batch_conversations,
+            "scheduler": decision,
+        }));
     }
 
     let effective_batch_conversations = scheduler_decision
@@ -120459,17 +120602,22 @@ fn run_models_backfill(
     // Refuse unavailable models before opening the archive: even a current-
     // schema storage open can change its shared-memory sidecar. Keep model
     // admission inside the maintenance lock so index-busy retains precedence.
-    let indexer = SemanticIndexer::new(&embedder_type, Some(&data_dir)).map_err(|e| CliError {
-        code: 20,
-        kind: CliErrorKind::Model.kind_str(),
-        message: format!("Failed to initialize semantic embedder '{embedder_type}': {e}"),
-        hint: Some(if embedder_type == "fastembed" {
-            "Run 'cass models install -y' or retry with --embedder hash".into()
-        } else {
-            "Use --embedder hash or install the selected embedder model".into()
-        }),
-        retryable: embedder_type != "hash",
-    })?;
+    let indexer = match retained_indexer {
+        Some(indexer) => indexer,
+        vacant => vacant.insert(
+            SemanticIndexer::new(&embedder_type, Some(&data_dir)).map_err(|e| CliError {
+                code: 20,
+                kind: CliErrorKind::Model.kind_str(),
+                message: format!("Failed to initialize semantic embedder '{embedder_type}': {e}"),
+                hint: Some(if embedder_type == "fastembed" {
+                    "Run 'cass models install -y' or retry with --embedder hash".into()
+                } else {
+                    "Use --embedder hash or install the selected embedder model".into()
+                }),
+                retryable: embedder_type != "hash",
+            })?,
+        ),
+    };
 
     let storage = crate::storage::sqlite::open_current_schema_storage_with_timeout(
         &db_path,
@@ -120673,59 +120821,28 @@ fn run_models_backfill(
         "quality_tier_processed": manifest.backlog.quality_tier_processed,
         "computed_at_ms": manifest.backlog.computed_at_ms,
     });
-    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
-        if matches!(fmt, RobotFormat::Sessions) {
-            RobotFormat::Compact
-        } else {
-            fmt
-        }
-    });
-
-    if let Some(_fmt) = structured_format {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "status": status,
-                "next_step": next_step,
-                "tier": outcome.tier.as_str(),
-                "embedder_id": outcome.embedder_id,
-                "data_dir": data_dir.display().to_string(),
-                "db_path": db_path.display().to_string(),
-                "batch_conversations_limit": effective_batch_conversations,
-                "requested_batch_conversations_limit": batch_conversations,
-                "scheduler": scheduler_decision,
-                "embedded_docs": outcome.embedded_docs,
-                "conversations_processed": outcome.conversations_processed,
-                "total_conversations": outcome.total_conversations,
-                "progress_pct": progress_pct,
-                "last_offset": outcome.last_offset,
-                "checkpoint_saved": outcome.checkpoint_saved,
-                "published": outcome.published,
-                "unchanged": outcome.unchanged,
-                "index_path": outcome.index_path.display().to_string(),
-                "manifest_path": outcome.manifest_path.display().to_string(),
-                "backlog": backlog,
-            }))
-            .unwrap_or_default()
-        );
-    } else {
-        println!("{}", "Semantic backfill batch".bold());
-        println!("  Status: {}", status);
-        println!("  Tier: {}", outcome.tier.as_str());
-        println!("  Embedder: {}", outcome.embedder_id);
-        println!("  Embedded docs: {}", outcome.embedded_docs);
-        println!(
-            "  Conversations: {}/{} ({:.1}%)",
-            outcome.conversations_processed, outcome.total_conversations, progress_pct
-        );
-        println!("  Last offset: {}", outcome.last_offset);
-        println!("  Index: {}", outcome.index_path.display());
-        println!("  Manifest: {}", outcome.manifest_path.display());
-        println!();
-        println!("{}", next_step);
-    }
-
-    Ok(())
+    Ok(serde_json::json!({
+        "status": status,
+        "next_step": next_step,
+        "tier": outcome.tier.as_str(),
+        "embedder_id": outcome.embedder_id,
+        "data_dir": data_dir.display().to_string(),
+        "db_path": db_path.display().to_string(),
+        "batch_conversations_limit": effective_batch_conversations,
+        "requested_batch_conversations_limit": batch_conversations,
+        "scheduler": scheduler_decision,
+        "embedded_docs": outcome.embedded_docs,
+        "conversations_processed": outcome.conversations_processed,
+        "total_conversations": outcome.total_conversations,
+        "progress_pct": progress_pct,
+        "last_offset": outcome.last_offset,
+        "checkpoint_saved": outcome.checkpoint_saved,
+        "published": outcome.published,
+        "unchanged": outcome.unchanged,
+        "index_path": outcome.index_path.display().to_string(),
+        "manifest_path": outcome.manifest_path.display().to_string(),
+        "backlog": backlog,
+    }))
 }
 
 #[cfg(test)]
