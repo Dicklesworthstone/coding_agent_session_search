@@ -949,6 +949,12 @@
         "hnsw_path": {
           "type": "null"
         },
+        "hnsw_present": {
+          "type": "boolean"
+        },
+        "hnsw_state": {
+          "type": "string"
+        },
         "hnsw_ready": {
           "type": "boolean"
         },
@@ -1312,7 +1318,7 @@
               "type": "boolean"
             },
             "present": {
-              "type": "null"
+              "type": "boolean"
             },
             "note": {
               "type": "string"

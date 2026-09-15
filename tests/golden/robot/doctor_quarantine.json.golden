@@ -773,6 +773,8 @@
     "vector_index_path": null,
     "model_dir": null,
     "hnsw_path": null,
+    "hnsw_present": false,
+    "hnsw_state": "not_inspected",
     "hnsw_ready": false,
     "progressive_ready": false,
     "progressive_reason_code": null,
@@ -896,7 +898,7 @@
       "redacted_path": null,
       "current_db_matches": null,
       "ready": false,
-      "present": null,
+      "present": false,
       "note": "HNSW/mmap accelerators are optional derived assets and must not block lexical search"
     },
     "memoization_cache": {

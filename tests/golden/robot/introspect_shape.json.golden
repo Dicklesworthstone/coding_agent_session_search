@@ -4525,6 +4525,22 @@
                             }
                           }
                         },
+                        "hnsw_present": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "hnsw_state": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
                         "hnsw_ready": {
                           "type": "object",
                           "properties": {
@@ -48490,6 +48506,22 @@
                             }
                           }
                         },
+                        "hnsw_present": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "hnsw_state": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
                         "hnsw_ready": {
                           "type": "object",
                           "properties": {
@@ -55443,6 +55475,22 @@
                                     }
                                   }
                                 },
+                                "hnsw_present": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "hnsw_state": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
                                 "hnsw_ready": {
                                   "type": "object",
                                   "properties": {
@@ -61250,6 +61298,22 @@
                                             }
                                           }
                                         },
+                                        "hnsw_present": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "hnsw_state": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
                                         "hnsw_ready": {
                                           "type": "object",
                                           "properties": {
@@ -64184,6 +64248,22 @@
                               "items": {
                                 "type": "string"
                               }
+                            }
+                          }
+                        },
+                        "hnsw_present": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "hnsw_state": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
                             }
                           }
                         },
@@ -68695,6 +68775,22 @@
                             }
                           }
                         },
+                        "hnsw_present": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "hnsw_state": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
                         "hnsw_ready": {
                           "type": "object",
                           "properties": {
@@ -73190,6 +73286,22 @@
                                       "items": {
                                         "type": "string"
                                       }
+                                    }
+                                  }
+                                },
+                                "hnsw_present": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "hnsw_state": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
                                     }
                                   }
                                 },

@@ -5912,6 +5912,12 @@
                 "null"
               ]
             },
+            "hnsw_present": {
+              "type": "boolean"
+            },
+            "hnsw_state": {
+              "type": "string"
+            },
             "hnsw_ready": {
               "type": "boolean"
             },
@@ -26477,6 +26483,12 @@
                 "null"
               ]
             },
+            "hnsw_present": {
+              "type": "boolean"
+            },
+            "hnsw_state": {
+              "type": "string"
+            },
             "hnsw_ready": {
               "type": "boolean"
             },
@@ -29836,6 +29848,12 @@
                     "null"
                   ]
                 },
+                "hnsw_present": {
+                  "type": "boolean"
+                },
+                "hnsw_state": {
+                  "type": "string"
+                },
                 "hnsw_ready": {
                   "type": "boolean"
                 },
@@ -32363,6 +32381,12 @@
                         "null"
                       ]
                     },
+                    "hnsw_present": {
+                      "type": "boolean"
+                    },
+                    "hnsw_state": {
+                      "type": "string"
+                    },
                     "hnsw_ready": {
                       "type": "boolean"
                     },
@@ -33735,6 +33759,12 @@
                 "string",
                 "null"
               ]
+            },
+            "hnsw_present": {
+              "type": "boolean"
+            },
+            "hnsw_state": {
+              "type": "string"
             },
             "hnsw_ready": {
               "type": "boolean"
@@ -35824,6 +35854,12 @@
                 "string",
                 "null"
               ]
+            },
+            "hnsw_present": {
+              "type": "boolean"
+            },
+            "hnsw_state": {
+              "type": "string"
             },
             "hnsw_ready": {
               "type": "boolean"
@@ -37929,6 +37965,12 @@
                     "string",
                     "null"
                   ]
+                },
+                "hnsw_present": {
+                  "type": "boolean"
+                },
+                "hnsw_state": {
+                  "type": "string"
                 },
                 "hnsw_ready": {
                   "type": "boolean"
