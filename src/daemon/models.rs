@@ -19,7 +19,7 @@ use frankensearch::core::EmbeddingIdentityBundleV1;
 /// Model manager that handles lazy loading of embedder and reranker models.
 pub struct ModelManager {
     data_dir: PathBuf,
-    embedder_registry_name: &'static str,
+    embedder_registry_name: String,
     embedder: RwLock<Option<Arc<dyn Embedder>>>,
     reranker: RwLock<Option<Arc<dyn Reranker>>>,
     embedder_name: RwLock<String>,
@@ -32,15 +32,15 @@ impl ModelManager {
         let policy = crate::search::policy::SemanticPolicy::resolve(
             &crate::search::policy::CliSemanticOverrides::default(),
         );
-        let embedder_registry_name =
-            FastEmbedder::canonical_name(&policy.quality_tier_embedder).unwrap_or("minilm");
-        Self::new_for_embedder(data_dir, embedder_registry_name)
+        Self::new_for_embedder(data_dir, &policy.quality_tier_embedder)
     }
 
-    fn new_for_embedder(data_dir: &Path, embedder_registry_name: &'static str) -> Self {
+    fn new_for_embedder(data_dir: &Path, embedder_registry_name: &str) -> Self {
         Self {
             data_dir: data_dir.to_path_buf(),
-            embedder_registry_name,
+            embedder_registry_name: FastEmbedder::canonical_name(embedder_registry_name)
+                .unwrap_or(embedder_registry_name)
+                .to_owned(),
             embedder: RwLock::new(None),
             reranker: RwLock::new(None),
             embedder_name: RwLock::new("not-loaded".to_string()),
@@ -135,11 +135,25 @@ impl ModelManager {
             return Ok(());
         }
 
+        // Validate the selection before consulting a model-directory override:
+        // an installed MiniLM bundle must not enable a disabled quality tier.
+        if FastEmbedder::canonical_name(&self.embedder_registry_name).is_none() {
+            *self.embedder_name.write() = "load-failed".to_string();
+            return Err(EmbedderError::EmbedderUnavailable {
+                model: self.embedder_registry_name.clone(),
+                reason: "selected quality model is disabled or unsupported by the native daemon"
+                    .to_string(),
+            });
+        }
+
         let model_dir =
-            FastEmbedder::runtime_model_dir_for(&self.data_dir, self.embedder_registry_name)
-                .ok_or_else(|| EmbedderError::EmbedderUnavailable {
-                    model: self.embedder_registry_name.to_string(),
-                    reason: "registered embedder has no model directory mapping".to_string(),
+            FastEmbedder::runtime_model_dir_for(&self.data_dir, &self.embedder_registry_name)
+                .ok_or_else(|| {
+                    *self.embedder_name.write() = "load-failed".to_string();
+                    EmbedderError::EmbedderUnavailable {
+                        model: self.embedder_registry_name.to_string(),
+                        reason: "registered embedder has no model directory mapping".to_string(),
+                    }
                 })?;
         info!(
             embedder = self.embedder_registry_name,
@@ -147,7 +161,7 @@ impl ModelManager {
             "Loading embedder"
         );
 
-        match FastEmbedder::load_by_name(&self.data_dir, self.embedder_registry_name) {
+        match FastEmbedder::load_by_name(&self.data_dir, &self.embedder_registry_name) {
             Ok(embedder) => {
                 let id = embedder.id().to_string();
                 let dimension = embedder.dimension();
@@ -300,6 +314,74 @@ mod tests {
         assert_eq!(manager.embedder_registry_name, "multilingual-minilm");
         assert_eq!(manager.embedder_name(), "not-loaded");
         assert_eq!(manager.embedder_id(), "not-loaded");
+    }
+
+    #[test]
+    fn model_manager_canonicalizes_supported_quality_aliases() {
+        for (selected, expected) in [
+            ("all-minilm-l6-v2", "minilm"),
+            ("multilingual", "multilingual-minilm"),
+        ] {
+            let manager = ModelManager::new_for_embedder(&test_data_dir(), selected);
+            assert_eq!(manager.embedder_registry_name, expected);
+        }
+    }
+
+    #[test]
+    fn unsupported_quality_selection_never_loads_or_attests_a_substitute()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const CHILD_SELECTION: &str = "CASS_DAEMON_MODEL_SELECTION_TEST_CHILD";
+        let data_dir = tempfile::tempdir()?;
+        if let Ok(selected) = dotenvy::var(CHILD_SELECTION) {
+            let manager = ModelManager::new(data_dir.path());
+            assert_eq!(manager.embedder_registry_name, selected);
+            for result in [
+                manager.warm_embedder(),
+                manager.embed("a real daemon embedding request").map(|_| ()),
+                manager.embedder_attestation_identity().map(|_| ()),
+            ] {
+                match result {
+                    Err(EmbedderError::EmbedderUnavailable { model, reason }) => {
+                        assert_eq!(model, selected);
+                        assert!(reason.contains("disabled or unsupported"));
+                    }
+                    other => panic!("expected explicit selection refusal, got {other:?}"),
+                }
+            }
+            assert!(!manager.is_ready());
+            assert!(!manager.embedder_loaded());
+            assert_eq!(manager.embedder_id(), "not-loaded");
+            assert_eq!(manager.embedder_name(), "load-failed");
+            assert_eq!(std::fs::read_dir(data_dir.path())?.count(), 0);
+            return Ok(());
+        }
+
+        for selected in ["hash", "unknown-quality-model"] {
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "daemon::models::tests::unsupported_quality_selection_never_loads_or_attests_a_substitute",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_SELECTION, selected)
+                .env("CASS_SEMANTIC_EMBEDDER", selected)
+                .env("FRANKENSEARCH_MODEL_DIR", data_dir.path())
+                .current_dir(data_dir.path())
+                .output()?;
+            assert!(
+                output.status.success(),
+                "selection {selected} failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "the exact child regression must actually execute"
+            );
+            assert_eq!(std::fs::read_dir(data_dir.path())?.count(), 0);
+        }
+        Ok(())
     }
 
     #[test]
