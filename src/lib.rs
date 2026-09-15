@@ -21603,6 +21603,8 @@ fn state_meta_json_inner(
                 vector_index_path: None,
                 model_dir: None,
                 hnsw_path: None,
+                hnsw_present: false,
+                hnsw_state: "not_inspected",
                 hnsw_ready: false,
                 progressive_ready: false,
                 progressive_reason_code: None,
@@ -21651,6 +21653,8 @@ fn state_meta_json_inner(
         assets.semantic.vector_index_path = None;
         assets.semantic.model_dir = None;
         assets.semantic.hnsw_path = None;
+        assets.semantic.hnsw_present = false;
+        assets.semantic.hnsw_state = "not_inspected";
         assets.semantic.hnsw_ready = false;
         assets.semantic.progressive_ready = false;
         assets.semantic.progressive_reason_code = None;
@@ -21976,6 +21980,8 @@ fn state_meta_json_inner(
             "vector_index_path": semantic.vector_index_path.as_ref().map(|path| path.display().to_string()),
             "model_dir": semantic.model_dir.as_ref().map(|path| path.display().to_string()),
             "hnsw_path": semantic.hnsw_path.as_ref().map(|path| path.display().to_string()),
+            "hnsw_present": semantic.hnsw_present,
+            "hnsw_state": semantic.hnsw_state,
             "hnsw_ready": semantic.hnsw_ready,
             "progressive_ready": semantic.progressive_ready,
             "progressive_reason_code": semantic.progressive_reason_code,
@@ -44091,10 +44097,18 @@ fn doctor_build_derived_semantic_asset_report(
         "skipped-archive-unavailable"
     } else if hnsw_ready {
         "ready"
-    } else if hnsw_path.is_some() {
-        "missing-or-unreadable"
     } else {
-        "not-present"
+        match state
+            .pointer("/semantic/hnsw_state")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("present_unverified") => "present-unverified",
+            Some("absent") => "not-present",
+            Some("inspection_failed") => "inspection-failed",
+            Some("not_inspected") => "not-inspected",
+            _ if hnsw_path.is_some() => "missing-or-unreadable",
+            _ => "not-present",
+        }
     };
     let memo_status = if !archive_db_usable {
         "skipped-archive-unavailable"
@@ -44147,10 +44161,7 @@ fn doctor_build_derived_semantic_asset_report(
             path: hnsw_path,
             current_db_matches: None,
             ready: Some(hnsw_ready),
-            present: state
-                .pointer("/semantic/hnsw_path")
-                .and_then(serde_json::Value::as_str)
-                .map(|_| true),
+            present: doctor_json_pointer_bool(state, "/semantic/hnsw_present"),
             safe_to_rebuild,
             safe_for_auto_repair: false,
             note: "HNSW/mmap accelerators are optional derived assets and must not block lexical search".to_string(),
@@ -44217,6 +44228,26 @@ fn doctor_build_derived_semantic_asset_report(
 mod doctor_derived_semantic_asset_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn ann_presence_is_not_readiness_and_does_not_probe_diagnostic_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut state = semantic_state(temp.path(), "ready", "ready", true, None);
+        for (present, ann_state, expected_status) in [
+            (true, "present_unverified", "present-unverified"),
+            (false, "absent", "not-present"),
+            (false, "not_inspected", "not-inspected"),
+            (false, "inspection_failed", "inspection-failed"),
+        ] {
+            state["semantic"]["hnsw_present"] = json!(present);
+            state["semantic"]["hnsw_state"] = json!(ann_state);
+            let report = doctor_build_derived_semantic_asset_report(temp.path(), &state, true, 0);
+            assert_eq!(report.hnsw_index.status, expected_status);
+            assert_eq!(report.hnsw_index.present, Some(present));
+            assert_eq!(report.hnsw_index.ready, Some(false));
+            assert!(!report.blocks_archive_recovery);
+        }
+    }
 
     fn semantic_state(
         data_dir: &Path,
@@ -95077,6 +95108,8 @@ fn response_schema_semantic_state() -> serde_json::Value {
             "vector_index_path": { "type": ["string", "null"] },
             "model_dir": { "type": ["string", "null"] },
             "hnsw_path": { "type": ["string", "null"] },
+            "hnsw_present": { "type": "boolean" },
+            "hnsw_state": { "type": "string" },
             "hnsw_ready": { "type": "boolean" },
             "progressive_ready": { "type": "boolean" },
             "progressive_reason_code": { "type": ["string", "null"] },
