@@ -827,6 +827,7 @@ fn e2e_subprocess_sources_cannot_mutate_the_parent_environment() -> SchemaTestRe
     let tracker = tracker_for("e2e_subprocess_sources_cannot_mutate_the_parent_environment");
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let sources = [
+        "tests/connector_chatgpt.rs",
         "tests/connector_codex.rs",
         "tests/connector_omp.rs",
         "tests/connector_pi_agent.rs",

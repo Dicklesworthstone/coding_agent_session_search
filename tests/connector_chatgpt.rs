@@ -4,14 +4,12 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
     aead::{Aead, KeyInit},
 };
-use base64::prelude::*;
 use coding_agent_search::connectors::chatgpt::ChatGptConnector;
 use coding_agent_search::connectors::{Connector, ScanContext};
 use serial_test::serial;
 use std::fs::{self, File};
 use std::path::Path;
 use tempfile::TempDir;
-use util::EnvGuard;
 
 // ============================================================================
 // Helper
@@ -553,8 +551,7 @@ fn scan_skips_encrypted_dir_without_key() {
 }
 
 #[test]
-#[serial]
-fn scan_parses_encrypted_conversation_id_fixture_with_env_key() {
+fn scan_parses_encrypted_conversation_id_fixture_with_explicit_key() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
     let enc_dir = root.join("conversations-v2-success");
@@ -566,12 +563,7 @@ fn scan_parses_encrypted_conversation_id_fixture_with_env_key() {
     );
     fs::write(enc_dir.join("conv.data"), ciphertext).unwrap();
 
-    let _key_guard = EnvGuard::set(
-        "CHATGPT_ENCRYPTION_KEY",
-        BASE64_STANDARD.encode(CHATGPT_TEST_KEY),
-    );
-
-    let connector = ChatGptConnector::new();
+    let connector = ChatGptConnector::with_encryption_key(CHATGPT_TEST_KEY);
     let ctx = ScanContext::local_default(root.to_path_buf(), None);
     let convs = connector.scan(&ctx).unwrap();
 
@@ -594,8 +586,7 @@ fn scan_parses_encrypted_conversation_id_fixture_with_env_key() {
 }
 
 #[test]
-#[serial]
-fn scan_parses_encrypted_multipart_fixture_with_env_key() {
+fn scan_parses_encrypted_multipart_fixture_with_explicit_key() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
     let enc_dir = root.join("conversations-v3-multipart");
@@ -607,12 +598,7 @@ fn scan_parses_encrypted_multipart_fixture_with_env_key() {
     );
     fs::write(enc_dir.join("conv.data"), ciphertext).unwrap();
 
-    let _key_guard = EnvGuard::set(
-        "CHATGPT_ENCRYPTION_KEY",
-        BASE64_STANDARD.encode(CHATGPT_TEST_KEY),
-    );
-
-    let connector = ChatGptConnector::new();
+    let connector = ChatGptConnector::with_encryption_key(CHATGPT_TEST_KEY);
     let ctx = ScanContext::local_default(root.to_path_buf(), None);
     let convs = connector.scan(&ctx).unwrap();
 
@@ -629,7 +615,6 @@ fn scan_parses_encrypted_multipart_fixture_with_env_key() {
 }
 
 #[test]
-#[serial]
 fn scan_continues_past_malformed_encrypted_file_with_valid_key() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
@@ -646,12 +631,7 @@ fn scan_continues_past_malformed_encrypted_file_with_valid_key() {
         r#"{"id":"plain","messages":[{"role":"user","content":"Recovered plain conversation"}]}"#,
     );
 
-    let _key_guard = EnvGuard::set(
-        "CHATGPT_ENCRYPTION_KEY",
-        BASE64_STANDARD.encode(CHATGPT_TEST_KEY),
-    );
-
-    let connector = ChatGptConnector::new();
+    let connector = ChatGptConnector::with_encryption_key(CHATGPT_TEST_KEY);
     let ctx = ScanContext::local_default(root.to_path_buf(), None);
     let convs = connector.scan(&ctx).unwrap();
 
@@ -661,7 +641,6 @@ fn scan_continues_past_malformed_encrypted_file_with_valid_key() {
 }
 
 #[test]
-#[serial]
 fn scan_skips_oversized_encrypted_file_even_with_key() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
@@ -680,12 +659,7 @@ fn scan_skips_oversized_encrypted_file_even_with_key() {
         r#"{"id":"plain","messages":[{"role":"user","content":"Small sibling conversation"}]}"#,
     );
 
-    let _key_guard = EnvGuard::set(
-        "CHATGPT_ENCRYPTION_KEY",
-        BASE64_STANDARD.encode(CHATGPT_TEST_KEY),
-    );
-
-    let connector = ChatGptConnector::new();
+    let connector = ChatGptConnector::with_encryption_key(CHATGPT_TEST_KEY);
     let ctx = ScanContext::local_default(root.to_path_buf(), None);
     let convs = connector.scan(&ctx).unwrap();
 
