@@ -230,6 +230,7 @@ fn cdzcl_index_idempotency_rejects_invalid_cached_payloads() {
     );
     let human_replay = command(false, true).output().unwrap();
     assert!(human_replay.status.success());
+    assert!(human_replay.stdout.is_empty());
     assert!(String::from_utf8_lossy(&human_replay.stderr).contains("Using cached result"));
     let mismatch = command(true, false).output().unwrap();
     assert_eq!(mismatch.status.code(), Some(5));
@@ -239,19 +240,19 @@ fn cdzcl_index_idempotency_rejects_invalid_cached_payloads() {
     // Four representative shapes in both output modes; the pure unit test
     // covers the complete shape table. Only nine tiny full indexes run here.
     for (case, invalid) in ["{", "7", "[]", "null"].into_iter().enumerate() {
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        let updated = storage
-            .raw()
-            .execute_compat(
-                "UPDATE idempotency_keys SET result_json = ?1 WHERE key = ?2",
-                coding_agent_search::franken_sync::params![invalid, "cache-shape"],
-            )
-            .unwrap();
-        assert_eq!(updated, 1);
-        storage.close_without_checkpoint().unwrap();
         append_message(case + 1);
 
         for robot in [false, true] {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            let updated = storage
+                .raw()
+                .execute_compat(
+                    "UPDATE idempotency_keys SET result_json = ?1 WHERE key = ?2",
+                    coding_agent_search::franken_sync::params![invalid, "cache-shape"],
+                )
+                .unwrap();
+            assert_eq!(updated, 1);
+            storage.close_without_checkpoint().unwrap();
             let output = command(robot, true).output().unwrap();
             assert!(
                 output.status.success(),
@@ -265,18 +266,30 @@ fn cdzcl_index_idempotency_rejects_invalid_cached_payloads() {
                 assert_eq!(payload["cached"], false);
                 assert_eq!(payload["messages"], case + 2);
                 assert_eq!(payload["idempotency_key"], "cache-shape");
+            } else {
+                assert!(output.stdout.is_empty());
             }
             let storage = FrankenStorage::open_readonly(&db_path).unwrap();
             assert_eq!(storage.total_conversation_count().unwrap(), 1);
             assert_eq!(storage.total_message_count().unwrap(), case + 2);
             storage.close_without_checkpoint().unwrap();
+
+            let (stored_hash, repaired) = read_cache();
+            assert_eq!(stored_hash, params_hash);
+            let repaired: Value = serde_json::from_str(&repaired).unwrap();
+            assert_eq!(repaired["success"], true);
+            assert_eq!(repaired["cached"], false);
+            assert_eq!(repaired["messages"], case + 2);
+            // A human-mode repair must persist just like a robot-mode repair.
+            let replay = command(true, true).output().unwrap();
+            assert!(replay.status.success());
+            let mut expected = repaired;
+            expected["cached"] = json!(true);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&replay.stdout).unwrap(),
+                expected
+            );
         }
-        let (stored_hash, repaired) = read_cache();
-        assert_eq!(stored_hash, params_hash);
-        let repaired: Value = serde_json::from_str(&repaired).unwrap();
-        assert_eq!(repaired["success"], true);
-        assert_eq!(repaired["cached"], false);
-        assert_eq!(repaired["messages"], case + 2);
     }
 }
 

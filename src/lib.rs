@@ -106191,7 +106191,7 @@ fn run_index_with_data(
             }
             emit_result(payload, fmt)?;
         }
-    } else if let Some(fmt) = structured_format {
+    } else if structured_format.is_some() || idempotency_key.is_some() {
         // Derive result counts from the indexer's own progress tracking rather
         // than reopening the live DB after the lexical checkpoint has already
         // been written (CASS #192). A post-checkpoint reopen through
@@ -106296,7 +106296,9 @@ fn run_index_with_data(
             emit_event(event);
         }
 
-        emit_result(payload, fmt)?;
+        if let Some(fmt) = structured_format {
+            emit_result(payload, fmt)?;
+        }
     }
 
     // gh359: `res.is_ok()` — the plain completion line used to print even
