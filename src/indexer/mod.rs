@@ -33439,6 +33439,8 @@ pub mod persist {
         use crate::connectors::NormalizedMessage;
         use fsqlite_types::value::SqliteValue;
         use serial_test::serial;
+        use std::path::PathBuf;
+        use std::sync::atomic::Ordering;
 
         static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
             std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
