@@ -910,7 +910,7 @@ fn gh467_robot_quality_backfill_resolves_native_aliases_before_loading_models() 
     let before = canonical_bundle_snapshot(&db_path)?;
     let multilingual = "paraphrase-multilingual-MiniLM-L12-v2";
 
-    let run = |name: &str| {
+    let run = |name: &str, environment_embedder: &str| {
         cargo_bin_cmd!("cass")
             .current_dir(temp.path())
             .arg("--db")
@@ -930,7 +930,7 @@ fn gh467_robot_quality_backfill_resolves_native_aliases_before_loading_models() 
             .arg("--json")
             .env("HOME", temp.path())
             .env("XDG_CONFIG_HOME", temp.path().join("config"))
-            .env("CASS_SEMANTIC_EMBEDDER", "minilm")
+            .env("CASS_SEMANTIC_EMBEDDER", environment_embedder)
             .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
             .env_remove("FRANKENSEARCH_MODEL_DIR")
             .timeout(Duration::from_secs(20))
@@ -945,21 +945,27 @@ fn gh467_robot_quality_backfill_resolves_native_aliases_before_loading_models() 
         .write(true)
         .open(data_dir.join("index-run.lock"))?;
     lock.lock_exclusive()?;
-    assert_backfill_busy(&run("minilm")?)?;
+    assert_backfill_busy(&run("minilm", "multilingual-minilm")?)?;
     assert!(
         canonical_bundle_snapshot(&db_path)? == before,
         "busy-index refusal must preserve database bundle bytes and timestamps"
     );
     FileExt::unlock(&lock)?;
 
-    for (name, model_directory) in [
-        ("minilm", "all-MiniLM-L6-v2"),
-        ("fastembed", "all-MiniLM-L6-v2"),
-        ("multilingual-minilm", multilingual),
-        ("multilingual-minilm-384", multilingual),
-        ("paraphrase-multilingual-minilm-l12-v2", multilingual),
+    // GH480: an explicit monolingual choice must also override a multilingual
+    // environment default, not only the reverse direction covered by GH467.
+    for (name, environment_embedder, model_directory) in [
+        ("minilm", "multilingual-minilm", "all-MiniLM-L6-v2"),
+        ("fastembed", "multilingual-minilm", "all-MiniLM-L6-v2"),
+        ("multilingual-minilm", "minilm", multilingual),
+        ("multilingual-minilm-384", "minilm", multilingual),
+        (
+            "paraphrase-multilingual-minilm-l12-v2",
+            "minilm",
+            multilingual,
+        ),
     ] {
-        let output = run(name)?;
+        let output = run(name, environment_embedder)?;
         assert_eq!(output.status.code(), Some(20), "{name}: {output:?}");
         assert!(output.stdout.is_empty(), "{name}: {output:?}");
         let report: Value = serde_json::from_slice(&output.stderr)?;

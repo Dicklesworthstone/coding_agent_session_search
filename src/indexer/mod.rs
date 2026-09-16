@@ -19502,6 +19502,14 @@ fn embed_incremental_semantic_inputs(
     filtered_watermark_context: &str,
     success_watermark_context: &str,
 ) -> Result<usize> {
+    // A watch callback may outlive the base generation it started with. Admit
+    // the target before loading a model, embedding a delta, or certifying even
+    // a filtered-only watermark. Append still validates again to catch races.
+    if !semantic_index_has_current_contract(data_dir, embedder) {
+        anyhow::bail!(
+            "incremental semantic base is missing or incompatible; rebuild with cass index --semantic before appending"
+        );
+    }
     if embedding_inputs.is_empty() {
         update_incremental_semantic_watermark(storage, raw_max_id, filtered_watermark_context)?;
         return Ok(0);
@@ -38354,6 +38362,136 @@ mod tests {
             assert!(!semantic_index_has_current_contract(temp.path(), requested));
             assert!(!temp.path().join("models").exists());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn gh481_incremental_semantic_preflight_preserves_watermark_before_model_load() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let storage = Mutex::new(FrankenStorage::open(&temp.path().join("archive.db"))?);
+        update_incremental_semantic_watermark(&storage, 7, "seed test watermark")?;
+        let index_path = vector_index_path(temp.path(), "minilm-384");
+        fs::create_dir_all(index_path.parent().context("vector parent")?)?;
+        let mut manifest = SemanticManifest::default();
+        manifest.publish_artifact(ArtifactRecord {
+            tier: SemanticTierKind::Quality,
+            embedder_id: "minilm-384".to_string(),
+            model_revision: semantic_model_revision_for_embedder_id("minilm-384"),
+            schema_version: SEMANTIC_SCHEMA_VERSION,
+            chunking_version: CHUNKING_STRATEGY_VERSION,
+            dimension: 384,
+            doc_count: 0,
+            conversation_count: 0,
+            db_fingerprint: "content-v1:0:0:0".to_string(),
+            index_path: index_path
+                .strip_prefix(temp.path())?
+                .to_string_lossy()
+                .into_owned(),
+            size_bytes: 0,
+            started_at_ms: 1,
+            completed_at_ms: 2,
+            ready: true,
+        });
+        manifest.save(temp.path())?;
+        for corrupt in [false, true] {
+            if corrupt {
+                fs::write(&index_path, b"not a vector index")?;
+            }
+            for inputs in [
+                vec![],
+                vec![EmbeddingInput::new(8, "Explain the parser bug")],
+            ] {
+                let error = embed_incremental_semantic_inputs(
+                    "minilm",
+                    temp.path(),
+                    &storage,
+                    inputs,
+                    8,
+                    "filtered test watermark",
+                    "appended test watermark",
+                )
+                .expect_err("unavailable base must refuse before loading the absent model");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("incremental semantic base is missing or incompatible"),
+                    "{error:#}"
+                );
+                assert_eq!(
+                    storage.lock().unwrap().get_last_embedded_message_id()?,
+                    Some(7)
+                );
+                assert!(!temp.path().join("models").exists());
+            }
+        }
+        assert_eq!(fs::read(&index_path)?, b"not a vector index");
+        Ok(())
+    }
+
+    #[test]
+    fn gh481_incremental_semantic_preflight_allows_valid_hash_append() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let storage = Mutex::new(FrankenStorage::open(&temp.path().join("archive.db"))?);
+        let indexer = SemanticIndexer::new("hash", Some(temp.path()))?;
+        let index_path = vector_index_path(temp.path(), indexer.embedder_id());
+        fs::create_dir_all(index_path.parent().context("vector parent")?)?;
+        let writer = FsVectorIndex::create_with_revision(
+            &index_path,
+            indexer.embedder_id(),
+            crate::indexer::semantic::HASH_VECTOR_SPACE_REVISION,
+            384,
+            frankensearch::index::Quantization::F16,
+        )?;
+        writer.finish()?;
+        publish_direct_semantic_artifact(
+            &storage.lock().unwrap(),
+            temp.path(),
+            &index_path,
+            indexer.embedder_id(),
+            384,
+            0,
+            1,
+        )?;
+        assert_eq!(
+            embed_incremental_semantic_inputs(
+                "hash",
+                temp.path(),
+                &storage,
+                vec![EmbeddingInput::new(8, "Explain the parser bug")],
+                8,
+                "filtered test watermark",
+                "appended test watermark",
+            )?,
+            1
+        );
+        assert_eq!(
+            inspect_semantic_artifact(&index_path)?.live_record_count(),
+            1
+        );
+        assert_eq!(
+            storage.lock().unwrap().get_last_embedded_message_id()?,
+            Some(8)
+        );
+        assert_eq!(
+            embed_incremental_semantic_inputs(
+                "hash",
+                temp.path(),
+                &storage,
+                vec![],
+                9,
+                "filtered test watermark",
+                "appended test watermark",
+            )?,
+            0
+        );
+        assert_eq!(
+            storage.lock().unwrap().get_last_embedded_message_id()?,
+            Some(9)
+        );
+        assert_eq!(
+            inspect_semantic_artifact(&index_path)?.live_record_count(),
+            1
+        );
         Ok(())
     }
 
