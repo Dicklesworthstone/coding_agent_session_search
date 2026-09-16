@@ -51,8 +51,10 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   rewrites of a large segment for each small append while preserving merge caps (#479).
 - Incremental semantic append validates its base before loading the model,
   embedding new messages, or advancing a filtered-only watermark (#481).
-- An explicit backfill embedder overrides the environment default in both
-  monolingual and multilingual model selection (#480).
+- An explicit index or backfill embedder overrides the environment default in
+  both monolingual and multilingual model selection (#480).
+- Continuous semantic watch retains pending changes across cooldowns and failed
+  publication attempts, then reconciles them against canonical archive content.
 - TUI source menus remain visible with more than 65,000 sources, and timestamp
   sparklines handle the full timestamp range without arithmetic overflow.
 - Source names reject Windows drive prefixes and alternate-stream separators,
@@ -62,7 +64,8 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 - `view` and `expand` bound context ranges safely even at the largest accepted
   context value, avoiding integer overflow near the beginning or end of a session.
 - Index idempotency replay rejects malformed or non-object cached results and
-  performs indexing instead of panicking or reporting a false cache hit.
+  performs indexing instead of panicking or reporting a false cache hit. The
+  first index can also persist its result when the data directory is new.
 - Linux release recipes preserve the installer's glibc 2.28 compatibility floor
   with pinned Zig builds and reject binaries requiring a newer glibc version.
 - Explicit watch-once paths retain their connector hint when symlink resolution
@@ -78,6 +81,7 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
   chunks while retaining message order and progress heartbeats (#474).
 - ANN sidecar presence no longer claims native readiness. Status, health and
   doctor distinguish absent, uninspected and present-but-unverified assets.
+- Doctor's model-install recommendations use supported command-line options.
 - Native model selection and admission happen before writable backfill storage
   is opened; supported MiniLM aliases resolve to their explicit model (#467).
 - Raw-mirror blob capture caches persist across processes and are pruned by
