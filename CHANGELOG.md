@@ -17,7 +17,7 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 Scope window: this update covers the changes after the 2026-08-31 v0.7.1
 binary release, through the 2026-09-10 v0.8.0 binary release and the unreleased
-2026-09-15 follow-ups. Earlier version entries retain their existing scope.
+2026-09-16 follow-ups. Earlier version entries retain their existing scope.
 Git commits, release metadata, and Beads supply
 the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
@@ -45,6 +45,17 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- Explicit watch-once paths retain their connector hint when symlink resolution
+  leads to a directory without a provider marker (#478).
+- FTS shadow recreation applies the configured message limit even when no
+  prior not-viable marker exists (#476).
+- Ordinary read-only archive opens can request recovery of a stale derived
+  WAL index. Strict diagnostic opens remain non-mutating, and recovery must
+  acquire the native locks without changing the database or WAL (#477).
+- Index writers default to a 10 ms inner busy wait, retaining bounded
+  transaction retries and the explicit timeout override (#473).
+- Large single-conversation batches redact messages across bounded worker
+  chunks while retaining message order and progress heartbeats (#474).
 - ANN sidecar presence no longer claims native readiness. Status, health and
   doctor distinguish absent, uninspected and present-but-unverified assets.
 - Native model selection and admission happen before writable backfill storage

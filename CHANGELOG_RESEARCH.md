@@ -1,5 +1,18 @@
 # CASS 0.8.0 changelog research
 
+September 16 continuation (unreleased): commits `70a33b7b`, `5403f925`,
+`4e32e8a9` and fixture correction `4cbee654` contain GH473/474/476/477/478
+changes. Their final-graph runtime and performance acceptance remains pending;
+the changelog describes source behavior, not completed issue acceptance.
+FAD 0.3.0 is now published and verified against its registry checksum after
+1,181 passing tests, all-target Clippy and its standard scanner gate. CASS
+still awaits Frankensearch 0.6.1 and the corrected SQLite recovery candidate.
+The first upstream recovery run passed 12 tests and exposed a live-writer
+fixture that inadvertently released its POSIX lock; the corrected fixture
+retains the descriptor and independently checks the lock. No owner archive
+was modified or certified repaired. The strict CASS scanner and complete
+platform release gates remain open.
+
 Next-release preparation (September 12 UTC, unreleased, bead yrjna): local
 Shelley/Grok Bot integration is represented by commits `5d187f87`, `59b5d10c`
 and the native-ID changes after v0.8.0. The published FAD dependency is now
