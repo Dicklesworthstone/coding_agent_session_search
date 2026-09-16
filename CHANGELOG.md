@@ -32,6 +32,8 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Added
 
+- Linux index summaries report physical write bytes across the indexing run,
+  including final checkpointing, to help diagnose disk write amplification (#479).
 - TUI result grouping cycles with Alt+F and persists in saved views (#464).
 - Native backfill can process multiple durable batches with one loaded model.
   Scheduled nightly enrichment uses one worker per tier and carries the
