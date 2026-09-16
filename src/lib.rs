@@ -445,9 +445,9 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         build_hnsw: bool,
 
-        /// Embedder to use for semantic indexing (hash, minilm, multilingual-minilm)
-        #[arg(long, default_value = "fastembed")]
-        embedder: String,
+        /// Embedder for semantic indexing (hash, minilm, multilingual-minilm); defaults to semantic policy
+        #[arg(long)]
+        embedder: Option<String>,
 
         /// Override data dir (index + db). Defaults to platform data dir.
         #[arg(long)]
@@ -85805,9 +85805,13 @@ mod cli_read_db_tests {
     fn unsupported_semantic_policy_does_not_route_to_unloadable_embedder() {
         let _embedder = set_env("CASS_SEMANTIC_EMBEDDER", "snowflake-arctic-s");
 
-        assert_eq!(resolve_semantic_index_embedder("fastembed"), "fastembed");
-        assert_eq!(resolve_semantic_index_embedder("minilm"), "minilm");
-        assert_eq!(resolve_semantic_index_embedder("hash"), "hash");
+        assert_eq!(resolve_semantic_index_embedder(None), "fastembed");
+        assert_eq!(
+            resolve_semantic_index_embedder(Some("fastembed")),
+            "fastembed"
+        );
+        assert_eq!(resolve_semantic_index_embedder(Some("minilm")), "minilm");
+        assert_eq!(resolve_semantic_index_embedder(Some("hash")), "hash");
     }
 
     #[test]
@@ -105422,7 +105426,7 @@ fn run_index_with_data(
     data_dir_override: Option<PathBuf>,
     semantic: bool,
     build_hnsw: bool,
-    embedder: String,
+    embedder: Option<String>,
     progress: ProgressResolved,
     output_format: Option<RobotFormat>,
     idempotency_key: Option<String>,
@@ -105449,7 +105453,7 @@ fn run_index_with_data(
 
     let data_dir = resolve_data_dir(&data_dir_override, db_override.as_ref());
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-    let embedder = resolve_semantic_index_embedder(&embedder);
+    let embedder = resolve_semantic_index_embedder(embedder.as_deref());
 
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
@@ -117778,7 +117782,7 @@ fn run_sources_sync(
             Some(data_dir), // data_dir
             false,          // semantic
             false,          // build_hnsw
-            "fastembed".to_string(),
+            None,           // embedder follows semantic policy
             progress,
             output_format,
             None,  // idempotency_key
@@ -118008,7 +118012,7 @@ fn run_sources_reingest(
         Some(data_dir.clone()), // data_dir (existing mirror root is discovered here)
         false,                  // semantic
         false,                  // build_hnsw
-        "fastembed".to_string(),
+        None,                   // embedder follows semantic policy
         progress,
         output_format,
         None,  // idempotency_key
@@ -120379,11 +120383,11 @@ fn parse_models_backfill_tier(raw: &str) -> CliResult<crate::search::semantic_ma
     }
 }
 
-fn resolve_semantic_index_embedder(raw: &str) -> String {
-    let requested = raw.trim();
-    if !matches!(requested, "fastembed" | "minilm") {
-        return requested.to_string();
+fn resolve_semantic_index_embedder(raw: Option<&str>) -> String {
+    if let Some(requested) = raw {
+        return requested.trim().to_string();
     }
+    let requested = "fastembed";
 
     let policy = crate::search::policy::SemanticPolicy::resolve(
         &crate::search::policy::CliSemanticOverrides::default(),
@@ -120626,9 +120630,8 @@ fn run_models_backfill_batch(
         .map(str::to_string)
         .unwrap_or_else(|| match tier {
             TierKind::Fast => "hash".to_string(),
-            TierKind::Quality => "fastembed".to_string(),
+            TierKind::Quality => resolve_semantic_index_embedder(None),
         });
-    let embedder_type = resolve_semantic_index_embedder(&embedder_type);
     let embedder_valid = embedder_type == "hash"
         || crate::search::fastembed_embedder::FastEmbedder::canonical_name(&embedder_type)
             .is_some();
