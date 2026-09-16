@@ -26492,7 +26492,7 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
                     ));
                     let strict =
                         open_franken_async_strict_readonly_connection_with_timeout(&path, timeout);
-                    let err = strict.err().expect("strict owner must refuse stale SHM");
+                    let err = strict.expect_err("strict owner must refuse stale SHM");
                     assert!(matches!(
                         err.downcast_ref::<crate::franken_sync::FrankenError>(),
                         Some(crate::franken_sync::FrankenError::BusyRecovery)
