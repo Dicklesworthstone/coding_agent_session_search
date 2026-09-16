@@ -690,45 +690,68 @@ fn search_returns_hits_with_expected_fields() {
 fn view_command_returns_session_detail() {
     let tracker = tracker_for("view_command_returns_session_detail");
     let command_env = tracker.command_environment();
-    let (tmp, data_dir) = setup_indexed_env();
-    let codex_session = tmp
-        .path()
-        .join(".codex/sessions/2024/12/01/rollout-test.jsonl");
+    let tmp = TempDir::new().unwrap();
+    let session = tmp.path().join("session.txt");
+    let source = "first\nsecond\nthird\n";
+    fs::write(&session, source).unwrap();
 
-    // View the session
-    let view_start = tracker.start("run_view", Some("Execute view command on session"));
-    let output = base_cmd(&command_env)
-        .args(["view", "--robot", "--data-dir"])
-        .arg(&data_dir)
-        .arg(&codex_session)
-        .env("HOME", tmp.path())
-        .output()
-        .unwrap();
-    let view_ms = view_start.elapsed().as_millis() as u64;
-    tracker.end("run_view", Some("View complete"), view_start);
-
-    // View may exit with 0 or non-zero depending on whether session is indexed
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    if output.status.success() {
-        // Should be valid JSON
-        let json: Value = serde_json::from_str(stdout.trim()).unwrap_or(Value::Null);
-        // May have messages or error
-        assert!(
-            json.get("messages").is_some()
-                || json.get("error").is_some()
-                || json.get("conversation").is_some(),
-            "View should return messages or error. stdout: {}",
-            stdout
-        );
+    for target in 1usize..=3 {
+        for context in [0usize, 1, usize::MAX - 1, usize::MAX] {
+            let expected: Vec<Value> = source
+                .lines()
+                .enumerate()
+                .filter(|(index, _)| (index + 1).abs_diff(target) <= context)
+                .map(|(index, content)| {
+                    serde_json::json!({
+                        "line": index + 1,
+                        "content": content,
+                        "highlighted": index + 1 == target,
+                    })
+                })
+                .collect();
+            for robot in [false, true] {
+                let mut cmd = base_cmd(&command_env);
+                cmd.arg("--db")
+                    .arg(tmp.path().join("data/agent_search.db"))
+                    .args(["view", "--line"])
+                    .arg(target.to_string())
+                    .arg("--context")
+                    .arg(context.to_string())
+                    .arg(&session)
+                    .env("HOME", tmp.path())
+                    .env("CASS_OUTPUT_FORMAT", "");
+                if robot {
+                    cmd.arg("--robot");
+                }
+                let output = cmd.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "target={target} context={context} robot={robot}: stdout={} stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+                if robot {
+                    let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+                    assert_eq!(actual["lines"], serde_json::json!(expected));
+                    assert_eq!(actual["total_lines"], 3);
+                    assert_eq!(actual["target_line"], target);
+                    assert_eq!(actual["archive_only"], false);
+                } else {
+                    let stdout = String::from_utf8(output.stdout).unwrap();
+                    let actual: Vec<&str> = stdout
+                        .lines()
+                        .filter_map(|line| line.split_once(" | ").map(|(_, text)| text))
+                        .collect();
+                    let expected_text: Vec<&str> = expected
+                        .iter()
+                        .map(|line| line["content"].as_str().unwrap())
+                        .collect();
+                    assert_eq!(actual, expected_text);
+                }
+            }
+        }
     }
-
-    tracker.metrics(
-        "cass_view",
-        &E2ePerformanceMetrics::new()
-            .with_duration(view_ms)
-            .with_custom("operation", "view_session"),
-    );
+    assert_eq!(fs::read(&session).unwrap(), source.as_bytes());
     tracker.complete();
 }
 
@@ -736,36 +759,53 @@ fn view_command_returns_session_detail() {
 fn expand_command_with_context() {
     let tracker = tracker_for("expand_command_with_context");
     let command_env = tracker.command_environment();
-    let (tmp, data_dir) = setup_indexed_env();
-    let codex_session = tmp
-        .path()
-        .join(".codex/sessions/2024/12/01/rollout-test.jsonl");
+    let tmp = TempDir::new().unwrap();
+    let session = tmp.path().join("session.jsonl");
+    let source = concat!(
+        "{\"role\":\"user\",\"content\":\"first\"}\n",
+        "{\"role\":\"assistant\",\"content\":\"second\"}\n",
+        "{\"role\":\"user\",\"content\":\"third\"}\n",
+    );
+    fs::write(&session, source).unwrap();
 
-    // Expand with context
-    let output = base_cmd(&command_env)
-        .args(["expand", "--robot", "-n", "1", "-C", "2", "--data-dir"])
-        .arg(&data_dir)
-        .arg(&codex_session)
-        .env("HOME", tmp.path())
-        .output()
-        .unwrap();
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    // Expand may succeed or fail depending on line existence
-    if output.status.success() && !stdout.is_empty() {
-        let json: Value = serde_json::from_str(stdout.trim()).unwrap_or(Value::Null);
-        // Should have context or messages
-        assert!(
-            json.get("messages").is_some()
-                || json.get("context").is_some()
-                || json.get("lines").is_some(),
-            "Expand should return context. stdout: {}, stderr: {}",
-            stdout,
-            stderr
-        );
+    for target in 1usize..=3 {
+        for context in [0usize, 1, usize::MAX - 1, usize::MAX] {
+            let output = base_cmd(&command_env)
+                .arg("--db")
+                .arg(tmp.path().join("data/agent_search.db"))
+                .args(["expand", "--robot", "--line"])
+                .arg(target.to_string())
+                .arg("--context")
+                .arg(context.to_string())
+                .arg(&session)
+                .env("HOME", tmp.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "target={target} context={context}: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            let expected: Vec<Value> = ["first", "second", "third"]
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| (index + 1).abs_diff(target) <= context)
+                .map(|(index, content)| {
+                    serde_json::json!({
+                        "line": index + 1,
+                        "role": if index == 1 { "assistant" } else { "user" },
+                        "is_target": index + 1 == target,
+                        "content": content,
+                    })
+                })
+                .collect();
+            let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(actual, serde_json::json!(expected));
+        }
     }
+    assert_eq!(fs::read(&session).unwrap(), source.as_bytes());
+    tracker.complete();
 }
 
 // =============================================================================

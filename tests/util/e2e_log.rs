@@ -322,6 +322,12 @@ impl Default for E2eErrorContext {
 /// - *_KEY, *_SECRET, *_TOKEN, *_PASSWORD, *_CREDENTIAL
 /// - API_*, AUTH_*, AWS_*, GITHUB_TOKEN, etc.
 pub fn capture_sanitized_env() -> std::collections::HashMap<String, String> {
+    sanitize_env(std::env::vars())
+}
+
+fn sanitize_env(
+    entries: impl IntoIterator<Item = (String, String)>,
+) -> std::collections::HashMap<String, String> {
     let sensitive_patterns = [
         "_KEY",
         "_SECRET",
@@ -344,7 +350,8 @@ pub fn capture_sanitized_env() -> std::collections::HashMap<String, String> {
         "MONGODB_URI",
     ];
 
-    std::env::vars()
+    entries
+        .into_iter()
         .filter(|(k, _)| {
             // Only include relevant env vars
             k.starts_with("RUST_")
@@ -2526,46 +2533,66 @@ mod tests {
 
     #[test]
     fn test_sanitized_env_redacts_sensitive() {
-        // Set a test sensitive env var
-        // SAFETY: This test runs in isolation and the env var is cleaned up afterwards
-        unsafe {
-            std::env::set_var("TEST_SECRET_KEY", "super_secret_value");
-        }
-
-        let env = capture_sanitized_env();
-
-        // Check that sensitive keys are redacted
-        if let Some(value) = env.get("TEST_SECRET_KEY") {
-            assert_eq!(value, "[REDACTED]");
-        }
-
-        // Clean up
-        // SAFETY: Cleaning up the env var we set above
-        unsafe {
-            std::env::remove_var("TEST_SECRET_KEY");
-        }
+        let sensitive_keys = [
+            "TEST_SECRET_KEY",
+            "E2E_SECRET",
+            "TEST_TOKEN",
+            "TEST_PASSWORD",
+            "TEST_CREDENTIAL",
+            "TEST_PASS",
+            "TEST_API_VALUE",
+            "TEST_AUTH_VALUE",
+            "TEST_AWS_VALUE",
+            "TEST_PRIVATE_VALUE",
+            "TEST_ENCRYPTION_VALUE",
+            "GITHUB_TOKEN",
+            "CARGO_REGISTRY_TOKEN",
+        ];
+        let env = sanitize_env(
+            sensitive_keys
+                .iter()
+                .map(|key| ((*key).to_string(), "super_secret_value".to_string())),
+        );
+        let expected: HashMap<_, _> = sensitive_keys
+            .iter()
+            .map(|key| ((*key).to_string(), "[REDACTED]".to_string()))
+            .collect();
+        assert_eq!(env, expected);
     }
 
     #[test]
     fn test_sanitized_env_preserves_safe() {
-        // Set a safe test env var
-        // SAFETY: This test runs in isolation and the env var is cleaned up afterwards
-        unsafe {
-            std::env::set_var("TEST_SAFE_VAR", "safe_value");
-        }
-
-        let env = capture_sanitized_env();
-
-        // Safe vars should be preserved
-        if let Some(value) = env.get("TEST_SAFE_VAR") {
-            assert_eq!(value, "safe_value");
-        }
-
-        // Clean up
-        // SAFETY: Cleaning up the env var we set above
-        unsafe {
-            std::env::remove_var("TEST_SAFE_VAR");
-        }
+        let safe_entries = [
+            ("TEST_SAFE_VAR", "safe_value"),
+            ("E2E_EMPTY", ""),
+            ("RUST_LOG", "debug"),
+            ("CARGO_TARGET_DIR", "/tmp/target"),
+            ("CI", "true"),
+            ("CI_CUSTOM", "custom"),
+            ("GITHUB_RUN_ID", "123"),
+            ("HOME", "/home/test"),
+            ("PATH", "/bin:/usr/bin"),
+            ("USER", "test"),
+            ("SHELL", "/bin/sh"),
+            ("TERM", "xterm"),
+        ];
+        let excluded_entries = [
+            ("UNRELATED", "value"),
+            ("DATABASE_URL", "sensitive but outside capture scope"),
+            ("test_lowercase", "case-sensitive scope"),
+        ];
+        let env = sanitize_env(
+            safe_entries
+                .iter()
+                .chain(excluded_entries.iter())
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string())),
+        );
+        let expected: HashMap<_, _> = safe_entries
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        assert_eq!(env, expected);
+        assert!(sanitize_env(std::iter::empty()).is_empty());
     }
 
     // ==================== Error with context in logger tests ====================

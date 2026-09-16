@@ -151,35 +151,19 @@ fn read_watch_once_paths_env() -> Option<Vec<std::path::PathBuf>> {
     None
 }
 
-/// #377: watch-once trigger classification (`classify_paths`) matches paths
-/// lexically against connector scan roots, so a relative or symlinked supplied
-/// path silently produces zero triggers and the run is skipped. Absolutize
-/// against the current directory and resolve symlinks at resolve time; a path
-/// that cannot be canonicalized (e.g. already deleted) keeps its absolutized
-/// form and is warned about loudly instead of vanishing without a trace.
-fn canonicalize_watch_once_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+/// Absolutize explicit paths without erasing provider hints in symlink names.
+/// Classification resolves symlinks after retaining the original hint (#478),
+/// then uses canonical paths for scan-root matching and I/O (#377).
+fn absolutize_watch_once_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     paths
         .into_iter()
         .map(|path| {
-            let absolute = if path.is_absolute() {
+            if path.is_absolute() {
                 path
             } else {
                 match std::env::current_dir() {
                     Ok(cwd) => cwd.join(&path),
                     Err(_) => path,
-                }
-            };
-            match std::fs::canonicalize(&absolute) {
-                Ok(canonical) => canonical,
-                Err(err) => {
-                    tracing::warn!(
-                        path = %absolute.display(),
-                        error = %err,
-                        "watch-once path could not be canonicalized; it may not \
-                         match any connector scan root and its run may be \
-                         skipped (issue #377)"
-                    );
-                    absolute
                 }
             }
         })
@@ -193,13 +177,13 @@ fn resolve_watch_once_paths_from_sources(
 ) -> Option<Vec<PathBuf>> {
     let explicit = watch_once.filter(|paths| !paths.is_empty());
     if let Some(paths) = explicit {
-        return Some(canonicalize_watch_once_paths(paths));
+        return Some(absolutize_watch_once_paths(paths));
     }
 
     if watch {
         return env_watch_once_paths
             .filter(|paths| !paths.is_empty())
-            .map(canonicalize_watch_once_paths);
+            .map(absolutize_watch_once_paths);
     }
 
     None
@@ -20240,6 +20224,16 @@ fn state_db_strict_open_error_message(
         "Failed to open {reason} database at {}: strict readonly open failed ({err:#})",
         db_path.display()
     );
+    if err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<crate::franken_sync::FrankenError>(),
+            Some(crate::franken_sync::FrankenError::BusyRecovery)
+        )
+    }) {
+        return format!(
+            "{base}; WAL-index recovery is required or another connection currently owns recovery. This strict read-only probe leaves the archive unchanged; retry after active work finishes, or run 'cass index' to attempt recovery"
+        );
+    }
     if retryable {
         return base;
     }
@@ -20943,6 +20937,37 @@ fn index_unsupported_quill_writer_admission_cli_error(chain: &str) -> CliError {
 #[cfg(test)]
 mod index_error_mapping_tests {
     use super::*;
+
+    #[test]
+    fn index_idempotency_cache_rejects_non_objects_and_preserves_valid_results() {
+        for invalid in [
+            "",
+            "{",
+            "null",
+            "true",
+            "false",
+            "42",
+            "1.5",
+            "\"cached\"",
+            "[]",
+            "[{}]",
+        ] {
+            assert_eq!(cached_index_payload(invalid, "retry-key"), None);
+        }
+        assert_eq!(
+            cached_index_payload(
+                r#"{"ok":true,"messages":3,"nested":{"value":[1,2]},"cached":false,"idempotency_key":"old-key"}"#,
+                "retry-key",
+            ),
+            Some(serde_json::json!({
+                "ok": true,
+                "messages": 3,
+                "nested": {"value": [1, 2]},
+                "cached": true,
+                "idempotency_key": "retry-key",
+            }))
+        );
+    }
 
     #[test]
     fn orphan_fk_cleanup_failure_is_retryable_after_operator_remediation() {
@@ -23473,21 +23498,21 @@ mod watch_once_resolution_tests {
         assert!(resolved[0].ends_with("some/relative/session.jsonl"));
     }
 
-    /// #377: symlinked supplied paths must resolve to their canonical target
-    /// so they match the connector scan roots discovered from real paths.
+    /// #478: keep the original spelling until classification can retain its
+    /// connector hint before resolving the canonical I/O target.
     #[cfg(unix)]
     #[test]
-    fn symlinked_watch_once_paths_resolve_to_canonical_target() {
+    fn symlinked_watch_once_paths_retain_original_connector_spelling() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let real = dir.path().join("real-session.jsonl");
         std::fs::write(&real, "{}\n").expect("write real file");
-        let link = dir.path().join("link-session.jsonl");
+        let link = dir.path().join(".codex/sessions/link-session.jsonl");
+        std::fs::create_dir_all(link.parent().expect("link parent")).expect("create parent");
         std::os::unix::fs::symlink(&real, &link).expect("create symlink");
 
-        let resolved = resolve_watch_once_paths_from_sources(false, Some(vec![link]), None)
+        let resolved = resolve_watch_once_paths_from_sources(false, Some(vec![link.clone()]), None)
             .expect("explicit paths resolve");
-        let canonical_real = std::fs::canonicalize(&real).expect("canonicalize real path");
-        assert_eq!(resolved, vec![canonical_real]);
+        assert_eq!(resolved, vec![link]);
     }
 }
 
@@ -85367,6 +85392,38 @@ mod cli_read_db_tests {
     }
 
     #[test]
+    fn strict_open_error_message_distinguishes_wal_recovery_from_plain_busy() {
+        for wal_bytes in [None, Some(32), Some(4096)] {
+            let temp = TempDir::new().expect("tempdir");
+            let db_path = temp.path().join("agent_search.db");
+            if let Some(bytes) = wal_bytes {
+                std::fs::write(temp.path().join("agent_search.db-wal"), vec![0_u8; bytes])
+                    .expect("write isolated WAL shape");
+            }
+            let err = anyhow::Error::new(crate::franken_sync::FrankenError::BusyRecovery)
+                .context("opening database through dedicated owner");
+            let message = state_db_strict_open_error_message(&db_path, "status", &err, true);
+            assert!(
+                message.contains("WAL-index recovery is required"),
+                "{message}"
+            );
+            assert!(message.contains("another connection"), "{message}");
+            assert!(
+                message.contains("leaves the archive unchanged"),
+                "{message}"
+            );
+            assert!(message.contains("cass index"), "{message}");
+            assert!(!message.contains("checkpoint"), "{message}");
+
+            let err = anyhow::Error::new(crate::franken_sync::FrankenError::Busy)
+                .context("opening database through dedicated owner");
+            let message = state_db_strict_open_error_message(&db_path, "status", &err, true);
+            assert!(!message.contains("WAL-index recovery"), "{message}");
+            assert!(!message.contains("cass index"), "{message}");
+        }
+    }
+
+    #[test]
     fn status_state_probes_large_regular_db_instead_of_trusting_index_mtime() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("agent_search.db");
@@ -102476,8 +102533,8 @@ fn run_view(
         });
     }
 
-    let start = target_line.saturating_sub(context + 1);
-    let end = (target_line + context).min(lines.len());
+    let start = target_line.saturating_sub(context.saturating_add(1));
+    let end = target_line.saturating_add(context).min(lines.len());
     let highlight_line = line.is_some();
 
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
@@ -103318,7 +103375,7 @@ fn macos_process_disk_io_bytes() -> Option<u64> {
         return None;
     }
     // SAFETY: the kernel filled the v2 layout on success (checked above).
-    let info = unsafe { info.assume_init() };
+    let info = unsafe { info.assume_init() }; // ubs:ignore[rust.unsafe-memory.assume-init] — Zeroed integer-only rusage_info_v2 is read only after proc_pid_rusage reports success.
     Some(
         info.ri_diskio_bytesread
             .saturating_add(info.ri_diskio_byteswritten),
@@ -105343,6 +105400,17 @@ fn run_lexical_gc_cli(
     Ok(())
 }
 
+fn cached_index_payload(result_json: &str, key: &str) -> Option<serde_json::Value> {
+    let mut payload =
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(result_json).ok()?;
+    payload.insert("cached".to_string(), serde_json::Value::Bool(true));
+    payload.insert(
+        "idempotency_key".to_string(),
+        serde_json::Value::String(key.to_string()),
+    );
+    Some(serde_json::Value::Object(payload))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_index_with_data(
     db_override: Option<PathBuf>,
@@ -105457,18 +105525,17 @@ fn run_index_with_data(
 
         if let Ok(Some((stored_hash, result_json))) = cached {
             if stored_hash == params_hash.to_string() {
-                if let Some(fmt) = structured_format {
-                    if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&result_json) {
-                        val["cached"] = serde_json::json!(true);
-                        val["idempotency_key"] = serde_json::json!(key);
+                // A syntactically valid scalar or array is not an index result.
+                // Treat damaged cache entries as misses in every output mode.
+                if let Some(val) = cached_index_payload(&result_json, key) {
+                    if let Some(fmt) = structured_format {
                         emit_result(val, fmt)?;
-                        return Ok(());
+                    } else {
+                        eprintln!(
+                            "Using cached result for idempotency key '{}' (use different key to force re-index)",
+                            key
+                        );
                     }
-                } else {
-                    eprintln!(
-                        "Using cached result for idempotency key '{}' (use different key to force re-index)",
-                        key
-                    );
                     return Ok(());
                 }
             } else {
@@ -108010,7 +108077,7 @@ fn run_resume(
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
-            let err = std::process::Command::new(program).args(args).exec();
+            let err = std::process::Command::new(program).args(args).exec(); // ubs:ignore[rust.security.command-executable] — resolve_resume_target selects a literal harness executable; session input appears only in argv after explicit --exec.
             // `exec` only returns on failure.
             return Err(CliError {
                 code: 7,
@@ -108024,7 +108091,7 @@ fn run_resume(
         }
         #[cfg(not(unix))]
         {
-            let status = std::process::Command::new(program)
+            let status = std::process::Command::new(program) // ubs:ignore[rust.security.command-executable] — The resolved program is a literal harness name; user session data remains separate argv.
                 .args(args)
                 .status()
                 .map_err(|err| CliError {
@@ -108342,7 +108409,7 @@ fn copy_to_system_clipboard(text: &str) -> Result<&'static str, String> {
 
     let mut last_err: Option<String> = None;
     for (program, args) in candidates {
-        let mut command = Command::new(program);
+        let mut command = Command::new(program); // ubs:ignore[rust.security.command-executable] — Program comes only from the fixed platform clipboard-tool list above; text is written to stdin.
         command.args(args.iter().copied());
         match write_clipboard_command(command, text) {
             Ok(status) if status.success() => return Ok(program),
@@ -114445,7 +114512,10 @@ fn run_expand(
     })?;
 
     let start = target_idx.saturating_sub(context);
-    let end = (target_idx + context + 1).min(messages.len());
+    let end = target_idx
+        .saturating_add(context)
+        .saturating_add(1)
+        .min(messages.len());
 
     let context_messages: Vec<_> = messages[start..end]
         .iter()

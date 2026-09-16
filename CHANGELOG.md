@@ -17,7 +17,7 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 Scope window: this update covers the changes after the 2026-08-31 v0.7.1
 binary release, through the 2026-09-10 v0.8.0 binary release and the unreleased
-2026-09-11 follow-ups. Earlier version entries retain their existing scope.
+2026-09-16 follow-ups. Earlier version entries retain their existing scope.
 Git commits, release metadata, and Beads supply
 the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
@@ -32,6 +32,12 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Added
 
+- TUI result grouping cycles with Alt+F and persists in saved views (#464).
+- Native backfill can process multiple durable batches with one loaded model.
+  Scheduled nightly enrichment uses one worker per tier and carries the
+  remaining work budget between batches (#471, #472).
+- Long messages produce bounded passage embeddings under the passages-v2
+  contract. Search hydrates passages back to their canonical messages (#470).
 - Local Shelley and Grok Bot session indexing. Their source containers are
   excluded from raw mirroring; Grok Bot containers are also excluded from
   generated remote-sync sources. Grok Bot keeps its own provider identity
@@ -39,6 +45,32 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- `view` and `expand` bound context ranges safely even at the largest accepted
+  context value, avoiding integer overflow near the beginning or end of a session.
+- Index idempotency replay rejects malformed or non-object cached results and
+  performs indexing instead of panicking or reporting a false cache hit.
+- Linux release recipes preserve the installer's glibc 2.28 compatibility floor
+  with pinned Zig builds and reject binaries requiring a newer glibc version.
+- Explicit watch-once paths retain their connector hint when symlink resolution
+  leads to a directory without a provider marker (#478).
+- FTS shadow recreation applies the configured message limit even when no
+  prior not-viable marker exists (#476).
+- Ordinary read-only archive opens can request recovery of a stale derived
+  WAL index. Strict diagnostic opens remain non-mutating, and recovery must
+  acquire the native locks without changing the database or WAL (#477).
+- Index writers default to a 10 ms inner busy wait, retaining bounded
+  transaction retries and the explicit timeout override (#473).
+- Large single-conversation batches redact messages across bounded worker
+  chunks while retaining message order and progress heartbeats (#474).
+- ANN sidecar presence no longer claims native readiness. Status, health and
+  doctor distinguish absent, uninspected and present-but-unverified assets.
+- Native model selection and admission happen before writable backfill storage
+  is opened; supported MiniLM aliases resolve to their explicit model (#467).
+- Raw-mirror blob capture caches persist across processes and are pruned by
+  the selected source (#461).
+- Remote synchronization recognizes openrsync transfer counts when deciding
+  whether local reindexing is needed (#468).
+- Watch failures retain lexical replay debt instead of losing unfinished work.
 - Source-configuration backups use exclusive file creation and bounded
   collision retries, preserving an existing destination or symlink target.
 - Fleet setup retains resumable progress while its final sync is pending,

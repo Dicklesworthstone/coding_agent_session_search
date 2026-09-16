@@ -106,6 +106,170 @@ fn index_creates_db_and_index() {
     assert!(index_path.exists(), "index dir created");
 }
 
+#[test]
+fn cdzcl_index_idempotency_rejects_invalid_cached_payloads() {
+    use coding_agent_search::franken_sync::compat::ConnectionExt;
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+    use frankensqlite::compat::RowExt;
+    use serde_json::{Value, json};
+    use std::io::Write;
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    fs::write(home.join(".env"), "").unwrap();
+    let data_dir = home.join("data");
+    let db_path = data_dir.join("agent_search.db");
+    let project = home.join(".claude/projects/-cache-shape");
+    fs::create_dir_all(&project).unwrap();
+    let session = project.join("cache-shape.jsonl");
+    let append_message = |ordinal: usize| {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&session)
+            .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "type": "user", "sessionId": "cache-shape",
+                "uuid": format!("cache-shape-{ordinal}"),
+                "timestamp": "2025-11-12T18:31:18.697Z",
+                "cwd": home.to_string_lossy(),
+                "message": {"role": "user", "content": format!("cache shape evidence {ordinal}")}
+            })
+        )
+        .unwrap();
+    };
+    let command = |robot: bool, full: bool| {
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        cmd.env_clear();
+        for key in ["PATH", "SystemRoot", "WINDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+        cmd.current_dir(home)
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("CODEX_HOME", home.join(".codex"))
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("RUST_MIN_STACK", "134217728")
+            .args(["--db"])
+            .arg(&db_path)
+            .args([
+                "index",
+                "--no-progress-events",
+                "--idempotency-key",
+                "cache-shape",
+            ])
+            .arg("--data-dir")
+            .arg(&data_dir);
+        if robot {
+            cmd.arg("--json");
+        }
+        if full {
+            cmd.arg("--full");
+        }
+        cmd
+    };
+    let read_cache = || {
+        let storage = FrankenStorage::open_readonly(&db_path).unwrap();
+        let rows = storage
+            .raw()
+            .query(
+                "SELECT params_hash, result_json FROM idempotency_keys WHERE key = 'cache-shape'",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let result = (
+            rows[0].get_typed::<String>(0).unwrap(),
+            rows[0].get_typed::<String>(1).unwrap(),
+        );
+        storage.close_without_checkpoint().unwrap();
+        result
+    };
+
+    append_message(0);
+    let seed = command(true, true).output().unwrap();
+    assert!(
+        seed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+    let seed_payload: Value = serde_json::from_slice(&seed.stdout).unwrap();
+    assert_eq!(seed_payload["success"], true);
+    assert_eq!(seed_payload["messages"], 1);
+    assert_eq!(seed_payload["cached"], false);
+    let (params_hash, seed_json) = read_cache();
+    assert_eq!(
+        serde_json::from_str::<Value>(&seed_json).unwrap(),
+        seed_payload
+    );
+
+    let replay = command(true, true).output().unwrap();
+    assert!(replay.status.success());
+    let mut expected = seed_payload.clone();
+    expected["cached"] = json!(true);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&replay.stdout).unwrap(),
+        expected
+    );
+    let human_replay = command(false, true).output().unwrap();
+    assert!(human_replay.status.success());
+    assert!(String::from_utf8_lossy(&human_replay.stderr).contains("Using cached result"));
+    let mismatch = command(true, false).output().unwrap();
+    assert_eq!(mismatch.status.code(), Some(5));
+    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("different parameters"));
+    assert_eq!(read_cache(), (params_hash.clone(), seed_json));
+
+    // Four representative shapes in both output modes; the pure unit test
+    // covers the complete shape table. Only nine tiny full indexes run here.
+    for (case, invalid) in ["{", "7", "[]", "null"].into_iter().enumerate() {
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let updated = storage
+            .raw()
+            .execute_compat(
+                "UPDATE idempotency_keys SET result_json = ?1 WHERE key = ?2",
+                coding_agent_search::franken_sync::params![invalid, "cache-shape"],
+            )
+            .unwrap();
+        assert_eq!(updated, 1);
+        storage.close_without_checkpoint().unwrap();
+        append_message(case + 1);
+
+        for robot in [false, true] {
+            let output = command(robot, true).output().unwrap();
+            assert!(
+                output.status.success(),
+                "invalid={invalid} robot={robot}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("Using cached result"));
+            if robot {
+                let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(payload["success"], true);
+                assert_eq!(payload["cached"], false);
+                assert_eq!(payload["messages"], case + 2);
+                assert_eq!(payload["idempotency_key"], "cache-shape");
+            }
+            let storage = FrankenStorage::open_readonly(&db_path).unwrap();
+            assert_eq!(storage.total_conversation_count().unwrap(), 1);
+            assert_eq!(storage.total_message_count().unwrap(), case + 2);
+            storage.close_without_checkpoint().unwrap();
+        }
+        let (stored_hash, repaired) = read_cache();
+        assert_eq!(stored_hash, params_hash);
+        let repaired: Value = serde_json::from_str(&repaired).unwrap();
+        assert_eq!(repaired["success"], true);
+        assert_eq!(repaired["cached"], false);
+        assert_eq!(repaired["messages"], case + 2);
+    }
+}
+
 /// Requires the GH459 FAD parser revision. A registry-0.2.3 run must fail this
 /// acceptance check; an unpublished dependency overlay is not release proof.
 #[test]
@@ -1268,6 +1432,143 @@ fn watch_once_indexes_real_aider_session_with_deferred_tantivy_open() {
                 .is_some_and(|content| content.contains("lazywatchprobe"))
         }),
         "search results should include the watch-once session content; payload: {payload}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn gh478_watch_once_retains_codex_hint_when_symlink_target_has_no_provider_marker() {
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+    use frankensqlite::compat::RowExt;
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    fs::write(home.join(".env"), "").unwrap();
+    let filename = "rollout-2026-01-01T00-00-00-22222222-2222-4222-8222-222222222222.jsonl";
+    let regular = make_codex_session(
+        &home.join("regular/.codex"),
+        "2026/01",
+        filename,
+        "heliotropesymlinkneedle",
+    );
+    let external = home.join("external-store");
+    let real = make_codex_session(&external, "2026/01", filename, "heliotropesymlinkneedle");
+    let neighbor = make_codex_session(
+        &external,
+        "2026/01",
+        "rollout-neighbor.jsonl",
+        "unrequestedneighborneedle",
+    );
+    for source in [&regular, &real, &neighbor] {
+        fs::File::open(source)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(100)),
+            )
+            .unwrap();
+    }
+    let source_bytes = fs::read(&real).unwrap();
+    let source_mtime = fs::metadata(&real).unwrap().modified().unwrap();
+    let linked_dir = home.join("linked/.codex/sessions/2026/01");
+    fs::create_dir_all(linked_dir.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(real.parent().unwrap(), &linked_dir).unwrap();
+    let linked = linked_dir.join(filename);
+    let canonical_real = fs::canonicalize(&real).unwrap();
+    let isolated_cmd = || {
+        let mut cmd = base_cmd(home);
+        cmd.env_clear();
+        if let Some(value) = std::env::var_os("PATH") {
+            cmd.env("PATH", value);
+        }
+        cmd.current_dir(home)
+            .env("HOME", home)
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("CODEX_HOME", home.join(".codex"))
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("RUST_MIN_STACK", "134217728");
+        cmd
+    };
+
+    for (label, paths, expected_source) in [
+        (
+            "regular",
+            vec![regular.clone()],
+            fs::canonicalize(&regular).unwrap(),
+        ),
+        ("linked", vec![linked.clone()], canonical_real.clone()),
+        (
+            "aliases",
+            vec![linked, canonical_real.clone()],
+            canonical_real,
+        ),
+    ] {
+        let data_dir = home.join(format!("data-{label}"));
+        let output = isolated_cmd()
+            .args(["index", "--watch-once"])
+            .args(&paths)
+            .args(["--json", "--no-progress-events", "--data-dir"])
+            .arg(&data_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(payload["success"], true, "{label}: {payload}");
+
+        let storage = FrankenStorage::open_readonly(&data_dir.join("agent_search.db")).unwrap();
+        assert_eq!(storage.total_conversation_count().unwrap(), 1, "{label}");
+        assert_eq!(storage.total_message_count().unwrap(), 2, "{label}");
+        let rows = storage
+            .raw()
+            .query("SELECT source_path FROM conversations")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get_typed::<String>(0).unwrap(),
+            expected_source.to_string_lossy()
+        );
+        storage.close_without_checkpoint().unwrap();
+
+        let output = isolated_cmd()
+            .args([
+                "search",
+                "heliotropesymlinkneedle",
+                "--json",
+                "--mode",
+                "lexical",
+                "--data-dir",
+            ])
+            .arg(&data_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let hits = payload["hits"].as_array().unwrap();
+        assert!(!hits.is_empty(), "{label}: {payload}");
+        assert!(
+            hits.iter()
+                .all(|hit| hit["content"].as_str().is_some_and(|content| {
+                    content.contains("heliotropesymlinkneedle")
+                        && !content.contains("unrequestedneighborneedle")
+                })),
+            "{label}: {payload}"
+        );
+    }
+    assert_eq!(fs::read(&real).unwrap(), source_bytes);
+    assert_eq!(
+        fs::metadata(&real).unwrap().modified().unwrap(),
+        source_mtime
     );
 }
 

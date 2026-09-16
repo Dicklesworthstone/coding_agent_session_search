@@ -3357,6 +3357,20 @@ Update check state is stored in the data directory:
 
 ## Dependency Source Contract
 
+The next release candidate is being qualified against `fsqlite =0.4.2`,
+`fsqlite-core =0.4.2`, `fsqlite-pager =0.4.2`, `fsqlite-btree =0.4.1`,
+`fsqlite-vdbe =0.4.1`, and the remaining SQLite family (including
+`fsqlite-types`) at `=0.4.0`, with `asupersync =0.5.0`.
+The published SQLite repair covers the reserved-page WAL conflict in GH#462;
+upstream GH#411 is also closed. Neither proves recovery of an already damaged
+archive. `franken-agent-detection =0.3.0` is published. SQLite `0.4.2` adds
+explicit derived WAL-index recovery for read-only opens (GH#477); its
+qualification and publication are pending, along with `frankensearch =0.6.1`
+publication and CASS runtime qualification.
+Until those complete, the lockfile and table below describe the previous graph;
+the candidate must not be released. The build guard enforces the reviewed
+per-package SQLite versions, a single resolution per package, and registry sources.
+
 `cass` pins its contract-critical ecosystem dependencies with exact registry requirements in [`Cargo.toml`](Cargo.toml); other direct dependencies use normal semver requirements, and `Cargo.lock` freezes the complete resolved graph. No active dependency or patch currently resolves from git. Optional sibling-path overrides stay commented out by default and must never be committed active.
 
 | Dependency | Pinned source |

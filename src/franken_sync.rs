@@ -90,6 +90,18 @@ impl Connection {
         })
     }
 
+    /// Open read-only while permitting derived WAL-index recovery under the
+    /// engine's recovery locks. Database/WAL writes remain forbidden.
+    pub fn open_schema_only_with_wal_index_recovery(
+        path: impl Into<String>,
+    ) -> Result<Self, FrankenError> {
+        Ok(Self {
+            inner: drive(
+                frankensqlite::Connection::open_schema_only_with_wal_index_recovery(path),
+            )?,
+        })
+    }
+
     /// Open an existing database only (never creates), loading the schema.
     pub fn open_existing_schema_only(path: impl Into<String>) -> Result<Self, FrankenError> {
         Ok(Self {

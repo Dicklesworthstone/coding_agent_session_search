@@ -499,3 +499,373 @@ fn daemon_reranker_timeout_backoff_with_jitter_retries_after_window() {
         "daemon must be retried after the bounded backoff window"
     );
 }
+
+#[cfg(unix)]
+mod native_daemon_process {
+    use super::*;
+    use std::fs::{self, OpenOptions};
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, Stdio};
+    use std::time::Instant;
+
+    use coding_agent_search::daemon::{DaemonClientConfig, UdsDaemonClient};
+    use coding_agent_search::search::fastembed_embedder::FastEmbedder;
+    use coding_agent_search::search::model_download::{
+        ModelManifest, compute_sha256, model_file_path,
+    };
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    struct NativeDaemon {
+        child: Child,
+        stdout_path: PathBuf,
+        stderr_path: PathBuf,
+    }
+
+    impl NativeDaemon {
+        fn wait_ready(&mut self, config: &DaemonClientConfig) -> TestResult {
+            let deadline = Instant::now() + Duration::from_secs(120);
+            loop {
+                if let Some(status) = self.child.try_wait()? {
+                    return Err(format!("native daemon exited before readiness: {status}").into());
+                }
+                let probe = UdsDaemonClient::new(DaemonClientConfig {
+                    request_timeout: Duration::from_secs(1),
+                    ..config.clone()
+                });
+                if probe.connect().is_ok()
+                    && let Ok(health) = probe.health()
+                    && health.ready
+                {
+                    assert_eq!(
+                        health.version,
+                        coding_agent_search::daemon::protocol::PROTOCOL_VERSION
+                    );
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err("native daemon did not become ready within 120 seconds".into());
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+
+        fn shutdown(&mut self, client: &UdsDaemonClient) -> TestResult {
+            client.shutdown()?;
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Some(status) = self.child.try_wait()? {
+                    assert!(status.success(), "native daemon shutdown failed: {status}");
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err("native daemon did not shut down within 20 seconds".into());
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    impl Drop for NativeDaemon {
+        fn drop(&mut self) {
+            match self.child.try_wait() {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    if let Err(error) = self.child.kill() {
+                        eprintln!("could not stop owned native daemon child: {error}");
+                    }
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    loop {
+                        match self.child.try_wait() {
+                            Ok(Some(_)) => break,
+                            Ok(None) if Instant::now() < deadline => {
+                                thread::sleep(Duration::from_millis(50));
+                            }
+                            result => {
+                                eprintln!("owned daemon child was not reaped: {result:?}");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(error) => eprintln!("could not inspect owned native daemon child: {error}"),
+            }
+            for (label, path) in [("stdout", &self.stdout_path), ("stderr", &self.stderr_path)] {
+                match fs::read_to_string(path) {
+                    Ok(contents) => eprintln!("native daemon {label}:\n{contents}"),
+                    Err(error) => eprintln!("could not read native daemon {label}: {error}"),
+                }
+            }
+        }
+    }
+
+    fn assert_vector_bits(actual: &[f32], expected: &[f32], context: &str) {
+        assert_eq!(actual.len(), 384, "{context}: native dimension");
+        assert!(actual.iter().all(|value| value.is_finite()), "{context}");
+        let actual_bits: Vec<_> = actual.iter().map(|value| value.to_bits()).collect();
+        let expected_bits: Vec<_> = expected.iter().map(|value| value.to_bits()).collect();
+        assert_eq!(actual_bits, expected_bits, "{context}: exact native output");
+    }
+
+    fn verify_supplied_bundle(source: &Path, manifest: &ModelManifest) -> TestResult {
+        assert_eq!(
+            manifest.files.len(),
+            5,
+            "the attested bundle has five files"
+        );
+        for file in &manifest.files {
+            let path = model_file_path(source, file)
+                .ok_or_else(|| format!("missing supplied native asset {}", file.name))?;
+            assert_eq!(fs::metadata(&path)?.len(), file.size, "{}", file.name);
+            assert_eq!(compute_sha256(&path)?, file.sha256, "{}", file.name);
+        }
+        Ok(())
+    }
+
+    fn run_native_daemon_case(model: &str, bundle_env: &str) -> TestResult {
+        let source = PathBuf::from(dotenvy::var(bundle_env).map_err(|error| {
+            format!("{bundle_env} must name an existing verified bundle; no downloads: {error}")
+        })?)
+        .canonicalize()?;
+        let manifest = ModelManifest::for_embedder(model).ok_or("unknown native model")?;
+        verify_supplied_bundle(&source, &manifest)?;
+
+        // A short private root also fits macOS sockaddr_un, regardless of the
+        // gate's TMPDIR. Both models use real supplied files, never acquisition.
+        let temp = tempfile::Builder::new()
+            .prefix("cass-native-daemon-")
+            .tempdir_in("/tmp")?;
+        let home = temp.path().join("home");
+        let data = temp.path().join("data");
+        fs::create_dir_all(&home)?;
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(home.join(".env"))?;
+        let managed = FastEmbedder::model_dir_for(&data, model).ok_or("model directory mapping")?;
+        fs::create_dir_all(&managed)?;
+        for file in &manifest.files {
+            let original = model_file_path(&source, file).ok_or("verified asset disappeared")?;
+            assert_eq!(
+                fs::copy(original, managed.join(file.local_name()))?,
+                file.size,
+                "copy complete managed native asset {}",
+                file.name
+            );
+        }
+        verify_supplied_bundle(&managed, &manifest)?;
+
+        let config = FastEmbedder::config_for(model).ok_or("native model configuration")?;
+        let expected_id = config.embedder_id.clone();
+        let wrong_id = if model == "minilm" {
+            "multilingual-minilm-384"
+        } else {
+            "minilm-384"
+        };
+        let texts = [
+            "A database transaction rolls back when validation fails.",
+            "数据库事务失败时回滚。データベースの復旧を確認します。",
+            "Unicode café λ: preserve source provenance and message order.",
+            "A database transaction rolls back when validation fails.",
+        ];
+        let direct = FastEmbedder::load_with_config(&managed, config)?;
+        assert!(direct.is_semantic());
+        assert_eq!(direct.category(), ModelCategory::TransformerEmbedder);
+        assert_eq!(direct.id(), expected_id);
+        let expected_identity = direct.identity()?.clone();
+        expected_identity.validate()?;
+        let expected_vectors = direct.embed_batch_sync(&texts)?;
+        assert_eq!(expected_vectors.len(), texts.len());
+        for (index, text) in texts.iter().enumerate() {
+            assert_vector_bits(
+                &direct.embed_sync(text)?,
+                &expected_vectors[index],
+                &format!("direct single/batch {model} input {index}"),
+            );
+        }
+        assert_ne!(expected_vectors[0], expected_vectors[1]);
+        assert_vector_bits(
+            &expected_vectors[0],
+            &expected_vectors[3],
+            "duplicate input",
+        );
+        // Do not retain a second native model while the child loads its own.
+        drop(direct);
+
+        let binary = PathBuf::from(assert_cmd::cargo::cargo_bin!("cass"));
+        let binary_sha = compute_sha256(&binary)?;
+        let socket = temp.path().join("daemon.sock");
+        let stdout_path = temp.path().join("daemon.stdout");
+        let stderr_path = temp.path().join("daemon.stderr");
+        let mut command = Command::new(&binary);
+        command.env_clear().current_dir(&home);
+        for key in ["PATH", "SystemRoot", "WINDIR"] {
+            if let Ok(value) = dotenvy::var(key) {
+                command.env(key, value);
+            }
+        }
+        command
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("CODEX_HOME", home.join(".codex"))
+            .env("CASS_DATA_DIR", &data)
+            .env("CASS_SEMANTIC_EMBEDDER", model)
+            .env("CASS_DAEMON_INDEX_INTERVAL_SECS", "0")
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CASS_RESPONSIVENESS_DISABLE", "1")
+            .env("TUI_HEADLESS", "1")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("RUST_MIN_STACK", "134217728")
+            .args(["daemon", "--socket"])
+            .arg(&socket)
+            .args(["--data-dir"])
+            .arg(&data)
+            .args(["--idle-timeout", "300", "--max-connections", "4"])
+            .stdin(Stdio::null())
+            .stdout(
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&stdout_path)?,
+            )
+            .stderr(
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&stderr_path)?,
+            );
+        let mut daemon = NativeDaemon {
+            child: command.spawn()?,
+            stdout_path,
+            stderr_path,
+        };
+        let client_config = DaemonClientConfig {
+            socket_path: socket,
+            connect_timeout: Duration::from_secs(1),
+            request_timeout: Duration::from_secs(60),
+            auto_spawn: false,
+            data_dir: Some(data.clone()),
+            expected_embedder_id: Some(expected_id.clone()),
+            ..Default::default()
+        };
+        daemon.wait_ready(&client_config)?;
+        let client = Arc::new(UdsDaemonClient::new(client_config.clone()));
+        client.connect()?;
+        let (connection, verifier) = client.attestation_channel(&data)?;
+        assert_eq!(connection.embedding_identity, expected_identity);
+        assert_eq!(
+            connection.model_category,
+            ModelCategory::TransformerEmbedder
+        );
+        assert_eq!(
+            connection.executable_fingerprint,
+            frankensearch::daemon_executable_fingerprint(&hex::decode(&binary_sha)?)
+        );
+        assert!(connection.generation > 0);
+        let transport: Arc<dyn DaemonClient> = client.clone();
+        let retry = DaemonRetryConfig {
+            max_attempts: 1,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+            jitter_pct: 0.0,
+        };
+        let verified = DaemonFallbackEmbedder::new_verified(
+            transport.clone(),
+            None,
+            retry.clone(),
+            connection.clone(),
+            verifier,
+        )?;
+        assert_eq!(verified.trust_level(), DaemonTrustLevelV1::VerifiedRemote);
+        assert_eq!(verified.identity()?, &expected_identity);
+        assert_eq!(verified.connection_identity(), &connection);
+        let remote_vectors = verified.embed_batch_sync(&texts)?;
+        assert_eq!(remote_vectors.len(), texts.len());
+        for (index, text) in texts.iter().enumerate() {
+            assert_vector_bits(
+                &remote_vectors[index],
+                &expected_vectors[index],
+                &format!("attested batch {model} input {index}"),
+            );
+            assert_vector_bits(
+                &verified.embed_sync(text)?,
+                &expected_vectors[index],
+                &format!("attested single {model} input {index}"),
+            );
+        }
+
+        // Reject a real same-width native response for the other model. The
+        // daemon really computes the vector; only its incompatible identity is
+        // refused. No fabricated response or local fallback participates.
+        let wrong_client = UdsDaemonClient::new(DaemonClientConfig {
+            expected_embedder_id: Some(wrong_id.to_owned()),
+            ..client_config
+        });
+        wrong_client.connect()?;
+        let error = wrong_client
+            .embed(texts[0], "native-wrong-space")
+            .expect_err("same dimension must not admit a different native model");
+        assert!(matches!(error, DaemonError::InvalidInput(_)));
+        assert!(error.to_string().contains(&format!("expected {wrong_id}")));
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("received {expected_id}"))
+        );
+        drop(wrong_client);
+
+        let (mut wrong_connection, verifier) = client.attestation_channel(&data)?;
+        let first = if wrong_connection.executable_fingerprint.starts_with('0') {
+            "1"
+        } else {
+            "0"
+        };
+        wrong_connection
+            .executable_fingerprint
+            .replace_range(..1, first);
+        wrong_connection.validate()?;
+        let error = DaemonFallbackEmbedder::new_verified(
+            transport,
+            None,
+            retry,
+            wrong_connection,
+            verifier,
+        )
+        .err()
+        .ok_or("changed executable identity was incorrectly authenticated")?;
+        assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }));
+        assert_vector_bits(
+            &verified.embed_sync(texts[2])?,
+            &expected_vectors[2],
+            "valid authenticated client remains usable after refusals",
+        );
+        drop(verified);
+        daemon.shutdown(&client)?;
+        verify_supplied_bundle(&source, &manifest)?;
+        verify_supplied_bundle(&managed, &manifest)?;
+        eprintln!(
+            "native daemon acceptance model={model} manifest_revision={} binary_sha={binary_sha} \
+             connection={} generation={} inputs={} exact_single_batch=true no_local_fallback=true",
+            manifest.revision,
+            connection.fingerprint(),
+            connection.generation,
+            texts.len()
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CASS_NATIVE_REUSE_MODEL_DIR with the verified five-file MiniLM bundle"]
+    fn gh467_native_daemon_attests_real_minilm_single_and_batch_vectors() -> TestResult {
+        run_native_daemon_case("minilm", "CASS_NATIVE_REUSE_MODEL_DIR")
+    }
+
+    #[test]
+    #[ignore = "requires CASS_NATIVE_MULTILINGUAL_MODEL_DIR with the separate verified multilingual bundle"]
+    fn gh467_native_daemon_attests_real_multilingual_single_and_batch_vectors() -> TestResult {
+        run_native_daemon_case("multilingual-minilm", "CASS_NATIVE_MULTILINGUAL_MODEL_DIR")
+    }
+}

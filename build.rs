@@ -48,7 +48,7 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "fsqlite",
         manifest_package_field: Some("fsqlite"),
         // Exact upstream source pin (established with the fsqlite 0.2.1
-        // migration, bead bo000; now at 0.3.18. 0.3.15 was evaluated on
+        // migration, bead bo000; now at 0.4.2. 0.3.15 was evaluated on
         // 2026-09-02 (bead gh382-fsqlite-pin) and NOT adopted: cass's own
         // writable open still looped on a large archive with a large WAL
         // (reclaim sweep x per-page WAL rescan, cass GH #382 / bead g3zyo).
@@ -68,13 +68,16 @@ const CONTRACTS: &[DependencyContract] = &[
         // freelist repair (GH#410), FTS metadata/visibility fixes (GH#408),
         // and prepared-read schema-retry cleanup. 0.3.18 adds parameterized
         // rowid seeks (GH#415/cass#382), read-only WAL preservation, reader
-        // registration error propagation and I/O lifetime fixes. The facade
-        // API and asupersync requirement are unchanged. Updated by owner
-        // request 2026-09-07; mixed-engine concurrent-WAL GH#411 stays open.
+        // registration error propagation and I/O lifetime fixes. The 0.4.1
+        // release preserves the facade API and requires asupersync 0.5.0.
+        // It includes the GH#462 reserved-page WAL repair and GH#411 shared
+        // WAL-index publication fixes; CASS archive acceptance is separate.
+        // 0.4.2 adds explicit derived WAL-index recovery for read-only
+        // connections, including the dedicated async owner (GH#477).
         // fsqlite resolves from crates.io at the exact version below.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.18",
+        expected_version: "0.4.2",
         // `async-api` exposes frankensqlite::AsyncConnection, which
         // src/search/query.rs uses (as SearchSqliteConnection) for the
         // no-hit alternate-agent suggestions without a full storage open.
@@ -92,10 +95,10 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "fsqlite-types",
         crate_package_name: "fsqlite-types",
         manifest_package_field: Some("fsqlite-types"),
-        // Keep shared types on the identical registry version as the facade.
+        // The 0.4.2 facade uses shared types 0.4.0.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.18",
+        expected_version: "0.4.0",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -110,10 +113,10 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "fsqlite-types",
         crate_package_name: "fsqlite-types",
         manifest_package_field: Some("fsqlite-types"),
-        // Keep shared types on the identical registry version as the facade.
+        // Match the production shared types from the published family.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.3.18",
+        expected_version: "0.4.0",
         expected_features: &[],
         expected_default_features: None,
         repo_rel: "../frankensqlite",
@@ -145,10 +148,12 @@ const CONTRACTS: &[DependencyContract] = &[
         // hyphenated project slug (cass#459), which no decoder can do
         // correctly because `parent-project/my-app` and `parent/project/my/app`
         // encode identically.
+        // The 0.3.0 candidate moves SQLite connectors onto the same 0.4.x
+        // engine and 0.5.x runtime as CASS; publication must precede adoption.
         // crates.io refuses git dependencies, hence version-only.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.2.4",
+        expected_version: "0.3.0",
         expected_features: &[
             "chatgpt",
             "connectors",
@@ -176,14 +181,14 @@ const CONTRACTS: &[DependencyContract] = &[
         manifest_package_field: None,
         // crates.io-only exact pin: every source (direct dep, frankensqlite
         // transitive, frankensearch transitive) resolves to a single published
-        // release. The 0.4.x line (>=0.4.3,<0.5) is required by fsqlite 0.3.x,
-        // whose public API names asupersync 0.4.x types. The 0.4.11 pin
-        // retains the Cx::is_cancelled API published in 0.4.10 for Quill 0.2.3.
+        // release. SQLite 0.4.x, FAD 0.3.0 and FrankenSearch 0.6.1 use
+        // asupersync 0.5.x native contexts; mixing the old runtime would
+        // split caller context, cancellation and capability identity.
         // Empty `expected_git` signals `validate_manifest_dependency_spec`
         // to skip git/rev checks.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.4.11",
+        expected_version: "0.5.0",
         expected_features: &["test-internals", "tls-native-roots"],
         expected_default_features: None,
         repo_rel: "../asupersync",
@@ -198,24 +203,15 @@ const CONTRACTS: &[DependencyContract] = &[
         dep_key: "frankensearch",
         crate_package_name: "frankensearch",
         manifest_package_field: None,
-        // Registry pin (gh#453, gh#429, gh#410). 0.4.3 (quill 0.2.3)
-        // clocks segment collection from retirement receipts, preserving
-        // progress under continued publication. Cx::is_cancelled comes from
-        // the separately pinned asupersync 0.4.11.
-        // 0.4.2 extends the native Windows Quill
-        // publication line with the explicit multilingual MiniLM embedding
-        // profile while preserving the first crates.io line carrying
-        // the pure-Rust `native` feature and the explicit `cass-compat` ->
-        // `lexical-tantivy` foreign-index surface (which keeps CASS schema-v8
-        // access independent from FrankenSearch's swappable generic lexical
-        // backend — cass #308, bd-8nqz.5). Registry 0.3.2 was a stale
-        // same-version twin of an older tree (no quill/cass-compat/native);
-        // the exact `=0.4.3` pin exists so resolution can never reach it.
+        // Coordinated registry candidate with asupersync 0.5.0. Preserve
+        // explicit native MiniLM, Quill and cass-compat lexical behavior.
+        // The producer's 0.6.1 publication and CASS qualification must finish
+        // before release; a manifest pin alone is not runtime acceptance.
         // Empty `expected_git` signals `validate_manifest_dependency_spec`
         // to skip git/rev checks.
         expected_git: "",
         expected_rev: "",
-        expected_version: "0.4.3",
+        expected_version: "0.6.1",
         // cass #308: the ort/ONNX `fastembed` stack was removed; semantic
         // embedding + reranking are now pure-Rust via frankensearch's `native`
         // feature, kept always-on here (no AVX/ONNX static-init hazard, so no
@@ -546,9 +542,10 @@ fn validate_path_dependency_contracts(
 
 fn validate_fsqlite_source_pin(manifest_dir: &Path, manifest: &Value, packaged_manifest: bool) {
     // The fsqlite engine family must resolve exclusively from crates.io at
-    // one exact version. The single-source identity is load-bearing for the
-    // read-only FTS5 integrity preflight used by CASS on Windows.
-    const EXPECTED_VERSION: &str = "0.3.18";
+    // the exact published package versions: the 0.4.2 storage patch updates
+    // the facade, core and pager; btree and vdbe supply required APIs at
+    // 0.4.1, while the remaining family stays at 0.4.0.
+    // One source per package remains load-bearing for read-only integrity.
     const EXPECTED_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
     // 1. With the family on crates.io (e926644f), a `[patch]` table is no
@@ -562,7 +559,7 @@ fn validate_fsqlite_source_pin(manifest_dir: &Path, manifest: &Value, packaged_m
             if dependency == "fsqlite" || dependency.starts_with("fsqlite-") {
                 fatal(format!(
                     "dependency source contract violation for {dependency}: the fsqlite \
-                     family resolves from crates.io at ={EXPECTED_VERSION}; a \
+                     family resolves from the pinned crates.io package versions; a \
                      [patch.crates-io] redirect would reintroduce an unreviewed shadow \
                      source"
                 ));
@@ -571,7 +568,7 @@ fn validate_fsqlite_source_pin(manifest_dir: &Path, manifest: &Value, packaged_m
     }
 
     // 2. Lockfile convergence: every resolved fsqlite-family package must be
-    //    the pinned source revision, with exactly one version per crate.
+    //    its pinned registry version, with exactly one version per crate.
     //    Cargo resolves the lockfile before running build scripts, so the
     //    lockfile is authoritative here. Packaged manifests (`cargo package`
     //    verification builds) re-resolve into a fresh lockfile that inherits
@@ -616,19 +613,24 @@ fn validate_fsqlite_source_pin(manifest_dir: &Path, manifest: &Value, packaged_m
         if !(name == "fsqlite" || name.starts_with("fsqlite-")) {
             continue;
         }
+        let expected_version = match name {
+            "fsqlite" | "fsqlite-core" | "fsqlite-pager" => "0.4.2",
+            "fsqlite-btree" | "fsqlite-vdbe" => "0.4.1",
+            _ => "0.4.0",
+        };
         let version = package.get("version").and_then(Value::as_str).unwrap_or("");
         if !seen.insert(name) {
             violations.push(format!(
                 "`{name}` resolves more than once; the fsqlite family must converge on \
-                 a single source revision"
+                 a single registry version per package"
             ));
         }
-        if version != EXPECTED_VERSION {
+        if version != expected_version {
             violations.push(format!(
-                "`{name}` resolves at `{version}`, expected `{EXPECTED_VERSION}`"
+                "`{name}` resolves at `{version}`, expected `{expected_version}`"
             ));
             remediations.push(format!(
-                "cargo update -p {name}@{version} --precise {EXPECTED_VERSION}"
+                "cargo update -p {name}@{version} --precise {expected_version}"
             ));
         }
         let source = package.get("source").and_then(Value::as_str).unwrap_or("");

@@ -330,6 +330,120 @@ fn install_ps1_derives_sibling_urls_without_host_path_semantics() {
 }
 
 #[test]
+fn release_workflow_pins_linux_glibc_to_installer_floor() {
+    let workflow: serde_yaml::Value = must(
+        serde_yaml::from_str(include_str!("../.github/workflows/release.yml")),
+        "parse release workflow",
+    );
+    let floor = workflow["env"]["LINUX_GLIBC_VERSION"]
+        .as_str()
+        .expect("explicit Linux ABI floor");
+    assert_eq!(floor, "2.28", "preserve the measured v0.8.0 ABI contract");
+    assert!(
+        include_str!("../install.sh")
+            .lines()
+            .any(|line| line == format!("MIN_GLIBC=\"{floor}\"")),
+        "installer admission must agree with the release ABI floor"
+    );
+    let matrix = workflow["jobs"]["build"]["strategy"]["matrix"]["include"]
+        .as_sequence()
+        .expect("release platform matrix");
+    for (os, target) in [
+        ("ubuntu-24.04", "x86_64-unknown-linux-gnu"),
+        ("ubuntu-24.04-arm", "aarch64-unknown-linux-gnu"),
+    ] {
+        assert!(
+            matrix.iter().any(|entry| {
+                entry["os"].as_str() == Some(os) && entry["target"].as_str() == Some(target)
+            }),
+            "retain plain target {target} for packaging and native smoke tests"
+        );
+    }
+    let steps = workflow["jobs"]["build"]["steps"]
+        .as_sequence()
+        .expect("release build steps");
+    let step = |name: &str| {
+        steps
+            .iter()
+            .find(|step| step["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("missing release step: {name}"))
+    };
+    let linux = step("Build Linux release at the installer ABI floor");
+    let rust_toolchain: toml::Value = must(
+        toml::from_str(include_str!("../rust-toolchain.toml")),
+        "parse repository Rust toolchain",
+    );
+    assert_eq!(
+        step("Install repository Rust toolchain")["with"]["toolchain"].as_str(),
+        rust_toolchain["toolchain"]["channel"].as_str(),
+        "release must install the repository nightly for -Z threads"
+    );
+    assert_eq!(linux["if"].as_str(), Some("runner.os == 'Linux'"));
+    let build = linux["run"].as_str().expect("Linux build command");
+    for required in [
+        "cargo zigbuild --locked --release --target \"${{ matrix.target }}.${LINUX_GLIBC_VERSION}\" --bin cass",
+        "unset CARGO_ENCODED_RUSTFLAGS CC CXX AR",
+        "export RUSTFLAGS='-Z threads=4'",
+        "test \"$(zig version)\" = 0.14.1",
+        "test \"$(cargo-zigbuild --version)\" = 'cargo-zigbuild 0.23.0'",
+    ] {
+        assert!(build.contains(required), "missing Linux guard: {required}");
+    }
+    assert_eq!(
+        step("Build release")["if"].as_str(),
+        Some("runner.os != 'Linux'"),
+        "a subsequent native build must not overwrite the Zig artifact"
+    );
+    let setup = step("Install pinned Linux cross toolchain");
+    assert_eq!(setup["if"].as_str(), Some("runner.os == 'Linux'"));
+    let setup = setup["run"].as_str().expect("pinned toolchain setup");
+    assert!(setup.contains("cargo install cargo-zigbuild --version 0.23.0 --locked"));
+    assert!(setup.contains("https://ziglang.org/download/0.14.1/"));
+    assert!(setup.contains("sha256sum --check --strict"));
+    let verification = step("Verify Linux glibc requirement");
+    assert_eq!(verification["if"].as_str(), Some("runner.os == 'Linux'"));
+    let verification = verification["run"].as_str().expect("ELF verification");
+    assert!(verification.contains("objdump -p \"$BINARY\""));
+    assert!(
+        verification.contains("target/${{ matrix.target }}/release/${{ matrix.artifact_name }}")
+    );
+
+    // Execute the actual ceiling guard with measured-symbol inputs. Version
+    // ordering must be numeric, and missing metadata must fail closed.
+    #[cfg(target_os = "linux")]
+    {
+        let guard_start = verification
+            .find("test -n \"$MAX_GLIBC\"")
+            .expect("nonempty ABI guard");
+        let guard = &verification[guard_start..];
+        for (version, accepted) in [
+            ("GLIBC_2.9", true),
+            ("GLIBC_2.27", true),
+            ("GLIBC_2.28", true),
+            ("GLIBC_2.29", false),
+            ("GLIBC_2.39", false),
+            ("GLIBC_2.43", false),
+            ("", false),
+        ] {
+            let output = must(
+                Command::new("bash")
+                    .args(["-euc", guard])
+                    .env("MAX_GLIBC", version)
+                    .env("LINUX_GLIBC_VERSION", floor)
+                    .output(),
+                "run release ABI ceiling guard",
+            );
+            assert_eq!(
+                output.status.success(),
+                accepted,
+                "ABI input {version:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+#[test]
 fn release_workflow_builds_and_publishes_the_exact_requested_tag() -> Result<(), String> {
     let workflow =
         fs::read_to_string(".github/workflows/release.yml").map_err(|err| err.to_string())?;
