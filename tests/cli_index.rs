@@ -102,7 +102,9 @@ fn index_creates_db_and_index() {
     let payload: serde_json::Value = serde_json::from_slice(&output).unwrap();
     #[cfg(target_os = "linux")]
     assert!(
-        payload["indexing_stats"]["bytes_written"].as_u64().is_some(),
+        payload["indexing_stats"]["bytes_written"]
+            .as_u64()
+            .is_some(),
         "Linux index summary must report its measured write counter"
     );
     #[cfg(not(target_os = "linux"))]

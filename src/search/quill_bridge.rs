@@ -2029,13 +2029,11 @@ mod tests {
             "comparable unequal inputs still make geometric progress"
         );
         assert!(
-            plan_capped_balanced_merge_runs(&[(1, 0), (2, 0)], &folds[..2], u64::MAX)
-                .is_empty(),
+            plan_capped_balanced_merge_runs(&[(1, 0), (2, 0)], &folds[..2], u64::MAX).is_empty(),
             "empty inputs must not repeatedly rewrite a large empty segment"
         );
         assert!(
-            plan_capped_balanced_merge_runs(&[(1, 0), (2, 1)], &folds[..2], u64::MAX)
-                .is_empty()
+            plan_capped_balanced_merge_runs(&[(1, 0), (2, 1)], &folds[..2], u64::MAX).is_empty()
         );
     }
 
