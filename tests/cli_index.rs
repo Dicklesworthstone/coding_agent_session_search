@@ -69,7 +69,7 @@ fn index_parses_semantic_flags() -> Result<(), String> {
             semantic, embedder, ..
         }) => {
             assert!(semantic, "semantic flag should be true");
-            assert_eq!(embedder, "fastembed");
+            assert_eq!(embedder.as_deref(), Some("fastembed"));
             Ok(())
         }
         other => Err(format!("expected index command, got {other:?}")),
@@ -77,12 +77,12 @@ fn index_parses_semantic_flags() -> Result<(), String> {
 }
 
 #[test]
-fn index_default_embedder_is_fastembed() -> Result<(), String> {
+fn index_default_embedder_defers_to_semantic_policy() -> Result<(), String> {
     let cli = parse_cli_ok(["cass", "index", "--semantic"], "parse index flags");
 
     match cli.command {
         Some(Commands::Index { embedder, .. }) => {
-            assert_eq!(embedder, "fastembed");
+            assert!(embedder.is_none());
             Ok(())
         }
         other => Err(format!("expected index command, got {other:?}")),

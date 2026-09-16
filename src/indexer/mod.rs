@@ -18088,7 +18088,7 @@ fn run_index_inner(
         let targeted_semantic_watch_once = targeted_semantic_watch_once && watch_once_mode;
         let embedder_id = opts.embedder.clone();
         let data_dir_for_semantic = opts.data_dir.clone();
-        let pre_watch_semantic_conversations = if targeted_semantic_watch_once {
+        let pre_watch_semantic_conversations = if semantic_enabled {
             let storage = storage.lock().map_err(|err| {
                 anyhow::anyhow!("storage lock poisoned before semantic watch-once: {err}")
             })?;
@@ -18102,7 +18102,9 @@ fn run_index_inner(
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
         );
-        let last_semantic_embed = Mutex::new(Instant::now());
+        let semantic_maintenance = std::cell::RefCell::new(WatchSemanticMaintenance::new(
+            pre_watch_semantic_conversations,
+        ));
 
         // Initialize stale detector for watch mode
         let stale_detector = Arc::new(StaleDetector::from_env());
@@ -18127,7 +18129,15 @@ fn run_index_inner(
             opts.watch_interval_secs,
             deferred_watch_sources,
             move |paths, roots, is_rebuild| {
-                let mut semantic_delta = WatchSemanticDelta::default();
+                let semantic_retry_paths = if semantic_enabled && !targeted_semantic_watch_once {
+                    if is_rebuild {
+                        roots.iter().map(|(_, root)| root.path.clone()).collect()
+                    } else {
+                        paths.clone()
+                    }
+                } else {
+                    Vec::new()
+                };
                 let active_source_filter = ActiveSessionSourceFilter::new(!watch_once_mode);
                 let indexed = if is_rebuild {
                     if let Ok(mut g) = state.lock() {
@@ -18170,7 +18180,7 @@ fn run_index_inner(
                             &t_index,
                             &index_path_for_watch,
                             false,
-                            semantic_enabled.then_some(&mut semantic_delta),
+                            None,
                             &active_source_filter,
                         ),
                         &detector_clone,
@@ -18220,7 +18230,7 @@ fn run_index_inner(
                             &t_index,
                             &index_path_for_watch,
                             false,
-                            semantic_enabled.then_some(&mut semantic_delta),
+                            None,
                             &active_source_filter,
                         ),
                         &detector_clone,
@@ -18246,46 +18256,29 @@ fn run_index_inner(
                     indexed
                 };
 
-                // Incremental semantic embedding with cooldown
-                if semantic_enabled && indexed > 0 && !targeted_semantic_watch_once {
-                    let should_embed = last_semantic_embed
-                        .lock()
-                        .map(|t| t.elapsed() >= semantic_cooldown)
-                        .unwrap_or(false);
-                    if should_embed {
-                        let embed_result = if semantic_delta.max_message_id.is_some() {
-                            incremental_semantic_embed_from_delta(
-                                &embedder_id,
-                                &data_dir_for_semantic,
-                                &storage_for_watch,
-                                semantic_delta,
-                            )
-                        } else {
-                            incremental_semantic_embed(
-                                &embedder_id,
-                                &data_dir_for_semantic,
-                                &storage_for_watch,
-                            )
-                        };
-                        match embed_result {
-                            Ok(0) => {} // no new messages to embed
-                            Ok(n) => {
-                                tracing::info!(
-                                    count = n,
-                                    "incremental semantic embedding complete"
-                                );
-                                if let Ok(mut t) = last_semantic_embed.lock() {
-                                    *t = Instant::now();
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "incremental semantic embedding failed");
-                                // Reset cooldown on error to avoid rapid-fire retries
-                                if let Ok(mut t) = last_semantic_embed.lock() {
-                                    *t = Instant::now();
-                                }
-                            }
-                        }
+                // Reconcile every pending canonical change, including earlier
+                // cooldown-skipped callbacks, before publishing current coverage.
+                if semantic_enabled && !targeted_semantic_watch_once {
+                    let mut maintenance = semantic_maintenance.borrow_mut();
+                    maintenance.record_ingest(indexed, semantic_retry_paths);
+                    match maintenance.reconcile_if_due(
+                        &embedder_id,
+                        &data_dir_for_semantic,
+                        &storage_for_watch,
+                        semantic_cooldown,
+                        opts_clone.progress.as_ref(),
+                    ) {
+                        Ok(Some(stats)) => tracing::info!(
+                            selected_docs = stats.selected_docs,
+                            embedded_docs = stats.embedded_docs,
+                            reason = %stats.reason,
+                            "watch semantic coverage reconciled and published"
+                        ),
+                        Ok(None) => {}
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "watch semantic maintenance failed; retaining sources for retry"
+                        ),
                     }
                 }
 
@@ -18321,7 +18314,9 @@ fn run_index_inner(
                     }
                 }
 
-                Ok(active_source_filter.take_deferred_sources())
+                let mut deferred = active_source_filter.take_deferred_sources();
+                deferred.extend(semantic_maintenance.borrow().pending_paths.iter().cloned());
+                Ok(deferred)
             },
         );
 
@@ -18831,6 +18826,78 @@ impl WatchSemanticDelta {
                     .map_or(max_message_id, |current| current.max(max_message_id)),
             );
         }
+    }
+}
+
+/// Keep semantic work on the existing watch retry queue until a canonical
+/// reconciliation has published it. Callback-local deltas cannot prove coverage
+/// after cooldown skips, same-ID edits, or deletions.
+struct WatchSemanticMaintenance {
+    pending_paths: BTreeSet<PathBuf>,
+    pending_conversations: usize,
+    pre_watch_conversations: usize,
+    last_attempt: Instant,
+}
+
+impl WatchSemanticMaintenance {
+    fn new(pre_watch_conversations: usize) -> Self {
+        Self {
+            pending_paths: BTreeSet::new(),
+            pending_conversations: 0,
+            pre_watch_conversations,
+            last_attempt: Instant::now(),
+        }
+    }
+
+    fn record_ingest(&mut self, indexed: usize, paths: impl IntoIterator<Item = PathBuf>) {
+        if indexed > 0 {
+            self.pending_conversations = self.pending_conversations.saturating_add(indexed);
+            self.pending_paths.extend(paths);
+        }
+    }
+
+    fn reconcile_if_due(
+        &mut self,
+        embedder: &str,
+        data_dir: &Path,
+        storage: &Mutex<FrankenStorage>,
+        cooldown: Duration,
+        progress: Option<&Arc<IndexingProgress>>,
+    ) -> Result<Option<SemanticWatchOnceStats>> {
+        if self.pending_conversations == 0 || self.last_attempt.elapsed() < cooldown {
+            return Ok(None);
+        }
+        prepare_progress_for_semantic_build(progress);
+        let result = (|| {
+            if self.pre_watch_conversations > 0
+                && !semantic_index_has_current_contract(data_dir, embedder)
+            {
+                anyhow::bail!(
+                    "watch semantic base is missing or incompatible; rebuild with cass index --semantic before retrying"
+                );
+            }
+            let stats = run_targeted_semantic_watch_once_publish(
+                embedder,
+                data_dir,
+                storage,
+                self.pending_conversations,
+                self.pre_watch_conversations,
+            )?;
+            let current_conversations = {
+                let guard = storage.lock().map_err(|error| {
+                    anyhow::anyhow!("lock storage after watch semantic publication: {error}")
+                })?;
+                count_total_conversations_exact(&guard)?
+            };
+            self.pre_watch_conversations = current_conversations;
+            self.pending_conversations = 0;
+            self.pending_paths.clear();
+            Ok(Some(stats))
+        })();
+        // Count cooldown from completion, on success or failure. A skipped
+        // callback must not move this clock and starve pending work forever.
+        self.last_attempt = Instant::now();
+        result
     }
 }
 
@@ -19502,6 +19569,14 @@ fn embed_incremental_semantic_inputs(
     filtered_watermark_context: &str,
     success_watermark_context: &str,
 ) -> Result<usize> {
+    // A watch callback may outlive the base generation it started with. Admit
+    // the target before loading a model, embedding a delta, or certifying even
+    // a filtered-only watermark. Append still validates again to catch races.
+    if !semantic_index_has_current_contract(data_dir, embedder) {
+        anyhow::bail!(
+            "incremental semantic base is missing or incompatible; rebuild with cass index --semantic before appending"
+        );
+    }
     if embedding_inputs.is_empty() {
         update_incremental_semantic_watermark(storage, raw_max_id, filtered_watermark_context)?;
         return Ok(0);
@@ -19513,33 +19588,6 @@ fn embed_incremental_semantic_inputs(
 
     update_incremental_semantic_watermark(storage, raw_max_id, success_watermark_context)?;
     Ok(count)
-}
-
-fn incremental_semantic_embed_from_delta(
-    embedder: &str,
-    data_dir: &Path,
-    storage: &Mutex<FrankenStorage>,
-    semantic_delta: WatchSemanticDelta,
-) -> Result<usize> {
-    let Some(raw_max_id) = semantic_delta.max_message_id else {
-        return Ok(0);
-    };
-
-    let embedding_inputs: Vec<EmbeddingInput> = semantic_delta
-        .inputs
-        .into_iter()
-        .filter(|msg| !is_hard_message_noise(semantic_role_name(msg.role), &msg.content))
-        .collect();
-
-    embed_incremental_semantic_inputs(
-        embedder,
-        data_dir,
-        storage,
-        embedding_inputs,
-        raw_max_id,
-        "advancing incremental semantic watermark for filtered packet delta",
-        "updating incremental semantic watermark from packet delta",
-    )
 }
 
 /// tpndx: after a one-shot delta append, make the artifact publishable —
@@ -28602,7 +28650,9 @@ fn reindex_paths_with_semantic_delta(
             watch_lexical_replay_debt_for_root(&storage, kind, &root)?
         };
         let replay_canonical = !pending_lexical_debt.is_empty();
-        if explicit_watch_once && !force_full && semantic_delta.is_none() {
+        // Semantic watch-once must reconcile and attest an unchanged source,
+        // even when the caller no longer captures callback-local deltas.
+        if explicit_watch_once && !force_full && !opts.semantic && semantic_delta.is_none() {
             let unchanged = {
                 let storage = storage
                     .lock()
@@ -31025,7 +31075,7 @@ pub mod persist {
     use rand::RngExt;
     use rayon::prelude::*;
 
-    use crate::connectors::NormalizedConversation;
+    use crate::connectors::{NormalizedConversation, NormalizedMessage};
     use crate::indexer::semantic::{
         EmbeddingInput, packet_embedding_inputs_from_storage_for_message_ids,
     };
@@ -32677,7 +32727,7 @@ pub mod persist {
         mut redactor: Option<&mut super::redact_secrets::MemoizingRedactor>,
         heartbeat: PersistHeartbeat<'_>,
     ) -> Message {
-        if mapped_message_index % MAP_HEARTBEAT_MESSAGE_STRIDE == 0 {
+        if mapped_message_index.is_multiple_of(MAP_HEARTBEAT_MESSAGE_STRIDE) {
             heartbeat.tick();
         }
         let content = if should_redact {
@@ -33391,6 +33441,8 @@ pub mod persist {
         use crate::connectors::NormalizedMessage;
         use fsqlite_types::value::SqliteValue;
         use serial_test::serial;
+        use std::path::PathBuf;
+        use std::sync::atomic::Ordering;
 
         static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
             std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
@@ -38354,6 +38406,268 @@ mod tests {
             assert!(!semantic_index_has_current_contract(temp.path(), requested));
             assert!(!temp.path().join("models").exists());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn gh481_incremental_semantic_preflight_preserves_watermark_before_model_load() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let storage = Mutex::new(FrankenStorage::open(&temp.path().join("archive.db"))?);
+        update_incremental_semantic_watermark(&storage, 7, "seed test watermark")?;
+        let index_path = vector_index_path(temp.path(), "minilm-384");
+        fs::create_dir_all(index_path.parent().context("vector parent")?)?;
+        let mut manifest = SemanticManifest::default();
+        manifest.publish_artifact(ArtifactRecord {
+            tier: SemanticTierKind::Quality,
+            embedder_id: "minilm-384".to_string(),
+            model_revision: semantic_model_revision_for_embedder_id("minilm-384"),
+            schema_version: SEMANTIC_SCHEMA_VERSION,
+            chunking_version: CHUNKING_STRATEGY_VERSION,
+            dimension: 384,
+            doc_count: 0,
+            conversation_count: 0,
+            db_fingerprint: "content-v1:0:0:0".to_string(),
+            index_path: index_path
+                .strip_prefix(temp.path())?
+                .to_string_lossy()
+                .into_owned(),
+            size_bytes: 0,
+            started_at_ms: 1,
+            completed_at_ms: 2,
+            ready: true,
+        });
+        manifest.save(temp.path())?;
+        for corrupt in [false, true] {
+            if corrupt {
+                fs::write(&index_path, b"not a vector index")?;
+            }
+            for inputs in [
+                vec![],
+                vec![EmbeddingInput::new(8, "Explain the parser bug")],
+            ] {
+                let error = embed_incremental_semantic_inputs(
+                    "minilm",
+                    temp.path(),
+                    &storage,
+                    inputs,
+                    8,
+                    "filtered test watermark",
+                    "appended test watermark",
+                )
+                .expect_err("unavailable base must refuse before loading the absent model");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("incremental semantic base is missing or incompatible"),
+                    "{error:#}"
+                );
+                assert_eq!(
+                    storage.lock().unwrap().get_last_embedded_message_id()?,
+                    Some(7)
+                );
+                assert!(!temp.path().join("models").exists());
+            }
+        }
+        assert_eq!(fs::read(&index_path)?, b"not a vector index");
+        Ok(())
+    }
+
+    #[test]
+    fn gh481_incremental_semantic_preflight_allows_valid_hash_append() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let storage = Mutex::new(FrankenStorage::open(&temp.path().join("archive.db"))?);
+        let indexer = SemanticIndexer::new("hash", Some(temp.path()))?;
+        let index_path = vector_index_path(temp.path(), indexer.embedder_id());
+        fs::create_dir_all(index_path.parent().context("vector parent")?)?;
+        let writer = FsVectorIndex::create_with_revision(
+            &index_path,
+            indexer.embedder_id(),
+            crate::indexer::semantic::HASH_VECTOR_SPACE_REVISION,
+            384,
+            frankensearch::index::Quantization::F16,
+        )?;
+        writer.finish()?;
+        publish_direct_semantic_artifact(
+            &storage.lock().unwrap(),
+            temp.path(),
+            &index_path,
+            indexer.embedder_id(),
+            384,
+            0,
+            1,
+        )?;
+        assert_eq!(
+            embed_incremental_semantic_inputs(
+                "hash",
+                temp.path(),
+                &storage,
+                vec![EmbeddingInput::new(8, "Explain the parser bug")],
+                8,
+                "filtered test watermark",
+                "appended test watermark",
+            )?,
+            1
+        );
+        assert_eq!(
+            inspect_semantic_artifact(&index_path)?.live_record_count(),
+            1
+        );
+        assert_eq!(
+            storage.lock().unwrap().get_last_embedded_message_id()?,
+            Some(8)
+        );
+        assert_eq!(
+            embed_incremental_semantic_inputs(
+                "hash",
+                temp.path(),
+                &storage,
+                vec![],
+                9,
+                "filtered test watermark",
+                "appended test watermark",
+            )?,
+            0
+        );
+        assert_eq!(
+            storage.lock().unwrap().get_last_embedded_message_id()?,
+            Some(9)
+        );
+        assert_eq!(
+            inspect_semantic_artifact(&index_path)?.live_record_count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn continuous_watch_semantic_retains_cooldown_work_and_publishes_all_rows() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let storage = Mutex::new(FrankenStorage::open(&temp.path().join("archive.db"))?);
+        seed_archive_conversation(&storage.lock().unwrap(), "watch-base");
+        run_targeted_semantic_watch_once_publish("hash", temp.path(), &storage, 1, 0)?;
+        let mut manifest = SemanticManifest::load_or_default(temp.path())?;
+        let old_fingerprint = manifest
+            .fast_tier
+            .as_ref()
+            .context("fast tier")?
+            .db_fingerprint
+            .clone();
+        manifest.publish_hnsw(crate::search::semantic_manifest::HnswRecord {
+            base_tier: SemanticTierKind::Fast,
+            embedder_id: "fnv1a-384".to_string(),
+            ef_search: 64,
+            index_path: "vector_index/hnsw-fnv1a-384.chsw".to_string(),
+            size_bytes: 1,
+            built_at_ms: 1,
+            ready: true,
+        });
+        manifest.save(temp.path())?;
+        let mut maintenance = WatchSemanticMaintenance::new(1);
+        let cooldown = Duration::from_secs(60);
+        for name in ["watch-cooldown-first", "watch-cooldown-second"] {
+            seed_archive_conversation(&storage.lock().unwrap(), name);
+            maintenance.record_ingest(1, [temp.path().join(name)]);
+            assert!(
+                maintenance
+                    .reconcile_if_due("hash", temp.path(), &storage, cooldown, None)?
+                    .is_none()
+            );
+        }
+        assert_eq!(maintenance.pending_paths.len(), 2);
+        assert_eq!(
+            SemanticManifest::load_or_default(temp.path())?
+                .fast_tier
+                .context("fast tier")?
+                .db_fingerprint,
+            old_fingerprint
+        );
+        // A retry with no new ingestion must still publish both skipped callbacks.
+        maintenance.record_ingest(0, std::iter::empty());
+        maintenance.last_attempt = Instant::now()
+            .checked_sub(cooldown)
+            .context("elapsed cooldown")?;
+        let stats = maintenance
+            .reconcile_if_due("hash", temp.path(), &storage, cooldown, None)?
+            .context("publication")?;
+        assert!(stats.published);
+        assert_eq!(stats.embedded_docs, 2);
+        assert!(maintenance.pending_paths.is_empty());
+        assert_eq!(maintenance.pending_conversations, 0);
+        assert_eq!(maintenance.pre_watch_conversations, 3);
+        let guard = storage.lock().unwrap();
+        let canonical = CanonicalSemanticDocuments::from_storage(&guard)?;
+        let index = FsVectorIndex::open(&vector_index_path(temp.path(), "fnv1a-384"))?;
+        let actual = (0..index.record_count())
+            .map(|i| index.doc_id_at(i).map(str::to_owned))
+            .collect::<Result<HashSet<_>, _>>()?;
+        assert_eq!(actual, canonical.doc_ids);
+        let manifest = SemanticManifest::load_or_default(temp.path())?;
+        assert!(manifest.hnsw.is_none());
+        assert_eq!(
+            manifest.fast_tier.context("fast tier")?.db_fingerprint,
+            lexical_rebuild_content_fingerprint(&guard, 3)?
+        );
+        assert_eq!(guard.get_last_embedded_message_id()?, Some(3));
+        Ok(())
+    }
+
+    #[test]
+    fn continuous_watch_semantic_retries_failed_base_and_reconciles_edits() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let storage = Mutex::new(FrankenStorage::open(&temp.path().join("archive.db"))?);
+        for name in ["watch-edited", "watch-deleted", "watch-preserved"] {
+            seed_archive_conversation(&storage.lock().unwrap(), name);
+        }
+        run_targeted_semantic_watch_once_publish("hash", temp.path(), &storage, 3, 0)?;
+        let index_path = vector_index_path(temp.path(), "fnv1a-384");
+        let before = FsVectorIndex::open(&index_path)?;
+        let before_vectors = (0..before.record_count())
+            .map(|i| Ok((before.doc_id_at(i)?.to_owned(), before.vector_at_f32(i)?)))
+            .collect::<Result<HashMap<_, _>>>()?;
+        drop(before);
+        {
+            let guard = storage.lock().unwrap();
+            guard.raw().execute_compat("UPDATE messages SET content = 'Explain the corrected watch reconciliation algorithm' WHERE id = 1", &[])?;
+            guard
+                .raw()
+                .execute_compat("DELETE FROM messages WHERE id = 2", &[])?;
+        }
+        let mut maintenance = WatchSemanticMaintenance::new(3);
+        let source = temp.path().join("watch-edited.jsonl");
+        maintenance.record_ingest(1, [source.clone()]);
+        let held_index = index_path.with_extension("held-for-retry");
+        fs::rename(&index_path, &held_index)?;
+        let error = maintenance
+            .reconcile_if_due("hash", temp.path(), &storage, Duration::ZERO, None)
+            .unwrap_err();
+        assert!(error.to_string().contains("watch semantic base is missing"));
+        assert!(maintenance.pending_paths.contains(&source));
+        assert_eq!(maintenance.pending_conversations, 1);
+        assert_eq!(
+            storage.lock().unwrap().get_last_embedded_message_id()?,
+            Some(3)
+        );
+        fs::rename(&held_index, &index_path)?;
+        let stats = maintenance
+            .reconcile_if_due("hash", temp.path(), &storage, Duration::ZERO, None)?
+            .context("retry publication")?;
+        assert!(stats.published);
+        assert_eq!(stats.embedded_docs, 1);
+        assert!(maintenance.pending_paths.is_empty());
+        let canonical = CanonicalSemanticDocuments::from_storage(&storage.lock().unwrap())?;
+        let after = FsVectorIndex::open(&index_path)?;
+        let mut actual = HashSet::new();
+        let mut preserved = 0;
+        for i in 0..after.record_count() {
+            let id = after.doc_id_at(i)?;
+            actual.insert(id.to_owned());
+            if let Some(vector) = before_vectors.get(id) {
+                assert_eq!(&after.vector_at_f32(i)?, vector);
+                preserved += 1;
+            }
+        }
+        assert_eq!(actual, canonical.doc_ids);
+        assert_eq!(preserved, 1);
         Ok(())
     }
 
@@ -56745,13 +57059,13 @@ mod tests {
     fn explicit_watch_once_omp_scan_root_survives_symlink_resolution() {
         let tmp = tempfile::tempdir().unwrap();
         let real_root = tmp.path().join("archive");
-        std::fs::create_dir_all(real_root.join("workspace")).unwrap();
-        let real = real_root.join("workspace/session.jsonl");
+        std::fs::create_dir_all(real_root.join("-workspace")).unwrap();
+        let real = real_root.join("-workspace/session.jsonl");
         std::fs::write(&real, b"{}\n").unwrap();
         let linked_root = tmp.path().join("share/omp/sessions");
         std::fs::create_dir_all(linked_root.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&real_root, &linked_root).unwrap();
-        let requested = linked_root.join("workspace/session.jsonl");
+        let requested = linked_root.join("-workspace/session.jsonl");
         let canonical = std::fs::canonicalize(&real).unwrap();
 
         assert_eq!(

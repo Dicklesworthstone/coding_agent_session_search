@@ -47,6 +47,12 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- Incremental lexical merges combine similarly sized segments, avoiding repeated
+  rewrites of a large segment for each small append while preserving merge caps (#479).
+- Incremental semantic append validates its base before loading the model,
+  embedding new messages, or advancing a filtered-only watermark (#481).
+- An explicit backfill embedder overrides the environment default in both
+  monolingual and multilingual model selection (#480).
 - TUI source menus remain visible with more than 65,000 sources, and timestamp
   sparklines handle the full timestamp range without arithmetic overflow.
 - Source names reject Windows drive prefixes and alternate-stream separators,
