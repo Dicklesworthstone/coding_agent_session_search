@@ -56,7 +56,10 @@ const E2E_TRACE_MAX_BYTES: u64 = 512 * 1024;
 const SEMANTIC_TRACE_AGGREGATE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
 fn is_log_file(path: &Path) -> bool {
-    if path.components().any(|part| part.as_os_str() == ".previous") {
+    if path
+        .components()
+        .any(|part| part.as_os_str() == ".previous")
+    {
         return false;
     }
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
@@ -703,7 +706,8 @@ fn jsonl_files_valid_schema() {
             errors.push(format!("{}: {warning}", path.display()));
         }
     }
-    if let Err(error) = require_selected_log_coverage(logging_enabled, jsonl_files.len(), total_events)
+    if let Err(error) =
+        require_selected_log_coverage(logging_enabled, jsonl_files.len(), total_events)
     {
         errors.push(error);
     }
