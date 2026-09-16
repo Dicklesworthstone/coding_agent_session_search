@@ -20939,6 +20939,37 @@ mod index_error_mapping_tests {
     use super::*;
 
     #[test]
+    fn index_idempotency_cache_rejects_non_objects_and_preserves_valid_results() {
+        for invalid in [
+            "",
+            "{",
+            "null",
+            "true",
+            "false",
+            "42",
+            "1.5",
+            "\"cached\"",
+            "[]",
+            "[{}]",
+        ] {
+            assert_eq!(cached_index_payload(invalid, "retry-key"), None);
+        }
+        assert_eq!(
+            cached_index_payload(
+                r#"{"ok":true,"messages":3,"nested":{"value":[1,2]},"cached":false,"idempotency_key":"old-key"}"#,
+                "retry-key",
+            ),
+            Some(serde_json::json!({
+                "ok": true,
+                "messages": 3,
+                "nested": {"value": [1, 2]},
+                "cached": true,
+                "idempotency_key": "retry-key",
+            }))
+        );
+    }
+
+    #[test]
     fn orphan_fk_cleanup_failure_is_retryable_after_operator_remediation() {
         let err = index_orphan_fk_cleanup_cli_error(
             "orphan FK self-heal failed for canonical cass archive at /tmp/cass.db: out of memory",
@@ -105369,6 +105400,17 @@ fn run_lexical_gc_cli(
     Ok(())
 }
 
+fn cached_index_payload(result_json: &str, key: &str) -> Option<serde_json::Value> {
+    let mut payload =
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(result_json).ok()?;
+    payload.insert("cached".to_string(), serde_json::Value::Bool(true));
+    payload.insert(
+        "idempotency_key".to_string(),
+        serde_json::Value::String(key.to_string()),
+    );
+    Some(serde_json::Value::Object(payload))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_index_with_data(
     db_override: Option<PathBuf>,
@@ -105483,18 +105525,17 @@ fn run_index_with_data(
 
         if let Ok(Some((stored_hash, result_json))) = cached {
             if stored_hash == params_hash.to_string() {
-                if let Some(fmt) = structured_format {
-                    if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&result_json) {
-                        val["cached"] = serde_json::json!(true);
-                        val["idempotency_key"] = serde_json::json!(key);
+                // A syntactically valid scalar or array is not an index result.
+                // Treat damaged cache entries as misses in every output mode.
+                if let Some(val) = cached_index_payload(&result_json, key) {
+                    if let Some(fmt) = structured_format {
                         emit_result(val, fmt)?;
-                        return Ok(());
+                    } else {
+                        eprintln!(
+                            "Using cached result for idempotency key '{}' (use different key to force re-index)",
+                            key
+                        );
                     }
-                } else {
-                    eprintln!(
-                        "Using cached result for idempotency key '{}' (use different key to force re-index)",
-                        key
-                    );
                     return Ok(());
                 }
             } else {
