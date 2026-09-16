@@ -31525,11 +31525,13 @@ pub mod persist {
     }
 
     fn index_writer_busy_timeout_ms() -> u64 {
+        // GH473: keep engine-local waits short; complete idempotent write
+        // transactions already have bounded retries at the CASS boundary.
         dotenvy::var("CASS_INDEX_WRITER_BUSY_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|v| *v > 0)
-            .unwrap_or(60_000)
+            .unwrap_or(10)
     }
 
     /// WAL autocheckpoint threshold (pages) for the index writer.
@@ -32511,6 +32513,34 @@ pub mod persist {
     /// keeps ticks cheap (one relaxed atomic add per 256 messages) while
     /// bounding the silent window to well under any sane threshold.
     const MAP_HEARTBEAT_MESSAGE_STRIDE: usize = 256;
+    const INNER_REDACTION_MIN_MESSAGES: usize = 512;
+    const INNER_REDACTION_MIN_TEXT_BYTES: usize = 1024 * 1024;
+
+    fn use_inner_message_redaction(convs: &[NormalizedConversation]) -> bool {
+        let [conv] = convs else {
+            return false;
+        };
+        if !super::redact_secrets::redaction_enabled()
+            || rayon::current_num_threads() <= 1
+            || conv.messages.len() < INNER_REDACTION_MIN_MESSAGES
+        {
+            return false;
+        }
+        let mut bytes = 0usize;
+        for message in &conv.messages {
+            bytes = bytes.saturating_add(message.content.len());
+            if bytes >= INNER_REDACTION_MIN_TEXT_BYTES {
+                return true;
+            }
+            for snippet in &message.snippets {
+                bytes = bytes.saturating_add(snippet.snippet_text.as_ref().map_or(0, String::len));
+                if bytes >= INNER_REDACTION_MIN_TEXT_BYTES {
+                    return true;
+                }
+            }
+        }
+        false
+    }
 
     /// Work-liveness heartbeat threaded through batched persistence
     /// (gh373/oeu5a). Mirrors the #282/#332/#366 pattern: real work ticks
@@ -32567,6 +32597,15 @@ pub mod persist {
         convs: &[NormalizedConversation],
         heartbeat: PersistHeartbeat<'_>,
     ) -> Vec<Conversation> {
+        if use_inner_message_redaction(convs) {
+            let mut redactor = super::redact_secrets::MemoizingRedactor::new();
+            return vec![map_to_internal_with_message_parallelism(
+                &convs[0],
+                Some(&mut redactor),
+                heartbeat,
+                true,
+            )];
+        }
         convs
             .par_iter()
             .map_init(
@@ -32588,8 +32627,78 @@ pub mod persist {
 
     pub(crate) fn map_to_internal_with_redactor_and_heartbeat(
         conv: &NormalizedConversation,
+        redactor: Option<&mut super::redact_secrets::MemoizingRedactor>,
+        heartbeat: PersistHeartbeat<'_>,
+    ) -> Conversation {
+        map_to_internal_with_message_parallelism(conv, redactor, heartbeat, false)
+    }
+
+    fn map_message_to_internal(
+        m: &NormalizedMessage,
+        mapped_message_index: usize,
+        should_redact: bool,
         mut redactor: Option<&mut super::redact_secrets::MemoizingRedactor>,
         heartbeat: PersistHeartbeat<'_>,
+    ) -> Message {
+        if mapped_message_index % MAP_HEARTBEAT_MESSAGE_STRIDE == 0 {
+            heartbeat.tick();
+        }
+        let content = if should_redact {
+            if let Some(r) = redactor.as_mut() {
+                r.redact_text(&m.content)
+            } else {
+                super::redact_secrets::redact_text(&m.content).into_owned()
+            }
+        } else {
+            m.content.clone()
+        };
+        let extra_json = if should_redact {
+            if let Some(r) = redactor.as_mut() {
+                r.redact_json(&m.extra)
+            } else {
+                super::redact_secrets::redact_json(&m.extra)
+            }
+        } else {
+            m.extra.clone()
+        };
+        Message {
+            id: None,
+            idx: m.idx,
+            role: map_role(&m.role),
+            author: m.author.clone(),
+            created_at: m.created_at,
+            content,
+            extra_json,
+            snippets: m
+                .snippets
+                .iter()
+                .map(|s| Snippet {
+                    id: None,
+                    file_path: s.file_path.clone(),
+                    start_line: s.start_line,
+                    end_line: s.end_line,
+                    language: s.language.clone(),
+                    snippet_text: s.snippet_text.as_ref().map(|snippet_text| {
+                        if should_redact {
+                            if let Some(r) = redactor.as_mut() {
+                                r.redact_text(snippet_text)
+                            } else {
+                                super::redact_secrets::redact_text(snippet_text).into_owned()
+                            }
+                        } else {
+                            snippet_text.clone()
+                        }
+                    }),
+                })
+                .collect(),
+        }
+    }
+
+    fn map_to_internal_with_message_parallelism(
+        conv: &NormalizedConversation,
+        mut redactor: Option<&mut super::redact_secrets::MemoizingRedactor>,
+        heartbeat: PersistHeartbeat<'_>,
+        parallel_messages: bool,
     ) -> Conversation {
         // Extract provenance from metadata (P2.2)
         let (source_id, origin_host) = extract_provenance(&conv.metadata);
@@ -32624,69 +32733,48 @@ pub mod persist {
             } else {
                 conv.metadata.clone()
             },
-            messages: conv
-                .messages
-                .iter()
-                .enumerate()
-                .map(|(mapped_message_index, m)| {
-                    // gh373/oeu5a: heartbeat during the long single-thread
-                    // redaction of one giant conversation, so the stall
-                    // watchdog sees live work between batch publications.
-                    if mapped_message_index % MAP_HEARTBEAT_MESSAGE_STRIDE == 0 {
-                        heartbeat.tick();
-                    }
-                    let content = if should_redact {
-                        if let Some(r) = redactor.as_mut() {
-                            r.redact_text(&m.content)
-                        } else {
-                            super::redact_secrets::redact_text(&m.content).into_owned()
-                        }
-                    } else {
-                        m.content.clone()
-                    };
-                    let extra_json = if should_redact {
-                        if let Some(r) = redactor.as_mut() {
-                            r.redact_json(&m.extra)
-                        } else {
-                            super::redact_secrets::redact_json(&m.extra)
-                        }
-                    } else {
-                        m.extra.clone()
-                    };
-                    Message {
-                        id: None,
-                        idx: m.idx,
-                        role: map_role(&m.role),
-                        author: m.author.clone(),
-                        created_at: m.created_at,
-                        content,
-                        extra_json,
-                        snippets: m
-                            .snippets
+            messages: if parallel_messages {
+                // At most one chunk/redactor per pool thread. Indexed chunks
+                // and ordered collection preserve the original message order.
+                let chunk_size = conv.messages.len().div_ceil(rayon::current_num_threads());
+                conv.messages
+                    .par_chunks(chunk_size)
+                    .enumerate()
+                    .map(|(chunk_index, chunk)| {
+                        let mut worker_redactor = super::redact_secrets::MemoizingRedactor::new();
+                        chunk
                             .iter()
-                            .map(|s| Snippet {
-                                id: None,
-                                file_path: s.file_path.clone(),
-                                start_line: s.start_line,
-                                end_line: s.end_line,
-                                language: s.language.clone(),
-                                snippet_text: s.snippet_text.as_ref().map(|snippet_text| {
-                                    if should_redact {
-                                        if let Some(r) = redactor.as_mut() {
-                                            r.redact_text(snippet_text)
-                                        } else {
-                                            super::redact_secrets::redact_text(snippet_text)
-                                                .into_owned()
-                                        }
-                                    } else {
-                                        snippet_text.clone()
-                                    }
-                                }),
+                            .enumerate()
+                            .map(|(index, message)| {
+                                map_message_to_internal(
+                                    message,
+                                    chunk_index * chunk_size + index,
+                                    should_redact,
+                                    Some(&mut worker_redactor),
+                                    heartbeat,
+                                )
                             })
-                            .collect(),
-                    }
-                })
-                .collect(),
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .flatten()
+                    .collect()
+            } else {
+                conv.messages
+                    .iter()
+                    .enumerate()
+                    .map(|(index, message)| {
+                        map_message_to_internal(
+                            message,
+                            index,
+                            should_redact,
+                            redactor.as_deref_mut(),
+                            heartbeat,
+                        )
+                    })
+                    .collect()
+            },
             source_id,
             origin_host,
         }
@@ -33351,6 +33439,121 @@ pub mod persist {
         /// so the stall watchdog sees live work during the minutes-long
         /// redaction window (previously zero ticks until the whole batch
         /// persisted — the proven exit(70) trigger).
+        #[test]
+        fn gh474_singleton_redaction_preserves_output_heartbeat_and_thresholds() {
+            const CHILD: &str = "CASS_TEST_GH474_CHILD";
+            if dotenvy::var(CHILD).is_err() {
+                for mode in ["full", "off"] {
+                    let output = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            "indexer::persist::persist_internal_tests::gh474_singleton_redaction_preserves_output_heartbeat_and_thresholds",
+                            "--nocapture",
+                        ])
+                        .env(CHILD, "1")
+                        .env("CASS_INDEX_REDACTION", mode)
+                        .output()
+                        .unwrap();
+                    assert!(
+                        output.status.success(),
+                        "{mode}: {} {}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+                }
+                return;
+            }
+            let enabled = super::super::redact_secrets::redaction_enabled();
+            let message_count = 769;
+            let secret = "password=abcdefgh12345678"; // Synthetic redaction fixture.
+            let conv = NormalizedConversation {
+                agent_slug: "codex".into(),
+                external_id: Some("gh474".into()),
+                title: Some(secret.into()),
+                workspace: Some(PathBuf::from("/workspace/gh474")),
+                source_path: PathBuf::from("/logs/gh474.jsonl"),
+                started_at: Some(1000),
+                ended_at: Some(2000),
+                metadata: serde_json::json!({"nested": [{"credential": secret}]}),
+                messages: (0..message_count).map(|index| NormalizedMessage {
+                    idx: (index * 2) as i64,
+                    role: ["user", "assistant", "tool", "system", "custom"][index % 5].into(),
+                    author: Some(format!("author-{index}")),
+                    created_at: Some(1000 + index as i64),
+                    content: format!("{index}: {} {secret}", "payload ".repeat(256)),
+                    extra: serde_json::json!({"nested": [{"credential": secret, "index": index}]}),
+                    snippets: vec![crate::connectors::NormalizedSnippet {
+                        file_path: Some(PathBuf::from(format!("file-{index}.rs"))),
+                        start_line: Some(1),
+                        end_line: Some(2),
+                        language: Some("rust".into()),
+                        snippet_text: Some(secret.into()),
+                    }],
+                    invocations: Vec::new(),
+                }).collect(),
+            };
+            let mut serial_redactor = super::super::redact_secrets::MemoizingRedactor::new();
+            let serial = map_to_internal_with_redactor(&conv, Some(&mut serial_redactor));
+            let serialized = serde_json::to_value(&serial).unwrap();
+            assert_eq!(serial.messages[0].content.contains(secret), !enabled);
+            for threads in [1, 4] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                pool.install(|| {
+                    assert_eq!(
+                        use_inner_message_redaction(std::slice::from_ref(&conv)),
+                        enabled && threads > 1
+                    );
+                    let progress = super::super::IndexingProgress::default();
+                    let bump = Arc::new(AtomicI64::new(0));
+                    let result = map_batch_to_internal(
+                        std::slice::from_ref(&conv),
+                        PersistHeartbeat::new(Some(&progress), Some(&bump)),
+                    );
+                    assert_eq!(serde_json::to_value(&result[0]).unwrap(), serialized);
+                    assert_eq!(progress.activity.load(Ordering::Relaxed), 4);
+                    assert!(bump.load(Ordering::Relaxed) > 0);
+                    let multi = vec![conv.clone(), conv.clone()];
+                    assert!(!use_inner_message_redaction(&multi));
+                    let mapped = map_batch_to_internal(&multi, PersistHeartbeat::NONE);
+                    assert_eq!(
+                        serde_json::to_value(&mapped).unwrap(),
+                        serde_json::json!([serialized, serialized])
+                    );
+
+                    let mut boundary = conv.clone();
+                    boundary.messages.truncate(INNER_REDACTION_MIN_MESSAGES);
+                    for message in &mut boundary.messages {
+                        message.content.clear();
+                        message.snippets.clear();
+                    }
+                    boundary.messages[0].content = "x".repeat(INNER_REDACTION_MIN_TEXT_BYTES - 1);
+                    assert!(!use_inner_message_redaction(std::slice::from_ref(
+                        &boundary
+                    )));
+                    boundary.messages[0].snippets = vec![crate::connectors::NormalizedSnippet {
+                        file_path: None,
+                        start_line: None,
+                        end_line: None,
+                        language: None,
+                        snippet_text: Some("x".into()),
+                    }];
+                    assert_eq!(
+                        use_inner_message_redaction(std::slice::from_ref(&boundary)),
+                        enabled && threads > 1
+                    );
+                    boundary.messages.pop();
+                    assert!(!use_inner_message_redaction(std::slice::from_ref(
+                        &boundary
+                    )));
+                    assert!(!use_inner_message_redaction(&[]));
+                });
+            }
+        }
+
         #[test]
         fn map_to_internal_heartbeat_ticks_per_message_stride() {
             use crate::connectors::NormalizedConversation;
@@ -39537,6 +39740,120 @@ mod tests {
             metadata: serde_json::json!({}),
             messages: msgs,
         }
+    }
+
+    #[test]
+    fn gh473_short_writer_wait_preserves_live_reader_ingest() {
+        const CHILD: &str = "CASS_TEST_GH473_CHILD";
+        if dotenvy::var(CHILD).is_err() {
+            for (value, expected) in [(None, "10"), (Some("0"), "10"), (Some("37"), "37")] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "indexer::tests::gh473_short_writer_wait_preserves_live_reader_ingest",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, expected)
+                    .env_remove("CASS_INDEX_WRITER_BUSY_TIMEOUT_MS");
+                if let Some(value) = value {
+                    command.env("CASS_INDEX_WRITER_BUSY_TIMEOUT_MS", value);
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "child failed: {} {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            }
+            return;
+        }
+        let expected = dotenvy::var(CHILD).unwrap().parse::<u64>().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("archive.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        persist::apply_index_writer_busy_timeout(&storage);
+        assert_eq!(storage.index_writer_busy_timeout_ms(), Some(expected));
+        let reader = FrankenStorage::open_readonly(&db_path).unwrap();
+        reader.raw().query("SELECT COUNT(*) FROM messages").unwrap();
+        let conv = norm_conv(Some("gh473"), vec![norm_msg(0, 100)]);
+        let completion = crate::storage::sqlite::SourceIngestLedgerEntry {
+            key: "source_ingest_v1:gh473".into(),
+            observation: "{\"complete\":true}".into(),
+        };
+        for pass in 0..3 {
+            let started = Instant::now();
+            persist::persist_conversations_batched_inner(
+                &storage,
+                None,
+                std::slice::from_ref(&conv),
+                LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                false,
+                false,
+                None,
+                persist::PersistHeartbeat::NONE,
+                Some(&completion),
+            )
+            .unwrap();
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "write/no-op pass {pass} must not incur a 60-second inner wait"
+            );
+            let rows = storage
+                .raw()
+                .query("SELECT COUNT(*) FROM messages")
+                .unwrap();
+            assert_eq!(rows[0].get_typed::<i64>(0).unwrap(), 1);
+            let rows = storage
+                .raw()
+                .query("SELECT COUNT(*) FROM conversations")
+                .unwrap();
+            assert_eq!(rows[0].get_typed::<i64>(0).unwrap(), 1);
+            assert_eq!(
+                storage
+                    .source_ingest_ledger_entries()
+                    .unwrap()
+                    .get(&completion.key),
+                Some(&completion.observation)
+            );
+        }
+        reader.close_without_checkpoint().unwrap();
+        storage
+            .raw()
+            .execute("CREATE TABLE gh473_retry(n INTEGER)")
+            .unwrap();
+        let writer = crate::franken_sync::Connection::open_existing_schema_only(
+            db_path.to_string_lossy().into_owned(),
+        )
+        .unwrap();
+        writer.execute("PRAGMA busy_timeout = 10").unwrap();
+        storage.raw().execute("BEGIN IMMEDIATE").unwrap();
+        let mut attempts = 0;
+        persist::with_concurrent_retry(2, || {
+            attempts += 1;
+            let result = writer
+                .execute("INSERT INTO gh473_retry VALUES(1)")
+                .map_err(anyhow::Error::new);
+            if attempts == 1 {
+                let err = result
+                    .as_ref()
+                    .expect_err("held writer lock must cause real contention");
+                assert!(anyhow_chain_indicates_retryable_storage_contention(err));
+                storage.raw().execute("ROLLBACK").unwrap();
+            }
+            result
+        })
+        .unwrap();
+        assert_eq!(
+            attempts, 2,
+            "whole-operation retry succeeds after lock release"
+        );
+        let rows = writer.query("SELECT COUNT(*) FROM gh473_retry").unwrap();
+        assert_eq!(rows[0].get_typed::<i64>(0).unwrap(), 1);
+        writer.close_without_checkpoint().unwrap();
+        storage.close().unwrap();
     }
 
     #[test]

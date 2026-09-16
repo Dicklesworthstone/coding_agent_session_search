@@ -96,7 +96,9 @@ impl Connection {
         path: impl Into<String>,
     ) -> Result<Self, FrankenError> {
         Ok(Self {
-            inner: drive(frankensqlite::Connection::open_schema_only_with_wal_index_recovery(path))?,
+            inner: drive(
+                frankensqlite::Connection::open_schema_only_with_wal_index_recovery(path),
+            )?,
         })
     }
 

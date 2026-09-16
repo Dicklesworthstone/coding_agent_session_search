@@ -879,13 +879,14 @@ pub(crate) fn open_franken_raw_readonly_connection_with_timeout(
     let mut wal_recovery_attempted = false;
     loop {
         let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
-        match FrankenConnection::open_schema_only_with_wal_index_recovery(&path_str)
-            .with_context(|| {
+        match FrankenConnection::open_schema_only_with_wal_index_recovery(&path_str).with_context(
+            || {
                 format!(
                     "opening raw frankensqlite db readonly at {}",
                     path.display()
                 )
-            }) {
+            },
+        ) {
             Ok(conn) => return Ok(conn),
             Err(err) if retryable_franken_anyhow(&err) => {
                 let now = Instant::now();
@@ -26423,7 +26424,9 @@ if sys.argv[2] == 'writer':
                             .stdin(Stdio::piped())
                             .stdout(Stdio::piped())
                             .spawn()
-                            .expect("Python sqlite3 is required for the GH477 foreign-writer fixture"),
+                            .expect(
+                                "Python sqlite3 is required for the GH477 foreign-writer fixture",
+                            ),
                     );
                     let stdout = fixture.0.stdout.take().unwrap();
                     let (sender, output) = std::sync::mpsc::channel();
@@ -26460,9 +26463,8 @@ if sys.argv[2] == 'writer':
                         err.downcast_ref::<crate::franken_sync::FrankenError>(),
                         Some(crate::franken_sync::FrankenError::BusyRecovery)
                     ));
-                    let strict = open_franken_async_strict_readonly_connection_with_timeout(
-                        &path, timeout,
-                    );
+                    let strict =
+                        open_franken_async_strict_readonly_connection_with_timeout(&path, timeout);
                     let err = strict.err().expect("strict owner must refuse stale SHM");
                     assert!(matches!(
                         err.downcast_ref::<crate::franken_sync::FrankenError>(),
@@ -26491,9 +26493,8 @@ if sys.argv[2] == 'writer':
                             assert!(storage.raw().execute("INSERT INTO t VALUES(99)").is_err());
                             storage.close_without_checkpoint()?;
                         } else {
-                            let mut conn = open_franken_raw_readonly_connection_with_timeout(
-                                &path, timeout,
-                            )?;
+                            let mut conn =
+                                open_franken_raw_readonly_connection_with_timeout(&path, timeout)?;
                             let rows = conn.query("SELECT sum(n) FROM t")?;
                             assert_eq!(rows[0].get_typed::<i64>(0)?, 30);
                             assert!(conn.execute("INSERT INTO t VALUES(99)").is_err());
