@@ -29859,8 +29859,7 @@ fn explicit_watch_once_scan_path(
     let scan_path = if let Some(root) = crate::connectors::omp::configured_session_root(path) {
         root
     } else if !path.to_string_lossy().contains(".omp") {
-        path
-            .ancestors()
+        path.ancestors()
             .find(|ancestor| ancestor.file_name().is_some_and(|name| name == "sessions"))
             .unwrap_or(path)
             .to_path_buf()
@@ -56223,7 +56222,10 @@ mod tests {
 
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::Claude);
-        assert_eq!(classified[0].1.path, std::fs::canonicalize(session).unwrap());
+        assert_eq!(
+            classified[0].1.path,
+            std::fs::canonicalize(session).unwrap()
+        );
     }
 
     #[test]
@@ -56244,7 +56246,10 @@ mod tests {
 
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::Codex);
-        assert_eq!(classified[0].1.path, std::fs::canonicalize(session).unwrap());
+        assert_eq!(
+            classified[0].1.path,
+            std::fs::canonicalize(session).unwrap()
+        );
     }
 
     #[test]
@@ -56266,7 +56271,10 @@ mod tests {
         let classified = classify_paths(vec![session.clone()], &roots, true);
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::PrimeAgent);
-        assert_eq!(classified[0].1.path, std::fs::canonicalize(session).unwrap());
+        assert_eq!(
+            classified[0].1.path,
+            std::fs::canonicalize(session).unwrap()
+        );
         for path in [
             ".prime-other/agent/sessions/x.jsonl",
             ".pi/agent/sessions/x.jsonl",
@@ -56295,7 +56303,10 @@ mod tests {
 
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::Codex);
-        assert_eq!(classified[0].1.path, std::fs::canonicalize(session).unwrap());
+        assert_eq!(
+            classified[0].1.path,
+            std::fs::canonicalize(session).unwrap()
+        );
         assert!(classified[0].2.is_some());
         assert!(classified[0].3.is_some());
     }

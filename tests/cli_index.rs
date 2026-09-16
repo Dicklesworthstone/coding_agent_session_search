@@ -1298,9 +1298,10 @@ fn gh478_watch_once_retains_codex_hint_when_symlink_target_has_no_provider_marke
     for source in [&regular, &real, &neighbor] {
         fs::File::open(source)
             .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(
-                std::time::UNIX_EPOCH + std::time::Duration::from_secs(100),
-            ))
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(100)),
+            )
             .unwrap();
     }
     let source_bytes = fs::read(&real).unwrap();
@@ -1392,15 +1393,19 @@ fn gh478_watch_once_retains_codex_hint_when_symlink_target_has_no_provider_marke
         let hits = payload["hits"].as_array().unwrap();
         assert!(!hits.is_empty(), "{label}: {payload}");
         assert!(
-            hits.iter().all(|hit| hit["content"].as_str().is_some_and(|content| {
-                content.contains("heliotropesymlinkneedle")
-                    && !content.contains("unrequestedneighborneedle")
-            })),
+            hits.iter()
+                .all(|hit| hit["content"].as_str().is_some_and(|content| {
+                    content.contains("heliotropesymlinkneedle")
+                        && !content.contains("unrequestedneighborneedle")
+                })),
             "{label}: {payload}"
         );
     }
     assert_eq!(fs::read(&real).unwrap(), source_bytes);
-    assert_eq!(fs::metadata(&real).unwrap().modified().unwrap(), source_mtime);
+    assert_eq!(
+        fs::metadata(&real).unwrap().modified().unwrap(),
+        source_mtime
+    );
 }
 
 #[test]
