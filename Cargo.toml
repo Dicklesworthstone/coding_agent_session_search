@@ -25,7 +25,7 @@ anyhow = "1.0.102"
 thiserror = "2.0.18"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "ansi", "json"] }
-asupersync = { version = "=0.4.11", features = ["test-internals", "tls-native-roots"] }
+asupersync = { version = "=0.5.0", features = ["test-internals", "tls-native-roots"] }
 clap = { version = "4.6.1", features = ["derive", "cargo", "env", "unicode", "wrap_help"] }
 clap_complete = "4.6.5"
 clap_mangen = "0.3.0"
@@ -77,11 +77,15 @@ notify = "8.2.0"
 # and prepared-read schema-retry transaction cleanup. 0.3.18 adds parameterized
 # rowid IN-list seeks (GH#415/cass#382), mutation-free read-only WAL readers,
 # reader-registration error propagation and I/O buffer lifetime fixes.
-# The async API and asupersync requirement remain unchanged.
-frankensqlite = { version = "=0.3.18", package = "fsqlite", features = ["fts5", "async-api"] }
+# 0.4.1 adds GH#462's reserved-page WAL freelist repair and consumes the
+# Asupersync 0.5 runtime. The 0.4.2 candidate adds explicit derived WAL-index
+# recovery for read-only opens (GH#477). Facade/core/pager use 0.4.2,
+# btree/vdbe use 0.4.1 for the APIs required by core, and the remaining
+# crates use 0.4.0; build.rs checks each package exactly.
+frankensqlite = { version = "=0.4.2", package = "fsqlite", features = ["fts5", "async-api"] }
 # The production storage-integrity probe calls FrankenSQLite's public VFS API
 # directly so it can inspect native writer locks without opening the pager.
-fsqlite-types = { version = "=0.3.18", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.4.0", package = "fsqlite-types" }
 rayon = "1.12.0"
 crossbeam-channel = "0.5.15"
 parking_lot = "0.12.5"
@@ -128,31 +132,11 @@ bytemuck = "1.25.0"
 # not run the all-MiniLM LayerNorm export, and its prebuilt AVX/AVX2 vendor
 # binaries crashed pre-AVX2 CPUs at static init (#256/#307). No ONNX means no
 # AVX-static-init hazard and no separate `-baseline` artifact is needed.
-# Registry pin (gh#453): 0.4.3 clocks retired-segment collection from each
-# receipt, so subsequent publication cannot indefinitely postpone reclamation.
-# Quill 0.2.3 uses Cx::is_cancelled from asupersync 0.4.10. It preserves
-# 0.4.2's opt-in multilingual space and the Windows Quill publication line;
-# registry 0.3.2 was a stale same-version twin and must never be resolved.
-#
-# HELD at 0.4.3 for the 0.8.0 release, with frankensearch 0.5.0 /
-# frankensearch-quill 0.2.4 already published (2026-09-08). Reasons, in order:
-#   1. The gh#453 engine GC fix this crate's doctor text promises
-#      (`cass index --gc`, receipt-clocked reclamation of merge-retired
-#      segments) shipped IN 0.4.3. Bumping buys none of it.
-#   2. Published 0.5.0 still declares `asupersync >= 0.4.4, < 0.5` while
-#      frankensearch-quill 0.2.4 calls `Cx::is_cancelled` — the defect
-#      frankensearch#44 describes. cass's exact `=0.4.11` pin masks it here,
-#      but the declaration is still wrong upstream.
-#   3. frankensearch#45 (live-document publication floor; discard a failed
-#      replacement ingest instead of committing a tombstone-only MANIFEST) is
-#      the ENGINE half of cass gh#457. It is on frankensearch `main`, not in
-#      0.5.0. cass carries its own consumer-side hollow-generation detection,
-#      so 0.4.3 is not less safe than 0.5.0 here — but 0.5.0 is not more safe
-#      either, and it would cost the frankensearch-rerank 0.3.0 semver-major
-#      plus a new engine-version stamp (quill 0.2.4) in every fresh MANIFEST.
-# Revisit when a frankensearch crate release contains both fixes.
-frankensearch = { version = "=0.4.3", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
-franken-agent-detection = { version = "=0.2.4", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes", "devin", "shelley", "grok-bot"] }
+# Coordinated release candidate: 0.6.1 targets the Asupersync 0.5 family and
+# the native scalar exponential repair. Upstream publication and CASS runtime
+# qualification must complete before this candidate can be released.
+frankensearch = { version = "=0.6.1", default-features = false, features = ["hash", "cass-compat", "quill", "ann", "native"] }
+franken-agent-detection = { version = "=0.3.0", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "goose", "hermes", "devin", "shelley", "grok-bot"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
 bloomfilter = "3.0.1"  # Probabilistic membership testing for P2 Opt 3.3: Workspace Cache
@@ -250,10 +234,10 @@ tokenizers = { version = "*", default-features = false, features = ["fancy-regex
 rusqlite = { version = "0.40.2", features = ["bundled", "modern_sqlite"] }
 # The manifest-policy build gate requires this explicit dev entry for compat
 # fixture assertions, even though production also uses the same pinned crate.
-fsqlite-types = { version = "=0.3.18", package = "fsqlite-types" }
+fsqlite-types = { version = "=0.4.0", package = "fsqlite-types" }
 
-# The fsqlite family resolves from the exact registry version for every direct
-# and transitive consumer. build.rs enforces a single 0.3.18 family source.
+# The fsqlite family resolves from exact reviewed registry versions for every
+# direct and transitive consumer. build.rs rejects duplicates and mixed sources.
 
 [[bin]]
 name = "cass"
@@ -312,9 +296,9 @@ inherits = "release"
 debug = "line-tables-only"
 strip = false
 
-# The dependency graph is pinned to the asupersync 0.4.x line (0.4.11). Keep
+# The dependency graph is pinned to the asupersync 0.5.x line (0.5.0). Keep
 # the frankensqlite, frankensearch, and franken-agent-detection registry pins
-# aligned so Cargo.lock does not reintroduce a parallel asupersync 0.3.x stack.
+# aligned so Cargo.lock does not reintroduce an older parallel runtime stack.
 #
 # If you need to build against a local checkout of asupersync (sibling
 # at ../asupersync) during runtime-level hacking, add the following
