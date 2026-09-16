@@ -45,6 +45,12 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- `view` and `expand` bound context ranges safely even at the largest accepted
+  context value, avoiding integer overflow near the beginning or end of a session.
+- Index idempotency replay rejects malformed or non-object cached results and
+  performs indexing instead of panicking or reporting a false cache hit.
+- Linux release recipes preserve the installer's glibc 2.28 compatibility floor
+  with pinned Zig builds and reject binaries requiring a newer glibc version.
 - Explicit watch-once paths retain their connector hint when symlink resolution
   leads to a directory without a provider marker (#478).
 - FTS shadow recreation applies the configured message limit even when no
