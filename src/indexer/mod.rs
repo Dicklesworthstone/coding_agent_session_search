@@ -29839,26 +29839,35 @@ fn explicit_watch_once_connector_hint(path: &Path) -> Option<ConnectorKind> {
     }
 }
 
-fn explicit_watch_once_scan_path(kind: ConnectorKind, path: &Path) -> PathBuf {
+fn explicit_watch_once_scan_path(
+    kind: ConnectorKind,
+    requested: &Path,
+    canonical: &Path,
+) -> PathBuf {
     if kind != ConnectorKind::Omp {
-        return path.to_path_buf();
+        return canonical.to_path_buf();
     }
-    if let Some(root) = crate::connectors::omp::configured_session_root(path) {
-        return root;
-    }
+    let path = if explicit_watch_once_connector_hint(requested) == Some(ConnectorKind::Omp) {
+        requested
+    } else {
+        canonical
+    };
 
     // FAD accepts a direct `.omp` transcript as an explicit root, but an XDG
     // transcript path has no `.omp` marker. Retain the nearest `sessions`
     // root so OMP's v18 resolver can recognize and scan it.
-    if !path.to_string_lossy().contains(".omp") {
-        return path
+    let scan_path = if let Some(root) = crate::connectors::omp::configured_session_root(path) {
+        root
+    } else if !path.to_string_lossy().contains(".omp") {
+        path
             .ancestors()
             .find(|ancestor| ancestor.file_name().is_some_and(|name| name == "sessions"))
             .unwrap_or(path)
-            .to_path_buf();
-    }
-
-    path.to_path_buf()
+            .to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
+    std::fs::canonicalize(&scan_path).unwrap_or(scan_path)
 }
 
 fn classify_paths(
@@ -29868,12 +29877,40 @@ fn classify_paths(
 ) -> Vec<(ConnectorKind, ScanRoot, Option<i64>, Option<i64>)> {
     // Key -> (Root, MinTS, MaxTS)
     let mut batch_map: BatchClassificationMap = HashMap::new();
+    // Keep provenance on the original roots while comparing both sides in
+    // the same path namespace, including macOS /var aliases and linked roots.
+    let match_root_paths: Vec<PathBuf> = roots
+        .iter()
+        .map(|(_, root)| {
+            if prefer_explicit_paths {
+                std::fs::canonicalize(&root.path).unwrap_or_else(|_| root.path.clone())
+            } else {
+                root.path.clone()
+            }
+        })
+        .collect();
 
-    for p in paths {
+    for requested in paths {
         let hinted_kind = prefer_explicit_paths
-            .then(|| explicit_watch_once_connector_hint(&p))
+            .then(|| explicit_watch_once_connector_hint(&requested))
             .flatten();
-        if let Ok(meta) = std::fs::metadata(&p)
+        let canonical = prefer_explicit_paths.then(|| {
+            std::fs::canonicalize(&requested).unwrap_or_else(|error| {
+                tracing::warn!(
+                    path = %requested.display(),
+                    %error,
+                    "watch-once path could not be canonicalized; it may not match a connector scan root (issue #377)"
+                );
+                requested.clone()
+            })
+        });
+        let p = canonical.as_ref().unwrap_or(&requested);
+        let hinted_kind = hinted_kind.or_else(|| {
+            prefer_explicit_paths
+                .then(|| explicit_watch_once_connector_hint(p))
+                .flatten()
+        });
+        if let Ok(meta) = std::fs::metadata(p)
             && let Ok(time) = meta.modified()
             && let Ok(dur) = time.duration_since(std::time::UNIX_EPOCH)
         {
@@ -29884,40 +29921,41 @@ fn classify_paths(
             // root derives different root-relative external IDs for the same
             // transcript, so retain only the deepest root per connector and
             // source provenance. Distinct sources remain distinct scans.
-            let mut matching_roots: Vec<(ConnectorKind, &ScanRoot)> = Vec::new();
-            for (kind, root) in roots {
+            let mut matching_roots: Vec<(ConnectorKind, &ScanRoot, &PathBuf)> = Vec::new();
+            for ((kind, root), match_root_path) in roots.iter().zip(&match_root_paths) {
                 if let Some(hinted_kind) = hinted_kind
                     && *kind != hinted_kind
                 {
                     continue;
                 }
-                if p.starts_with(&root.path)
+                if p.starts_with(match_root_path)
                     || (is_database_watch_root(*kind, root)
-                        && database_sidecar_paths(&root.path).contains(&p))
+                        && database_sidecar_paths(match_root_path).contains(p))
                 {
                     if let Some(index) =
                         matching_roots
                             .iter()
-                            .position(|(selected_kind, selected_root)| {
+                            .position(|(selected_kind, selected_root, _)| {
                                 *selected_kind == *kind && selected_root.origin == root.origin
                             })
                     {
-                        if root.path.components().count()
-                            > matching_roots[index].1.path.components().count()
+                        if match_root_path.components().count()
+                            > matching_roots[index].2.components().count()
                         {
                             matching_roots[index].1 = root;
+                            matching_roots[index].2 = match_root_path;
                         }
                     } else {
-                        matching_roots.push((*kind, root));
+                        matching_roots.push((*kind, root, match_root_path));
                     }
                 }
             }
             let matched_root = !matching_roots.is_empty();
-            for (kind, root) in matching_roots {
+            for (kind, root, match_root_path) in matching_roots {
                 let scan_path = if prefer_explicit_paths && !is_database_watch_root(kind, root) {
-                    explicit_watch_once_scan_path(kind, &p)
+                    explicit_watch_once_scan_path(kind, &requested, p)
                 } else {
-                    root.path.clone()
+                    match_root_path.clone()
                 };
                 let mut scan_root = root.clone();
                 scan_root.path = scan_path.clone();
@@ -29948,7 +29986,7 @@ fn classify_paths(
                 && !matched_root
                 && let Some(hinted_kind) = hinted_kind
             {
-                let scan_path = explicit_watch_once_scan_path(hinted_kind, &p);
+                let scan_path = explicit_watch_once_scan_path(hinted_kind, &requested, p);
                 let scan_root = ScanRoot::local(scan_path.clone());
                 let entry = batch_map
                     .entry((
@@ -55989,7 +56027,12 @@ mod tests {
                     let classified = classify_paths(vec![event.clone()], &roots, explicit);
                     assert_eq!(classified.len(), 1, "{name}: {}", event.display());
                     assert_eq!(classified[0].0, ConnectorKind::Shelley);
-                    assert_eq!(classified[0].1.path, db);
+                    let expected = if explicit {
+                        fs::canonicalize(&db).unwrap()
+                    } else {
+                        db.clone()
+                    };
+                    assert_eq!(classified[0].1.path, expected);
                     assert_eq!(classified[0].1.origin, root.origin);
                 }
             }
@@ -56016,7 +56059,12 @@ mod tests {
                 let classified = classify_paths(vec![sidecar.clone()], &roots, explicit);
                 assert_eq!(classified.len(), 1);
                 assert_eq!(classified[0].0, ConnectorKind::Devin);
-                assert_eq!(classified[0].1.path, db);
+                let expected = if explicit {
+                    fs::canonicalize(&db).unwrap()
+                } else {
+                    db.clone()
+                };
+                assert_eq!(classified[0].1.path, expected);
                 assert_eq!(classified[0].1.origin, root.origin);
                 assert_eq!(classified[0].1.platform, root.platform);
             }
@@ -56175,7 +56223,7 @@ mod tests {
 
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::Claude);
-        assert_eq!(classified[0].1.path, session);
+        assert_eq!(classified[0].1.path, std::fs::canonicalize(session).unwrap());
     }
 
     #[test]
@@ -56196,7 +56244,7 @@ mod tests {
 
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::Codex);
-        assert_eq!(classified[0].1.path, session);
+        assert_eq!(classified[0].1.path, std::fs::canonicalize(session).unwrap());
     }
 
     #[test]
@@ -56218,7 +56266,7 @@ mod tests {
         let classified = classify_paths(vec![session.clone()], &roots, true);
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::PrimeAgent);
-        assert_eq!(classified[0].1.path, session);
+        assert_eq!(classified[0].1.path, std::fs::canonicalize(session).unwrap());
         for path in [
             ".prime-other/agent/sessions/x.jsonl",
             ".pi/agent/sessions/x.jsonl",
@@ -56247,9 +56295,104 @@ mod tests {
 
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::Codex);
-        assert_eq!(classified[0].1.path, session);
+        assert_eq!(classified[0].1.path, std::fs::canonicalize(session).unwrap());
         assert!(classified[0].2.is_some());
         assert!(classified[0].3.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_paths_keeps_codex_hint_across_symlinks_and_deduplicates_aliases() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("archive/2026/01/rollout.jsonl");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, b"{}\n").unwrap();
+        let linked_dir = tmp.path().join(".codex/sessions/2026/01");
+        std::fs::create_dir_all(linked_dir.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(real.parent().unwrap(), &linked_dir).unwrap();
+        let linked = linked_dir.join("rollout.jsonl");
+        let canonical = std::fs::canonicalize(&real).unwrap();
+        let classified = classify_paths(vec![linked.clone(), linked, canonical.clone()], &[], true);
+
+        assert_eq!(classified.len(), 1);
+        assert_eq!(classified[0].0, ConnectorKind::Codex);
+        assert_eq!(classified[0].1.path, canonical);
+        assert!(classified[0].2.is_some());
+        assert!(classified[0].3.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_paths_recovers_canonical_hint_and_matches_canonical_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join(".codex/sessions/rollout.jsonl");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, b"{}\n").unwrap();
+        let link = tmp.path().join("unmarked-alias.jsonl");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let canonical = std::fs::canonicalize(&real).unwrap();
+        let root = ScanRoot::local(canonical.parent().unwrap().to_path_buf());
+
+        for roots in [Vec::new(), vec![(ConnectorKind::Codex, root)]] {
+            let classified = classify_paths(vec![link.clone()], &roots, true);
+            assert_eq!(classified.len(), 1);
+            assert_eq!(classified[0].0, ConnectorKind::Codex);
+            assert_eq!(classified[0].1.path, canonical);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_paths_preserves_remote_provenance_through_a_symlinked_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_root = tmp.path().join("archive");
+        std::fs::create_dir_all(&real_root).unwrap();
+        let session = real_root.join("session.jsonl");
+        std::fs::write(&session, b"{}\n").unwrap();
+        let linked_root = tmp.path().join("mirror-alias");
+        std::os::unix::fs::symlink(&real_root, &linked_root).unwrap();
+        let roots = vec![
+            (
+                ConnectorKind::Claude,
+                ScanRoot::remote(linked_root.clone(), Origin::remote("source-a"), None),
+            ),
+            (
+                ConnectorKind::Claude,
+                ScanRoot::remote(linked_root.clone(), Origin::remote("source-b"), None),
+            ),
+        ];
+        let classified = classify_paths(vec![linked_root.join("session.jsonl")], &roots, true);
+        let canonical = std::fs::canonicalize(&session).unwrap();
+        assert_eq!(classified.len(), 2);
+        for (kind, root, _, _) in &classified {
+            assert_eq!(*kind, ConnectorKind::Claude);
+            assert_eq!(root.path, canonical);
+        }
+        let source_ids = classified
+            .iter()
+            .map(|(_, root, _, _)| root.origin.source_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(source_ids, ["source-a", "source-b"].into_iter().collect());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_watch_once_omp_scan_root_survives_symlink_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_root = tmp.path().join("archive");
+        std::fs::create_dir_all(real_root.join("workspace")).unwrap();
+        let real = real_root.join("workspace/session.jsonl");
+        std::fs::write(&real, b"{}\n").unwrap();
+        let linked_root = tmp.path().join("share/omp/sessions");
+        std::fs::create_dir_all(linked_root.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real_root, &linked_root).unwrap();
+        let requested = linked_root.join("workspace/session.jsonl");
+        let canonical = std::fs::canonicalize(&real).unwrap();
+
+        assert_eq!(
+            explicit_watch_once_scan_path(ConnectorKind::Omp, &requested, &canonical),
+            std::fs::canonicalize(real_root).unwrap()
+        );
     }
 
     #[test]
@@ -56267,7 +56410,10 @@ mod tests {
 
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::Omp);
-        assert_eq!(classified[0].1.path, sessions_root);
+        assert_eq!(
+            classified[0].1.path,
+            std::fs::canonicalize(sessions_root).unwrap()
+        );
         assert!(classified[0].2.is_some());
         assert!(classified[0].3.is_some());
     }
@@ -56291,7 +56437,10 @@ mod tests {
 
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::Omp);
-        assert_eq!(classified[0].1.path, sessions_root);
+        assert_eq!(
+            classified[0].1.path,
+            std::fs::canonicalize(sessions_root).unwrap()
+        );
         assert!(classified[0].2.is_some());
         assert!(classified[0].3.is_some());
     }

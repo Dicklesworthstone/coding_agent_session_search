@@ -14199,9 +14199,9 @@ impl FrankenStorage {
         self.fts_shadow_run.drop_pending.load(Ordering::SeqCst)
     }
 
-    /// When the shadow was dropped for size, refuse to recreate it while the
-    /// corpus still exceeds the bound (`Some(detail)`); clear the marker and
-    /// allow the rebuild once it fits again.
+    /// Refuse shadow recreation whenever the corpus exceeds the current bound
+    /// (`Some(detail)`), regardless of any historical retirement marker. Clear
+    /// an obsolete marker and allow the rebuild once the corpus fits again.
     fn fts_shadow_recreate_refused(&self) -> Result<Option<String>> {
         self.fts_shadow_recreate_refused_with_bound(fts_shadow_max_messages())
     }
@@ -14210,9 +14210,7 @@ impl FrankenStorage {
         &self,
         bound_messages: Option<u64>,
     ) -> Result<Option<String>> {
-        if self.fts_shadow_not_viable_marker()?.is_none() {
-            return Ok(None);
-        }
+        let marker_present = self.fts_shadow_not_viable_marker()?.is_some();
         let corpus_messages = self.fts_shadow_corpus_messages()?;
         if let Some(bound_messages) = bound_messages
             && corpus_messages > bound_messages
@@ -14222,7 +14220,9 @@ impl FrankenStorage {
                 bound_messages,
             )));
         }
-        self.clear_fts_shadow_not_viable_marker()?;
+        if marker_present {
+            self.clear_fts_shadow_not_viable_marker()?;
+        }
         Ok(None)
     }
 
@@ -14993,9 +14993,9 @@ impl FrankenStorage {
                 })
             }
             FtsShadowParityStatus::Absent => {
-                // GH #413 follow-up (iify0): a shadow dropped for size stays
-                // dropped while the corpus is over the bound; the index run
-                // maps this error to a nonfatal outcome.
+                // GH #476: enforce the current corpus bound even when this
+                // archive has no historical size-retirement marker. The index
+                // run maps this error to a nonfatal outcome.
                 if let Some(detail) = self.fts_shadow_recreate_refused()? {
                     anyhow::bail!("{detail}");
                 }
@@ -23695,6 +23695,126 @@ mod tests {
                 corpus_messages: corpus
             }
         );
+    }
+
+    #[test]
+    fn fts_shadow_recreation_enforces_bound_with_and_without_retirement_marker() {
+        const CHILD_ENV: &str = "CASS_TEST_FTS_RECREATION_BOUND_CHILD";
+        if !matches!(dotenvy::var(CHILD_ENV).as_deref(), Ok("1")) {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current library test executable"),
+            )
+            .args([
+                "--exact",
+                "storage::sqlite::tests::fts_shadow_recreation_enforces_bound_with_and_without_retirement_marker",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env("CASS_FTS_SHADOW_MAX_MESSAGES", "2")
+            .output()
+            .expect("run isolated FTS bound regression");
+            assert!(
+                output.status.success(),
+                "FTS bound child failed: {}\nstdout: {}\nstderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "the child must execute the regression, not silently filter it out"
+            );
+            return;
+        }
+        assert_eq!(fts_shadow_max_messages(), Some(2));
+
+        for marker_present in [false, true] {
+            for corpus_messages in [1_u64, 2, 3] {
+                let dir = TempDir::new().unwrap();
+                let storage = FrankenStorage::open(&dir.path().join("fts-bound-matrix.db"))
+                    .expect("open boundary fixture");
+                seed_atomic_fts_rebuild_fixture(&storage);
+                let conversation_id: i64 = storage
+                    .raw()
+                    .query_row_map("SELECT id FROM conversations LIMIT 1", fparams![], |row| {
+                        row.get_typed(0)
+                    })
+                    .unwrap();
+                for idx in 1..corpus_messages {
+                    storage
+                        .raw()
+                        .execute_compat(
+                            "INSERT INTO messages(conversation_id, idx, role, content) VALUES(?1, ?2, 'user', 'marigold boundary message')",
+                            fparams![conversation_id, i64::try_from(idx).unwrap()],
+                        )
+                        .unwrap();
+                }
+                let canonical_rows = || {
+                    [
+                        "SELECT * FROM conversations ORDER BY id",
+                        "SELECT * FROM messages ORDER BY id",
+                    ]
+                    .map(|sql| {
+                        storage
+                            .raw()
+                            .query(sql)
+                            .unwrap()
+                            .iter()
+                            .map(|row| row.values().to_vec())
+                            .collect::<Vec<_>>()
+                    })
+                };
+                let before = canonical_rows();
+                let historical_marker = "historical FTS size retirement";
+                storage
+                    .drop_fts_shadow_as_not_viable(historical_marker)
+                    .unwrap();
+                if !marker_present {
+                    storage.clear_fts_shadow_not_viable_marker().unwrap();
+                    storage.record_fallback_fts_repair_pending(None).unwrap();
+                }
+                assert_eq!(
+                    storage.fts_shadow_corpus_messages().unwrap(),
+                    corpus_messages
+                );
+                assert_eq!(
+                    storage.inspect_search_fallback_fts_parity().unwrap().status,
+                    FtsShadowParityStatus::Absent
+                );
+
+                let repair = storage.ensure_search_fallback_fts_consistency();
+                if corpus_messages > 2 {
+                    let error = repair.expect_err("over-bound recreation must be refused");
+                    assert!(error_message_indicates_fts_shadow_not_viable(&format!(
+                        "{error:#}"
+                    )));
+                    assert_eq!(
+                        storage.inspect_search_fallback_fts_parity().unwrap().status,
+                        FtsShadowParityStatus::Absent
+                    );
+                    assert_eq!(
+                        storage.fts_shadow_not_viable_marker().unwrap().as_deref(),
+                        marker_present.then_some(historical_marker)
+                    );
+                } else {
+                    assert!(matches!(
+                        repair.expect("within-bound recreation must succeed"),
+                        FtsConsistencyRepair::Rebuilt { inserted_rows }
+                            if inserted_rows == usize::try_from(corpus_messages).unwrap()
+                    ));
+                    assert_eq!(
+                        storage.inspect_search_fallback_fts_parity().unwrap().status,
+                        FtsShadowParityStatus::Healthy
+                    );
+                    assert!(storage.fts_shadow_not_viable_marker().unwrap().is_none());
+                }
+                assert_eq!(
+                    canonical_rows(),
+                    before,
+                    "canonical rows changed: marker={marker_present}, corpus={corpus_messages}"
+                );
+            }
+        }
     }
 
     #[test]

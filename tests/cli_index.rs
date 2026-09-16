@@ -1271,6 +1271,138 @@ fn watch_once_indexes_real_aider_session_with_deferred_tantivy_open() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn gh478_watch_once_retains_codex_hint_when_symlink_target_has_no_provider_marker() {
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+    use frankensqlite::compat::RowExt;
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    fs::write(home.join(".env"), "").unwrap();
+    let filename = "rollout-2026-01-01T00-00-00-22222222-2222-4222-8222-222222222222.jsonl";
+    let regular = make_codex_session(
+        &home.join("regular/.codex"),
+        "2026/01",
+        filename,
+        "heliotropesymlinkneedle",
+    );
+    let external = home.join("external-store");
+    let real = make_codex_session(&external, "2026/01", filename, "heliotropesymlinkneedle");
+    let neighbor = make_codex_session(
+        &external,
+        "2026/01",
+        "rollout-neighbor.jsonl",
+        "unrequestedneighborneedle",
+    );
+    for source in [&regular, &real, &neighbor] {
+        fs::File::open(source)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(100),
+            ))
+            .unwrap();
+    }
+    let source_bytes = fs::read(&real).unwrap();
+    let source_mtime = fs::metadata(&real).unwrap().modified().unwrap();
+    let linked_dir = home.join("linked/.codex/sessions/2026/01");
+    fs::create_dir_all(linked_dir.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(real.parent().unwrap(), &linked_dir).unwrap();
+    let linked = linked_dir.join(filename);
+    let canonical_real = fs::canonicalize(&real).unwrap();
+    let isolated_cmd = || {
+        let mut cmd = base_cmd(home);
+        cmd.env_clear();
+        if let Some(value) = std::env::var_os("PATH") {
+            cmd.env("PATH", value);
+        }
+        cmd.current_dir(home)
+            .env("HOME", home)
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("CODEX_HOME", home.join(".codex"))
+            .env("CASS_AUTO_REFRESH", "0")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("RUST_MIN_STACK", "134217728");
+        cmd
+    };
+
+    for (label, paths, expected_source) in [
+        (
+            "regular",
+            vec![regular.clone()],
+            fs::canonicalize(&regular).unwrap(),
+        ),
+        ("linked", vec![linked.clone()], canonical_real.clone()),
+        (
+            "aliases",
+            vec![linked, canonical_real.clone()],
+            canonical_real,
+        ),
+    ] {
+        let data_dir = home.join(format!("data-{label}"));
+        let output = isolated_cmd()
+            .args(["index", "--watch-once"])
+            .args(&paths)
+            .args(["--json", "--no-progress-events", "--data-dir"])
+            .arg(&data_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(payload["success"], true, "{label}: {payload}");
+
+        let storage = FrankenStorage::open_readonly(&data_dir.join("agent_search.db")).unwrap();
+        assert_eq!(storage.total_conversation_count().unwrap(), 1, "{label}");
+        assert_eq!(storage.total_message_count().unwrap(), 2, "{label}");
+        let rows = storage
+            .raw()
+            .query("SELECT source_path FROM conversations")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get_typed::<String>(0).unwrap(),
+            expected_source.to_string_lossy()
+        );
+        storage.close_without_checkpoint().unwrap();
+
+        let output = isolated_cmd()
+            .args([
+                "search",
+                "heliotropesymlinkneedle",
+                "--json",
+                "--mode",
+                "lexical",
+                "--data-dir",
+            ])
+            .arg(&data_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let hits = payload["hits"].as_array().unwrap();
+        assert!(!hits.is_empty(), "{label}: {payload}");
+        assert!(
+            hits.iter().all(|hit| hit["content"].as_str().is_some_and(|content| {
+                content.contains("heliotropesymlinkneedle")
+                    && !content.contains("unrequestedneighborneedle")
+            })),
+            "{label}: {payload}"
+        );
+    }
+    assert_eq!(fs::read(&real).unwrap(), source_bytes);
+    assert_eq!(fs::metadata(&real).unwrap().modified().unwrap(), source_mtime);
+}
+
 #[test]
 #[serial]
 fn index_json_reports_full_refresh_lexical_strategy() {

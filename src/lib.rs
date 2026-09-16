@@ -151,35 +151,19 @@ fn read_watch_once_paths_env() -> Option<Vec<std::path::PathBuf>> {
     None
 }
 
-/// #377: watch-once trigger classification (`classify_paths`) matches paths
-/// lexically against connector scan roots, so a relative or symlinked supplied
-/// path silently produces zero triggers and the run is skipped. Absolutize
-/// against the current directory and resolve symlinks at resolve time; a path
-/// that cannot be canonicalized (e.g. already deleted) keeps its absolutized
-/// form and is warned about loudly instead of vanishing without a trace.
-fn canonicalize_watch_once_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+/// Absolutize explicit paths without erasing provider hints in symlink names.
+/// Classification resolves symlinks after retaining the original hint (#478),
+/// then uses canonical paths for scan-root matching and I/O (#377).
+fn absolutize_watch_once_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     paths
         .into_iter()
         .map(|path| {
-            let absolute = if path.is_absolute() {
+            if path.is_absolute() {
                 path
             } else {
                 match std::env::current_dir() {
                     Ok(cwd) => cwd.join(&path),
                     Err(_) => path,
-                }
-            };
-            match std::fs::canonicalize(&absolute) {
-                Ok(canonical) => canonical,
-                Err(err) => {
-                    tracing::warn!(
-                        path = %absolute.display(),
-                        error = %err,
-                        "watch-once path could not be canonicalized; it may not \
-                         match any connector scan root and its run may be \
-                         skipped (issue #377)"
-                    );
-                    absolute
                 }
             }
         })
@@ -193,13 +177,13 @@ fn resolve_watch_once_paths_from_sources(
 ) -> Option<Vec<PathBuf>> {
     let explicit = watch_once.filter(|paths| !paths.is_empty());
     if let Some(paths) = explicit {
-        return Some(canonicalize_watch_once_paths(paths));
+        return Some(absolutize_watch_once_paths(paths));
     }
 
     if watch {
         return env_watch_once_paths
             .filter(|paths| !paths.is_empty())
-            .map(canonicalize_watch_once_paths);
+            .map(absolutize_watch_once_paths);
     }
 
     None
@@ -23473,21 +23457,21 @@ mod watch_once_resolution_tests {
         assert!(resolved[0].ends_with("some/relative/session.jsonl"));
     }
 
-    /// #377: symlinked supplied paths must resolve to their canonical target
-    /// so they match the connector scan roots discovered from real paths.
+    /// #478: keep the original spelling until classification can retain its
+    /// connector hint before resolving the canonical I/O target.
     #[cfg(unix)]
     #[test]
-    fn symlinked_watch_once_paths_resolve_to_canonical_target() {
+    fn symlinked_watch_once_paths_retain_original_connector_spelling() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let real = dir.path().join("real-session.jsonl");
         std::fs::write(&real, "{}\n").expect("write real file");
-        let link = dir.path().join("link-session.jsonl");
+        let link = dir.path().join(".codex/sessions/link-session.jsonl");
+        std::fs::create_dir_all(link.parent().expect("link parent")).expect("create parent");
         std::os::unix::fs::symlink(&real, &link).expect("create symlink");
 
-        let resolved = resolve_watch_once_paths_from_sources(false, Some(vec![link]), None)
+        let resolved = resolve_watch_once_paths_from_sources(false, Some(vec![link.clone()]), None)
             .expect("explicit paths resolve");
-        let canonical_real = std::fs::canonicalize(&real).expect("canonicalize real path");
-        assert_eq!(resolved, vec![canonical_real]);
+        assert_eq!(resolved, vec![link]);
     }
 }
 
