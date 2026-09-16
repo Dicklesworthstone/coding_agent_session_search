@@ -595,6 +595,11 @@ fn read_git_links(root: &Path, project_prefix: Option<&str>, revision: &str) -> 
 /// Extract `<project>-<id>` bead references from a commit subject. References are
 /// expected in `(…)`, but a bare reference is accepted too. Pure.
 fn parse_bead_refs(subject: &str, project_prefix: &str) -> Vec<String> {
+    // `source_repo` comes from repository JSONL, not the identifier tokenizer.
+    // Unsupported prefixes must fail open before byte-based identifier slicing.
+    if project_prefix.is_empty() || !project_prefix.chars().all(is_id_char) {
+        return Vec::new();
+    }
     let mut refs = Vec::new();
     let mut rest = subject;
     while let Some(pos) = rest.find(project_prefix) {
@@ -931,6 +936,21 @@ mod tests {
         // Prefix with no id suffix should not produce a ref.
         let refs = parse_bead_refs("just the coding- prefix alone", "coding-");
         assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn parse_bead_refs_rejects_invalid_repository_prefixes_without_panicking() {
+        for prefix in ["", "équipe-", "项目-", "🦀-", "my repo-", "/repo-"] {
+            let subject = format!("fix: ({prefix}abc123) and {prefix}def456");
+            assert!(
+                parse_bead_refs(&subject, prefix).is_empty(),
+                "unsupported repository prefix {prefix:?} must supply no trust link"
+            );
+        }
+        assert_eq!(
+            parse_bead_refs("修复: (repo-abc123) — café repo-def456", "repo-"),
+            ["repo-abc123", "repo-def456"]
+        );
     }
 
     #[test]
