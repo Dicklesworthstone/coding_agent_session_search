@@ -106,6 +106,170 @@ fn index_creates_db_and_index() {
     assert!(index_path.exists(), "index dir created");
 }
 
+#[test]
+fn cdzcl_index_idempotency_rejects_invalid_cached_payloads() {
+    use coding_agent_search::franken_sync::compat::ConnectionExt;
+    use coding_agent_search::storage::sqlite::FrankenStorage;
+    use frankensqlite::compat::RowExt;
+    use serde_json::{Value, json};
+    use std::io::Write;
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+    fs::write(home.join(".env"), "").unwrap();
+    let data_dir = home.join("data");
+    let db_path = data_dir.join("agent_search.db");
+    let project = home.join(".claude/projects/-cache-shape");
+    fs::create_dir_all(&project).unwrap();
+    let session = project.join("cache-shape.jsonl");
+    let append_message = |ordinal: usize| {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&session)
+            .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "type": "user", "sessionId": "cache-shape",
+                "uuid": format!("cache-shape-{ordinal}"),
+                "timestamp": "2025-11-12T18:31:18.697Z",
+                "cwd": home.to_string_lossy(),
+                "message": {"role": "user", "content": format!("cache shape evidence {ordinal}")}
+            })
+        )
+        .unwrap();
+    };
+    let command = |robot: bool, full: bool| {
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        cmd.env_clear();
+        for key in ["PATH", "SystemRoot", "WINDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+        cmd.current_dir(home)
+            .env("HOME", home)
+            .env("USERPROFILE", home)
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("CODEX_HOME", home.join(".codex"))
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("RUST_MIN_STACK", "134217728")
+            .args(["--db"])
+            .arg(&db_path)
+            .args([
+                "index",
+                "--no-progress-events",
+                "--idempotency-key",
+                "cache-shape",
+            ])
+            .arg("--data-dir")
+            .arg(&data_dir);
+        if robot {
+            cmd.arg("--json");
+        }
+        if full {
+            cmd.arg("--full");
+        }
+        cmd
+    };
+    let read_cache = || {
+        let storage = FrankenStorage::open_readonly(&db_path).unwrap();
+        let rows = storage
+            .raw()
+            .query(
+                "SELECT params_hash, result_json FROM idempotency_keys WHERE key = 'cache-shape'",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let result = (
+            rows[0].get_typed::<String>(0).unwrap(),
+            rows[0].get_typed::<String>(1).unwrap(),
+        );
+        storage.close_without_checkpoint().unwrap();
+        result
+    };
+
+    append_message(0);
+    let seed = command(true, true).output().unwrap();
+    assert!(
+        seed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+    let seed_payload: Value = serde_json::from_slice(&seed.stdout).unwrap();
+    assert_eq!(seed_payload["success"], true);
+    assert_eq!(seed_payload["messages"], 1);
+    assert_eq!(seed_payload["cached"], false);
+    let (params_hash, seed_json) = read_cache();
+    assert_eq!(
+        serde_json::from_str::<Value>(&seed_json).unwrap(),
+        seed_payload
+    );
+
+    let replay = command(true, true).output().unwrap();
+    assert!(replay.status.success());
+    let mut expected = seed_payload.clone();
+    expected["cached"] = json!(true);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&replay.stdout).unwrap(),
+        expected
+    );
+    let human_replay = command(false, true).output().unwrap();
+    assert!(human_replay.status.success());
+    assert!(String::from_utf8_lossy(&human_replay.stderr).contains("Using cached result"));
+    let mismatch = command(true, false).output().unwrap();
+    assert_eq!(mismatch.status.code(), Some(5));
+    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("different parameters"));
+    assert_eq!(read_cache(), (params_hash.clone(), seed_json));
+
+    // Four representative shapes in both output modes; the pure unit test
+    // covers the complete shape table. Only nine tiny full indexes run here.
+    for (case, invalid) in ["{", "7", "[]", "null"].into_iter().enumerate() {
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let updated = storage
+            .raw()
+            .execute_compat(
+                "UPDATE idempotency_keys SET result_json = ?1 WHERE key = ?2",
+                coding_agent_search::franken_sync::params![invalid, "cache-shape"],
+            )
+            .unwrap();
+        assert_eq!(updated, 1);
+        storage.close_without_checkpoint().unwrap();
+        append_message(case + 1);
+
+        for robot in [false, true] {
+            let output = command(robot, true).output().unwrap();
+            assert!(
+                output.status.success(),
+                "invalid={invalid} robot={robot}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("Using cached result"));
+            if robot {
+                let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(payload["success"], true);
+                assert_eq!(payload["cached"], false);
+                assert_eq!(payload["messages"], case + 2);
+                assert_eq!(payload["idempotency_key"], "cache-shape");
+            }
+            let storage = FrankenStorage::open_readonly(&db_path).unwrap();
+            assert_eq!(storage.total_conversation_count().unwrap(), 1);
+            assert_eq!(storage.total_message_count().unwrap(), case + 2);
+            storage.close_without_checkpoint().unwrap();
+        }
+        let (stored_hash, repaired) = read_cache();
+        assert_eq!(stored_hash, params_hash);
+        let repaired: Value = serde_json::from_str(&repaired).unwrap();
+        assert_eq!(repaired["success"], true);
+        assert_eq!(repaired["cached"], false);
+        assert_eq!(repaired["messages"], case + 2);
+    }
+}
+
 /// Requires the GH459 FAD parser revision. A registry-0.2.3 run must fail this
 /// acceptance check; an unpublished dependency overlay is not release proof.
 #[test]
