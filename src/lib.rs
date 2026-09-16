@@ -40354,7 +40354,7 @@ fn doctor_human_semantic_fallback_summary(
     }
 
     Some(format!(
-        "Semantic search: {}. This is derived-search state, not archive damage; cass will not download models during doctor. Next optional command: cass models install --json, then cass index --semantic --json.",
+        "Semantic search: {}. This is derived-search state, not archive damage; cass will not download models during doctor. Next optional command: cass models install, then cass index --semantic --json.",
         derived_semantic_assets.recommended_action
     ))
 }
@@ -43943,7 +43943,7 @@ fn doctor_semantic_recommended_action(
     }
     match availability {
         "not_installed" | "needs_consent" | "model_missing" => {
-            "cass models status --json; install explicitly with cass models install --json or cass models install --from-file <dir> --json, then run cass index --semantic --json".to_string()
+            "cass models status --json; install explicitly with cass models install or cass models install --from-file <dir>, then run cass index --semantic --json".to_string()
         }
         "index_missing" | "update_available" | "index_building" => {
             "cass index --semantic --json, or keep using lexical search".to_string()
@@ -44332,11 +44332,7 @@ mod doctor_derived_semantic_asset_tests {
         assert!(!report.auto_download_allowed);
         assert!(!report.auto_download_attempted);
         assert!(!report.model_cache.safe_to_rebuild);
-        assert!(
-            report
-                .recommended_action
-                .contains("cass models install --json")
-        );
+        assert!(report.recommended_action.contains("cass models install"));
     }
 
     #[test]
@@ -44356,7 +44352,8 @@ mod doctor_derived_semantic_asset_tests {
 
         assert!(summary.contains("not archive damage"));
         assert!(summary.contains("cass will not download models during doctor"));
-        assert!(summary.contains("cass models install --json"));
+        assert!(summary.contains("cass models install"));
+        assert!(!summary.contains("cass models install --json"));
         assert!(summary.contains("cass index --semantic --json"));
     }
 
@@ -44414,19 +44411,21 @@ mod doctor_derived_semantic_asset_tests {
     }
 
     #[test]
-    fn unreadable_hnsw_mmap_is_optional_and_does_not_block_lexical() {
+    fn failed_hnsw_inspection_is_optional_and_does_not_block_lexical() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let state = semantic_state(
+        let mut state = semantic_state(
             temp.path(),
             "missing",
             "index_missing",
             false,
             Some("lexical"),
         );
+        state["semantic"]["hnsw_present"] = json!(true);
+        state["semantic"]["hnsw_state"] = json!("inspection_failed");
 
         let report = doctor_build_derived_semantic_asset_report(temp.path(), &state, true, 17);
 
-        assert_eq!(report.hnsw_index.status, "missing-or-unreadable");
+        assert_eq!(report.hnsw_index.status, "inspection-failed");
         assert_eq!(report.hnsw_index.present, Some(true));
         assert_eq!(report.hnsw_index.ready, Some(false));
         assert!(report.lexical_search_unblocked);

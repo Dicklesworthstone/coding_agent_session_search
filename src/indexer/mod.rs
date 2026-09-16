@@ -28650,7 +28650,9 @@ fn reindex_paths_with_semantic_delta(
             watch_lexical_replay_debt_for_root(&storage, kind, &root)?
         };
         let replay_canonical = !pending_lexical_debt.is_empty();
-        if explicit_watch_once && !force_full && semantic_delta.is_none() {
+        // Semantic watch-once must reconcile and attest an unchanged source,
+        // even when the caller no longer captures callback-local deltas.
+        if explicit_watch_once && !force_full && !opts.semantic && semantic_delta.is_none() {
             let unchanged = {
                 let storage = storage
                     .lock()
@@ -57057,13 +57059,13 @@ mod tests {
     fn explicit_watch_once_omp_scan_root_survives_symlink_resolution() {
         let tmp = tempfile::tempdir().unwrap();
         let real_root = tmp.path().join("archive");
-        std::fs::create_dir_all(real_root.join("workspace")).unwrap();
-        let real = real_root.join("workspace/session.jsonl");
+        std::fs::create_dir_all(real_root.join("-workspace")).unwrap();
+        let real = real_root.join("-workspace/session.jsonl");
         std::fs::write(&real, b"{}\n").unwrap();
         let linked_root = tmp.path().join("share/omp/sessions");
         std::fs::create_dir_all(linked_root.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&real_root, &linked_root).unwrap();
-        let requested = linked_root.join("workspace/session.jsonl");
+        let requested = linked_root.join("-workspace/session.jsonl");
         let canonical = std::fs::canonicalize(&real).unwrap();
 
         assert_eq!(
