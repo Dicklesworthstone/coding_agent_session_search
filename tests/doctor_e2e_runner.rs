@@ -617,9 +617,12 @@ fn doctor_e2e_human_output_aligns_with_robot_recommended_actions() {
         !human.contains("\u{1b}["),
         "doctor human output should honor no-color in e2e capture:\n{human}"
     );
+    // The command explicitly requests wrapping; compare prose and commands
+    // independently of the line breaks introduced at that width.
+    let human_unwrapped = human.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        human.contains("Risk and next actions:")
-            && human.contains("Safety: doctor will not delete source session logs"),
+        human_unwrapped.contains("Risk and next actions:")
+            && human_unwrapped.contains("Safety: doctor will not delete source session logs"),
         "doctor human output should include incident-oriented safety copy:\n{human}"
     );
 
@@ -628,7 +631,7 @@ fn doctor_e2e_human_output_aligns_with_robot_recommended_actions() {
         .and_then(serde_json::Value::as_str)
     {
         assert!(
-            human.contains(&format!("Next safe command: {next_command}")),
+            human_unwrapped.contains(&format!("Next safe command: {next_command}")),
             "human next command should align with robot operation_outcome.next_command={next_command:?}:\n{human}"
         );
     }
@@ -644,14 +647,14 @@ fn doctor_e2e_human_output_aligns_with_robot_recommended_actions() {
         "fixture should exercise explicit semantic model guidance: {derived:#}"
     );
     assert!(
-        human.contains("not archive damage")
-            && human.contains("cass will not download models during doctor")
-            && human.contains("cass models install"),
+        human_unwrapped.contains("not archive damage")
+            && human_unwrapped.contains("cass will not download models during doctor")
+            && human_unwrapped.contains("cass models install"),
         "human semantic fallback copy should reflect the robot derived semantic fields:\n{human}"
     );
     assert!(!derived_action.contains("cass models install --json"));
     assert!(!derived_action.contains("--from-file <dir> --json"));
-    assert!(!human.contains("cass models install --json"));
+    assert!(!human_unwrapped.contains("cass models install --json"));
 }
 
 #[test]

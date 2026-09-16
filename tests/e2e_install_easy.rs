@@ -54,11 +54,13 @@ macro_rules! skip_unless_install_tests {
 fn truncate_output(bytes: &[u8], max_len: usize) -> String {
     let s = String::from_utf8_lossy(bytes);
     if s.len() > max_len {
-        format!(
-            "{}... [truncated {} bytes]",
-            &s[..max_len],
-            s.len() - max_len
-        )
+        let mut end = max_len;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        let prefix = &s[..end];
+        let omitted_bytes = s.len() - end;
+        format!("{prefix}... [truncated {omitted_bytes} bytes]")
     } else {
         s.to_string()
     }
@@ -102,14 +104,34 @@ fn save_binary_checksum(tracker: &PhaseTracker, binary_path: &std::path::Path) -
 
 /// Compute SHA256 hex string for bytes
 fn sha256_hex(data: &[u8]) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use sha2::{Digest, Sha256};
 
-    // Use a simple hash for test purposes (not cryptographic)
-    // Real checksum verification is done by sha256sum in install.sh
-    let mut hasher = DefaultHasher::new();
-    data.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    hex::encode(Sha256::digest(data))
+}
+
+#[test]
+fn artifact_checksum_uses_sha256() {
+    assert_eq!(
+        sha256_hex(b""),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    assert_eq!(
+        sha256_hex(b"abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+}
+
+#[test]
+fn diagnostic_truncation_preserves_utf8_boundaries() {
+    let text = "café😀rest";
+    let bytes = text.as_bytes();
+    assert_eq!(truncate_output(bytes, text.len()), text);
+    assert_eq!(truncate_output(b"", 0), "");
+    for limit in [5, 6, 7, 8] {
+        assert_eq!(truncate_output(bytes, limit), "café... [truncated 8 bytes]");
+    }
+    assert_eq!(truncate_output(bytes, 4), "caf... [truncated 10 bytes]");
+    assert_eq!(truncate_output(bytes, 0), "... [truncated 13 bytes]");
 }
 
 // ============================================

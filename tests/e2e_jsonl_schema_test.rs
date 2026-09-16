@@ -28,7 +28,13 @@ fn tracker_for(test_name: &str) -> PhaseTracker {
 fn selected_e2e_root() -> Option<PathBuf> {
     std::env::var("CASS_E2E_RUN_ID")
         .ok()
-        .map(|run_id| PathBuf::from("test-results/e2e/runs").join(run_id))
+        .map(|run_id| e2e_root_for_run(&run_id))
+}
+
+fn e2e_root_for_run(run_id: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("test-results/e2e/runs")
+        .join(run_id)
 }
 
 /// Required fields per event type.
@@ -50,14 +56,18 @@ const E2E_TRACE_MAX_BYTES: u64 = 512 * 1024;
 const SEMANTIC_TRACE_AGGREGATE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
 fn is_log_file(path: &Path) -> bool {
+    if path.components().any(|part| part.as_os_str() == ".previous") {
+        return false;
+    }
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
         // Trace files use the separate cass-trace-v1 schema below.
         if name == "trace.jsonl" || name == "combined.jsonl" {
             return false;
         }
-        // Exclude cass.log files (application logs, not E2E schema)
+        // PhaseTracker writes the per-test E2E schema here; application traces
+        // are kept separately in trace.jsonl.
         if name == "cass.log" {
-            return false;
+            return true;
         }
         // Only validate E2E log files (shell_*.jsonl, rust_*.jsonl patterns)
         if name.ends_with(".jsonl") {
@@ -90,6 +100,15 @@ fn collect_matching_files(root: &Path, predicate: fn(&Path) -> bool) -> Vec<Path
 
 fn collect_jsonl_logs(root: &Path) -> Vec<PathBuf> {
     collect_matching_files(root, is_log_file)
+        .into_iter()
+        // Artifact paths exist even when no logger was enabled. Empty files
+        // are not evidence; unreadable or malformed nonempty files still reach
+        // validation and fail rather than disappearing from the gate.
+        .filter(|path| match fs::metadata(path) {
+            Ok(metadata) => metadata.len() != 0,
+            Err(_) => true,
+        })
+        .collect()
 }
 
 fn collect_trace_logs(root: &Path) -> Vec<PathBuf> {
@@ -207,13 +226,14 @@ fn validate_trace_event(json: &Value) -> Result<(), String> {
 }
 
 /// Validate structural consistency within a single JSONL file.
-fn validate_file_structure(events: &[Value]) -> Vec<String> {
+fn validate_file_structure(path: &Path, events: &[Value]) -> Vec<String> {
     let mut warnings = Vec::new();
 
     let has_run_start = events.iter().any(|e| e["event"] == "run_start");
     let has_test_start = events.iter().any(|e| e["event"] == "test_start");
 
-    if has_test_start && !has_run_start {
+    let per_test = path.file_name().and_then(|name| name.to_str()) == Some("cass.log");
+    if has_test_start && !has_run_start && !per_test {
         warnings.push("Has test events but no run_start".to_string());
     }
 
@@ -227,6 +247,102 @@ fn validate_file_structure(events: &[Value]) -> Vec<String> {
     }
 
     warnings
+}
+
+fn require_selected_log_coverage(
+    logging_enabled: bool,
+    files: usize,
+    events: usize,
+) -> Result<(), String> {
+    if logging_enabled && (files == 0 || events == 0) {
+        return Err(format!(
+            "Selected E2E run with E2E_LOG enabled has no schema evidence ({files} files, {events} events)"
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn jsonl_collection_includes_per_test_logs_and_excludes_archives() -> SchemaTestResult {
+    let temp = tempfile::TempDir::new()?;
+    let per_test = temp.path().join("suite/test/cass.log");
+    let aggregate = temp.path().join("rust_current.jsonl");
+    let shell = temp.path().join("shell_current.jsonl");
+    let events = [
+        serde_json::json!({"ts":"2026-01-01T00:00:00Z","event":"test_start","run_id":"r1","runner":"rust","test":{"name":"fixture"}}),
+        serde_json::json!({"ts":"2026-01-01T00:00:01Z","event":"test_end","run_id":"r1","runner":"rust","test":{"name":"fixture"},"result":{"status":"pass"}}),
+    ];
+    let content = events
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    for relative in [
+        "suite/test/cass.log",
+        "rust_current.jsonl",
+        "shell_current.jsonl",
+        "suite/test/trace.jsonl",
+        "combined.jsonl",
+        ".previous/old/suite/test/cass.log",
+        ".previous/old/rust_old.jsonl",
+    ] {
+        let path = temp.path().join(relative);
+        fs::create_dir_all(path.parent().ok_or("fixture log has no parent")?)?;
+        fs::write(path, &content)?;
+    }
+    let empty = temp.path().join("suite/empty/cass.log");
+    fs::create_dir_all(empty.parent().ok_or("empty log has no parent")?)?;
+    fs::write(&empty, b"")?;
+    let malformed = temp.path().join("rust_malformed.jsonl");
+    fs::write(&malformed, "not json\n")?;
+    let files = collect_jsonl_logs(temp.path());
+    assert_eq!(files, vec![aggregate, malformed, shell, per_test.clone()]);
+    assert!(!files.contains(&empty));
+    let parsed = fs::read_to_string(&per_test)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    for event in &parsed {
+        validate_event(event)?;
+    }
+    assert!(validate_file_structure(&per_test, &parsed).is_empty());
+    Ok(())
+}
+
+#[test]
+fn selected_log_root_uses_absolute_manifest_directory() {
+    let root = e2e_root_for_run("schema-path-regression");
+    assert!(root.is_absolute());
+    assert!(root.starts_with(env!("CARGO_MANIFEST_DIR")));
+}
+
+#[test]
+fn jsonl_structure_requires_run_start_only_for_aggregate_logs() {
+    let mut events = vec![
+        serde_json::json!({"event":"test_start"}),
+        serde_json::json!({"event":"test_end"}),
+    ];
+    assert!(validate_file_structure(Path::new("suite/test/cass.log"), &events).is_empty());
+    assert_eq!(
+        validate_file_structure(Path::new("rust_run.jsonl"), &events),
+        vec!["Has test events but no run_start"]
+    );
+    events.insert(0, serde_json::json!({"event":"run_start"}));
+    assert!(validate_file_structure(Path::new("rust_run.jsonl"), &events).is_empty());
+    events.pop();
+    assert!(
+        validate_file_structure(Path::new("suite/test/cass.log"), &events)
+            .iter()
+            .any(|error| error.contains("Mismatched test_start"))
+    );
+}
+
+#[test]
+fn selected_logged_run_requires_nonempty_schema_evidence() {
+    assert!(require_selected_log_coverage(false, 0, 0).is_ok());
+    assert!(require_selected_log_coverage(true, 0, 0).is_err());
+    assert!(require_selected_log_coverage(true, 1, 0).is_err());
+    assert!(require_selected_log_coverage(true, 1, 2).is_ok());
 }
 
 #[test]
@@ -521,7 +637,10 @@ fn jsonl_files_valid_schema() {
         tracker.complete();
         return;
     };
+    let logging_enabled = std::env::var_os("E2E_LOG").is_some();
     if !e2e_dir.exists() {
+        require_selected_log_coverage(logging_enabled, 0, 0)
+            .expect("selected run must contain E2E schema evidence");
         eprintln!("No test-results/e2e directory — skipping JSONL validation");
         tracker.complete();
         return;
@@ -536,6 +655,8 @@ fn jsonl_files_valid_schema() {
     tracker.end("discover_files", Some("Find JSONL files"), phase_start);
 
     if jsonl_files.is_empty() {
+        require_selected_log_coverage(logging_enabled, 0, 0)
+            .expect("selected run must contain E2E schema evidence");
         eprintln!("No JSONL files in test-results/e2e/ — skipping");
         tracker.complete();
         return;
@@ -578,9 +699,13 @@ fn jsonl_files_valid_schema() {
         }
 
         // Structural validation per file
-        for warning in validate_file_structure(&file_events) {
+        for warning in validate_file_structure(path, &file_events) {
             errors.push(format!("{}: {warning}", path.display()));
         }
+    }
+    if let Err(error) = require_selected_log_coverage(logging_enabled, jsonl_files.len(), total_events)
+    {
+        errors.push(error);
     }
     tracker.end(
         "validate_events",
@@ -1092,6 +1217,13 @@ fn jsonl_run_ids_consistent_within_file() -> SchemaTestResult {
     for path in collect_jsonl_logs(&e2e_dir) {
         let content = fs::read_to_string(&path).unwrap();
         let mut run_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // PhaseTracker creates artifact paths even when E2E_LOG is disabled.
+        // An empty file has no conflicting identity; the schema coverage gate
+        // separately rejects a selected logged run with no events at all.
+        if content.trim().is_empty() {
+            continue;
+        }
 
         for line in content.lines() {
             if line.trim().is_empty() {
