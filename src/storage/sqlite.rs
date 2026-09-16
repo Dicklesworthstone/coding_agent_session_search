@@ -879,7 +879,7 @@ pub(crate) fn open_franken_raw_readonly_connection_with_timeout(
     let mut wal_recovery_attempted = false;
     loop {
         let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
-        match open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
+        match FrankenConnection::open_schema_only_with_wal_index_recovery(&path_str)
             .with_context(|| {
                 format!(
                     "opening raw frankensqlite db readonly at {}",
@@ -917,7 +917,8 @@ pub(crate) fn open_franken_raw_readonly_connection_with_timeout(
 /// dedicated owner thread for its entire lifetime.
 ///
 /// This mirrors [`open_franken_raw_readonly_connection_with_timeout`]'s doctor
-/// lock, bounded contention retry, and one-shot dirty-WAL recovery contract,
+/// lock, explicit WAL-index repair, bounded contention retry, and one-shot
+/// dirty-WAL recovery contract,
 /// and retains the canonical storage opener's duplicate-FTS-schema repair. It
 /// returns the thread-safe dispatch handle required by shared search clients.
 /// The worker creates, uses, closes, and drops the `!Send` raw connection on
@@ -937,16 +938,13 @@ pub(crate) fn open_franken_async_readonly_connection_with_timeout(
     let mut duplicate_fts_repair_attempted = false;
     loop {
         let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
-        match FrankenAsyncConnection::open_with_flags_sync(
-            &path_str,
-            FrankenOpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .with_context(|| {
-            format!(
-                "opening dedicated-owner frankensqlite db readonly at {}",
-                path.display()
-            )
-        }) {
+        match FrankenAsyncConnection::open_schema_only_with_wal_index_recovery_sync(&path_str)
+            .with_context(|| {
+                format!(
+                    "opening dedicated-owner frankensqlite db readonly at {}",
+                    path.display()
+                )
+            }) {
             Ok(conn) => return Ok(conn),
             Err(err) if retryable_franken_anyhow(&err) => {
                 let now = Instant::now();
@@ -984,7 +982,8 @@ pub(crate) fn open_franken_async_readonly_connection_with_timeout(
 
 /// Open a dedicated-owner read connection without performing or preparing any
 /// repair. Unlike the ordinary read opener, this path never creates the doctor
-/// lock hierarchy, deduplicates schema rows, or checkpoints a dirty WAL. It is
+/// lock hierarchy, repairs the WAL index, deduplicates schema rows, or
+/// checkpoints a dirty WAL. It is
 /// the storage seam for `search --no-maintenance`: an archive that requires
 /// recovery is reported as unavailable instead of being changed by a read.
 pub(crate) fn open_franken_async_strict_readonly_connection_with_timeout(
@@ -5619,7 +5618,7 @@ impl FrankenStorage {
         }
     }
 
-    /// Open in read-only mode using frankensqlite compat flags.
+    /// Open read-only, allowing locked recovery of the derived WAL index.
     pub fn open_readonly(path: &Path) -> Result<Self> {
         Self::open_readonly_with_doctor_lock_timeout(path, DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT)
     }
@@ -5637,14 +5636,14 @@ impl FrankenStorage {
         // lexical-rebuild page-prep workers open readonly right next to the
         // active writer, so a bounded retry here is load-bearing.
         let conn = match retry_transient_storage_op("open_readonly", || {
-            open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
+            FrankenConnection::open_schema_only_with_wal_index_recovery(&path_str)
                 .map_err(anyhow::Error::new)
         }) {
             Ok(conn) => conn,
             // Same duplicate-fts_messages debris handling as the canonical
             // open: fsqlite 0.3.x refuses the historical duplicate schema row
-            // at load. The dedupe is the one sanctioned mutation from a read
-            // lane — it repairs sqlite_master metadata only (the lexical
+            // at load. The dedupe is a sanctioned mutation from an ordinary
+            // read lane — it repairs sqlite_master metadata only (the lexical
             // self-healing contract), then the readonly open is retried.
             Err(err) if format!("{err:#}").contains("conflicting virtual-table entries") => {
                 tracing::warn!(
@@ -5654,7 +5653,7 @@ impl FrankenStorage {
                      fts_messages schema rows; deduplicating via sqlite3 bridge"
                 );
                 dedupe_conflicting_fts_schema_rows_via_sqlite3(path)?;
-                open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
+                FrankenConnection::open_schema_only_with_wal_index_recovery(&path_str)
                     .map_err(anyhow::Error::new)?
             }
             // gh #389: a hard (non-busy) readonly failure with a non-empty
@@ -5664,7 +5663,7 @@ impl FrankenStorage {
             // shutdown path uses, then retry the readonly open once. The
             // doctor mutation guard acquired above is still held here.
             Err(err) if attempt_dirty_wal_recovery_checkpoint(path, &err) => {
-                open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
+                FrankenConnection::open_schema_only_with_wal_index_recovery(&path_str)
                     .map_err(anyhow::Error::new)
                     .with_context(|| {
                         format!(
@@ -5686,8 +5685,8 @@ impl FrankenStorage {
 
     /// Open an archive for a strict non-mutating read.
     ///
-    /// This deliberately omits the ordinary read opener's two sanctioned
-    /// recovery writes (duplicate-FTS schema repair and dirty-WAL checkpoint)
+    /// This deliberately omits the ordinary read opener's sanctioned recovery
+    /// writes (WAL-index repair, duplicate-FTS repair and dirty-WAL checkpoint)
     /// and observes only an already-existing doctor lock. Callers must surface
     /// any recovery-required error and leave repair to an explicitly mutating
     /// command.
@@ -26358,6 +26357,182 @@ mod tests {
         let count: i64 = rows.first().unwrap().get_typed(0).unwrap();
         assert_eq!(count, 3, "checkpointed rows must survive recovery");
         conn.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh477_readonly_openers_recover_only_derived_wal_index() {
+        // Stock SQLite supplies two real WAL generations and a foreign lock
+        // owner; all application opens and reads below use FrankenSQLite.
+        let script = r#"
+import pathlib, shutil, sqlite3, sys
+p = pathlib.Path(sys.argv[1])
+seed = str(p) + '.seed'
+c = sqlite3.connect(seed)
+c.executescript('PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE t(n INTEGER); INSERT INTO t VALUES(10);')
+old = pathlib.Path(seed + '-shm').read_bytes()
+c.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchall()
+c.execute('INSERT INTO t VALUES(20)')
+c.commit()
+current = pathlib.Path(seed + '-shm').read_bytes()
+assert old[32:40] != current[32:40]
+if sys.argv[3] == 'header':
+    checkpoint = c.execute('PRAGMA wal_checkpoint(FULL)').fetchone()
+    assert checkpoint[0] == 0 and checkpoint[1] == checkpoint[2]
+for suffix in ['', '-wal']:
+    shutil.copyfile(seed + suffix, str(p) + suffix)
+if sys.argv[3] == 'header':
+    header = pathlib.Path(seed + '-wal').read_bytes()[:32]
+    assert len(header) == 32
+    pathlib.Path(str(p) + '-wal').write_bytes(header)
+pathlib.Path(str(p) + '-shm').write_bytes(old)
+c.close()
+if sys.argv[2] == 'writer':
+    c = sqlite3.connect(str(p), timeout=0)
+    c.execute('BEGIN IMMEDIATE')
+    pathlib.Path(str(p) + '-shm').write_bytes(old)
+print('ready', flush=True)
+sys.stdin.readline()
+if sys.argv[2] == 'writer':
+    c.rollback()
+    print('released', flush=True)
+    sys.stdin.readline()
+    c.close()
+"#;
+        struct Fixture(std::process::Child);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        for opener in ["raw", "storage", "owner"] {
+            for header_only in [false, true] {
+                for writer in [false, true] {
+                    let case_dir = dir.path().join(format!("{opener}-{header_only}-{writer}"));
+                    fs::create_dir(&case_dir).unwrap();
+                    let path = case_dir.join("archive.db");
+                    let mut fixture = Fixture(
+                        Command::new("python3")
+                            .args(["-c", script])
+                            .arg(&path)
+                            .arg(if writer { "writer" } else { "idle" })
+                            .arg(if header_only { "header" } else { "frames" })
+                            .stdin(Stdio::piped())
+                            .stdout(Stdio::piped())
+                            .spawn()
+                            .expect("Python sqlite3 is required for the GH477 foreign-writer fixture"),
+                    );
+                    let stdout = fixture.0.stdout.take().unwrap();
+                    let (sender, output) = std::sync::mpsc::channel();
+                    let reader = std::thread::spawn(move || {
+                        for line in BufReader::new(stdout).lines() {
+                            if sender.send(line.unwrap()).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    assert_eq!(
+                        output.recv_timeout(Duration::from_secs(10)).unwrap(),
+                        "ready"
+                    );
+                    let fingerprint = |suffix: &str| {
+                        let file = database_sidecar_path(&path, suffix);
+                        (
+                            fs::read(&file).unwrap(),
+                            fs::metadata(&file).unwrap().modified().unwrap(),
+                        )
+                    };
+                    let main_before = fingerprint("");
+                    let wal_before = fingerprint("-wal");
+                    let shm_before = fingerprint("-shm");
+                    if header_only {
+                        assert_eq!(wal_before.0.len(), 32);
+                    } else {
+                        assert!(wal_before.0.len() > 32);
+                    }
+                    let timeout = Duration::from_millis(50);
+                    let strict = FrankenStorage::open_strict_readonly_with_timeout(&path, timeout);
+                    let err = strict.err().expect("strict storage must refuse stale SHM");
+                    assert!(matches!(
+                        err.downcast_ref::<crate::franken_sync::FrankenError>(),
+                        Some(crate::franken_sync::FrankenError::BusyRecovery)
+                    ));
+                    let strict = open_franken_async_strict_readonly_connection_with_timeout(
+                        &path, timeout,
+                    );
+                    let err = strict.err().expect("strict owner must refuse stale SHM");
+                    assert!(matches!(
+                        err.downcast_ref::<crate::franken_sync::FrankenError>(),
+                        Some(crate::franken_sync::FrankenError::BusyRecovery)
+                    ));
+                    assert_eq!(fingerprint("-shm"), shm_before);
+                    assert_eq!(fingerprint(""), main_before);
+                    assert_eq!(fingerprint("-wal"), wal_before);
+                    assert!(!case_dir.join("doctor").exists());
+
+                    let open_and_read = || -> Result<()> {
+                        if opener == "owner" {
+                            let mut conn = open_franken_async_readonly_connection_with_timeout(
+                                &path, timeout,
+                            )?;
+                            let rows = conn.query_sync("SELECT sum(n) FROM t")?;
+                            assert_eq!(rows[0].get_typed::<i64>(0)?, 30);
+                            assert!(conn.execute_sync("INSERT INTO t VALUES(99)").is_err());
+                            conn.close_without_checkpoint_sync()?;
+                        } else if opener == "storage" {
+                            let storage = FrankenStorage::open_readonly_with_doctor_lock_timeout(
+                                &path, timeout,
+                            )?;
+                            let rows = storage.raw().query("SELECT sum(n) FROM t")?;
+                            assert_eq!(rows[0].get_typed::<i64>(0)?, 30);
+                            assert!(storage.raw().execute("INSERT INTO t VALUES(99)").is_err());
+                            storage.close_without_checkpoint()?;
+                        } else {
+                            let mut conn = open_franken_raw_readonly_connection_with_timeout(
+                                &path, timeout,
+                            )?;
+                            let rows = conn.query("SELECT sum(n) FROM t")?;
+                            assert_eq!(rows[0].get_typed::<i64>(0)?, 30);
+                            assert!(conn.execute("INSERT INTO t VALUES(99)").is_err());
+                            close_franken_in_place_with_busy_retry(&mut conn, false)?;
+                        }
+                        Ok(())
+                    };
+                    let started = Instant::now();
+                    let result = open_and_read();
+                    assert!(started.elapsed() < Duration::from_secs(10));
+                    if writer {
+                        let err = result.expect_err("live writer must prevent SHM repair");
+                        assert!(retryable_franken_anyhow(&err), "{err:#}");
+                        assert_eq!(fingerprint("-shm"), shm_before);
+                        assert_eq!(fingerprint(""), main_before);
+                        assert_eq!(fingerprint("-wal"), wal_before);
+                        writeln!(fixture.0.stdin.as_mut().unwrap(), "release").unwrap();
+                        assert_eq!(
+                            output.recv_timeout(Duration::from_secs(10)).unwrap(),
+                            "released"
+                        );
+                        open_and_read().expect("same stale fixture recovers after writer release");
+                    } else {
+                        result.expect("ordinary read opener repairs stale SHM");
+                    }
+                    assert_ne!(fingerprint("-shm").0, shm_before.0);
+                    let strict = FrankenStorage::open_strict_readonly_with_timeout(&path, timeout)
+                        .expect("strict reads succeed once the WAL index is repaired");
+                    let rows = strict.raw().query("SELECT sum(n) FROM t").unwrap();
+                    assert_eq!(rows[0].get_typed::<i64>(0).unwrap(), 30);
+                    strict.close_without_checkpoint().unwrap();
+                    assert_eq!(fingerprint(""), main_before);
+                    assert_eq!(fingerprint("-wal"), wal_before);
+                    writeln!(fixture.0.stdin.as_mut().unwrap(), "exit").unwrap();
+                    assert!(fixture.0.wait().unwrap().success());
+                    reader.join().unwrap();
+                }
+            }
+        }
     }
 
     #[test]
