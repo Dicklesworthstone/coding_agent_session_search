@@ -16,6 +16,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  LINUX_GLIBC_VERSION: "2.28"
   # A manual dispatch names the immutable tag to build. Every checkout below
   # must use that tag rather than the branch from which the dispatch was
   # launched, or the release could publish branch bytes under an older tag.
@@ -64,14 +65,12 @@ jobs:
           # runtime-dispatched SIMD, so there is no AVX2 static-init hazard
           # and no separate `-baseline` artifact anymore (cass#256 is moot;
           # see bead coding_agent_session_search-tg5o9).
-          # Linux x86_64 - ubuntu-24.04 (glibc 2.39): CI builds target the
-          # newer kernel/glibc features used by the frankensqlite storage
-          # engine, so 22.04-era glibc is not supported for prebuilt binaries.
+          # Zig pins the Linux ABI to glibc 2.28 independently of runner glibc.
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact_name: cass
             asset_name: cass-linux-amd64
-          # Linux ARM64 - same glibc constraint as x86_64.
+          # Linux ARM64 - same pinned glibc floor as x86_64.
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact_name: cass
@@ -98,9 +97,10 @@ jobs:
         with:
           ref: ${{ env.RELEASE_REF }}
 
-      - name: Install Rust stable
+      - name: Install repository Rust toolchain
         uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
         with:
+          toolchain: nightly-2026-08-31
           targets: ${{ matrix.target }}
 
       - name: Cache cargo
@@ -140,7 +140,51 @@ jobs:
           brew install openssl@3
           echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
 
+      - name: Install pinned Linux cross toolchain
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) ZIG_ARCH=x86_64; ZIG_SHA256=24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c ;;
+            aarch64) ZIG_ARCH=aarch64; ZIG_SHA256=f7a654acc967864f7a050ddacfaa778c7504a0eca8d2b678839c21eea47c992b ;;
+            *) echo 'Unsupported Zig host architecture' >&2; exit 1 ;;
+          esac
+          ZIG_DIR="$(mktemp -d "$RUNNER_TEMP/cass-zig.XXXXXX")"
+          curl --fail --location --retry 3 "https://ziglang.org/download/0.14.1/zig-${ZIG_ARCH}-linux-0.14.1.tar.xz" -o "$ZIG_DIR/zig.tar.xz"
+          printf '%s  %s\n' "$ZIG_SHA256" "$ZIG_DIR/zig.tar.xz" | sha256sum --check --strict
+          tar -xJf "$ZIG_DIR/zig.tar.xz" -C "$ZIG_DIR"
+          echo "$ZIG_DIR/zig-${ZIG_ARCH}-linux-0.14.1" >> "$GITHUB_PATH"
+          cargo install cargo-zigbuild --version 0.23.0 --locked
+
+      - name: Build Linux release at the installer ABI floor
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset CARGO_ENCODED_RUSTFLAGS CC CXX AR
+          unset CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
+          unset CC_x86_64_unknown_linux_gnu CXX_x86_64_unknown_linux_gnu AR_x86_64_unknown_linux_gnu
+          unset CC_aarch64_unknown_linux_gnu CXX_aarch64_unknown_linux_gnu AR_aarch64_unknown_linux_gnu
+          # Override the repository's native -fuse-ld=lld; Zig owns the linker.
+          export RUSTFLAGS='-Z threads=4'
+          test "$(zig version)" = 0.14.1
+          test "$(cargo zigbuild --version)" = 'cargo-zigbuild 0.23.0'
+          cargo zigbuild --locked --release --target "${{ matrix.target }}.${LINUX_GLIBC_VERSION}" --bin cass
+
+      - name: Verify Linux glibc requirement
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          BINARY="target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
+          MAX_GLIBC="$(objdump -p "$BINARY" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1)"
+          test -n "$MAX_GLIBC"
+          test "$(printf '%s\n' "${MAX_GLIBC#GLIBC_}" "$LINUX_GLIBC_VERSION" | sort -V | tail -1)" = "$LINUX_GLIBC_VERSION"
+          echo "Required glibc: $MAX_GLIBC; supported floor: $LINUX_GLIBC_VERSION"
+
       - name: Build release
+        if: runner.os != 'Linux'
         run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Smoke-test release binary (Unix)
