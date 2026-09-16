@@ -85372,9 +85372,15 @@ mod cli_read_db_tests {
             let err = anyhow::Error::new(crate::franken_sync::FrankenError::BusyRecovery)
                 .context("opening database through dedicated owner");
             let message = state_db_strict_open_error_message(&db_path, "status", &err, true);
-            assert!(message.contains("WAL-index recovery is required"), "{message}");
+            assert!(
+                message.contains("WAL-index recovery is required"),
+                "{message}"
+            );
             assert!(message.contains("another connection"), "{message}");
-            assert!(message.contains("leaves the archive unchanged"), "{message}");
+            assert!(
+                message.contains("leaves the archive unchanged"),
+                "{message}"
+            );
             assert!(message.contains("cass index"), "{message}");
             assert!(!message.contains("checkpoint"), "{message}");
 
