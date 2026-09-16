@@ -20008,6 +20008,33 @@ fn full_rebuild_existing_storage_integrity_problem(
         return Ok(Some(format!("quick_check reported {quick_check:?}")));
     }
 
+    // A first index can be killed after SQLite creates the file, or after
+    // MigrationRunner creates its empty tracking table, but before the atomic
+    // V13 schema transaction commits. Neither state contains an archive yet.
+    // Admit only those exact catalogs after integrity checks; missing canonical
+    // tables in any other schema must retain the archive-damage refusal below.
+    let schema_objects = storage
+        .raw()
+        .query("SELECT type, name FROM sqlite_master LIMIT 2")
+        .context("classifying an interrupted canonical schema bootstrap")?;
+    let unfinished_bootstrap = match schema_objects.as_slice() {
+        [] => true,
+        [object]
+            if object.get_typed::<String>(0)? == "table"
+                && object.get_typed::<String>(1)? == "_schema_migrations" =>
+        {
+            storage
+                .raw()
+                .query("SELECT version FROM _schema_migrations LIMIT 1")
+                .context("checking for a committed canonical schema migration")?
+                .is_empty()
+        }
+        _ => false,
+    };
+    if unfinished_bootstrap {
+        return Ok(None);
+    }
+
     for (table, sql) in [
         ("conversations", "SELECT COUNT(*) FROM conversations"),
         ("messages", "SELECT COUNT(*) FROM messages"),
@@ -51275,6 +51302,72 @@ mod tests {
                 "large-archive preflight opened fsqlite and created {}",
                 sidecar.display()
             );
+        }
+    }
+
+    #[test]
+    fn full_rebuild_integrity_preflight_accepts_only_empty_bootstrap_states() {
+        for tracking_table in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let db_path = tmp.path().join("interrupted-bootstrap.db");
+            {
+                let conn =
+                    crate::franken_sync::Connection::open(db_path.to_string_lossy().into_owned())
+                        .unwrap();
+                // Persist a valid SQLite header even in the zero-object case.
+                conn.execute("PRAGMA user_version = 1").unwrap();
+                if tracking_table {
+                    conn.execute(
+                        "CREATE TABLE _schema_migrations (
+                            version INTEGER PRIMARY KEY,
+                            name TEXT NOT NULL,
+                            applied_at TEXT NOT NULL DEFAULT 'now'
+                        )",
+                    )
+                    .unwrap();
+                }
+            }
+            let before = fs::read(&db_path).unwrap();
+            assert!(!before.is_empty());
+            assert_eq!(
+                full_rebuild_existing_archive_integrity_preflight(&db_path).unwrap(),
+                None,
+                "an interrupted empty bootstrap must permit normal migrations"
+            );
+            assert_eq!(fs::read(&db_path).unwrap(), before);
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            assert_eq!(
+                storage.schema_version().unwrap(),
+                crate::storage::sqlite::CURRENT_SCHEMA_VERSION
+            );
+        }
+    }
+
+    #[test]
+    fn full_rebuild_integrity_preflight_refuses_nonempty_bootstrap_catalogs() {
+        for sql in [
+            "CREATE TABLE _schema_migrations (version INTEGER PRIMARY KEY);
+             INSERT INTO _schema_migrations VALUES (13)",
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta VALUES ('schema_version', '21')",
+            "CREATE TABLE conversations (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE unrelated (id INTEGER PRIMARY KEY)",
+            "CREATE VIEW _schema_migrations AS SELECT 13 AS version",
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let db_path = tmp.path().join("incomplete-archive.db");
+            {
+                let conn =
+                    crate::franken_sync::Connection::open(db_path.to_string_lossy().into_owned())
+                        .unwrap();
+                conn.execute_batch(sql).unwrap();
+            }
+            let before = fs::read(&db_path).unwrap();
+            let problem = full_rebuild_existing_archive_integrity_preflight(&db_path)
+                .unwrap()
+                .expect("schema objects or committed migrations must not bypass archive checks");
+            assert!(problem.contains("canonical table canary failed"), "{problem}");
+            assert_eq!(fs::read(&db_path).unwrap(), before);
         }
     }
 
