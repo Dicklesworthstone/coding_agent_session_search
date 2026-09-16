@@ -169,11 +169,14 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 
 **Dependency source contract:**
 
-Release-candidate transition (2026-09-15): Cargo.toml prepares the published
-`fsqlite`/core/pager `=0.4.1` and remaining family, including `fsqlite-types`,
-`=0.4.0`, with Asupersync `=0.5.0`. FAD `=0.3.0` and Frankensearch `=0.6.1`
-are coordinated pending publications; do not commit or publish the candidate
-until they exist, Cargo.lock is regenerated, and the runtime gates pass.
+Release-candidate transition (2026-09-16): Cargo.toml prepares
+`fsqlite`/core/pager `=0.4.2`, btree/vdbe `=0.4.1`, and remaining family,
+including `fsqlite-types`, `=0.4.0`, with Asupersync `=0.5.0`.
+FAD `=0.3.0` is published; the five updated SQLite packages
+and Frankensearch `=0.6.1` are pending publication. Do not commit or publish
+the candidate until they exist, Cargo.lock is regenerated, and runtime gates pass.
+SQLite `0.4.2` adds explicit derived WAL-index recovery for read-only opens
+(GH#477); its qualification is still in progress.
 The table below is historical during this transition; its GH#411-open statement
 is superseded by upstream closure. The published SQLite 0.4.1 includes the
 GH#462 reserved-page WAL repair, but damaged-archive recovery remains unproven.

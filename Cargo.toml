@@ -78,9 +78,11 @@ notify = "8.2.0"
 # rowid IN-list seeks (GH#415/cass#382), mutation-free read-only WAL readers,
 # reader-registration error propagation and I/O buffer lifetime fixes.
 # 0.4.1 adds GH#462's reserved-page WAL freelist repair and consumes the
-# Asupersync 0.5 runtime. The published family intentionally uses 0.4.1 for
-# facade/core/pager and 0.4.0 for the remaining crates; build.rs checks each.
-frankensqlite = { version = "=0.4.1", package = "fsqlite", features = ["fts5", "async-api"] }
+# Asupersync 0.5 runtime. The 0.4.2 candidate adds explicit derived WAL-index
+# recovery for read-only opens (GH#477). Facade/core/pager use 0.4.2,
+# btree/vdbe use 0.4.1 for the APIs required by core, and the remaining
+# crates use 0.4.0; build.rs checks each package exactly.
+frankensqlite = { version = "=0.4.2", package = "fsqlite", features = ["fts5", "async-api"] }
 # The production storage-integrity probe calls FrankenSQLite's public VFS API
 # directly so it can inspect native writer locks without opening the pager.
 fsqlite-types = { version = "=0.4.0", package = "fsqlite-types" }
