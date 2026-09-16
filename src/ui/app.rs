@@ -8332,9 +8332,10 @@ impl CassApp {
                     '\u{2587}', '\u{2588}',
                 ];
                 let mut buckets = vec![0u32; spark_width];
-                let range = (t_max - t_min) as f64;
+                let range = (i128::from(t_max) - i128::from(t_min)) as f64;
                 for &ts in &timestamps {
-                    let idx = (((ts - t_min) as f64 / range) * (spark_width - 1) as f64) as usize;
+                    let offset = (i128::from(ts) - i128::from(t_min)) as f64;
+                    let idx = ((offset / range) * (spark_width - 1) as f64) as usize;
                     buckets[idx.min(spark_width - 1)] += 1;
                 }
                 let max_bucket = *buckets.iter().max().unwrap_or(&1);
@@ -9589,9 +9590,10 @@ impl CassApp {
 
         // Bucket messages into bins
         let mut buckets = vec![0u32; width];
-        let range = (t_max - t_min) as f64;
+        let range = (i128::from(t_max) - i128::from(t_min)) as f64;
         for &ts in &timestamps {
-            let idx = (((ts - t_min) as f64 / range) * (width - 1) as f64) as usize;
+            let offset = (i128::from(ts) - i128::from(t_min)) as f64;
+            let idx = ((offset / range) * (width - 1) as f64) as usize;
             buckets[idx.min(width - 1)] += 1;
         }
 
@@ -38662,6 +38664,52 @@ not jsonl",
             sparkline.chars().count() <= 20,
             "sparkline width should not exceed max_width"
         );
+    }
+
+    #[test]
+    fn timestamp_sparklines_preserve_full_range_and_nearby_extremes() {
+        use crate::model::types::{Message, MessageRole};
+
+        let styles = StyleContext::from_options(StyleOptions::default());
+        for timestamps in [
+            [i64::MIN, 0, i64::MAX],
+            [i64::MAX - 2, i64::MAX - 1, i64::MAX],
+            [i64::MIN, i64::MIN + 1, i64::MIN + 2],
+        ] {
+            let messages: Vec<Message> = timestamps
+                .iter()
+                .map(|&ts| Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(ts),
+                    content: String::new(),
+                    extra_json: serde_json::json!({}),
+                    snippets: Vec::new(),
+                })
+                .collect();
+            let expected = "█  █   █";
+            assert_eq!(CassApp::build_text_sparkline(&messages, 8), expected);
+
+            let mut app = CassApp::default();
+            app.results = timestamps
+                .iter()
+                .enumerate()
+                .map(|(idx, &ts)| {
+                    let mut hit = make_hit(idx as u64, "/timestamp-boundary");
+                    hit.created_at = Some(ts);
+                    hit
+                })
+                .collect();
+            app.regroup_panes();
+            let line = app.build_results_stats_line(78, &styles);
+            assert_eq!(
+                line.spans().last().map(|span| span.content.as_ref()),
+                Some(expected),
+                "results sparkline for {timestamps:?}"
+            );
+        }
     }
 
     #[test]
