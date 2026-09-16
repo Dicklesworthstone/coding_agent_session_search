@@ -323,6 +323,14 @@ fn validate_source_name(name: &str) -> Result<(), ConfigError> {
         ));
     }
 
+    // Source names become mirror-directory components on every platform.
+    // Windows drive-relative prefixes such as C: discard the base on join.
+    if name.contains(':') {
+        return Err(ConfigError::Validation(
+            "Source name cannot contain ':'".into(),
+        ));
+    }
+
     if has_dot_components(Path::new(name)) {
         return Err(ConfigError::Validation(
             "Source name cannot be '.' or '..'".into(),
@@ -2006,6 +2014,34 @@ mod tests {
 
         let source = SourceDefinition::local("..");
         assert!(source.validate().is_err());
+    }
+
+    #[test]
+    fn test_source_validation_portable_names_reject_drive_prefixes() {
+        let temp = tempfile::tempdir().expect("source-name fixture directory");
+        let path = temp.path().join("sources.toml");
+        for name in ["C:", "C:outside", "c:outside", "host:stream"] {
+            let source = SourceDefinition::ssh(name, "user@host");
+            assert!(source.validate().is_err(), "accepted source name {name}");
+            let mut config = SourcesConfig::default();
+            assert!(config.add_source(source.clone()).is_err());
+            config.sources.push(source);
+            assert!(config.validate().is_err());
+            // Bypass save validation to exercise the actual TOML load path.
+            std::fs::write(&path, toml::to_string(&config).expect("encode fixture"))
+                .expect("write source-name fixture");
+            assert!(SourcesConfig::load_from(&path).is_err(), "loaded {name}");
+        }
+        for name in ["laptop", "host-name.example", "build_host-1"] {
+            let source = SourceDefinition::ssh(name, "user@host");
+            assert!(source.validate().is_ok(), "rejected source name {name}");
+            let mut config = SourcesConfig::default();
+            config.add_source(source).expect("add portable source");
+            config.save_to(&path).expect("save portable source");
+            let loaded = SourcesConfig::load_from(&path).expect("load portable source");
+            assert_eq!(loaded.sources.len(), 1);
+            assert_eq!(loaded.sources[0].name, name);
+        }
     }
 
     #[test]
