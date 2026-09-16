@@ -3177,9 +3177,9 @@ fn format_number_with_grouping(n: i64) -> String {
 }
 
 /// Smart timestamp conversion: detects seconds vs milliseconds automatically.
-/// Values >= 10 billion are treated as milliseconds; smaller values as seconds.
+/// Magnitudes >= 10 billion are treated as milliseconds; smaller values as seconds.
 fn smart_timestamp(ts: i64) -> Option<chrono::DateTime<chrono::Utc>> {
-    if ts.abs() >= 10_000_000_000 {
+    if ts.unsigned_abs() >= 10_000_000_000 {
         chrono::DateTime::from_timestamp_millis(ts)
     } else {
         chrono::DateTime::from_timestamp(ts, 0)
@@ -3188,7 +3188,7 @@ fn smart_timestamp(ts: i64) -> Option<chrono::DateTime<chrono::Utc>> {
 
 /// Normalize a raw timestamp (seconds or milliseconds) to seconds.
 fn ts_to_secs(ts: i64) -> i64 {
-    if ts.abs() >= 10_000_000_000 {
+    if ts.unsigned_abs() >= 10_000_000_000 {
         ts / 1000
     } else {
         ts
@@ -38664,6 +38664,31 @@ not jsonl",
             sparkline.chars().count() <= 20,
             "sparkline width should not exceed max_width"
         );
+    }
+
+    #[test]
+    fn timestamp_helpers_handle_extremes_and_unit_boundaries() {
+        for (raw, seconds, millis_remainder, normalized) in [
+            (0, 0, 0, 0),
+            (1, 1, 0, 1),
+            (-1, -1, 0, -1),
+            (9_999_999_999, 9_999_999_999, 0, 9_999_999_999),
+            (-9_999_999_999, -9_999_999_999, 0, -9_999_999_999),
+            (10_000_000_000, 10_000_000, 0, 10_000_000),
+            (-10_000_000_000, -10_000_000, 0, -10_000_000),
+            (10_000_000_001, 10_000_000, 1, 10_000_000),
+            (-10_000_000_001, -10_000_001, 999, -10_000_000),
+        ] {
+            let datetime = smart_timestamp(raw).expect("boundary timestamp is representable");
+            assert_eq!(datetime.timestamp(), seconds, "raw={raw}");
+            assert_eq!(datetime.timestamp_subsec_millis(), millis_remainder);
+            // The integer normalization deliberately truncates toward zero.
+            assert_eq!(ts_to_secs(raw), normalized, "raw={raw}");
+        }
+        for raw in [i64::MIN, i64::MAX] {
+            assert!(smart_timestamp(raw).is_none(), "raw={raw}");
+            assert_eq!(ts_to_secs(raw), raw / 1000, "raw={raw}");
+        }
     }
 
     #[test]
