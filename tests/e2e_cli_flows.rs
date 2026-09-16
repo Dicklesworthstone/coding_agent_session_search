@@ -711,12 +711,12 @@ fn view_command_returns_session_detail() {
                 .collect();
             for robot in [false, true] {
                 let mut cmd = base_cmd(&command_env);
-                cmd.args(["view", "--line"])
+                cmd.arg("--db")
+                    .arg(tmp.path().join("data/agent_search.db"))
+                    .args(["view", "--line"])
                     .arg(target.to_string())
                     .arg("--context")
                     .arg(context.to_string())
-                    .arg("--data-dir")
-                    .arg(tmp.path().join("data"))
                     .arg(&session)
                     .env("HOME", tmp.path())
                     .env("CASS_OUTPUT_FORMAT", "");
@@ -771,12 +771,12 @@ fn expand_command_with_context() {
     for target in 1usize..=3 {
         for context in [0usize, 1, usize::MAX - 1, usize::MAX] {
             let output = base_cmd(&command_env)
+                .arg("--db")
+                .arg(tmp.path().join("data/agent_search.db"))
                 .args(["expand", "--robot", "--line"])
                 .arg(target.to_string())
                 .arg("--context")
                 .arg(context.to_string())
-                .arg("--data-dir")
-                .arg(tmp.path().join("data"))
                 .arg(&session)
                 .env("HOME", tmp.path())
                 .output()
