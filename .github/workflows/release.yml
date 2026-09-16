@@ -169,7 +169,7 @@ jobs:
           # Override the repository's native -fuse-ld=lld; Zig owns the linker.
           export RUSTFLAGS='-Z threads=4'
           test "$(zig version)" = 0.14.1
-          test "$(cargo zigbuild --version)" = 'cargo-zigbuild 0.23.0'
+          test "$(cargo-zigbuild --version)" = 'cargo-zigbuild 0.23.0'
           cargo zigbuild --locked --release --target "${{ matrix.target }}.${LINUX_GLIBC_VERSION}" --bin cass
 
       - name: Verify Linux glibc requirement

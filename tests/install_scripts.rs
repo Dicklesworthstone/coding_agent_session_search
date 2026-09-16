@@ -385,7 +385,7 @@ fn release_workflow_pins_linux_glibc_to_installer_floor() {
         "unset CARGO_ENCODED_RUSTFLAGS CC CXX AR",
         "export RUSTFLAGS='-Z threads=4'",
         "test \"$(zig version)\" = 0.14.1",
-        "test \"$(cargo zigbuild --version)\" = 'cargo-zigbuild 0.23.0'",
+        "test \"$(cargo-zigbuild --version)\" = 'cargo-zigbuild 0.23.0'",
     ] {
         assert!(build.contains(required), "missing Linux guard: {required}");
     }
