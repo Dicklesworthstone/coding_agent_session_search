@@ -51366,7 +51366,10 @@ mod tests {
             let problem = full_rebuild_existing_archive_integrity_preflight(&db_path)
                 .unwrap()
                 .expect("schema objects or committed migrations must not bypass archive checks");
-            assert!(problem.contains("canonical table canary failed"), "{problem}");
+            assert!(
+                problem.contains("canonical table canary failed"),
+                "{problem}"
+            );
             assert_eq!(fs::read(&db_path).unwrap(), before);
         }
     }
