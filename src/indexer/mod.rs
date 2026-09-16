@@ -31033,7 +31033,7 @@ pub mod persist {
     use rand::RngExt;
     use rayon::prelude::*;
 
-    use crate::connectors::NormalizedConversation;
+    use crate::connectors::{NormalizedConversation, NormalizedMessage};
     use crate::indexer::semantic::{
         EmbeddingInput, packet_embedding_inputs_from_storage_for_message_ids,
     };
