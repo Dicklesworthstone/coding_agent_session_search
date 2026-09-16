@@ -102502,8 +102502,8 @@ fn run_view(
         });
     }
 
-    let start = target_line.saturating_sub(context + 1);
-    let end = (target_line + context).min(lines.len());
+    let start = target_line.saturating_sub(context.saturating_add(1));
+    let end = target_line.saturating_add(context).min(lines.len());
     let highlight_line = line.is_some();
 
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
@@ -103344,7 +103344,7 @@ fn macos_process_disk_io_bytes() -> Option<u64> {
         return None;
     }
     // SAFETY: the kernel filled the v2 layout on success (checked above).
-    let info = unsafe { info.assume_init() };
+    let info = unsafe { info.assume_init() }; // ubs:ignore[rust.unsafe-memory.assume-init] — Zeroed integer-only rusage_info_v2 is read only after proc_pid_rusage reports success.
     Some(
         info.ri_diskio_bytesread
             .saturating_add(info.ri_diskio_byteswritten),
@@ -108036,7 +108036,7 @@ fn run_resume(
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
-            let err = std::process::Command::new(program).args(args).exec();
+            let err = std::process::Command::new(program).args(args).exec(); // ubs:ignore[rust.security.command-executable] — resolve_resume_target selects a literal harness executable; session input appears only in argv after explicit --exec.
             // `exec` only returns on failure.
             return Err(CliError {
                 code: 7,
@@ -108050,7 +108050,7 @@ fn run_resume(
         }
         #[cfg(not(unix))]
         {
-            let status = std::process::Command::new(program)
+            let status = std::process::Command::new(program) // ubs:ignore[rust.security.command-executable] — The resolved program is a literal harness name; user session data remains separate argv.
                 .args(args)
                 .status()
                 .map_err(|err| CliError {
@@ -108368,7 +108368,7 @@ fn copy_to_system_clipboard(text: &str) -> Result<&'static str, String> {
 
     let mut last_err: Option<String> = None;
     for (program, args) in candidates {
-        let mut command = Command::new(program);
+        let mut command = Command::new(program); // ubs:ignore[rust.security.command-executable] — Program comes only from the fixed platform clipboard-tool list above; text is written to stdin.
         command.args(args.iter().copied());
         match write_clipboard_command(command, text) {
             Ok(status) if status.success() => return Ok(program),
@@ -114471,7 +114471,10 @@ fn run_expand(
     })?;
 
     let start = target_idx.saturating_sub(context);
-    let end = (target_idx + context + 1).min(messages.len());
+    let end = target_idx
+        .saturating_add(context)
+        .saturating_add(1)
+        .min(messages.len());
 
     let context_messages: Vec<_> = messages[start..end]
         .iter()
