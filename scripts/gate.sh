@@ -271,7 +271,7 @@ run_tests() {
 }
 
 run_ubs() {
-    local expected actual scanner installed expected_sha tool_dir
+    local expected actual scanner installed expected_sha expected_contract_sha tool_dir
     expected="$(tr -d '[:space:]' < .github/workflows/ubs-version.txt)"
     # The runner verifies its language modules against embedded release hashes.
     # Updating the pin also requires reviewing the new runner digest here.
@@ -280,6 +280,7 @@ run_ubs() {
         return 1
     fi
     expected_sha=bdeccbb35f2056e6177c73b3f0f9966d20d1cbeff22b7f084133c4a6ac625ee2
+    expected_contract_sha=7319b2e5e085d0dd2434e5114291b2dee9fbbb96e2cfe02027eb263abcb06ac3
     # Keep both runner and modules private: a different pinned UBS invocation
     # would otherwise replace the shared module cache while this one scans.
     tool_dir="$(mktemp -d -t cass-gate-ubs.XXXXXX)" || return 1
@@ -298,9 +299,22 @@ run_ubs() {
         echo "gate: UBS runner bytes differ from the pinned release" >&2
         return 1
     fi
+    # Multi-file language routing runs before module acquisition. A private
+    # runner without its contract would classify every explicit target as
+    # unsupported and exit without scanning anything.
+    mkdir -p "$tool_dir/modules" || return 1
+    curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+        --max-time 60 --user-agent 'OpenAI File Downloader, XaiImageApiFetch/1.0' \
+        "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/${expected}/modules/contract.json" \
+        --output "$tool_dir/modules/contract.json" || return 1
+    if [ "$(sha256sum "$tool_dir/modules/contract.json" | cut -d' ' -f1)" != "$expected_contract_sha" ]; then
+        echo "gate: UBS routing contract bytes differ from the pinned release" >&2
+        return 1
+    fi
     actual="$(bash "$scanner" --version)" || return 1
     echo "UBS_VERSION=${actual} UBS_PIN=${expected} UBS_SHA256=${expected_sha}"
     echo "UBS_MODULE_DIR=${tool_dir}/modules"
+    echo "UBS_CONTRACT_SHA256=${expected_contract_sha}"
     if [ "$#" -eq 0 ]; then
         echo "UBS_FILES=0 (no changed scanner-supported source files)"
         return 0
