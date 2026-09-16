@@ -1365,7 +1365,8 @@ mod tests {
         let link_tmp = tmp.path().join("tmp");
         std::os::unix::fs::symlink(&real_tmp, &link_tmp).expect("symlink tmp");
 
-        let socket_path = link_tmp.join("cass-semantic.sock");
+        // Leave room for the private runtime suffix under long worker TMPDIRs.
+        let socket_path = link_tmp.join("s");
 
         // The parent classifier must follow the symlink instead of erroring
         // with InvalidInput ("socket parent is not a directory").
@@ -1542,7 +1543,8 @@ mod tests {
         let public_dir = temp_dir.path().join("public");
         fs::create_dir(&public_dir).unwrap();
         fs::set_permissions(&public_dir, fs::Permissions::from_mode(0o777)).unwrap();
-        let public_socket = public_dir.join("daemon.sock");
+        // Leave room for the private runtime suffix under long worker TMPDIRs.
+        let public_socket = public_dir.join("s");
 
         let BoundDaemonSocket {
             listener,

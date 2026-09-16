@@ -2301,14 +2301,16 @@ mod tests {
                     .expect("query published document");
                 assert_eq!(page.hits.len(), 1);
                 assert_eq!(page.total_count, Some(1));
+                // Content is searchable but not stored in CASS_SEMANTIC_SCHEMA.
+                // Exercise stored-field hydration with the fixture's title.
                 assert_eq!(
                     stored_text(
                         &reader,
-                        QuillCassFields::compiled().content,
+                        QuillCassFields::compiled().title,
                         page.hits[0].global_docid
                     )
-                    .expect("hydrate content"),
-                    Some(content.to_owned())
+                    .expect("hydrate title"),
+                    Some("bridge session".to_owned())
                 );
                 assert_caller();
                 drop(reader);
