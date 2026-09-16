@@ -106257,6 +106257,18 @@ fn run_index_with_data(
                 &db_path,
                 "storing index idempotency result",
                 |conn| {
+                    // On a first run the data directory may not exist when
+                    // cache lookup runs. Indexing creates it, so initialize
+                    // the cache here as well before persisting the result.
+                    conn.execute(
+                        "CREATE TABLE IF NOT EXISTS idempotency_keys (
+                            key TEXT PRIMARY KEY,
+                            params_hash TEXT NOT NULL,
+                            result_json TEXT NOT NULL,
+                            created_at INTEGER NOT NULL,
+                            expires_at INTEGER NOT NULL
+                        )",
+                    )?;
                     let now_ms = chrono::Utc::now().timestamp_millis();
                     let expires_ms = now_ms + 24 * 60 * 60 * 1000; // 24 hours
                     let result_json = serde_json::to_string(&payload).unwrap_or_default();
