@@ -934,6 +934,11 @@ pub struct IndexingStats {
     pub scan_ms: u64,
     /// Time spent in indexing phase (ms)
     pub index_ms: u64,
+    /// Linux process block-write counter delta across the index run, including
+    /// final checkpointing. This is physical I/O accounting, not logical source
+    /// bytes or an attribution to one storage layer. Omitted when unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_written: Option<u64>,
     /// Per-connector breakdown
     pub connectors: Vec<ConnectorStats>,
     /// Per-provider source outcomes; unlike conversation counts this preserves
@@ -3158,17 +3163,49 @@ fn should_skip_post_full_scan_authoritative_rebuild(
 
 struct RunIndexProgressReset {
     progress: Option<Arc<IndexingProgress>>,
+    initial_write_bytes: Option<u64>,
 }
 
 impl RunIndexProgressReset {
     fn new(progress: Option<Arc<IndexingProgress>>) -> Self {
-        Self { progress }
+        Self {
+            initial_write_bytes: progress.as_ref().and_then(|_| process_index_write_bytes()),
+            progress,
+        }
     }
 }
 
 impl Drop for RunIndexProgressReset {
     fn drop(&mut self) {
+        if let Some(progress) = self.progress.as_ref()
+            && let Ok(mut stats) = progress.stats.lock()
+        {
+            stats.bytes_written = self
+                .initial_write_bytes
+                .zip(process_index_write_bytes())
+                .and_then(|(before, after)| after.checked_sub(before));
+        }
         reset_progress_to_idle(self.progress.as_ref());
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_process_index_write_bytes(text: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("write_bytes:"))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn process_index_write_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        parse_process_index_write_bytes(&fs::read_to_string("/proc/self/io").ok()?)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
     }
 }
 
@@ -60910,6 +60947,60 @@ mod tests {
             }
         }
         assert_eq!(detector.stats().consecutive_zero_scans, 2);
+    }
+
+    #[test]
+    fn gh479_write_byte_counter_parses_only_physical_writes() {
+        assert_eq!(
+            parse_process_index_write_bytes(
+                "wchar: 90000\nread_bytes: 80000\nwrite_bytes: 4096\ncancelled_write_bytes: 1024\n"
+            ),
+            Some(4096)
+        );
+        assert_eq!(parse_process_index_write_bytes("write_bytes: 0\n"), Some(0));
+        assert_eq!(
+            parse_process_index_write_bytes("write_bytes: 18446744073709551615\n"),
+            Some(u64::MAX)
+        );
+        for text in [
+            "",
+            "wchar: 42",
+            "cancelled_write_bytes: 42",
+            "write_bytes: -1",
+            "write_bytes: bad",
+            "write_bytes: 18446744073709551616",
+        ] {
+            assert_eq!(parse_process_index_write_bytes(text), None, "{text}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gh479_write_byte_counter_includes_writes_before_guard_drop() {
+        use std::io::Write;
+
+        let progress = Arc::new(IndexingProgress::default());
+        let mut file = tempfile::tempfile().unwrap();
+        let guard = RunIndexProgressReset::new(Some(Arc::clone(&progress)));
+        let before = guard.initial_write_bytes.unwrap();
+        file.write_all(&[0x5a; 65536]).unwrap();
+        file.sync_all().unwrap();
+        let observed = process_index_write_bytes().unwrap();
+        drop(guard);
+        let stats = progress.stats.lock().unwrap();
+        // A tmpfs may account zero physical writes. Concurrent process threads
+        // may add writes, so use the observed kernel delta as a lower bound.
+        assert!(stats.bytes_written.unwrap() >= observed - before);
+        assert_eq!(
+            serde_json::to_value(&*stats).unwrap()["bytes_written"].as_u64(),
+            stats.bytes_written
+        );
+        assert!(
+            serde_json::to_value(IndexingStats::default())
+                .unwrap()
+                .get("bytes_written")
+                .is_none()
+        );
     }
 
     #[test]

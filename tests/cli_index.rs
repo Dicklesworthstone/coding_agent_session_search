@@ -98,7 +98,15 @@ fn index_creates_db_and_index() {
     let mut cmd = base_cmd(tmp.path());
     cmd.args(["index", "--data-dir", data_dir.to_str().unwrap(), "--json"]);
 
-    cmd.assert().success();
+    let output = cmd.assert().success().get_output().stdout.clone();
+    let payload: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    #[cfg(target_os = "linux")]
+    assert!(
+        payload["indexing_stats"]["bytes_written"].as_u64().is_some(),
+        "Linux index summary must report its measured write counter"
+    );
+    #[cfg(not(target_os = "linux"))]
+    assert!(payload["indexing_stats"].get("bytes_written").is_none());
 
     assert!(data_dir.join("agent_search.db").exists(), "DB created");
     // Index dir should exist
