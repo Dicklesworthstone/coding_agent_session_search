@@ -128,19 +128,10 @@ fn diagnostic_truncation_preserves_utf8_boundaries() {
     assert_eq!(truncate_output(bytes, text.len()), text);
     assert_eq!(truncate_output(b"", 0), "");
     for limit in [5, 6, 7, 8] {
-        assert_eq!(
-            truncate_output(bytes, limit),
-            "café... [truncated 8 bytes]"
-        );
+        assert_eq!(truncate_output(bytes, limit), "café... [truncated 8 bytes]");
     }
-    assert_eq!(
-        truncate_output(bytes, 4),
-        "caf... [truncated 10 bytes]"
-    );
-    assert_eq!(
-        truncate_output(bytes, 0),
-        "... [truncated 13 bytes]"
-    );
+    assert_eq!(truncate_output(bytes, 4), "caf... [truncated 10 bytes]");
+    assert_eq!(truncate_output(bytes, 0), "... [truncated 13 bytes]");
 }
 
 // ============================================
