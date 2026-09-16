@@ -29839,26 +29839,34 @@ fn explicit_watch_once_connector_hint(path: &Path) -> Option<ConnectorKind> {
     }
 }
 
-fn explicit_watch_once_scan_path(kind: ConnectorKind, path: &Path) -> PathBuf {
+fn explicit_watch_once_scan_path(
+    kind: ConnectorKind,
+    requested: &Path,
+    canonical: &Path,
+) -> PathBuf {
     if kind != ConnectorKind::Omp {
-        return path.to_path_buf();
+        return canonical.to_path_buf();
     }
-    if let Some(root) = crate::connectors::omp::configured_session_root(path) {
-        return root;
-    }
+    let path = if explicit_watch_once_connector_hint(requested) == Some(ConnectorKind::Omp) {
+        requested
+    } else {
+        canonical
+    };
 
     // FAD accepts a direct `.omp` transcript as an explicit root, but an XDG
     // transcript path has no `.omp` marker. Retain the nearest `sessions`
     // root so OMP's v18 resolver can recognize and scan it.
-    if !path.to_string_lossy().contains(".omp") {
-        return path
-            .ancestors()
+    let scan_path = if let Some(root) = crate::connectors::omp::configured_session_root(path) {
+        root
+    } else if !path.to_string_lossy().contains(".omp") {
+        path.ancestors()
             .find(|ancestor| ancestor.file_name().is_some_and(|name| name == "sessions"))
             .unwrap_or(path)
-            .to_path_buf();
-    }
-
-    path.to_path_buf()
+            .to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
+    std::fs::canonicalize(&scan_path).unwrap_or(scan_path)
 }
 
 fn classify_paths(
@@ -29868,12 +29876,40 @@ fn classify_paths(
 ) -> Vec<(ConnectorKind, ScanRoot, Option<i64>, Option<i64>)> {
     // Key -> (Root, MinTS, MaxTS)
     let mut batch_map: BatchClassificationMap = HashMap::new();
+    // Keep provenance on the original roots while comparing both sides in
+    // the same path namespace, including macOS /var aliases and linked roots.
+    let match_root_paths: Vec<PathBuf> = roots
+        .iter()
+        .map(|(_, root)| {
+            if prefer_explicit_paths {
+                std::fs::canonicalize(&root.path).unwrap_or_else(|_| root.path.clone())
+            } else {
+                root.path.clone()
+            }
+        })
+        .collect();
 
-    for p in paths {
+    for requested in paths {
         let hinted_kind = prefer_explicit_paths
-            .then(|| explicit_watch_once_connector_hint(&p))
+            .then(|| explicit_watch_once_connector_hint(&requested))
             .flatten();
-        if let Ok(meta) = std::fs::metadata(&p)
+        let canonical = prefer_explicit_paths.then(|| {
+            std::fs::canonicalize(&requested).unwrap_or_else(|error| {
+                tracing::warn!(
+                    path = %requested.display(),
+                    %error,
+                    "watch-once path could not be canonicalized; it may not match a connector scan root (issue #377)"
+                );
+                requested.clone()
+            })
+        });
+        let p = canonical.as_ref().unwrap_or(&requested);
+        let hinted_kind = hinted_kind.or_else(|| {
+            prefer_explicit_paths
+                .then(|| explicit_watch_once_connector_hint(p))
+                .flatten()
+        });
+        if let Ok(meta) = std::fs::metadata(p)
             && let Ok(time) = meta.modified()
             && let Ok(dur) = time.duration_since(std::time::UNIX_EPOCH)
         {
@@ -29884,40 +29920,41 @@ fn classify_paths(
             // root derives different root-relative external IDs for the same
             // transcript, so retain only the deepest root per connector and
             // source provenance. Distinct sources remain distinct scans.
-            let mut matching_roots: Vec<(ConnectorKind, &ScanRoot)> = Vec::new();
-            for (kind, root) in roots {
+            let mut matching_roots: Vec<(ConnectorKind, &ScanRoot, &PathBuf)> = Vec::new();
+            for ((kind, root), match_root_path) in roots.iter().zip(&match_root_paths) {
                 if let Some(hinted_kind) = hinted_kind
                     && *kind != hinted_kind
                 {
                     continue;
                 }
-                if p.starts_with(&root.path)
+                if p.starts_with(match_root_path)
                     || (is_database_watch_root(*kind, root)
-                        && database_sidecar_paths(&root.path).contains(&p))
+                        && database_sidecar_paths(match_root_path).contains(p))
                 {
                     if let Some(index) =
                         matching_roots
                             .iter()
-                            .position(|(selected_kind, selected_root)| {
+                            .position(|(selected_kind, selected_root, _)| {
                                 *selected_kind == *kind && selected_root.origin == root.origin
                             })
                     {
-                        if root.path.components().count()
-                            > matching_roots[index].1.path.components().count()
+                        if match_root_path.components().count()
+                            > matching_roots[index].2.components().count()
                         {
                             matching_roots[index].1 = root;
+                            matching_roots[index].2 = match_root_path;
                         }
                     } else {
-                        matching_roots.push((*kind, root));
+                        matching_roots.push((*kind, root, match_root_path));
                     }
                 }
             }
             let matched_root = !matching_roots.is_empty();
-            for (kind, root) in matching_roots {
+            for (kind, root, match_root_path) in matching_roots {
                 let scan_path = if prefer_explicit_paths && !is_database_watch_root(kind, root) {
-                    explicit_watch_once_scan_path(kind, &p)
+                    explicit_watch_once_scan_path(kind, &requested, p)
                 } else {
-                    root.path.clone()
+                    match_root_path.clone()
                 };
                 let mut scan_root = root.clone();
                 scan_root.path = scan_path.clone();
@@ -29948,7 +29985,7 @@ fn classify_paths(
                 && !matched_root
                 && let Some(hinted_kind) = hinted_kind
             {
-                let scan_path = explicit_watch_once_scan_path(hinted_kind, &p);
+                let scan_path = explicit_watch_once_scan_path(hinted_kind, &requested, p);
                 let scan_root = ScanRoot::local(scan_path.clone());
                 let entry = batch_map
                     .entry((
@@ -31488,11 +31525,13 @@ pub mod persist {
     }
 
     fn index_writer_busy_timeout_ms() -> u64 {
+        // GH473: keep engine-local waits short; complete idempotent write
+        // transactions already have bounded retries at the CASS boundary.
         dotenvy::var("CASS_INDEX_WRITER_BUSY_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|v| *v > 0)
-            .unwrap_or(60_000)
+            .unwrap_or(10)
     }
 
     /// WAL autocheckpoint threshold (pages) for the index writer.
@@ -32474,6 +32513,34 @@ pub mod persist {
     /// keeps ticks cheap (one relaxed atomic add per 256 messages) while
     /// bounding the silent window to well under any sane threshold.
     const MAP_HEARTBEAT_MESSAGE_STRIDE: usize = 256;
+    const INNER_REDACTION_MIN_MESSAGES: usize = 512;
+    const INNER_REDACTION_MIN_TEXT_BYTES: usize = 1024 * 1024;
+
+    fn use_inner_message_redaction(convs: &[NormalizedConversation]) -> bool {
+        let [conv] = convs else {
+            return false;
+        };
+        if !super::redact_secrets::redaction_enabled()
+            || rayon::current_num_threads() <= 1
+            || conv.messages.len() < INNER_REDACTION_MIN_MESSAGES
+        {
+            return false;
+        }
+        let mut bytes = 0usize;
+        for message in &conv.messages {
+            bytes = bytes.saturating_add(message.content.len());
+            if bytes >= INNER_REDACTION_MIN_TEXT_BYTES {
+                return true;
+            }
+            for snippet in &message.snippets {
+                bytes = bytes.saturating_add(snippet.snippet_text.as_ref().map_or(0, String::len));
+                if bytes >= INNER_REDACTION_MIN_TEXT_BYTES {
+                    return true;
+                }
+            }
+        }
+        false
+    }
 
     /// Work-liveness heartbeat threaded through batched persistence
     /// (gh373/oeu5a). Mirrors the #282/#332/#366 pattern: real work ticks
@@ -32530,6 +32597,15 @@ pub mod persist {
         convs: &[NormalizedConversation],
         heartbeat: PersistHeartbeat<'_>,
     ) -> Vec<Conversation> {
+        if use_inner_message_redaction(convs) {
+            let mut redactor = super::redact_secrets::MemoizingRedactor::new();
+            return vec![map_to_internal_with_message_parallelism(
+                &convs[0],
+                Some(&mut redactor),
+                heartbeat,
+                true,
+            )];
+        }
         convs
             .par_iter()
             .map_init(
@@ -32551,8 +32627,78 @@ pub mod persist {
 
     pub(crate) fn map_to_internal_with_redactor_and_heartbeat(
         conv: &NormalizedConversation,
+        redactor: Option<&mut super::redact_secrets::MemoizingRedactor>,
+        heartbeat: PersistHeartbeat<'_>,
+    ) -> Conversation {
+        map_to_internal_with_message_parallelism(conv, redactor, heartbeat, false)
+    }
+
+    fn map_message_to_internal(
+        m: &NormalizedMessage,
+        mapped_message_index: usize,
+        should_redact: bool,
         mut redactor: Option<&mut super::redact_secrets::MemoizingRedactor>,
         heartbeat: PersistHeartbeat<'_>,
+    ) -> Message {
+        if mapped_message_index % MAP_HEARTBEAT_MESSAGE_STRIDE == 0 {
+            heartbeat.tick();
+        }
+        let content = if should_redact {
+            if let Some(r) = redactor.as_mut() {
+                r.redact_text(&m.content)
+            } else {
+                super::redact_secrets::redact_text(&m.content).into_owned()
+            }
+        } else {
+            m.content.clone()
+        };
+        let extra_json = if should_redact {
+            if let Some(r) = redactor.as_mut() {
+                r.redact_json(&m.extra)
+            } else {
+                super::redact_secrets::redact_json(&m.extra)
+            }
+        } else {
+            m.extra.clone()
+        };
+        Message {
+            id: None,
+            idx: m.idx,
+            role: map_role(&m.role),
+            author: m.author.clone(),
+            created_at: m.created_at,
+            content,
+            extra_json,
+            snippets: m
+                .snippets
+                .iter()
+                .map(|s| Snippet {
+                    id: None,
+                    file_path: s.file_path.clone(),
+                    start_line: s.start_line,
+                    end_line: s.end_line,
+                    language: s.language.clone(),
+                    snippet_text: s.snippet_text.as_ref().map(|snippet_text| {
+                        if should_redact {
+                            if let Some(r) = redactor.as_mut() {
+                                r.redact_text(snippet_text)
+                            } else {
+                                super::redact_secrets::redact_text(snippet_text).into_owned()
+                            }
+                        } else {
+                            snippet_text.clone()
+                        }
+                    }),
+                })
+                .collect(),
+        }
+    }
+
+    fn map_to_internal_with_message_parallelism(
+        conv: &NormalizedConversation,
+        mut redactor: Option<&mut super::redact_secrets::MemoizingRedactor>,
+        heartbeat: PersistHeartbeat<'_>,
+        parallel_messages: bool,
     ) -> Conversation {
         // Extract provenance from metadata (P2.2)
         let (source_id, origin_host) = extract_provenance(&conv.metadata);
@@ -32587,69 +32733,48 @@ pub mod persist {
             } else {
                 conv.metadata.clone()
             },
-            messages: conv
-                .messages
-                .iter()
-                .enumerate()
-                .map(|(mapped_message_index, m)| {
-                    // gh373/oeu5a: heartbeat during the long single-thread
-                    // redaction of one giant conversation, so the stall
-                    // watchdog sees live work between batch publications.
-                    if mapped_message_index % MAP_HEARTBEAT_MESSAGE_STRIDE == 0 {
-                        heartbeat.tick();
-                    }
-                    let content = if should_redact {
-                        if let Some(r) = redactor.as_mut() {
-                            r.redact_text(&m.content)
-                        } else {
-                            super::redact_secrets::redact_text(&m.content).into_owned()
-                        }
-                    } else {
-                        m.content.clone()
-                    };
-                    let extra_json = if should_redact {
-                        if let Some(r) = redactor.as_mut() {
-                            r.redact_json(&m.extra)
-                        } else {
-                            super::redact_secrets::redact_json(&m.extra)
-                        }
-                    } else {
-                        m.extra.clone()
-                    };
-                    Message {
-                        id: None,
-                        idx: m.idx,
-                        role: map_role(&m.role),
-                        author: m.author.clone(),
-                        created_at: m.created_at,
-                        content,
-                        extra_json,
-                        snippets: m
-                            .snippets
+            messages: if parallel_messages {
+                // At most one chunk/redactor per pool thread. Indexed chunks
+                // and ordered collection preserve the original message order.
+                let chunk_size = conv.messages.len().div_ceil(rayon::current_num_threads());
+                conv.messages
+                    .par_chunks(chunk_size)
+                    .enumerate()
+                    .map(|(chunk_index, chunk)| {
+                        let mut worker_redactor = super::redact_secrets::MemoizingRedactor::new();
+                        chunk
                             .iter()
-                            .map(|s| Snippet {
-                                id: None,
-                                file_path: s.file_path.clone(),
-                                start_line: s.start_line,
-                                end_line: s.end_line,
-                                language: s.language.clone(),
-                                snippet_text: s.snippet_text.as_ref().map(|snippet_text| {
-                                    if should_redact {
-                                        if let Some(r) = redactor.as_mut() {
-                                            r.redact_text(snippet_text)
-                                        } else {
-                                            super::redact_secrets::redact_text(snippet_text)
-                                                .into_owned()
-                                        }
-                                    } else {
-                                        snippet_text.clone()
-                                    }
-                                }),
+                            .enumerate()
+                            .map(|(index, message)| {
+                                map_message_to_internal(
+                                    message,
+                                    chunk_index * chunk_size + index,
+                                    should_redact,
+                                    Some(&mut worker_redactor),
+                                    heartbeat,
+                                )
                             })
-                            .collect(),
-                    }
-                })
-                .collect(),
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .flatten()
+                    .collect()
+            } else {
+                conv.messages
+                    .iter()
+                    .enumerate()
+                    .map(|(index, message)| {
+                        map_message_to_internal(
+                            message,
+                            index,
+                            should_redact,
+                            redactor.as_deref_mut(),
+                            heartbeat,
+                        )
+                    })
+                    .collect()
+            },
             source_id,
             origin_host,
         }
@@ -33314,6 +33439,121 @@ pub mod persist {
         /// so the stall watchdog sees live work during the minutes-long
         /// redaction window (previously zero ticks until the whole batch
         /// persisted — the proven exit(70) trigger).
+        #[test]
+        fn gh474_singleton_redaction_preserves_output_heartbeat_and_thresholds() {
+            const CHILD: &str = "CASS_TEST_GH474_CHILD";
+            if dotenvy::var(CHILD).is_err() {
+                for mode in ["full", "off"] {
+                    let output = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            "indexer::persist::persist_internal_tests::gh474_singleton_redaction_preserves_output_heartbeat_and_thresholds",
+                            "--nocapture",
+                        ])
+                        .env(CHILD, "1")
+                        .env("CASS_INDEX_REDACTION", mode)
+                        .output()
+                        .unwrap();
+                    assert!(
+                        output.status.success(),
+                        "{mode}: {} {}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+                }
+                return;
+            }
+            let enabled = super::super::redact_secrets::redaction_enabled();
+            let message_count = 769;
+            let secret = "password=abcdefgh12345678"; // Synthetic redaction fixture.
+            let conv = NormalizedConversation {
+                agent_slug: "codex".into(),
+                external_id: Some("gh474".into()),
+                title: Some(secret.into()),
+                workspace: Some(PathBuf::from("/workspace/gh474")),
+                source_path: PathBuf::from("/logs/gh474.jsonl"),
+                started_at: Some(1000),
+                ended_at: Some(2000),
+                metadata: serde_json::json!({"nested": [{"credential": secret}]}),
+                messages: (0..message_count).map(|index| NormalizedMessage {
+                    idx: (index * 2) as i64,
+                    role: ["user", "assistant", "tool", "system", "custom"][index % 5].into(),
+                    author: Some(format!("author-{index}")),
+                    created_at: Some(1000 + index as i64),
+                    content: format!("{index}: {} {secret}", "payload ".repeat(256)),
+                    extra: serde_json::json!({"nested": [{"credential": secret, "index": index}]}),
+                    snippets: vec![crate::connectors::NormalizedSnippet {
+                        file_path: Some(PathBuf::from(format!("file-{index}.rs"))),
+                        start_line: Some(1),
+                        end_line: Some(2),
+                        language: Some("rust".into()),
+                        snippet_text: Some(secret.into()),
+                    }],
+                    invocations: Vec::new(),
+                }).collect(),
+            };
+            let mut serial_redactor = super::super::redact_secrets::MemoizingRedactor::new();
+            let serial = map_to_internal_with_redactor(&conv, Some(&mut serial_redactor));
+            let serialized = serde_json::to_value(&serial).unwrap();
+            assert_eq!(serial.messages[0].content.contains(secret), !enabled);
+            for threads in [1, 4] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                pool.install(|| {
+                    assert_eq!(
+                        use_inner_message_redaction(std::slice::from_ref(&conv)),
+                        enabled && threads > 1
+                    );
+                    let progress = super::super::IndexingProgress::default();
+                    let bump = Arc::new(AtomicI64::new(0));
+                    let result = map_batch_to_internal(
+                        std::slice::from_ref(&conv),
+                        PersistHeartbeat::new(Some(&progress), Some(&bump)),
+                    );
+                    assert_eq!(serde_json::to_value(&result[0]).unwrap(), serialized);
+                    assert_eq!(progress.activity.load(Ordering::Relaxed), 4);
+                    assert!(bump.load(Ordering::Relaxed) > 0);
+                    let multi = vec![conv.clone(), conv.clone()];
+                    assert!(!use_inner_message_redaction(&multi));
+                    let mapped = map_batch_to_internal(&multi, PersistHeartbeat::NONE);
+                    assert_eq!(
+                        serde_json::to_value(&mapped).unwrap(),
+                        serde_json::json!([serialized, serialized])
+                    );
+
+                    let mut boundary = conv.clone();
+                    boundary.messages.truncate(INNER_REDACTION_MIN_MESSAGES);
+                    for message in &mut boundary.messages {
+                        message.content.clear();
+                        message.snippets.clear();
+                    }
+                    boundary.messages[0].content = "x".repeat(INNER_REDACTION_MIN_TEXT_BYTES - 1);
+                    assert!(!use_inner_message_redaction(std::slice::from_ref(
+                        &boundary
+                    )));
+                    boundary.messages[0].snippets = vec![crate::connectors::NormalizedSnippet {
+                        file_path: None,
+                        start_line: None,
+                        end_line: None,
+                        language: None,
+                        snippet_text: Some("x".into()),
+                    }];
+                    assert_eq!(
+                        use_inner_message_redaction(std::slice::from_ref(&boundary)),
+                        enabled && threads > 1
+                    );
+                    boundary.messages.pop();
+                    assert!(!use_inner_message_redaction(std::slice::from_ref(
+                        &boundary
+                    )));
+                    assert!(!use_inner_message_redaction(&[]));
+                });
+            }
+        }
+
         #[test]
         fn map_to_internal_heartbeat_ticks_per_message_stride() {
             use crate::connectors::NormalizedConversation;
@@ -39500,6 +39740,120 @@ mod tests {
             metadata: serde_json::json!({}),
             messages: msgs,
         }
+    }
+
+    #[test]
+    fn gh473_short_writer_wait_preserves_live_reader_ingest() {
+        const CHILD: &str = "CASS_TEST_GH473_CHILD";
+        if dotenvy::var(CHILD).is_err() {
+            for (value, expected) in [(None, "10"), (Some("0"), "10"), (Some("37"), "37")] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "indexer::tests::gh473_short_writer_wait_preserves_live_reader_ingest",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, expected)
+                    .env_remove("CASS_INDEX_WRITER_BUSY_TIMEOUT_MS");
+                if let Some(value) = value {
+                    command.env("CASS_INDEX_WRITER_BUSY_TIMEOUT_MS", value);
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "child failed: {} {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            }
+            return;
+        }
+        let expected = dotenvy::var(CHILD).unwrap().parse::<u64>().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("archive.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        persist::apply_index_writer_busy_timeout(&storage);
+        assert_eq!(storage.index_writer_busy_timeout_ms(), Some(expected));
+        let reader = FrankenStorage::open_readonly(&db_path).unwrap();
+        reader.raw().query("SELECT COUNT(*) FROM messages").unwrap();
+        let conv = norm_conv(Some("gh473"), vec![norm_msg(0, 100)]);
+        let completion = crate::storage::sqlite::SourceIngestLedgerEntry {
+            key: "source_ingest_v1:gh473".into(),
+            observation: "{\"complete\":true}".into(),
+        };
+        for pass in 0..3 {
+            let started = Instant::now();
+            persist::persist_conversations_batched_inner(
+                &storage,
+                None,
+                std::slice::from_ref(&conv),
+                LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                false,
+                false,
+                None,
+                persist::PersistHeartbeat::NONE,
+                Some(&completion),
+            )
+            .unwrap();
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "write/no-op pass {pass} must not incur a 60-second inner wait"
+            );
+            let rows = storage
+                .raw()
+                .query("SELECT COUNT(*) FROM messages")
+                .unwrap();
+            assert_eq!(rows[0].get_typed::<i64>(0).unwrap(), 1);
+            let rows = storage
+                .raw()
+                .query("SELECT COUNT(*) FROM conversations")
+                .unwrap();
+            assert_eq!(rows[0].get_typed::<i64>(0).unwrap(), 1);
+            assert_eq!(
+                storage
+                    .source_ingest_ledger_entries()
+                    .unwrap()
+                    .get(&completion.key),
+                Some(&completion.observation)
+            );
+        }
+        reader.close_without_checkpoint().unwrap();
+        storage
+            .raw()
+            .execute("CREATE TABLE gh473_retry(n INTEGER)")
+            .unwrap();
+        let writer = crate::franken_sync::Connection::open_existing_schema_only(
+            db_path.to_string_lossy().into_owned(),
+        )
+        .unwrap();
+        writer.execute("PRAGMA busy_timeout = 10").unwrap();
+        storage.raw().execute("BEGIN IMMEDIATE").unwrap();
+        let mut attempts = 0;
+        persist::with_concurrent_retry(2, || {
+            attempts += 1;
+            let result = writer
+                .execute("INSERT INTO gh473_retry VALUES(1)")
+                .map_err(anyhow::Error::new);
+            if attempts == 1 {
+                let err = result
+                    .as_ref()
+                    .expect_err("held writer lock must cause real contention");
+                assert!(anyhow_chain_indicates_retryable_storage_contention(err));
+                storage.raw().execute("ROLLBACK").unwrap();
+            }
+            result
+        })
+        .unwrap();
+        assert_eq!(
+            attempts, 2,
+            "whole-operation retry succeeds after lock release"
+        );
+        let rows = writer.query("SELECT COUNT(*) FROM gh473_retry").unwrap();
+        assert_eq!(rows[0].get_typed::<i64>(0).unwrap(), 1);
+        writer.close_without_checkpoint().unwrap();
+        storage.close().unwrap();
     }
 
     #[test]
@@ -55989,7 +56343,12 @@ mod tests {
                     let classified = classify_paths(vec![event.clone()], &roots, explicit);
                     assert_eq!(classified.len(), 1, "{name}: {}", event.display());
                     assert_eq!(classified[0].0, ConnectorKind::Shelley);
-                    assert_eq!(classified[0].1.path, db);
+                    let expected = if explicit {
+                        fs::canonicalize(&db).unwrap()
+                    } else {
+                        db.clone()
+                    };
+                    assert_eq!(classified[0].1.path, expected);
                     assert_eq!(classified[0].1.origin, root.origin);
                 }
             }
@@ -56016,7 +56375,12 @@ mod tests {
                 let classified = classify_paths(vec![sidecar.clone()], &roots, explicit);
                 assert_eq!(classified.len(), 1);
                 assert_eq!(classified[0].0, ConnectorKind::Devin);
-                assert_eq!(classified[0].1.path, db);
+                let expected = if explicit {
+                    fs::canonicalize(&db).unwrap()
+                } else {
+                    db.clone()
+                };
+                assert_eq!(classified[0].1.path, expected);
                 assert_eq!(classified[0].1.origin, root.origin);
                 assert_eq!(classified[0].1.platform, root.platform);
             }
@@ -56175,7 +56539,10 @@ mod tests {
 
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::Claude);
-        assert_eq!(classified[0].1.path, session);
+        assert_eq!(
+            classified[0].1.path,
+            std::fs::canonicalize(session).unwrap()
+        );
     }
 
     #[test]
@@ -56196,7 +56563,10 @@ mod tests {
 
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::Codex);
-        assert_eq!(classified[0].1.path, session);
+        assert_eq!(
+            classified[0].1.path,
+            std::fs::canonicalize(session).unwrap()
+        );
     }
 
     #[test]
@@ -56218,7 +56588,10 @@ mod tests {
         let classified = classify_paths(vec![session.clone()], &roots, true);
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::PrimeAgent);
-        assert_eq!(classified[0].1.path, session);
+        assert_eq!(
+            classified[0].1.path,
+            std::fs::canonicalize(session).unwrap()
+        );
         for path in [
             ".prime-other/agent/sessions/x.jsonl",
             ".pi/agent/sessions/x.jsonl",
@@ -56247,9 +56620,107 @@ mod tests {
 
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::Codex);
-        assert_eq!(classified[0].1.path, session);
+        assert_eq!(
+            classified[0].1.path,
+            std::fs::canonicalize(session).unwrap()
+        );
         assert!(classified[0].2.is_some());
         assert!(classified[0].3.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_paths_keeps_codex_hint_across_symlinks_and_deduplicates_aliases() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("archive/2026/01/rollout.jsonl");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, b"{}\n").unwrap();
+        let linked_dir = tmp.path().join(".codex/sessions/2026/01");
+        std::fs::create_dir_all(linked_dir.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(real.parent().unwrap(), &linked_dir).unwrap();
+        let linked = linked_dir.join("rollout.jsonl");
+        let canonical = std::fs::canonicalize(&real).unwrap();
+        let classified = classify_paths(vec![linked.clone(), linked, canonical.clone()], &[], true);
+
+        assert_eq!(classified.len(), 1);
+        assert_eq!(classified[0].0, ConnectorKind::Codex);
+        assert_eq!(classified[0].1.path, canonical);
+        assert!(classified[0].2.is_some());
+        assert!(classified[0].3.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_paths_recovers_canonical_hint_and_matches_canonical_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join(".codex/sessions/rollout.jsonl");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, b"{}\n").unwrap();
+        let link = tmp.path().join("unmarked-alias.jsonl");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let canonical = std::fs::canonicalize(&real).unwrap();
+        let root = ScanRoot::local(canonical.parent().unwrap().to_path_buf());
+
+        for roots in [Vec::new(), vec![(ConnectorKind::Codex, root)]] {
+            let classified = classify_paths(vec![link.clone()], &roots, true);
+            assert_eq!(classified.len(), 1);
+            assert_eq!(classified[0].0, ConnectorKind::Codex);
+            assert_eq!(classified[0].1.path, canonical);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_paths_preserves_remote_provenance_through_a_symlinked_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_root = tmp.path().join("archive");
+        std::fs::create_dir_all(&real_root).unwrap();
+        let session = real_root.join("session.jsonl");
+        std::fs::write(&session, b"{}\n").unwrap();
+        let linked_root = tmp.path().join("mirror-alias");
+        std::os::unix::fs::symlink(&real_root, &linked_root).unwrap();
+        let roots = vec![
+            (
+                ConnectorKind::Claude,
+                ScanRoot::remote(linked_root.clone(), Origin::remote("source-a"), None),
+            ),
+            (
+                ConnectorKind::Claude,
+                ScanRoot::remote(linked_root.clone(), Origin::remote("source-b"), None),
+            ),
+        ];
+        let classified = classify_paths(vec![linked_root.join("session.jsonl")], &roots, true);
+        let canonical = std::fs::canonicalize(&session).unwrap();
+        assert_eq!(classified.len(), 2);
+        for (kind, root, _, _) in &classified {
+            assert_eq!(*kind, ConnectorKind::Claude);
+            assert_eq!(root.path, canonical);
+        }
+        let source_ids = classified
+            .iter()
+            .map(|(_, root, _, _)| root.origin.source_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(source_ids, ["source-a", "source-b"].into_iter().collect());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_watch_once_omp_scan_root_survives_symlink_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_root = tmp.path().join("archive");
+        std::fs::create_dir_all(real_root.join("workspace")).unwrap();
+        let real = real_root.join("workspace/session.jsonl");
+        std::fs::write(&real, b"{}\n").unwrap();
+        let linked_root = tmp.path().join("share/omp/sessions");
+        std::fs::create_dir_all(linked_root.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real_root, &linked_root).unwrap();
+        let requested = linked_root.join("workspace/session.jsonl");
+        let canonical = std::fs::canonicalize(&real).unwrap();
+
+        assert_eq!(
+            explicit_watch_once_scan_path(ConnectorKind::Omp, &requested, &canonical),
+            std::fs::canonicalize(real_root).unwrap()
+        );
     }
 
     #[test]
@@ -56267,7 +56738,10 @@ mod tests {
 
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::Omp);
-        assert_eq!(classified[0].1.path, sessions_root);
+        assert_eq!(
+            classified[0].1.path,
+            std::fs::canonicalize(sessions_root).unwrap()
+        );
         assert!(classified[0].2.is_some());
         assert!(classified[0].3.is_some());
     }
@@ -56291,7 +56765,10 @@ mod tests {
 
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].0, ConnectorKind::Omp);
-        assert_eq!(classified[0].1.path, sessions_root);
+        assert_eq!(
+            classified[0].1.path,
+            std::fs::canonicalize(sessions_root).unwrap()
+        );
         assert!(classified[0].2.is_some());
         assert!(classified[0].3.is_some());
     }
