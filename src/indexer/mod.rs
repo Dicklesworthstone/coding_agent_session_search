@@ -32725,7 +32725,7 @@ pub mod persist {
         mut redactor: Option<&mut super::redact_secrets::MemoizingRedactor>,
         heartbeat: PersistHeartbeat<'_>,
     ) -> Message {
-        if mapped_message_index % MAP_HEARTBEAT_MESSAGE_STRIDE == 0 {
+        if mapped_message_index.is_multiple_of(MAP_HEARTBEAT_MESSAGE_STRIDE) {
             heartbeat.tick();
         }
         let content = if should_redact {
