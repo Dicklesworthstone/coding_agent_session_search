@@ -12837,7 +12837,10 @@ impl CassApp {
     ) {
         let items = self.source_menu_items();
         let menu_w = 44u16.min(area.width.saturating_sub(2));
-        let menu_h = (items.len() as u16 + 4).min(area.height.saturating_sub(2));
+        let menu_h = items
+            .len()
+            .saturating_add(4)
+            .min(usize::from(area.height.saturating_sub(2))) as u16;
         if menu_w == 0 || menu_h == 0 {
             return;
         }
@@ -30030,6 +30033,41 @@ mod tests {
             text.contains("* Source: work-laptop"),
             "expected normalized active source row, got: {text}"
         );
+    }
+
+    #[test]
+    fn source_filter_menu_overlay_clamps_large_source_counts_before_narrowing() {
+        // The three fixed rows put these counts at the u16 padding-overflow
+        // boundary and just beyond the item-count narrowing boundary.
+        for source_count in [65_529, 65_533] {
+            let mut app = CassApp::default();
+            app.source_filter_menu_open = true;
+            app.available_source_ids = (0..source_count)
+                .map(|index| format!("source-{index:05}"))
+                .collect();
+            app.source_filter_menu_selection = app.source_menu_total_items() - 1;
+            let last_source = format!("source-{:05}", source_count - 1);
+            app.filters.source_filter = SourceFilter::SourceId(last_source.clone());
+
+            let text = ftui_harness::buffer_to_text(&render_at_degradation(
+                &app,
+                90,
+                24,
+                ftui::render::budget::DegradationLevel::Full,
+            ));
+
+            assert!(
+                text.contains(&format!("> * Source: {last_source}")),
+                "source_count={source_count}: selected last source must remain visible: {text}"
+            );
+            assert!(
+                text.lines()
+                    .filter(|line| line.contains("Source: source-"))
+                    .count()
+                    >= 10,
+                "source_count={source_count}: menu must use the viewport rather than wrap to a tiny height: {text}"
+            );
+        }
     }
 
     #[test]
