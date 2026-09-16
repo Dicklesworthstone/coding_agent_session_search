@@ -26366,7 +26366,7 @@ mod tests {
         // Stock SQLite supplies two real WAL generations and a foreign lock
         // owner; all application opens and reads below use FrankenSQLite.
         let script = r#"
-import pathlib, shutil, sqlite3, sys
+import os, pathlib, shutil, sqlite3, sys
 p = pathlib.Path(sys.argv[1])
 seed = str(p) + '.seed'
 c = sqlite3.connect(seed)
@@ -26390,8 +26390,11 @@ pathlib.Path(str(p) + '-shm').write_bytes(old)
 c.close()
 if sys.argv[2] == 'writer':
     c = sqlite3.connect(str(p), timeout=0)
+    # Closing any SHM descriptor releases this process's POSIX locks.
+    # Keep the fixture descriptor open for the complete writer lifetime.
+    shm_fd = os.open(str(p) + '-shm', os.O_RDWR)
     c.execute('BEGIN IMMEDIATE')
-    pathlib.Path(str(p) + '-shm').write_bytes(old)
+    assert os.pwrite(shm_fd, old, 0) == len(old)
 print('ready', flush=True)
 sys.stdin.readline()
 if sys.argv[2] == 'writer':
@@ -26399,6 +26402,7 @@ if sys.argv[2] == 'writer':
     print('released', flush=True)
     sys.stdin.readline()
     c.close()
+    os.close(shm_fd)
 "#;
         struct Fixture(std::process::Child);
         impl Drop for Fixture {
@@ -26441,6 +26445,29 @@ if sys.argv[2] == 'writer':
                         output.recv_timeout(Duration::from_secs(10)).unwrap(),
                         "ready"
                     );
+                    if writer {
+                        // Witness the stock writer's real WAL_WRITE_LOCK from
+                        // another process before trusting the negative control.
+                        let probe = r#"
+import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_RDWR)
+try:
+    fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, 120, os.SEEK_SET)
+except BlockingIOError:
+    sys.exit(0)
+sys.exit('stock writer does not own WAL_WRITE_LOCK')
+"#;
+                        let probe_output = Command::new("python3")
+                            .args(["-c", probe])
+                            .arg(database_sidecar_path(&path, "-shm"))
+                            .output()
+                            .unwrap();
+                        assert!(
+                            probe_output.status.success(),
+                            "{}",
+                            String::from_utf8_lossy(&probe_output.stderr)
+                        );
+                    }
                     let fingerprint = |suffix: &str| {
                         let file = database_sidecar_path(&path, suffix);
                         (
