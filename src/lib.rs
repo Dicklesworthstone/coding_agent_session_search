@@ -445,9 +445,9 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         build_hnsw: bool,
 
-        /// Embedder to use for semantic indexing (hash, minilm, multilingual-minilm)
-        #[arg(long, default_value = "fastembed")]
-        embedder: String,
+        /// Embedder for semantic indexing (hash, minilm, multilingual-minilm); defaults to semantic policy
+        #[arg(long)]
+        embedder: Option<String>,
 
         /// Override data dir (index + db). Defaults to platform data dir.
         #[arg(long)]
@@ -40354,7 +40354,7 @@ fn doctor_human_semantic_fallback_summary(
     }
 
     Some(format!(
-        "Semantic search: {}. This is derived-search state, not archive damage; cass will not download models during doctor. Next optional command: cass models install --json, then cass index --semantic --json.",
+        "Semantic search: {}. This is derived-search state, not archive damage; cass will not download models during doctor. Next optional command: cass models install, then cass index --semantic --json.",
         derived_semantic_assets.recommended_action
     ))
 }
@@ -43943,7 +43943,7 @@ fn doctor_semantic_recommended_action(
     }
     match availability {
         "not_installed" | "needs_consent" | "model_missing" => {
-            "cass models status --json; install explicitly with cass models install --json or cass models install --from-file <dir> --json, then run cass index --semantic --json".to_string()
+            "cass models status --json; install explicitly with cass models install or cass models install --from-file <dir>, then run cass index --semantic --json".to_string()
         }
         "index_missing" | "update_available" | "index_building" => {
             "cass index --semantic --json, or keep using lexical search".to_string()
@@ -44332,11 +44332,7 @@ mod doctor_derived_semantic_asset_tests {
         assert!(!report.auto_download_allowed);
         assert!(!report.auto_download_attempted);
         assert!(!report.model_cache.safe_to_rebuild);
-        assert!(
-            report
-                .recommended_action
-                .contains("cass models install --json")
-        );
+        assert!(report.recommended_action.contains("cass models install"));
     }
 
     #[test]
@@ -44356,7 +44352,8 @@ mod doctor_derived_semantic_asset_tests {
 
         assert!(summary.contains("not archive damage"));
         assert!(summary.contains("cass will not download models during doctor"));
-        assert!(summary.contains("cass models install --json"));
+        assert!(summary.contains("cass models install"));
+        assert!(!summary.contains("cass models install --json"));
         assert!(summary.contains("cass index --semantic --json"));
     }
 
@@ -44414,19 +44411,21 @@ mod doctor_derived_semantic_asset_tests {
     }
 
     #[test]
-    fn unreadable_hnsw_mmap_is_optional_and_does_not_block_lexical() {
+    fn failed_hnsw_inspection_is_optional_and_does_not_block_lexical() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let state = semantic_state(
+        let mut state = semantic_state(
             temp.path(),
             "missing",
             "index_missing",
             false,
             Some("lexical"),
         );
+        state["semantic"]["hnsw_present"] = json!(true);
+        state["semantic"]["hnsw_state"] = json!("inspection_failed");
 
         let report = doctor_build_derived_semantic_asset_report(temp.path(), &state, true, 17);
 
-        assert_eq!(report.hnsw_index.status, "missing-or-unreadable");
+        assert_eq!(report.hnsw_index.status, "inspection-failed");
         assert_eq!(report.hnsw_index.present, Some(true));
         assert_eq!(report.hnsw_index.ready, Some(false));
         assert!(report.lexical_search_unblocked);
@@ -85805,9 +85804,13 @@ mod cli_read_db_tests {
     fn unsupported_semantic_policy_does_not_route_to_unloadable_embedder() {
         let _embedder = set_env("CASS_SEMANTIC_EMBEDDER", "snowflake-arctic-s");
 
-        assert_eq!(resolve_semantic_index_embedder("fastembed"), "fastembed");
-        assert_eq!(resolve_semantic_index_embedder("minilm"), "minilm");
-        assert_eq!(resolve_semantic_index_embedder("hash"), "hash");
+        assert_eq!(resolve_semantic_index_embedder(None), "fastembed");
+        assert_eq!(
+            resolve_semantic_index_embedder(Some("fastembed")),
+            "fastembed"
+        );
+        assert_eq!(resolve_semantic_index_embedder(Some("minilm")), "minilm");
+        assert_eq!(resolve_semantic_index_embedder(Some("hash")), "hash");
     }
 
     #[test]
@@ -105422,7 +105425,7 @@ fn run_index_with_data(
     data_dir_override: Option<PathBuf>,
     semantic: bool,
     build_hnsw: bool,
-    embedder: String,
+    embedder: Option<String>,
     progress: ProgressResolved,
     output_format: Option<RobotFormat>,
     idempotency_key: Option<String>,
@@ -105449,7 +105452,7 @@ fn run_index_with_data(
 
     let data_dir = resolve_data_dir(&data_dir_override, db_override.as_ref());
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-    let embedder = resolve_semantic_index_embedder(&embedder);
+    let embedder = resolve_semantic_index_embedder(embedder.as_deref());
 
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
@@ -106254,6 +106257,18 @@ fn run_index_with_data(
                 &db_path,
                 "storing index idempotency result",
                 |conn| {
+                    // On a first run the data directory may not exist when
+                    // cache lookup runs. Indexing creates it, so initialize
+                    // the cache here as well before persisting the result.
+                    conn.execute(
+                        "CREATE TABLE IF NOT EXISTS idempotency_keys (
+                            key TEXT PRIMARY KEY,
+                            params_hash TEXT NOT NULL,
+                            result_json TEXT NOT NULL,
+                            created_at INTEGER NOT NULL,
+                            expires_at INTEGER NOT NULL
+                        )",
+                    )?;
                     let now_ms = chrono::Utc::now().timestamp_millis();
                     let expires_ms = now_ms + 24 * 60 * 60 * 1000; // 24 hours
                     let result_json = serde_json::to_string(&payload).unwrap_or_default();
@@ -117778,7 +117793,7 @@ fn run_sources_sync(
             Some(data_dir), // data_dir
             false,          // semantic
             false,          // build_hnsw
-            "fastembed".to_string(),
+            None,           // embedder follows semantic policy
             progress,
             output_format,
             None,  // idempotency_key
@@ -118008,7 +118023,7 @@ fn run_sources_reingest(
         Some(data_dir.clone()), // data_dir (existing mirror root is discovered here)
         false,                  // semantic
         false,                  // build_hnsw
-        "fastembed".to_string(),
+        None,                   // embedder follows semantic policy
         progress,
         output_format,
         None,  // idempotency_key
@@ -120379,11 +120394,11 @@ fn parse_models_backfill_tier(raw: &str) -> CliResult<crate::search::semantic_ma
     }
 }
 
-fn resolve_semantic_index_embedder(raw: &str) -> String {
-    let requested = raw.trim();
-    if !matches!(requested, "fastembed" | "minilm") {
-        return requested.to_string();
+fn resolve_semantic_index_embedder(raw: Option<&str>) -> String {
+    if let Some(requested) = raw {
+        return requested.trim().to_string();
     }
+    let requested = "fastembed";
 
     let policy = crate::search::policy::SemanticPolicy::resolve(
         &crate::search::policy::CliSemanticOverrides::default(),
@@ -120626,9 +120641,8 @@ fn run_models_backfill_batch(
         .map(str::to_string)
         .unwrap_or_else(|| match tier {
             TierKind::Fast => "hash".to_string(),
-            TierKind::Quality => "fastembed".to_string(),
+            TierKind::Quality => resolve_semantic_index_embedder(None),
         });
-    let embedder_type = resolve_semantic_index_embedder(&embedder_type);
     let embedder_valid = embedder_type == "hash"
         || crate::search::fastembed_embedder::FastEmbedder::canonical_name(&embedder_type)
             .is_some();

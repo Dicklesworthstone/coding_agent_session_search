@@ -337,11 +337,10 @@
         },
         {
           "name": "embedder",
-          "description": "Embedder to use for semantic indexing (hash, minilm, multilingual-minilm)",
+          "description": "Embedder for semantic indexing (hash, minilm, multilingual-minilm); defaults to semantic policy",
           "arg_type": "option",
           "value_type": "string",
-          "required": false,
-          "default": "fastembed"
+          "required": false
         },
         {
           "name": "data-dir",

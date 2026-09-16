@@ -698,7 +698,9 @@ schemas: (auto-generated from contract)
       - feature_compiled_in: boolean
       - hint: ?
       - hnsw_path: ?
+      - hnsw_present: boolean
       - hnsw_ready: boolean
+      - hnsw_state: string
       - model_dir: ?
       - preferred_backend: string
       - progressive_ready: boolean
@@ -2577,7 +2579,9 @@ schemas: (auto-generated from contract)
       - feature_compiled_in: boolean
       - hint: ?
       - hnsw_path: ?
+      - hnsw_present: boolean
       - hnsw_ready: boolean
+      - hnsw_state: string
       - model_dir: ?
       - preferred_backend: string
       - progressive_ready: boolean
@@ -3063,7 +3067,9 @@ schemas: (auto-generated from contract)
         - feature_compiled_in: boolean
         - hint: ?
         - hnsw_path: ?
+        - hnsw_present: boolean
         - hnsw_ready: boolean
+        - hnsw_state: string
         - model_dir: ?
         - preferred_backend: string
         - progressive_ready: boolean
@@ -3653,7 +3659,9 @@ schemas: (auto-generated from contract)
       - feature_compiled_in: boolean
       - hint: ?
       - hnsw_path: ?
+      - hnsw_present: boolean
       - hnsw_ready: boolean
+      - hnsw_state: string
       - model_dir: ?
       - preferred_backend: string
       - progressive_ready: boolean
@@ -4046,7 +4054,9 @@ schemas: (auto-generated from contract)
       - feature_compiled_in: boolean
       - hint: ?
       - hnsw_path: ?
+      - hnsw_present: boolean
       - hnsw_ready: boolean
+      - hnsw_state: string
       - model_dir: ?
       - preferred_backend: string
       - progressive_ready: boolean
@@ -4250,7 +4260,9 @@ schemas: (auto-generated from contract)
         - feature_compiled_in: boolean
         - hint: ?
         - hnsw_path: ?
+        - hnsw_present: boolean
         - hnsw_ready: boolean
+        - hnsw_state: string
         - inspected: boolean
         - model_dir: ?
         - preferred_backend: string

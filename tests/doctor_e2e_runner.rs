@@ -640,15 +640,18 @@ fn doctor_e2e_human_output_aligns_with_robot_recommended_actions() {
         .as_str()
         .expect("derived semantic recommended_action");
     assert!(
-        derived_action.contains("cass models install --json"),
+        derived_action.contains("cass models install"),
         "fixture should exercise explicit semantic model guidance: {derived:#}"
     );
     assert!(
         human.contains("not archive damage")
             && human.contains("cass will not download models during doctor")
-            && human.contains("cass models install --json"),
+            && human.contains("cass models install"),
         "human semantic fallback copy should reflect the robot derived semantic fields:\n{human}"
     );
+    assert!(!derived_action.contains("cass models install --json"));
+    assert!(!derived_action.contains("--from-file <dir> --json"));
+    assert!(!human.contains("cass models install --json"));
 }
 
 #[test]
