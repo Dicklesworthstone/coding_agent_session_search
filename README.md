@@ -3367,8 +3367,10 @@ The published SQLite repair covers the reserved-page WAL conflict in GH#462;
 upstream GH#411 is also closed. Neither proves recovery of an already damaged
 archive. `franken-agent-detection =0.3.0` is published. SQLite `0.4.2` adds
 explicit derived WAL-index recovery for read-only opens (GH#477); its
-qualification and publication are pending, along with `frankensearch =0.6.1`
-publication and CASS runtime qualification.
+upstream recovery, compiler, and package gates passed, and all five updated
+SQLite packages were published on 2026-09-16 with matching verified checksums.
+`frankensearch =0.6.1` publication and CASS consumer runtime qualification
+remain pending.
 Until those complete, the lockfile and table below describe the previous graph;
 the candidate must not be released. The build guard enforces the reviewed
 per-package SQLite versions, a single resolution per package, and registry sources.
