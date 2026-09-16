@@ -510,7 +510,7 @@ pub fn agent_css_class(slug: &str) -> &'static str {
         "cody" | "sourcegraph" => "agent-cody",
         "windsurf" => "agent-windsurf",
         "amp" => "agent-amp",
-        "grok" => "agent-grok",
+        "grok" | "grok_bot" => "agent-grok",
         "cline" | "clawdbot" | "kimi" => "agent-gemini",
         "opencode" | "qwen" => "agent-codex",
         "pi_agent" | "omp" | "factory" | "droid" => "agent-aider",
@@ -519,7 +519,7 @@ pub fn agent_css_class(slug: &str) -> &'static str {
         "crush" => "agent-amp",
         "hermes" => "agent-hermes",
         "goose" => "agent-goose",
-        "openhands" | "open_hands" => "agent-aider",
+        "openhands" | "open_hands" | "shelley" => "agent-aider",
         "muse" | "muse_code" => "agent-amp",
         "prime_agent" => "agent-codex",
         "kiro" => "agent-gemini",
@@ -1608,6 +1608,10 @@ mod tests {
         assert_eq!(agent_css_class("oh_my_pipeline"), "agent-default");
         assert_eq!(agent_css_class("hermes"), "agent-hermes");
         assert_eq!(agent_css_class("goose"), "agent-goose");
+        assert_eq!(agent_css_class("shelley"), "agent-aider");
+        for alias in ["grok", "grok_bot", "grok-bot"] {
+            assert_eq!(agent_css_class(alias), "agent-grok", "Grok alias {alias:?}");
+        }
         assert_eq!(agent_css_class("unknown"), "agent-default");
     }
 
@@ -1632,8 +1636,8 @@ mod tests {
         assert_eq!(agent_display_name("qwen"), "Qwen");
         assert_eq!(agent_display_name("unknown"), "AI Assistant");
         assert_eq!(agent_display_name("shelley"), "Shelley");
-        assert_eq!(agent_css_class("shelley"), "agent-default");
         assert_eq!(agent_display_name("grok_bot"), "Grok Bot");
+        assert_eq!(agent_display_name("grok-bot"), "Grok Bot");
     }
 
     #[test]
