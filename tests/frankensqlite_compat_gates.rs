@@ -56,7 +56,12 @@ fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
     let manifest: toml::Table =
         toml::from_str(include_str!("../Cargo.toml")).expect("parse Cargo.toml");
     for (table_name, dependency_name, package_name, requirement) in [
-        ("dependencies", "frankensqlite", "fsqlite", FACADE_REQUIREMENT),
+        (
+            "dependencies",
+            "frankensqlite",
+            "fsqlite",
+            FACADE_REQUIREMENT,
+        ),
         (
             "dependencies",
             "fsqlite-types",
@@ -167,8 +172,7 @@ fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
             .and_then(toml::Value::as_str)
             .unwrap_or_default();
         assert_eq!(
-            source,
-            "registry+https://github.com/rust-lang/crates.io-index",
+            source, "registry+https://github.com/rust-lang/crates.io-index",
             "{name} resolved away from the pinned crates.io release"
         );
     }
@@ -394,7 +398,9 @@ fn cass_v15_open_repairs_sparse_wal_reserved_freelist_without_losing_rows() {
             for index in 0..leaves {
                 let offset = 8 + index * 4;
                 let leaf = u32::from_be_bytes(
-                    page[offset..offset + 4].try_into().expect("leaf page number"),
+                    page[offset..offset + 4]
+                        .try_into()
+                        .expect("leaf page number"),
                 );
                 assert!((2..=PAGE_COUNT).contains(&leaf), "invalid leaf {leaf}");
                 assert!(seen.insert(leaf), "duplicate free page {leaf}");
@@ -402,7 +408,10 @@ fn cass_v15_open_repairs_sparse_wal_reserved_freelist_without_losing_rows() {
             assert!(seen.len() <= usize::try_from(count).expect("count fits usize"));
             trunk = u32::from_be_bytes(page[..4].try_into().expect("next trunk"));
         }
-        assert_eq!(seen.len(), usize::try_from(count).expect("count fits usize"));
+        assert_eq!(
+            seen.len(),
+            usize::try_from(count).expect("count fits usize")
+        );
         seen.into_iter().collect()
     }
 

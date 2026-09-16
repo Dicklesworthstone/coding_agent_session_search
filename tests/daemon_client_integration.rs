@@ -510,7 +510,9 @@ mod native_daemon_process {
 
     use coding_agent_search::daemon::{DaemonClientConfig, UdsDaemonClient};
     use coding_agent_search::search::fastembed_embedder::FastEmbedder;
-    use coding_agent_search::search::model_download::{ModelManifest, compute_sha256, model_file_path};
+    use coding_agent_search::search::model_download::{
+        ModelManifest, compute_sha256, model_file_path,
+    };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -606,7 +608,11 @@ mod native_daemon_process {
     }
 
     fn verify_supplied_bundle(source: &Path, manifest: &ModelManifest) -> TestResult {
-        assert_eq!(manifest.files.len(), 5, "the attested bundle has five files");
+        assert_eq!(
+            manifest.files.len(),
+            5,
+            "the attested bundle has five files"
+        );
         for file in &manifest.files {
             let path = model_file_path(source, file)
                 .ok_or_else(|| format!("missing supplied native asset {}", file.name))?;
@@ -678,7 +684,11 @@ mod native_daemon_process {
             );
         }
         assert_ne!(expected_vectors[0], expected_vectors[1]);
-        assert_vector_bits(&expected_vectors[0], &expected_vectors[3], "duplicate input");
+        assert_vector_bits(
+            &expected_vectors[0],
+            &expected_vectors[3],
+            "duplicate input",
+        );
         // Do not retain a second native model while the child loads its own.
         drop(direct);
 
@@ -746,7 +756,10 @@ mod native_daemon_process {
         client.connect()?;
         let (connection, verifier) = client.attestation_channel(&data)?;
         assert_eq!(connection.embedding_identity, expected_identity);
-        assert_eq!(connection.model_category, ModelCategory::TransformerEmbedder);
+        assert_eq!(
+            connection.model_category,
+            ModelCategory::TransformerEmbedder
+        );
         assert_eq!(
             connection.executable_fingerprint,
             frankensearch::daemon_executable_fingerprint(&hex::decode(&binary_sha)?)
@@ -797,7 +810,11 @@ mod native_daemon_process {
             .expect_err("same dimension must not admit a different native model");
         assert!(matches!(error, DaemonError::InvalidInput(_)));
         assert!(error.to_string().contains(&format!("expected {wrong_id}")));
-        assert!(error.to_string().contains(&format!("received {expected_id}")));
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("received {expected_id}"))
+        );
         drop(wrong_client);
 
         let (mut wrong_connection, verifier) = client.attestation_channel(&data)?;
