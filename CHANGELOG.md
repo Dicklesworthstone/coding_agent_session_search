@@ -45,6 +45,12 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 ### Fixed
 
+- TUI source menus remain visible with more than 65,000 sources, and timestamp
+  sparklines handle the full timestamp range without arithmetic overflow.
+- Source names reject Windows drive prefixes and alternate-stream separators,
+  keeping mirror paths under the configured remote-source directory.
+- Trust correlation ignores unsupported repository identifier prefixes instead
+  of panicking when commit subjects contain a matching Unicode prefix.
 - `view` and `expand` bound context ranges safely even at the largest accepted
   context value, avoiding integer overflow near the beginning or end of a session.
 - Index idempotency replay rejects malformed or non-object cached results and
