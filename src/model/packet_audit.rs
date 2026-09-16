@@ -35,13 +35,18 @@ pub const PACKET_EQUIVALENCE_AUDIT_ENV: &str = "CASS_INDEXER_PACKET_EQUIVALENCE_
 /// Returns `true` when the env knob explicitly opts in. Anything else
 /// (unset, "0", "false", "no", "off") leaves the audit disabled.
 pub fn packet_equivalence_audit_enabled() -> bool {
-    match dotenvy::var(PACKET_EQUIVALENCE_AUDIT_ENV) {
-        Ok(value) => matches!(
+    packet_equivalence_audit_enabled_from(
+        dotenvy::var(PACKET_EQUIVALENCE_AUDIT_ENV).ok().as_deref(),
+    )
+}
+
+fn packet_equivalence_audit_enabled_from(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
-        ),
-        Err(_) => false,
-    }
+        )
+    })
 }
 
 /// Tolerances applied while comparing packets. Each field documents *why*
@@ -296,15 +301,6 @@ mod tests {
     use crate::model::types::{Conversation, Message, MessageRole, Snippet};
     use serde_json::json;
     use std::path::PathBuf;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-    }
-
     fn raw_conversation() -> NormalizedConversation {
         NormalizedConversation {
             agent_slug: "codex".to_string(),
@@ -510,47 +506,25 @@ mod tests {
 
     #[test]
     fn audit_env_gate_is_off_by_default_and_respects_explicit_opt_in() {
-        let _guard = env_lock();
-        let previous = std::env::var(PACKET_EQUIVALENCE_AUDIT_ENV).ok();
-
-        // SAFETY: single-threaded test holding env_lock; restored below.
-        unsafe {
-            std::env::remove_var(PACKET_EQUIVALENCE_AUDIT_ENV);
-        }
         assert!(
-            !packet_equivalence_audit_enabled(),
+            !packet_equivalence_audit_enabled_from(None),
             "audit must default to OFF so production cost stays at zero"
         );
 
-        for value in ["1", "true", "TRUE", "yes", "on"] {
-            // SAFETY: single-threaded test holding env_lock.
-            unsafe {
-                std::env::set_var(PACKET_EQUIVALENCE_AUDIT_ENV, value);
-            }
+        for value in ["1", "true", "TRUE", "yes", "on", " YeS \n", "\tON\t"] {
             assert!(
-                packet_equivalence_audit_enabled(),
+                packet_equivalence_audit_enabled_from(Some(value)),
                 "value {value:?} should opt into the audit"
             );
         }
 
-        for value in ["0", "false", "no", "off", ""] {
-            // SAFETY: single-threaded test holding env_lock.
-            unsafe {
-                std::env::set_var(PACKET_EQUIVALENCE_AUDIT_ENV, value);
-            }
+        for value in [
+            "0", "false", "no", "off", "", " \t\n", "2", "enabled", "truex",
+        ] {
             assert!(
-                !packet_equivalence_audit_enabled(),
+                !packet_equivalence_audit_enabled_from(Some(value)),
                 "value {value:?} must NOT opt into the audit"
             );
-        }
-
-        // Restore the caller's env to keep parallel tests deterministic.
-        // SAFETY: single-threaded test holding env_lock.
-        unsafe {
-            match previous {
-                Some(v) => std::env::set_var(PACKET_EQUIVALENCE_AUDIT_ENV, v),
-                None => std::env::remove_var(PACKET_EQUIVALENCE_AUDIT_ENV),
-            }
         }
     }
 
