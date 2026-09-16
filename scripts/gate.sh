@@ -275,11 +275,11 @@ run_ubs() {
     expected="$(tr -d '[:space:]' < .github/workflows/ubs-version.txt)"
     # The runner verifies its language modules against embedded release hashes.
     # Updating the pin also requires reviewing the new runner digest here.
-    if [ "$expected" != v5.4.3 ]; then
+    if [ "$expected" != v5.4.4 ]; then
         echo "gate: no reviewed UBS runner digest for ${expected}" >&2
         return 1
     fi
-    expected_sha=656f1a449754531ae3f5362ddb96566bb2ab0a884e5f3d0074a79bc22318a598
+    expected_sha=bdeccbb35f2056e6177c73b3f0f9966d20d1cbeff22b7f084133c4a6ac625ee2
     # Keep both runner and modules private: a different pinned UBS invocation
     # would otherwise replace the shared module cache while this one scans.
     tool_dir="$(mktemp -d -t cass-gate-ubs.XXXXXX)" || return 1
