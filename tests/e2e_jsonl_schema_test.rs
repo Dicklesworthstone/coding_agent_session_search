@@ -979,6 +979,7 @@ fn e2e_subprocess_sources_cannot_mutate_the_parent_environment() -> SchemaTestRe
         "tests/metamorphic_stats.rs",
         "tests/pages_preview_integration.rs",
         "tests/regex_cache.rs",
+        "tests/regression_behavioral.rs",
         "tests/semantic_integration.rs",
         "tests/storage.rs",
         "tests/tui_smoke.rs",

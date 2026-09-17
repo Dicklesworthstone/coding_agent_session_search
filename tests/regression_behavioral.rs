@@ -12,7 +12,6 @@
 //! Each test category catches a CLASS of bugs, not just specific instances.
 
 use assert_cmd::cargo::cargo_bin_cmd;
-use serial_test::serial;
 use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
@@ -20,7 +19,59 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 mod util;
-use util::EnvGuard;
+
+/// Run environment-dependent detection in its own process. A serial mutex
+/// cannot isolate HOME from the unannotated CLI tests running beside it.
+fn run_detection_in_child(test_name: &str) -> bool {
+    const CHILD_TEST: &str = "CASS_REGRESSION_DETECTION_CHILD";
+    if dotenvy::var(CHILD_TEST).ok().as_deref() == Some(test_name) {
+        return false;
+    }
+
+    let home = TempDir::new().unwrap();
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", test_name, "--nocapture"])
+        .env_clear()
+        .current_dir(home.path())
+        .env(CHILD_TEST, test_name)
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("XDG_DATA_HOME", home.path().join(".local/share"))
+        .env("RUST_MIN_STACK", "134217728");
+    // Preserve executable and dynamic-library lookup, but no connector roots.
+    for key in [
+        "PATH",
+        "SystemRoot",
+        "WINDIR",
+        "LD_LIBRARY_PATH",
+        "DYLD_LIBRARY_PATH",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    let output = util::timeout::spawn_with_timeout_or_diag(
+        command,
+        test_name,
+        Some(home.path()),
+        Duration::from_secs(60),
+    );
+    assert!(
+        output.status.success(),
+        "isolated detection failed: {:?}\nstdout={}\nstderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains(&format!("cass-detection-child-ok:{test_name}")),
+        "detection child did not reach its assertions"
+    );
+    true
+}
 
 // =============================================================================
 // PERFORMANCE TESTS - Catch operations that become unexpectedly slow
@@ -30,11 +81,7 @@ use util::EnvGuard;
 ///
 /// This test would have caught the Aider detect() bug where it was doing
 /// a recursive WalkDir scan on every call, making it O(files) instead of O(1).
-// qu81y documented exception: in-process detect() has no root-injection
-// seam, so this test genuinely depends on a HOME override and must be
-// serialized against the other env-dependent detect test below.
 #[test]
-#[serial]
 fn detect_must_complete_within_100ms_all_connectors() {
     use coding_agent_search::connectors::Connector;
     use coding_agent_search::connectors::aider::AiderConnector;
@@ -47,8 +94,10 @@ fn detect_must_complete_within_100ms_all_connectors() {
     use coding_agent_search::connectors::gemini::GeminiConnector;
     use coding_agent_search::connectors::opencode::OpenCodeConnector;
 
-    let tmp = TempDir::new().unwrap();
-    let home = tmp.path();
+    if run_detection_in_child("detect_must_complete_within_100ms_all_connectors") {
+        return;
+    }
+    let home = std::path::PathBuf::from(dotenvy::var("HOME").unwrap());
 
     // Create deep nested directories to stress-test any accidental recursive scanning
     let deep_path = home.join("a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q/r/s/t");
@@ -60,8 +109,6 @@ fn detect_must_complete_within_100ms_all_connectors() {
     for i in 0..100 {
         fs::write(many_files.join(format!("file_{i}.txt")), "content").unwrap();
     }
-
-    let _guard = EnvGuard::set("HOME", home.to_string_lossy());
 
     let connectors: Vec<(&str, Box<dyn Connector>)> = vec![
         ("aider", Box::new(AiderConnector::new())),
@@ -96,18 +143,19 @@ fn detect_must_complete_within_100ms_all_connectors() {
         "Performance regression in detect():\n{}",
         failures.join("\n")
     );
+    println!("cass-detection-child-ok:detect_must_complete_within_100ms_all_connectors");
 }
 
 /// Stress test: detect() must stay fast even with many nested directories.
-// qu81y documented exception: see detect_must_complete_within_100ms_all_connectors.
 #[test]
-#[serial]
 fn aider_detect_must_not_scan_recursively() {
     use coding_agent_search::connectors::Connector;
     use coding_agent_search::connectors::aider::AiderConnector;
 
-    let tmp = TempDir::new().unwrap();
-    let home = tmp.path();
+    if run_detection_in_child("aider_detect_must_not_scan_recursively") {
+        return;
+    }
+    let home = std::path::PathBuf::from(dotenvy::var("HOME").unwrap());
 
     // Create a massive directory tree (10*10*10 = 1000 directories)
     for a in 0..10 {
@@ -119,12 +167,6 @@ fn aider_detect_must_not_scan_recursively() {
                 fs::write(path.join(".aider.chat.history.md"), "decoy").unwrap();
             }
         }
-    }
-
-    let _guard = EnvGuard::set("HOME", home.to_string_lossy());
-    // SAFETY: Test-only env var manipulation
-    unsafe {
-        std::env::remove_var("CASS_AIDER_DATA_ROOT");
     }
 
     let connector = AiderConnector::new();
@@ -141,6 +183,7 @@ fn aider_detect_must_not_scan_recursively() {
         "Aider detect() appears to be scanning recursively. 10 calls took {:?}",
         elapsed
     );
+    println!("cass-detection-child-ok:aider_detect_must_not_scan_recursively");
 }
 
 // =============================================================================
@@ -953,7 +996,6 @@ struct TestEnv {
     codex_home: std::path::PathBuf,
     claude_home: std::path::PathBuf,
     data_dir: std::path::PathBuf,
-    _guards: Vec<EnvGuard>,
 }
 
 impl TestEnv {
@@ -968,18 +1010,12 @@ impl TestEnv {
         fs::create_dir_all(&codex_home).unwrap();
         fs::create_dir_all(&claude_home).unwrap();
 
-        let guards = vec![
-            EnvGuard::set("HOME", home.to_string_lossy()),
-            EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy()),
-        ];
-
         Self {
             _tmp: tmp,
             home,
             codex_home,
             claude_home,
             data_dir,
-            _guards: guards,
         }
     }
 
@@ -1071,6 +1107,7 @@ impl TestEnv {
             .args(["search", query, "--robot", "--data-dir"])
             .arg(&self.data_dir)
             .env("HOME", &self.home)
+            .env("CODEX_HOME", &self.codex_home)
             .output()
             .unwrap()
     }
@@ -1080,6 +1117,7 @@ impl TestEnv {
             .args(["search", query, "--robot", "--agent", agent, "--data-dir"])
             .arg(&self.data_dir)
             .env("HOME", &self.home)
+            .env("CODEX_HOME", &self.codex_home)
             .output()
             .unwrap();
 
