@@ -4,11 +4,14 @@
 //! embedding and reranking. It implements the `DaemonClient` trait from
 //! `search::daemon_client` for integration with the fallback wrappers.
 
-use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+mod exchange;
+mod transport;
+
+use std::io::Read;
+#[cfg(test)]
+use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -19,17 +22,16 @@ use frankensearch::{
 };
 use fs2::FileExt;
 use parking_lot::Mutex;
-use tracing::{debug, info, warn};
+use tracing::debug;
 
-use super::protocol::{
-    EmbeddingJobInfo, ErrorCode, FramedMessage, HealthStatus, PROTOCOL_VERSION, Request, Response,
-    decode_message, default_socket_path, encode_message,
-};
+use super::protocol::{EmbeddingJobInfo, HealthStatus, Request, Response, default_socket_path};
+#[cfg(test)]
+use super::protocol::{FramedMessage, PROTOCOL_VERSION, decode_message, encode_message};
 use super::worker::EmbeddingJobConfig;
 use super::{
     DAEMON_ATTESTATION_PROTOCOL_REVISION, DaemonRunLockMetadata, daemon_run_lock_path,
     daemon_socket_endpoint_fingerprint, daemon_socket_path_for_data_dir,
-    daemon_spawn_guard_lock_path, load_daemon_attestation_key, published_lexical_generation,
+    load_daemon_attestation_key, published_lexical_generation,
 };
 use crate::search::daemon_client::{DaemonClient, DaemonError};
 
@@ -58,9 +60,10 @@ fn unexpected_response(response: Response) -> DaemonError {
 pub struct DaemonClientConfig {
     /// Path to the Unix socket.
     pub socket_path: PathBuf,
-    /// Connection timeout.
+    /// Shared connection/startup budget, including spawn-lock admission.
     pub connect_timeout: Duration,
-    /// Request timeout.
+    /// Whole exchange budget, including encoding, connection admission and I/O.
+    /// Filesystem/process calls and decoding are cooperatively checked.
     pub request_timeout: Duration,
     /// Whether to auto-spawn daemon if not running.
     pub auto_spawn: bool,
@@ -156,12 +159,6 @@ impl UdsDaemonClient {
         *self.last_health_check.lock() = None;
     }
 
-    fn install_connection(&self, stream: UnixStream) {
-        *self.connection.lock() = Some(stream);
-        *self.last_health_check.lock() = None;
-        self.available.store(true, Ordering::SeqCst);
-    }
-
     fn validate_embedder_id(&self, actual: &str) -> Result<(), DaemonError> {
         if let Some(expected) = self.config.expected_embedder_id.as_deref()
             && actual != expected
@@ -173,349 +170,11 @@ impl UdsDaemonClient {
         Ok(())
     }
 
-    /// Connect to the daemon, optionally spawning it if not running.
-    pub fn connect(&self) -> Result<(), DaemonError> {
-        // Try to connect to existing daemon
-        if let Ok(stream) = self.try_connect() {
-            self.install_connection(stream);
-            debug!(socket = %self.config.socket_path.display(), "Connected to existing daemon");
-            return Ok(());
-        }
-
-        // If auto-spawn is enabled and connection failed, try to spawn
-        if self.config.auto_spawn {
-            info!("Daemon not running, attempting to spawn");
-            self.spawn_daemon()?;
-
-            // Wait for daemon to start and retry connection
-            for attempt in 0..10 {
-                std::thread::sleep(Duration::from_millis(100 * (attempt + 1)));
-                if let Ok(stream) = self.try_connect() {
-                    self.install_connection(stream);
-                    info!(
-                        socket = %self.config.socket_path.display(),
-                        attempts = attempt + 1,
-                        "Connected to newly spawned daemon"
-                    );
-                    return Ok(());
-                }
-            }
-
-            return Err(DaemonError::Unavailable(
-                "daemon failed to start within timeout".to_string(),
-            ));
-        }
-
-        Err(DaemonError::Unavailable(format!(
-            "daemon not running at {}",
-            self.config.socket_path.display()
-        )))
-    }
-
-    /// Try to connect to the daemon socket.
-    fn try_connect(&self) -> std::io::Result<UnixStream> {
-        let stream = UnixStream::connect(&self.config.socket_path)?;
-        stream.set_read_timeout(Some(self.config.request_timeout))?;
-        stream.set_write_timeout(Some(self.config.request_timeout))?;
-        Ok(stream)
-    }
-
-    /// Spawn the daemon process.
-    fn spawn_daemon(&self) -> Result<(), DaemonError> {
-        let binary = self
-            .config
-            .daemon_binary
-            .clone()
-            .or_else(|| std::env::current_exe().ok())
-            .ok_or_else(|| {
-                DaemonError::Unavailable("cannot determine daemon binary path".to_string())
-            })?;
-
-        // Use a file lock to prevent multiple processes from spawning the daemon simultaneously
-        let lock_path = daemon_spawn_guard_lock_path(&self.config.socket_path);
-
-        let mut create_options = std::fs::OpenOptions::new();
-        create_options
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW);
-        let lock_file = match create_options.open(&lock_path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let mut existing_options = std::fs::OpenOptions::new();
-                existing_options
-                    .read(true)
-                    .write(true)
-                    .custom_flags(libc::O_NOFOLLOW);
-                existing_options.open(&lock_path).map_err(|e| {
-                    DaemonError::Unavailable(format!("failed to open spawn lock: {}", e))
-                })?
-            }
-            Err(e) => {
-                return Err(DaemonError::Unavailable(format!(
-                    "failed to create spawn lock: {}",
-                    e
-                )));
-            }
-        };
-        let lock_metadata = lock_file.metadata().map_err(|error| {
-            DaemonError::Unavailable(format!("failed to inspect spawn lock: {error}"))
-        })?;
-        if !lock_metadata.file_type().is_file() || lock_metadata.nlink() != 1 {
-            return Err(DaemonError::Unavailable(
-                "refusing to use a non-regular or multiply-linked spawn lock".to_string(),
-            ));
-        }
-
-        // Acquire exclusive lock (blocks until available) so concurrent clients
-        // don't all try to auto-spawn the daemon at once.
-        lock_file.lock_exclusive().map_err(|e| {
-            DaemonError::Unavailable(format!("failed to acquire spawn lock: {}", e))
-        })?;
-
-        // Re-check if daemon is already running now that we hold the lock
-        if UnixStream::connect(&self.config.socket_path).is_ok() {
-            debug!("Daemon already running, skipping spawn");
-            return Ok(());
-        }
-
-        remove_stale_daemon_socket(&self.config.socket_path)?;
-
-        // Spawn daemon in background. A custom data directory is part of the
-        // authenticated channel, so it must be forwarded to the resident
-        // process rather than silently serving the platform default.
-        let mut command = Command::new(&binary);
-        command
-            .arg("daemon")
-            .arg("--socket")
-            .arg(&self.config.socket_path);
-        if let Some(data_dir) = &self.config.data_dir {
-            command.arg("--data-dir").arg(data_dir);
-        }
-        let result = command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-
-        match result {
-            Ok(mut child) => {
-                info!(
-                    pid = child.id(),
-                    binary = %binary.display(),
-                    socket = %self.config.socket_path.display(),
-                    "Spawned daemon process"
-                );
-                self.wait_for_spawned_daemon_ready(&mut child)?;
-                // Reap the child in a background thread to avoid zombie processes.
-                // The daemon is long-lived, so we just detach and let it run.
-                // ubs:ignore — detached reaper thread intentionally waits on the
-                // spawned daemon child so an auto-started daemon does not become
-                // a zombie when it eventually exits.
-                std::thread::spawn(move || {
-                    let _ = child.wait();
-                });
-                Ok(())
-            }
-            Err(e) => Err(DaemonError::Unavailable(format!(
-                "failed to spawn daemon: {}",
-                e
-            ))),
-        }
-    }
-
-    fn wait_for_spawned_daemon_ready(&self, child: &mut Child) -> Result<(), DaemonError> {
-        let ready_timeout = self.config.connect_timeout.max(Duration::from_secs(5));
-        let started = Instant::now();
-        while started.elapsed() < ready_timeout {
-            if UnixStream::connect(&self.config.socket_path).is_ok() {
-                return Ok(());
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    return Err(DaemonError::Unavailable(format!(
-                        "spawned daemon exited before becoming ready: {}",
-                        status
-                    )));
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        socket = %self.config.socket_path.display(),
-                        "failed to poll spawned daemon status while waiting for readiness"
-                    );
-                    break;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        Ok(())
-    }
-
-    /// Get a fresh connection, reconnecting if needed.
-    fn get_connection_locked(
-        &self,
-    ) -> Result<parking_lot::MutexGuard<'_, Option<UnixStream>>, DaemonError> {
-        // Try to use existing connection
-        let conn = self.connection.lock();
-        let is_valid = conn.as_ref().is_some_and(|s| s.peer_addr().is_ok());
-
-        if is_valid {
-            return Ok(conn);
-        }
-
-        // Connection is stale or missing, release lock and reconnect
-        drop(conn);
-
-        // Reconnect
-        self.mark_unavailable();
-        self.connect()?;
-
-        let conn = self.connection.lock();
-        if conn.is_some() {
-            Ok(conn)
-        } else {
-            Err(connection_not_established())
-        }
-    }
-
-    /// Send a request and receive a response.
-    fn send_request(&self, request: Request) -> Result<Response, DaemonError> {
-        let request_id = format!(
-            "cass-{}",
-            self.request_counter.fetch_add(1, Ordering::Relaxed)
-        );
-        let msg = FramedMessage::new(&request_id, request);
-
-        let encoded = encode_message(&msg)
-            .map_err(|e| DaemonError::Failed(format!("failed to encode request: {}", e)))?;
-
-        let mut stream_guard = self.get_connection_locked()?;
-        let stream = stream_guard
-            .as_mut()
-            .ok_or_else(connection_not_established)?;
-
-        // Send request
-        if let Err(e) = stream.write_all(&encoded) {
-            *stream_guard = None;
-            self.mark_unavailable();
-            return Err(DaemonError::Unavailable(format!(
-                "failed to send request: {}",
-                e
-            )));
-        }
-
-        // Read length prefix
-        let mut len_buf = [0u8; 4];
-        if let Err(e) = stream.read_exact(&mut len_buf) {
-            *stream_guard = None;
-            self.mark_unavailable();
-            if e.kind() == std::io::ErrorKind::TimedOut {
-                return Err(DaemonError::Timeout("response timeout".to_string()));
-            } else {
-                return Err(DaemonError::Unavailable(format!(
-                    "failed to read response length: {}",
-                    e
-                )));
-            }
-        }
-
-        let len = u32::from_be_bytes(len_buf) as usize;
-        // 10MB sanity limit - typical embedding responses are well under 1MB
-        const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
-        if len > MAX_RESPONSE_SIZE {
-            *stream_guard = None;
-            self.mark_unavailable();
-            warn!(
-                response_size = len,
-                max_size = MAX_RESPONSE_SIZE,
-                "Rejecting oversized daemon response"
-            );
-            return Err(DaemonError::Failed(format!(
-                "response too large: {} bytes (max {})",
-                len, MAX_RESPONSE_SIZE
-            )));
-        }
-
-        // Read response payload
-        let mut payload = vec![0u8; len];
-        if let Err(e) = stream.read_exact(&mut payload) {
-            *stream_guard = None;
-            self.mark_unavailable();
-            if e.kind() == std::io::ErrorKind::TimedOut {
-                return Err(DaemonError::Timeout("response timeout".to_string()));
-            } else {
-                return Err(DaemonError::Unavailable(format!(
-                    "failed to read response: {}",
-                    e
-                )));
-            }
-        }
-
-        // Decode response
-        let response: FramedMessage<Response> = match decode_message(&payload) {
-            Ok(response) => response,
-            Err(error) => {
-                *stream_guard = None;
-                self.mark_unavailable();
-                return Err(DaemonError::Failed(format!(
-                    "failed to decode response: {error}"
-                )));
-            }
-        };
-
-        // Check version compatibility
-        if response.version != PROTOCOL_VERSION {
-            *stream_guard = None;
-            self.mark_unavailable();
-            return Err(DaemonError::Failed(format!(
-                "protocol version mismatch: expected {}, got {}",
-                PROTOCOL_VERSION, response.version
-            )));
-        }
-
-        // A response for another request indicates a broken or incompatible
-        // peer. Close the stream so no later call can consume a frame from a
-        // protocol sequence we no longer trust.
-        if response.request_id != request_id {
-            let response_id = response.request_id;
-            *stream_guard = None;
-            self.mark_unavailable();
-            return Err(DaemonError::Failed(format!(
-                "response request ID mismatch: expected {request_id}, got {response_id}"
-            )));
-        }
-
-        drop(stream_guard);
-
-        // Handle error responses
-        match response.payload {
-            Response::Error(err) => {
-                let daemon_err = match err.code {
-                    ErrorCode::Overloaded => DaemonError::Overloaded {
-                        retry_after: err.retry_after_ms.map(Duration::from_millis),
-                        message: err.message,
-                    },
-                    ErrorCode::Timeout => DaemonError::Timeout(err.message),
-                    ErrorCode::InvalidInput => DaemonError::InvalidInput(err.message),
-                    _ => DaemonError::Failed(err.message),
-                };
-                Err(daemon_err)
-            }
-            other => Ok(other),
-        }
-    }
-
-    /// Check daemon health.
+    /// Check daemon health. The exchange updates its cache while it still
+    /// owns the connection, so a late caller cannot recache an invalid stream.
     pub fn health(&self) -> Result<HealthStatus, DaemonError> {
         match self.send_request(Request::Health)? {
-            Response::Health(status) => {
-                *self.last_health_check.lock() = status.ready.then(Instant::now);
-                Ok(status)
-            }
+            Response::Health(status) => Ok(status),
             other => Err(unexpected_response(other)),
         }
     }
@@ -554,14 +213,11 @@ impl UdsDaemonClient {
         Ok((identity, verifier))
     }
 
-    /// Request daemon shutdown.
+    /// Request daemon shutdown. The exchange closes its owned stream before
+    /// releasing it, rather than reacquiring and possibly closing a new stream.
     pub fn shutdown(&self) -> Result<(), DaemonError> {
         match self.send_request(Request::Shutdown)? {
-            Response::Shutdown { .. } => {
-                self.mark_unavailable();
-                *self.connection.lock() = None;
-                Ok(())
-            }
+            Response::Shutdown { .. } => Ok(()),
             other => Err(unexpected_response(other)),
         }
     }
@@ -627,13 +283,12 @@ impl DaemonClient for UdsDaemonClient {
             return true;
         }
 
-        // Verify with health check
+        // The transport invalidates a failed exchange while it owns the
+        // stream. A waiting probe's timeout or a peer's retryable overload
+        // must not poison another caller's still-valid shared connection.
         match self.health() {
             Ok(status) => status.ready,
-            Err(_) => {
-                self.mark_unavailable();
-                false
-            }
+            Err(_) => false,
         }
     }
 
