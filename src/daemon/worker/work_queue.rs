@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
 
-use super::{EmbeddingJobConfig, FastEmbedder, WorkerMessage};
+use super::{EmbeddingJobConfig, EmbeddingWorkerHandle, FastEmbedder, WorkerMessage};
 
 const MAX_PENDING_JOBS: usize = 32;
 const MAX_PENDING_CANCELLATIONS: usize = 32;
@@ -72,16 +72,20 @@ impl JobControl {
             .any(|(_, cancelled)| cancelled.load(Ordering::SeqCst))
     }
 
-    fn cancel(&self, scope: &CancelScope) {
+    fn cancel(&self, scope: &CancelScope) -> usize {
         if self.0.db_path != scope.db_path {
-            return;
+            return 0;
         }
         let selected = scope.model.as_deref().map(model_key);
+        let mut changed = 0;
         for (model, cancelled) in &self.0.models {
-            if selected.as_ref().is_none_or(|selected| selected == model) {
-                cancelled.store(true, Ordering::SeqCst);
+            if selected.as_ref().is_none_or(|selected| selected == model)
+                && !cancelled.swap(true, Ordering::SeqCst)
+            {
+                changed += 1;
             }
         }
+        changed
     }
 
     fn cancel_all(&self) {
@@ -203,6 +207,12 @@ impl Sender {
     /// Admission never waits for queue space. Exact duplicate pending jobs
     /// coalesce, but an active job may have one pending rerun for freshness.
     pub(super) fn send(&self, message: WorkerMessage) -> Result<(), String> {
+        self.send_counted(message).map(|_| ())
+    }
+
+    /// Count newly signalled passes inside the admission lock. Repeated
+    /// cancellation returns zero; the count is not a durable completion claim.
+    fn send_counted(&self, message: WorkerMessage) -> Result<usize, String> {
         let mut state = self
             .state
             .lock()
@@ -213,6 +223,7 @@ impl Sender {
         if state.stopped && !matches!(&message, WorkerMessage::Shutdown) {
             return Err("embedding worker is shutting down".to_string());
         }
+        let mut cancelled_passes = 0;
         match message {
             WorkerMessage::Submit(config) => {
                 validate_request(&[
@@ -253,10 +264,10 @@ impl Sender {
                     return Err("embedding cancellation queue is full; retry after pending controls complete".to_string());
                 }
                 if let Some(active) = &state.active {
-                    active.cancel(&scope);
+                    cancelled_passes += active.cancel(&scope);
                 }
                 for pending in &state.pending {
-                    pending.control.cancel(&scope);
+                    cancelled_passes += pending.control.cancel(&scope);
                 }
                 state.pending.retain(|pending| !pending.control.all_cancelled());
                 if !duplicate {
@@ -275,9 +286,18 @@ impl Sender {
         }
         drop(state);
         match self.wake.try_send(()) {
-            Ok(()) | Err(TrySendError::Full(())) => Ok(()),
+            Ok(()) | Err(TrySendError::Full(())) => Ok(cancelled_passes),
             Err(TrySendError::Disconnected(())) => Err("embedding worker channel closed".to_string()),
         }
+    }
+}
+
+impl EmbeddingWorkerHandle {
+    /// Return the exact number of queued/running passes newly signalled by
+    /// this request. Durable job-row cleanup is queued before later jobs;
+    /// callers must not report this receipt as completed database cleanup.
+    pub fn cancel_with_count(&self, db_path: String, model_id: Option<String>) -> Result<usize, String> {
+        self.sender.send_counted(WorkerMessage::Cancel { db_path, model_id })
     }
 }
 
@@ -516,5 +536,19 @@ mod tests {
         let admitted = threads.into_iter().map(|thread| usize::from(thread.join().unwrap())).sum::<usize>();
         assert_eq!(admitted, MAX_PENDING_JOBS);
         assert_eq!(sender.state.lock().unwrap().pending.len(), MAX_PENDING_JOBS);
+    }
+
+    #[test]
+    fn cancellation_receipts_count_only_newly_signalled_passes() {
+        let (worker, handle) = super::super::EmbeddingWorker::new();
+        handle.submit(job(1)).unwrap();
+        assert_eq!(handle.cancel_with_count(job(1).db_path, Some("minilm-384".into())).unwrap(), 1);
+        assert_eq!(handle.cancel_with_count(job(1).db_path, Some("minilm".into())).unwrap(), 0);
+        assert_eq!(handle.cancel_with_count(job(1).db_path, None).unwrap(), 1);
+        assert_eq!(handle.cancel_with_count(job(1).db_path, None).unwrap(), 0);
+        // A fresh job is not swallowed by an older coalesced control message.
+        handle.submit(job(1)).unwrap();
+        assert_eq!(handle.cancel_with_count(job(1).db_path, None).unwrap(), 2);
+        assert!(worker.receiver.state.lock().unwrap().pending.is_empty());
     }
 }
