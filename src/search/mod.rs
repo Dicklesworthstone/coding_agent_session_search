@@ -62,6 +62,7 @@ pub(crate) mod salvage_ledger;
 pub(crate) mod search_mode_metadata;
 pub mod semantic_manifest;
 pub(crate) mod semantic_publish_safety;
+pub mod semantic_reader;
 pub(crate) mod semantic_readiness;
 pub(crate) mod source_provenance;
 pub(crate) mod storage_integrity;
