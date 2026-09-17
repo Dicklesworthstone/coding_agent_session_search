@@ -54,6 +54,7 @@ impl Default for SemanticSelectionBudget {
 pub enum SemanticSelectionError {
     #[error(transparent)]
     Publication(#[from] SemanticGenerationError),
+    #[error(transparent)]
     Reader(#[from] SemanticReaderError),
     #[error(transparent)]
     Index(#[from] frankensearch::SearchError),
