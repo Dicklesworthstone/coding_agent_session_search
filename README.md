@@ -1090,11 +1090,18 @@ cass swarm lint --json --bead coding_agent_session_search-example
 cass swarm dependency-drift --json
 ```
 
-`swarm status`, `swarm work-packet`, and `swarm lint` currently compose their
-snapshot from checked-in fixtures (`--fixture <file>` or `--fixture-dir <dir>
---fixture-id <id>`); without a fixture the live provider path reports every
-source as `live-provider-unimplemented`. Only `swarm dependency-drift` has a
-live path today.
+`swarm status` and `swarm work-packet` collect bounded read-only Git state and
+Beads exports when run from the repository root without a fixture. Git uses
+porcelain-v2 with optional locks disabled. Beads uses `br 0.6.x --no-db`, so its
+JSONL snapshot is explicitly partial: unexported database changes may exist.
+Recheck Beads and reservations before claiming work. Child commands share a
+15-second budget per provider and each has an 8 MiB output cap; Beads categories
+cap at 512 issues.
+Failures report unavailable providers and unknown summary counts, not zero work.
+Other live providers remain unwired. `swarm lint` still uses the placeholder
+live snapshot. Fixture selection (`--fixture <file>` or `--fixture-dir <dir>
+--fixture-id <id>`) retains deterministic behavior; `swarm dependency-drift`
+also has a live path.
 
 `swarm status` composes Beads, Agent Mail metadata, git state, rch/build
 pressure, cass health/status, and proof references. Stale candidates are

@@ -10904,7 +10904,7 @@ fn run_swarm_status(
         let collection = set.collect_required();
         render_swarm_status_fixture(set.input(), &collection, privacy_probe.as_ref())
     } else {
-        render_swarm_status_live_partial()
+        render_swarm_status_live()
     };
 
     if let Some(fmt) = structured_format {
@@ -11847,6 +11847,141 @@ pub fn render_swarm_status_live_partial() -> serde_json::Value {
     )
 }
 
+/// CLI-only collection; the TUI's initial model must remain allocation-only.
+fn render_swarm_status_live() -> serde_json::Value {
+    use crate::swarm_status::{
+        REQUIRED_SWARM_SOURCE_PROVIDERS, SwarmProviderName, SwarmProviderStatus,
+        SwarmSourceCollection, SwarmSourceSnapshot,
+    };
+    let started = std::time::Instant::now();
+    let collection = match std::env::current_dir() {
+        Ok(repo) => crate::swarm_status::collect_live_swarm_sources(&repo),
+        Err(_) => SwarmSourceCollection {
+            snapshots: REQUIRED_SWARM_SOURCE_PROVIDERS
+                .iter()
+                .copied()
+                .map(|name| {
+                    SwarmSourceSnapshot::unavailable(
+                        name,
+                        format!("live:{name}"),
+                        "working-directory-unavailable",
+                        "Cannot identify the current repository",
+                    )
+                })
+                .collect(),
+        },
+    };
+    let mut payload = render_swarm_status_payload(
+        "live",
+        "Bounded live source collection",
+        &collection,
+        None,
+        true,
+    );
+    payload["_meta"]["generated_at_ms"] = serde_json::json!(
+        std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+    payload["_meta"]["elapsed_ms"] = serde_json::json!(started.elapsed().as_millis());
+    // Empty arrays remain iterable, but unknown measurements are never zero.
+    for (provider, fields) in [
+        (
+            SwarmProviderName::Beads,
+            &[
+                "ready_count",
+                "in_progress_count",
+                "blocked_count",
+                "stale_candidate_count",
+                "stale_state_counts",
+            ][..],
+        ),
+        (
+            SwarmProviderName::AgentMail,
+            &["active_agent_count", "active_reservation_count"][..],
+        ),
+        (SwarmProviderName::Evidence, &["proof_gap_count"][..]),
+        (SwarmProviderName::Process, &["build_pressure"][..]),
+        (SwarmProviderName::Git, &["dirty_worktree"][..]),
+    ] {
+        if collection
+            .snapshot(provider)
+            .is_none_or(|snapshot| snapshot.status == SwarmProviderStatus::Unavailable)
+        {
+            for field in fields {
+                payload["summary"][*field] = serde_json::Value::Null;
+            }
+        }
+    }
+    payload["beads"]["graph"] = serde_json::Value::Null;
+    // Exported tracker state and missing coordination cannot authorize a claim
+    // or classify an owner's work as stale.
+    payload["summary"]["stale_candidate_count"] = serde_json::Value::Null;
+    payload["summary"]["stale_state_counts"] = serde_json::Value::Null;
+    payload["beads"]["stale_candidates"] = serde_json::json!([]);
+    for category in ["ready", "in_progress", "blocked"] {
+        if let Some(rows) = payload["beads"][category].as_array_mut() {
+            for row in rows {
+                row["safe_to_claim"] = serde_json::json!(false);
+                row["recommended_action"] = serde_json::json!("recheck-live-coordination");
+                if let Some(blockers) = row["claim_blockers"].as_array_mut() {
+                    blockers.push(serde_json::json!("live-coordination-unverified"));
+                }
+                if let Some(object) = row.as_object_mut() {
+                    for field in [
+                        "stale_state",
+                        "stale_confidence",
+                        "stale_evidence",
+                        "takeover_advice",
+                        "age_seconds",
+                    ] {
+                        object.remove(field);
+                    }
+                }
+            }
+        }
+    }
+    // Process collection is still unavailable. Never turn that absence into
+    // a recommendation to start a build on an apparently idle fleet.
+    payload["build_pressure"] = serde_json::json!({
+        "status": "unknown", "active_rch_jobs": null, "active_cargo_jobs": null,
+        "load_average_1m": null, "cpu_count": null,
+        "recommended_action": "inspect-rch-state",
+    });
+    payload["_meta"]["source_observations"] = serde_json::json!({});
+    for snapshot in &collection.snapshots {
+        let observed = &snapshot.payload;
+        if observed.is_null() {
+            continue;
+        }
+        payload["_meta"]["source_observations"][snapshot.name.as_str()] = serde_json::json!({
+            "observed_at_ms": observed.get("observed_at_ms"),
+            "repository": observed.get("repository"),
+            "repository_id": observed.get("repository_id"),
+            "head": observed.get("head"),
+            "version": observed.get("version"),
+            "source_kind": observed.get("source_kind"),
+            "export_age_ms": observed.get("export_age_ms"),
+        });
+    }
+    if collection
+        .snapshot(SwarmProviderName::Git)
+        .is_none_or(|snapshot| snapshot.status == SwarmProviderStatus::Unavailable)
+    {
+        for field in [
+            "branch",
+            "ahead",
+            "behind",
+            "dirty",
+            "legacy_branch_mirror_required",
+        ] {
+            payload["git"][field] = serde_json::Value::Null;
+        }
+    }
+    payload
+}
+
 fn render_swarm_status_fixture(
     input: &crate::swarm_status::SwarmFixtureInput,
     collection: &crate::swarm_status::SwarmSourceCollection,
@@ -11862,8 +11997,10 @@ fn render_swarm_status_fixture(
 }
 
 fn render_swarm_work_packet_live_partial(bead_filter: Option<&str>) -> serde_json::Value {
-    let status = render_swarm_status_live_partial();
-    render_swarm_work_packet_from_status(&status, bead_filter)
+    let status = render_swarm_status_live();
+    let mut packet = render_swarm_work_packet_from_status(&status, bead_filter);
+    packet["_meta"]["source_observations"] = status["_meta"]["source_observations"].clone();
+    packet
 }
 
 fn render_swarm_work_packet_fixture(

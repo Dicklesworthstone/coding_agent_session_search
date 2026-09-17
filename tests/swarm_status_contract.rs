@@ -28,6 +28,55 @@ const GOLDEN_UPDATE_COMMAND_SHAPE: &str = "UPDATE_GOLDENS=1 rch exec -- env CARG
 const GOLDEN_REVIEW_COMMAND_SHAPE: &str = "git diff -- tests/fixtures/swarm_status tests/golden/swarm_status tests/swarm_status_contract.rs";
 const STRESS_SAMPLE_COUNT: usize = 5;
 
+#[test]
+fn live_swarm_status_reports_unknown_sources_without_zero_work_claims() {
+    let root = TempDir::new().expect("empty working directory");
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .current_dir(root.path())
+        .env("HOME", root.path().join("home"))
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("XDG_DATA_HOME", root.path().join("data"))
+        .env("CASS_DATA_DIR", root.path().join("cass-data"))
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .arg("--data-dir")
+        .arg(root.path().join("cass-data"))
+        .args(["swarm", "status", "--json"])
+        .output()
+        .expect("live status command");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("status JSON");
+    assert_eq!(value["status"], "partial");
+    for field in [
+        "ready_count",
+        "in_progress_count",
+        "blocked_count",
+        "dirty_worktree",
+    ] {
+        assert!(
+            value["summary"][field].is_null(),
+            "unknown {field}: {value}"
+        );
+    }
+    assert_eq!(value["build_pressure"]["status"], "unknown");
+    assert_eq!(
+        value["build_pressure"]["recommended_action"],
+        "inspect-rch-state"
+    );
+    assert!(value["beads"]["graph"].is_null());
+    assert!(
+        value["_meta"]["generated_at_ms"]
+            .as_u64()
+            .is_some_and(|time| time > 0)
+    );
+    assert!(!root.path().join(".beads").exists());
+    assert!(!root.path().join(".git").exists());
+}
+
 const REQUIRED_SCENARIOS: &[&str] = &[
     "healthy",
     "busy",

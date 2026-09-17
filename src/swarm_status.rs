@@ -1,9 +1,7 @@
 //! Fixtureable source adapters for the planned `cass swarm status` surface.
 //!
-//! This module intentionally avoids live provider calls. It defines the adapter
-//! trait and deterministic fixture-backed implementation that the future
-//! aggregator can consume without knowing whether data came from fixtures or a
-//! live source.
+//! Live command adapters use bounded, read-only collection. Fixture adapters
+//! retain the same snapshot contract for deterministic rendering tests.
 
 use crate::pages::redact::{redact_swarm_json_value, redact_swarm_text};
 use serde::{Deserialize, Serialize};
@@ -13,7 +11,335 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
+
+/// Live collection never opens Beads' writable database. Its exported JSONL
+/// snapshot is explicitly partial because unexported database changes may exist.
+#[must_use]
+pub fn collect_live_swarm_sources(repo: &Path) -> SwarmSourceCollection {
+    let snapshots = REQUIRED_SWARM_SOURCE_PROVIDERS
+        .iter()
+        .copied()
+        .map(|name| {
+            if matches!(name, SwarmProviderName::Git | SwarmProviderName::Beads) {
+                LiveSwarmSourceAdapter {
+                    repo: repo.to_path_buf(),
+                    name,
+                }
+                .collect()
+            } else {
+                SwarmSourceSnapshot::unavailable(
+                    name,
+                    format!("live:{name}"),
+                    "live-provider-unimplemented",
+                    format!("live provider {name} is not wired yet"),
+                )
+            }
+        })
+        .collect();
+    SwarmSourceCollection { snapshots }
+}
+
+struct LiveSwarmSourceAdapter {
+    repo: PathBuf,
+    name: SwarmProviderName,
+}
+
+impl SwarmSourceAdapter for LiveSwarmSourceAdapter {
+    fn provider(&self) -> SwarmProviderName {
+        self.name
+    }
+
+    fn collect(&self) -> SwarmSourceSnapshot {
+        let started = Instant::now();
+        let source = format!("live:{}", self.name);
+        let result = match self.name {
+            SwarmProviderName::Git => collect_live_git(&self.repo, started),
+            SwarmProviderName::Beads => collect_exported_beads(&self.repo, started),
+            _ => Err("unsupported live provider".to_string()),
+        };
+        let mut snapshot = match result {
+            Ok(payload) if self.name == SwarmProviderName::Beads => SwarmSourceSnapshot::partial(
+                self.name,
+                source,
+                "Read-only exported JSONL snapshot; unexported Beads database changes are not observed. Recheck br before claiming work.",
+                payload,
+            ),
+            Ok(payload) => SwarmSourceSnapshot::ok(self.name, source, payload),
+            Err(error) => SwarmSourceSnapshot::unavailable(
+                self.name,
+                source,
+                "live-provider-read-failed",
+                error,
+            ),
+        };
+        snapshot.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if self.name == SwarmProviderName::Beads {
+            snapshot.freshness_ms = snapshot
+                .payload
+                .get("export_age_ms")
+                .and_then(Value::as_u64);
+        }
+        snapshot
+    }
+}
+
+fn live_command(
+    repo: &Path,
+    program: &str,
+    args: &[&str],
+    started: Instant,
+) -> Result<Vec<u8>, String> {
+    let remaining = Duration::from_secs(15)
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or("live provider deadline exceeded")?;
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .current_dir(repo)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("BEADS_DIR", repo.join(".beads"));
+    // Caller-specific overrides must not redirect a project snapshot elsewhere.
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "BEADS_DB",
+        "BD_DB",
+    ] {
+        command.env_remove(key);
+    }
+    crate::sources::configure_child_process_group(&mut command);
+    let child = command
+        .spawn()
+        .map_err(|error| format!("{program} spawn failed: {error}"))?;
+    let output =
+        crate::sources::wait_for_child_output_with_limit(child, remaining, Some(8 * 1024 * 1024))
+            .map_err(|error| format!("{program} output failed: {error}"))?
+            .ok_or_else(|| format!("{program} exceeded the live provider deadline"))?;
+    if !output.status.success() {
+        // Do not echo raw tool diagnostics, which may contain private paths/text.
+        return Err(format!("{program} exited with {}", output.status));
+    }
+    Ok(output.stdout)
+}
+
+fn collect_live_git(repo: &Path, started: Instant) -> Result<Value, String> {
+    let root = live_command(repo, "git", &["rev-parse", "--show-toplevel"], started)?;
+    let root = std::str::from_utf8(&root)
+        .map_err(|_| "git root is not UTF-8")?
+        .trim_end();
+    let canonical = repo.canonicalize().map_err(|error| error.to_string())?;
+    if Path::new(root)
+        .canonicalize()
+        .map_err(|error| error.to_string())?
+        != canonical
+    {
+        return Err("run live swarm collection from the repository root".to_string());
+    }
+    let status = live_command(
+        repo,
+        "git",
+        &[
+            "-c",
+            "core.fsmonitor=false",
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "-z",
+            "--untracked-files=normal",
+            "--ignore-submodules=all",
+        ],
+        started,
+    )?;
+    let mut payload = parse_git_status(&status)?;
+    payload["repository"] = Value::String(root.to_string());
+    payload["repository_id"] = Value::String(
+        blake3::hash(canonical.as_os_str().as_encoded_bytes())
+            .to_hex()
+            .to_string(),
+    );
+    payload["observed_at_ms"] = serde_json::json!(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+    // Porcelain's branch.oid is the identity of the observed generation,
+    // including null for an unborn branch. No fetch or index refresh occurs.
+    Ok(payload)
+}
+
+fn parse_git_status(bytes: &[u8]) -> Result<Value, String> {
+    if !bytes.ends_with(&[0]) {
+        return Err("truncated git porcelain output".to_string());
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| "git porcelain paths are not UTF-8")?;
+    let mut records = text.split_terminator('\0');
+    let mut branch = None;
+    let mut head = None;
+    let mut upstream = None;
+    let mut ahead = None;
+    let mut behind = None;
+    let mut paths = std::collections::BTreeSet::new();
+    while let Some(record) = records.next() {
+        if let Some(value) = record.strip_prefix("# branch.head ") {
+            branch = Some(value.to_string());
+        } else if let Some(value) = record.strip_prefix("# branch.oid ") {
+            head = (value != "(initial)").then(|| value.to_string());
+        } else if let Some(value) = record.strip_prefix("# branch.upstream ") {
+            upstream = Some(value.to_string());
+        } else if let Some(value) = record.strip_prefix("# branch.ab ") {
+            let (a, b) = value
+                .split_once(' ')
+                .ok_or("invalid git ahead/behind counts")?;
+            ahead = Some(
+                a.strip_prefix('+')
+                    .ok_or("invalid git ahead count")?
+                    .parse::<u64>()
+                    .map_err(|_| "invalid git ahead count")?,
+            );
+            behind = Some(
+                b.strip_prefix('-')
+                    .ok_or("invalid git behind count")?
+                    .parse::<u64>()
+                    .map_err(|_| "invalid git behind count")?,
+            );
+        } else if let Some(path) = record.strip_prefix("? ") {
+            paths.insert(path.to_string());
+        } else if record.starts_with("1 ") || record.starts_with("2 ") || record.starts_with("u ") {
+            let fields = match record.as_bytes()[0] {
+                b'1' => 9,
+                b'2' => 10,
+                _ => 11,
+            };
+            let path = record
+                .splitn(fields, ' ')
+                .nth(fields - 1)
+                .filter(|path| !path.is_empty())
+                .ok_or("invalid git path record")?;
+            paths.insert(path.to_string());
+            if record.starts_with("2 ") {
+                let old = records
+                    .next()
+                    .filter(|path| !path.is_empty())
+                    .ok_or("truncated git rename record")?;
+                paths.insert(old.to_string());
+            }
+        } else {
+            return Err("unsupported git porcelain record".to_string());
+        }
+    }
+    let branch = branch.ok_or("missing git branch identity")?;
+    Ok(
+        serde_json::json!({"branch": branch, "head": head, "upstream": upstream,
+        "ahead": ahead, "behind": behind, "dirty": !paths.is_empty(), "dirty_paths": paths,
+        "recent_commits": null}),
+    )
+}
+
+fn collect_exported_beads(repo: &Path, started: Instant) -> Result<Value, String> {
+    let path = repo.join(".beads/issues.jsonl");
+    let before =
+        fs::metadata(&path).map_err(|error| format!("Beads export unavailable: {error}"))?;
+    let version = live_command(repo, "br", &["--version"], started)?;
+    let version = supported_beads_version(&version)?;
+    let read = |args: &[&str]| -> Result<Value, String> {
+        let mut argv = vec!["--no-db", "--no-auto-import", "--no-auto-flush"];
+        argv.extend_from_slice(args);
+        let bytes = live_command(repo, "br", &argv, started)?;
+        parse_beads_json(&bytes)
+    };
+    let ready = read(&["ready", "--json", "--limit", "513"])?;
+    let active = read(&[
+        "list",
+        "--status",
+        "in_progress",
+        "--json",
+        "--limit",
+        "513",
+    ])?;
+    let blocked = read(&["blocked", "--json", "--limit", "513"])?;
+    if blocked.get("has_more").and_then(Value::as_bool) != Some(false) {
+        return Err("blocked Beads snapshot is truncated or has an unsupported schema".to_string());
+    }
+    let project_rows = |rows: &Value| -> Result<Vec<Value>, String> {
+        let rows = rows.as_array().ok_or("unsupported br issue schema")?;
+        if rows.len() > 512 {
+            return Err("Beads snapshot exceeds the 512-issue category limit".to_string());
+        }
+        rows.iter()
+            .map(|row| {
+                if row.get("id").and_then(Value::as_str).is_none()
+                    || row.get("status").and_then(Value::as_str).is_none()
+                {
+                    return Err("Beads issue lacks identity or status".to_string());
+                }
+                let mut projected = serde_json::Map::new();
+                for field in [
+                    "id",
+                    "title",
+                    "status",
+                    "priority",
+                    "issue_type",
+                    "assignee",
+                    "labels",
+                    "updated_at",
+                    "blocked_by",
+                ] {
+                    if let Some(value) = row.get(field) {
+                        projected.insert(field.to_string(), value.clone());
+                    }
+                }
+                Ok(Value::Object(projected))
+            })
+            .collect()
+    };
+    let after = unchanged_beads_export(&path, &before)?;
+    Ok(
+        serde_json::json!({"ready": project_rows(&ready)?, "in_progress": project_rows(&active)?,
+        "blocked": project_rows(blocked.get("issues").ok_or("missing blocked issues")?)?,
+        "graph": null, "version": version, "source_kind": "exported-jsonl",
+        "observed_at_ms": SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis(),
+        "export_age_ms": after.modified().ok().and_then(|time| time.elapsed().ok()).map(|age| age.as_millis())}),
+    )
+}
+
+fn unchanged_beads_export(path: &Path, before: &fs::Metadata) -> Result<fs::Metadata, String> {
+    let after = fs::metadata(path).map_err(|error| error.to_string())?;
+    if before.len() != after.len()
+        || before.modified().map_err(|error| error.to_string())?
+            != after.modified().map_err(|error| error.to_string())?
+    {
+        return Err("Beads export changed during collection; retry the snapshot".to_string());
+    }
+    Ok(after)
+}
+
+fn supported_beads_version(bytes: &[u8]) -> Result<&str, String> {
+    let version = std::str::from_utf8(bytes)
+        .map_err(|_| "invalid br version")?
+        .trim();
+    if version
+        .strip_prefix("br 0.6.")
+        .is_some_and(|patch| !patch.is_empty() && patch.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        Ok(version)
+    } else {
+        Err("unsupported br version; live reader supports 0.6.x".to_string())
+    }
+}
+
+fn parse_beads_json(bytes: &[u8]) -> Result<Value, String> {
+    serde_json::from_slice(bytes).map_err(|_| "malformed or truncated br JSON".to_string())
+}
 
 /// Providers named by the swarm status contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -525,6 +851,248 @@ mod tests {
 
     fn repo_path(relative: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
+    }
+
+    #[test]
+    fn live_git_porcelain_preserves_rename_paths_and_unknown_upstream() {
+        let bytes = b"# branch.oid 0123456789012345678901234567890123456789\0# branch.head main\02 R. N... 100644 100644 100644 abc def R100 new name\0old\nname\0? untracked\0";
+        let value = parse_git_status(bytes).expect("valid porcelain");
+        assert_eq!(value["branch"], "main");
+        assert_eq!(value["dirty"], true);
+        assert_eq!(
+            value["dirty_paths"],
+            json!(["new name", "old\nname", "untracked"])
+        );
+        assert!(value["ahead"].is_null());
+        assert!(value["behind"].is_null());
+        assert!(value["recent_commits"].is_null());
+    }
+
+    #[test]
+    fn live_git_porcelain_rejects_truncated_and_unknown_records() {
+        for bytes in [
+            b"# branch.head main".as_slice(),
+            b"# branch.head main\0x future-record\0".as_slice(),
+            b"# branch.head main\02 R. N... 100644 100644 100644 a b R100 new\0".as_slice(),
+            b"# branch.head main\0# branch.ab +wrong -0\0".as_slice(),
+        ] {
+            assert!(
+                parse_git_status(bytes).is_err(),
+                "accepted invalid porcelain: {bytes:?}"
+            );
+        }
+        let clean = parse_git_status(b"# branch.oid (initial)\0# branch.head main\0")
+            .expect("unborn branch");
+        assert_eq!(clean["dirty"], false);
+        assert!(clean["head"].is_null());
+    }
+
+    #[test]
+    fn live_git_collection_reads_real_dirty_repository_without_writing_index() {
+        let dir = tempfile::tempdir().expect("temporary repository");
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("git installed");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        let tracked = dir.path().join("tracked.txt");
+        fs::write(&tracked, "first").expect("seed tracked file");
+        git(&["add", "tracked.txt"]);
+        git(&[
+            "-c",
+            "user.name=CASS Test",
+            "-c",
+            "user.email=cass@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "seed",
+        ]);
+        fs::write(&tracked, "changed").expect("dirty tracked file");
+        fs::write(dir.path().join("new.txt"), "new").expect("untracked file");
+        let index_path = dir.path().join(".git/index");
+        let index_before = fs::read(&index_path).expect("read index");
+        let modified_before = fs::metadata(&index_path)
+            .expect("index metadata")
+            .modified()
+            .expect("mtime");
+        let value = collect_live_git(dir.path(), Instant::now()).expect("live Git snapshot");
+        assert_eq!(value["branch"], "main");
+        assert_eq!(value["dirty"], true);
+        assert_eq!(value["dirty_paths"], json!(["new.txt", "tracked.txt"]));
+        assert_eq!(fs::read(&tracked).expect("tracked bytes"), b"changed");
+        assert_eq!(fs::read(&index_path).expect("index bytes"), index_before);
+        assert_eq!(
+            fs::metadata(&index_path)
+                .expect("index metadata")
+                .modified()
+                .expect("mtime"),
+            modified_before
+        );
+        assert!(!dir.path().join(".git/index.lock").exists());
+    }
+
+    #[test]
+    fn live_collection_reports_missing_sources_without_initializing_them() {
+        let dir = tempfile::tempdir().expect("empty directory");
+        let collection = collect_live_swarm_sources(dir.path());
+        for name in [SwarmProviderName::Git, SwarmProviderName::Beads] {
+            let snapshot = collection.snapshot(name).expect("provider retained");
+            assert_eq!(snapshot.status, SwarmProviderStatus::Unavailable);
+            assert!(snapshot.payload.is_null());
+        }
+        assert_eq!(
+            fs::read_dir(dir.path()).expect("directory intact").count(),
+            0
+        );
+    }
+
+    #[test]
+    fn live_command_refuses_an_expired_budget_before_spawning() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let started = Instant::now()
+            .checked_sub(Duration::from_secs(16))
+            .expect("earlier instant");
+        let error = live_command(dir.path(), "nonexistent-cass-test-command", &[], started)
+            .expect_err("deadline expired");
+        assert!(error.contains("deadline"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_command_terminates_a_child_that_outlives_the_budget() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let started = Instant::now()
+            .checked_sub(Duration::from_secs(14))
+            .expect("earlier instant");
+        let error = live_command(dir.path(), "sh", &["-c", "exec sleep 10"], started)
+            .expect_err("sleep must exceed the remaining one-second budget");
+        assert!(error.contains("deadline"), "{error}");
+    }
+
+    #[test]
+    fn live_beads_rejects_a_changed_export_and_preserves_its_age() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("issues.jsonl");
+        fs::write(&path, "first export").expect("seed export");
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open export")
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .expect("old export timestamp");
+        let before = fs::metadata(&path).expect("initial metadata");
+        let unchanged = unchanged_beads_export(&path, &before).expect("stable old export");
+        assert!(unchanged.modified().unwrap().elapsed().unwrap() >= Duration::from_secs(3599));
+        fs::write(&path, "a changed export with a different length").expect("concurrent export");
+        let error = unchanged_beads_export(&path, &before).expect_err("reject mixed snapshot");
+        assert!(error.contains("changed during collection"));
+    }
+
+    #[test]
+    fn live_beads_rejects_unknown_versions_and_invalid_machine_output() {
+        assert_eq!(
+            supported_beads_version(b"br 0.6.12\n").unwrap(),
+            "br 0.6.12"
+        );
+        for bytes in [
+            b"br 0.7.0".as_slice(),
+            b"br 0.6.".as_slice(),
+            b"br 0.6.1-dev".as_slice(),
+            b"br 0.6.future".as_slice(),
+            b"br \xff".as_slice(),
+        ] {
+            assert!(supported_beads_version(bytes).is_err());
+        }
+        assert_eq!(parse_beads_json(b"[]\n").unwrap(), json!([]));
+        for bytes in [
+            b"[{\"id\":\"partial".as_slice(),
+            b"diagnostic\n[]".as_slice(),
+            b"[] trailing output".as_slice(),
+            b"\xff".as_slice(),
+        ] {
+            assert!(parse_beads_json(bytes).is_err());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires installed br 0.6.x; run explicitly through RCH"]
+    fn live_beads_collection_reads_real_tracker_without_writing_it() {
+        let dir = tempfile::tempdir().expect("temporary tracker");
+        let br = |args: &[&str]| {
+            let output = Command::new("br")
+                .args(args)
+                .current_dir(dir.path())
+                .env("BEADS_DIR", dir.path().join(".beads"))
+                .env_remove("BEADS_DB")
+                .env_remove("BD_DB")
+                .output()
+                .expect("br 0.6.x installed");
+            assert!(
+                output.status.success(),
+                "br {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output.stdout
+        };
+        br(&["init", "--prefix", "live"]);
+        let create = |title: &str| {
+            let bytes = br(&["create", title, "--json"]);
+            let value: Value = serde_json::from_slice(&bytes).expect("created issue");
+            value["id"].as_str().expect("created ID").to_string()
+        };
+        let ready = create("Ready task");
+        let active = create("Active task");
+        let blocked = create("Blocked task");
+        br(&["update", &active, "--status", "in_progress"]);
+        br(&["dep", "add", &blocked, &active]);
+        br(&["sync", "--flush-only"]);
+        let before: Vec<_> = ["issues.jsonl", "beads.db"]
+            .into_iter()
+            .map(|name| {
+                let path = dir.path().join(".beads").join(name);
+                let bytes = fs::read(&path).expect("tracker file");
+                let modified = fs::metadata(&path)
+                    .expect("tracker metadata")
+                    .modified()
+                    .expect("mtime");
+                (path, bytes, modified)
+            })
+            .collect();
+        let snapshot = LiveSwarmSourceAdapter {
+            repo: dir.path().to_path_buf(),
+            name: SwarmProviderName::Beads,
+        }
+        .collect();
+        assert_eq!(
+            snapshot.status,
+            SwarmProviderStatus::Partial,
+            "{snapshot:?}"
+        );
+        assert_eq!(snapshot.payload["ready"][0]["id"], ready);
+        assert_eq!(snapshot.payload["in_progress"][0]["id"], active);
+        assert_eq!(snapshot.payload["blocked"][0]["id"], blocked);
+        assert!(snapshot.payload["graph"].is_null());
+        for (path, bytes, modified) in before {
+            assert_eq!(fs::read(&path).expect("tracker intact"), bytes);
+            assert_eq!(
+                fs::metadata(&path)
+                    .expect("metadata intact")
+                    .modified()
+                    .expect("mtime"),
+                modified
+            );
+        }
     }
 
     #[test]
