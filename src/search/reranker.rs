@@ -25,6 +25,9 @@ pub use frankensearch::{RerankDocument, RerankScore};
 ///
 /// Wraps `&[&str]` documents into [`RerankDocument`] structs and extracts
 /// the resulting scores back into a `Vec<f32>` in original document order.
+/// Every input must have exactly one finite score under its original ID.
+/// Missing, duplicated, foreign or malformed identities are errors, never
+/// synthesized zero scores or silent last-write-wins replacements.
 pub fn rerank_texts(
     reranker: &dyn Reranker,
     query: &str,
@@ -40,15 +43,32 @@ pub fn rerank_texts(
         .collect();
 
     let scores = reranker.rerank_sync(query, &rerank_docs)?;
+    let invalid_output = || RerankerError::RerankFailed {
+        model: reranker.id().to_string(),
+        source: Box::new(std::io::Error::other(
+            "reranker must return exactly one finite score for each original document ID",
+        )),
+    };
+    if scores.len() != documents.len() {
+        return Err(invalid_output());
+    }
 
-    // Convert RerankScore vec back to Vec<f32> in original document order
+    // Backends return relevance order; restore input order only after checking
+    // the complete identity mapping. A real score of zero remains valid.
     let mut result = vec![0.0f32; documents.len()];
-    for rs in &scores {
-        if let Ok(idx) = rs.doc_id.parse::<usize>()
-            && idx < result.len()
-        {
-            result[idx] = rs.score;
+    let mut seen = vec![false; documents.len()];
+    for score in scores {
+        let index = score
+            .doc_id
+            .parse::<usize>()
+            .ok()
+            .filter(|index| *index < result.len() && score.doc_id == index.to_string())
+            .ok_or_else(&invalid_output)?;
+        if seen[index] || !score.score.is_finite() {
+            return Err(invalid_output());
         }
+        seen[index] = true;
+        result[index] = score.score;
     }
     Ok(result)
 }
@@ -165,7 +185,7 @@ mod tests {
         assert!(info.is_available);
 
         let display = format!("{info}");
-        assert!(display.contains(FastEmbedReranker::reranker_id_static()));
+        assert!(display.contains(info.id.as_str()));
         assert!(display.contains("available"));
     }
 
@@ -176,5 +196,82 @@ mod tests {
             source: Box::new(std::io::Error::other("inference error")),
         };
         assert!(err.to_string().contains("inference error"));
+    }
+
+    // Deliberately synthetic backend: these tests exercise the real bridge's
+    // validation and reordering, not native-model accuracy or performance.
+    struct ResponseReranker {
+        scores: Vec<RerankScore>,
+        calls: std::sync::atomic::AtomicUsize,
+        fail: bool,
+    }
+
+    impl Reranker for ResponseReranker {
+        fn rerank_sync(&self, _query: &str, documents: &[RerankDocument]) -> RerankerResult<Vec<RerankScore>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            for (index, document) in documents.iter().enumerate() {
+                assert_eq!(document.doc_id, index.to_string());
+            }
+            if self.fail {
+                return Err(RerankerError::RerankerUnavailable { model: self.id().to_string() });
+            }
+            Ok(self.scores.clone())
+        }
+        fn id(&self) -> &str { "synthetic-score-contract" }
+        fn model_name(&self) -> &str { self.id() }
+        fn is_available(&self) -> bool { !self.fail }
+    }
+
+    fn response_reranker(entries: &[(&str, f32)]) -> ResponseReranker {
+        ResponseReranker {
+            scores: entries.iter().enumerate().map(|(rank, (id, score))| RerankScore {
+                doc_id: (*id).to_string(), score: *score, original_rank: rank, raw_logit: None,
+            }).collect(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail: false,
+        }
+    }
+
+    #[test]
+    fn bridge_restores_score_order_without_replacing_real_zero_or_negative_values() {
+        let backend = response_reranker(&[("2", -0.5), ("0", 0.75), ("1", 0.0)]);
+        assert_eq!(rerank_texts(&backend, "query", &["a", "b", "c"]).unwrap(), [0.75, 0.0, -0.5]);
+        assert_eq!(backend.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn bridge_rejects_missing_extra_duplicate_foreign_and_noncanonical_score_ids() {
+        for entries in [
+            vec![("0", 1.0)],
+            vec![("0", 1.0), ("1", 2.0), ("2", 3.0)],
+            vec![("0", 1.0), ("0", 2.0)],
+            vec![("0", 1.0), ("2", 2.0)],
+            vec![("0", 1.0), ("not-an-id", 2.0)],
+            vec![("0", 1.0), ("01", 2.0)],
+            vec![("0", 1.0), ("+1", 2.0)],
+            vec![("0", 1.0), ("-1", 2.0)],
+        ] {
+            let backend = response_reranker(&entries);
+            assert!(matches!(rerank_texts(&backend, "query", &["private-a", "private-b"]), Err(RerankerError::RerankFailed { .. })), "accepted invalid mapping: {entries:?}");
+            assert_eq!(backend.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn bridge_rejects_nonfinite_scores_instead_of_serializing_them() {
+        for score in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let backend = response_reranker(&[("0", score)]);
+            let error = rerank_texts(&backend, "query", &["private-document"]).unwrap_err();
+            assert!(matches!(error, RerankerError::RerankFailed { .. }));
+            assert!(!error.to_string().contains("private-document"));
+        }
+    }
+
+    #[test]
+    fn bridge_propagates_backend_failure_without_retry_or_fabricated_scores() {
+        let mut backend = response_reranker(&[]);
+        backend.fail = true;
+        assert!(matches!(rerank_texts(&backend, "query", &["document"]), Err(RerankerError::RerankerUnavailable { .. })));
+        assert_eq!(backend.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
