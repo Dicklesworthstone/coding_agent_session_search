@@ -17,6 +17,7 @@
 //! most O(k) candidates per active tier; this is NOT a bound on total index RSS.
 
 pub mod ann;
+pub mod publication;
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashSet};
@@ -69,7 +70,7 @@ pub enum SemanticReaderError {
     AnnSelectionMismatch(TierKind),
     #[error("ANN candidate limits must satisfy 1 <= initial <= maximum <= 65536")]
     InvalidAnnPolicy,
-    #[error("a canonical semantic shard must contain only live, canonical CASS passage IDs")]
+    #[error("a semantic shard must be a WAL-free admitted image with canonical CASS passage IDs")]
     NonCanonicalDocuments,
     #[error("a canonical passage ID occurs more than once within a semantic tier")]
     DuplicateDocument,
@@ -124,7 +125,7 @@ impl AdmittedTier {
                 shard: position,
                 source: Box::new(source),
             })?;
-            if !owner.published_wal_absent() || owner.tombstone_count() != 0 {
+            if !owner.published_wal_absent() {
                 return Err(SemanticReaderError::NonCanonicalDocuments);
             }
             live_count = live_count
@@ -141,7 +142,7 @@ impl AdmittedTier {
             for position in 0..shard.record_count() {
                 let id = shard.doc_id_at(position)?;
                 canonical_document(id)?;
-                if !ids.insert(id) {
+                if shard.row(position)?.flags().is_live() && !ids.insert(id) {
                     return Err(SemanticReaderError::DuplicateDocument);
                 }
             }
@@ -208,6 +209,7 @@ impl AdmittedTier {
                 let physical_index = usize::try_from(hit.index)
                     .map_err(|_| SemanticReaderError::InvalidCandidate)?;
                 if !hit.score.is_finite()
+                    || !owner.row(physical_index)?.flags().is_live()
                     || owner.doc_id_at(physical_index)? != hit.doc_id.as_str()
                 {
                     return Err(SemanticReaderError::InvalidCandidate);
