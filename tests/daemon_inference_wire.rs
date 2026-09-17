@@ -36,7 +36,10 @@ impl RunningDaemon {
         ));
         let owner = Arc::clone(&daemon);
         let thread = std::thread::spawn(move || owner.run());
-        let running = Self { daemon, thread: Some(thread) };
+        let running = Self {
+            daemon,
+            thread: Some(thread),
+        };
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if let Ok(stream) = UnixStream::connect(&socket) {
@@ -44,7 +47,12 @@ impl RunningDaemon {
                 stream.set_write_timeout(Some(Duration::from_secs(5)))?;
                 return Ok((running, stream));
             }
-            if Instant::now() >= deadline || running.thread.as_ref().is_some_and(|thread| thread.is_finished()) {
+            if Instant::now() >= deadline
+                || running
+                    .thread
+                    .as_ref()
+                    .is_some_and(|thread| thread.is_finished())
+            {
                 anyhow::bail!("fixture daemon did not accept connections");
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -54,7 +62,9 @@ impl RunningDaemon {
     fn finish(mut self) -> anyhow::Result<()> {
         self.daemon.request_shutdown();
         if let Some(thread) = self.thread.take() {
-            thread.join().map_err(|_| anyhow::anyhow!("fixture daemon panicked"))??;
+            thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("fixture daemon panicked"))??;
         }
         Ok(())
     }
@@ -78,7 +88,10 @@ fn exchange(stream: &mut UnixStream, id: &str, request: Request) -> anyhow::Resu
     let mut payload = vec![0; length];
     stream.read_exact(&mut payload)?;
     let response = decode_message::<Response>(&payload)?;
-    anyhow::ensure!(response.version == PROTOCOL_VERSION, "wrong response version");
+    anyhow::ensure!(
+        response.version == PROTOCOL_VERSION,
+        "wrong response version"
+    );
     anyhow::ensure!(response.request_id == id, "wrong response request id");
     Ok(response.payload)
 }
@@ -98,33 +111,89 @@ fn bounded_inference_rejections_keep_a_framed_connection_usable() -> anyhow::Res
             .env("FRANKENSEARCH_MODEL_DIR", root.path().join("no-assets"))
             .current_dir(root.path())
             .output()?;
-        anyhow::ensure!(result.status.success(), "wire fixture failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
-        anyhow::ensure!(String::from_utf8_lossy(&result.stdout).contains("1 passed; 0 failed"), "exact child test did not execute");
+        anyhow::ensure!(
+            result.status.success(),
+            "wire fixture failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        anyhow::ensure!(
+            String::from_utf8_lossy(&result.stdout).contains("1 passed; 0 failed"),
+            "exact child test did not execute"
+        );
         return Ok(());
     }
 
     let root = tempfile::tempdir()?;
     let (running, mut stream) = RunningDaemon::start(root.path())?;
     let requests = [
-        (Request::Embed { texts: vec!["private-input".into()], model: "default".into(), dims: Some(768) }, ErrorCode::InvalidInput),
-        (Request::Embed { texts: vec!["private-input".into()], model: "unknown-model".into(), dims: None }, ErrorCode::ModelNotFound),
-        (Request::Embed { texts: vec!["private-input".into(); 1025], model: "default".into(), dims: None }, ErrorCode::InvalidInput),
-        (Request::Embed { texts: vec!["x".repeat(64 * 1024); 65], model: "default".into(), dims: None }, ErrorCode::InvalidInput),
-        (Request::Rerank { query: "private-input".into(), documents: vec!["x".repeat(64 * 1024 + 1)], model: "default".into() }, ErrorCode::InvalidInput),
-        (Request::Rerank { query: "private-input".into(), documents: vec!["doc".into()], model: "unknown-model".into() }, ErrorCode::ModelNotFound),
+        (
+            Request::Embed {
+                texts: vec!["private-input".into()],
+                model: "default".into(),
+                dims: Some(768),
+            },
+            ErrorCode::InvalidInput,
+        ),
+        (
+            Request::Embed {
+                texts: vec!["private-input".into()],
+                model: "unknown-model".into(),
+                dims: None,
+            },
+            ErrorCode::ModelNotFound,
+        ),
+        (
+            Request::Embed {
+                texts: vec!["private-input".into(); 1025],
+                model: "default".into(),
+                dims: None,
+            },
+            ErrorCode::InvalidInput,
+        ),
+        (
+            Request::Embed {
+                texts: vec!["x".repeat(64 * 1024); 65],
+                model: "default".into(),
+                dims: None,
+            },
+            ErrorCode::InvalidInput,
+        ),
+        (
+            Request::Rerank {
+                query: "private-input".into(),
+                documents: vec!["x".repeat(64 * 1024 + 1)],
+                model: "default".into(),
+            },
+            ErrorCode::InvalidInput,
+        ),
+        (
+            Request::Rerank {
+                query: "private-input".into(),
+                documents: vec!["doc".into()],
+                model: "unknown-model".into(),
+            },
+            ErrorCode::ModelNotFound,
+        ),
     ];
     for (index, (request, expected)) in requests.into_iter().enumerate() {
         let response = exchange(&mut stream, &format!("reject-{index}"), request)?;
-        let Response::Error(error) = response else { anyhow::bail!("invalid inference unexpectedly succeeded"); };
+        let Response::Error(error) = response else {
+            anyhow::bail!("invalid inference unexpectedly succeeded");
+        };
         assert_eq!(error.code, expected);
         assert!(!error.retryable);
         assert!(error.retry_after_ms.is_none());
         assert!(!error.message.contains("private-input"));
         // Every refusal must leave framing and the next control request usable.
-        assert!(matches!(exchange(&mut stream, "health", Request::Health)?, Response::Health(health) if !health.ready));
+        assert!(
+            matches!(exchange(&mut stream, "health", Request::Health)?, Response::Health(health) if !health.ready)
+        );
     }
-    assert!(matches!(exchange(&mut stream, "stop", Request::Shutdown)?, Response::Shutdown { .. }));
+    assert!(matches!(
+        exchange(&mut stream, "stop", Request::Shutdown)?,
+        Response::Shutdown { .. }
+    ));
     drop(stream);
     running.finish()?;
     assert!(!root.path().join("agent_search.db").exists());
