@@ -154,11 +154,7 @@ fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
     let mut seen_names = std::collections::BTreeSet::new();
     for package in resolved_fsqlite {
         let name = package["name"].as_str().expect("locked package name");
-        let expected_version = match name {
-            "fsqlite" | "fsqlite-core" | "fsqlite-pager" => "0.4.2",
-            "fsqlite-btree" | "fsqlite-vdbe" => "0.4.1",
-            _ => "0.4.0",
-        };
+        let expected_version = "0.4.4";
         assert!(
             seen_names.insert(name.to_string()),
             "Cargo.lock resolves more than one version of {name}"
@@ -166,7 +162,7 @@ fn frankensqlite_registry_source_identity_is_exact_and_coherent() {
         assert_eq!(
             package.get("version").and_then(toml::Value::as_str),
             Some(expected_version),
-            "{name} resolved at a different version than the published split-family contract"
+            "{name} resolved at a different version than the published 0.4.4 family contract"
         );
         let source = package
             .get("source")
