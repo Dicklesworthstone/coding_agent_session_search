@@ -6,7 +6,7 @@
  * Uses virtual scrolling for long conversations with 50+ messages.
  */
 
-import { getConversation, getConversationMessages, checkMemoryPressure, getMemoryUsage } from './database.js';
+import { getConversation, ConversationMessageSource, checkMemoryPressure, getMemoryUsage } from './database.js';
 import {
     createAttachmentElement,
     getMessageAttachments,
@@ -111,13 +111,19 @@ export async function loadConversation(conversationId, highlightMessageId = null
 
             if (!conversation) {
                 if (loadId === activeConversationLoadId) {
+                    teardownDocumentListeners();
+                    destroyVirtualList();
+                    currentConversation = null;
+                    currentMessages = [];
                     showError('Conversation not found');
                 }
                 return;
             }
 
-            // Load messages
-            messages = getConversationMessages(conversationId);
+            // Read only the count now; the virtual renderer fetches visible
+            // bodies on demand through a bounded cache, not a whole transcript.
+            messages = new ConversationMessageSource(conversationId);
+            conversation = { ...conversation, message_count: messages.length };
 
             // Cache the loaded data
             loadedConversations.set(conversationId, {
@@ -150,6 +156,8 @@ export async function loadConversation(conversationId, highlightMessageId = null
         }
 
         console.error(`[Conversation] Failed to load conversation ${conversationId}:`, error);
+        loadedConversations.get(conversationId)?.messages.dispose();
+        loadedConversations.delete(conversationId);
         teardownDocumentListeners();
         destroyVirtualList();
         currentConversation = null;
@@ -286,6 +294,7 @@ function render(conv, messages, highlightId) {
  * @private
  */
 function renderVirtualMessages(messages, highlightId) {
+    const loadId = activeConversationLoadId;
     // Set up container for virtual scrolling
     elements.messagesList.style.height = 'calc(100vh - 200px)';
     elements.messagesList.style.minHeight = '400px';
@@ -296,7 +305,22 @@ function renderVirtualMessages(messages, highlightId) {
         container: elements.messagesList,
         totalCount: messages.length,
         estimatedItemHeight: VIRTUAL_CONFIG.ESTIMATED_MESSAGE_HEIGHT,
-        renderItem: (index) => createMessageElement(messages[index], index, messages[index].id === highlightId),
+        renderItem: (index) => {
+            if (loadId !== activeConversationLoadId) {
+                return document.createElement('span');
+            }
+            try {
+                const message = messages.get(index);
+                return createMessageElement(message, index, message.id === highlightId);
+            } catch (error) {
+                console.error('[Conversation] Failed to read message:', error);
+                const notice = document.createElement('article');
+                notice.className = 'message message-error';
+                notice.setAttribute('role', 'alert');
+                notice.textContent = 'Unable to load this message. Reopen the conversation to retry.';
+                return notice;
+            }
+        },
         overscan: VIRTUAL_CONFIG.OVERSCAN,
     });
 
@@ -304,10 +328,13 @@ function renderVirtualMessages(messages, highlightId) {
 
     // Scroll to highlighted message if specified
     if (highlightId) {
-        const highlightIndex = messages.findIndex(m => m.id === highlightId);
+        const highlightIndex = messages.indexOfId(highlightId);
         if (highlightIndex >= 0) {
+            const list = messageVirtualList;
             setTimeout(() => {
-                messageVirtualList.scrollToIndex(highlightIndex, 'center');
+                if (loadId === activeConversationLoadId && list === messageVirtualList) {
+                    list.scrollToIndex(highlightIndex, 'center');
+                }
             }, 100);
         }
     }
@@ -479,6 +506,10 @@ function appendAttachmentsToMessage(messageElement, message) {
 
 function handleArchiveLock() {
     activeConversationLoadId += 1;
+    currentMessages.dispose?.();
+    for (const cached of loadedConversations.values()) {
+        cached.messages.dispose();
+    }
     currentConversation = null;
     currentMessages = [];
     teardownDocumentListeners();
@@ -486,6 +517,9 @@ function handleArchiveLock() {
     clearAllCache();
     attachmentState = createAttachmentState();
     resetAttachments();
+    if (elements.container) {
+        elements.container.innerHTML = '';
+    }
 }
 
 /**
@@ -518,6 +552,10 @@ function setupEventListeners() {
 }
 
 function teardownDocumentListeners() {
+    if (copyFeedbackTimeoutId !== null) {
+        clearTimeout(copyFeedbackTimeoutId);
+        copyFeedbackTimeoutId = null;
+    }
     if (documentKeydownHandler) {
         document.removeEventListener('keydown', documentKeydownHandler);
         documentKeydownHandler = null;
@@ -693,7 +731,11 @@ function applySyntaxHighlighting() {
  * Scroll to a specific message
  */
 function scrollToMessage(messageId) {
+    const loadId = activeConversationLoadId;
     setTimeout(() => {
+        if (loadId !== activeConversationLoadId) {
+            return;
+        }
         const messageEl = document.getElementById(`message-${messageId}`);
         if (messageEl) {
             messageEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -709,17 +751,25 @@ function scrollToMessage(messageId) {
  * Copy conversation to clipboard
  */
 async function copyConversation() {
-    if (!currentConversation || !currentMessages.length) return;
+    if (!currentConversation) return;
 
-    const text = formatConversationAsText(currentConversation, currentMessages);
-
+    const loadId = activeConversationLoadId;
     try {
+        if (!currentMessages.length) return;
+        // Full traversal is explicit here; browsing never hydrates all bodies.
+        const text = formatConversationAsText(currentConversation, currentMessages);
         const copied = await copyTextToClipboard(text);
+        if (loadId !== activeConversationLoadId) {
+            return;
+        }
         if (!copied) {
             throw new Error('Clipboard copy failed');
         }
         showCopyFeedback('Copied!');
     } catch (error) {
+        if (loadId !== activeConversationLoadId) {
+            return;
+        }
         console.error('[Conversation] Copy failed:', error);
         showCopyFeedback('Copy failed');
     }
@@ -892,6 +942,7 @@ export function getCurrentConversation() {
 function unloadOldestConversation() {
     const oldest = loadedConversations.keys().next().value;
     if (oldest !== undefined) {
+        loadedConversations.get(oldest).messages.clearCache();
         loadedConversations.delete(oldest);
         console.debug(`[Conversation] Unloaded oldest conversation ${oldest} (cache size: ${loadedConversations.size})`);
     }
@@ -908,6 +959,7 @@ export function clearOldConversations(keepCount = 1) {
     if (toRemove > 0) {
         // Remove oldest entries (first ones in the Map)
         for (let i = 0; i < toRemove; i++) {
+            entries[i][1].messages.clearCache();
             loadedConversations.delete(entries[i][0]);
         }
         console.debug(`[Conversation] Cleared ${toRemove} old conversations (cache size: ${loadedConversations.size})`);
@@ -993,9 +1045,12 @@ export function stopMemoryMonitoring() {
  */
 export function getCacheStats() {
     const memory = getMemoryUsage();
+    const messageCaches = Array.from(loadedConversations.values(), entry => entry.messages.getCacheStats());
     return {
         cachedCount: loadedConversations.size,
         maxCached: MEMORY_CONFIG.MAX_LOADED_CONVERSATIONS,
+        cachedMessageBodies: messageCaches.reduce((sum, cache) => sum + cache.messages, 0),
+        cachedTextUnits: messageCaches.reduce((sum, cache) => sum + cache.textUnits, 0),
         memoryUsed: memory?.used || 0,
         memoryLimit: memory?.limit || 0,
         memoryPercent: memory?.percent || 0,
@@ -1025,6 +1080,12 @@ export function cleanupConversationViewer() {
  * Clear all cached conversations
  */
 export function clearAllCache() {
+    // An active view may still use its source after a manual cache clear.
+    // Clear retained text without disabling scrolling; lock disposes sources.
+    currentMessages.clearCache?.();
+    for (const cached of loadedConversations.values()) {
+        cached.messages.clearCache();
+    }
     loadedConversations.clear();
     hideMemoryWarning();
     console.debug('[Conversation] All cached conversations cleared');
