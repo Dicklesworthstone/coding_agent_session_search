@@ -17,6 +17,11 @@ use frankensearch::index::native_hnsw::{
 use frankensearch::index::{ValidatedFsviBytes, dot_product_f32_f32};
 use serde::Serialize;
 
+use crate::search::semantic_manifest::{
+    SemanticAnnBaseBindingV1, SemanticArtifactRole, SemanticGenerationArtifact,
+    SemanticGenerationManifestV1,
+};
+
 use super::{SemanticGenerationReader, SemanticReaderError, SemanticReaderResult, TierKind};
 
 /// A graph and the complete receipt selected by the publication layer. Merely
@@ -25,6 +30,105 @@ use super::{SemanticGenerationReader, SemanticReaderError, SemanticReaderResult,
 pub struct SemanticAnnExpectation {
     pub graph_path: PathBuf,
     pub receipt: NativeHnswGenerationReceiptV2,
+}
+
+/// Native graph format with its complete v2 receipt sealed into the manifest.
+/// `artifact_parameters_sha256` is the canonical receipt fingerprint, not a
+/// digest invented from a subset of HNSW parameters or inferred from a filename.
+pub const NATIVE_ANN_ARTIFACT_FORMAT: &str = "native-hnsw-v2";
+
+/// Preflight cap across all manifest-selected graph images. The loaded graph,
+/// parser scratch, already-retained vectors and concurrent file growth are NOT
+/// covered by this declared-byte limit. Zero explicitly disables graph loading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnnAdmissionBudget {
+    pub max_declared_graph_bytes: u64,
+}
+
+impl Default for AnnAdmissionBudget {
+    fn default() -> Self {
+        Self { max_declared_graph_bytes: 256 * 1024 * 1024 }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum NativeAnnArtifactError {
+    #[error("native ANN requires an exact FSVI v2 base artifact")]
+    InvalidBase,
+    #[error("native ANN receipt does not bind the selected vector artifact")]
+    ReceiptMismatch,
+    #[error("native ANN requires a safe relative path with the receipted graph basename")]
+    InvalidPath,
+}
+
+/// Describe a graph produced by `ValidatedNativeHnsw::save` for sealing in the
+/// SAME immutable generation as `base`. This does not write or publish anything.
+/// The manifest sealer still validates the actual graph bytes before publication.
+/// Preserve the adjacent binary receipt: serving verifies its entire fingerprint.
+pub fn native_ann_artifact(
+    base: &SemanticGenerationArtifact,
+    receipt: &NativeHnswGenerationReceiptV2,
+    relative_path: &str,
+    validated_at_ms: i64,
+) -> Result<SemanticGenerationArtifact, NativeAnnArtifactError> {
+    let role = match base.role {
+        SemanticArtifactRole::FastVector => SemanticArtifactRole::FastAnn,
+        SemanticArtifactRole::QualityVector => SemanticArtifactRole::QualityAnn,
+        _ => return Err(NativeAnnArtifactError::InvalidBase),
+    };
+    if base.artifact_format != "fsvi-v2" || base.ann_base.is_some() || base.wal_entry_count != 0 {
+        return Err(NativeAnnArtifactError::InvalidBase);
+    }
+    if receipt.validate().is_err() || !receipt_matches_base(receipt, base) {
+        return Err(NativeAnnArtifactError::ReceiptMismatch);
+    }
+    let path = Path::new(relative_path);
+    if !crate::search::semantic_manifest::semantic_shard_artifact_path_is_safe(relative_path)
+        || relative_path.contains('\\')
+        || relative_path.contains(':')
+        || path.file_name().and_then(|name| name.to_str()) != Some(receipt.graph_basename.as_str())
+        || native_hnsw_generation_receipt_path(path).is_err()
+    {
+        return Err(NativeAnnArtifactError::InvalidPath);
+    }
+    let mut artifact = base.clone();
+    artifact.role = role;
+    artifact.relative_path = relative_path.to_owned();
+    artifact.artifact_format = NATIVE_ANN_ARTIFACT_FORMAT.to_owned();
+    artifact.artifact_sha256 = receipt.graph_sha256.clone();
+    artifact.size_bytes = receipt.graph_byte_len;
+    artifact.artifact_parameters_sha256 = receipt.receipt_sha256.clone();
+    artifact.ann_base = Some(SemanticAnnBaseBindingV1 {
+        base_role: base.role,
+        base_artifact_sha256: base.artifact_sha256.clone(),
+        base_storage_fingerprint: receipt.vector_storage_fingerprint.clone(),
+        base_artifact_parameters_sha256: base.artifact_parameters_sha256.clone(),
+        algorithm: "native-hnsw".to_owned(),
+        metric: "cosine".to_owned(),
+        parameters_sha256: receipt.receipt_sha256.clone(),
+    });
+    artifact.validation.validator_id = "cass-native-hnsw-v2".to_owned();
+    artifact.validation.validated_at_ms = validated_at_ms;
+    artifact.validation.artifact_sha256 = artifact.artifact_sha256.clone();
+    artifact.validation.size_bytes = artifact.size_bytes;
+    Ok(artifact)
+}
+
+fn receipt_matches_base(
+    receipt: &NativeHnswGenerationReceiptV2,
+    base: &SemanticGenerationArtifact,
+) -> bool {
+    receipt.fsvi_whole_image_sha256 == base.artifact_sha256
+        && receipt.embedding_identity_fingerprint == base.embedding_identity.fingerprint
+        && receipt.vector_storage_fingerprint == base.embedding_identity.identity.storage.fingerprint()
+        && receipt.fsvi_physical_row_count == base.vector_slot_count
+        && receipt.point_count == base.vector_slot_count
+        && receipt.ordered_live_docset_digest == base.covered_live_docset_sha256
+}
+
+fn graph_bytes_within_budget(mut sizes: impl Iterator<Item = u64>, budget: AnnAdmissionBudget) -> bool {
+    sizes.try_fold(0_u64, |total, bytes| total.checked_add(bytes))
+        .is_some_and(|total| total <= budget.max_declared_graph_bytes && usize::try_from(total).is_ok())
 }
 
 /// Stable reasons for using the retained exact shard instead of its ANN graph.
@@ -36,6 +140,7 @@ pub enum AnnFallbackReason {
     UnsafePath,
     SidecarUnavailable,
     ReceiptMismatch,
+    AdmissionBudget,
     CandidateLimit,
     FilterUnderfill,
     QueryFailed,
@@ -149,6 +254,58 @@ impl ShardAnn {
         }
     }
 
+    fn load_manifest(
+        owner: Arc<ValidatedFsviBytes>,
+        artifact: &SemanticGenerationArtifact,
+        base: &SemanticGenerationArtifact,
+        generation_dir: &Path,
+    ) -> Self {
+        let Some(binding) = artifact.ann_base.as_ref() else {
+            return Self::Unavailable(AnnFallbackReason::InvalidExpectation);
+        };
+        // Validate the selected manifest against the RETAINED owner, not an
+        // FSVI reopened at the publication path. A replaced path is irrelevant.
+        if artifact.artifact_format != NATIVE_ANN_ARTIFACT_FORMAT
+            || binding.algorithm != "native-hnsw" || binding.metric != "cosine"
+            || hex::encode(owner.witness().whole_image_sha256) != base.artifact_sha256
+            || hex::encode(owner.identity_v2().identity_bundle_fingerprint) != base.embedding_identity.fingerprint
+        {
+            return Self::Unavailable(AnnFallbackReason::InvalidExpectation);
+        }
+        let graph_path = generation_dir.join(&artifact.relative_path);
+        let Ok(receipt_path) = native_hnsw_generation_receipt_path(&graph_path) else {
+            return Self::Unavailable(AnnFallbackReason::UnsafePath);
+        };
+        if !single_link_regular(&graph_path) || !single_link_regular(&receipt_path) {
+            return Self::Unavailable(AnnFallbackReason::SidecarUnavailable);
+        }
+        // Fixed-format receipts are small. Do not feed an obviously oversized
+        // sidecar to the upstream read-all loader. This is a preflight, not a
+        // race-free allocation ceiling; upstream byte/identity checks still run.
+        let graph_size = std::fs::metadata(&graph_path).ok().map(|meta| meta.len());
+        let receipt_size = std::fs::metadata(&receipt_path).ok().map(|meta| meta.len());
+        if graph_size != Some(artifact.size_bytes) {
+            return Self::Unavailable(AnnFallbackReason::ReceiptMismatch);
+        }
+        if receipt_size.is_none_or(|bytes| bytes > 64 * 1024) {
+            return Self::Unavailable(AnnFallbackReason::AdmissionBudget);
+        }
+        // The upstream loader performs structural and cryptographic admission
+        // with this exact owner. Keep that loaded graph: no second graph open.
+        match ValidatedNativeHnsw::load(owner, &graph_path) {
+            Ok((graph, receipt))
+                if receipt.graph_sha256 == artifact.artifact_sha256
+                    && receipt.graph_byte_len == artifact.size_bytes
+                    && receipt.receipt_sha256 == artifact.artifact_parameters_sha256
+                    && receipt_matches_base(&receipt, base) =>
+            {
+                Self::Ready(Box::new(AdmittedAnn { graph, receipt }))
+            }
+            Ok(_) => Self::Unavailable(AnnFallbackReason::ReceiptMismatch),
+            Err(_) => Self::Unavailable(AnnFallbackReason::SidecarUnavailable),
+        }
+    }
+
     fn admission(&self) -> SemanticAnnAdmission {
         match self {
             Self::Unavailable(reason) => SemanticAnnAdmission::Unavailable { reason: *reason },
@@ -218,6 +375,51 @@ impl SemanticGenerationReader {
         };
         self.ann = Arc::new(selected);
         Ok(self)
+    }
+
+    /// Load only ANN roles explicitly declared by a complete v1 manifest.
+    /// The caller supplies selection authority; use SelectedSemanticGeneration
+    /// for current.json-selected serving. This API never discovers adjacent
+    /// graphs, reopens vector paths, or treats graph failure as loss of a tier.
+    /// A v1 manifest names one vector per tier; sharded selections fail back to
+    /// exact rather than applying one graph to unrelated shards.
+    pub fn with_manifest_ann(
+        mut self,
+        manifest: &SemanticGenerationManifestV1,
+        generation_dir: &Path,
+        budget: AnnAdmissionBudget,
+    ) -> Self {
+        let manifest_valid = manifest.validate().is_ok();
+        let within_budget = graph_bytes_within_budget(
+            manifest.artifacts.iter().filter(|artifact| matches!(artifact.role,
+                SemanticArtifactRole::FastAnn | SemanticArtifactRole::QualityAnn))
+                .map(|artifact| artifact.size_bytes),
+            budget,
+        );
+        let load = |kind, ann_role, base_role| {
+            self.tier(kind).map_or_else(Vec::new, |tier| {
+                tier.shards.iter().map(|owner| {
+                    let Some(artifact) = manifest.artifact(ann_role) else {
+                        return ShardAnn::Unavailable(AnnFallbackReason::NotSelected);
+                    };
+                    if !manifest_valid || tier.shards.len() != 1 {
+                        return ShardAnn::Unavailable(AnnFallbackReason::InvalidExpectation);
+                    }
+                    if !within_budget {
+                        return ShardAnn::Unavailable(AnnFallbackReason::AdmissionBudget);
+                    }
+                    let Some(base) = manifest.artifact(base_role) else {
+                        return ShardAnn::Unavailable(AnnFallbackReason::InvalidExpectation);
+                    };
+                    ShardAnn::load_manifest(Arc::clone(owner), artifact, base, generation_dir)
+                }).collect()
+            })
+        };
+        self.ann = Arc::new(AnnSelection {
+            fast: load(TierKind::Fast, SemanticArtifactRole::FastAnn, SemanticArtifactRole::FastVector),
+            quality: load(TierKind::Quality, SemanticArtifactRole::QualityAnn, SemanticArtifactRole::QualityVector),
+        });
+        self
     }
 
     /// Missing tier/shard is None, distinct from an exact shard without ANN.
@@ -330,3 +532,36 @@ fn native_window(
     hits.sort_unstable_by(|left, right| right.score.total_cmp(&left.score)
         .then_with(|| left.index.cmp(&right.index)));
     Ok((hits, count))
+}
+
+#[cfg(test)]
+mod publication_budget_tests {
+    use super::*;
+
+    #[test]
+    fn combined_graph_budget_is_checked_before_loading_either_tier() {
+        let budget = AnnAdmissionBudget { max_declared_graph_bytes: 100 };
+        assert!(graph_bytes_within_budget([40, 60].into_iter(), budget));
+        assert!(!graph_bytes_within_budget([40, 61].into_iter(), budget));
+    }
+
+    #[test]
+    fn overflow_is_not_misreported_as_an_empty_graph_selection() {
+        let budget = AnnAdmissionBudget { max_declared_graph_bytes: u64::MAX };
+        assert!(!graph_bytes_within_budget([u64::MAX, 1].into_iter(), budget));
+    }
+
+    #[test]
+    fn zero_budget_disables_selected_graphs_but_not_an_absent_selection() {
+        let budget = AnnAdmissionBudget { max_declared_graph_bytes: 0 };
+        assert!(graph_bytes_within_budget(std::iter::empty(), budget));
+        assert!(!graph_bytes_within_budget([1].into_iter(), budget));
+    }
+
+    #[test]
+    fn graph_budget_rejection_has_a_stable_machine_readable_reason() {
+        let admission = SemanticAnnAdmission::Unavailable { reason: AnnFallbackReason::AdmissionBudget };
+        assert_eq!(serde_json::to_value(admission).unwrap(),
+            serde_json::json!({"state": "unavailable", "reason": "admission_budget"}));
+    }
+}
