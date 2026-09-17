@@ -3,6 +3,7 @@
 //! This module provides the server that listens on a Unix Domain Socket
 //! and handles embedding/reranking requests using loaded models.
 
+mod inference;
 mod job_requests;
 
 use std::ffi::OsString;
@@ -25,9 +26,8 @@ use tracing::{debug, error, info, warn};
 
 use super::models::ModelManager;
 use super::protocol::{
-    EmbedResponse, ErrorCode, ErrorResponse, FramedMessage,
-    HealthStatus, ModelInfo, PROTOCOL_VERSION, Request, RerankResponse, Response, StatusResponse,
-    decode_message, default_socket_path, encode_message,
+    ErrorCode, ErrorResponse, FramedMessage, HealthStatus, ModelInfo, PROTOCOL_VERSION, Request,
+    Response, StatusResponse, decode_message, default_socket_path, encode_message,
 };
 use super::resource::ResourceMonitor;
 use super::worker::{EmbeddingJobConfig, EmbeddingWorker, EmbeddingWorkerHandle};
@@ -380,6 +380,7 @@ pub struct ModelDaemon {
     shutdown: AtomicBool,
     last_activity: RwLock<Instant>,
     attestation: RwLock<Option<DaemonAttestationState>>,
+    inference_gate: inference::InferenceGate,
     worker_handle: parking_lot::Mutex<Option<EmbeddingWorkerHandle>>,
     worker_thread: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -397,6 +398,7 @@ impl ModelDaemon {
             shutdown: AtomicBool::new(false),
             last_activity: RwLock::new(Instant::now()),
             attestation: RwLock::new(None),
+            inference_gate: inference::InferenceGate::default(),
             worker_handle: parking_lot::Mutex::new(None),
             worker_thread: parking_lot::Mutex::new(None),
         }
@@ -907,8 +909,6 @@ impl ModelDaemon {
 
     /// Handle a single request.
     fn handle_request(&self, request_id: String, request: Request) -> Response {
-        let start = Instant::now();
-
         match request {
             Request::Health => Response::Health(HealthStatus {
                 uptime_secs: self.uptime_secs(),
@@ -949,140 +949,10 @@ impl ModelDaemon {
                 }
             }
 
-            Request::Embed {
-                texts,
-                model,
-                dims: _,
-            } => {
-                debug!(
-                    request_id = %request_id,
-                    batch_size = texts.len(),
-                    model = %model,
-                    "Processing embed request"
-                );
-
-                match self.models.embed_batch(&texts) {
-                    Ok(embeddings) => Response::Embed(EmbedResponse {
-                        embeddings,
-                        model: self.models.embedder_id().to_string(),
-                        elapsed_ms: start.elapsed().as_millis() as u64,
-                    }),
-                    Err(e) => Response::Error(ErrorResponse {
-                        code: ErrorCode::ModelLoadFailed,
-                        message: e.to_string(),
-                        retryable: true,
-                        retry_after_ms: Some(1000),
-                    }),
-                }
-            }
-
-            Request::EmbedAttested {
-                texts,
-                model,
-                dims: _,
-                challenge,
-            } => {
-                let operation = if texts.len() == 1 {
-                    DaemonOperationV1::Embed
-                } else {
-                    DaemonOperationV1::EmbedBatch
-                };
-                let inputs: Vec<&str> = texts.iter().map(String::as_str).collect();
-                let state = self.attestation.read();
-                let Some(state) = state.as_ref() else {
-                    return attestation_unavailable_response();
-                };
-                if state
-                    .validate_challenge_for_inputs(&challenge, operation, &inputs)
-                    .is_err()
-                {
-                    return rejected_attestation_response();
-                }
-                debug!(
-                    request_id = %request_id,
-                    batch_size = texts.len(),
-                    model = %model,
-                    "Processing attested embed request"
-                );
-                match self.models.embed_batch(&texts) {
-                    Ok(embeddings) => state
-                        .sign_vectors(&challenge, operation, &inputs, embeddings)
-                        .map(Response::AttestedEmbedding)
-                        .unwrap_or_else(|_| rejected_attestation_response()),
-                    Err(error) => Response::Error(ErrorResponse {
-                        code: ErrorCode::ModelLoadFailed,
-                        message: error.to_string(),
-                        retryable: true,
-                        retry_after_ms: Some(1000),
-                    }),
-                }
-            }
-
-            Request::Rerank {
-                query,
-                documents,
-                model,
-            } => {
-                debug!(
-                    request_id = %request_id,
-                    doc_count = documents.len(),
-                    model = %model,
-                    "Processing rerank request"
-                );
-
-                match self.models.rerank(&query, &documents) {
-                    Ok(scores) => Response::Rerank(RerankResponse {
-                        scores,
-                        model: self.models.reranker_id().to_string(),
-                        elapsed_ms: start.elapsed().as_millis() as u64,
-                    }),
-                    Err(e) => Response::Error(ErrorResponse {
-                        code: ErrorCode::ModelLoadFailed,
-                        message: e.to_string(),
-                        retryable: true,
-                        retry_after_ms: Some(1000),
-                    }),
-                }
-            }
-
-            Request::RerankAttested {
-                query,
-                documents,
-                model,
-                challenge,
-            } => {
-                let mut inputs = Vec::with_capacity(documents.len() + 1);
-                inputs.push(query.as_str());
-                inputs.extend(documents.iter().map(String::as_str));
-                let state = self.attestation.read();
-                let Some(state) = state.as_ref() else {
-                    return attestation_unavailable_response();
-                };
-                if state
-                    .validate_challenge_for_inputs(&challenge, DaemonOperationV1::Rerank, &inputs)
-                    .is_err()
-                {
-                    return rejected_attestation_response();
-                }
-                debug!(
-                    request_id = %request_id,
-                    doc_count = documents.len(),
-                    model = %model,
-                    "Processing attested rerank request"
-                );
-                match self.models.rerank(&query, &documents) {
-                    Ok(scores) => state
-                        .sign_vectors(&challenge, DaemonOperationV1::Rerank, &inputs, vec![scores])
-                        .map(Response::AttestedEmbedding)
-                        .unwrap_or_else(|_| rejected_attestation_response()),
-                    Err(error) => Response::Error(ErrorResponse {
-                        code: ErrorCode::ModelLoadFailed,
-                        message: error.to_string(),
-                        retryable: true,
-                        retry_after_ms: Some(1000),
-                    }),
-                }
-            }
+            request @ (Request::Embed { .. }
+            | Request::EmbedAttested { .. }
+            | Request::Rerank { .. }
+            | Request::RerankAttested { .. }) => inference::handle(self, request),
 
             Request::Status => {
                 let embedder_info = ModelInfo {
@@ -1301,9 +1171,10 @@ mod tests {
     /// Regression for #346: on macOS `/tmp` is a symlink to `/private/tmp`,
     /// and the daemon refused to start with "socket parent is not a
     /// directory: /tmp" because the parent check used symlink (lstat)
-    /// semantics. The classifier must follow a symlinked parent and the full
-    /// bind flow must succeed for a socket whose parent is a symlink to a
-    /// world-writable directory (routing through the private runtime dir).
+    /// semantics. The classifier must follow the symlink instead of erroring
+    /// with InvalidInput, and the full bind flow must succeed for a socket
+    /// whose parent is a symlink to a world-writable directory (routing through
+    /// the private runtime dir).
     #[test]
     fn test_bind_follows_symlinked_socket_parent() {
         let tmp = TempDir::new().expect("tempdir");
