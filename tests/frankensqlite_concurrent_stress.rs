@@ -457,6 +457,187 @@ fn stress_crash_recovery_uncommitted_data_absent() {
     );
 }
 
+/// Unlike dropping a connection, process::exit skips the connection and
+/// transaction destructors. Exercise the real WAL recovery boundary while a
+/// separate process retains an older read snapshot (GH391 / 2l1b0.2).
+#[test]
+fn stress_writer_process_exit_preserves_exact_rows_and_pinned_reader() {
+    use std::process::{Command, Stdio};
+    use wait_timeout::ChildExt;
+
+    const CHILD_DB: &str = "CASS_GH391_CRASH_CHILD_DB";
+    const CHILD_PHASE: &str = "CASS_GH391_CRASH_CHILD_PHASE";
+    const TEST_NAME: &str = "stress_writer_process_exit_preserves_exact_rows_and_pinned_reader";
+    const CRASH_EXIT: i32 = 73;
+
+    fn payload(id: i64) -> String {
+        format!("row-{id:04}:{}", "x".repeat(1024))
+    }
+
+    fn assert_rows(conn: &Connection, last_id: i64) {
+        let expected: Vec<_> = (1..=last_id).filter(|id| !(21..=80).contains(id)).collect();
+        let rows = conn
+            .query("SELECT id, thread_id, seq, val FROM items ORDER BY id")
+            .expect("read every committed row");
+        assert_eq!(rows.len(), expected.len(), "no lost or extra rows");
+        for (row, id) in rows.iter().zip(expected) {
+            assert_eq!(row.get_typed::<i64>(0).unwrap(), id);
+            assert_eq!(row.get_typed::<i64>(1).unwrap(), 0);
+            assert_eq!(row.get_typed::<i64>(2).unwrap(), id);
+            assert_eq!(row.get_typed::<String>(3).unwrap(), payload(id));
+        }
+    }
+
+    fn run_bounded(command: &mut Command, log: &std::path::Path) -> std::process::ExitStatus {
+        let output = std::fs::File::create_new(log).expect("create private child log");
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(output.try_clone().unwrap())
+            .stderr(output)
+            .spawn()
+            .expect("spawn real child process");
+        match child.wait_timeout(Duration::from_secs(90)) {
+            Ok(Some(status)) => status,
+            result => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("child failed to finish: {result:?}; log={}", log.display());
+            }
+        }
+    }
+
+    if let Ok(path) = dotenvy::var(CHILD_DB) {
+        let conn = open_configured(std::path::Path::new(&path));
+        conn.execute("PRAGMA wal_autocheckpoint = 0").unwrap();
+        conn.execute("BEGIN IMMEDIATE").unwrap();
+        for id in 481..=500 {
+            conn.execute_compat(
+                "INSERT INTO items (id, thread_id, seq, val) VALUES (?1, 0, ?1, ?2)",
+                fparams![id, payload(id)],
+            )
+            .unwrap();
+        }
+        conn.execute("COMMIT").unwrap();
+        match dotenvy::var(CHILD_PHASE).unwrap().as_str() {
+            "after-commit" => {}
+            "before-commit" => {
+                conn.execute("BEGIN IMMEDIATE").unwrap();
+                for id in 501..=520 {
+                    conn.execute_compat(
+                        "INSERT INTO items (id, thread_id, seq, val) VALUES (?1, 0, ?1, ?2)",
+                        fparams![id, payload(id)],
+                    )
+                    .unwrap();
+                }
+                conn.execute("UPDATE items SET val = 'must roll back' WHERE id = 410")
+                    .unwrap();
+                conn.execute("DELETE FROM items WHERE id = 411").unwrap();
+            }
+            phase => panic!("unexpected crash phase {phase}"),
+        }
+        // Deliberately no close, rollback, checkpoint or Rust destructors.
+        std::process::exit(CRASH_EXIT);
+    }
+
+    for phase in ["after-commit", "before-commit"] {
+        let dir = TempDir::new().unwrap();
+        let db_path = setup_simple_db(&dir);
+        let seed = open_configured(&db_path);
+        for first in (1..=480).step_by(20) {
+            seed.execute("BEGIN IMMEDIATE").unwrap();
+            for id in first..first + 20 {
+                seed.execute_compat(
+                    "INSERT INTO items (id, thread_id, seq, val) VALUES (?1, 0, ?1, ?2)",
+                    fparams![id, payload(id)],
+                )
+                .unwrap();
+            }
+            seed.execute("COMMIT").unwrap();
+        }
+        seed.execute("DELETE FROM items WHERE id BETWEEN 21 AND 80")
+            .unwrap();
+        assert!(
+            seed.query("PRAGMA freelist_count").unwrap()[0]
+                .get_typed::<i64>(0)
+                .unwrap()
+                > 0,
+            "fixture must exercise recycled pages"
+        );
+        seed.query("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        seed.close().unwrap();
+
+        let reader = open_configured(&db_path);
+        reader.execute("BEGIN DEFERRED").unwrap();
+        assert_rows(&reader, 480); // Materialize the pre-writer snapshot.
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_DB, &db_path)
+            .env(CHILD_PHASE, phase);
+        let child_log = dir.path().join("writer.log");
+        let status = run_bounded(&mut command, &child_log);
+        assert_eq!(
+            status.code(),
+            Some(CRASH_EXIT),
+            "writer must reach the requested crash boundary: {}",
+            std::fs::read_to_string(&child_log).unwrap()
+        );
+        assert!(
+            std::fs::metadata(db_path.with_file_name("simple.db-wal"))
+                .unwrap()
+                .len()
+                > 32,
+            "process exit must leave committed WAL frames to recover"
+        );
+        assert_rows(&reader, 480); // A commit cannot rewrite the pinned view.
+        reader.execute("ROLLBACK").unwrap();
+        reader.close_without_checkpoint().unwrap();
+
+        // Independent C SQLite reads the WAL before a FrankenSQLite opener
+        // can repair or checkpoint it. Never use immutable=1: it ignores WAL.
+        let mut oracle = Command::new("python3");
+        oracle
+            .args([
+                "-I",
+                "-c",
+                r#"
+import pathlib, sqlite3, sys
+db = sqlite3.connect(pathlib.Path(sys.argv[1]).as_uri() + '?mode=ro', uri=True, timeout=5)
+assert db.execute('PRAGMA integrity_check').fetchall() == [('ok',)]
+expected = [(i, 0, i, f'row-{i:04}:' + 'x' * 1024) for i in range(1, 501) if not 21 <= i <= 80]
+assert db.execute('SELECT id, thread_id, seq, val FROM items ORDER BY id').fetchall() == expected
+db.close()
+print('C SQLite integrity and exact rows passed')
+"#,
+            ])
+            .arg(&db_path);
+        let oracle_log = dir.path().join("oracle.log");
+        assert!(
+            run_bounded(&mut oracle, &oracle_log).success(),
+            "independent WAL oracle failed: {}",
+            std::fs::read_to_string(&oracle_log).unwrap()
+        );
+
+        for reopen in 0..2 {
+            let recovered = open_configured(&db_path);
+            assert_rows(&recovered, 500);
+            let checks: Vec<String> = recovered
+                .query("PRAGMA integrity_check")
+                .unwrap()
+                .iter()
+                .map(|row| row.get_typed(0).unwrap())
+                .collect();
+            assert_eq!(checks, ["ok"], "{phase} reopen {reopen}");
+            let checkpoint = recovered.query("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            assert_eq!(checkpoint[0].get_typed::<i64>(0).unwrap(), 0);
+            recovered.close().unwrap();
+        }
+        eprintln!(
+            "GH391 phase={phase}: pinned snapshot, exact rows, independent integrity, checkpoint and reopen passed"
+        );
+    }
+}
+
 // ============================================================================
 // 5. LARGE TRANSACTION
 // ============================================================================
