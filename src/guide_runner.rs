@@ -10,7 +10,8 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -42,6 +43,7 @@ struct AllowedCommand {
 enum Adapter {
     Readiness,
     DoctorTruth,
+    SearchCoverage,
     ResourcePlan,
     PrivacyPreview,
     SupportEvidence,
@@ -64,7 +66,7 @@ const ALLOWLIST: &[AllowedCommand] = &[
     AllowedCommand {
         id: "diag.search-coverage",
         mutation_class: "read-only-proof",
-        adapter: Adapter::ObservationOnly,
+        adapter: Adapter::SearchCoverage,
     },
     AllowedCommand {
         id: "diag.ci-first-failure",
@@ -169,7 +171,8 @@ fn allowlisted_argv(command: AllowedCommand, data_dir: &Path) -> Option<Vec<Stri
     let data_dir = data_dir.display().to_string();
     let argv = match command.adapter {
         Adapter::Readiness => vec!["cass", "health", "--data-dir", &data_dir, "--json"],
-        Adapter::DoctorTruth => vec!["cass", "doctor", "--data-dir", &data_dir, "--json"],
+        Adapter::DoctorTruth => vec!["cass", "doctor", "check", "--data-dir", &data_dir, "--json"],
+        Adapter::SearchCoverage => vec!["cass", "status", "--data-dir", &data_dir, "--json"],
         Adapter::ResourcePlan => vec![
             "cass",
             "swarm",
@@ -273,6 +276,7 @@ struct ProofResult {
     result: &'static str,
     source: &'static str,
     detail: String,
+    observation: Option<Value>,
 }
 
 fn evaluate_read_only_proof(
@@ -282,10 +286,26 @@ fn evaluate_read_only_proof(
     request: &GuideRunRequest<'_>,
     privacy_accepted: bool,
     cost_accepted: bool,
+    deadline: Instant,
 ) -> ProofResult {
-    if let Some(passed) = fixture_proof(request.fixture_context, proof_gate) {
+    if request.source_kind != "fixture"
+        && matches!(
+            command.adapter,
+            Adapter::Readiness
+                | Adapter::DoctorTruth
+                | Adapter::SearchCoverage
+                | Adapter::SupportEvidence
+        )
+    {
+        return evaluate_live_proof(command, request.data_dir, deadline);
+    }
+    if let Some(passed) = (request.source_kind == "fixture")
+        .then(|| fixture_proof(request.fixture_context, proof_gate))
+        .flatten()
+    {
         return ProofResult {
             result: if passed { "passed" } else { "failed" },
+            observation: None,
             source: "fixture-observation",
             detail: "deterministic fixture proof observation".to_string(),
         };
@@ -297,6 +317,7 @@ fn evaluate_read_only_proof(
             } else {
                 "failed"
             },
+            observation: None,
             source: "preflight-facts",
             detail: "evaluated guide readiness from preflight facts".to_string(),
         },
@@ -306,6 +327,7 @@ fn evaluate_read_only_proof(
             } else {
                 "failed"
             },
+            observation: None,
             source: "preflight-facts",
             detail: "evaluated canonical database presence before derived-asset diagnosis"
                 .to_string(),
@@ -321,6 +343,7 @@ fn evaluate_read_only_proof(
                 } else {
                     "needs-confirmation"
                 },
+                observation: None,
                 source: "resource-what-if",
                 detail: format!("resource plan readiness: {readiness}"),
             }
@@ -335,6 +358,7 @@ fn evaluate_read_only_proof(
                 } else {
                     "needs-confirmation"
                 },
+                observation: None,
                 source: "privacy-preview",
                 detail: format!("privacy preview readiness: {readiness}"),
             }
@@ -345,6 +369,7 @@ fn evaluate_read_only_proof(
             } else {
                 "failed"
             },
+            observation: None,
             source: "preflight-facts",
             detail: "checked evidence source availability".to_string(),
         },
@@ -354,14 +379,146 @@ fn evaluate_read_only_proof(
             } else {
                 "needs-confirmation"
             },
+            observation: None,
             source: "operator-and-preflight",
             detail: "requires an available key and exact privacy-tier acceptance".to_string(),
         },
-        Adapter::SupportBundle | Adapter::ObservationOnly => ProofResult {
+        Adapter::SearchCoverage | Adapter::SupportBundle | Adapter::ObservationOnly => ProofResult {
             result: "not-run",
+            observation: None,
             source: "none",
             detail: "no automatic read-only proof adapter".to_string(),
         },
+    }
+}
+
+/// Run the installed binary, never another `cass` selected by PATH. The shared
+/// supervisor bounds both captured streams and terminates timed-out children.
+fn run_bounded_cass(argv: &[String], timeout: Duration) -> Result<Output, &'static str> {
+    let args = argv
+        .get(1..)
+        .filter(|args| !args.is_empty())
+        .ok_or("missing argv")?;
+    if argv.first().map(String::as_str) != Some("cass") || timeout.is_zero() {
+        return Err("invalid command or exhausted live proof budget");
+    }
+    #[cfg(target_os = "linux")]
+    let mut child = Command::new("/proc/self/exe");
+    #[cfg(not(target_os = "linux"))]
+    let mut child = Command::new(
+        std::env::current_exe().map_err(|_| "cannot resolve the running cass executable")?,
+    );
+    child
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("CASS_AUTO_REFRESH", "0")
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
+    crate::sources::configure_child_process_group(&mut child);
+    let child = child.spawn().map_err(|_| "could not start live cass proof")?;
+    crate::sources::wait_for_child_output_with_limit(child, timeout, Some(2 * 1024 * 1024))
+        .map_err(|_| "live cass proof failed to capture bounded output")?
+        .ok_or("live cass proof deadline exceeded")
+}
+
+fn unavailable_live_proof(detail: impl Into<String>) -> ProofResult {
+    ProofResult {
+        result: "not-run",
+        source: "live-command",
+        detail: detail.into(),
+        observation: None,
+    }
+}
+
+fn evaluate_live_proof(command: AllowedCommand, data_dir: &Path, deadline: Instant) -> ProofResult {
+    let Some(timeout) = deadline.checked_duration_since(Instant::now()) else {
+        return unavailable_live_proof("shared live proof deadline exhausted; no child started");
+    };
+    let Some(argv) = allowlisted_argv(command, data_dir) else {
+        return unavailable_live_proof("no safe argv for live proof");
+    };
+    let output = match run_bounded_cass(&argv, timeout) {
+        Ok(output) => output,
+        Err(detail) => return unavailable_live_proof(detail),
+    };
+    let payload = match serde_json::from_slice::<Value>(&output.stdout) {
+        Ok(payload) => payload,
+        Err(_) => return unavailable_live_proof("live proof returned malformed or non-JSON output"),
+    };
+    classify_live_proof(command.adapter, output.status.code(), &payload)
+}
+
+/// A diagnostic completing is distinct from the archive being healthy. A
+/// degraded health report is useful support evidence, but cannot pass readiness.
+/// Receipts contain only typed measurements: no paths, messages, or raw stderr.
+fn classify_live_proof(adapter: Adapter, exit_code: Option<i32>, payload: &Value) -> ProofResult {
+    if !matches!(exit_code, Some(0 | 1)) {
+        return ProofResult {
+            result: "failed",
+            source: "live-command",
+            detail: "live diagnostic did not complete (refusal, concurrency, or process failure)"
+                .to_string(),
+            observation: Some(json!({"exit_code": exit_code})),
+        };
+    }
+    let Some(healthy) = payload.get("healthy").and_then(Value::as_bool) else {
+        return unavailable_live_proof("live diagnostic lacks a typed healthy verdict");
+    };
+    if payload.get("error").is_some_and(|value| !value.is_null())
+        || payload.get("err").is_some_and(|value| !value.is_null())
+    {
+        return unavailable_live_proof("live diagnostic returned an error envelope");
+    }
+    let checks = payload.get("checks").and_then(Value::as_array);
+    let index = payload.get("index");
+    let shape_valid = match adapter {
+        Adapter::Readiness | Adapter::SupportEvidence => true,
+        Adapter::DoctorTruth => checks.is_some_and(|checks| !checks.is_empty()),
+        Adapter::SearchCoverage => index
+            .and_then(|index| index.get("status"))
+            .and_then(Value::as_str)
+            .is_some(),
+        _ => false,
+    };
+    if !shape_valid {
+        return unavailable_live_proof("live diagnostic has an unsupported or incomplete schema");
+    }
+    let rebuilding = payload
+        .pointer("/rebuild_progress/active")
+        .and_then(Value::as_bool);
+    let passed = adapter != Adapter::Readiness
+        || (healthy && exit_code == Some(0) && rebuilding != Some(true));
+    let observation = json!({
+        "exit_code": exit_code,
+        "healthy": healthy,
+        "needs_rebuild": payload.get("needs_rebuild").and_then(Value::as_bool),
+        "rebuild_active": rebuilding,
+        "check_count": checks.map(Vec::len),
+        "error_count": payload.get("errors").and_then(Value::as_array).map(Vec::len),
+        "lexical": {
+            "ready": index.and_then(|index| index.get("status")).and_then(Value::as_str)
+                .map(|status| status == "ready"),
+            "fresh": index.and_then(|index| index.get("fresh")).and_then(Value::as_bool),
+            "hollow": index.and_then(|index| index.get("hollow")).and_then(Value::as_bool),
+            "documents": index.and_then(|index| index.get("documents")).and_then(Value::as_u64),
+            "live_documents": index.and_then(|index| index.get("live_documents")).and_then(Value::as_u64)
+        }
+    });
+    ProofResult {
+        result: if passed { "passed" } else { "failed" },
+        source: "live-command",
+        detail: match adapter {
+            Adapter::Readiness if passed => "live health confirms search readiness",
+            Adapter::Readiness => "live health is not ready; inspect health before mutating",
+            Adapter::DoctorTruth => "live doctor classified assets; this is not repair authorization",
+            Adapter::SearchCoverage => {
+                "live status reported search coverage; unknown counts remain null"
+            }
+            _ => "live health evidence collected, including any degraded verdict",
+        }
+        .to_string(),
+        observation: Some(observation),
     }
 }
 
@@ -590,6 +747,7 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
     let mut awaiting_confirmation = false;
     let mut blocked_step = false;
 
+    let proof_deadline = Instant::now() + Duration::from_secs(15);
     for step in &steps {
         let order = step
             .get("order")
@@ -674,6 +832,7 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
                 request,
                 privacy_accepted,
                 cost_accepted,
+                proof_deadline,
             );
             let result = if proof.result == "passed" {
                 automatic_read_only_count += 1;
@@ -699,6 +858,11 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
                 "result": result,
                 "detail": proof.detail
             }));
+            if let Some(observation) = proof.observation
+                && let Some(entry) = transcript.last_mut().and_then(Value::as_object_mut)
+            {
+                entry.insert("observation".to_string(), observation);
+            }
             continue;
         }
 
@@ -778,7 +942,7 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
         "bead_id": BEAD_ID,
         "mode": if request.apply { "apply" } else { "dry-run" },
         "overall_status": overall_status,
-        "deterministic_transcript": true,
+        "deterministic_transcript": !request.apply || request.source_kind == "fixture",
         "shell_evaluation": false,
         "fixture_mutation_allowed": false,
         "confirmed_facts": request.confirmed_facts,
@@ -829,7 +993,7 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
 mod tests {
     use std::path::Path;
 
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::{
         GuideRunRequest, allowed_command, allowlisted_argv, has_shell_metacharacter,
@@ -904,5 +1068,99 @@ mod tests {
             return Err("dry-run transcript reported execution".into());
         }
         Ok(())
+    }
+
+
+    #[test]
+    fn live_readiness_requires_a_healthy_successful_non_rebuilding_report() {
+        use super::{Adapter, classify_live_proof};
+        let ready = json!({"healthy": true, "rebuild_progress": {"active": false}});
+        assert_eq!(classify_live_proof(Adapter::Readiness, Some(0), &ready).result, "passed");
+        for (code, payload) in [
+            (Some(1), ready.clone()),
+            (Some(0), json!({"healthy": false})),
+            (Some(0), json!({"healthy": true, "rebuild_progress": {"active": true}})),
+            (None, ready),
+        ] {
+            assert_ne!(classify_live_proof(Adapter::Readiness, code, &payload).result, "passed");
+        }
+    }
+
+    #[test]
+    fn live_diagnostics_reject_error_envelopes_and_incomplete_schemas() {
+        use super::{Adapter, classify_live_proof};
+        for payload in [Value::Null, json!({}), json!({"healthy": "true"}),
+            json!({"healthy": true, "error": {"message": "private"}})] {
+            assert_ne!(classify_live_proof(Adapter::Readiness, Some(0), &payload).result, "passed");
+        }
+        assert_ne!(classify_live_proof(Adapter::DoctorTruth, Some(0), &json!({"healthy": true, "checks": []})).result, "passed");
+        assert_ne!(classify_live_proof(Adapter::SearchCoverage, Some(0), &json!({"healthy": true})).result, "passed");
+    }
+
+    #[test]
+    fn degraded_diagnostics_are_evidence_not_readiness() {
+        use super::{Adapter, classify_live_proof};
+        let payload = json!({"healthy": false, "needs_rebuild": true,
+            "checks": [{"name": "lexical", "status": "warning"}],
+            "index": {"status": "hollow", "hollow": true, "documents": 1}});
+        for adapter in [Adapter::DoctorTruth, Adapter::SupportEvidence, Adapter::SearchCoverage] {
+            assert_eq!(classify_live_proof(adapter, Some(1), &payload).result, "passed");
+        }
+        assert_eq!(classify_live_proof(Adapter::Readiness, Some(1), &payload).result, "failed");
+    }
+
+    #[test]
+    fn live_receipts_project_measurements_without_private_content_or_invented_counts() {
+        use super::{Adapter, classify_live_proof};
+        let payload = json!({"healthy": true, "index": {"status": "ready", "path": "/private",
+            "documents": 12, "live_documents": null}, "errors": ["secret diagnostic"],
+            "source_path": "/secret", "content": "sensitive message"});
+        let proof = classify_live_proof(Adapter::SearchCoverage, Some(0), &payload);
+        let observation = proof.observation.expect("live receipt");
+        assert_eq!(observation.pointer("/lexical/documents"), Some(&json!(12)));
+        assert_eq!(observation.pointer("/lexical/live_documents"), Some(&Value::Null));
+        let text = observation.to_string();
+        for private in ["private", "secret", "sensitive"] {
+            assert!(!text.contains(private));
+        }
+    }
+
+    #[test]
+    fn live_proofs_ignore_fixture_overrides_and_expired_budgets_never_spawn() {
+        use super::evaluate_read_only_proof;
+        use std::time::Instant;
+        let context = json!({"proof_results": {"readiness-ok": true}});
+        let mut request = request(Path::new("/unread/missing/archive"));
+        request.source_kind = "live";
+        request.fixture_context = Some(&context);
+        let command = allowed_command("search.readiness").expect("allowed proof");
+        let proof = evaluate_read_only_proof(command, "readiness-ok", &json!({"readiness": "ready"}),
+            &request, true, true, Instant::now());
+        assert_eq!(proof.result, "not-run");
+        assert_eq!(proof.source, "live-command");
+        assert!(proof.detail.contains("deadline"));
+    }
+
+    #[test]
+    fn fixture_proofs_remain_offline_even_without_observations() {
+        use super::evaluate_read_only_proof;
+        use std::time::Instant;
+        let request = request(Path::new("/unread/missing/archive"));
+        for id in ["search.readiness", "doctor.asset-truth-table", "diag.search-coverage", "support.gather-evidence"] {
+            let proof = evaluate_read_only_proof(allowed_command(id).expect("allowed proof"), "missing",
+                &json!({}), &request, true, true, Instant::now());
+            assert_ne!(proof.source, "live-command");
+            assert!(proof.observation.is_none());
+        }
+    }
+
+    #[test]
+    fn coverage_and_doctor_argv_are_explicit_read_only_commands() {
+        for id in ["doctor.asset-truth-table", "diag.search-coverage"] {
+            let argv = allowlisted_argv(allowed_command(id).expect("allowed"), Path::new("/archive with spaces")).expect("argv");
+            assert!(argv.iter().any(|arg| arg == "/archive with spaces"));
+            assert!(argv.iter().any(|arg| arg == "--json"));
+            assert!(!argv.iter().any(|arg| matches!(arg.as_str(), "--fix" | "--yes" | "repair" | "index")));
+        }
     }
 }
