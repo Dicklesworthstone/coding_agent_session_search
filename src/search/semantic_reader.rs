@@ -1,4 +1,5 @@
-//! Exact semantic retrieval over retained, witness-checked FSVI v2 shards.
+//! Semantic retrieval over retained, witness-checked FSVI v2 shards.
+//! Exact is the default; opt-in native ANN has per-shard exact fallback.
 //!
 //! This is the reader component of the immutable-generation migration. Callers
 //! must supply the complete artifact selection, bindings and witnesses from a
@@ -15,6 +16,8 @@
 //! Owners retain complete artifact images in memory. Query merging retains at
 //! most O(k) candidates per active tier; this is NOT a bound on total index RSS.
 
+pub mod ann;
+
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::path::PathBuf;
@@ -28,6 +31,7 @@ use frankensearch::core::{
 };
 use frankensearch::index::{FsviAdmissionError, FsviV2IdentityBinding, FsviV2Witness, ValidatedFsviBytes};
 
+use ann::{AnnSearchPolicy, SemanticShardEngine, SemanticShardExecution};
 use super::semantic_manifest::TierKind;
 use super::vector_index::{
     ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER, SemanticDocId, parse_semantic_doc_id,
@@ -61,6 +65,10 @@ pub enum SemanticReaderError {
         #[source]
         source: Box<FsviAdmissionError>,
     },
+    #[error("ANN selection does not align with the {0:?} tier's shard order")]
+    AnnSelectionMismatch(TierKind),
+    #[error("ANN candidate limits must satisfy 1 <= initial <= maximum <= 65536")]
+    InvalidAnnPolicy,
     #[error("a canonical semantic shard must contain only live, canonical CASS passage IDs")]
     NonCanonicalDocuments,
     #[error("a canonical passage ID occurs more than once within a semantic tier")]
@@ -86,7 +94,7 @@ pub type SemanticReaderResult<T> = Result<T, SemanticReaderError>;
 #[derive(Debug)]
 struct AdmittedTier {
     binding: FsviV2IdentityBinding,
-    shards: Vec<ValidatedFsviBytes>,
+    shards: Vec<Arc<ValidatedFsviBytes>>,
     live_count: u64,
 }
 
@@ -122,7 +130,7 @@ impl AdmittedTier {
             live_count = live_count
                 .checked_add(owner.witness().live_count)
                 .ok_or(SemanticReaderError::CountOverflow)?;
-            shards.push(owner);
+            shards.push(Arc::new(owner));
         }
 
         // One temporary set of borrowed IDs, not a second copy of the corpus.
@@ -170,20 +178,29 @@ impl AdmittedTier {
 
     fn search(
         &self,
+        kind: TierKind,
         query: &BoundQueryEmbedding,
         k: usize,
         filter: Option<&dyn SearchFilter>,
-    ) -> SemanticReaderResult<Vec<Candidate>> {
-        if k == 0 {
-            return Ok(Vec::new());
-        }
+        ann: &ann::AnnSelection,
+        policy: Option<AnnSearchPolicy>,
+    ) -> SemanticReaderResult<TierResult> {
+        let mut execution = Vec::with_capacity(self.shards.len());
         // Do not allocate from caller k: allocation grows only with real hits.
         let mut best = BinaryHeap::<Candidate>::new();
         for (shard, owner) in self.shards.iter().enumerate() {
             let local_limit = k.min(owner.live_count());
             // k is a requested maximum, never an allocation hint larger than
             // the actual shard. Preserve identity checks even for empty shards.
-            let local = owner.search_top_k(query.vector(), local_limit, filter)?;
+            let report = SemanticShardExecution {
+                tier: kind, shard, engine: SemanticShardEngine::Skipped,
+                fallback_reason: None, graph_sha256: None, ann_windows: 0,
+                candidate_rows: 0, final_candidate_limit: 0, returned_candidates: 0,
+            };
+            let (local, report) = ann::search_shard(
+                owner, ann.shard(kind, shard), query, local_limit, filter, policy, report,
+            )?;
+            execution.push(report);
             if local.len() > local_limit {
                 return Err(SemanticReaderError::InvalidCandidate);
             }
@@ -212,8 +229,14 @@ impl AdmittedTier {
                 }
             }
         }
-        Ok(best.into_sorted_vec())
+        Ok(TierResult { candidates: best.into_sorted_vec(), execution })
     }
+}
+
+#[derive(Debug, Clone)]
+struct TierResult {
+    candidates: Vec<Candidate>,
+    execution: Vec<SemanticShardExecution>,
 }
 
 fn canonical_document(id: &str) -> SemanticReaderResult<SemanticDocId> {
@@ -237,6 +260,7 @@ pub struct SemanticGenerationReader {
     fast: Option<Arc<AdmittedTier>>,
     quality: Option<Arc<AdmittedTier>>,
     generation: ArtifactGenerationIdentityV1,
+    ann: Arc<ann::AnnSelection>,
 }
 
 impl SemanticGenerationReader {
@@ -274,7 +298,7 @@ impl SemanticGenerationReader {
                 return Err(SemanticReaderError::ArtifactRoleAlias);
             }
         }
-        Ok(Self { fast, quality, generation })
+        Ok(Self { fast, quality, generation, ann: Arc::new(ann::AnnSelection::default()) })
     }
 
     /// Install only a completely admitted successor. Previously returned batches
@@ -308,7 +332,7 @@ impl SemanticGenerationReader {
 
     /// Read an exact retained witness without reopening its publication path.
     pub fn witness(&self, tier: TierKind, shard: usize) -> Option<&FsviV2Witness> {
-        self.tier(tier)?.shards.get(shard).map(ValidatedFsviBytes::witness)
+        self.tier(tier)?.shards.get(shard).map(|owner| owner.witness())
     }
 
     fn tier(&self, kind: TierKind) -> Option<&AdmittedTier> {
@@ -354,8 +378,31 @@ impl<'reader, 'query> ActivatedSemanticSearch<'reader, 'query> {
         k: usize,
         filter: Option<&dyn SearchFilter>,
     ) -> SemanticReaderResult<SemanticSearchBatch> {
-        let fast = self.search_tier(TierKind::Fast, k, filter)?;
-        let quality = self.search_tier(TierKind::Quality, k, filter)?;
+        self.search_impl(k, filter, None)
+    }
+
+    /// Opt into per-shard native ANN. A missing/rejected graph, exhausted
+    /// candidate budget, or graph-query failure uses that shard's retained
+    /// exact owner. Inspect execution() on the batch for what actually ran.
+    /// Narrow ANN windows are approximate; no recall guarantee is implied.
+    pub fn search_with_ann(
+        &self,
+        k: usize,
+        filter: Option<&dyn SearchFilter>,
+        policy: AnnSearchPolicy,
+    ) -> SemanticReaderResult<SemanticSearchBatch> {
+        policy.validate()?;
+        self.search_impl(k, filter, Some(policy))
+    }
+
+    fn search_impl(
+        &self,
+        k: usize,
+        filter: Option<&dyn SearchFilter>,
+        policy: Option<AnnSearchPolicy>,
+    ) -> SemanticReaderResult<SemanticSearchBatch> {
+        let fast = self.search_tier(TierKind::Fast, k, filter, policy)?;
+        let quality = self.search_tier(TierKind::Quality, k, filter, policy)?;
         Ok(make_batch(self.reader, self.queries.supported_topology(), SemanticResultPhase::Complete,
             fast, quality, k))
     }
@@ -370,11 +417,32 @@ impl<'reader, 'query> ActivatedSemanticSearch<'reader, 'query> {
         k: usize,
         filter: Option<&'call dyn SearchFilter>,
     ) -> SemanticReaderResult<ProgressiveSemanticSearch<'call, 'reader, 'query>> {
+        self.progressive_impl(k, filter, None)
+    }
+
+    /// Same lazy phase ordering as progressive(), with optional native ANN on
+    /// each tier. Dropping Initial never starts a quality graph/vector search.
+    pub fn progressive_with_ann<'call>(
+        &'call self,
+        k: usize,
+        filter: Option<&'call dyn SearchFilter>,
+        policy: AnnSearchPolicy,
+    ) -> SemanticReaderResult<ProgressiveSemanticSearch<'call, 'reader, 'query>> {
+        policy.validate()?;
+        self.progressive_impl(k, filter, Some(policy))
+    }
+
+    fn progressive_impl<'call>(
+        &'call self,
+        k: usize,
+        filter: Option<&'call dyn SearchFilter>,
+        policy: Option<AnnSearchPolicy>,
+    ) -> SemanticReaderResult<ProgressiveSemanticSearch<'call, 'reader, 'query>> {
         if self.queries.fast().is_none() || self.queries.quality().is_none() {
             return Err(SemanticReaderError::ProgressiveRequiresBothTiers);
         }
         Ok(ProgressiveSemanticSearch {
-            search: self, k, filter, state: ProgressiveState::Initial,
+            search: self, k, filter, policy, state: ProgressiveState::Initial,
         })
     }
 
@@ -383,21 +451,22 @@ impl<'reader, 'query> ActivatedSemanticSearch<'reader, 'query> {
         kind: TierKind,
         k: usize,
         filter: Option<&dyn SearchFilter>,
-    ) -> SemanticReaderResult<Option<Vec<Candidate>>> {
+        policy: Option<AnnSearchPolicy>,
+    ) -> SemanticReaderResult<Option<TierResult>> {
         let query = match kind {
             TierKind::Fast => self.queries.fast(),
             TierKind::Quality => self.queries.quality(),
         };
         query.map(|query| {
             self.reader.tier(kind).ok_or(SemanticReaderError::MissingTier(kind))?
-                .search(query, k, filter)
+                .search(kind, query, k, filter, &self.reader.ann, policy)
         }).transpose()
     }
 }
 
 enum ProgressiveState {
     Initial,
-    Refine(Vec<Candidate>),
+    Refine(TierResult),
     Done,
 }
 
@@ -408,6 +477,7 @@ pub struct ProgressiveSemanticSearch<'call, 'reader, 'query> {
     k: usize,
     filter: Option<&'call dyn SearchFilter>,
     state: ProgressiveState,
+    policy: Option<AnnSearchPolicy>,
 }
 
 impl std::fmt::Debug for ProgressiveSemanticSearch<'_, '_, '_> {
@@ -430,7 +500,7 @@ impl Iterator for ProgressiveSemanticSearch<'_, '_, '_> {
         let state = std::mem::replace(&mut self.state, ProgressiveState::Done);
         match state {
             ProgressiveState::Initial => {
-                let result = self.search.search_tier(TierKind::Fast, self.k, self.filter)
+                let result = self.search.search_tier(TierKind::Fast, self.k, self.filter, self.policy)
                     .and_then(|hits| hits.ok_or(SemanticReaderError::MissingTier(TierKind::Fast)));
                 Some(result.map(|fast| {
                     let batch = make_batch(self.search.reader,
@@ -441,7 +511,7 @@ impl Iterator for ProgressiveSemanticSearch<'_, '_, '_> {
                 }))
             }
             ProgressiveState::Refine(fast) => {
-                let result = self.search.search_tier(TierKind::Quality, self.k, self.filter)
+                let result = self.search.search_tier(TierKind::Quality, self.k, self.filter, self.policy)
                     .and_then(|hits| hits.ok_or(SemanticReaderError::MissingTier(TierKind::Quality)));
                 Some(result.map(|quality| make_batch(self.search.reader,
                     self.search.queries.supported_topology(), SemanticResultPhase::Refined,
@@ -458,7 +528,12 @@ impl std::iter::FusedIterator for ProgressiveSemanticSearch<'_, '_, '_> {}
 pub enum SemanticResultPhase { Initial, Refined, Complete }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SemanticScoreKind { Exact, ReciprocalRankFusion }
+pub enum SemanticScoreKind {
+    Exact,
+    /// Exact-source dot products over ANN-selected candidates, NOT exact top-k.
+    AnnRescored,
+    ReciprocalRankFusion,
+}
 
 /// A source location always includes its shard. It is never a global row index.
 #[derive(Debug, Clone, PartialEq)]
@@ -506,12 +581,15 @@ pub struct SemanticSearchBatch {
     hits: Vec<SemanticPassageHit>,
     coverage: SemanticSearchCoverage,
     score_kind: SemanticScoreKind,
+    execution: Vec<SemanticShardExecution>,
 }
 
 impl SemanticSearchBatch {
     pub fn hits(&self) -> &[SemanticPassageHit] { &self.hits }
     pub fn coverage(&self) -> &SemanticSearchCoverage { &self.coverage }
     pub fn score_kind(&self) -> SemanticScoreKind { self.score_kind }
+    /// Per-shard execution for the phase(s) represented by this batch.
+    pub fn execution(&self) -> &[SemanticShardExecution] { &self.execution }
     pub fn witness(&self, tier: TierKind, shard: usize) -> Option<&FsviV2Witness> {
         self.reader.witness(tier, shard)
     }
@@ -552,13 +630,18 @@ fn make_batch(
     reader: &SemanticGenerationReader,
     topology: RetrievalTopology,
     phase: SemanticResultPhase,
-    fast: Option<Vec<Candidate>>,
-    quality: Option<Vec<Candidate>>,
+    fast: Option<TierResult>,
+    quality: Option<TierResult>,
     k: usize,
 ) -> SemanticSearchBatch {
-    let fast_count = fast.as_ref().map(Vec::len);
-    let quality_count = quality.as_ref().map(Vec::len);
+    let fast_count = fast.as_ref().map(|tier| tier.candidates.len());
+    let quality_count = quality.as_ref().map(|tier| tier.candidates.len());
     let fused = fast.is_some() && quality.is_some();
+    let execution: Vec<_> = fast.iter().chain(quality.iter())
+        .flat_map(|tier| tier.execution.iter().cloned()).collect();
+    let used_ann = execution.iter().any(|report| report.engine == SemanticShardEngine::NativeAnn);
+    let fast = fast.map(|tier| tier.candidates);
+    let quality = quality.map(|tier| tier.candidates);
     let mut merged = BTreeMap::<String, SemanticPassageHit>::new();
     let mut single = Vec::new();
     for (kind, candidates) in [(TierKind::Fast, fast), (TierKind::Quality, quality)] {
@@ -625,7 +708,9 @@ fn make_batch(
     };
     SemanticSearchBatch {
         reader: reader.clone(), hits, coverage,
-        score_kind: if fused { SemanticScoreKind::ReciprocalRankFusion } else { SemanticScoreKind::Exact },
+        score_kind: if fused { SemanticScoreKind::ReciprocalRankFusion }
+            else if used_ann { SemanticScoreKind::AnnRescored } else { SemanticScoreKind::Exact },
+        execution,
     }
 }
 
