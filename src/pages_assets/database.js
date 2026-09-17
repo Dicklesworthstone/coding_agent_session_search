@@ -29,6 +29,18 @@ const SQLITE_DESERIALIZE_PADDING = 20;
 // bounded even if config validation or a fetch-path check is bypassed.
 const MAX_BROWSER_DATABASE_SIZE = 512 * 1024 * 1024;
 const MAX_WASM32_ALLOCATION_SIZE = 0xFFFFFFFF;
+// Bound row hydration independently of callers. In SQLite a negative LIMIT
+// means unlimited, so invalid input must never reach a prepared statement.
+const MAX_QUERY_PAGE_SIZE = 1000;
+
+function validatePagination(limit, offset) {
+    if (!Number.isSafeInteger(limit) || limit < 0 || limit > MAX_QUERY_PAGE_SIZE) {
+        throw new RangeError(`Query limit must be an integer between 0 and ${MAX_QUERY_PAGE_SIZE}`);
+    }
+    if (!Number.isSafeInteger(offset) || offset < 0) {
+        throw new RangeError('Query offset must be a non-negative safe integer');
+    }
+}
 
 function checkedDatabaseAllocationSize(byteLength) {
     if (!Number.isSafeInteger(byteLength) || byteLength <= 0) {
@@ -284,16 +296,18 @@ export function getStatistics() {
 
 /**
  * Get recent conversations
- * @param {number} limit - Maximum number of conversations
+ * @param {number} limit - Maximum number of conversations (0-1000)
+ * @param {number} offset - Number of conversations to skip
  * @returns {Array<Object>} Conversation objects
  */
-export function getRecentConversations(limit = 50) {
+export function getRecentConversations(limit = 50, offset = 0) {
+    validatePagination(limit, offset);
     return queryAll(`
         SELECT id, agent, workspace, title, source_path, started_at, ended_at, message_count
         FROM conversations
-        ORDER BY started_at DESC
-        LIMIT ?
-    `, [limit]);
+        ORDER BY started_at DESC, id DESC
+        LIMIT ? OFFSET ?
+    `, [limit, offset]);
 }
 
 /**
@@ -436,7 +450,7 @@ function normalizeTimestampFilterValue(value) {
  *
  * @param {string} query - Search query
  * @param {Object} options - Search options
- * @param {number} [options.limit=50] - Maximum results
+ * @param {number} [options.limit=50] - Maximum results (0-1000)
  * @param {number} [options.offset=0] - Result offset for pagination
  * @param {string|null} [options.agent=null] - Filter by agent name
  * @param {SearchMode} [options.searchMode='auto'] - Search mode: 'auto', 'prose', or 'code'
@@ -446,6 +460,7 @@ function normalizeTimestampFilterValue(value) {
  */
 export function searchConversations(query, options = {}) {
     const { limit = 50, offset = 0, agent = null, searchMode = 'auto', since = null, until = null } = options;
+    validatePagination(limit, offset);
 
     // Escape query for FTS5
     const escapedQuery = escapeFts5Query(query);
@@ -501,17 +516,13 @@ export function searchConversations(query, options = {}) {
     }
 
     sql += `
-        ORDER BY score
+        ORDER BY score, m.id ASC
         LIMIT ? OFFSET ?
     `;
     params.push(limit, offset);
 
-    try {
-        return queryAll(sql, params);
-    } catch (error) {
-        console.error('[DB] Search error:', error);
-        return [];
-    }
+    // Let the UI distinguish a failed query from a successful empty result.
+    return queryAll(sql, params);
 }
 
 /**
@@ -520,9 +531,11 @@ export function searchConversations(query, options = {}) {
  * @param {number} limit - Maximum results
  * @param {number|string|null} since - Earliest conversation start timestamp (ms)
  * @param {number|string|null} until - Latest conversation start timestamp (ms)
+ * @param {number} offset - Number of matching conversations to skip
  * @returns {Array<Object>} Conversation objects
  */
-export function getConversationsByAgent(agent, limit = 50, since = null, until = null) {
+export function getConversationsByAgent(agent, limit = 50, since = null, until = null, offset = 0) {
+    validatePagination(limit, offset);
     let sql = `
         SELECT id, agent, workspace, title, source_path, started_at, message_count
         FROM conversations
@@ -543,10 +556,10 @@ export function getConversationsByAgent(agent, limit = 50, since = null, until =
     }
 
     sql += `
-        ORDER BY started_at DESC
-        LIMIT ?
+        ORDER BY started_at DESC, id DESC
+        LIMIT ? OFFSET ?
     `;
-    params.push(limit);
+    params.push(limit, offset);
 
     return queryAll(sql, params);
 }
@@ -554,34 +567,53 @@ export function getConversationsByAgent(agent, limit = 50, since = null, until =
 /**
  * Get conversations by workspace
  * @param {string} workspace - Workspace path
- * @param {number} limit - Maximum results
+ * @param {number} limit - Maximum results (0-1000)
+ * @param {number} offset - Number of matching conversations to skip
  * @returns {Array<Object>} Conversation objects
  */
-export function getConversationsByWorkspace(workspace, limit = 50) {
+export function getConversationsByWorkspace(workspace, limit = 50, offset = 0) {
+    validatePagination(limit, offset);
     return queryAll(`
         SELECT id, agent, workspace, title, source_path, started_at, message_count
         FROM conversations
         WHERE workspace = ?
-        ORDER BY started_at DESC
-        LIMIT ?
-    `, [workspace, limit]);
+        ORDER BY started_at DESC, id DESC
+        LIMIT ? OFFSET ?
+    `, [workspace, limit, offset]);
 }
 
 /**
- * Get conversations by time range
- * @param {number} since - Start timestamp (ms)
- * @param {number} until - End timestamp (ms)
- * @param {number} limit - Maximum results
+ * Get conversations by time range (either bound may be omitted)
+ * @param {number|string|null} since - Start timestamp (ms)
+ * @param {number|string|null} until - End timestamp (ms)
+ * @param {number} limit - Maximum results (0-1000)
+ * @param {number} offset - Number of matching conversations to skip
  * @returns {Array<Object>} Conversation objects
  */
-export function getConversationsByTimeRange(since, until, limit = 50) {
-    return queryAll(`
+export function getConversationsByTimeRange(since, until, limit = 50, offset = 0) {
+    validatePagination(limit, offset);
+    let sql = `
         SELECT id, agent, workspace, title, source_path, started_at, message_count
         FROM conversations
-        WHERE started_at >= ? AND started_at <= ?
-        ORDER BY started_at DESC
-        LIMIT ?
-    `, [since, until, limit]);
+        WHERE 1 = 1
+    `;
+    const params = [];
+    const sinceTimestamp = normalizeTimestampFilterValue(since);
+    if (sinceTimestamp !== null) {
+        sql += ' AND started_at >= ?';
+        params.push(sinceTimestamp);
+    }
+    const untilTimestamp = normalizeTimestampFilterValue(until);
+    if (untilTimestamp !== null) {
+        sql += ' AND started_at <= ?';
+        params.push(untilTimestamp);
+    }
+    sql += `
+        ORDER BY started_at DESC, id DESC
+        LIMIT ? OFFSET ?
+    `;
+    params.push(limit, offset);
+    return queryAll(sql, params);
 }
 
 // ============================================
