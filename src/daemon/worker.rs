@@ -3,6 +3,8 @@
 //! Processes embedding jobs on a dedicated thread using sync primitives.
 //! Adapted from xf's async worker to cass's sync daemon architecture.
 
+mod embedding_source;
+
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use tracing::{debug, error, info, warn};
 
+use self::embedding_source::{EmbeddingMessageSource, SqliteEmbeddingSource};
 use crate::indexer::semantic::{
     EmbeddingInput, SemanticIndexer, expected_vector_space_revision, message_id_from_db,
     saturating_u32_from_i64, semantic_doc_id_for_input,
@@ -24,8 +27,7 @@ use crate::storage::sqlite::FrankenStorage;
 const HASH_EMBEDDER_MODEL: &str = "hash";
 const DEFAULT_SEMANTIC_MODEL: &str = "minilm";
 
-/// How many documents to embed per progress/cancellation checkpoint. Matches
-/// the healthy MiniLM batch size observed in cass#257 telemetry.
+/// Maximum passages retained for one embedding/progress checkpoint.
 const EMBED_PROGRESS_CHUNK_SIZE: usize = 128;
 
 /// How an embedding pass ended: normally, or via a user cancel (which must be
@@ -90,6 +92,17 @@ struct RunningEmbeddingPass {
     model: String,
 }
 
+/// Clear the running identity on every exit, including archive-open errors.
+struct RunningPassReset<'a>(&'a Mutex<Option<RunningEmbeddingPass>>);
+
+impl Drop for RunningPassReset<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.0.lock() {
+            *guard = None;
+        }
+    }
+}
+
 /// Handle for sending messages to the background worker.
 #[derive(Clone)]
 pub struct EmbeddingWorkerHandle {
@@ -97,6 +110,8 @@ pub struct EmbeddingWorkerHandle {
     /// Shared cancel flag — set directly from the handle so cancellation
     /// takes effect even while `process_job` is running on the worker thread.
     cancel_flag: Arc<AtomicBool>,
+    /// Shutdown is permanent and cannot be cleared by starting a queued job.
+    shutdown_requested: Arc<AtomicBool>,
     /// The pass currently running on the worker thread, if any.
     running_pass: Arc<Mutex<Option<RunningEmbeddingPass>>>,
 }
@@ -104,6 +119,9 @@ pub struct EmbeddingWorkerHandle {
 impl EmbeddingWorkerHandle {
     /// Submit an embedding job to the worker.
     pub fn submit(&self, config: EmbeddingJobConfig) -> Result<(), String> {
+        if self.shutdown_requested.load(Ordering::SeqCst) {
+            return Err("embedding worker is shutting down".to_string());
+        }
         self.sender
             .send(WorkerMessage::Submit(config))
             .map_err(|e| format!("worker channel closed: {e}"))
@@ -116,27 +134,33 @@ impl EmbeddingWorkerHandle {
     /// cancel aimed at one data dir can never abort another client's job.
     /// Always sends a Cancel message for database-level cleanup.
     pub fn cancel(&self, db_path: String, model_id: Option<String>) -> Result<(), String> {
-        let targets_running_job = self
-            .running_pass
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
-            .is_some_and(|running| {
+        // Keep the identity lock until the flag is set: copying the identity
+        // then releasing the lock could cancel a subsequent, unrelated pass.
+        {
+            let guard = self
+                .running_pass
+                .lock()
+                .map_err(|_| "embedding worker state lock poisoned".to_string())?;
+            if guard.as_ref().is_some_and(|running| {
                 running.db_path == db_path
                     && model_id
                         .as_deref()
                         .is_none_or(|model| running.model == model)
-            });
-        if targets_running_job {
-            self.cancel_flag.store(true, Ordering::SeqCst);
+            }) {
+                self.cancel_flag.store(true, Ordering::SeqCst);
+            }
         }
         self.sender
             .send(WorkerMessage::Cancel { db_path, model_id })
             .map_err(|e| format!("worker channel closed: {e}"))
     }
 
-    /// Request the worker to shut down.
+    /// Request cooperative shutdown immediately, not after queued jobs finish.
+    /// An in-flight engine operation or embedding batch finishes before its
+    /// next cancellation checkpoint; this does not forcibly kill the thread.
     pub fn shutdown(&self) -> Result<(), String> {
+        self.shutdown_requested.store(true, Ordering::SeqCst);
+        self.cancel_flag.store(true, Ordering::SeqCst);
         self.sender
             .send(WorkerMessage::Shutdown)
             .map_err(|e| format!("worker channel closed: {e}"))
@@ -147,6 +171,7 @@ impl EmbeddingWorkerHandle {
 pub struct EmbeddingWorker {
     receiver: Receiver<WorkerMessage>,
     cancel_flag: Arc<AtomicBool>,
+    shutdown_requested: Arc<AtomicBool>,
     running_pass: Arc<Mutex<Option<RunningEmbeddingPass>>>,
 }
 
@@ -224,29 +249,78 @@ fn saturating_i64_from_usize(raw: usize) -> i64 {
     i64::try_from(raw).unwrap_or(i64::MAX)
 }
 
+/// Prepare at most one message's bounded passages, never the whole archive.
+fn canonical_message_inputs(
+    message: &crate::storage::sqlite::MessageForEmbedding,
+) -> anyhow::Result<Vec<(String, EmbeddingInput)>> {
+    let Some(message_id) = message_id_from_db(message.message_id) else {
+        return Ok(Vec::new());
+    };
+    let mut inputs = Vec::new();
+    for (ordinal, passage) in embedding_passages(&message.content).into_iter().enumerate() {
+        let input = EmbeddingInput {
+            message_id,
+            created_at_ms: message.created_at.unwrap_or(0),
+            agent_id: saturating_u32_from_i64(message.agent_id),
+            workspace_id: saturating_u32_from_i64(message.workspace_id.unwrap_or(0)),
+            source_id: message.source_id_hash,
+            role: role_code_from_str(&message.role).unwrap_or(0),
+            chunk_idx: u8::try_from(ordinal)?,
+            content: passage.to_owned(),
+        };
+        if let Some(doc_id) = semantic_doc_id_for_input(&input) {
+            inputs.push((doc_id, input));
+        }
+    }
+    Ok(inputs)
+}
+
 impl EmbeddingWorker {
     /// Create a new worker and its handle.
     pub fn new() -> (Self, EmbeddingWorkerHandle) {
         let (sender, receiver) = std::sync::mpsc::channel();
         let cancel_flag = Arc::new(AtomicBool::new(false));
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
         let running_pass = Arc::new(Mutex::new(None));
         let handle = EmbeddingWorkerHandle {
             sender,
             cancel_flag: Arc::clone(&cancel_flag),
+            shutdown_requested: Arc::clone(&shutdown_requested),
             running_pass: Arc::clone(&running_pass),
         };
         let worker = Self {
             receiver,
             cancel_flag,
+            shutdown_requested,
             running_pass,
         };
         (worker, handle)
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel_flag.load(Ordering::SeqCst)
+            || self.shutdown_requested.load(Ordering::SeqCst)
+    }
+
+    fn set_running_pass(&self, db_path: &str, model: &str) -> anyhow::Result<()> {
+        let mut guard = self
+            .running_pass
+            .lock()
+            .map_err(|_| anyhow::anyhow!("embedding worker state lock poisoned"))?;
+        *guard = Some(RunningEmbeddingPass {
+            db_path: db_path.to_string(),
+            model: model.to_string(),
+        });
+        Ok(())
     }
 
     /// Run the worker loop (blocking). Call from a spawned thread.
     pub fn run(self) {
         info!("Embedding worker started");
         while let Ok(msg) = self.receiver.recv() {
+            if self.shutdown_requested.load(Ordering::SeqCst) {
+                break;
+            }
             match msg {
                 WorkerMessage::Submit(config) => {
                     self.cancel_flag.store(false, Ordering::SeqCst);
@@ -282,14 +356,25 @@ impl EmbeddingWorker {
 
     /// Process a single embedding job.
     fn process_job(&self, config: &EmbeddingJobConfig) -> anyhow::Result<()> {
+        if self.is_cancelled() {
+            return Ok(());
+        }
         let db_path = Path::new(&config.db_path);
         let index_path = Path::new(&config.index_path);
-
-        // Open storage and fetch messages
+        let passes = self.build_passes(config);
+        let Some((first_model, _)) = passes.first() else {
+            return Ok(());
+        };
+        // Register before opening/scanning so a matching cancel also reaches
+        // archive admission, not only the later native embedding loop.
+        self.set_running_pass(&config.db_path, first_model)?;
+        let _running_reset = RunningPassReset(&self.running_pass);
         let storage = FrankenStorage::open(db_path)?;
-        let messages = storage.fetch_messages_for_embedding()?;
-        let total_docs = saturating_i64_from_usize(messages.len());
-
+        if self.is_cancelled() {
+            return Ok(());
+        }
+        let messages = SqliteEmbeddingSource::open(db_path)?;
+        let total_docs = saturating_i64_from_usize(messages.total_docs());
         info!(
             db_path = %config.db_path,
             total_docs,
@@ -297,25 +382,15 @@ impl EmbeddingWorker {
             "Found messages to embed"
         );
 
-        // Determine which passes to run
-        let passes = self.build_passes(config);
-
         for (model_name, use_semantic) in &passes {
-            if self.cancel_flag.load(Ordering::SeqCst) {
+            self.set_running_pass(&config.db_path, model_name)?;
+            if self.is_cancelled() {
                 info!("Embedding job cancelled");
                 return Ok(());
             }
-
             let job_id = storage.upsert_embedding_job(&config.db_path, model_name, total_docs)?;
             storage.start_embedding_job(job_id)?;
-
-            if let Ok(mut guard) = self.running_pass.lock() {
-                *guard = Some(RunningEmbeddingPass {
-                    db_path: config.db_path.clone(),
-                    model: model_name.clone(),
-                });
-            }
-            let pass_result = self.generate_embeddings_and_save(
+            let pass_result = self.generate_embeddings_from_source(
                 &storage,
                 &messages,
                 model_name,
@@ -324,19 +399,13 @@ impl EmbeddingWorker {
                 index_path,
                 db_path,
             );
-            if let Ok(mut guard) = self.running_pass.lock() {
-                *guard = None;
-            }
-
             match pass_result {
                 Ok(EmbeddingPassOutcome::Completed) => {
                     storage.complete_embedding_job(job_id)?;
                     info!(model = model_name, "Embedding pass completed");
                 }
                 Ok(EmbeddingPassOutcome::Cancelled) => {
-                    // A user cancel is not a failure — record it as cancelled
-                    // so job status matches what actually happened.
-                    let _ = storage.cancel_embedding_jobs(&config.db_path, Some(model_name));
+                    storage.cancel_embedding_jobs(&config.db_path, Some(model_name))?;
                     info!(model = model_name, "Embedding pass cancelled");
                     return Ok(());
                 }
@@ -347,7 +416,6 @@ impl EmbeddingWorker {
                 }
             }
         }
-
         Ok(())
     }
 
@@ -373,7 +441,8 @@ impl EmbeddingWorker {
         passes
     }
 
-    /// Generate embeddings for messages and save the vector index.
+    /// Keep the existing reconciliation regressions on the production path.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn generate_embeddings_and_save(
         &self,
@@ -385,105 +454,82 @@ impl EmbeddingWorker {
         index_path: &Path,
         db_path: &Path,
     ) -> anyhow::Result<EmbeddingPassOutcome> {
-        let embedder_kind = resolve_embedder_kind(model_name, use_semantic)?;
+        self.generate_embeddings_from_source(
+            storage,
+            &embedding_source::SliceEmbeddingSource(messages),
+            model_name,
+            use_semantic,
+            job_id,
+            index_path,
+            db_path,
+        )
+    }
 
-        // Build the canonical identities before deciding what to embed. A
-        // message-id-to-hash map is insufficient here: doc IDs also encode
-        // metadata, duplicate live records are possible, and an edited row's
-        // old identity must be removed rather than merely appended around.
-        let mut canonical_inputs: Vec<(String, EmbeddingInput)> = Vec::new();
+    /// Plan identities without retaining bodies, then replay the same source
+    /// into bounded passage batches. Generated vectors and reconciliation
+    /// identities remain corpus-sized; this is not a total-memory bound.
+    #[allow(clippy::too_many_arguments)]
+    fn generate_embeddings_from_source(
+        &self,
+        storage: &FrankenStorage,
+        messages: &dyn EmbeddingMessageSource,
+        model_name: &str,
+        use_semantic: bool,
+        job_id: i64,
+        index_path: &Path,
+        db_path: &Path,
+    ) -> anyhow::Result<EmbeddingPassOutcome> {
+        let cancelled = || self.is_cancelled();
+        if cancelled() {
+            return Ok(EmbeddingPassOutcome::Cancelled);
+        }
+        let embedder_kind = resolve_embedder_kind(model_name, use_semantic)?;
+        let existing_state = self.load_existing_index_state(index_path, &embedder_kind);
+        let mut current_doc_ids = HashSet::new();
         let mut pending_passages: HashMap<u64, usize> = HashMap::new();
         let mut skipped_count = 0usize;
+        let mut input_count = 0usize;
         let mut completed = 0i64;
 
-        for msg in messages {
-            if self.cancel_flag.load(Ordering::SeqCst) {
-                return Ok(EmbeddingPassOutcome::Cancelled);
-            }
-
-            let role = role_code_from_str(&msg.role).unwrap_or(0);
-
-            // Invalid/negative IDs indicate corrupted data; skip rather than collapsing to 0.
-            let Some(message_id) = message_id_from_db(msg.message_id) else {
+        let planned = messages.visit(&cancelled, &mut |message| {
+            if message_id_from_db(message.message_id).is_none() {
                 warn!(
-                    raw_message_id = msg.message_id,
+                    raw_message_id = message.message_id,
                     "Skipping message with out-of-range id during embedding"
                 );
-                completed += 1;
-                continue;
-            };
-
-            // Clamp to a stable range instead of silently wrapping/failing.
-            let agent_id = saturating_u32_from_i64(msg.agent_id);
-            let workspace_id = saturating_u32_from_i64(msg.workspace_id.unwrap_or(0));
-
-            let first_input = canonical_inputs.len();
-            for (ordinal, passage) in embedding_passages(&msg.content).into_iter().enumerate() {
-                let input = EmbeddingInput {
-                    message_id,
-                    created_at_ms: msg.created_at.unwrap_or(0),
-                    agent_id,
-                    workspace_id,
-                    source_id: msg.source_id_hash,
-                    role,
-                    chunk_idx: u8::try_from(ordinal)?,
-                    content: passage.to_owned(),
-                };
-                let Some(doc_id) = semantic_doc_id_for_input(&input) else {
-                    continue;
-                };
-                *pending_passages.entry(message_id).or_default() += 1;
-                canonical_inputs.push((doc_id, input));
             }
-            if canonical_inputs.len() == first_input {
-                completed += 1;
+            let mut pending = 0usize;
+            for (doc_id, input) in canonical_message_inputs(message)? {
+                if !current_doc_ids.insert(doc_id.clone()) {
+                    anyhow::bail!("daemon embedding input contains duplicate canonical document IDs");
+                }
+                if existing_state.active_count(&doc_id) == 1 {
+                    skipped_count += 1;
+                } else {
+                    pending += 1;
+                    input_count += 1;
+                    *pending_passages.entry(input.message_id).or_default() += 1;
+                }
             }
+            if pending == 0 {
+                completed = completed.saturating_add(1);
+            }
+            Ok(())
+        })?;
+        if !planned || cancelled() {
+            return Ok(EmbeddingPassOutcome::Cancelled);
         }
-
-        let current_doc_ids = canonical_inputs
-            .iter()
-            .map(|(doc_id, _)| doc_id.clone())
-            .collect::<HashSet<_>>();
-        if current_doc_ids.len() != canonical_inputs.len() {
-            anyhow::bail!("daemon embedding input contains duplicate canonical document IDs");
-        }
-
-        let existing_state = self.load_existing_index_state(index_path, &embedder_kind);
         if existing_state.exactly_matches(&current_doc_ids) {
-            let final_completed = saturating_i64_from_usize(messages.len());
-            let _ = storage.update_job_progress(job_id, final_completed);
+            storage.update_job_progress(job_id, saturating_i64_from_usize(messages.total_docs()))?;
             info!(
                 model = model_name,
-                skipped = canonical_inputs.len(),
+                skipped = current_doc_ids.len(),
                 "Semantic index already exactly matches the canonical database"
             );
             return Ok(EmbeddingPassOutcome::Completed);
         }
-
-        let mut inputs = Vec::new();
-        for (doc_id, input) in canonical_inputs {
-            if existing_state.active_count(&doc_id) == 1 {
-                skipped_count += 1;
-                let pending = pending_passages.get_mut(&input.message_id).ok_or_else(|| {
-                    anyhow::anyhow!("cached passage has no canonical message progress entry")
-                })?;
-                *pending -= 1;
-                if *pending == 0 {
-                    completed += 1;
-                }
-            } else {
-                inputs.push(input);
-            }
-        }
-
-        // Job totals are canonical messages, not vector passages. A message
-        // with both reused and missing passages completes only after its last
-        // missing passage finishes, even across progress chunk boundaries.
-        let _ = storage.update_job_progress(job_id, completed);
-
-        if inputs.is_empty() && !existing_state.path_exists {
-            let final_completed = saturating_i64_from_usize(messages.len());
-            let _ = storage.update_job_progress(job_id, final_completed);
+        storage.update_job_progress(job_id, completed)?;
+        if input_count == 0 && !existing_state.path_exists {
             info!(
                 model = model_name,
                 skipped = skipped_count,
@@ -491,52 +537,69 @@ impl EmbeddingWorker {
             );
             return Ok(EmbeddingPassOutcome::Completed);
         }
+        info!(model = model_name, input_count, skipped = skipped_count, "Embedding documents");
 
-        info!(
-            model = model_name,
-            input_count = inputs.len(),
-            skipped = skipped_count,
-            "Embedding documents"
-        );
-
-        // Create the appropriate embedder/indexer
         let indexer = match &embedder_kind {
             WorkerEmbedderKind::Hash => SemanticIndexer::new(HASH_EMBEDDER_MODEL, None)?,
             WorkerEmbedderKind::FastEmbed { model_name, .. } => {
                 SemanticIndexer::new(model_name, Some(index_path))?
             }
         };
-
-        // Embed in bounded chunks so a long semantic pass reports progress
-        // and honors cancellation between chunks instead of running as one
-        // opaque, uncancellable block.
-        let mut embedded = Vec::with_capacity(inputs.len());
-        for chunk in inputs.chunks(EMBED_PROGRESS_CHUNK_SIZE) {
-            if self.cancel_flag.load(Ordering::SeqCst) {
+        let mut embedded = Vec::new();
+        {
+            let mut embed_chunk = |chunk: &[EmbeddingInput]| -> anyhow::Result<()> {
+                let batch = indexer.embed_messages(chunk)?;
+                if batch.len() != chunk.len() {
+                    anyhow::bail!("daemon embedding batch returned an incomplete vector set");
+                }
+                embedded.extend(batch);
+                for input in chunk {
+                    let pending = pending_passages.get_mut(&input.message_id).ok_or_else(|| {
+                        anyhow::anyhow!("embedded passage has no canonical message progress entry")
+                    })?;
+                    *pending = pending.checked_sub(1).ok_or_else(|| {
+                        anyhow::anyhow!("daemon embedding source repeated a planned passage")
+                    })?;
+                    if *pending == 0 {
+                        completed = completed.saturating_add(1);
+                    }
+                }
+                storage.update_job_progress(job_id, completed)?;
+                debug!(job_id, completed, "Embedding progress");
+                Ok(())
+            };
+            let mut inputs = Vec::with_capacity(EMBED_PROGRESS_CHUNK_SIZE);
+            let scanned = messages.visit(&cancelled, &mut |message| {
+                for (doc_id, input) in canonical_message_inputs(message)? {
+                    if !current_doc_ids.contains(&doc_id) {
+                        anyhow::bail!("daemon embedding source changed after identity planning");
+                    }
+                    if existing_state.active_count(&doc_id) != 1 {
+                        inputs.push(input);
+                        if inputs.len() == EMBED_PROGRESS_CHUNK_SIZE {
+                            embed_chunk(&inputs)?;
+                            inputs.clear();
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+            if !scanned || cancelled() {
                 return Ok(EmbeddingPassOutcome::Cancelled);
             }
-            embedded.extend(indexer.embed_messages(chunk)?);
-            for input in chunk {
-                let pending = pending_passages.get_mut(&input.message_id).ok_or_else(|| {
-                    anyhow::anyhow!("embedded passage has no canonical message progress entry")
-                })?;
-                *pending -= 1;
-                if *pending == 0 {
-                    completed += 1;
-                }
+            if !inputs.is_empty() {
+                embed_chunk(&inputs)?;
             }
-            let _ = storage.update_job_progress(job_id, completed);
-            debug!(job_id, completed, "Embedding progress");
+        }
+        if cancelled() {
+            return Ok(EmbeddingPassOutcome::Cancelled);
+        }
+        if embedded.len() != input_count || pending_passages.values().any(|count| *count != 0) {
+            anyhow::bail!("daemon embedding source did not yield every planned passage");
         }
 
-        // Update final progress
-        let final_completed = saturating_i64_from_usize(messages.len());
-        let _ = storage.update_job_progress(job_id, final_completed);
-
-        // Existing artifacts are reconciled through a private candidate and
-        // atomic publish. This removes stale identities, collapses duplicate
-        // live records, clears tombstones/WAL state, and preserves exact
-        // unchanged vectors without exposing a half-updated index.
+        // Preserve the existing private-candidate/atomic-publication path:
+        // stale identities disappear and unchanged vectors retain exact bits.
         let save_path = vector_index_path(index_path, indexer.embedder_id());
         if existing_state.path_exists {
             let tier = match &embedder_kind {
@@ -544,6 +607,9 @@ impl EmbeddingWorker {
                 WorkerEmbedderKind::FastEmbed { .. } => TierKind::Quality,
             };
             let db_fingerprint = crate::indexer::lexical_storage_fingerprint_for_db(db_path)?;
+            if cancelled() {
+                return Ok(EmbeddingPassOutcome::Cancelled);
+            }
             let reconciled = indexer.reconcile_index_with_canonical_documents(
                 embedded,
                 index_path,
@@ -558,14 +624,13 @@ impl EmbeddingWorker {
         } else {
             let _index = indexer.build_and_save_index(embedded, index_path)?;
         }
-
+        storage.update_job_progress(job_id, saturating_i64_from_usize(messages.total_docs()))?;
         info!(
             model = model_name,
             path = %save_path.display(),
-            count = inputs.len(),
+            count = input_count,
             "Saved vector index"
         );
-
         Ok(EmbeddingPassOutcome::Completed)
     }
 
@@ -1212,5 +1277,106 @@ mod tests {
         let err = resolve_embedder_kind("e5-large", true).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("unsupported semantic model"));
+    }
+
+    #[test]
+    fn shutdown_is_permanent_and_preempts_queued_submissions() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db_path = temp.path().join("must-not-be-created.db");
+        let index_path = temp.path().join("must-not-be-created-index");
+        let config = EmbeddingJobConfig {
+            db_path: db_path.to_string_lossy().into_owned(),
+            index_path: index_path.to_string_lossy().into_owned(),
+            two_tier: false,
+            fast_model: Some("hash".into()),
+            quality_model: None,
+        };
+        let (worker, handle) = EmbeddingWorker::new();
+        handle.submit(config.clone()).map_err(anyhow::Error::msg)?;
+        handle.shutdown().map_err(anyhow::Error::msg)?;
+        assert!(worker.is_cancelled());
+        // Model the job-start race: its reset must not erase shutdown intent.
+        worker.cancel_flag.store(false, Ordering::SeqCst);
+        assert!(worker.is_cancelled());
+        assert!(handle.clone().submit(config).is_err());
+        worker.run();
+        assert!(!db_path.exists());
+        assert!(!index_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn archive_open_failure_clears_running_pass_identity() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let config = EmbeddingJobConfig {
+            db_path: temp.path().to_string_lossy().into_owned(),
+            index_path: temp.path().join("index").to_string_lossy().into_owned(),
+            two_tier: false,
+            fast_model: Some("hash".into()),
+            quality_model: None,
+        };
+        let (worker, _) = EmbeddingWorker::new();
+        assert!(worker.process_job(&config).is_err());
+        assert!(worker.running_pass.lock().unwrap().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_after_embedding_last_batch_preserves_published_index() -> anyhow::Result<()> {
+        use std::cell::Cell;
+        use crate::storage::sqlite::MessageForEmbedding;
+
+        struct CancelAfterReplay {
+            rows: Vec<MessageForEmbedding>,
+            visits: Cell<usize>,
+            cancel: Arc<AtomicBool>,
+        }
+        impl EmbeddingMessageSource for CancelAfterReplay {
+            fn total_docs(&self) -> usize { self.rows.len() }
+            fn visit(
+                &self,
+                cancelled: &dyn Fn() -> bool,
+                visitor: &mut dyn FnMut(&MessageForEmbedding) -> anyhow::Result<()>,
+            ) -> anyhow::Result<bool> {
+                self.visits.set(self.visits.get() + 1);
+                for row in &self.rows {
+                    if cancelled() { return Ok(false); }
+                    visitor(row)?;
+                }
+                if self.visits.get() == 2 {
+                    self.cancel.store(true, Ordering::SeqCst);
+                }
+                Ok(!cancelled())
+            }
+        }
+        let temp = tempfile::tempdir()?;
+        let db_path = temp.path().join("archive.db");
+        let index_path = temp.path().join("semantic");
+        let storage = FrankenStorage::open(&db_path)?;
+        let (worker, _) = EmbeddingWorker::new();
+        let make_row = |id, content: String| MessageForEmbedding {
+            message_id: id, created_at: Some(1700000000000), agent_id: 1,
+            workspace_id: None, source_id_hash: 2, role: "user".into(), content,
+        };
+        let job_id = storage.upsert_embedding_job(&db_path.to_string_lossy(), "hash", 128)?;
+        storage.start_embedding_job(job_id)?;
+        let original = make_row(1, "original published content".into());
+        assert_eq!(worker.generate_embeddings_and_save(
+            &storage, std::slice::from_ref(&original), "hash", false, job_id,
+            &index_path, &db_path,
+        )?, EmbeddingPassOutcome::Completed);
+        let path = vector_index_path(&index_path, "fnv1a-384");
+        let before = std::fs::read(&path)?;
+        let source = CancelAfterReplay {
+            rows: (1..=128).map(|id| make_row(id, format!("replacement content {id}"))).collect(),
+            visits: Cell::new(0),
+            cancel: Arc::clone(&worker.cancel_flag),
+        };
+        assert_eq!(worker.generate_embeddings_from_source(
+            &storage, &source, "hash", false, job_id, &index_path, &db_path,
+        )?, EmbeddingPassOutcome::Cancelled);
+        assert_eq!(source.visits.get(), 2);
+        assert_eq!(std::fs::read(&path)?, before);
+        Ok(())
     }
 }
