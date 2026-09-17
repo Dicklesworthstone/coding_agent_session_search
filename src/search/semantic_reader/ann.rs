@@ -11,8 +11,7 @@ use std::sync::Arc;
 use frankensearch::core::filter::SearchFilter;
 use frankensearch::core::{BoundQueryEmbedding, VectorHit};
 use frankensearch::index::native_hnsw::{
-    NativeHnswGenerationReceiptV2, ValidatedNativeHnsw,
-    native_hnsw_generation_receipt_path,
+    NativeHnswGenerationReceiptV2, ValidatedNativeHnsw, native_hnsw_generation_receipt_path,
 };
 use frankensearch::index::{ValidatedFsviBytes, dot_product_f32_f32};
 use serde::Serialize;
@@ -46,8 +45,13 @@ pub enum AnnFallbackReason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SemanticAnnAdmission {
-    Unavailable { reason: AnnFallbackReason },
-    Admitted { graph_sha256: String, receipt_sha256: String },
+    Unavailable {
+        reason: AnnFallbackReason,
+    },
+    Admitted {
+        graph_sha256: String,
+        receipt_sha256: String,
+    },
 }
 
 /// Exact remains the default. Opt-in ANN requests start with this candidate
@@ -61,7 +65,10 @@ pub struct AnnSearchPolicy {
 
 impl Default for AnnSearchPolicy {
     fn default() -> Self {
-        Self { initial_candidates: 128, max_candidates: 4096 }
+        Self {
+            initial_candidates: 128,
+            max_candidates: 4096,
+        }
     }
 }
 
@@ -79,7 +86,12 @@ impl AnnSearchPolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SemanticShardEngine { Skipped, Exact, NativeAnn, ExactFallback }
+pub enum SemanticShardEngine {
+    Skipped,
+    Exact,
+    NativeAnn,
+    ExactFallback,
+}
 
 /// Actual work for one requested shard. `candidate_rows` counts candidates in
 /// successfully processed ANN windows, including repeated rows during widening;
@@ -119,7 +131,8 @@ impl ShardAnn {
         // The whole-image digest binds every owner byte; the upstream loader
         // separately checks every persisted identity and topology component.
         if expected.receipt.validate().is_err()
-            || expected.receipt.fsvi_whole_image_sha256 != hex::encode(owner.witness().whole_image_sha256)
+            || expected.receipt.fsvi_whole_image_sha256
+                != hex::encode(owner.witness().whole_image_sha256)
             || expected.receipt.artifact_generation != owner.witness().generation
         {
             return Self::Unavailable(AnnFallbackReason::InvalidExpectation);
@@ -161,12 +174,18 @@ impl ShardAnn {
 }
 
 fn single_link_regular(path: &Path) -> bool {
-    let Ok(metadata) = std::fs::symlink_metadata(path) else { return false; };
-    if !metadata.is_file() { return false; }
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if metadata.nlink() != 1 { return false; }
+        if metadata.nlink() != 1 {
+            return false;
+        }
     }
     true
 }
@@ -179,7 +198,10 @@ pub(super) struct AnnSelection {
 
 impl AnnSelection {
     pub(super) fn shard(&self, kind: TierKind, shard: usize) -> Option<&ShardAnn> {
-        match kind { TierKind::Fast => self.fast.get(shard), TierKind::Quality => self.quality.get(shard) }
+        match kind {
+            TierKind::Fast => self.fast.get(shard),
+            TierKind::Quality => self.quality.get(shard),
+        }
     }
 }
 
@@ -199,7 +221,9 @@ impl SemanticGenerationReader {
     ) -> SemanticReaderResult<Self> {
         for (kind, selected) in [(TierKind::Fast, fast), (TierKind::Quality, quality)] {
             if let Some(selected) = selected {
-                let tier = self.tier(kind).ok_or(SemanticReaderError::MissingTier(kind))?;
+                let tier = self
+                    .tier(kind)
+                    .ok_or(SemanticReaderError::MissingTier(kind))?;
                 if selected.len() != tier.shards.len() {
                     return Err(SemanticReaderError::AnnSelectionMismatch(kind));
                 }
@@ -207,9 +231,16 @@ impl SemanticGenerationReader {
         }
         let load_tier = |kind, selected: Option<&[Option<SemanticAnnExpectation>]>| {
             self.tier(kind).map_or_else(Vec::new, |tier| {
-                tier.shards.iter().enumerate().map(|(position, owner)| {
-                    ShardAnn::load(Arc::clone(owner), selected.and_then(|list| list[position].as_ref()))
-                }).collect()
+                tier.shards
+                    .iter()
+                    .enumerate()
+                    .map(|(position, owner)| {
+                        ShardAnn::load(
+                            Arc::clone(owner),
+                            selected.and_then(|list| list[position].as_ref()),
+                        )
+                    })
+                    .collect()
             })
         };
         let selected = AnnSelection {
@@ -224,7 +255,9 @@ impl SemanticGenerationReader {
     pub fn ann_admission(&self, tier: TierKind, shard: usize) -> Option<SemanticAnnAdmission> {
         self.tier(tier)?.shards.get(shard)?;
         Some(self.ann.shard(tier, shard).map_or(
-            SemanticAnnAdmission::Unavailable { reason: AnnFallbackReason::NotSelected },
+            SemanticAnnAdmission::Unavailable {
+                reason: AnnFallbackReason::NotSelected,
+            },
             ShardAnn::admission,
         ))
     }
@@ -254,8 +287,14 @@ pub(super) fn search_shard(
     };
     let ready = match ann {
         Some(ShardAnn::Ready(ready)) => Some(ready),
-        Some(ShardAnn::Unavailable(reason)) => { report.fallback_reason = Some(*reason); None }
-        None => { report.fallback_reason = Some(AnnFallbackReason::NotSelected); None }
+        Some(ShardAnn::Unavailable(reason)) => {
+            report.fallback_reason = Some(*reason);
+            None
+        }
+        None => {
+            report.fallback_reason = Some(AnnFallbackReason::NotSelected);
+            None
+        }
     };
     if let Some(ready) = ready {
         if target > policy.max_candidates {
@@ -308,25 +347,41 @@ fn native_window(
     filter: Option<&dyn SearchFilter>,
 ) -> SemanticReaderResult<(Vec<VectorHit>, usize)> {
     let candidates = graph.search(query.vector(), width, Some(width))?;
-    if candidates.len() > width { return Err(SemanticReaderError::InvalidCandidate); }
+    if candidates.len() > width {
+        return Err(SemanticReaderError::InvalidCandidate);
+    }
     let count = candidates.len();
     let mut hits = Vec::with_capacity(count);
     let mut seen = HashSet::with_capacity(count);
     for candidate in candidates {
         let row = usize::try_from(candidate.physical_row())
             .map_err(|_| SemanticReaderError::InvalidCandidate)?;
-        if !seen.insert(row) || !candidate.flags().is_live()
+        if !seen.insert(row)
+            || !candidate.flags().is_live()
             || owner.doc_id_at(row)? != candidate.doc_id()
         {
             return Err(SemanticReaderError::InvalidCandidate);
         }
-        if filter.is_some_and(|filter| !filter.matches(candidate.doc_id(), None)) { continue; }
+        if filter.is_some_and(|filter| !filter.matches(candidate.doc_id(), None)) {
+            continue;
+        }
         // 1.0 - distance loses small scores to rounding. Recompute from the
         // exact retained source at its declared storage precision instead.
         let score = dot_product_f32_f32(&owner.vector_at_f32(row)?, query.vector())?;
-        if !score.is_finite() { return Err(SemanticReaderError::InvalidCandidate); }
-        hits.push(VectorHit { index: candidate.physical_row(), score, doc_id: candidate.doc_id().into() });
+        if !score.is_finite() {
+            return Err(SemanticReaderError::InvalidCandidate);
+        }
+        hits.push(VectorHit {
+            index: candidate.physical_row(),
+            score,
+            doc_id: candidate.doc_id().into(),
+        });
     }
-    hits.sort_unstable_by(|left, right| right.score.total_cmp(&left.score)
-        .then_with(|| left.index.cmp(&right.index)));
+    hits.sort_unstable_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.index.cmp(&right.index))
+    });
     Ok((hits, count))
+}
