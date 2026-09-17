@@ -956,6 +956,7 @@ fn e2e_subprocess_sources_cannot_mutate_the_parent_environment() -> SchemaTestRe
     let tracker = tracker_for("e2e_subprocess_sources_cannot_mutate_the_parent_environment");
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let sources = [
+        "tests/connector_aider.rs",
         "tests/connector_chatgpt.rs",
         "tests/connector_codex.rs",
         "tests/connector_omp.rs",
@@ -990,6 +991,8 @@ fn e2e_subprocess_sources_cannot_mutate_the_parent_environment() -> SchemaTestRe
         ["EnvGuard", "::set("].concat(),
         ["std::env::", "set_var"].concat(),
         ["std::env::", "remove_var"].concat(),
+        ["CwdGuard", "::change_to("].concat(),
+        ["std::env::", "set_current_dir"].concat(),
     ];
     let mut violations = Vec::new();
 
