@@ -283,13 +283,12 @@ impl DaemonClient for UdsDaemonClient {
             return true;
         }
 
-        // Verify with health check
+        // The transport invalidates a failed exchange while it owns the
+        // stream. A waiting probe's timeout or a peer's retryable overload
+        // must not poison another caller's still-valid shared connection.
         match self.health() {
             Ok(status) => status.ready,
-            Err(_) => {
-                self.mark_unavailable();
-                false
-            }
+            Err(_) => false,
         }
     }
 
