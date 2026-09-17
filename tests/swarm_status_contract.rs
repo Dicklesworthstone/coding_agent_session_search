@@ -84,7 +84,13 @@ fn live_swarm_cli_reads_real_git_and_beads_without_authorizing_claims() {
     let repo = sandbox.path().join("repo");
     fs::create_dir(&repo).expect("repository directory");
     let tool = |program: &str, args: &[&str]| {
-        let output = std::process::Command::new(program)
+        assert!(matches!(program, "git" | "br"), "unknown test tool");
+        let mut command = if program == "git" {
+            std::process::Command::new("git")
+        } else {
+            std::process::Command::new("br")
+        };
+        let output = command
             .args(args)
             .current_dir(&repo)
             .env("HOME", sandbox.path().join("home"))

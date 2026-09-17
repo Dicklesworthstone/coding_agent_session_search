@@ -96,7 +96,13 @@ fn live_command(
         .checked_sub(started.elapsed())
         .filter(|remaining| !remaining.is_zero())
         .ok_or("live provider deadline exceeded")?;
-    let mut command = Command::new(program);
+    let mut command = match program {
+        "git" => Command::new("git"),
+        "br" => Command::new("br"),
+        #[cfg(test)]
+        "sh" => Command::new("sh"),
+        _ => return Err("unsupported live provider executable".to_string()),
+    };
     command
         .args(args)
         .current_dir(repo)
@@ -133,9 +139,9 @@ fn live_command(
 
 fn collect_live_git(repo: &Path, started: Instant) -> Result<Value, String> {
     let root = live_command(repo, "git", &["rev-parse", "--show-toplevel"], started)?;
-    let root = std::str::from_utf8(&root)
-        .map_err(|_| "git root is not UTF-8")?
-        .trim_end();
+    let root = std::str::from_utf8(&root).map_err(|_| "git root is not UTF-8")?;
+    // Remove Git's line terminator, not whitespace that belongs to the path.
+    let root = root.strip_suffix('\n').unwrap_or(root);
     let canonical = repo.canonicalize().map_err(|error| error.to_string())?;
     if Path::new(root)
         .canonicalize()
@@ -155,7 +161,7 @@ fn collect_live_git(repo: &Path, started: Instant) -> Result<Value, String> {
             "--branch",
             "-z",
             "--untracked-files=normal",
-            "--ignore-submodules=all",
+            "--ignore-submodules=none",
         ],
         started,
     )?;
@@ -185,14 +191,26 @@ fn parse_git_status(bytes: &[u8]) -> Result<Value, String> {
     let mut records = text.split_terminator('\0');
     let mut branch = None;
     let mut head = None;
+    let mut saw_head = false;
     let mut upstream = None;
     let mut ahead = None;
     let mut behind = None;
     let mut paths = std::collections::BTreeSet::new();
     while let Some(record) = records.next() {
         if let Some(value) = record.strip_prefix("# branch.head ") {
+            if value.is_empty() || branch.is_some() {
+                return Err("invalid or duplicate git branch identity".to_string());
+            }
             branch = Some(value.to_string());
         } else if let Some(value) = record.strip_prefix("# branch.oid ") {
+            if saw_head
+                || (value != "(initial)"
+                    && (!matches!(value.len(), 40 | 64)
+                        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())))
+            {
+                return Err("invalid or duplicate git commit identity".to_string());
+            }
+            saw_head = true;
             head = (value != "(initial)").then(|| value.to_string());
         } else if let Some(value) = record.strip_prefix("# branch.upstream ") {
             upstream = Some(value.to_string());
@@ -213,6 +231,9 @@ fn parse_git_status(bytes: &[u8]) -> Result<Value, String> {
                     .map_err(|_| "invalid git behind count")?,
             );
         } else if let Some(path) = record.strip_prefix("? ") {
+            if path.is_empty() {
+                return Err("empty git untracked path".to_string());
+            }
             paths.insert(path.to_string());
         } else if record.starts_with("1 ") || record.starts_with("2 ") || record.starts_with("u ") {
             let fields = match record.as_bytes()[0] {
@@ -238,6 +259,9 @@ fn parse_git_status(bytes: &[u8]) -> Result<Value, String> {
         }
     }
     let branch = branch.ok_or("missing git branch identity")?;
+    if !saw_head {
+        return Err("missing git commit identity".to_string());
+    }
     Ok(
         serde_json::json!({"branch": branch, "head": head, "upstream": upstream,
         "ahead": ahead, "behind": behind, "dirty": !paths.is_empty(), "dirty_paths": paths,
@@ -872,6 +896,12 @@ mod tests {
     fn live_git_porcelain_rejects_truncated_and_unknown_records() {
         for bytes in [
             b"# branch.head main".as_slice(),
+            b"# branch.head main\0".as_slice(),
+            b"# branch.oid invalid\0# branch.head main\0".as_slice(),
+            b"# branch.oid (initial)\0# branch.head \0".as_slice(),
+            b"# branch.oid (initial)\0# branch.oid (initial)\0# branch.head main\0".as_slice(),
+            b"# branch.oid (initial)\0# branch.head main\0# branch.head other\0".as_slice(),
+            b"# branch.oid (initial)\0# branch.head main\0? \0".as_slice(),
             b"# branch.head main\0x future-record\0".as_slice(),
             b"# branch.head main\02 R. N... 100644 100644 100644 a b R100 new\0".as_slice(),
             b"# branch.head main\0# branch.ab +wrong -0\0".as_slice(),
@@ -941,6 +971,86 @@ mod tests {
         assert!(!dir.path().join(".git/index.lock").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn live_git_detects_dirty_submodules_and_preserves_trailing_path_spaces() {
+        let sandbox = tempfile::tempdir().expect("temporary repositories");
+        let parent = sandbox.path().join("parent with trailing space ");
+        let upstream = sandbox.path().join("upstream");
+        fs::create_dir(&parent).expect("parent directory");
+        fs::create_dir(&upstream).expect("upstream directory");
+        let git = |repo: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=CASS Test",
+                    "-c",
+                    "user.email=cass@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(repo)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .output()
+                .expect("Git installed");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&upstream, &["init", "-b", "main"]);
+        fs::write(upstream.join("tracked.txt"), "original").expect("submodule source");
+        git(&upstream, &["add", "tracked.txt"]);
+        git(&upstream, &["commit", "-m", "seed"]);
+        git(&parent, &["init", "-b", "main"]);
+        git(
+            &parent,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                upstream.to_str().expect("temporary source path"),
+                "module",
+            ],
+        );
+        git(&parent, &["commit", "-m", "add submodule"]);
+        // The explicit collector option must override a repository setting
+        // that would otherwise conceal edits within this submodule.
+        git(&parent, &["config", "submodule.module.ignore", "all"]);
+        let clean = collect_live_git(&parent, Instant::now()).expect("clean parent");
+        assert_eq!(clean["dirty"], false);
+        fs::write(parent.join("module/tracked.txt"), "changed").expect("dirty submodule");
+        let indexes = [
+            parent.join(".git/index"),
+            parent.join(".git/modules/module/index"),
+        ];
+        let before: Vec<_> = indexes
+            .iter()
+            .map(|path| {
+                (
+                    fs::read(path).unwrap(),
+                    fs::metadata(path).unwrap().modified().unwrap(),
+                )
+            })
+            .collect();
+        let dirty = collect_live_git(&parent, Instant::now()).expect("dirty submodule snapshot");
+        assert_eq!(dirty["dirty"], true);
+        assert_eq!(dirty["dirty_paths"], json!(["module"]));
+        assert_eq!(
+            dirty["repository"],
+            parent.canonicalize().unwrap().to_str().unwrap()
+        );
+        for (path, (bytes, modified)) in indexes.iter().zip(before) {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+            assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), modified);
+        }
+    }
+
     #[test]
     fn live_collection_reports_missing_sources_without_initializing_them() {
         let dir = tempfile::tempdir().expect("empty directory");
@@ -965,6 +1075,14 @@ mod tests {
         let error = live_command(dir.path(), "nonexistent-cass-test-command", &[], started)
             .expect_err("deadline expired");
         assert!(error.contains("deadline"));
+    }
+
+    #[test]
+    fn live_command_rejects_executables_outside_the_provider_allowlist() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let error = live_command(dir.path(), "echo", &["unexpected"], Instant::now())
+            .expect_err("only provider executables are admitted");
+        assert_eq!(error, "unsupported live provider executable");
     }
 
     #[cfg(unix)]

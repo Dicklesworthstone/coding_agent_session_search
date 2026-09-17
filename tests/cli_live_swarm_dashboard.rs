@@ -29,10 +29,19 @@ impl Fixture {
         for directory in [&nested, &home, &data] {
             fs::create_dir_all(directory)?;
         }
-        let output = Command::new("git").arg("-C").arg(&repo)
-            .args(["init", "--quiet", "--initial-branch=main"]).output()?;
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["init", "--quiet", "--initial-branch=main"])
+            .output()?;
         require_success(&output)?;
-        Ok(Self { _temp: temp, repo, nested, home, data })
+        Ok(Self {
+            _temp: temp,
+            repo,
+            nested,
+            home,
+            data,
+        })
     }
 
     fn write_beads(&self, body: &str) -> std::io::Result<PathBuf> {
@@ -47,19 +56,27 @@ impl Fixture {
         let mut command = Command::new(env!("CARGO_BIN_EXE_cass"));
         for (name, _) in std::env::vars_os() {
             let key = name.to_string_lossy();
-            if ["CASS_", "TOON_", "FRANKENSEARCH_", "FSQLITE_", "GIT_"].iter().any(|prefix| key.starts_with(prefix)) {
+            if ["CASS_", "TOON_", "FRANKENSEARCH_", "FSQLITE_", "GIT_"]
+                .iter()
+                .any(|prefix| key.starts_with(prefix))
+            {
                 command.env_remove(name);
             }
         }
-        let output = command.current_dir(&self.nested)
-            .env("HOME", &self.home).env("USERPROFILE", &self.home)
+        let output = command
+            .current_dir(&self.nested)
+            .env("HOME", &self.home)
+            .env("USERPROFILE", &self.home)
             .env("XDG_CONFIG_HOME", self.home.join("config"))
             .env("XDG_DATA_HOME", self.home.join("data"))
             .env("CASS_DATA_DIR", &self.data)
             .env("CASS_AUTO_REFRESH", "0")
             .env("CASS_SEMANTIC_ENABLED", "0")
-            .args(["--data-dir"]).arg(&self.data)
-            .args(["swarm", "dashboard"]).args(args).output()?;
+            .args(["--data-dir"])
+            .arg(&self.data)
+            .args(["swarm", "dashboard"])
+            .args(args)
+            .output()?;
         require_success(&output)?;
         Ok(output)
     }
@@ -74,9 +91,11 @@ fn require_success(output: &Output) -> TestResult {
         Ok(())
     } else {
         Err(std::io::Error::other(format!(
-            "command failed with {}; stderr={}", output.status,
+            "command failed with {}; stderr={}",
+            output.status,
             String::from_utf8_lossy(&output.stderr)
-        )).into())
+        ))
+        .into())
     }
 }
 
@@ -114,12 +133,22 @@ fn nested_live_dashboard_classifies_tasks_without_mutating_beads() -> TestResult
     assert_eq!(repository["beads"]["complete"], true);
     assert_eq!(repository["beads"]["locally_unblocked_count"], 1);
     assert_eq!(repository["beads"]["candidate_tasks"][0]["id"], "ready");
-    assert_eq!(repository["beads"]["active_tasks"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        repository["beads"]["active_tasks"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
     assert_eq!(repository["beads"]["attention_tasks"][0]["id"], "blocked");
     assert_eq!(repository["git"]["provider"]["status"], "partial");
     assert!(repository["git"]["unstaged_changes"].is_null());
     assert_eq!(repository["coordination_verified"], false);
-    assert!(!output.to_string().contains("SECRET-DESCRIPTION-NOT-PUBLISHED"));
+    assert!(
+        !output
+            .to_string()
+            .contains("SECRET-DESCRIPTION-NOT-PUBLISHED")
+    );
     assert_preserved(&path, &before, modified)
 }
 
