@@ -21,7 +21,6 @@ const SEARCH_CONFIG = {
     DEBOUNCE_MS: 300,
     PAGE_SIZE: 50,
     SNIPPET_LENGTH: 64,
-    MAX_RESULTS: 1000,
     TIME_FILTER_CUSTOM_VALUE: 'custom',
     // Virtual list configuration
     RESULT_CARD_HEIGHT: 88, // Fixed height per result card
@@ -44,6 +43,8 @@ let currentFilters = createEmptySearchFilters();
 let currentSearchMode = 'auto'; // 'auto', 'prose', or 'code'
 let currentResults = [];
 let currentPage = 0;
+let hasNextPage = false;
+let isSearching = false;
 let searchTimeout = null;
 let onResultSelect = null;
 let virtualList = null; // Virtual list instance for large result sets
@@ -62,6 +63,10 @@ let elements = {
     loadingIndicator: null,
     resultCount: null,
     noResults: null,
+    pagination: null,
+    previousPage: null,
+    nextPage: null,
+    pageStatus: null,
 };
 
 function parseResultSelection(card) {
@@ -343,6 +348,11 @@ function renderSearchUI() {
                 <!-- Screen reader announcer for search results -->
                 <div id="search-announcer" class="visually-hidden" aria-live="assertive" aria-atomic="true"></div>
                 <div id="results-list" class="results-list" role="listbox" aria-label="Search results list"></div>
+                <nav id="search-pagination" class="search-results-header hidden" aria-label="Search result pages">
+                    <button type="button" id="search-previous-page" class="btn btn-secondary" aria-controls="results-list" disabled>Previous</button>
+                    <span id="search-page-status" role="status" aria-live="polite"></span>
+                    <button type="button" id="search-next-page" class="btn btn-secondary" aria-controls="results-list" disabled>Next</button>
+                </nav>
             </div>
         </div>
     `;
@@ -362,6 +372,10 @@ function cacheElements() {
     elements.loadingIndicator = document.getElementById('loading-indicator');
     elements.resultCount = document.getElementById('result-count');
     elements.noResults = document.getElementById('no-results');
+    elements.pagination = document.getElementById('search-pagination');
+    elements.previousPage = document.getElementById('search-previous-page');
+    elements.nextPage = document.getElementById('search-next-page');
+    elements.pageStatus = document.getElementById('search-page-status');
 }
 
 /**
@@ -370,7 +384,9 @@ function cacheElements() {
 function setupEventListeners() {
     // Search input with debounce
     elements.searchInput.addEventListener('input', (e) => {
-        clearTimeout(searchTimeout);
+        // Invalidate immediately, not after the debounce: a pending page must
+        // not repaint stale/private results after a query edit or session lock.
+        invalidateSearchResults();
         searchTimeout = setTimeout(() => {
             handleSearch(e.target.value);
         }, SEARCH_CONFIG.DEBOUNCE_MS);
@@ -393,13 +409,13 @@ function setupEventListeners() {
     // Agent filter
     elements.agentFilter.addEventListener('change', (e) => {
         currentFilters.agent = e.target.value || null;
-        handleSearch(currentQuery);
+        handleSearch(elements.searchInput.value);
     });
 
     // Time filter
     elements.timeFilter.addEventListener('change', (e) => {
         updateTimeFilter(e.target.value);
-        handleSearch(currentQuery);
+        handleSearch(elements.searchInput.value);
     });
 
     // Search mode toggle
@@ -409,15 +425,15 @@ function setupEventListeners() {
             if (btn) {
                 const mode = btn.dataset.mode;
                 setSearchMode(mode);
-                // Re-run search with new mode if there's a query
-                if (currentQuery) {
-                    handleSearch(currentQuery);
-                }
+                handleSearch(elements.searchInput.value);
             }
         });
     }
 
-    // Result click delegation
+    elements.previousPage.addEventListener('click', () => changeSearchPage(-1));
+    elements.nextPage.addEventListener('click', () => changeSearchPage(1));
+
+    // Result click delegation (also handles virtual-list cards).
     elements.resultsList.addEventListener('click', (e) => {
         const resultCard = e.target.closest('.result-card');
         if (resultCard) {
@@ -584,22 +600,109 @@ function updateTimeFilter(value) {
 }
 
 /**
- * Handle search query
+ * Clear retained results and cancel pending page renders/announcements.
+ * Shared by query edits, route changes and the session-lock cleanup path.
+ */
+function invalidateSearchResults() {
+    clearTimeout(searchTimeout);
+    searchTimeout = null;
+    searchEpoch += 1;
+    currentResults = [];
+    currentPage = 0;
+    hasNextPage = false;
+    isSearching = false;
+    destroyVirtualResultsView();
+    hideLoading();
+    hideNoResults();
+    if (elements.resultsList) {
+        elements.resultsList.innerHTML = '';
+        elements.resultsList.scrollTop = 0;
+    }
+    if (elements.resultCount) {
+        elements.resultCount.textContent = '';
+    }
+    const announcer = document.getElementById('search-announcer');
+    if (announcer) {
+        announcer.textContent = '';
+    }
+    updatePagination();
+}
+
+/**
+ * Handle a new query, always starting from the first page.
  */
 async function handleSearch(query) {
-    const epoch = ++searchEpoch;
+    invalidateSearchResults();
     currentQuery = query.trim();
-    currentPage = 0;
+    updateSearchModeIndicator(currentQuery);
+    await loadSearchPage(0);
+}
 
+/**
+ * Read one bounded window, with one lookahead row for an exact Next state.
+ * Filtering and ordering stay in SQL. Only the current page is retained.
+ */
+function readSearchPage(page) {
+    const limit = SEARCH_CONFIG.PAGE_SIZE + 1;
+    const offset = page * SEARCH_CONFIG.PAGE_SIZE;
+    if (currentQuery) {
+        return searchConversations(currentQuery, {
+            limit,
+            offset,
+            agent: currentFilters.agent,
+            searchMode: currentSearchMode,
+            since: currentFilters.since,
+            until: currentFilters.until,
+        });
+    }
+
+    let results;
+    if (currentFilters.agent) {
+        results = getConversationsByAgent(
+            currentFilters.agent, limit,
+            currentFilters.since, currentFilters.until, offset,
+        );
+    } else if (currentFilters.since !== null || currentFilters.until !== null) {
+        results = getConversationsByTimeRange(
+            currentFilters.since, currentFilters.until, limit, offset,
+        );
+    } else {
+        results = getRecentConversations(limit, offset);
+    }
+
+    return results.map(conv => ({
+        conversation_id: conv.id,
+        message_id: null,
+        agent: conv.agent,
+        workspace: conv.workspace,
+        title: conv.title || 'Untitled conversation',
+        started_at: conv.started_at,
+        snippet: null,
+        rank: 0,
+    }));
+}
+
+async function loadSearchPage(page, focusResults = false) {
+    const epoch = ++searchEpoch;
+    isSearching = true;
     showLoading();
+    updatePagination();
 
     try {
-        if (!currentQuery) {
-            // Empty query - show recent conversations
-            await loadRecentConversations(epoch);
-        } else {
-            // FTS5 search
-            await performSearch(epoch);
+        // Yield before the synchronous SQLite query so loading feedback can
+        // paint and a newer query/lock can cancel this work before it starts.
+        await new Promise(resolve => setTimeout(resolve, 0));
+        if (!isCurrentSearchEpoch(epoch)) {
+            return;
+        }
+        const rows = readSearchPage(page);
+        currentPage = page;
+        hasNextPage = rows.length > SEARCH_CONFIG.PAGE_SIZE;
+        currentResults = rows.slice(0, SEARCH_CONFIG.PAGE_SIZE);
+        renderResults();
+        elements.resultsList.scrollTop = 0;
+        if (focusResults) {
+            focusResultCardAtIndex(0, 'start');
         }
     } catch (error) {
         if (!isCurrentSearchEpoch(epoch)) {
@@ -607,87 +710,42 @@ async function handleSearch(query) {
         }
         console.error('[Search] Search error:', error);
         showError('Search failed. Please try again.');
+    } finally {
+        if (isCurrentSearchEpoch(epoch)) {
+            isSearching = false;
+            hideLoading();
+            updatePagination();
+        }
     }
-
-    if (!isCurrentSearchEpoch(epoch)) {
-        return;
-    }
-    hideLoading();
 }
 
-/**
- * Perform FTS5 search
- */
-async function performSearch(epoch) {
-    const options = {
-        limit: SEARCH_CONFIG.PAGE_SIZE,
-        offset: currentPage * SEARCH_CONFIG.PAGE_SIZE,
-        agent: currentFilters.agent,
-        searchMode: currentSearchMode,
-        since: currentFilters.since,
-        until: currentFilters.until,
-    };
-
-    // Pass raw query and filters - searchConversations applies SQL filters before pagination.
-    currentResults = searchConversations(currentQuery, options);
-
-    // Update search mode indicator
-    updateSearchModeIndicator(currentQuery);
-
-    if (!isCurrentSearchEpoch(epoch)) {
+async function changeSearchPage(direction) {
+    if (isSearching || (direction !== -1 && direction !== 1)) {
         return;
     }
-
-    renderResults();
+    if (elements.searchInput.value.trim() !== currentQuery) {
+        await handleSearch(elements.searchInput.value);
+        return;
+    }
+    if ((direction < 0 && currentPage === 0) || (direction > 0 && !hasNextPage)) {
+        return;
+    }
+    const page = currentPage + direction;
+    if (!Number.isSafeInteger(page * SEARCH_CONFIG.PAGE_SIZE)) {
+        return;
+    }
+    await loadSearchPage(page, true);
 }
 
-/**
- * Load recent conversations (no search query)
- */
-async function loadRecentConversations(epoch = searchEpoch) {
-    try {
-        let results;
-        const hasTimeFilter = currentFilters.since !== null || currentFilters.until !== null;
-
-        if (currentFilters.agent) {
-            results = getConversationsByAgent(
-                currentFilters.agent,
-                SEARCH_CONFIG.PAGE_SIZE,
-                currentFilters.since,
-                currentFilters.until,
-            );
-        } else if (hasTimeFilter) {
-            const since = currentFilters.since ?? 0;
-            const until = currentFilters.until ?? Date.now();
-            results = getConversationsByTimeRange(since, until, SEARCH_CONFIG.PAGE_SIZE);
-        } else {
-            results = getRecentConversations(SEARCH_CONFIG.PAGE_SIZE);
-        }
-
-        // Transform to match search result format
-        currentResults = results.map(conv => ({
-            conversation_id: conv.id,
-            message_id: null,
-            agent: conv.agent,
-            workspace: conv.workspace,
-            title: conv.title || 'Untitled conversation',
-            started_at: conv.started_at,
-            snippet: null,
-            rank: 0,
-        }));
-
-        if (!isCurrentSearchEpoch(epoch)) {
-            return;
-        }
-
-        renderResults();
-    } catch (error) {
-        if (!isCurrentSearchEpoch(epoch)) {
-            return;
-        }
-        console.error('[Search] Failed to load recent:', error);
-        showError('Failed to load conversations');
+function updatePagination() {
+    if (!elements.pagination) {
+        return;
     }
+    const visible = currentPage > 0 || hasNextPage;
+    elements.pagination.classList.toggle('hidden', !visible);
+    elements.previousPage.disabled = isSearching || currentPage === 0;
+    elements.nextPage.disabled = isSearching || !hasNextPage;
+    elements.pageStatus.textContent = visible ? `Page ${currentPage + 1}` : '';
 }
 
 // Note: FTS5 query formatting and escaping is now handled in database.js
@@ -798,18 +856,8 @@ function createResultCard(result, index) {
         </div>
     `;
 
-    // Add click handler for virtual list items
-    article.addEventListener('click', () => {
-        const selection = parseResultSelection(article);
-        if (!selection) {
-            console.warn('[Search] Ignoring result with invalid conversation/message id');
-            return;
-        }
-        if (onResultSelect) {
-            onResultSelect(selection.conversationId, selection.messageId);
-        }
-    });
-
+    // Clicks bubble to the results-list delegate. A second handler here would
+    // open the same conversation twice (including keyboard-triggered clicks).
     return article;
 }
 
@@ -883,15 +931,18 @@ function destroyVirtualResultsView() {
  */
 function updateResultCount() {
     const count = currentResults.length;
-    const hasMore = count >= SEARCH_CONFIG.PAGE_SIZE;
+    const start = currentPage * SEARCH_CONFIG.PAGE_SIZE + 1;
+    const end = currentPage * SEARCH_CONFIG.PAGE_SIZE + count;
+    const context = currentQuery ? ` for "${currentQuery}"` : '';
 
     let message;
-    if (currentQuery) {
-        message = hasMore
-            ? `${count}+ results for "${currentQuery}"`
-            : `${count} result${count !== 1 ? 's' : ''} for "${currentQuery}"`;
+    if (currentPage === 0 && !hasNextPage) {
+        const noun = currentQuery ? 'result' : 'recent conversation';
+        message = `${count} ${noun}${count !== 1 ? 's' : ''}${context}`;
     } else {
-        message = `${count} recent conversation${count !== 1 ? 's' : ''}`;
+        const noun = currentQuery ? 'Results' : 'Conversations';
+        const extent = hasNextPage ? ' (more available)' : ` of ${end}`;
+        message = `${noun} ${start}–${end}${extent}${context}`;
     }
 
     elements.resultCount.textContent = message;
@@ -923,6 +974,7 @@ function announceToScreenReader(message, epoch = searchEpoch) {
  * Show loading indicator
  */
 function showLoading() {
+    elements.resultsContainer?.setAttribute('aria-busy', 'true');
     elements.loadingIndicator.classList.remove('hidden');
     elements.resultsList.classList.add('loading');
 }
@@ -931,6 +983,7 @@ function showLoading() {
  * Hide loading indicator
  */
 function hideLoading() {
+    elements.resultsContainer?.setAttribute('aria-busy', 'false');
     elements.loadingIndicator.classList.add('hidden');
     elements.resultsList.classList.remove('loading');
 }
@@ -955,10 +1008,14 @@ function hideNoResults() {
  * Show error message
  */
 function showError(message) {
+    currentResults = [];
+    currentPage = 0;
+    hasNextPage = false;
+    updatePagination();
     destroyVirtualResultsView();
     hideNoResults();
     elements.resultsList.innerHTML = `
-        <div class="search-error">
+        <div class="search-error" role="alert">
             <span class="error-icon">⚠️</span>
             <p>${escapeHtml(message)}</p>
         </div>
@@ -1062,6 +1119,7 @@ export async function setSearchQuery(query, options = {}) {
     if (runSearch) {
         await handleSearch(normalized);
     } else {
+        invalidateSearchResults();
         currentQuery = normalized.trim();
         updateSearchModeIndicator(currentQuery);
     }
@@ -1083,6 +1141,7 @@ export async function setSearchRoute(routeSearch = {}, options = {}) {
     if (runSearch) {
         await handleSearch(normalizedQuery);
     } else {
+        invalidateSearchResults();
         currentQuery = normalizedQuery.trim();
         updateSearchModeIndicator(currentQuery);
     }
@@ -1094,17 +1153,10 @@ export async function setSearchRoute(routeSearch = {}, options = {}) {
 export function clearSearch(options = {}) {
     const { reloadRecent = true } = options;
 
-    clearTimeout(searchTimeout);
-    searchEpoch += 1;
+    invalidateSearchResults();
     currentQuery = '';
     currentFilters = createEmptySearchFilters();
     currentSearchMode = 'auto';
-    currentResults = [];
-    currentPage = 0;
-
-    // Clean up virtual list if it exists
-    destroyVirtualResultsView();
-    hideLoading();
 
     if (elements.searchInput) {
         elements.searchInput.value = '';
@@ -1122,7 +1174,7 @@ export function clearSearch(options = {}) {
     setSearchMode('auto');
 
     if (reloadRecent) {
-        loadRecentConversations(searchEpoch);
+        void handleSearch('');
     } else {
         hideNoResults();
         if (elements.resultsList) {
@@ -1143,6 +1195,9 @@ export function getSearchState() {
         filters: { ...currentFilters },
         searchMode: currentSearchMode,
         resultCount: currentResults.length,
+        page: currentPage + 1,
+        hasNextPage,
+        isSearching,
     };
 }
 
