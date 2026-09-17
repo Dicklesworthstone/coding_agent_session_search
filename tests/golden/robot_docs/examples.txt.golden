@@ -1,5 +1,10 @@
 examples:
 
+# Quick project history (0.8.0 flags; check older-version help once)
+  cass search "performance regression" --workspace /path/to/project --days 7 --mode lexical --no-maintenance --robot --robot-meta --fields minimal --limit 5 --max-tokens 2000 --timeout 2000
+  # Also set a caller-side deadline. Read budget.timed_out even after exit 0; maintenance-required is a blocker, not permission to rebuild.
+  cass view /path/to/session.jsonl -n 42 -C 3 --json --timeout 2000
+
 # One-shot agent triage from zero context
   cass triage --json
   cass ready --json      # accepted alias

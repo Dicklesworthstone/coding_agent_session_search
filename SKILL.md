@@ -26,15 +26,42 @@ cass search "query" --json  # alias
 
 ## Quick Reference for AI Agents
 
-### Pre-Flight Check
+### Bounded History Retrieval
+
+For a quick project-history question, start with one scoped query. The flag set
+below is verified on cass 0.8.0; check `cass --version` and `cass search --help`
+once per installed version. If `--no-maintenance` is unsupported, stop and report
+the version mismatch; silently removing it permits maintenance.
 
 ```bash
-# Health check (exit 0=healthy, 1=unhealthy, <50ms)
-cass health
+# Specific terms, one workspace, recent history, small cited result set
+cass search "performance regression" --workspace /path/to/project --days 7 \
+  --mode lexical --no-maintenance --robot --robot-meta --fields minimal \
+  --limit 5 --max-tokens 2000 --timeout 2000
 
-# If unhealthy, rebuild index
-cass index --full
+# Expand only a useful hit, using its exact source_path and line_number
+cass view /path/to/session.jsonl -n 42 -C 3 --json --timeout 2000
 ```
+
+`--timeout` is in milliseconds; `--max-tokens` is an approximate output budget,
+not a CPU or memory limit. Apply a caller-side wall-clock deadline as well (for
+example, GNU `timeout 10s` before the command). Exit 124 from that wrapper is an
+incomplete attempt; its interrupted stdout may not be valid JSON. In JSON search
+output, inspect `budget.timed_out` even after exit 0: empty timed-out hits do not
+prove that no history exists.
+
+`view -C 3` limits surrounding lines, not bytes or tokens; a single JSONL record
+can be large. Check its output size before adding excerpts to a prompt.
+
+Hybrid remains the product default. Explicit lexical mode keeps this workflow
+out of semantic inference; `--no-maintenance` prevents index repair, catch-up,
+and daemon auto-spawn. If it returns `maintenance-required`, report that blocker
+and stop this retrieval attempt. Do not turn a summary request into an index,
+repair, model-install, wildcard-aggregate, or repeated health/status workflow.
+Use readiness commands when diagnosing readiness; review their proposed actions
+before starting a separate mutating task. Broaden dates or terms deliberately
+after a completed query; choose semantic/hybrid only when conceptual retrieval
+is needed and its cost is acceptable. Preserve source/line citations in summaries.
 
 ### Essential Commands
 
@@ -214,8 +241,7 @@ cass context /path/to/source.ts --json
 ### Status & Diagnostics
 
 ```bash
-# Quick health (<50ms)
-cass health
+# Readiness diagnosis, when needed; not a prerequisite for every query
 cass health --json
 
 # Full status snapshot
@@ -235,6 +261,9 @@ cass diag --verbose
 ## Aggregation & Analytics
 
 Aggregate search results server-side to get counts and distributions without transferring full result data:
+
+Aggregations reduce output volume, not necessarily scan work. They are not the
+first step for a quick history question; use the scoped retrieval recipe above.
 
 ```bash
 # Count results by agent
@@ -415,15 +444,19 @@ Errors are JSON with actionable hints:
 | Code | Meaning | Action |
 |------|---------|--------|
 | 0 | Success | Parse stdout |
-| 1 | Health check failed | Run `cass index --full` |
+| 1 | Health check failed | Inspect the reported condition; no automatic rebuild |
 | 2 | Usage error | Fix syntax (hint provided) |
-| 3 | Index/DB missing | Run `cass index --full` |
+| 3 | Index/DB missing | Report missing assets; indexing is a separate mutating task |
 | 4 | Network error | Check connectivity |
-| 5 | Data corruption | Run `cass index --full --force-rebuild` |
+| 5 | Data/maintenance failure | Read error kind; preserve the archive and report the blocker |
 | 6 | Incompatible version | Update cass |
 | 7 | Lock/busy | Retry later |
-| 8 | Partial result | Increase `--timeout` |
+| 8 | Partial result | Report incomplete coverage; do not silently retry |
 | 9 | Unknown error | Check `retryable` flag |
+
+Codes are command-specific: consult `cass robot-docs exit-codes` and the JSON
+error kind. Search budget expiry can return exit 0 with `budget.timed_out=true`;
+session-path output instead uses exit 10 for timeout.
 
 ---
 
@@ -433,9 +466,9 @@ Three search modes, selectable with `--mode` flag:
 
 | Mode | Algorithm | Best For |
 |------|-----------|----------|
-| **lexical** (default) | BM25 full-text | Exact term matching, code searches |
+| **lexical** | BM25 full-text | Exact term matching, bounded history recipes |
 | **semantic** | Vector similarity | Conceptual queries, "find similar" |
-| **hybrid** | Reciprocal Rank Fusion | Balanced precision and recall |
+| **hybrid** (default) | Reciprocal Rank Fusion | Lexical retrieval with semantic refinement when ready |
 
 ```bash
 cass search "authentication" --mode lexical --robot
@@ -811,17 +844,10 @@ CASS uses multi-layer deduplication:
 
 ## Performance Characteristics
 
-| Operation | Latency |
-|-----------|---------|
-| Prefix search (cached) | 2-8ms |
-| Prefix search (cold) | 40-60ms |
-| Substring search | 80-200ms |
-| Full reindex | 5-30s |
-| Incremental reindex | 50-500ms |
-| Health check | <50ms |
-
-**Memory:** 70-140MB typical (50K messages)
-**Disk:** ~600 bytes/message (including n-gram overhead)
+Latency and memory depend on archive size, index readiness, model state, and
+whether the process is cold. Historical small-corpus timings are not deadlines
+for a large archive. Measure the complete command, bound each retrieval attempt,
+and distinguish successful results from timeout or maintenance refusal.
 
 ---
 
@@ -938,9 +964,9 @@ cm reflect
 
 | Issue | Solution |
 |-------|----------|
-| "missing index" | `cass index --full` |
-| Stale warning | Rerun index or enable watch |
-| Empty results | Check `cass stats --json`, verify connectors detected |
+| "missing index" / `maintenance-required` | Report the blocker; separate retrieval from authorized indexing/repair |
+| Stale warning | Report the age/coverage; decide separately whether to refresh |
+| Empty results | Check `budget.timed_out`; then reconsider query scope if the attempt completed |
 | JSON parsing errors | Use `--robot-format compact` |
 | Watch not triggering | Check `watch_state.json`, verify file event support |
 | Reset TUI state | `cass tui --reset-state` or `Ctrl+Shift+Del` |

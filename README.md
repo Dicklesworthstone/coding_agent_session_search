@@ -49,25 +49,26 @@ The Homebrew tap installs prebuilt release tarballs (not bottles) for Linux and 
 ⚠️ **Never run bare `cass` in an agent context** — it launches the interactive TUI. Always use `--robot` or `--json`.
 
 ```bash
-# 1) One-shot agent triage. Follow next_command when present.
-cass triage --json
-#    From zero context, `cass --json` and `cass --robot` also resolve to triage.
+# 1) Check the installed interface once per version (recipe verified on 0.8.0).
+cass --version
+cass search --help
 
 # Verify a newly installed executable without opening the configured archive.
 cass selftest --json
 # `health --binary-only` still reports (and therefore probes) archive readiness.
 
-# 2) Search across all agent history. Default search is hybrid-preferred:
-#    lexical is the fast required path; semantic refinement joins when ready.
-cass search "authentication error" --robot --limit 5 --fields minimal
+# 2) For a quick history question, start with scoped read-only lexical retrieval.
+#    Hybrid remains the product default; lexical is explicit for this workflow.
+cass search "performance regression" --workspace /path/to/project --days 7 \
+  --mode lexical --no-maintenance --robot --robot-meta --fields minimal \
+  --limit 5 --max-tokens 2000 --timeout 2000
 
 # 3) Find the current or recent session for this workspace
 cass sessions --current --json
 cass sessions --workspace "$(pwd)" --json --limit 5
 
 # 4) View + expand a hit (use source_path/line_number from search output)
-cass view /path/to/session.jsonl -n 42 --json
-cass expand /path/to/session.jsonl -n 42 -C 3 --json
+cass view /path/to/session.jsonl -n 42 -C 3 --json --timeout 2000
 
 # 5) Discover the full machine API
 cass capabilities --json
@@ -80,6 +81,19 @@ cass sources agents exclude openclaw
 cass sources agents include openclaw
 ```
 
+The retrieval flags above are available in 0.8.0. On older builds, check help;
+if `--no-maintenance` is absent, report the mismatch instead of dropping the
+read-only constraint. `--timeout` is in milliseconds, while `--max-tokens` limits
+approximate output size. Also set a caller-side deadline (for example, GNU
+`timeout 10s`); an externally interrupted command may leave incomplete JSON.
+Inspect `budget.timed_out` even after exit 0: timed-out empty hits are not proof
+that no history exists. A `maintenance-required` response ends the retrieval
+attempt; indexing or repair is a separate mutating task. Use triage/health/status
+for readiness diagnosis, not as repeated prerequisites to a short summary.
+Broaden scope deliberately, expand useful hits, and preserve source/line citations.
+`view -C` bounds context lines, not bytes; check excerpt size before including
+a long JSONL record in an agent prompt.
+
 **Output conventions**
 - stdout = data only
 - stderr = diagnostics
@@ -91,7 +105,7 @@ cass sources agents include openclaw
 - Hybrid is the default search intent. Robot metadata (`--robot --robot-meta`) reports the requested mode, realized mode, semantic refinement status, and any lexical fallback reason when semantic assets are not ready.
 - Semantic assets are opportunistic background enrichment. Lexical-only results are expected during first indexing, semantic catch-up, disabled semantic policy, or unavailable local model/vector files.
 - Semantic model acquisition is **opt-in**: `cass models install` downloads the default `all-minilm-l6-v2` (alias `minilm`, ~90 MB) only on explicit request; `--model multilingual-minilm` selects the larger multilingual MiniLM L12 model (~480 MB) for CJK/mixed-language archives. Cass never auto-downloads or auto-selects the multilingual space. Air-gapped installs use `--from-file <dir>`. While the selected model is absent, hybrid search uses lexical-only and reports `fallback_mode="lexical"` in health/status.
-- `cass triage --json` is the safest first command for agents: it combines readiness, `next_command`, `recommended_commands[]`, docs/schema pointers, starter workflows, and accepted recoveries. `cass health --json` and `cass status --json` remain the narrower truth surfaces for readiness, active rebuilds, and recovery.
+- `cass triage --json` combines readiness, `next_command`, `recommended_commands[]`, docs/schema pointers, starter workflows, and accepted recoveries for diagnosis. Review recommended mutations before executing them. `cass health --json` and `cass status --json` remain the narrower truth surfaces for readiness, active rebuilds, and recovery.
 
 **Lexical publish durability (atomic-swap)**
 - Every lexical publish is an atomic renameat2(RENAME_EXCHANGE) on Linux, or a parked-rename + restore-on-failure dance elsewhere. Readers never see a half-torn index — they see either the old or the new generation, never a mix. See `src/indexer/mod.rs::publish_staged_lexical_index`.
