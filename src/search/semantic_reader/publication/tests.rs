@@ -473,3 +473,382 @@ fn missing_pointer_is_not_an_empty_searchable_generation() -> TestResult {
     assert_eq!(snapshot(root.path()), before);
     Ok(())
 }
+
+// Exercise the production path from native graph save to manifest sealing,
+// current.json selection, exact-owner admission and actual query execution.
+use crate::search::semantic_reader::ann::{
+    AnnFallbackReason, NativeAnnArtifactError, SemanticShardEngine, native_ann_artifact,
+};
+use frankensearch::index::native_hnsw::{
+    HnswParams, NativeHnswGenerationReceiptV2, ValidatedNativeHnsw,
+    native_hnsw_generation_receipt_path,
+};
+
+fn attach_native_graph(
+    root: &Path,
+    manifest: &mut SemanticGenerationManifestV1,
+    base_role: SemanticArtifactRole,
+    sequence: u64,
+) -> NativeHnswGenerationReceiptV2 {
+    let base = manifest.artifact(base_role).unwrap().clone();
+    let directory = manifest.generation_dir(root).unwrap();
+    let owner = Arc::new(ValidatedFsviBytes::open_published(
+        &directory.join(&base.relative_path), &binding(base_role, sequence),
+    ).unwrap());
+    let relative_path = format!("{}/selected.fshnsw", base_role.as_str());
+    let params = HnswParams { m: 16, m0: 32, ef_construction: 64, ef_search: 8 };
+    let graph = ValidatedNativeHnsw::build(owner, params, 17).unwrap();
+    let receipt = graph.save(&directory.join(&relative_path)).unwrap();
+    let artifact = native_ann_artifact(&base, &receipt, &relative_path, 25).unwrap();
+    manifest.artifacts.push(artifact);
+    manifest.artifacts.sort_by_key(|artifact| artifact.role);
+    manifest.validate().unwrap();
+    receipt
+}
+
+fn native_policy() -> AnnSearchPolicy {
+    AnnSearchPolicy { initial_candidates: 8, max_candidates: 8 }
+}
+
+fn native_batch(reader: &SelectedSemanticGeneration) -> SelectedSemanticBatch {
+    reader.activate(&queries()).unwrap().search_with_ann(1, None, native_policy()).unwrap()
+}
+
+fn assert_engine(batch: &SelectedSemanticBatch, engine: SemanticShardEngine) {
+    assert!(!batch.batch().execution().is_empty());
+    assert!(batch.batch().execution().iter().all(|report| report.engine == engine));
+}
+
+#[test]
+fn published_native_ann_reopens_and_searches_without_mutating_any_artifact() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let mut m = fixture(root.path(), "gen-native", 1, Some(A), None);
+    let receipt = attach_native_graph(root.path(), &mut m, SemanticArtifactRole::FastVector, 1);
+    let pointer = select(root.path(), &m, None);
+    let before = snapshot(root.path());
+    let exact = open(root.path(), &m);
+    assert!(matches!(exact.ann_admission(TierKind::Fast), Some(SemanticAnnAdmission::Unavailable {
+        reason: AnnFallbackReason::NotSelected,
+    })));
+    let reader = exact.with_ann(AnnAdmissionBudget::default())?;
+    assert_eq!(reader.ann_admission(TierKind::Fast), Some(SemanticAnnAdmission::Admitted {
+        graph_sha256: receipt.graph_sha256, receipt_sha256: receipt.receipt_sha256,
+    }));
+    let result = native_batch(&reader);
+    assert_engine(&result, SemanticShardEngine::NativeAnn);
+    assert_eq!(first_id(&result), 1);
+    assert_eq!(result.selection().pointer(), &pointer);
+    let q = queries();
+    let exact_result = reader.activate(&q)?.search(1, None)?;
+    assert_engine(&exact_result, SemanticShardEngine::Exact);
+    assert_eq!(result.batch().hits(), exact_result.batch().hits());
+    assert_eq!(snapshot(root.path()), before);
+    Ok(())
+}
+
+#[test]
+fn adjacent_native_graph_is_not_selected_without_a_manifest_ann_role() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let mut m = fixture(root.path(), "gen-unselected-ann", 1, Some(A), None);
+    attach_native_graph(root.path(), &mut m, SemanticArtifactRole::FastVector, 1);
+    m.artifacts.retain(|artifact| artifact.role != SemanticArtifactRole::FastAnn);
+    select(root.path(), &m, None);
+    let before = snapshot(root.path());
+    let reader = open(root.path(), &m).with_ann(AnnAdmissionBudget::default())?;
+    let batch = native_batch(&reader);
+    assert_eq!(first_id(&batch), 1);
+    assert_engine(&batch, SemanticShardEngine::ExactFallback);
+    assert_eq!(batch.batch().execution()[0].fallback_reason, Some(AnnFallbackReason::NotSelected));
+    assert_eq!(snapshot(root.path()), before);
+    Ok(())
+}
+
+#[test]
+fn native_ann_artifact_builder_refuses_foreign_bases_and_unsafe_paths() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let mut a = fixture(root.path(), "gen-artifact-a", 1, Some(A), None);
+    let b = fixture(root.path(), "gen-artifact-b", 2, Some(B), None);
+    let receipt = attach_native_graph(root.path(), &mut a, SemanticArtifactRole::FastVector, 1);
+    let base = a.artifact(SemanticArtifactRole::FastVector).unwrap();
+    let foreign = b.artifact(SemanticArtifactRole::FastVector).unwrap();
+    assert!(matches!(native_ann_artifact(foreign, &receipt, "fast_vector/selected.fshnsw", 25),
+        Err(NativeAnnArtifactError::ReceiptMismatch)));
+    for path in ["../selected.fshnsw", "/selected.fshnsw", "fast_vector/other.fshnsw", "C:fast/selected.fshnsw", "fast\\selected.fshnsw"] {
+        assert!(matches!(native_ann_artifact(base, &receipt, path, 25), Err(NativeAnnArtifactError::InvalidPath)));
+    }
+    assert!(matches!(native_ann_artifact(a.artifact(SemanticArtifactRole::FastAnn).unwrap(),
+        &receipt, "fast_vector/selected.fshnsw", 25), Err(NativeAnnArtifactError::InvalidBase)));
+    Ok(())
+}
+
+#[test]
+fn combined_native_graph_budget_rejects_both_tiers_before_reading_receipts() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let mut m = fixture(root.path(), "gen-ann-budget", 1, Some(A), Some(B));
+    let fast = attach_native_graph(root.path(), &mut m, SemanticArtifactRole::FastVector, 1);
+    let quality = attach_native_graph(root.path(), &mut m, SemanticArtifactRole::QualityVector, 1);
+    select(root.path(), &m, None);
+    let exact = open(root.path(), &m);
+    let q = TieredQueryEmbeddings::progressive(query(SemanticArtifactRole::FastVector), query(SemanticArtifactRole::QualityVector));
+    // Exact-fit admission is valid; one byte less must reject the pair, even
+    // though either graph fits separately. Broken receipts distinguish this
+    // preflight from loading first and merely reporting a budget afterwards.
+    let total = fast.graph_byte_len + quality.graph_byte_len;
+    let admitted = exact.clone().with_ann(AnnAdmissionBudget { max_declared_graph_bytes: total })?;
+    assert_engine(&admitted.activate(&q)?.search_with_ann(2, None, native_policy())?, SemanticShardEngine::NativeAnn);
+    for role in [SemanticArtifactRole::FastAnn, SemanticArtifactRole::QualityAnn] {
+        let graph = m.generation_dir(root.path())?.join(&m.artifact(role).unwrap().relative_path);
+        fs::write(native_hnsw_generation_receipt_path(&graph)?, b"broken receipt")?;
+    }
+    let before = snapshot(root.path());
+    for limit in [0, total - 1] {
+        let reader = exact.clone().with_ann(AnnAdmissionBudget { max_declared_graph_bytes: limit })?;
+        for tier in [TierKind::Fast, TierKind::Quality] {
+            assert_eq!(reader.ann_admission(tier), Some(SemanticAnnAdmission::Unavailable {
+                reason: AnnFallbackReason::AdmissionBudget,
+            }));
+        }
+        let result = reader.activate(&q)?.search_with_ann(2, None, native_policy())?;
+        assert_engine(&result, SemanticShardEngine::ExactFallback);
+        assert_eq!(result.batch().hits().len(), 2);
+    }
+    assert_eq!(snapshot(root.path()), before);
+    Ok(())
+}
+
+#[test]
+fn receipt_fingerprint_is_selected_by_the_manifest_not_inferred_from_disk() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let mut m = fixture(root.path(), "gen-wrong-ann-receipt", 1, Some(A), None);
+    attach_native_graph(root.path(), &mut m, SemanticArtifactRole::FastVector, 1);
+    let artifact = m.artifacts.iter_mut().find(|artifact| artifact.role == SemanticArtifactRole::FastAnn).unwrap();
+    artifact.artifact_parameters_sha256 = digest(b"another-receipt");
+    artifact.ann_base.as_mut().unwrap().parameters_sha256 = artifact.artifact_parameters_sha256.clone();
+    select(root.path(), &m, None);
+    let before = snapshot(root.path());
+    let reader = open(root.path(), &m).with_ann(AnnAdmissionBudget::default())?;
+    let batch = native_batch(&reader);
+    assert_engine(&batch, SemanticShardEngine::ExactFallback);
+    assert_eq!(batch.batch().execution()[0].fallback_reason, Some(AnnFallbackReason::ReceiptMismatch));
+    assert_eq!(first_id(&batch), 1);
+    assert_eq!(snapshot(root.path()), before);
+    Ok(())
+}
+
+#[test]
+fn native_ann_uses_retained_vectors_and_graphs_after_all_paths_are_replaced() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let mut m = fixture(root.path(), "gen-retained-ann", 1, Some(A), None);
+    attach_native_graph(root.path(), &mut m, SemanticArtifactRole::FastVector, 1);
+    let pointer = select(root.path(), &m, None);
+    let selected = open(root.path(), &m);
+    let weak = Arc::downgrade(&selected.reader.fast.as_ref().unwrap().shards[0]);
+    let directory = m.generation_dir(root.path())?;
+    let vector_path = directory.join(&m.artifact(SemanticArtifactRole::FastVector).unwrap().relative_path);
+    fs::rename(&vector_path, vector_path.with_extension("original-fsvi"))?;
+    fs::write(&vector_path, b"not the retained vector")?;
+    // Loading ANN must not re-open or derive identity from vector_path.
+    let reader = selected.with_ann(AnnAdmissionBudget::default())?;
+    let graph_path = directory.join(&m.artifact(SemanticArtifactRole::FastAnn).unwrap().relative_path);
+    let receipt_path = native_hnsw_generation_receipt_path(&graph_path)?;
+    for path in [graph_path, receipt_path] {
+        fs::rename(&path, path.with_extension("preserved-original"))?;
+        fs::write(&path, b"not the retained graph or receipt")?;
+    }
+    let before_query = snapshot(root.path());
+    let result = native_batch(&reader);
+    assert_engine(&result, SemanticShardEngine::NativeAnn);
+    assert_eq!(first_id(&result), 1);
+    assert_eq!(result.selection().pointer(), &pointer);
+    assert_eq!(snapshot(root.path()), before_query);
+    drop(reader);
+    assert!(weak.upgrade().is_some(), "result batch must own its original vectors");
+    drop(result);
+    assert!(weak.upgrade().is_none());
+    Ok(())
+}
+
+#[test]
+fn native_progressive_search_is_lazy_and_quality_retrieves_independent_candidates() -> TestResult {
+    struct Counter(AtomicUsize);
+    impl SearchFilter for Counter {
+        fn matches(&self, _: &str, _: Option<&serde_json::Value>) -> bool { self.0.fetch_add(1, Ordering::SeqCst); true }
+        fn name(&self) -> &str { "native-progressive-counter" }
+    }
+    let root = tempfile::tempdir()?;
+    let mut m = fixture(root.path(), "gen-native-progressive", 1, Some(B), Some(A));
+    attach_native_graph(root.path(), &mut m, SemanticArtifactRole::FastVector, 1);
+    attach_native_graph(root.path(), &mut m, SemanticArtifactRole::QualityVector, 1);
+    select(root.path(), &m, None);
+    let reader = open(root.path(), &m).with_ann(AnnAdmissionBudget::default())?;
+    let q = TieredQueryEmbeddings::progressive(query(SemanticArtifactRole::FastVector), query(SemanticArtifactRole::QualityVector));
+    let active = reader.activate(&q)?;
+    let counter = Counter(AtomicUsize::new(0));
+    let mut phases = active.progressive_with_ann(1, Some(&counter), native_policy())?;
+    assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+    let initial = phases.next().unwrap()?;
+    assert_eq!(first_id(&initial), 2);
+    assert_eq!(initial.batch().execution().len(), 1);
+    assert_eq!(initial.batch().execution()[0].tier, TierKind::Fast);
+    assert!(initial.batch().coverage().quality.is_none());
+    assert_engine(&initial, SemanticShardEngine::NativeAnn);
+    let after_fast = counter.0.load(Ordering::SeqCst);
+    let refined = phases.next().unwrap()?;
+    assert_eq!(first_id(&refined), 1);
+    assert_engine(&refined, SemanticShardEngine::NativeAnn);
+    assert_eq!(refined.batch().coverage().phase, SemanticResultPhase::Refined);
+    assert!(counter.0.load(Ordering::SeqCst) > after_fast);
+    assert!(Arc::ptr_eq(&initial.identity, &refined.identity));
+    assert!(phases.next().is_none());
+    let mut early = active.progressive_with_ann(1, Some(&counter), native_policy())?;
+    let _ = early.next().unwrap()?;
+    let before_drop = counter.0.load(Ordering::SeqCst);
+    drop(early);
+    assert_eq!(counter.0.load(Ordering::SeqCst), before_drop);
+    Ok(())
+}
+
+#[test]
+fn corrupt_quality_receipt_preserves_fast_ann_and_independent_exact_quality() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let mut m = fixture(root.path(), "gen-quality-fallback", 1, Some(B), Some(A));
+    attach_native_graph(root.path(), &mut m, SemanticArtifactRole::FastVector, 1);
+    attach_native_graph(root.path(), &mut m, SemanticArtifactRole::QualityVector, 1);
+    select(root.path(), &m, None);
+    let graph = m.generation_dir(root.path())?.join(&m.artifact(SemanticArtifactRole::QualityAnn).unwrap().relative_path);
+    fs::write(native_hnsw_generation_receipt_path(&graph)?, b"invalid receipt")?;
+    let reader = open(root.path(), &m).with_ann(AnnAdmissionBudget::default())?;
+    let q = TieredQueryEmbeddings::progressive(query(SemanticArtifactRole::FastVector), query(SemanticArtifactRole::QualityVector));
+    let active = reader.activate(&q)?;
+    let mut phases = active.progressive_with_ann(1, None, native_policy())?;
+    let initial = phases.next().unwrap()?;
+    assert_eq!(first_id(&initial), 2);
+    assert_engine(&initial, SemanticShardEngine::NativeAnn);
+    let refined = phases.next().unwrap()?;
+    assert_eq!(first_id(&refined), 1);
+    let execution = refined.batch().execution();
+    assert_eq!(execution[0].engine, SemanticShardEngine::NativeAnn);
+    assert_eq!(execution[1].engine, SemanticShardEngine::ExactFallback);
+    assert_eq!(execution[1].fallback_reason, Some(AnnFallbackReason::SidecarUnavailable));
+    Ok(())
+}
+
+#[test]
+fn native_ann_refresh_reloads_only_the_successor_and_opt_out_preserves_old_readers() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let mut a = fixture(root.path(), "gen-ann-a", 10, Some(A), None);
+    let mut b = fixture(root.path(), "gen-ann-b", 20, Some(B), None);
+    attach_native_graph(root.path(), &mut a, SemanticArtifactRole::FastVector, 10);
+    attach_native_graph(root.path(), &mut b, SemanticArtifactRole::FastVector, 20);
+    let first = select(root.path(), &a, None);
+    let mut reader = open(root.path(), &a).with_ann(AnnAdmissionBudget::default())?;
+    let old_reader = reader.clone();
+    let old_batch = native_batch(&reader);
+    let second = select(root.path(), &b, Some(&first));
+    assert!(reader.refresh_current(&b.corpus, SemanticSelectionBudget::default())?);
+    let new_batch = native_batch(&reader);
+    assert_engine(&new_batch, SemanticShardEngine::NativeAnn);
+    assert_eq!(first_id(&new_batch), 2);
+    assert_eq!(new_batch.selection().pointer(), &second);
+    assert_eq!(first_id(&native_batch(&old_reader)), 1);
+    assert_eq!(old_batch.selection().pointer(), &first);
+    assert!(!reader.refresh_current(&b.corpus, SemanticSelectionBudget::default())?);
+    let mut opted_out = reader.without_ann();
+    let rollback = select(root.path(), &a, Some(&second));
+    assert!(opted_out.refresh_current(&a.corpus, SemanticSelectionBudget::default())?);
+    let batch = native_batch(&opted_out);
+    assert_eq!(batch.selection().pointer(), &rollback);
+    assert_engine(&batch, SemanticShardEngine::ExactFallback);
+    assert_eq!(batch.batch().execution()[0].fallback_reason, Some(AnnFallbackReason::NotSelected));
+    assert_engine(&native_batch(&old_reader), SemanticShardEngine::NativeAnn);
+    Ok(())
+}
+
+#[test]
+fn native_ann_refresh_keeps_the_original_graph_byte_budget() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let mut a = fixture(root.path(), "gen-small-ann", 1, Some(A), None);
+    let extra = [A[0], A[1], (3, [1.0, 0.0, 0.0, 0.0], false)];
+    let mut b = fixture(root.path(), "gen-larger-ann", 2, Some(&extra), None);
+    let small = attach_native_graph(root.path(), &mut a, SemanticArtifactRole::FastVector, 1);
+    let large = attach_native_graph(root.path(), &mut b, SemanticArtifactRole::FastVector, 2);
+    assert!(large.graph_byte_len > small.graph_byte_len);
+    let first = select(root.path(), &a, None);
+    let mut reader = open(root.path(), &a).with_ann(AnnAdmissionBudget { max_declared_graph_bytes: small.graph_byte_len })?;
+    assert_engine(&native_batch(&reader), SemanticShardEngine::NativeAnn);
+    select(root.path(), &b, Some(&first));
+    assert!(reader.refresh_current(&b.corpus, SemanticSelectionBudget::default())?);
+    let batch = native_batch(&reader);
+    assert_engine(&batch, SemanticShardEngine::ExactFallback);
+    assert_eq!(batch.batch().execution()[0].fallback_reason, Some(AnnFallbackReason::AdmissionBudget));
+    assert_eq!(first_id(&batch), 1);
+    Ok(())
+}
+
+#[test]
+fn quality_only_native_ann_never_requires_or_fabricates_a_fast_tier() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let mut m = fixture(root.path(), "gen-quality-native", 1, None, Some(B));
+    attach_native_graph(root.path(), &mut m, SemanticArtifactRole::QualityVector, 1);
+    select(root.path(), &m, None);
+    let reader = open(root.path(), &m).with_ann(AnnAdmissionBudget::default())?;
+    assert_eq!(reader.ann_admission(TierKind::Fast), None);
+    let q = TieredQueryEmbeddings::quality_only(query(SemanticArtifactRole::QualityVector));
+    let active = reader.activate(&q)?;
+    let batch = active.search_with_ann(1, None, native_policy())?;
+    assert_eq!(first_id(&batch), 2);
+    assert_engine(&batch, SemanticShardEngine::NativeAnn);
+    assert!(batch.batch().coverage().fast.is_none());
+    assert!(active.progressive_with_ann(1, None, native_policy()).is_err());
+    Ok(())
+}
+
+#[test]
+fn native_filtered_underfill_and_huge_limits_use_exact_while_zero_skips_work() -> TestResult {
+    struct OnlySecond;
+    impl SearchFilter for OnlySecond {
+        fn matches(&self, id: &str, _: Option<&serde_json::Value>) -> bool { id == document(2) }
+        fn name(&self) -> &str { "only-second" }
+    }
+    let root = tempfile::tempdir()?;
+    let mut m = fixture(root.path(), "gen-native-limits", 1, Some(A), None);
+    attach_native_graph(root.path(), &mut m, SemanticArtifactRole::FastVector, 1);
+    select(root.path(), &m, None);
+    let reader = open(root.path(), &m).with_ann(AnnAdmissionBudget::default())?;
+    let q = queries();
+    let active = reader.activate(&q)?;
+    let narrow = AnnSearchPolicy { initial_candidates: 1, max_candidates: 1 };
+    let filtered = active.search_with_ann(1, Some(&OnlySecond), narrow)?;
+    assert_engine(&filtered, SemanticShardEngine::ExactFallback);
+    assert_eq!(first_id(&filtered), 2);
+    assert_eq!(filtered.batch().execution()[0].fallback_reason, Some(AnnFallbackReason::FilterUnderfill));
+    let huge = active.search_with_ann(usize::MAX, None, narrow)?;
+    assert_eq!(huge.batch().hits().len(), 2);
+    assert_eq!(huge.batch().execution()[0].fallback_reason, Some(AnnFallbackReason::CandidateLimit));
+    let zero = active.search_with_ann(0, None, native_policy())?;
+    assert!(zero.batch().hits().is_empty());
+    assert_engine(&zero, SemanticShardEngine::Skipped);
+    assert_eq!(zero.batch().execution()[0].ann_windows, 0);
+    assert!(active.search_with_ann(0, None, AnnSearchPolicy { initial_candidates: 0, max_candidates: 1 }).is_err());
+    Ok(())
+}
+
+#[test]
+fn corrupt_declared_graph_blocks_new_selection_but_does_not_destroy_retained_results() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let mut m = fixture(root.path(), "gen-ann-corrupt", 1, Some(A), None);
+    attach_native_graph(root.path(), &mut m, SemanticArtifactRole::FastVector, 1);
+    select(root.path(), &m, None);
+    let reader = open(root.path(), &m).with_ann(AnnAdmissionBudget::default())?;
+    let graph = m.generation_dir(root.path())?.join(&m.artifact(SemanticArtifactRole::FastAnn).unwrap().relative_path);
+    let mut bytes = fs::read(&graph)?;
+    *bytes.last_mut().unwrap() ^= 1;
+    fs::write(&graph, bytes)?;
+    let before = snapshot(root.path());
+    assert!(matches!(SelectedSemanticGeneration::open_current(root.path(), &m.corpus, SemanticSelectionBudget::default()),
+        Err(SemanticSelectionError::Publication(SemanticGenerationError::ArtifactDigestMismatch { role: SemanticArtifactRole::FastAnn, .. }))));
+    assert_engine(&native_batch(&reader), SemanticShardEngine::NativeAnn);
+    assert_eq!(first_id(&native_batch(&reader)), 1);
+    assert_eq!(snapshot(root.path()), before);
+    Ok(())
+}
