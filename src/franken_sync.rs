@@ -330,7 +330,11 @@ pub mod compat {
         where
             F: FnOnce(&Row) -> Result<T, FrankenError>;
 
-        /// Execute a query and collect all rows into a `Vec<T>` via `f`.
+        /// Stream rows through `f` and collect the mapped values.
+        ///
+        /// The facade does not retain a second `Vec<Row>` containing every
+        /// original text/blob payload. The returned `Vec<T>` and any buffers
+        /// required by the engine's query plan still consume memory.
         fn query_map_collect<T, F>(
             &self,
             sql: &str,
@@ -371,11 +375,11 @@ pub mod compat {
             F: FnMut(&Row) -> Result<T, FrankenError>,
         {
             let values = param_slice_to_values(params);
-            let rows = self.query_with_params(sql, &values)?;
-            let mut mapped = Vec::with_capacity(rows.len());
-            for row in &rows {
+            let mut mapped = Vec::new();
+            self.query_with_params_for_each(sql, &values, |row| {
                 mapped.push(f(row)?);
-            }
+                Ok(())
+            })?;
             Ok(mapped)
         }
 
@@ -722,6 +726,92 @@ mod tests {
             !conn.as_async().in_transaction(),
             "ROLLBACK left transaction marked open",
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn mapped_query_streams_through_the_bridge_and_preserves_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::compat::{ConnectionExt, ParamValue};
+
+        let conn = Connection::open(":memory:")?;
+        conn.execute_batch(
+            "CREATE TABLE mapped_rows (id INTEGER PRIMARY KEY, body TEXT); \
+             INSERT INTO mapped_rows VALUES (1, 'first'), (2, 'second'), (3, 'third');",
+        )?;
+        let values = conn.query_map_collect(
+            "SELECT id, body FROM mapped_rows WHERE id >= ?1 ORDER BY id DESC",
+            &[ParamValue::from(2_i64)],
+            |row| {
+                // The old collect-then-map path ran this outside drive().
+                // This is also a regression for nested bridge ownership.
+                let context = Cx::current().expect("streaming row callback context");
+                let nested = Connection::open(":memory:")?;
+                let extra = nested.query_row("SELECT 10")?.get_typed::<i64>(0)?;
+                nested.close()?;
+                let restored = Cx::current().expect("restored row callback context");
+                assert_eq!(restored.task_id(), context.task_id());
+                assert_eq!(restored.region_id(), context.region_id());
+                Ok((row.get_typed::<i64>(0)? + extra, row.get_typed::<String>(1)?))
+            },
+        )?;
+        assert_eq!(values, vec![(13, "third".into()), (12, "second".into())]);
+        Ok(())
+    }
+
+    #[test]
+    fn mapped_query_error_stops_callbacks_without_replay_or_partial_success()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::compat::ConnectionExt;
+
+        let conn = Connection::open(":memory:")?;
+        conn.execute_batch(
+            "CREATE TABLE mapped_errors (id INTEGER PRIMARY KEY); \
+             INSERT INTO mapped_errors VALUES (1), (2), (3);",
+        )?;
+        let mut seen = Vec::new();
+        let result: Result<Vec<i64>, FrankenError> = conn.query_map_collect(
+            "SELECT id FROM mapped_errors ORDER BY id",
+            &[],
+            |row| {
+                let id = row.get_typed::<i64>(0)?;
+                seen.push(id);
+                if id == 2 {
+                    return Err(FrankenError::BusyRecovery);
+                }
+                Ok(id)
+            },
+        );
+        assert!(matches!(result, Err(FrankenError::BusyRecovery)));
+        assert_eq!(seen, vec![1, 2]);
+        let recovered: Vec<i64> = conn.query_map_collect(
+            "SELECT id FROM mapped_errors ORDER BY id",
+            &[],
+            |row| row.get_typed(0),
+        )?;
+        assert_eq!(recovered, vec![1, 2, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn mapped_query_empty_and_engine_error_do_not_invoke_mapper()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::compat::ConnectionExt;
+
+        let conn = Connection::open(":memory:")?;
+        let mut calls = 0;
+        let empty: Vec<i64> = conn.query_map_collect("SELECT 1 WHERE 0", &[], |row| {
+            calls += 1;
+            row.get_typed(0)
+        })?;
+        assert!(empty.is_empty());
+        let missing: Result<Vec<i64>, FrankenError> =
+            conn.query_map_collect("SELECT id FROM missing_mapped_table", &[], |row| {
+                calls += 1;
+                row.get_typed(0)
+            });
+        assert!(matches!(missing, Err(FrankenError::NoSuchTable { .. })));
+        assert_eq!(calls, 0);
         Ok(())
     }
 }
