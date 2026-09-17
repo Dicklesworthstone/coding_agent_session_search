@@ -4,16 +4,17 @@
 //! Adapted from xf's async worker to cass's sync daemon architecture.
 
 mod embedding_source;
+mod work_queue;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use tracing::{debug, error, info, warn};
 
 use self::embedding_source::{EmbeddingMessageSource, SqliteEmbeddingSource};
+use self::work_queue::{JobControl, Receiver, Sender};
 use crate::indexer::semantic::{
     EmbeddingInput, SemanticIndexer, expected_vector_space_revision, message_id_from_db,
     saturating_u32_from_i64, semantic_doc_id_for_input,
@@ -83,9 +84,7 @@ pub enum WorkerMessage {
     Shutdown,
 }
 
-/// The (db_path, model) pass the worker thread is currently embedding, used
-/// by the handle to decide whether a cancel targets the running job or only
-/// needs database-level cleanup.
+/// The (db_path, model) pass the worker thread is currently embedding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunningEmbeddingPass {
     db_path: String,
@@ -103,56 +102,29 @@ impl Drop for RunningPassReset<'_> {
     }
 }
 
-/// Handle for sending messages to the background worker.
+/// Handle for admitting bounded jobs and issuing job-scoped cancellation.
 #[derive(Clone)]
 pub struct EmbeddingWorkerHandle {
-    sender: Sender<WorkerMessage>,
-    /// Shared cancel flag — set directly from the handle so cancellation
-    /// takes effect even while `process_job` is running on the worker thread.
+    sender: Sender,
     cancel_flag: Arc<AtomicBool>,
-    /// Shutdown is permanent and cannot be cleared by starting a queued job.
     shutdown_requested: Arc<AtomicBool>,
-    /// The pass currently running on the worker thread, if any.
-    running_pass: Arc<Mutex<Option<RunningEmbeddingPass>>>,
 }
 
 impl EmbeddingWorkerHandle {
-    /// Submit an embedding job to the worker.
+    /// Admit a job without waiting for queue space. Identical pending requests
+    /// coalesce; full queues return a retryable admission failure to the daemon.
     pub fn submit(&self, config: EmbeddingJobConfig) -> Result<(), String> {
         if self.shutdown_requested.load(Ordering::SeqCst) {
             return Err("embedding worker is shutting down".to_string());
         }
-        self.sender
-            .send(WorkerMessage::Submit(config))
-            .map_err(|e| format!("worker channel closed: {e}"))
+        self.sender.send(WorkerMessage::Submit(config))
     }
 
-    /// Cancel embedding jobs for a db_path.
-    ///
-    /// Sets the cancel flag directly — but only when the worker is currently
-    /// running a pass for that `db_path` (and `model_id`, when given) — so a
-    /// cancel aimed at one data dir can never abort another client's job.
-    /// Always sends a Cancel message for database-level cleanup.
+    /// Cancel matching passes in already-admitted jobs. The mailbox registers
+    /// active ownership at dequeue, so cancellation cannot miss the interval
+    /// before archive admission. Later submissions receive fresh tokens.
     pub fn cancel(&self, db_path: String, model_id: Option<String>) -> Result<(), String> {
-        // Keep the identity lock until the flag is set: copying the identity
-        // then releasing the lock could cancel a subsequent, unrelated pass.
-        {
-            let guard = self
-                .running_pass
-                .lock()
-                .map_err(|_| "embedding worker state lock poisoned".to_string())?;
-            if guard.as_ref().is_some_and(|running| {
-                running.db_path == db_path
-                    && model_id
-                        .as_deref()
-                        .is_none_or(|model| running.model == model)
-            }) {
-                self.cancel_flag.store(true, Ordering::SeqCst);
-            }
-        }
-        self.sender
-            .send(WorkerMessage::Cancel { db_path, model_id })
-            .map_err(|e| format!("worker channel closed: {e}"))
+        self.sender.send(WorkerMessage::Cancel { db_path, model_id })
     }
 
     /// Request cooperative shutdown immediately, not after queued jobs finish.
@@ -161,18 +133,17 @@ impl EmbeddingWorkerHandle {
     pub fn shutdown(&self) -> Result<(), String> {
         self.shutdown_requested.store(true, Ordering::SeqCst);
         self.cancel_flag.store(true, Ordering::SeqCst);
-        self.sender
-            .send(WorkerMessage::Shutdown)
-            .map_err(|e| format!("worker channel closed: {e}"))
+        self.sender.send(WorkerMessage::Shutdown)
     }
 }
 
 /// Background embedding worker that processes jobs on a dedicated thread.
 pub struct EmbeddingWorker {
-    receiver: Receiver<WorkerMessage>,
+    receiver: Receiver,
     cancel_flag: Arc<AtomicBool>,
     shutdown_requested: Arc<AtomicBool>,
     running_pass: Arc<Mutex<Option<RunningEmbeddingPass>>>,
+    active_control: Mutex<Option<JobControl>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -278,7 +249,7 @@ fn canonical_message_inputs(
 impl EmbeddingWorker {
     /// Create a new worker and its handle.
     pub fn new() -> (Self, EmbeddingWorkerHandle) {
-        let (sender, receiver) = std::sync::mpsc::channel();
+        let (sender, receiver) = work_queue::channel();
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let shutdown_requested = Arc::new(AtomicBool::new(false));
         let running_pass = Arc::new(Mutex::new(None));
@@ -286,20 +257,47 @@ impl EmbeddingWorker {
             sender,
             cancel_flag: Arc::clone(&cancel_flag),
             shutdown_requested: Arc::clone(&shutdown_requested),
-            running_pass: Arc::clone(&running_pass),
         };
         let worker = Self {
             receiver,
             cancel_flag,
             shutdown_requested,
             running_pass,
+            active_control: Mutex::new(None),
         };
         (worker, handle)
     }
 
-    fn is_cancelled(&self) -> bool {
+    fn is_stopping(&self) -> bool {
         self.cancel_flag.load(Ordering::SeqCst)
             || self.shutdown_requested.load(Ordering::SeqCst)
+    }
+
+    fn pass_was_cancelled(&self, model: &str) -> bool {
+        self.active_control
+            .lock()
+            .map(|control| control.as_ref().is_some_and(|control| control.is_cancelled(model)))
+            .unwrap_or(true)
+    }
+
+    fn all_passes_cancelled(&self) -> bool {
+        self.active_control
+            .lock()
+            .map(|control| control.as_ref().is_some_and(JobControl::all_cancelled))
+            .unwrap_or(true)
+    }
+
+    fn is_cancelled(&self) -> bool {
+        if self.is_stopping() {
+            return true;
+        }
+        match self.running_pass.lock() {
+            Ok(pass) => match pass.as_ref() {
+                Some(pass) => self.pass_was_cancelled(&pass.model),
+                None => self.all_passes_cancelled(),
+            },
+            Err(_) => true,
+        }
     }
 
     fn set_running_pass(&self, db_path: &str, model: &str) -> anyhow::Result<()> {
@@ -317,23 +315,37 @@ impl EmbeddingWorker {
     /// Run the worker loop (blocking). Call from a spawned thread.
     pub fn run(self) {
         info!("Embedding worker started");
-        while let Ok(msg) = self.receiver.recv() {
+        while let Ok((msg, permit)) = self.receiver.recv() {
             if self.shutdown_requested.load(Ordering::SeqCst) {
                 break;
             }
             match msg {
                 WorkerMessage::Submit(config) => {
+                    let Some(permit) = permit.as_ref() else {
+                        error!("embedding submission has no job ownership permit");
+                        break;
+                    };
+                    match self.active_control.lock() {
+                        Ok(mut control) => *control = Some(permit.control()),
+                        Err(_) => {
+                            error!("embedding worker state lock poisoned");
+                            break;
+                        }
+                    }
                     self.cancel_flag.store(false, Ordering::SeqCst);
                     info!(db_path = %config.db_path, two_tier = config.two_tier, "Processing embedding job");
                     if let Err(e) = self.process_job(&config) {
                         error!(db_path = %config.db_path, error = %e, "Embedding job failed");
                     }
+                    match self.active_control.lock() {
+                        Ok(mut control) => *control = None,
+                        Err(_) => break,
+                    }
                 }
                 WorkerMessage::Cancel { db_path, model_id } => {
-                    // The cancel_flag is already set by the handle (so the running
-                    // job sees it immediately). This handler performs DB cleanup.
-                    info!(%db_path, ?model_id, "Processing cancel — flag already set by handle");
-                    // Cancel in the database
+                    // The queue already cancelled in-memory ownership. Process
+                    // durable cleanup before any newer submission can start.
+                    info!(%db_path, ?model_id, "Processing embedding cancellation cleanup");
                     if let Err(e) = Self::cancel_in_db(&db_path, model_id.as_deref()) {
                         warn!(%db_path, error = %e, "Failed to cancel jobs in database");
                     }
@@ -347,30 +359,41 @@ impl EmbeddingWorker {
         info!("Embedding worker stopped");
     }
 
-    /// Cancel jobs in the database.
+    /// Cancel persisted jobs without creating an archive for an absent target.
     fn cancel_in_db(db_path: &str, model_id: Option<&str>) -> anyhow::Result<()> {
+        match std::fs::metadata(db_path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => anyhow::bail!("embedding cancellation target is not a regular file"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
         let storage = FrankenStorage::open(Path::new(db_path))?;
         storage.cancel_embedding_jobs(db_path, model_id)?;
         Ok(())
     }
 
-    /// Process a single embedding job.
+    /// Process a single embedding job. A model-specific cancellation skips only
+    /// that pass, including a future tier of a currently active two-tier job.
     fn process_job(&self, config: &EmbeddingJobConfig) -> anyhow::Result<()> {
-        if self.is_cancelled() {
+        if self.is_stopping() || self.all_passes_cancelled() {
             return Ok(());
         }
         let db_path = Path::new(&config.db_path);
         let index_path = Path::new(&config.index_path);
         let passes = self.build_passes(config);
-        let Some((first_model, _)) = passes.first() else {
+        let Some((first_model, _)) = passes
+            .iter()
+            .find(|(model, _)| !self.pass_was_cancelled(model))
+        else {
             return Ok(());
         };
-        // Register before opening/scanning so a matching cancel also reaches
-        // archive admission, not only the later native embedding loop.
         self.set_running_pass(&config.db_path, first_model)?;
         let _running_reset = RunningPassReset(&self.running_pass);
+        if self.is_stopping() || self.all_passes_cancelled() {
+            return Ok(());
+        }
         let storage = FrankenStorage::open(db_path)?;
-        if self.is_cancelled() {
+        if self.is_stopping() || self.all_passes_cancelled() {
             return Ok(());
         }
         let messages = SqliteEmbeddingSource::open(db_path)?;
@@ -383,10 +406,13 @@ impl EmbeddingWorker {
         );
 
         for (model_name, use_semantic) in &passes {
-            self.set_running_pass(&config.db_path, model_name)?;
-            if self.is_cancelled() {
-                info!("Embedding job cancelled");
+            if self.is_stopping() {
                 return Ok(());
+            }
+            self.set_running_pass(&config.db_path, model_name)?;
+            if self.pass_was_cancelled(model_name) {
+                info!(model = model_name, "Skipping cancelled embedding pass");
+                continue;
             }
             let job_id = storage.upsert_embedding_job(&config.db_path, model_name, total_docs)?;
             storage.start_embedding_job(job_id)?;
@@ -407,7 +433,8 @@ impl EmbeddingWorker {
                 Ok(EmbeddingPassOutcome::Cancelled) => {
                     storage.cancel_embedding_jobs(&config.db_path, Some(model_name))?;
                     info!(model = model_name, "Embedding pass cancelled");
-                    return Ok(());
+                    // A different tier remains eligible unless the whole job
+                    // was cancelled or shutdown was requested.
                 }
                 Err(e) => {
                     let err_msg = format!("{e:#}");
@@ -737,41 +764,21 @@ mod tests {
     #[test]
     fn cancel_only_flags_matching_running_pass() {
         let (worker, handle) = EmbeddingWorker::new();
-        if let Ok(mut guard) = worker.running_pass.lock() {
-            *guard = Some(RunningEmbeddingPass {
-                db_path: "/data/a.db".to_string(),
-                model: "minilm".to_string(),
-            });
-        }
+        let mut config = build_pass_config(true, Some("hash"), Some("minilm"));
+        config.db_path = "/data/a.db".into();
+        config.index_path = "/data/index".into();
+        handle.submit(config).unwrap();
+        let (_, permit) = worker.receiver.recv().unwrap();
+        *worker.active_control.lock().unwrap() = Some(permit.as_ref().unwrap().control());
+        worker.set_running_pass("/data/a.db", "minilm").unwrap();
 
-        // Different db_path: must not abort the running job.
         assert!(handle.cancel("/data/b.db".to_string(), None).is_ok());
-        assert!(
-            !worker.cancel_flag.load(Ordering::SeqCst),
-            "cancel for another db_path must not flag the running job"
-        );
-
-        // Same db_path but different model: must not abort the running pass.
-        assert!(
-            handle
-                .cancel("/data/a.db".to_string(), Some("hash".to_string()))
-                .is_ok()
-        );
-        assert!(
-            !worker.cancel_flag.load(Ordering::SeqCst),
-            "cancel for another model must not flag the running pass"
-        );
-
-        // Matching target: flags the running job.
-        assert!(
-            handle
-                .cancel("/data/a.db".to_string(), Some("minilm".to_string()))
-                .is_ok()
-        );
-        assert!(
-            worker.cancel_flag.load(Ordering::SeqCst),
-            "cancel matching the running pass must set the flag"
-        );
+        assert!(!worker.is_cancelled(), "another archive must not cancel the running job");
+        assert!(handle.cancel("/data/a.db".to_string(), Some("hash".to_string())).is_ok());
+        assert!(!worker.is_cancelled(), "another model must not cancel the running pass");
+        assert!(handle.cancel("/data/a.db".to_string(), Some("minilm".to_string())).is_ok());
+        assert!(worker.is_cancelled(), "the matching model must cancel the running pass");
+        drop(permit);
     }
 
     #[test]
@@ -1377,6 +1384,54 @@ mod tests {
         )?, EmbeddingPassOutcome::Cancelled);
         assert_eq!(source.visits.get(), 2);
         assert_eq!(std::fs::read(&path)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn queued_cancellation_does_not_create_a_database_or_index() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let config = EmbeddingJobConfig {
+            db_path: temp.path().join("absent.db").to_string_lossy().into_owned(),
+            index_path: temp.path().join("absent-index").to_string_lossy().into_owned(),
+            two_tier: true,
+            fast_model: Some("hash".into()),
+            quality_model: Some("minilm".into()),
+        };
+        let (worker, handle) = EmbeddingWorker::new();
+        handle.submit(config.clone()).map_err(anyhow::Error::msg)?;
+        handle.cancel(config.db_path.clone(), None).map_err(anyhow::Error::msg)?;
+        drop(handle);
+        worker.run();
+        assert!(!Path::new(&config.db_path).exists());
+        assert!(!Path::new(&config.index_path).exists());
+        assert_eq!(std::fs::read_dir(temp.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn queued_tier_cancellation_still_executes_the_other_empty_archive_pass() -> anyhow::Result<()> {
+        for (cancelled_model, remaining_model) in [("hash", "minilm"), ("minilm", "hash")] {
+            let temp = tempfile::tempdir()?;
+            let db_path = temp.path().join("archive.db");
+            let storage = FrankenStorage::open(&db_path)?;
+            let config = EmbeddingJobConfig {
+                db_path: db_path.to_string_lossy().into_owned(),
+                index_path: temp.path().join("index").to_string_lossy().into_owned(),
+                two_tier: true,
+                fast_model: Some("hash".into()),
+                quality_model: Some("minilm".into()),
+            };
+            let (worker, handle) = EmbeddingWorker::new();
+            handle.submit(config.clone()).map_err(anyhow::Error::msg)?;
+            handle.cancel(config.db_path.clone(), Some(cancelled_model.into())).map_err(anyhow::Error::msg)?;
+            drop(handle);
+            worker.run();
+            let jobs = storage.get_embedding_jobs(&config.db_path)?;
+            assert_eq!(jobs.len(), 1, "only the uncancelled tier should start");
+            assert_eq!(jobs[0].model_id, remaining_model);
+            assert_eq!(jobs[0].status, "completed");
+            assert_eq!(jobs[0].total_docs, 0);
+        }
         Ok(())
     }
 }
