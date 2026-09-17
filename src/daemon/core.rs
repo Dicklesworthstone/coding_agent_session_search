@@ -3,6 +3,8 @@
 //! This module provides the server that listens on a Unix Domain Socket
 //! and handles embedding/reranking requests using loaded models.
 
+mod job_requests;
+
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -23,7 +25,7 @@ use tracing::{debug, error, info, warn};
 
 use super::models::ModelManager;
 use super::protocol::{
-    EmbedResponse, EmbeddingJobDetail, EmbeddingJobInfo, ErrorCode, ErrorResponse, FramedMessage,
+    EmbedResponse, ErrorCode, ErrorResponse, FramedMessage,
     HealthStatus, ModelInfo, PROTOCOL_VERSION, Request, RerankResponse, Response, StatusResponse,
     decode_message, default_socket_path, encode_message,
 };
@@ -379,6 +381,7 @@ pub struct ModelDaemon {
     last_activity: RwLock<Instant>,
     attestation: RwLock<Option<DaemonAttestationState>>,
     worker_handle: parking_lot::Mutex<Option<EmbeddingWorkerHandle>>,
+    worker_thread: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl ModelDaemon {
@@ -395,6 +398,7 @@ impl ModelDaemon {
             last_activity: RwLock::new(Instant::now()),
             attestation: RwLock::new(None),
             worker_handle: parking_lot::Mutex::new(None),
+            worker_thread: parking_lot::Mutex::new(None),
         }
     }
 
@@ -498,15 +502,20 @@ impl ModelDaemon {
         memory_bytes > self.config.memory_limit
     }
 
-    /// Initialize the background embedding worker thread.
+    /// Initialize exactly one owned background embedding worker thread.
     fn init_worker(&self) {
+        let mut current = self.worker_handle.lock();
+        if current.is_some() || self.shutdown.load(Ordering::SeqCst) {
+            return;
+        }
         let (worker, handle) = EmbeddingWorker::new();
         match std::thread::Builder::new()
             .name("embedding-worker".into())
             .spawn(move || worker.run())
         {
-            Ok(_) => {
-                *self.worker_handle.lock() = Some(handle);
+            Ok(thread) => {
+                *self.worker_thread.lock() = Some(thread);
+                *current = Some(handle);
                 info!("Embedding worker initialized");
             }
             Err(e) => {
@@ -517,6 +526,23 @@ impl ModelDaemon {
                 // Continue without worker - daemon can still handle other requests
             }
         }
+    }
+
+    /// Signal first, then join without holding either ownership mutex. The
+    /// worker may finish an in-flight native batch; there is no hard-kill
+    /// deadline. Returning from run must not leave a detached archive writer.
+    fn finish_worker(&self) -> std::io::Result<()> {
+        let worker_handle = self.worker_handle.lock().take();
+        if let Some(handle) = worker_handle
+            && let Err(e) = handle.shutdown()
+        {
+            warn!(error = %e, "Embedding worker was already disconnected during shutdown");
+        }
+        let thread = self.worker_thread.lock().take();
+        if let Some(thread) = thread {
+            thread.join().map_err(|_| std::io::Error::other("embedding worker panicked"))?;
+        }
+        Ok(())
     }
 
     /// Start the daemon server.
@@ -707,21 +733,18 @@ impl ModelDaemon {
                     }
                 }
             }
+            // Idle and memory-limit exits must cancel socket reads and the
+            // embedding worker before the scope joins connection handlers.
+            self.request_shutdown();
         });
 
-        // Shutdown embedding worker
-        let worker_handle = self.worker_handle.lock().take();
-        if let Some(handle) = worker_handle
-            && let Err(e) = handle.shutdown()
-        {
-            warn!(error = %e, "Failed to send shutdown to embedding worker");
-        }
+        let worker_result = self.finish_worker();
 
-        // Cleanup
+        // Cleanup only after the owned worker has stopped writing.
         cleanup_bound_socket(&public_path, &bind_path);
 
         info!("Daemon stopped");
-        Ok(())
+        worker_result
     }
 
     fn read_frame_bytes_with_shutdown(
@@ -1103,98 +1126,19 @@ impl ModelDaemon {
                     quality_model,
                 };
                 let worker_handle = self.worker_handle.lock().clone();
-                match worker_handle {
-                    Some(handle) => match handle.submit(config) {
-                        Ok(()) => Response::JobSubmitted {
-                            job_id: request_id.clone(),
-                            message: "embedding job submitted".to_string(),
-                        },
-                        Err(e) => Response::Error(ErrorResponse {
-                            code: ErrorCode::Internal,
-                            message: format!("failed to submit job: {e}"),
-                            retryable: true,
-                            retry_after_ms: Some(1000),
-                        }),
-                    },
-                    None => Response::Error(ErrorResponse {
-                        code: ErrorCode::Internal,
-                        message: "embedding worker not initialized".to_string(),
-                        retryable: true,
-                        retry_after_ms: Some(1000),
-                    }),
-                }
+                job_requests::submit(config, &request_id, worker_handle.as_ref())
             }
 
-            Request::EmbeddingJobStatus { db_path } => {
-                match crate::storage::sqlite::FrankenStorage::open(std::path::Path::new(&db_path)) {
-                    Ok(storage) => match storage.get_embedding_jobs(&db_path) {
-                        Ok(rows) => {
-                            let jobs = rows
-                                .into_iter()
-                                .map(|r| EmbeddingJobDetail {
-                                    job_id: r.id,
-                                    model_id: r.model_id,
-                                    status: r.status,
-                                    total_docs: r.total_docs,
-                                    completed_docs: r.completed_docs,
-                                    error_message: r.error_message,
-                                })
-                                .collect();
-                            Response::JobStatus(EmbeddingJobInfo { jobs })
-                        }
-                        Err(e) => Response::Error(ErrorResponse {
-                            code: ErrorCode::Internal,
-                            message: format!("failed to query jobs: {e}"),
-                            retryable: false,
-                            retry_after_ms: None,
-                        }),
-                    },
-                    Err(e) => Response::Error(ErrorResponse {
-                        code: ErrorCode::Internal,
-                        message: format!("failed to open database: {e}"),
-                        retryable: false,
-                        retry_after_ms: None,
-                    }),
-                }
-            }
+            Request::EmbeddingJobStatus { db_path } => job_requests::status(&db_path),
 
             Request::CancelEmbeddingJob { db_path, model_id } => {
-                // Send cancel to worker
                 let worker_handle = self.worker_handle.lock().clone();
-                if let Some(handle) = worker_handle
-                    && let Err(e) = handle.cancel(db_path.clone(), model_id.clone())
-                {
-                    warn!(error = %e, "Failed to send cancel to embedding worker");
-                }
-
-                // Also cancel in database
-                match crate::storage::sqlite::FrankenStorage::open(std::path::Path::new(&db_path)) {
-                    Ok(storage) => {
-                        match storage.cancel_embedding_jobs(&db_path, model_id.as_deref()) {
-                            Ok(count) => Response::JobCancelled {
-                                cancelled: count,
-                                message: format!("cancelled {count} job(s)"),
-                            },
-                            Err(e) => Response::Error(ErrorResponse {
-                                code: ErrorCode::Internal,
-                                message: format!("failed to cancel jobs: {e}"),
-                                retryable: false,
-                                retry_after_ms: None,
-                            }),
-                        }
-                    }
-                    Err(e) => Response::Error(ErrorResponse {
-                        code: ErrorCode::Internal,
-                        message: format!("failed to open database: {e}"),
-                        retryable: false,
-                        retry_after_ms: None,
-                    }),
-                }
+                job_requests::cancel(db_path, model_id, worker_handle.as_ref())
             }
 
             Request::Shutdown => {
                 info!(request_id = %request_id, "Shutdown requested");
-                self.shutdown.store(true, Ordering::SeqCst);
+                self.request_shutdown();
                 Response::Shutdown {
                     message: "daemon shutting down".to_string(),
                 }
@@ -1202,9 +1146,15 @@ impl ModelDaemon {
         }
     }
 
-    /// Request the daemon to shutdown.
+    /// Request shutdown of both connection handlers and owned embedding work.
     pub fn request_shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        let worker_handle = self.worker_handle.lock().clone();
+        if let Some(handle) = worker_handle
+            && let Err(error) = handle.shutdown()
+        {
+            warn!(error = %error, "Embedding worker shutdown notification failed");
+        }
     }
 }
 
@@ -1766,5 +1716,65 @@ mod tests {
             result.is_ok(),
             "handler must return Ok on shutdown-during-partial-payload; got {result:?}"
         );
+    }
+
+    #[test]
+    fn shutdown_dispatch_reaches_queued_worker_before_it_starts() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let daemon = ModelDaemon::new(DaemonConfig::default(), ModelManager::new(temp.path()));
+        let (worker, handle) = EmbeddingWorker::new();
+        let config = EmbeddingJobConfig {
+            db_path: temp.path().join("absent.db").to_string_lossy().into_owned(),
+            index_path: temp.path().join("index").to_string_lossy().into_owned(),
+            two_tier: false,
+            fast_model: Some("hash".into()),
+            quality_model: None,
+        };
+        handle.submit(config.clone()).map_err(anyhow::Error::msg)?;
+        *daemon.worker_handle.lock() = Some(handle.clone());
+        assert!(matches!(daemon.handle_request("shutdown".into(), Request::Shutdown), Response::Shutdown { .. }));
+        assert!(handle.submit(config.clone()).is_err());
+        worker.run();
+        assert!(!Path::new(&config.db_path).exists());
+        assert!(!Path::new(&config.index_path).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn worker_initialization_has_one_owner_and_shutdown_joins_it() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let daemon = ModelDaemon::new(DaemonConfig::default(), ModelManager::new(temp.path()));
+        daemon.init_worker();
+        let first = daemon.worker_thread.lock().as_ref().map(|thread| thread.thread().id());
+        assert!(first.is_some(), "the worker thread must actually start");
+        daemon.init_worker();
+        let second = daemon.worker_thread.lock().as_ref().map(|thread| thread.thread().id());
+        assert_eq!(first, second);
+        daemon.request_shutdown();
+        daemon.finish_worker()?;
+        assert!(daemon.worker_thread.lock().is_none());
+        assert!(daemon.worker_handle.lock().is_none());
+        daemon.init_worker();
+        assert!(daemon.worker_thread.lock().is_none(), "shutdown cannot resurrect a worker");
+        Ok(())
+    }
+
+    #[test]
+    fn live_job_dispatch_uses_read_only_status_and_cancellation_receipts() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let path = temp.path().join("absent.db").to_string_lossy().into_owned();
+        let daemon = ModelDaemon::new(DaemonConfig::default(), ModelManager::new(temp.path()));
+        let (_worker, handle) = EmbeddingWorker::new();
+        *daemon.worker_handle.lock() = Some(handle);
+        assert!(matches!(daemon.handle_request("status".into(), Request::EmbeddingJobStatus { db_path: path.clone() }), Response::JobStatus(info) if info.jobs.is_empty()));
+        let response = daemon.handle_request("submit".into(), Request::SubmitEmbeddingJob {
+            db_path: path.clone(), index_path: temp.path().join("index").to_string_lossy().into_owned(),
+            two_tier: false, fast_model: Some("hash".into()), quality_model: None,
+        });
+        assert!(matches!(response, Response::JobSubmitted { .. }));
+        let response = daemon.handle_request("cancel".into(), Request::CancelEmbeddingJob { db_path: path.clone(), model_id: None });
+        assert!(matches!(response, Response::JobCancelled { cancelled: 1, message } if message.contains("cleanup is pending")));
+        assert!(!Path::new(&path).exists());
+        Ok(())
     }
 }
