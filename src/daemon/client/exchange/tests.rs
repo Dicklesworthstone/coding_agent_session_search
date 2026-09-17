@@ -337,3 +337,27 @@ fn nonfinite_rerank_scores_cannot_enter_search_results() -> io::Result<()> {
     server.join().unwrap()?;
     Ok(())
 }
+
+#[test]
+fn uncached_availability_probe_timeout_does_not_disable_another_callers_connection() -> io::Result<()> {
+    let (client, peer) = pair(Duration::from_millis(100))?;
+    let client = Arc::new(client);
+    *client.last_health_check.lock() = None;
+    let guard = client.connection.lock();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let waiting = Arc::clone(&client);
+    let waiter = std::thread::spawn(move || { let _ = tx.send(waiting.is_available()); });
+    let result = rx.recv_timeout(Duration::from_secs(2));
+    // Capture the ownership invariant before releasing the simulated active
+    // request. Release both resources even if a regression missed the deadline.
+    let remained_available = client.available.load(Ordering::SeqCst);
+    let cache_remained_empty = client.last_health_check.lock().is_none();
+    drop(guard);
+    drop(peer);
+    waiter.join().unwrap();
+    assert!(matches!(result, Ok(false)), "the waiting probe must report unavailable for this call only");
+    assert!(remained_available, "a probe that never owned the exchange must not disable the shared stream");
+    assert!(cache_remained_empty, "the timed-out probe must not synthesize a health observation");
+    assert!(client.connection.lock().is_some(), "the waiting probe must not clear another caller's stream");
+    Ok(())
+}
