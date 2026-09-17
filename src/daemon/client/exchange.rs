@@ -175,6 +175,7 @@ impl UdsDaemonClient {
                 return Err(DaemonError::Failed(format!("response request ID mismatch: expected {request_id}, got {observed}")));
             }
             validate_response_kind(&message.payload, &response.payload)?;
+            validate_inference_response(self, &message.payload, &response.payload)?;
             if let Response::Health(health) = &response.payload {
                 if health.version != PROTOCOL_VERSION {
                     return Err(DaemonError::Failed("health payload protocol version mismatch".into()));
@@ -201,8 +202,9 @@ impl UdsDaemonClient {
         drop(guard);
         match response {
             Response::Error(error) => {
-                let mut message = error.message.chars().take(1024).collect::<String>();
-                if error.message.chars().count() > 1024 { message.push_str(" [truncated]"); }
+                let mut characters = error.message.chars();
+                let mut message = characters.by_ref().take(1024).collect::<String>();
+                if characters.next().is_some() { message.push_str(" [truncated]"); }
                 Err(match error.code {
                     ErrorCode::Overloaded => DaemonError::Overloaded {
                         retry_after: error.retry_after_ms.map(Duration::from_millis), message,
@@ -235,6 +237,50 @@ fn validate_response_kind(request: &Request, response: &Response) -> Result<(), 
     if valid { Ok(()) } else { Err(DaemonError::Failed("unexpected response type for daemon request".into())) }
 }
 
+
+/// Check raw model outputs while the exchange still owns its socket. Signed
+/// responses get structural binding checks here; authentication with the pinned
+/// local key remains mandatory in the verified fallback wrapper.
+fn validate_inference_response(client: &UdsDaemonClient, request: &Request, response: &Response) -> Result<(), DaemonError> {
+    let invalid = || DaemonError::Failed("daemon inference response has invalid identity, count, dimensions or non-finite values".into());
+    match (request, response) {
+        (Request::Embed { texts, dims, .. }, Response::Embed(output)) => {
+            if output.model.is_empty() || output.model.len() > 256 { return Err(invalid()); }
+            client.validate_embedder_id(&output.model)?;
+            let registered = crate::search::fastembed_embedder::FastEmbedder::config_for(&output.model)
+                .map(|config| config.dimension);
+            if dims.zip(registered).is_some_and(|(requested, actual)| requested != actual) { return Err(invalid()); }
+            let dimension = registered
+                .or(*dims)
+                .or_else(|| output.embeddings.first().map(Vec::len));
+            if output.embeddings.len() != texts.len()
+                || dimension == Some(0)
+                || output.embeddings.iter().any(|vector| Some(vector.len()) != dimension || vector.iter().any(|value| !value.is_finite()))
+            {
+                return Err(invalid());
+            }
+        }
+        (Request::Rerank { documents, .. }, Response::Rerank(output)) => {
+            if output.model.is_empty() || output.model.len() > 256
+                || output.scores.len() != documents.len()
+                || output.scores.iter().any(|score| !score.is_finite())
+            {
+                return Err(invalid());
+            }
+        }
+        (Request::EmbedAttested { challenge, .. } | Request::RerankAttested { challenge, .. }, Response::AttestedEmbedding(output)) => {
+            output.attestation.validate_against(challenge, &output.attestation.connection, &output.vectors)
+                .map_err(|_| DaemonError::UnverifiableRemoteSpace)?;
+        }
+        (Request::HandshakeAttested { challenge } | Request::HealthAttested { challenge }, Response::Attestation(output)) => {
+            output.validate_against(challenge, &output.connection, &[])
+                .map_err(|_| DaemonError::UnverifiableRemoteSpace)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn reap_daemon(child: Child) -> Result<(), DaemonError> {
     // Preserve ownership if thread creation fails, unlike dropping Child in a
     // failed spawn closure. Cleanup only ever targets the child we just made.
@@ -253,3 +299,6 @@ fn reap_daemon(child: Child) -> Result<(), DaemonError> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
