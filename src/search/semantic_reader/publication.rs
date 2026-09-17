@@ -22,6 +22,8 @@ use frankensearch::index::{
     FsviAdmissionError, FsviInspection, FsviV2IdentityBinding, ValidatedFsviBytes, VectorIndex,
 };
 
+use super::ann::{AnnAdmissionBudget, AnnSearchPolicy, SemanticAnnAdmission};
+
 use super::{
     ActivatedSemanticSearch, AdmittedTier, SemanticGenerationReader, SemanticReaderError,
     SemanticReaderResult, SemanticSearchBatch, canonical_document,
@@ -52,7 +54,6 @@ impl Default for SemanticSelectionBudget {
 pub enum SemanticSelectionError {
     #[error(transparent)]
     Publication(#[from] SemanticGenerationError),
-    #[error(transparent)]
     Reader(#[from] SemanticReaderError),
     #[error(transparent)]
     Index(#[from] frankensearch::SearchError),
@@ -102,6 +103,9 @@ pub struct SelectedSemanticGeneration {
     data_dir: PathBuf,
     identity: Arc<SemanticSelectionIdentity>,
     reader: SemanticGenerationReader,
+    // Opt-in graph loading is sticky across publication refreshes, but never
+    // changes the default exact query policy or mutates earlier result batches.
+    ann_budget: Option<AnnAdmissionBudget>,
 }
 
 impl SelectedSemanticGeneration {
@@ -168,7 +172,36 @@ impl SelectedSemanticGeneration {
                 pointer: selected.pointer, manifest: selected.manifest,
             }),
             reader,
+            ann_budget: None,
         })
+    }
+
+    /// Opt into graphs named by this already-selected immutable manifest.
+    /// Never rediscover a graph beside a vector or reopen a serving vector.
+    /// Rejections remain per-tier exact fallback; inspect ann_admission() and
+    /// each batch's execution() rather than inferring acceleration from files.
+    ///
+    /// The selection remains the one this handle admitted, even when current.json
+    /// advances during graph loading. refresh_current() is the explicit boundary
+    /// for adopting a successor. Ordinary search() remains exact after this call.
+    pub fn with_ann(mut self, budget: AnnAdmissionBudget) -> SemanticSelectionResult<Self> {
+        let directory = self.identity.manifest.generation_dir(&self.data_dir)?;
+        self.reader = self.reader.with_manifest_ann(&self.identity.manifest, &directory, budget);
+        self.ann_budget = Some(budget);
+        Ok(self)
+    }
+
+    /// Drop this handle's graph selection and opt out of graph loading on refresh.
+    /// Existing clones and batches keep their own graph/vector owners alive.
+    pub fn without_ann(mut self) -> Self {
+        self.reader.ann = Arc::new(super::ann::AnnSelection::default());
+        self.ann_budget = None;
+        self
+    }
+
+    /// None means the tier is absent, not that a present tier has zero work.
+    pub fn ann_admission(&self, tier: TierKind) -> Option<SemanticAnnAdmission> {
+        self.reader.ann_admission(tier, 0)
     }
 
     /// Revalidate the entire successor before touching the current handle.
@@ -176,6 +209,8 @@ impl SelectedSemanticGeneration {
     /// Selection epochs, NOT vector-build sequence numbers, order refreshes.
     /// An explicitly published rollback to an older build is valid at a newer
     /// selection epoch. Previously returned batches retain their old owners.
+    /// Explicit ANN opt-in and its admission budget carry forward to the new
+    /// manifest; old graphs are never attached to a successor's vector owners.
     pub fn refresh_current(
         &mut self,
         expected_corpus: &SemanticCorpusSnapshotIdentity,
@@ -193,6 +228,10 @@ impl SelectedSemanticGeneration {
         if next == previous {
             return Ok(false);
         }
+        let candidate = match self.ann_budget {
+            Some(ann_budget) => candidate.with_ann(ann_budget)?,
+            None => candidate,
+        };
         *self = candidate;
         Ok(true)
     }
@@ -227,6 +266,32 @@ impl SelectedSemanticSearch<'_, '_> {
         self.search.search(k, filter).map(|batch| SelectedSemanticBatch {
             batch, identity: Arc::clone(&self.identity),
         })
+    }
+
+    /// Request native ANN over graphs explicitly admitted with with_ann().
+    /// The caller selects approximation separately from loading. Missing or
+    /// rejected graphs, candidate limits and filtered underfill use the exact
+    /// retained tier, with the actual engine recorded in batch().execution().
+    pub fn search_with_ann(
+        &self, k: usize, filter: Option<&dyn SearchFilter>, policy: AnnSearchPolicy,
+    ) -> SemanticReaderResult<SelectedSemanticBatch> {
+        self.search.search_with_ann(k, filter, policy).map(|batch| SelectedSemanticBatch {
+            batch, identity: Arc::clone(&self.identity),
+        })
+    }
+
+    /// Lazy ANN-accelerated fast results followed by independent quality
+    /// retrieval and rank fusion, all bound to the same publication. Stopping
+    /// after Initial does not run quality retrieval; quality failure stays an
+    /// error, never a falsely successful refinement. Graph admission itself is
+    /// explicit and eager in with_ann(), not hidden inside iterator creation.
+    pub fn progressive_with_ann<'call>(
+        &'call self, k: usize, filter: Option<&'call dyn SearchFilter>, policy: AnnSearchPolicy,
+    ) -> SemanticReaderResult<impl Iterator<Item = SemanticReaderResult<SelectedSemanticBatch>> + 'call> {
+        let identity = Arc::clone(&self.identity);
+        Ok(self.search.progressive_with_ann(k, filter, policy)?.map(move |result| result.map(|batch| {
+            SelectedSemanticBatch { batch, identity: Arc::clone(&identity) }
+        })))
     }
 
     /// Preserve lazy fast/quality retrieval and attach the same publication
