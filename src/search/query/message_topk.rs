@@ -72,7 +72,9 @@ pub(super) fn collect_exact_messages<E>(
         let excluded = retained.iter().map(|hit| hit.message_id).collect();
         let batch = fetch(&excluded, ceiling, window).map_err(RefillError::Backend)?;
         if batch.len() > window {
-            return Err(RefillError::InvalidBatch("backend exceeded candidate limit"));
+            return Err(RefillError::InvalidBatch(
+                "backend exceeded candidate limit",
+            ));
         }
         for (position, hit) in batch.iter().enumerate() {
             if !hit.score.is_finite() {
@@ -81,10 +83,14 @@ pub(super) fn collect_exact_messages<E>(
             if excluded.contains(&hit.message_id)
                 || ceiling.is_some_and(|ceiling| hit.message_id >= ceiling)
             {
-                return Err(RefillError::InvalidBatch("backend did not enforce refill scope"));
+                return Err(RefillError::InvalidBatch(
+                    "backend did not enforce refill scope",
+                ));
             }
             if position > 0 && batch[position - 1].score.total_cmp(&hit.score).is_lt() {
-                return Err(RefillError::InvalidBatch("backend scores are not descending"));
+                return Err(RefillError::InvalidBatch(
+                    "backend scores are not descending",
+                ));
             }
         }
         let exhausted = batch.len() < window;
@@ -140,7 +146,11 @@ mod tests {
     use super::*;
 
     fn hit(message_id: u64, chunk_idx: u8, score: f32) -> VectorSearchResult {
-        VectorSearchResult { message_id, chunk_idx, score }
+        VectorSearchResult {
+            message_id,
+            chunk_idx,
+            score,
+        }
     }
 
     // Model only the documented exact backend contract: filter before top-k,
@@ -151,10 +161,14 @@ mod tests {
         ceiling: Option<u64>,
         window: usize,
     ) -> Vec<VectorSearchResult> {
-        let mut rows = records.iter().filter(|hit| {
-            !excluded.contains(&hit.message_id)
-                && ceiling.is_none_or(|ceiling| hit.message_id < ceiling)
-        }).cloned().collect::<Vec<_>>();
+        let mut rows = records
+            .iter()
+            .filter(|hit| {
+                !excluded.contains(&hit.message_id)
+                    && ceiling.is_none_or(|ceiling| hit.message_id < ceiling)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         rows.sort_by(|a, b| b.score.total_cmp(&a.score));
         rows.truncate(window);
         rows
@@ -162,9 +176,13 @@ mod tests {
 
     fn select(records: &[VectorSearchResult], target: usize, window: usize) -> MessageTopK {
         collect_exact_messages(target, window, 4096, |excluded, ceiling, window| {
-            assert!(excluded.len() <= target, "retained IDs must not grow with archive size");
+            assert!(
+                excluded.len() <= target,
+                "retained IDs must not grow with archive size"
+            );
             Ok::<_, &'static str>(backend(records, excluded, ceiling, window))
-        }).unwrap_or_else(|error| panic!("{error}"))
+        })
+        .unwrap_or_else(|error| panic!("{error}"))
     }
 
     fn ids(result: &MessageTopK) -> Vec<u64> {
@@ -174,23 +192,37 @@ mod tests {
     fn oracle(records: &[VectorSearchResult], limit: usize) -> Vec<(u64, u32)> {
         let mut best = HashMap::<u64, f32>::new();
         for hit in records {
-            best.entry(hit.message_id).and_modify(|score| {
-                if hit.score.total_cmp(score).is_gt() { *score = hit.score; }
-            }).or_insert(hit.score);
+            best.entry(hit.message_id)
+                .and_modify(|score| {
+                    if hit.score.total_cmp(score).is_gt() {
+                        *score = hit.score;
+                    }
+                })
+                .or_insert(hit.score);
         }
         let mut values = best.into_iter().collect::<Vec<_>>();
         values.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         values.truncate(limit);
-        values.into_iter().map(|(id, score)| (id, score.to_bits())).collect()
+        values
+            .into_iter()
+            .map(|(id, score)| (id, score.to_bits()))
+            .collect()
     }
 
     #[test]
     fn dominant_message_cannot_hide_lower_ranked_messages() {
-        let mut records = (0..=255).map(|chunk| hit(1, chunk, 1.0)).collect::<Vec<_>>();
+        let mut records = (0..=255)
+            .map(|chunk| hit(1, chunk, 1.0))
+            .collect::<Vec<_>>();
         records.extend([hit(2, 0, 0.8), hit(3, 0, 0.6), hit(4, 0, 0.4)]);
         // Even the old second window (three times a 4x overfetch) contains
         // only message 1. This fixture is deliberately beyond both windows.
-        assert!(records.iter().take(3 * 4 * 3).all(|hit| hit.message_id == 1));
+        assert!(
+            records
+                .iter()
+                .take(3 * 4 * 3)
+                .all(|hit| hit.message_id == 1)
+        );
         let result = select(&records, 3, 12);
         assert_eq!(ids(&result), vec![1, 2, 3]);
         assert_eq!(result.rounds, 2);
@@ -198,9 +230,9 @@ mod tests {
 
     #[test]
     fn many_dominant_messages_keep_exclusion_storage_bounded() {
-        let records = (1..=100_u64).flat_map(|id| {
-            (0..=255).map(move |chunk| hit(id, chunk, 1.0 / id as f32))
-        }).collect::<Vec<_>>();
+        let records = (1..=100_u64)
+            .flat_map(|id| (0..=255).map(move |chunk| hit(id, chunk, 1.0 / id as f32)))
+            .collect::<Vec<_>>();
         let result = select(&records, 7, 28);
         assert_eq!(ids(&result), (1..=7).collect::<Vec<_>>());
         assert!(result.rounds <= 8);
@@ -208,7 +240,10 @@ mod tests {
 
     #[test]
     fn equal_score_ties_refine_to_lowest_message_ids() {
-        let records = (1..=70).rev().flat_map(|id| [hit(id, 0, 0.5), hit(id, 1, 0.5)]).collect::<Vec<_>>();
+        let records = (1..=70)
+            .rev()
+            .flat_map(|id| [hit(id, 0, 0.5), hit(id, 1, 0.5)])
+            .collect::<Vec<_>>();
         let result = select(&records, 5, 8);
         assert_eq!(ids(&result), vec![1, 2, 3, 4, 5]);
         assert!(result.rounds > 2);
@@ -216,7 +251,12 @@ mod tests {
 
     #[test]
     fn score_order_precedes_id_ceiling_and_best_chunk_is_retained() {
-        let records = vec![hit(100, 1, 0.8), hit(1, 0, 0.1), hit(100, 2, 0.9), hit(2, 7, 0.8)];
+        let records = vec![
+            hit(100, 1, 0.8),
+            hit(1, 0, 0.1),
+            hit(100, 2, 0.9),
+            hit(2, 7, 0.8),
+        ];
         let result = select(&records, 2, 1);
         assert_eq!(ids(&result), vec![100, 2]);
         assert_eq!(result.hits[0].chunk_idx, 2);
@@ -224,7 +264,8 @@ mod tests {
 
     #[test]
     fn zero_target_does_not_call_backend() {
-        let result = collect_exact_messages::<&str>(0, 0, 0, |_, _, _| panic!("unexpected query")).unwrap();
+        let result =
+            collect_exact_messages::<&str>(0, 0, 0, |_, _, _| panic!("unexpected query")).unwrap();
         assert!(result.hits.is_empty());
         assert_eq!(result.rounds, 0);
     }
@@ -249,32 +290,66 @@ mod tests {
             Ok::<_, &str>(backend(&records, excluded, ceiling, window))
         });
         assert!(matches!(result, Err(RefillError::BudgetExhausted)));
-        assert!(matches!(collect_exact_messages::<&str>(1, 1, 0, |_, _, _| unreachable!()), Err(RefillError::BudgetExhausted)));
+        assert!(matches!(
+            collect_exact_messages::<&str>(1, 1, 0, |_, _, _| unreachable!()),
+            Err(RefillError::BudgetExhausted)
+        ));
     }
 
     #[test]
     fn backend_failure_is_preserved_not_replaced_by_empty_results() {
-        let result = collect_exact_messages(2, 2, 4, |_, _, _| Err::<Vec<VectorSearchResult>, _>("vector read failed"));
-        assert!(matches!(result, Err(RefillError::Backend("vector read failed"))));
+        let result = collect_exact_messages(2, 2, 4, |_, _, _| {
+            Err::<Vec<VectorSearchResult>, _>("vector read failed")
+        });
+        assert!(matches!(
+            result,
+            Err(RefillError::Backend("vector read failed"))
+        ));
     }
 
     #[test]
     fn broken_backend_cannot_repeat_excluded_messages_forever() {
         let result = collect_exact_messages(2, 1, 4, |_, _, _| Ok::<_, &str>(vec![hit(1, 0, 1.0)]));
-        assert!(matches!(result, Err(RefillError::InvalidBatch("backend did not enforce refill scope"))));
+        assert!(matches!(
+            result,
+            Err(RefillError::InvalidBatch(
+                "backend did not enforce refill scope"
+            ))
+        ));
     }
 
     #[test]
     fn invalid_backend_scores_and_windows_fail_explicitly() {
         for score in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            let result = collect_exact_messages(1, 1, 1, |_, _, _| Ok::<_, &str>(vec![hit(1, 0, score)]));
-            assert!(matches!(result, Err(RefillError::InvalidBatch("non-finite chunk score"))));
+            let result =
+                collect_exact_messages(1, 1, 1, |_, _, _| Ok::<_, &str>(vec![hit(1, 0, score)]));
+            assert!(matches!(
+                result,
+                Err(RefillError::InvalidBatch("non-finite chunk score"))
+            ));
         }
-        let unsorted = collect_exact_messages(2, 2, 1, |_, _, _| Ok::<_, &str>(vec![hit(1, 0, 0.1), hit(2, 0, 0.9)]));
-        assert!(matches!(unsorted, Err(RefillError::InvalidBatch("backend scores are not descending"))));
-        let oversized = collect_exact_messages(1, 1, 1, |_, _, _| Ok::<_, &str>(vec![hit(1, 0, 0.9), hit(2, 0, 0.8)]));
-        assert!(matches!(oversized, Err(RefillError::InvalidBatch("backend exceeded candidate limit"))));
-        assert!(matches!(collect_exact_messages::<&str>(1, 0, 1, |_, _, _| unreachable!()), Err(RefillError::InvalidBatch("zero candidate window"))));
+        let unsorted = collect_exact_messages(2, 2, 1, |_, _, _| {
+            Ok::<_, &str>(vec![hit(1, 0, 0.1), hit(2, 0, 0.9)])
+        });
+        assert!(matches!(
+            unsorted,
+            Err(RefillError::InvalidBatch(
+                "backend scores are not descending"
+            ))
+        ));
+        let oversized = collect_exact_messages(1, 1, 1, |_, _, _| {
+            Ok::<_, &str>(vec![hit(1, 0, 0.9), hit(2, 0, 0.8)])
+        });
+        assert!(matches!(
+            oversized,
+            Err(RefillError::InvalidBatch(
+                "backend exceeded candidate limit"
+            ))
+        ));
+        assert!(matches!(
+            collect_exact_messages::<&str>(1, 0, 1, |_, _, _| unreachable!()),
+            Err(RefillError::InvalidBatch("zero candidate window"))
+        ));
     }
 
     #[test]
@@ -295,8 +370,16 @@ mod tests {
             for target in [1, 2, 7, 25] {
                 for window in [1, 4, 17, 64] {
                     let result = select(&records, target, window);
-                    let actual = result.hits.iter().map(|hit| (hit.message_id, hit.score.to_bits())).collect::<Vec<_>>();
-                    assert_eq!(actual, oracle(&records, target), "case={case} target={target} window={window}");
+                    let actual = result
+                        .hits
+                        .iter()
+                        .map(|hit| (hit.message_id, hit.score.to_bits()))
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        actual,
+                        oracle(&records, target),
+                        "case={case} target={target} window={window}"
+                    );
                 }
             }
         }
