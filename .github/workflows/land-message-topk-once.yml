@@ -1,5 +1,5 @@
 # Hash-guarded final application of the bounded shard merge and real-FSVI tests.
-# Successful application retires this writer in the SAME source commit.
+# The connector retires this writer after the source-only push succeeds.
 name: Qualify exact message retrieval against real FSVI
 on:
   push:
@@ -81,12 +81,23 @@ jobs:
                           .collect();
           ''', 1)
           path.write_text(text)
+          kernel_path = Path('src/search/query/message_topk.rs')
+          kernel = kernel_path.read_text()
+          old = '        let exhausted = batch.len() < window;'
+          assert kernel.count(old) == 1
+          kernel = kernel.replace(old, '        // FSVI deduplicates document IDs after selecting raw records. A\n        // short nonempty window can still have unseen messages behind it.\n        // Only an empty filtered result proves that this scope is exhausted.\n        let exhausted = batch.is_empty();', 1)
+          kernel = kernel.replace('across one search, not per shard.', 'per candidate call, across shards.', 1)
+          anchor = '    #[test]\n    fn deterministic_generated_corpora_match_exhaustive_message_oracle()'
+          assert kernel.count(anchor) == 1
+          test = '    #[test]\n    fn short_post_dedup_windows_are_not_mistaken_for_exhaustion() {\n        let mut records = vec![hit(1, 0, 1.0); 100];\n        records.extend(vec![hit(2, 0, 0.8); 100]);\n        records.push(hit(3, 0, 0.6));\n        let result = collect_exact_messages(3, 12, 8, |excluded, ceiling, window| {\n            let mut batch = backend(&records, excluded, ceiling, window);\n            // Match the real FSVI resolver\'s post-top-k document-ID dedup.\n            let mut seen = HashSet::new();\n            batch.retain(|hit| seen.insert((hit.message_id, hit.chunk_idx)));\n            assert!(batch.len() < window);\n            Ok::<_, &str>(batch)\n        }).unwrap();\n        assert_eq!(ids(&result), vec![1, 2, 3]);\n        assert_eq!(result.rounds, 4);\n    }\n\n'
+          kernel = kernel.replace(anchor, test + anchor, 1)
+          kernel_path.write_text(kernel)
           PY
       - name: Format only the new retrieval code and parse the complete query module
         run: |
           set -euo pipefail
           rustc --version
-          rustfmt --edition 2024 src/search/query/message_topk_integration.rs
+          rustfmt --edition 2024 src/search/query/message_topk.rs src/search/query/message_topk_integration.rs
           python3 - <<'PY'
           import importlib.util
           from pathlib import Path
@@ -109,7 +120,7 @@ jobs:
           PY
           rustfmt --edition 2024 --config skip_children=true --emit stdout src/search/query.rs > "$RUNNER_TEMP/query-parse.rs"
           git diff --check
-      - name: Build the exact driver with pinned real FSVI and execute all 19 tests
+      - name: Build the exact driver with pinned real FSVI and execute all 20 tests
         run: |
           set -euo pipefail
           python3 scripts/verify_message_topk_fsvi.py "$PWD" "$GITHUB_WORKSPACE/fs-source" "$RUNNER_TEMP/cass-exact-fsvi"
@@ -118,7 +129,7 @@ jobs:
           cargo generate-lockfile
           sha256sum Cargo.lock
           cargo test --locked -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/cass-exact-fsvi.log"
-          grep -Eq 'test result: ok\. 19 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/cass-exact-fsvi.log"
+          grep -Eq 'test result: ok\. 20 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/cass-exact-fsvi.log"
       - name: Record full CASS qualification separately without changing its dependency pins
         id: full
         run: |
@@ -131,49 +142,36 @@ jobs:
           cat "$RUNNER_TEMP/cass-full.log"
           printf 'full_cass_exit=%s\n' "$status" >> "$GITHUB_OUTPUT"
           printf 'Full CASS qualification exit=%s; this outcome is separate from the pinned component test.\n' "$status"
-      - name: Commit bounded shard merge and integration tests, and retire writer permissions
+      - name: Commit tested source changes directly to main
         env:
           FULL_CASS_EXIT: ${{ steps.full.outputs.full_cass_exit }}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path('.github/workflows/land-message-topk-once.yml')
-          path.write_text('''# One-shot application completed; only explicit read-only checks remain.
-          name: Verify exact message retrieval
-          on:
-            workflow_dispatch:
-          permissions:
-            contents: read
-          jobs:
-            verify:
-              runs-on: ubuntu-24.04
-              timeout-minutes: 20
-              env:
-                CARGO_BUILD_JOBS: '2'
-                CARGO_PROFILE_TEST_DEBUG: '0'
-                CARGO_PROFILE_DEV_DEBUG: '0'
-              steps:
-                - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-                  with:
-                    persist-credentials: false
-                - name: Check exact message and FSVI regressions under the repository lockfile
-                  run: cargo test --locked --lib search::query::message_topk -- --nocapture
-          ''')
-          PY
-          git add -- src/search/query.rs src/search/query/message_topk_integration.rs .github/workflows/land-message-topk-once.yml
+          git add -- src/search/query.rs src/search/query/message_topk_integration.rs src/search/query/message_topk.rs
           python3 - <<'PY'
           import subprocess
           paths = set(subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines())
-          expected = {'src/search/query.rs', 'src/search/query/message_topk_integration.rs', '.github/workflows/land-message-topk-once.yml'}
+          expected = {'src/search/query.rs', 'src/search/query/message_topk_integration.rs', 'src/search/query/message_topk.rs'}
           if paths != expected:
               raise SystemExit('Unexpected staged paths: ' + repr(paths))
           PY
           git diff --cached --check
           git hash-object src/search/query.rs src/search/query/message_topk.rs src/search/query/message_topk_integration.rs
           git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit \
-            -m 'fix(search): bound initial shard merging and qualify exact message refills with real FSVI' \
-            -m 'Prune the first-pass collapsed map after every shard instead of retaining one full page per shard. Add seven real-FSVI tests for chunk starvation beyond both previous windows, filter preservation, shared-message shard merge, score ties, unchanged fast-path results, the global refill cap, and bounded-merge equivalence. Preserve all prior tests and dependency pins. Retire the one-shot writer in this same commit.' \
-            -m "Executed 19 tests of exact CASS selection bodies/filters/artifact constructors and the production kernel against real FSVI from pinned upstream 6852e79. This temporary harness has its own recorded dependency graph and is not the locked CASS binary. Full CASS qualification probe exit=$FULL_CASS_EXIT; model inference, hydration, CLI/RCH and archive-scale acceptance remain separate."
-          GIT_TERMINAL_PROMPT=0 git push origin HEAD:refs/heads/main
-          git rev-parse HEAD
+            -m 'fix(search): bound shard merging and preserve refills across post-top-k deduplication' \
+            -m 'Prune the first-pass collapsed map after every shard instead of retaining one full page per shard. Add seven real-FSVI tests for chunk starvation beyond both previous windows, filter preservation, shared-message shard merge, score ties, unchanged fast-path results, the global refill cap, and bounded-merge equivalence. Preserve all prior tests and dependency pins. Treat short post-dedup batches conservatively: only an empty filtered result proves exhaustion, with an additional regression for that backend behavior.' \
+            -m "Executed 20 tests of exact CASS selection bodies/filters/artifact constructors and the production kernel against real FSVI from pinned upstream 6852e79. This temporary harness has its own recorded dependency graph and is not the locked CASS binary. Full CASS qualification probe exit=$FULL_CASS_EXIT; model inference, hydration, CLI/RCH and archive-scale acceptance remain separate."
+          for attempt in 1 2 3; do
+            if GIT_TERMINAL_PROMPT=0 git push origin HEAD:refs/heads/main; then
+              git rev-parse HEAD
+              exit 0
+            fi
+            # Rebase only this private, unpublished commit and only over
+            # unrelated updates. Never force or merge changed search inputs.
+            parent=$(git rev-parse HEAD^)
+            git fetch --depth=100 origin main
+            test -z "$(git diff --name-only "$parent" FETCH_HEAD -- src/search/query.rs src/search/vector_index.rs src/search/query/session_scope.rs src/search/query/message_topk.rs src/search/query/message_topk_integration.rs scripts/verify_message_topk_fsvi.py Cargo.toml Cargo.lock)"
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' rebase FETCH_HEAD
+          done
+          echo 'Direct main push failed; no force-push attempted' >&2
+          exit 1
