@@ -1,20 +1,13 @@
-name: Qualify retained semantic refresh
+# Admission and refresh implementations landed; this workflow cannot modify repository refs.
+name: Verify semantic publications
 on:
-  push:
-    branches: [main]
-    paths: [.github/workflows/qualify-sharded-publication.yml]
+  workflow_dispatch:
 permissions:
   contents: read
-concurrency:
-  group: cass-semantic-admission-landing
-  cancel-in-progress: false
 jobs:
-  qualify-and-land:
+  production-components:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
-    permissions:
-      contents: write
-      actions: read
+    timeout-minutes: 20
     env:
       RUSTUP_TOOLCHAIN: nightly-2026-08-31
       CARGO_BUILD_JOBS: '2'
@@ -22,153 +15,67 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_TERM_COLOR: never
       RUST_MIN_STACK: '16777216'
-    defaults:
-      run:
-        shell: bash
-        working-directory: cass-source
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: main
+          ref: ${{ github.sha }}
           path: cass-source
-          clean: false
+          persist-credentials: false
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: Dicklesworthstone/frankensearch
           ref: 6852e79a830c402ea4e55eb79eda3373c618dfc3
           path: fs-source
           persist-credentials: false
-          clean: false
-      - name: Guard source and install tests with the exact previously qualified dependency lock
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Execute actual immutable publication modules in the independent component package
+        shell: bash
         run: |
           set -euo pipefail
-          test "$(git branch --show-current)" = main
-          test -z "$(git status --porcelain)"
-          mkdir -p "$RUNNER_TEMP/refresh-evidence"
+          mkdir -p "$RUNNER_TEMP/evidence"
+          python3 cass-source/scripts/verify_sharded_publication.py "$GITHUB_WORKSPACE/cass-source" "$GITHUB_WORKSPACE/fs-source" "$RUNNER_TEMP/components"
+          cp "$RUNNER_TEMP/components/source-receipt.json" "$RUNNER_TEMP/evidence/"
+          cd "$RUNNER_TEMP/components"
+          cargo generate-lockfile
+          cp Cargo.lock "$RUNNER_TEMP/evidence/component-Cargo.lock"
+          cargo test --locked --lib -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/evidence/unit.log"
+          cargo test --locked --test semantic_generation_manifest -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/evidence/process.log"
           python3 - <<'PY'
-          import base64, hashlib, io, json, lzma, os, re, subprocess, zipfile
+          import os, re
           from pathlib import Path
-          def blob(data):
-              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-          repository = 'repos/' + os.environ['GITHUB_REPOSITORY']
-          evidence = Path(os.environ['RUNNER_TEMP']) / 'refresh-evidence'
-          response = json.loads(subprocess.check_output(['gh', 'api', repository + '/git/blobs/934a977ff4d7113a286b96b9ac8b188d32abfd34'], text=True))
-          compressed = base64.b64decode(response['content'])
-          assert blob(compressed) == '934a977ff4d7113a286b96b9ac8b188d32abfd34'
-          data = lzma.decompress(compressed)
-          assert hashlib.sha256(data).hexdigest() == '8eabaedd3fbc0f0165362815e0e03de605830cd753faf2e49efba9a50d0859ae'
-          payload = json.loads(data)
-          guards = payload['guards']
-          assert set(guards) == {'src/search/semantic_reader/publication.rs', 'src/search/semantic_reader/publication/tests/sharded.rs', 'src/search/semantic_reader/publication/tests/sharded/refresh.rs'}
-          for name, (before, _) in guards.items():
-              path = Path(name)
-              assert not path.is_symlink(), name
-              assert not path.exists() if before is None else blob(path.read_bytes()) == before, name
-          (evidence / 'payload.json').write_bytes(data)
-          (evidence / 'base.txt').write_text(subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True))
-          patch = payload['patch'].encode()
-          (evidence / 'reviewed.patch').write_bytes(patch)
-          tests, runtime, found = [], [], []
-          for piece in filter(None, re.split(rb'(?=^--- )', patch, flags=re.M)):
-              name = re.search(rb'^\+\+\+ b/([^\n]+)', piece, re.M).group(1).decode()
-              assert name in guards and name not in found, name
-              found.append(name)
-              (tests if '/tests/' in name else runtime).append(piece)
-          assert set(found) == set(guards)
-          for name, parts in [('tests.patch', tests), ('runtime.patch', runtime)]:
-              (evidence / name).write_bytes(b''.join(parts))
-          archive = subprocess.check_output(['gh', 'api', repository + '/actions/artifacts/10569657639/zip'])
-          assert hashlib.sha256(archive).hexdigest() == '6c137ee2867cc035ac4ff58febdc5b944ef763188f2b19fd43fdbe5d61327965'
-          with zipfile.ZipFile(io.BytesIO(archive)) as source:
-              (evidence / 'component-Cargo.lock').write_bytes(source.read('component-Cargo.lock'))
-          subprocess.run(['git', 'apply', '--check', '--whitespace=error-all', str(evidence / 'reviewed.patch')], check=True)
-          subprocess.run(['git', 'apply', str(evidence / 'tests.patch')], check=True)
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'evidence'
+          for name, minimum in [('unit.log', 162), ('process.log', 4)]:
+              counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed; 0 ignored;', (evidence / name).read_text())
+              assert counts and max(map(int, counts)) >= minimum, name
           PY
-          rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt
-      - name: RED - unchanged and stale refreshes must incorrectly reacquire artifacts on the parent
-        run: |
-          set -euo pipefail
-          python3 scripts/verify_sharded_publication.py "$PWD" "$GITHUB_WORKSPACE/fs-source" "$RUNNER_TEMP/refresh-red"
-          cp "$RUNNER_TEMP/refresh-red/source-receipt.json" "$RUNNER_TEMP/refresh-evidence/red-source.json"
-          cp "$RUNNER_TEMP/refresh-evidence/component-Cargo.lock" "$RUNNER_TEMP/refresh-red/Cargo.lock"
-          export CARGO_TARGET_DIR="$RUNNER_TEMP/refresh-target"
-          cd "$RUNNER_TEMP/refresh-red"
-          python3 - <<'PY'
-          import json, os, re, subprocess
-          from pathlib import Path
-          evidence = Path(os.environ['RUNNER_TEMP']) / 'refresh-evidence'
-          for index, case in enumerate(json.loads((evidence / 'payload.json').read_text())['red_cases']):
-              with (evidence / f'red-{index}.log').open('w') as log:
-                  result = subprocess.run(['timeout', '900', 'cargo', 'test', '--locked', '--lib', case, '--', '--exact', '--nocapture'], stdout=log, stderr=subprocess.STDOUT)
-              text = (evidence / f'red-{index}.log').read_text()
-              print(text[-8000:])
-              assert result.returncode == 101 and re.search(r'test result: FAILED\. 0 passed; 1 failed; 0 ignored;', text), case
-          PY
-      - name: GREEN - preserve all existing contracts while reusing retained readers
-        run: |
-          set -euo pipefail
-          git apply --check --whitespace=error-all "$RUNNER_TEMP/refresh-evidence/runtime.patch"
-          git apply "$RUNNER_TEMP/refresh-evidence/runtime.patch"
-          python3 - <<'PY'
-          import hashlib, json, os, subprocess
-          from pathlib import Path
-          evidence = Path(os.environ['RUNNER_TEMP']) / 'refresh-evidence'
-          for name, (_, expected) in json.loads((evidence / 'payload.json').read_text())['guards'].items():
-              data = Path(name).read_bytes()
-              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == expected, name
-              subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', name], check=True)
-          PY
-          git diff --check
-          python3 scripts/verify_sharded_publication.py "$PWD" "$GITHUB_WORKSPACE/fs-source" "$RUNNER_TEMP/refresh-green"
-          cp "$RUNNER_TEMP/refresh-green/source-receipt.json" "$RUNNER_TEMP/refresh-evidence/green-source.json"
-          cp "$RUNNER_TEMP/refresh-evidence/component-Cargo.lock" "$RUNNER_TEMP/refresh-green/Cargo.lock"
-          export CARGO_TARGET_DIR="$RUNNER_TEMP/refresh-target"
-          cd "$RUNNER_TEMP/refresh-green"
-          timeout 900 cargo test --locked --lib -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/refresh-evidence/green.log"
-          grep -Eq 'test result: ok\. 162 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/refresh-evidence/green.log"
-          timeout 120 cargo test --locked --test semantic_generation_manifest -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/refresh-evidence/process.log"
-          grep -Eq 'test result: ok\. 4 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/refresh-evidence/process.log"
-      - name: Record shipping-build result separately
-        run: |
-          set +e
-          timeout 90 cargo test --locked --lib search::semantic_reader::publication::tests::sharded::refresh -- --nocapture > "$RUNNER_TEMP/refresh-evidence/shipping.log" 2>&1
-          status=$?
-          printf '%s\n' "$status" > "$RUNNER_TEMP/refresh-evidence/shipping-exit.txt"
-          cat "$RUNNER_TEMP/refresh-evidence/shipping.log"
-          exit 0
-      - name: Commit the three qualified files directly to main
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import hashlib, json, os, subprocess
-          from pathlib import Path
-          evidence = Path(os.environ['RUNNER_TEMP']) / 'refresh-evidence'
-          paths = list(json.loads((evidence / 'payload.json').read_text())['guards'])
-          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
-          added = subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard'], text=True).splitlines()
-          assert set(changed + added) == set(paths), (changed, added)
-          records = {}
-          for name in paths:
-              data = Path(name).read_bytes()
-              dest = evidence / 'source' / name
-              dest.parent.mkdir(parents=True, exist_ok=True)
-              dest.write_bytes(data)
-              records[name] = {'blob': hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest(), 'sha256': hashlib.sha256(data).hexdigest()}
-          (evidence / 'published-source.json').write_text(json.dumps(records, indent=2))
-          subprocess.run(['git', 'add', '--', *paths], check=True)
-          PY
-          git fetch --no-tags origin main
-          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'perf(search): reuse sealed vector and ANN owners on unchanged publication refresh' -m 'Check authenticated metadata, expected corpus and caller byte budget before reacquiring artifacts. Unchanged selections retain all existing owners and graph opt-in state; stale epochs fail before artifact I/O. New selections still undergo complete fresh admission and a second epoch check before replacement. Two six-shard/stale-read regressions are RED on the parent and GREEN after the change; all 162 component unit tests and four public process contracts pass under the exact previous dependency lock. Full shipping CASS qualification remains separate; no dependency pins, repository lockfile, models or user archive changed.'
-          git push origin HEAD:main
-          git rev-parse HEAD > "$RUNNER_TEMP/refresh-evidence/runtime-commit.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: semantic-refresh-evidence-${{ github.sha }}
-          path: ${{ runner.temp }}/refresh-evidence/
+          name: semantic-publication-components-${{ github.sha }}
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 14
+  shipping-cass:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Test the complete CASS crate under its unchanged shipping lockfile
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          cargo test --locked --lib search::semantic_reader::publication::tests:: -- --nocapture 2>&1 | tee "$RUNNER_TEMP/evidence/shipping-unit.log"
+          cargo test --locked --test semantic_generation_manifest -- --nocapture 2>&1 | tee "$RUNNER_TEMP/evidence/shipping-process.log"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: semantic-publication-shipping-${{ github.sha }}
+          path: ${{ runner.temp }}/evidence/
           retention-days: 14
