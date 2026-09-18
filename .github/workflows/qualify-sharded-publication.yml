@@ -75,8 +75,6 @@ jobs:
           subprocess.run(['git', 'apply', str(evidence / 'reviewed.patch')], check=True)
           for name, (_, after) in expected.items():
               assert blob(Path(name).read_bytes()) == after, name
-          # Preserve value-type derives in the independent component harness.
-          # No production definitions or test assertions are replaced here.
           script = Path('scripts/verify_sharded_publication.py')
           text = script.read_text()
           old = "        parts.append('#[derive(Debug, Clone, Default)]\\n' + helper.block"
@@ -84,6 +82,12 @@ jobs:
           assert text.count(old) == 1
           script.write_text(text.replace(old, new))
           assert blob(script.read_bytes()) == '294ff0d02f3f82390ceb8085fa5eedb6cad0b49c'
+          text = script.read_text()
+          needle = "        '[profile.test]"
+          extra = '        \'[dev-dependencies]\\nproptest="1"\\ntracing-subscriber={version="0.3", features=["env-filter"]}\\nwait-timeout="0.2"\\n\'\n'
+          assert text.count(needle) == 1
+          script.write_text(text.replace(needle, extra + needle))
+          assert blob(script.read_bytes()) == '9f83ca7ce9a71c439ced830ab38b58c9782dda30'
           (evidence / 'paths.json').write_text(json.dumps(list(expected)))
           beads = []
           for line in Path('.beads/issues.jsonl').read_text().splitlines():
@@ -100,6 +104,9 @@ jobs:
           for name in json.loads((evidence / 'paths.json').read_text()):
               if name.endswith('.rs'):
                   subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', name], check=True)
+              output = evidence / 'source' / name
+              output.parent.mkdir(parents=True, exist_ok=True)
+              output.write_bytes(Path(name).read_bytes())
           PY
           git diff --check
       - name: Compile and execute real manifest, retained-reader and native-ANN regressions
