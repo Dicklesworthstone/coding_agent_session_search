@@ -1,0 +1,102 @@
+name: GH473 writer contention regression
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/gh473-writer-contention.yml
+      - src/indexer/**
+      - src/storage/**
+      - src/franken_sync.rs
+      - tests/gh473_writer_contention.rs
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gh473-writer-contention-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  regression:
+    if: github.repository == 'Dicklesworthstone/coding_agent_session_search'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      CARGO_NET_RETRY: '1'
+      RUST_MIN_STACK: '134217728'
+      RUST_BACKTRACE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Record exact source and current writer policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          git hash-object src/indexer/mod.rs src/storage/sqlite.rs Cargo.toml Cargo.lock
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          source = Path('src/indexer/mod.rs').read_text()
+          names = [
+              'index_writer_busy_timeout_ms',
+              'apply_index_writer_busy_timeout',
+              'with_ephemeral_writer',
+              'is_retryable_franken_error',
+              'with_concurrent_retry',
+              'gh473_short_writer_wait_preserves_live_reader_ingest',
+          ]
+          for name in names:
+              matches = list(re.finditer(r'^( *)(?:pub(?:\([^)]*\))? )?fn ' + name + r'\b', source, re.M))
+              if len(matches) != 1:
+                  raise SystemExit(f'Missing or ambiguous production/test definition: {name}')
+              match = matches[0]
+              end = re.search('^' + match[1] + r'}$', source[match.end():], re.M)
+              if end is None:
+                  raise SystemExit(f'Unterminated definition: {name}')
+              definition = source[match.start():match.end() + end.end()]
+              print(f'=== {name} ===\n{definition}\n')
+          PY
+      - name: Record toolchain
+        run: |
+          rustc --version
+          cargo --version
+      - name: Run real CASS live-reader, no-op, atomic ledger and held-writer regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          # No dependency rewrites, unlocked fallback, or substitute SQLite engine.
+          # A resolution/build failure is a failed gate, never a passing runtime receipt.
+          timeout 1800s cargo test --locked --lib gh473_short_writer_wait_preserves_live_reader_ingest -- --exact indexer::tests::gh473_short_writer_wait_preserves_live_reader_ingest --nocapture 2>&1 | tee "$RUNNER_TEMP/gh473-live-reader.log"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import re
+          text = (Path(os.environ['RUNNER_TEMP']) / 'gh473-live-reader.log').read_text()
+          if not re.search(r'test result: ok\. [1-9][0-9]* passed; 0 failed;', text):
+              raise SystemExit('Missing nonzero passing CASS regression receipt')
+          PY
+      - name: Run additional production-path contention regressions when present
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -f tests/gh473_writer_contention.rs; then
+            timeout 900s cargo test --locked --test gh473_writer_contention -- --nocapture 2>&1 | tee "$RUNNER_TEMP/gh473-contention.log"
+          fi
+      - name: State qualification scope
+        if: always()
+        run: |
+          echo 'This job tests the committed CASS graph and synthetic temporary archives only.'
+          echo 'Original-archive index --all/MiniLM and final lexical/semantic/HNSW qualification remain separate.'
+          echo 'A failed dependency resolution or compilation is NOT runtime validation.'
