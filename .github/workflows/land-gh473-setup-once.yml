@@ -1,70 +1,23 @@
-name: Land GH473 writer setup retry
+# Production changes landed in 93b149e0 and 44344e16. No repository writes remain.
+name: Verify GH473 writer setup source
 on:
-  push:
-    branches: [main]
-    paths: [.github/workflows/land-gh473-setup-once.yml]
+  workflow_dispatch:
 permissions:
-  contents: write
-concurrency:
-  group: cass-gh473-setup-patch
-  cancel-in-progress: false
+  contents: read
 jobs:
-  land:
-    if: github.repository == 'Dicklesworthstone/coding_agent_session_search'
+  verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: main
-      - name: Apply only the reviewed setup and regression changes
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify the setup policy and its real-path regressions
         run: |
           set -euo pipefail
-          test -z "$(git status --porcelain)"
-          cp src/indexer/mod.rs "$RUNNER_TEMP/indexer-before.rs"
-          if git apply --reverse --check scripts/patches/gh473-writer-setup-retry.patch 2>/dev/null; then
-            echo 'GH473 writer setup patch already present'
-          else
-            git apply --check scripts/patches/gh473-writer-setup-retry.patch
-            git apply scripts/patches/gh473-writer-setup-retry.patch
-          fi
-          python3 - <<'PY'
-          import hashlib, importlib.util, os
-          from pathlib import Path
-          spec = importlib.util.spec_from_file_location('probe', 'scripts/verify_gh473_core.py')
-          probe = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(probe)
-          before = Path(os.environ['RUNNER_TEMP'], 'indexer-before.rs').read_text()
-          after = Path('src/indexer/mod.rs').read_text()
-          for name in ['index_writer_busy_timeout_ms', 'with_concurrent_retry', 'is_retryable_franken_error', 'persist_conversations_batched_inner', 'anyhow_chain_indicates_retryable_storage_contention']:
-              old, new = probe.definition(before, name), probe.definition(after, name)
-              assert old == new, 'Unexpected change to protected transaction policy: ' + name
-              print('UNCHANGED', name, hashlib.sha256(new.encode()).hexdigest())
-          body = probe.definition(after, 'with_ephemeral_writer')
-          assert body.count('with_concurrent_retry(SERIAL_CHUNK_CONTENTION_RETRIES') == 2
-          assert body.count('let result = f(&writer);') == 1
-          assert 'F: FnOnce(&FrankenStorage) -> Result<T>' in body
-          assert body.index('Ok((writer, reusable))') < body.index('let result = f(&writer);')
-          PY
-      - name: Format regressions and parse the production module
-        run: |
-          set -euo pipefail
-          rustfmt --edition 2024 src/indexer/gh473_tests.rs
-          rustfmt --edition 2024 --config skip_children=true --emit stdout src/indexer/mod.rs > "$RUNNER_TEMP/indexer-parsed.rs"
-          git diff --check
-          python3 scripts/verify_gh473_core.py "$RUNNER_TEMP/gh473-core-source-check"
-      - name: Commit directly to main without overwriting concurrent work
-        run: |
-          set -euo pipefail
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -- src/indexer/mod.rs src/indexer/gh473_tests.rs
-          if ! git diff --cached --quiet; then
-            git diff --cached --stat
-            git commit -m 'fix(index): retry writer setup without replaying committed ingest bodies (GH473)'
-            git push origin HEAD:main
-          fi
           git rev-parse HEAD
-      - name: State qualification scope
-        if: always()
-        run: echo 'Source invariance and parsing checks are not runtime validation; the full CASS candidate lane runs the actual persistence tests.'
+          python3 scripts/verify_gh473_core.py "$RUNNER_TEMP/gh473-source-check"
+          grep -F 'fn warm_writer_parent_registration_retries' src/indexer/gh473_tests.rs
+          grep -F 'fn writer_body_errors_are_never_replayed' src/indexer/gh473_tests.rs
+          grep -F 'fn canonical_contention_preserves_completion_and_lexical_state' src/indexer/gh473_tests.rs
