@@ -139,6 +139,30 @@ fn main() -> anyhow::Result<()> {
     production::verify(expected)
 }
 '''
+    storage_source = (root / "src/storage/sqlite.rs").read_text()
+    fallback_message = definition(storage_source, "retryable_storage_error_message")
+    fallback_classifier = definition(source, "anyhow_chain_indicates_retryable_storage_contention")
+    program = program.replace("mod production {", "mod storage { pub mod sqlite {\n" + fallback_message + "}}\nmod production {\n" + fallback_classifier, 1)
+    program = program.replace('assert!(is_retryable_franken_error(&err));', 'assert!(is_retryable_franken_error(&err));\n    assert!(anyhow_chain_indicates_retryable_storage_contention(&err));')
+    program = program.replace('assert!(!is_retryable_franken_error(&err));', 'assert!(!is_retryable_franken_error(&err));\n    assert!(!anyhow_chain_indicates_retryable_storage_contention(&err));')
+    readonly_check = """    writer.execute("PRAGMA query_only = ON")?;
+    let mut readonly_attempts = 0;
+    let readonly = with_concurrent_retry(2, || {
+        readonly_attempts += 1;
+        attempt(&writer, &path)
+    });
+    let err = readonly.expect_err("query-only preflight must fail permanently");
+    assert!(!is_retryable_franken_error(&err));
+    assert!(!anyhow_chain_indicates_retryable_storage_contention(&err));
+    assert_eq!(readonly_attempts, 1);
+    writer.execute("PRAGMA query_only = OFF")?;
+    println!("GH473_CORE_READONLY_OK attempts={readonly_attempts}");
+"""
+    anchor = '    assert!(started.elapsed() < Duration::from_secs(5), "short waits regressed");'
+    if program.count(anchor) != 1:
+        raise ValueError("Missing unique probe assertion anchor")
+    program = program.replace(anchor, readonly_check + anchor, 1)
+    print("exact_fallback_functions", hashlib.sha256((fallback_message + fallback_classifier).encode()).hexdigest())
     manifest_source = (root / "Cargo.toml").read_text()
     dependencies = production_dependencies(manifest_source, [
         "anyhow", "tracing", "asupersync", "frankensqlite", "dotenvy", "tempfile", "rand",

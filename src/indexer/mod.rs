@@ -19846,6 +19846,22 @@ fn storage_error_mentions_missing_table_or_column(err: &impl std::fmt::Display) 
 }
 
 fn anyhow_chain_indicates_retryable_storage_contention(err: &anyhow::Error) -> bool {
+    use crate::franken_sync::FrankenError;
+
+    if let Some(engine_error) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<FrankenError>())
+    {
+        return matches!(
+            engine_error,
+            FrankenError::Busy
+                | FrankenError::BusyRecovery
+                | FrankenError::BusySnapshot { .. }
+                | FrankenError::WriteConflict { .. }
+                | FrankenError::SerializationFailure { .. }
+        );
+    }
+
     err.chain()
         .any(|cause| crate::storage::sqlite::retryable_storage_error_message(&cause.to_string()))
 }

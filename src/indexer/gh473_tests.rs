@@ -30,7 +30,10 @@ mod gh473_preflight {
         let diagnostic = if primary {
             storage.enable_bulk_single_connection();
             assert!(storage.bulk_single_connection_enabled());
-            storage.raw().execute("PRAGMA busy_timeout = 60000").unwrap();
+            storage
+                .raw()
+                .execute("PRAGMA busy_timeout = 60000")
+                .unwrap();
             storage.mark_index_writer_busy_timeout_ms(60_000);
             "primary writer preflight failed"
         } else {
@@ -172,6 +175,46 @@ mod gh473_preflight {
         reopened.close_without_checkpoint().unwrap();
     }
 
+    fn readonly_preflight_is_permanent(primary: bool) {
+        let tmp = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&tmp.path().join("busy-readonly.db")).unwrap();
+        if primary {
+            storage.enable_bulk_single_connection();
+            storage.raw().execute("PRAGMA query_only = ON").unwrap();
+        } else {
+            let (writer, reusable) = storage.acquire_cached_ephemeral_writer().unwrap();
+            assert!(reusable);
+            writer.raw().execute("PRAGMA query_only = ON").unwrap();
+            storage.release_cached_ephemeral_writer(writer);
+        }
+        let mut attempts = 0;
+        let mut bodies = 0;
+        let result = persist::with_concurrent_retry(2, || {
+            attempts += 1;
+            persist::with_ephemeral_writer(&storage, false, "GH473 read-only preflight", |_| {
+                bodies += 1;
+                Ok(())
+            })
+        });
+        let err = result.expect_err("query-only writers must reject preflight");
+        assert!(
+            err.downcast_ref::<crate::franken_sync::FrankenError>()
+                .is_some()
+        );
+        assert!(
+            !anyhow_chain_indicates_retryable_storage_contention(&err),
+            "permanent error misclassified: {err:#}"
+        );
+        assert_eq!((attempts, bodies), (1, 0));
+        assert!(!storage.ephemeral_writer_preflight_verified());
+        assert_eq!(scalar(&storage, "SELECT COUNT(*) FROM messages"), 0);
+        assert!(storage.source_ingest_ledger_entries().unwrap().is_empty());
+        if primary {
+            storage.raw().execute("PRAGMA query_only = OFF").unwrap();
+        }
+        storage.close().unwrap();
+    }
+
     #[test]
     fn writer_preflight_contention_regression() {
         const CHILD: &str = "CASS_TEST_GH473_PREFLIGHT_CHILD";
@@ -180,6 +223,7 @@ mod gh473_preflight {
             for primary in [false, true] {
                 preflight_contention(expected, true, primary);
                 preflight_contention(expected, false, primary);
+                readonly_preflight_is_permanent(primary);
             }
             permanent_error_is_not_retried();
             canonical_write_and_replay_with_pinned_reader(expected);
