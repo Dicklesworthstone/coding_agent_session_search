@@ -1,5 +1,12 @@
 # Installer Spec (UBS-style) for coding-agent-search
 
+This is the current contract for `install.sh` and `install.ps1`. The separate
+[Rust-installer proposal](planning/PLAN_TO_PORT_INSTALL_SCRIPTS_TO_RUST.md) is
+retired as a current implementation requirement; its user-facing installation
+goals remain here. Exact release-artifact and platform qualification remains
+open in `coding_agent_session_search-2l1b0.25`. A spec or a fixture test is not
+evidence that a particular published binary installs and updates correctly.
+
 ## Goals
 - One-line curl|bash / pwsh that installs coding-agent-search safely.
 - Default: non-interactive install with PATH guidance; prebuilt artifacts require a checksum.
