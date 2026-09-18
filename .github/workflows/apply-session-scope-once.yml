@@ -29,7 +29,6 @@ jobs:
       CARGO_TERM_COLOR: never
       RUST_MIN_STACK: '134217728'
       RUST_BACKTRACE: '1'
-      CARGO_TARGET_DIR: ${{ runner.temp }}/cass-session-scope-target
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -47,6 +46,7 @@ jobs:
       - name: Check formatting and run nonempty scoped-search regressions
         shell: bash
         run: |
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/cass-session-scope-target"
           set +e
           rustfmt --edition 2024 --check src/search/query/session_scope.rs
           fmt_status=$?
