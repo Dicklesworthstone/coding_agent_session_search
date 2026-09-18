@@ -1,0 +1,37 @@
+name: Ingest source qualification
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [.github/workflows/ingest-source-qualification.yml]
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Capture tracked source only, with no credentials or untracked archives
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/cass-source.tar.gz"
+          sha256sum "$RUNNER_TEMP/cass-source.tar.gz"
+          python3 - <<'PY'
+          from pathlib import Path
+          source = Path('src/lib.rs').read_text().splitlines()
+          for i, line in enumerate(source):
+              if 'SemanticAnnUnavailableReason::' in line:
+                  print('\n'.join(f'{n+1}: {source[n]}' for n in range(max(0,i-12), min(len(source),i+18))))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cass-source-${{ github.sha }}
+          path: ${{ runner.temp }}/cass-source.tar.gz
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: error
