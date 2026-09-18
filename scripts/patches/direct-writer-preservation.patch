@@ -1,0 +1,79 @@
+diff --git a/src/indexer/semantic.rs b/src/indexer/semantic.rs
+--- a/src/indexer/semantic.rs
++++ b/src/indexer/semantic.rs
+@@ -2910,8 +2910,10 @@
+             std::fs::create_dir_all(parent)?;
+         }
+ 
+-        // Store as f16 by default (smaller, faster I/O). Validate before the
+-        // writer so NaN/Inf never reaches a persisted or staged artifact.
++        // The engine buffers records until finish(), then owns its temporary
++        // file and publication. The destination may already be a live index;
++        // this layer must never unlink it when preparing its replacement fails.
++        // Store as f16 by default (smaller, faster I/O).
+         let mut writer: FsVectorIndexWriter = FsVectorIndex::create_with_revision(
+             index_path,
+             self.embedder_id(),
+@@ -2919,44 +2921,26 @@
+             self.embedder_dimension(),
+             FsQuantization::F16,
+         )
+-        .map_err(|err| anyhow::anyhow!("create fsvi index failed: {err}"))?;
++        .context("create fsvi index failed")?;
+ 
+         let mut records_written = 0_usize;
+-        let write_result: Result<()> = (|| {
+-            for embedded in embedded_messages {
+-                validate_embedding_vector(
+-                    &embedded.embedding,
+-                    self.embedder_dimension(),
+-                    embedded.message_id,
+-                )?;
+-                let doc_id = semantic_doc_id_for_embedded(&embedded);
+-                writer
+-                    .write_record(&doc_id, &embedded.embedding)
+-                    .map_err(|err| anyhow::anyhow!("write fsvi record failed: {err}"))?;
+-                records_written = records_written.saturating_add(1);
+-                on_progress(records_written);
+-            }
+-            Ok(())
+-        })();
+-
+-        if let Err(e) = &write_result {
+-            // Clean up partial index file to prevent corruption
+-            tracing::warn!("removing partial vector index after write failure: {e}");
+-            if let Err(rm_err) = std::fs::remove_file(index_path) {
+-                tracing::error!(
+-                    "failed to remove partial index file {}: {rm_err}",
+-                    index_path.display()
+-                );
+-            }
+-            return Err(anyhow::anyhow!("{e}"));
+-        }
+-
+-        writer
+-            .finish()
+-            .map_err(|err| anyhow::anyhow!("finish fsvi index failed: {err}"))?;
+-
+-        FsVectorIndex::open(index_path)
+-            .map_err(|err| anyhow::anyhow!("open fsvi index failed: {err}"))
++        for embedded in embedded_messages {
++            validate_embedding_vector(
++                &embedded.embedding,
++                self.embedder_dimension(),
++                embedded.message_id,
++            )?;
++            let doc_id = semantic_doc_id_for_embedded(&embedded);
++            writer
++                .write_record(&doc_id, &embedded.embedding)
++                .context("write fsvi record failed")?;
++            records_written = records_written.saturating_add(1);
++            on_progress(records_written);
++        }
++
++        writer.finish().context("finish fsvi index failed")?;
++
++        FsVectorIndex::open(index_path).context("open fsvi index failed")
+     }
+ 
+     /// Append new embeddings to an existing FSVI index via the WAL.
