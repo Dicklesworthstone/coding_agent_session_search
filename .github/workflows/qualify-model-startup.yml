@@ -1,0 +1,130 @@
+name: Qualify responsive model publication
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/qualify-model-startup.yml]
+permissions:
+  contents: write
+concurrency:
+  group: cass-model-startup-landing
+  cancel-in-progress: false
+jobs:
+  qualify-and-land:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-08-31
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+    defaults:
+      run:
+        shell: bash
+        working-directory: cass-source
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          path: cass-source
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: Dicklesworthstone/frankensearch
+          ref: 6852e79a830c402ea4e55eb79eda3373c618dfc3
+          path: fs-source
+          persist-credentials: false
+      - name: Apply the exact reviewed model-publication change
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git branch --show-current)" = main
+          test -z "$(git status --porcelain)"
+          mkdir -p "$RUNNER_TEMP/model-evidence"
+          python3 - <<'PY'
+          import base64, gzip, hashlib, json, os, subprocess
+          from pathlib import Path
+          def blob(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          source = json.loads(subprocess.check_output(['gh', 'api', 'repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs/4a667e322627dad7f1d7120f0facf155db049644'], text=True))
+          compressed = base64.b64decode(source['content'])
+          assert blob(compressed) == '4a667e322627dad7f1d7120f0facf155db049644'
+          patch = gzip.decompress(compressed)
+          assert hashlib.sha256(patch).hexdigest() == '1f67bbb94b54f01894598af2ac9ce8657d1c354aca0e101ddb1eabaeb433d60b'
+          expected = {'src/daemon/models.rs': ('ef6657016a26a046ae0fa3bd2e744880d0f7a02d', 'a7954965148575716eae398c8ac27c2e6c5d7ad8'), 'src/daemon/models/slot.rs': (None, '9236f62837be139fe1671cf6a50cf00de9f80d64')}
+          for name, (before, _) in expected.items():
+              path = Path(name)
+              assert not path.is_symlink()
+              assert (not path.exists()) if before is None else blob(path.read_bytes()) == before, name
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'model-evidence'
+          (evidence / 'reviewed.patch').write_bytes(patch)
+          subprocess.run(['git', 'apply', '--check', '--whitespace=error-all', str(evidence / 'reviewed.patch')], check=True)
+          subprocess.run(['git', 'apply', str(evidence / 'reviewed.patch')], check=True)
+          for name, (_, after) in expected.items():
+              assert blob(Path(name).read_bytes()) == after, name
+          (evidence / 'base.txt').write_text(subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True))
+          PY
+          rustup component add rustfmt
+          rustfmt --edition 2024 src/daemon/models.rs
+          git diff --check
+      - name: Compile real native wrappers and run all model-manager regressions
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, os
+          root = Path.cwd()
+          upstream = Path(os.environ['GITHUB_WORKSPACE']) / 'fs-source/frankensearch'
+          dest = Path(os.environ['RUNNER_TEMP']) / 'model-harness'
+          (dest / 'src').mkdir(parents=True)
+          lines = ['pub mod search {']
+          for name in ['embedder', 'reranker', 'hash_embedder', 'fastembed_embedder', 'fastembed_reranker', 'policy']:
+              lines.append('#[path = ' + json.dumps(str(root / ('src/search/' + name + '.rs'))) + '] pub mod ' + name + ';')
+          lines.append('}\npub mod daemon {')
+          for name in ['protocol', 'models']:
+              lines.append('#[path = ' + json.dumps(str(root / ('src/daemon/' + name + '.rs'))) + '] pub mod ' + name + ';')
+          lines.append('}')
+          (dest / 'src/lib.rs').write_text('\n'.join(lines))
+          (dest / 'Cargo.toml').write_text('[package]\nname="cass-model-publication-check"\nversion="0.0.0"\nedition="2024"\n[dependencies]\nfrankensearch={path=' + json.dumps(str(upstream)) + ', default-features=false, features=["hash", "native"]}\nparking_lot="=0.12.5"\nserde={version="1", features=["derive"]}\nserde_json="1"\nrmp-serde="1.3"\ndotenvy="0.15"\nthiserror="2"\ntracing="0.1"\ntoml="0.9"\ntempfile="3"\n')
+          PY
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/model-target"
+          cd "$RUNNER_TEMP/model-harness"
+          cargo generate-lockfile
+          cp Cargo.lock "$RUNNER_TEMP/model-evidence/component-Cargo.lock"
+          timeout 600 cargo test --locked daemon::models:: -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/model-evidence/tests.log"
+          grep -Eq 'test result: ok\. 18 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/model-evidence/tests.log"
+      - name: Record the unmodified locked-CASS result separately
+        run: |
+          set -uo pipefail
+          timeout 90 cargo test --locked --lib daemon::models:: -- --nocapture > "$RUNNER_TEMP/model-evidence/full-cass.log" 2>&1
+          status=$?
+          printf '%s\n' "$status" > "$RUNNER_TEMP/model-evidence/full-cass-exit.txt"
+          cat "$RUNNER_TEMP/model-evidence/full-cass.log"
+          printf 'Full locked CASS exit=%s; component success is not full-binary qualification\n' "$status"
+      - name: Commit the tested model-publication files directly to main
+        run: |
+          set -euo pipefail
+          git add -- src/daemon/models.rs src/daemon/models/slot.rs
+          test "$(git diff --cached --name-only | wc -l)" = 2
+          git diff --cached --check
+          git hash-object src/daemon/models.rs src/daemon/models/slot.rs > "$RUNNER_TEMP/model-evidence/published-blobs.txt"
+          git diff --cached > "$RUNNER_TEMP/model-evidence/published.patch"
+          full=$(cat "$RUNNER_TEMP/model-evidence/full-cass-exit.txt")
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'fix(daemon): keep health and status responsive during native model loading' -m 'Separate single-flight loading from published model state. Publish model/name atomically, retain borrowed inference owners, and serialize unload against pending loads. Add coherent status snapshots and ten loading/publication regressions; preserve all existing ModelManager tests.' -m "Executed all 18 manager/slot tests using complete production ModelManager, native wrappers, policy and protocol with pinned real upstream code. No model assets downloaded or inference-quality claim. Full locked CASS exit=$full; separate component lock is not release qualification."
+          for attempt in 1 2 3; do
+            if git push origin HEAD:refs/heads/main; then
+              git rev-parse HEAD > "$RUNNER_TEMP/model-evidence/commit.txt"
+              exit 0
+            fi
+            parent=$(git rev-parse HEAD^)
+            git fetch --depth=100 origin main
+            test -z "$(git diff --name-only "$parent" FETCH_HEAD -- src/daemon src/search/embedder.rs src/search/reranker.rs src/search/hash_embedder.rs src/search/fastembed_embedder.rs src/search/fastembed_reranker.rs src/search/policy.rs Cargo.toml Cargo.lock)"
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' rebase FETCH_HEAD
+          done
+          exit 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: model-publication-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/model-evidence/
+          retention-days: 14
