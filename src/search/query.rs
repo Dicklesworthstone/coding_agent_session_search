@@ -732,6 +732,8 @@ impl SemanticTierMode {
 }
 
 mod message_topk;
+#[cfg(test)]
+mod message_topk_integration;
 mod session_scope;
 use session_scope::{
     SEMANTIC_SESSION_SCOPE_MAX_MESSAGES, SessionScopedSemanticFilter,
@@ -748,12 +750,17 @@ struct ExactMessageRefillFilter<'a> {
 
 impl FsSearchFilter for ExactMessageRefillFilter<'_> {
     fn matches(&self, doc_id: &str, metadata: Option<&serde_json::Value>) -> bool {
-        let Some(rest) = doc_id.strip_prefix("m|") else { return false; };
+        let Some(rest) = doc_id.strip_prefix("m|") else {
+            return false;
+        };
         let mut parts = rest.splitn(3, '|');
         let Some(message_id) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
             return false;
         };
-        if parts.next().and_then(|value| value.parse::<u8>().ok()).is_none()
+        if parts
+            .next()
+            .and_then(|value| value.parse::<u8>().ok())
+            .is_none()
             || self.excluded.contains(&message_id)
             || self.ceiling.is_some_and(|ceiling| message_id >= ceiling)
         {
@@ -763,11 +770,17 @@ impl FsSearchFilter for ExactMessageRefillFilter<'_> {
             && self.base.is_none_or(|base| base.matches(doc_id, metadata))
     }
 
-    fn matches_doc_id_hash(&self, _hash: u64, _metadata: Option<&serde_json::Value>) -> Option<bool> {
+    fn matches_doc_id_hash(
+        &self,
+        _hash: u64,
+        _metadata: Option<&serde_json::Value>,
+    ) -> Option<bool> {
         None
     }
 
-    fn name(&self) -> &str { "cass_exact_message_refill_filter" }
+    fn name(&self) -> &str {
+        "cass_exact_message_refill_filter"
+    }
 }
 
 const PROGRESSIVE_EMBEDDING_CACHE_CAPACITY: usize = 64;
@@ -5007,7 +5020,10 @@ impl SearchClient {
         fs_filter: Option<&dyn FsSearchFilter>,
     ) -> Result<(Vec<VectorSearchResult>, SemanticCandidateRetryState)> {
         let (initial, retry) = Self::search_exact_semantic_indexes_initial_window(
-            context, embedding, fetch_limit, fs_filter,
+            context,
+            embedding,
+            fetch_limit,
+            fs_filter,
         )?;
         if !retry.exact_window_may_omit_competitor {
             return Ok((initial, retry));
@@ -5031,37 +5047,53 @@ impl SearchClient {
                 window,
                 refills_left + 1,
                 |excluded, ceiling, window| {
-                    let filter = ExactMessageRefillFilter { base: fs_filter, excluded, ceiling };
-                    let hits = index.search_top_k(embedding, window, Some(&filter))
+                    let filter = ExactMessageRefillFilter {
+                        base: fs_filter,
+                        excluded,
+                        ceiling,
+                    };
+                    let hits = index
+                        .search_top_k(embedding, window, Some(&filter))
                         .map_err(|error| anyhow!("exact semantic refill failed: {error}"))?;
-                    hits.into_iter().map(|hit| {
-                        let parsed = parse_semantic_doc_id(&hit.doc_id)
-                            .ok_or_else(|| anyhow!("exact semantic refill returned an invalid message identity"))?;
-                        Ok(VectorSearchResult {
-                            message_id: parsed.message_id,
-                            chunk_idx: parsed.chunk_idx,
-                            score: hit.score,
+                    hits.into_iter()
+                        .map(|hit| {
+                            let parsed = parse_semantic_doc_id(&hit.doc_id).ok_or_else(|| {
+                                anyhow!(
+                                    "exact semantic refill returned an invalid message identity"
+                                )
+                            })?;
+                            Ok(VectorSearchResult {
+                                message_id: parsed.message_id,
+                                chunk_idx: parsed.chunk_idx,
+                                score: hit.score,
+                            })
                         })
-                    }).collect::<Result<Vec<_>>>()
+                        .collect::<Result<Vec<_>>>()
                 },
-            ).map_err(|error| match error {
+            )
+            .map_err(|error| match error {
                 message_topk::RefillError::Backend(error) => error,
                 other => anyhow!("{other}"),
             })?;
             rounds = rounds.saturating_add(selection.rounds);
             refills_left -= selection.rounds.saturating_sub(1);
             for hit in selection.hits {
-                best_by_message.entry(hit.message_id).and_modify(|best| {
-                    if hit.score.total_cmp(&best.score).is_gt() {
-                        best.score = hit.score;
-                        best.chunk_idx = hit.chunk_idx;
-                    }
-                }).or_insert(hit);
+                best_by_message
+                    .entry(hit.message_id)
+                    .and_modify(|best| {
+                        if hit.score.total_cmp(&best.score).is_gt() {
+                            best.score = hit.score;
+                            best.chunk_idx = hit.chunk_idx;
+                        }
+                    })
+                    .or_insert(hit);
             }
             // Per-shard top-k messages suffice for global top-k. Prune after
             // each merge instead of retaining k messages times all shard count.
             best_by_message = Self::collapse_semantic_results(best_by_message, return_limit)
-                .into_iter().map(|hit| (hit.message_id, hit)).collect();
+                .into_iter()
+                .map(|hit| (hit.message_id, hit))
+                .collect();
         }
         let hits = Self::collapse_semantic_results(best_by_message, return_limit);
         let has_more_candidates = hits.len() >= return_limit && return_limit < record_count;
@@ -5071,10 +5103,13 @@ impl SearchClient {
             returned = hits.len(),
             "exact semantic message refinement complete"
         );
-        Ok((hits, SemanticCandidateRetryState {
-            has_more_candidates,
-            exact_window_may_omit_competitor: false,
-        }))
+        Ok((
+            hits,
+            SemanticCandidateRetryState {
+                has_more_candidates,
+                exact_window_may_omit_competitor: false,
+            },
+        ))
     }
 
     fn search_exact_semantic_indexes_initial_window(
@@ -5151,6 +5186,14 @@ impl SearchClient {
             for hit in &fs_hits {
                 Self::record_fs_semantic_hit(&mut best_by_message, hit);
             }
+            // Max-score collapse distributes over bounded top-k merge. Keep
+            // only the eventual return window after each shard, rather than
+            // retaining a full candidate page for every opened shard.
+            let keep = Self::semantic_exact_candidate_limit(fetch_limit, raw_hits);
+            best_by_message = Self::collapse_semantic_results(best_by_message, keep)
+                .into_iter()
+                .map(|hit| (hit.message_id, hit))
+                .collect();
         }
         let candidate_return_limit = Self::semantic_exact_candidate_limit(fetch_limit, raw_hits);
         let collapsed = Self::collapse_semantic_results(best_by_message, candidate_return_limit);

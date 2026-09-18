@@ -9,7 +9,7 @@ use super::VectorSearchResult;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-/// Limits extra full-vector passes across one search, not per shard. The caller
+/// Limits extra full-vector passes per candidate call, across shards. The caller
 /// still owns its wall-clock cancellation. Exhaustion is an error, never an
 /// apparently complete but incorrectly ranked exact result.
 pub(super) const MAX_EXACT_MESSAGE_REFILLS: usize = 64;
@@ -93,7 +93,10 @@ pub(super) fn collect_exact_messages<E>(
                 ));
             }
         }
-        let exhausted = batch.len() < window;
+        // FSVI deduplicates document IDs after selecting raw records. A
+        // short nonempty window can still have unseen messages behind it.
+        // Only an empty filtered result proves that this scope is exhausted.
+        let exhausted = batch.is_empty();
         let tail_score = batch.last().map(|hit| hit.score);
         let mut best_by_message: HashMap<_, _> = retained
             .into_iter()
@@ -350,6 +353,24 @@ mod tests {
             collect_exact_messages::<&str>(1, 0, 1, |_, _, _| unreachable!()),
             Err(RefillError::InvalidBatch("zero candidate window"))
         ));
+    }
+
+    #[test]
+    fn short_post_dedup_windows_are_not_mistaken_for_exhaustion() {
+        let mut records = vec![hit(1, 0, 1.0); 100];
+        records.extend(vec![hit(2, 0, 0.8); 100]);
+        records.push(hit(3, 0, 0.6));
+        let result = collect_exact_messages(3, 12, 8, |excluded, ceiling, window| {
+            let mut batch = backend(&records, excluded, ceiling, window);
+            // Match the real FSVI resolver's post-top-k document-ID dedup.
+            let mut seen = HashSet::new();
+            batch.retain(|hit| seen.insert((hit.message_id, hit.chunk_idx)));
+            assert!(batch.len() < window);
+            Ok::<_, &str>(batch)
+        })
+        .unwrap();
+        assert_eq!(ids(&result), vec![1, 2, 3]);
+        assert_eq!(result.rounds, 4);
     }
 
     #[test]
