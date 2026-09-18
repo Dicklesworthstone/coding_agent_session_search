@@ -22,12 +22,21 @@ mod gh473_preflight {
         storage.release_cached_ephemeral_writer(writer);
     }
 
-    fn preflight_contention(expected: u64, release_after_failure: bool) {
+    fn preflight_contention(expected: u64, release_after_failure: bool, primary: bool) {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("preflight.db");
         let storage = FrankenStorage::open(&path).unwrap();
         assert!(!storage.bulk_single_connection_enabled());
-        prime_cold_writer(&storage);
+        let diagnostic = if primary {
+            storage.enable_bulk_single_connection();
+            assert!(storage.bulk_single_connection_enabled());
+            storage.raw().execute("PRAGMA busy_timeout = 60000").unwrap();
+            storage.mark_index_writer_busy_timeout_ms(60_000);
+            "primary writer preflight failed"
+        } else {
+            prime_cold_writer(&storage);
+            "ephemeral writer preflight write failed"
+        };
         let holder = crate::franken_sync::Connection::open_existing_schema_only(
             path.to_string_lossy().into_owned(),
         )
@@ -49,9 +58,8 @@ mod gh473_preflight {
                     .as_ref()
                     .expect_err("a held writer must block preflight");
                 assert!(
-                    err.to_string()
-                        .contains("ephemeral writer preflight write failed"),
-                    "the failure must reach preflight, not a different open path: {err:#}"
+                    err.to_string().contains(diagnostic),
+                    "the failure must reach the selected preflight, not an open path: {err:#}"
                 );
                 assert!(anyhow_chain_indicates_retryable_storage_contention(err));
                 assert!(!storage.ephemeral_writer_preflight_verified());
@@ -169,8 +177,10 @@ mod gh473_preflight {
         const CHILD: &str = "CASS_TEST_GH473_PREFLIGHT_CHILD";
         if let Ok(expected) = dotenvy::var(CHILD) {
             let expected = expected.parse::<u64>().unwrap();
-            preflight_contention(expected, true);
-            preflight_contention(expected, false);
+            for primary in [false, true] {
+                preflight_contention(expected, true, primary);
+                preflight_contention(expected, false, primary);
+            }
             permanent_error_is_not_retried();
             canonical_write_and_replay_with_pinned_reader(expected);
             return;
