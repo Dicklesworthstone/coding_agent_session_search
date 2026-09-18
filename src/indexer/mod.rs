@@ -31992,15 +31992,17 @@ pub mod persist {
             // Preflight is a write too; tune it before entering the retryable operation.
             apply_index_writer_busy_timeout(storage);
             if !storage.ephemeral_writer_preflight_verified() {
-                storage
-                    .raw()
-                    .execute("UPDATE meta SET value = value WHERE key = 'schema_version'")
-                    .with_context(|| {
-                        format!(
-                            "primary writer preflight failed for {context} after the bulk WAL reset at {}",
-                            db_path.display()
-                        )
-                    })?;
+                with_concurrent_retry(SERIAL_CHUNK_CONTENTION_RETRIES, || {
+                    storage
+                        .raw()
+                        .execute("UPDATE meta SET value = value WHERE key = 'schema_version'")
+                        .with_context(|| {
+                            format!(
+                                "primary writer preflight failed for {context} after the bulk WAL reset at {}",
+                                db_path.display()
+                            )
+                        })
+                })?;
                 storage.mark_ephemeral_writer_preflight_verified();
             }
             apply_index_writer_checkpoint_policy(storage, defer_checkpoints);
@@ -32014,11 +32016,53 @@ pub mod persist {
             return f(storage);
         }
 
-        let (writer, reusable) = storage.acquire_cached_ephemeral_writer().with_context(|| {
-            format!(
-                "opening short-lived frankensqlite writer for {context}: {}",
-                db_path.display()
-            )
+        // Writer acquisition and the idempotent preflight happen before any
+        // canonical transaction. Short engine waits must not turn a transient
+        // cold-open/preflight conflict into a fatal ingest failure (GH473).
+        // Retry only setup: replaying f or close here could lose the outcomes
+        // of already-committed chunks and therefore skip lexical publication.
+        let (writer, reusable) = with_concurrent_retry(SERIAL_CHUNK_CONTENTION_RETRIES, || {
+            let (writer, reusable) = storage.acquire_cached_ephemeral_writer().with_context(|| {
+                format!(
+                    "opening short-lived frankensqlite writer for {context}: {}",
+                    db_path.display()
+                )
+            })?;
+
+            let discard_writer = |mut writer: FrankenStorage| {
+                if reusable {
+                    storage.discard_cached_ephemeral_writer(writer);
+                } else {
+                    writer.close_best_effort_in_place();
+                }
+            };
+
+            // A cold/reused writer must not inherit a long timeout for its first write.
+            apply_index_writer_busy_timeout(&writer);
+            if !storage.ephemeral_writer_preflight_verified() {
+                // CASS #162 item 2: Preflight write check to catch "attempt to write
+                // a readonly database" early with a clear diagnostic instead of letting
+                // it surface deep inside a batched insert. Once one writer open has
+                // succeeded on this storage handle, repeating the same idempotent
+                // meta-table write on every steady-state persist just adds fixed
+                // overhead without improving correctness.
+                if let Err(err) = writer
+                    .raw()
+                    .execute("UPDATE meta SET value = value WHERE key = 'schema_version'")
+                {
+                    discard_writer(writer);
+                    // Preserve the typed engine error for outer retry/fallback classification.
+                    return Err(anyhow::Error::new(err).context(format!(
+                        "ephemeral writer preflight write failed for {context} at {}. \
+                         The database may be locked by another process or opened in \
+                         readonly mode. Try closing other cass instances and retrying.",
+                        db_path.display()
+                    )));
+                }
+                storage.mark_ephemeral_writer_preflight_verified();
+            }
+
+            Ok((writer, reusable))
         })?;
 
         let release_writer = |writer: FrankenStorage| -> Result<()> {
@@ -32034,39 +32078,6 @@ pub mod persist {
                 })
             }
         };
-
-        let discard_writer = |mut writer: FrankenStorage| {
-            if reusable {
-                storage.discard_cached_ephemeral_writer(writer);
-            } else {
-                writer.close_best_effort_in_place();
-            }
-        };
-
-        // A cold/reused writer must not inherit a long timeout for its first write.
-        apply_index_writer_busy_timeout(&writer);
-        if !storage.ephemeral_writer_preflight_verified() {
-            // CASS #162 item 2: Preflight write check to catch "attempt to write
-            // a readonly database" early with a clear diagnostic instead of letting
-            // it surface deep inside a batched insert. Once one writer open has
-            // succeeded on this storage handle, repeating the same idempotent
-            // meta-table write on every steady-state persist just adds fixed
-            // overhead without improving correctness.
-            if let Err(err) = writer
-                .raw()
-                .execute("UPDATE meta SET value = value WHERE key = 'schema_version'")
-            {
-                discard_writer(writer);
-                // Preserve the typed engine error for outer retry/fallback classification.
-                return Err(anyhow::Error::new(err).context(format!(
-                    "ephemeral writer preflight write failed for {context} at {}. \
-                     The database may be locked by another process or opened in \
-                     readonly mode. Try closing other cass instances and retrying.",
-                    db_path.display()
-                )));
-            }
-            storage.mark_ephemeral_writer_preflight_verified();
-        }
 
         apply_index_writer_checkpoint_policy(&writer, defer_checkpoints);
 

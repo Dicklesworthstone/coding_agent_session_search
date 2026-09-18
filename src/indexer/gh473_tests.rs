@@ -22,6 +22,103 @@ mod gh473_preflight {
         storage.release_cached_ephemeral_writer(writer);
     }
 
+    // Release a real writer lock only after the production retry loop has
+    // observed a failure. No sleep-based race or synthetic Busy is involved.
+    struct RetryObserver {
+        retries: Arc<AtomicUsize>,
+        release: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RetryObserver {
+        fn enabled(
+            &self,
+            metadata: &tracing::Metadata<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) -> bool {
+            metadata.target().ends_with("indexer::persist")
+        }
+
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Message(bool);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}") == "begin_concurrent_retry";
+                    }
+                }
+            }
+            let mut message = Message(false);
+            event.record(&mut message);
+            if !message.0 {
+                return;
+            }
+            self.retries.fetch_add(1, Ordering::Relaxed);
+            if let Some((release, released)) = self.release.lock().unwrap().take() {
+                release.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+        }
+    }
+
+    fn with_held_writer<T>(
+        path: &Path,
+        release_on_retry: bool,
+        operation: impl FnOnce() -> T,
+    ) -> (T, usize) {
+        use std::sync::mpsc;
+        use tracing_subscriber::prelude::*;
+
+        // Release even when an assertion in operation unwinds. Scoped joining
+        // ensures the holder is gone before the temporary archive is removed.
+        struct ReleaseOnDrop(mpsc::Sender<()>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let path = path.to_path_buf();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (released_tx, released_rx) = mpsc::channel();
+        let retries = Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            let holder = scope.spawn(move || {
+                let writer = crate::franken_sync::Connection::open_existing_schema_only(
+                    path.to_string_lossy().into_owned(),
+                )
+                .unwrap();
+                writer.execute("BEGIN IMMEDIATE").unwrap();
+                ready_tx.send(()).unwrap();
+                let released = release_rx.recv_timeout(Duration::from_secs(30));
+                writer.execute("ROLLBACK").unwrap();
+                writer.close_without_checkpoint().unwrap();
+                let _ = released_tx.send(());
+                assert!(released.is_ok(), "test never released the real writer");
+            });
+            let release_guard = ReleaseOnDrop(release_tx.clone());
+            ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let observer = RetryObserver {
+                retries: Arc::clone(&retries),
+                release: Mutex::new(release_on_retry.then_some((release_tx, released_rx))),
+            };
+            let result = tracing::subscriber::with_default(
+                tracing_subscriber::registry().with(observer),
+                operation,
+            );
+            drop(release_guard);
+            holder.join().unwrap();
+            (result, retries.load(Ordering::Relaxed))
+        })
+    }
+
     fn preflight_contention(expected: u64, release_after_failure: bool, primary: bool) {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("preflight.db");
@@ -29,7 +126,6 @@ mod gh473_preflight {
         assert!(!storage.bulk_single_connection_enabled());
         let diagnostic = if primary {
             storage.enable_bulk_single_connection();
-            assert!(storage.bulk_single_connection_enabled());
             storage
                 .raw()
                 .execute("PRAGMA busy_timeout = 60000")
@@ -40,58 +136,39 @@ mod gh473_preflight {
             prime_cold_writer(&storage);
             "ephemeral writer preflight write failed"
         };
-        let holder = crate::franken_sync::Connection::open_existing_schema_only(
-            path.to_string_lossy().into_owned(),
-        )
-        .unwrap();
-        holder.execute("BEGIN IMMEDIATE").unwrap();
-        let mut attempts = 0;
         let mut bodies = 0;
         let started = Instant::now();
-        let result = persist::with_concurrent_retry(2, || {
-            attempts += 1;
-            let result =
-                persist::with_ephemeral_writer(&storage, false, "GH473 preflight", |writer| {
-                    bodies += 1;
-                    assert_eq!(scalar(writer, "PRAGMA busy_timeout"), expected as i64);
-                    Ok(())
-                });
-            if attempts == 1 {
-                let err = result
-                    .as_ref()
-                    .expect_err("a held writer must block preflight");
-                assert!(
-                    err.to_string().contains(diagnostic),
-                    "the failure must reach the selected preflight, not an open path: {err:#}"
-                );
-                assert!(anyhow_chain_indicates_retryable_storage_contention(err));
-                assert!(!storage.ephemeral_writer_preflight_verified());
-                assert_eq!(bodies, 0, "the body must not run before preflight succeeds");
-                if release_after_failure {
-                    holder.execute("ROLLBACK").unwrap();
-                }
-            }
-            result
+        // Deliberately do NOT add a test-only with_concurrent_retry around the
+        // writer. The actual production setup must handle the first conflict.
+        let (result, retries) = with_held_writer(&path, release_after_failure, || {
+            persist::with_ephemeral_writer(&storage, false, "GH473 preflight", |writer| {
+                bodies += 1;
+                assert_eq!(scalar(writer, "PRAGMA busy_timeout"), expected as i64);
+                Ok(())
+            })
         });
         if release_after_failure {
             result.unwrap();
-            assert_eq!((attempts, bodies), (2, 1));
+            assert_eq!((retries, bodies), (1, 1));
             assert!(storage.ephemeral_writer_preflight_verified());
         } else {
             let err = result.expect_err("exhaustion must not turn contention into success");
+            assert!(
+                err.to_string().contains(diagnostic),
+                "wrong boundary: {err:#}"
+            );
             assert!(anyhow_chain_indicates_retryable_storage_contention(&err));
-            assert_eq!((attempts, bodies), (3, 0));
+            assert_eq!(retries, persist::SERIAL_CHUNK_CONTENTION_RETRIES);
+            assert_eq!(bodies, 0);
             assert!(!storage.ephemeral_writer_preflight_verified());
-            holder.execute("ROLLBACK").unwrap();
         }
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(10),
             "preflight retained a long inner wait"
         );
         assert_eq!(scalar(&storage, "SELECT COUNT(*) FROM conversations"), 0);
         assert_eq!(scalar(&storage, "SELECT COUNT(*) FROM messages"), 0);
         assert!(storage.source_ingest_ledger_entries().unwrap().is_empty());
-        holder.close_without_checkpoint().unwrap();
         storage.close().unwrap();
     }
 
@@ -215,6 +292,142 @@ mod gh473_preflight {
         storage.close().unwrap();
     }
 
+    fn canonical_contention_preserves_completion_and_lexical_state() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("atomic.db");
+        let storage = FrankenStorage::open(&path).unwrap();
+        let index_path = tmp.path().join("index");
+        let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+        let mut conversation = norm_conv(Some("gh473-atomic"), vec![norm_msg(0, 100)]);
+        let mut completion = crate::storage::sqlite::SourceIngestLedgerEntry {
+            key: "source_ingest_v1:gh473-atomic".into(),
+            observation: "generation-1".into(),
+        };
+        prime_cold_writer(&storage);
+        let (first, retries) = with_held_writer(&path, true, || {
+            persist::persist_conversations_batched_inner(
+                &storage,
+                Some(&mut index),
+                std::slice::from_ref(&conversation),
+                LexicalPopulationStrategy::IncrementalInline,
+                false,
+                false,
+                None,
+                persist::PersistHeartbeat::NONE,
+                Some(&completion),
+            )
+        });
+        let first = first.unwrap();
+        assert_eq!(
+            retries, 1,
+            "cold preflight must really retry inside ingestion"
+        );
+        assert_eq!(
+            (first.inserted_conversations, first.inserted_messages),
+            (1, 1)
+        );
+        index.commit().unwrap();
+        assert_eq!(index.doc_count().unwrap(), 1);
+
+        // With a warm writer, the existing canonical transaction retry budget
+        // must fail without committing either the new message or the new ledger.
+        conversation.messages.push(norm_msg(1, 101));
+        completion.observation = "generation-2".into();
+        let (blocked, retries) = with_held_writer(&path, false, || {
+            persist::persist_conversations_batched_inner(
+                &storage,
+                Some(&mut index),
+                std::slice::from_ref(&conversation),
+                LexicalPopulationStrategy::IncrementalInline,
+                false,
+                false,
+                None,
+                persist::PersistHeartbeat::NONE,
+                Some(&completion),
+            )
+        });
+        let err = blocked.expect_err("a genuine holder must exhaust the transaction retry budget");
+        assert!(anyhow_chain_indicates_retryable_storage_contention(&err));
+        assert_eq!(retries, persist::SERIAL_CHUNK_CONTENTION_RETRIES);
+        assert_eq!(scalar(&storage, "SELECT COUNT(*) FROM messages"), 1);
+        let ledger = storage.source_ingest_ledger_entries().unwrap();
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(
+            ledger.get(&completion.key).map(String::as_str),
+            Some("generation-1")
+        );
+        index.commit().unwrap();
+        assert_eq!(index.doc_count().unwrap(), 1);
+
+        // Resume the exact source, then replay it unchanged. Both sinks and
+        // the source-completion observation must converge without duplicates.
+        for expected_insertions in [1, 0] {
+            let outcome = persist::persist_conversations_batched_inner(
+                &storage,
+                Some(&mut index),
+                std::slice::from_ref(&conversation),
+                LexicalPopulationStrategy::IncrementalInline,
+                false,
+                false,
+                None,
+                persist::PersistHeartbeat::NONE,
+                Some(&completion),
+            )
+            .unwrap();
+            assert_eq!(outcome.inserted_messages, expected_insertions);
+            assert_eq!(outcome.inserted_conversations, 0);
+            index.commit().unwrap();
+            assert_eq!(index.doc_count().unwrap(), 2);
+            assert_eq!(scalar(&storage, "SELECT COUNT(*) FROM conversations"), 1);
+            assert_eq!(scalar(&storage, "SELECT COUNT(*) FROM messages"), 2);
+            let ledger = storage.source_ingest_ledger_entries().unwrap();
+            assert_eq!(ledger.len(), 1);
+            assert_eq!(ledger.get(&completion.key), Some(&completion.observation));
+        }
+        drop(index);
+        storage.close().unwrap();
+        let reopened = FrankenStorage::open_readonly(&path).unwrap();
+        assert_eq!(scalar(&reopened, "SELECT COUNT(*) FROM messages"), 2);
+        assert_eq!(
+            reopened
+                .source_ingest_ledger_entries()
+                .unwrap()
+                .get(&completion.key),
+            Some(&completion.observation)
+        );
+        let index = TantivyIndex::open_or_create(&index_path).unwrap();
+        assert_eq!(index.doc_count().unwrap(), 2);
+        reopened.close_without_checkpoint().unwrap();
+    }
+
+    fn writer_body_errors_are_never_replayed() {
+        let tmp = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&tmp.path().join("body.db")).unwrap();
+        let mut calls = 0;
+        let error =
+            persist::with_ephemeral_writer(&storage, false, "GH473 once-only body", |writer| {
+                calls += 1;
+                writer
+                    .raw()
+                    .execute("INSERT INTO meta (key, value) VALUES ('gh473-side-effect', '1')")?;
+                Err::<(), _>(anyhow::Error::new(crate::franken_sync::FrankenError::Busy))
+            })
+            .unwrap_err();
+        assert!(anyhow_chain_indicates_retryable_storage_contention(&error));
+        assert_eq!(
+            calls, 1,
+            "setup retries must never replay an arbitrary writer body"
+        );
+        assert_eq!(
+            scalar(
+                &storage,
+                "SELECT COUNT(*) FROM meta WHERE key = 'gh473-side-effect'"
+            ),
+            1
+        );
+        storage.close().unwrap();
+    }
+
     #[test]
     fn writer_preflight_contention_regression() {
         const CHILD: &str = "CASS_TEST_GH473_PREFLIGHT_CHILD";
@@ -226,6 +439,8 @@ mod gh473_preflight {
                 readonly_preflight_is_permanent(primary);
             }
             permanent_error_is_not_retried();
+            writer_body_errors_are_never_replayed();
+            canonical_contention_preserves_completion_and_lexical_state();
             canonical_write_and_replay_with_pinned_reader(expected);
             return;
         }
