@@ -40,29 +40,60 @@ fn command(home: &Path, db: &Path) -> Command {
     command
 }
 
+fn message_content(ordinal: usize) -> String {
+    format!(
+        "gh473canonicaltoken persistent archive evidence for writer and reader coexistence message {ordinal}"
+    )
+}
+
 fn append_message(path: &Path, home: &Path, ordinal: usize) {
-    let mut file = OpenOptions::new().create(true).append(true).open(path).unwrap();
-    writeln!(file, "{}", json!({
-        "type": "user", "sessionId": "gh473-live-reader",
-        "uuid": format!("gh473-live-reader-{ordinal}"),
-        "timestamp": "2025-11-12T18:31:18.697Z", "cwd": home.to_string_lossy(),
-        "message": {"role": "user", "content": format!(
-            "gh473canonicaltoken persistent archive evidence for writer and reader coexistence message {ordinal}"
-        )}
-    })).unwrap();
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    writeln!(
+        file,
+        "{}",
+        json!({
+            "type": "user", "sessionId": "gh473-live-reader",
+            "uuid": format!("gh473-live-reader-{ordinal}"),
+            "timestamp": "2025-11-12T18:31:18.697Z", "cwd": home.to_string_lossy(),
+            "message": {"role": "user", "content": message_content(ordinal)}
+        })
+    )
+    .unwrap();
 }
 
 fn messages(storage: &FrankenStorage) -> Vec<(i64, String)> {
-    storage.raw().query("SELECT id, content FROM messages ORDER BY id").unwrap()
-        .iter().map(|row| (row.get_typed(0).unwrap(), row.get_typed(1).unwrap())).collect()
+    storage
+        .raw()
+        .query("SELECT id, content FROM messages ORDER BY id")
+        .unwrap()
+        .iter()
+        .map(|row| (row.get_typed(0).unwrap(), row.get_typed(1).unwrap()))
+        .collect()
 }
 
 fn index(home: &Path, data: &Path, db: &Path) {
     let output = command(home, db)
-        .args(["index", "--full", "--json", "--no-progress-events", "--data-dir"])
-        .arg(data).output().unwrap();
-    assert!(output.status.success(), "index failed: status={} stdout={} stderr={}",
-        output.status, String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        .args([
+            "index",
+            "--full",
+            "--json",
+            "--no-progress-events",
+            "--data-dir",
+        ])
+        .arg(data)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index failed: status={} stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["success"], true, "{payload}");
 }
@@ -84,6 +115,7 @@ fn gh473_real_cli_write_and_noop_replays_preserve_pinned_reader_and_lexical_stat
     reader.raw().execute("BEGIN").unwrap();
     let pinned_messages = messages(&reader);
     assert_eq!(pinned_messages.len(), 1);
+    assert_eq!(pinned_messages[0].1, message_content(0));
     let initial_ledger = reader.source_ingest_ledger_entries().unwrap();
     assert_eq!(initial_ledger.len(), 1);
     let (key, mut observation) = initial_ledger.into_iter().next().unwrap();
@@ -99,31 +131,54 @@ fn gh473_real_cli_write_and_noop_replays_preserve_pinned_reader_and_lexical_stat
             writeln!(OpenOptions::new().append(true).open(&source).unwrap()).unwrap();
         }
         index(home, &data, &db);
-        assert_eq!(messages(&reader), pinned_messages, "reader snapshot changed on pass {pass}");
+        assert_eq!(
+            messages(&reader),
+            pinned_messages,
+            "reader snapshot changed on pass {pass}"
+        );
         let current = FrankenStorage::open_readonly(&db).unwrap();
         let rows = messages(&current);
         assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], pinned_messages[0], "existing identity changed");
+        assert_eq!(rows[1].1, message_content(1));
+        let conversation_count = current
+            .raw()
+            .query_row("SELECT COUNT(*) FROM conversations")
+            .unwrap()
+            .get_typed::<i64>(0)
+            .unwrap();
+        assert_eq!(conversation_count, 1);
         if let Some(expected) = &expected_messages {
-            assert_eq!(&rows, expected, "no-op replay changed canonical identities or content");
+            assert_eq!(
+                &rows, expected,
+                "no-op replay changed canonical identities or content"
+            );
         } else {
             expected_messages = Some(rows);
         }
         let ledger = current.source_ingest_ledger_entries().unwrap();
         assert_eq!(ledger.len(), 1);
         let actual = ledger.get(&key).expect("same source identity");
-        assert_ne!(actual, &observation, "changed source was not acknowledged on pass {pass}");
+        assert_ne!(
+            actual, &observation,
+            "changed source was not acknowledged on pass {pass}"
+        );
         observation.clone_from(actual);
 
         // Inspect the publication before any search could heal a stale index.
         let checkpoint: Value = serde_json::from_slice(
-            &fs::read(index_path.join(".lexical-rebuild-state.json")).unwrap()
-        ).unwrap();
+            &fs::read(index_path.join(".lexical-rebuild-state.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(checkpoint["completed"], true, "{checkpoint}");
         assert_eq!(checkpoint["db"]["total_conversations"], 1);
         assert_eq!(checkpoint["db"]["total_messages"], 2);
         assert_eq!(checkpoint["indexed_docs"], 2);
         let fingerprint = searchable_index_fingerprint(&index_path).unwrap().unwrap();
-        assert_eq!(checkpoint["committed_meta_fingerprint"].as_str(), Some(fingerprint.as_str()));
+        assert_eq!(
+            checkpoint["committed_meta_fingerprint"].as_str(),
+            Some(fingerprint.as_str())
+        );
         assert_eq!(searchable_index_summary(&index_path).unwrap().unwrap().docs, 2);
         current.close_without_checkpoint().unwrap();
     }
@@ -131,6 +186,9 @@ fn gh473_real_cli_write_and_noop_replays_preserve_pinned_reader_and_lexical_stat
     reader.close_without_checkpoint().unwrap();
     let reopened = FrankenStorage::open_readonly(&db).unwrap();
     assert_eq!(messages(&reopened), expected_messages.unwrap());
-    assert_eq!(reopened.source_ingest_ledger_entries().unwrap().get(&key), Some(&observation));
+    assert_eq!(
+        reopened.source_ingest_ledger_entries().unwrap().get(&key),
+        Some(&observation)
+    );
     reopened.close_without_checkpoint().unwrap();
 }
