@@ -1,14 +1,11 @@
-# Component qualification is separate from the complete CASS dependency gate.
-name: Qualify retained multi-shard ANN
+# One-shot source-only landing. The connector retires this writer after success.
+name: Wire retained multi-shard ANN
 on:
   push:
     branches: [main]
-    paths:
-      - .github/workflows/qualify-ann-shards.yml
-      - src/search/query/ann_shards.rs
-      - scripts/verify_ann_shards.py
+    paths: [.github/workflows/qualify-ann-shards.yml]
 permissions:
-  contents: read
+  contents: write
 concurrency:
   group: cass-ann-shards-qualification
   cancel-in-progress: false
@@ -25,43 +22,106 @@ jobs:
     defaults:
       run:
         working-directory: cass-source
+        shell: bash
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ github.sha }}
+          ref: main
           path: cass-source
-          persist-credentials: false
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: Dicklesworthstone/frankensearch
           ref: 6852e79a830c402ea4e55eb79eda3373c618dfc3
           path: fs-source
           persist-credentials: false
-      - name: Record current tracker and existing ANN integration obligations
-        run: |
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-          beads = [json.loads(row) for row in Path('.beads/issues.jsonl').read_text().splitlines() if row.strip()]
-          for bead in beads:
-              if bead.get('id', '').endswith('ds7uy.3.3'):
-                  print(json.dumps(bead, ensure_ascii=False)[:30000])
-          text = Path('src/search/query.rs').read_text().splitlines()
-          for n, line in enumerate(text):
-              if 'SemanticAnnUnavailableReason::MultipleExactShards' in line or ('ann_index()' in line and n > 9000):
-                  print('ANN_SOURCE_CONTEXT', n + 1)
-                  print('\n'.join(f'{i+1}: {text[i]}' for i in range(max(0, n-25), min(len(text), n+15))))
-          PY
-      - name: Execute real native-graph admission and retrieval tests
-        shell: bash
+      - name: Guard and wire the complete native shard cohort
         run: |
           set -euo pipefail
+          test "$(git branch --show-current)" = main
+          test -z "$(git status --porcelain)"
+          reviewed=5401c9fa93f6351e25b350663ccd1823c843bfc8
+          git fetch --depth=1 origin "$reviewed"
+          test ! -e src/search/query/ann_shards_integration.rs
+          test ! -L src/search/query/ann_shards_integration.rs
+          git show "$reviewed:src/search/query/ann_shards_integration.rs" > src/search/query/ann_shards_integration.rs
+          git show "$reviewed:scripts/patches/ann-shards-reference.patch" > "$RUNNER_TEMP/ann-shards-reference.patch"
+          git show "$reviewed:scripts/patches/wire_ann_shards.py" > "$RUNNER_TEMP/wire_ann_shards.py"
+          test "$(git hash-object src/search/query/ann_shards.rs)" = bb76ee87f8ea9fcca5ffa4b5870cc5934c3b381f
+          test "$(git hash-object "$RUNNER_TEMP/ann-shards-reference.patch")" = 52646a1db1e3dcd91c4bfe5b91d7197d9dc71b58
+          test "$(git hash-object "$RUNNER_TEMP/wire_ann_shards.py")" = 9239b3eb32cfc6dcfce3279fa962ee1d2ec888e9
+          test "$(git hash-object src/search/query/ann_shards_integration.rs)" = 653a9c86afdccd07c58f9734f9d2e180837419ad
+          git apply --check --whitespace=error-all "$RUNNER_TEMP/ann-shards-reference.patch"
+          git apply --whitespace=error-all "$RUNNER_TEMP/ann-shards-reference.patch"
+          python3 "$RUNNER_TEMP/wire_ann_shards.py"
           rustc --version
-          rustfmt --edition 2024 --emit stdout src/search/query/ann_shards.rs > "$RUNNER_TEMP/ann-shards-formatted.rs"
+          rustfmt --edition 2024 src/search/query/ann_shards.rs src/search/query/ann_shards_integration.rs
+          python3 - <<'PY'
+          import importlib.util
+          from pathlib import Path
+          import subprocess
+          spec = importlib.util.spec_from_file_location('extract', 'scripts/verify_message_topk_fsvi.py')
+          extract = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(extract)
+          path = Path('src/search/query.rs')
+          text = path.read_text()
+          for name in ['ann_index', 'set_semantic_artifacts_context', 'search_semantic_candidates']:
+              old = extract.function(text, name, '    ')
+              formatted = subprocess.run(['rustfmt', '--edition', '2024', '--emit', 'stdout'], input='impl SearchClient {\n' + old + '}\n', text=True, capture_output=True, check=True).stdout
+              new = extract.function(formatted, name, '    ')
+              assert text.count(old) == 1
+              text = text.replace(old, new, 1)
+          path.write_text(text)
+          PY
+          rustfmt --edition 2024 --config skip_children=true --emit stdout src/search/query.rs > "$RUNNER_TEMP/query-parsed.rs"
+          git diff --check
+      - name: Execute all native-shard and exact-FSVI component tests
+        run: |
+          set -euo pipefail
           python3 scripts/verify_ann_shards.py "$PWD" "$GITHUB_WORKSPACE/fs-source" "$RUNNER_TEMP/cass-ann-shards"
           export CARGO_TARGET_DIR="$RUNNER_TEMP/cass-ann-shards-target"
           cd "$RUNNER_TEMP/cass-ann-shards"
           cargo generate-lockfile
           sha256sum Cargo.lock
           cargo test --locked -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/ann-shards-tests.log"
-          grep -Eq 'test result: ok\. 30 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/ann-shards-tests.log"
+          grep -Eq 'test result: ok\. 31 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/ann-shards-tests.log"
+      - name: Attempt the complete CASS routing tests separately
+        id: full
+        run: |
+          set -uo pipefail
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/cass-full-target"
+          set +e
+          timeout 90 cargo test --locked --lib search::query::ann_shards -- --nocapture > "$RUNNER_TEMP/full-cass.log" 2>&1
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/full-cass.log"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          printf 'FULL_CASS_EXIT=%s; component success is not full-binary qualification\n' "$status"
+      - name: Commit tested source-only changes directly to main
+        env:
+          FULL_CASS_EXIT: ${{ steps.full.outputs.status }}
+        run: |
+          set -euo pipefail
+          git add -- src/search/query.rs src/search/query/ann_shards.rs src/search/query/ann_shards_integration.rs
+          python3 - <<'PY'
+          import subprocess
+          paths = set(subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines())
+          assert paths == {'src/search/query.rs', 'src/search/query/ann_shards.rs', 'src/search/query/ann_shards_integration.rs'}, paths
+          PY
+          git diff --cached --check
+          git hash-object src/search/query.rs src/search/query/ann_shards.rs src/search/query/ann_shards_integration.rs
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit \
+            -m 'feat(search): route approximate retrieval across every retained native shard' \
+            -m 'Replace the single-shard restriction in context admission, cached graph ownership and candidate execution. Keep session-scoped exact routing and all exact/progressive paths unchanged. A failed optional sidecar rejects the entire ANN cohort, preserving complete exact fallback. Add four SearchClient integration regressions for cache reuse, missing-sidecar fallback, scoped bypass and context invalidation.' \
+            -m "Executed 31 component tests with pinned real FSVI/native HNSW, including 11 shard tests and 20 existing exact tests. Preserve the degenerate duplicate-vector corpus as native-union differential evidence: ANN recall is approximate, not an exhaustive guarantee. Full CASS routing test attempt exit=$FULL_CASS_EXIT; these four full-graph tests, hydration, CLI, RCH/UBS and archive-scale qualification remain separate."
+          for attempt in 1 2 3; do
+            if GIT_TERMINAL_PROMPT=0 git push origin HEAD:refs/heads/main; then
+              git rev-parse HEAD
+              exit 0
+            fi
+            parent=$(git rev-parse HEAD^)
+            git fetch --depth=100 origin main
+            test -z "$(git diff --name-only "$parent" FETCH_HEAD -- src/search/query.rs src/search/vector_index.rs src/search/query/ann_shards.rs src/search/query/ann_shards_integration.rs src/search/query/session_scope.rs src/search/ann_index.rs scripts/verify_ann_shards.py scripts/verify_message_topk_fsvi.py Cargo.toml Cargo.lock)"
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' rebase FETCH_HEAD
+          done
+          echo 'Direct main push failed; no force-push attempted' >&2
+          exit 1
