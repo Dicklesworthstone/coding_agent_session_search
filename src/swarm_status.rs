@@ -330,9 +330,15 @@ fn parse_git_status(bytes: &[u8]) -> Result<Value, String> {
     if !saw_head {
         return Err("missing git commit identity".to_string());
     }
+    // Use the same row contract as fixtures and the collision/evidence readers.
+    // Bare strings would silently disappear when consumers inspect `path`.
+    let dirty_paths: Vec<Value> = paths
+        .iter()
+        .map(|path| serde_json::json!({"path": path}))
+        .collect();
     Ok(
         serde_json::json!({"branch": branch, "head": head, "upstream": upstream,
-        "ahead": ahead, "behind": behind, "dirty": !paths.is_empty(), "dirty_paths": paths,
+        "ahead": ahead, "behind": behind, "dirty": !paths.is_empty(), "dirty_paths": dirty_paths,
         "recent_commits": null}),
     )
 }
@@ -1041,7 +1047,7 @@ mod tests {
         assert_eq!(value["dirty"], true);
         assert_eq!(
             value["dirty_paths"],
-            json!(["new name", "old\nname", "untracked"])
+            json!([{"path":"new name"}, {"path":"old\nname"}, {"path":"untracked"}])
         );
         assert!(value["ahead"].is_null());
         assert!(value["behind"].is_null());
@@ -1114,7 +1120,10 @@ mod tests {
         let value = collect_live_git(dir.path(), Instant::now()).expect("live Git snapshot");
         assert_eq!(value["branch"], "main");
         assert_eq!(value["dirty"], true);
-        assert_eq!(value["dirty_paths"], json!(["new.txt", "tracked.txt"]));
+        assert_eq!(
+            value["dirty_paths"],
+            json!([{"path":"new.txt"}, {"path":"tracked.txt"}])
+        );
         assert_eq!(fs::read(&tracked).expect("tracked bytes"), b"changed");
         assert_eq!(fs::read(&index_path).expect("index bytes"), index_before);
         assert_eq!(
@@ -1196,7 +1205,7 @@ mod tests {
             .collect();
         let dirty = collect_live_git(&parent, Instant::now()).expect("dirty submodule snapshot");
         assert_eq!(dirty["dirty"], true);
-        assert_eq!(dirty["dirty_paths"], json!(["module"]));
+        assert_eq!(dirty["dirty_paths"], json!([{"path":"module"}]));
         assert_eq!(
             dirty["repository"],
             parent.canonicalize().unwrap().to_str().unwrap()
