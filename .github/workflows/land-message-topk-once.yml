@@ -1,0 +1,102 @@
+# One-shot, hash-guarded transport for the exact-message retrieval fix. The
+# independent kernel tests below are not a substitute for the full CASS gate.
+name: Land bounded exact message retrieval
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/land-message-topk-once.yml
+      - scripts/patches/exact-message-refill.patch
+permissions:
+  contents: write
+concurrency:
+  group: cass-exact-message-refill-landing
+  cancel-in-progress: false
+jobs:
+  apply:
+    if: github.repository == 'Dicklesworthstone/coding_agent_session_search'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 1
+      - name: Verify source identities and apply the reviewed retrieval change
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import collections, json, re, subprocess
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          if git('branch', '--show-current') != 'main' or git('status', '--porcelain'):
+              raise SystemExit('Refusing non-main or dirty checkout')
+          expected = {
+              'src/search/query.rs': '5b553f2ba0409be25151f7d4209fe6f5c2a0d1f2',
+              'src/search/vector_index.rs': '7e2adc8aa0535af69cb478385b97d05ffb6df41d',
+              'src/search/query/message_topk.rs': '58f48c21f1d73cd9a55097dec1e6095f2a9f6753',
+              'scripts/patches/exact-message-refill.patch': 'a98cbb730b031733ff93dcd5a72eeeb362ac9b77',
+          }
+          for path, sha in expected.items():
+              if Path(path).is_symlink() or not Path(path).is_file() or git('hash-object', path) != sha:
+                  raise SystemExit('Changed source requires review: ' + path)
+          # The contents API cannot return the 8 MiB tracker. Read the actual
+          # exported records here without opening Beads' database or changing it.
+          beads = [json.loads(line) for line in Path('.beads/issues.jsonl').read_text().splitlines() if line.strip()]
+          print('Beads exported states:', dict(collections.Counter(item.get('status') for item in beads)))
+          selected = [item for item in beads if item.get('status') != 'closed' and re.search(r'semantic|chunk|retrieval|ANN', item.get('title', ''), re.I)]
+          for item in sorted(selected, key=lambda item: (item.get('priority', 9), item.get('id', '')))[:20]:
+              print('BEAD', json.dumps({key: item.get(key) for key in ('id', 'title', 'status', 'priority', 'assignee')}))
+          query = Path('src/search/query.rs').read_text()
+          for number, line in enumerate(query.splitlines(), 1):
+              if number > 10000 and ('search_exact_semantic_indexes' in line or 'exact_window_may_omit_competitor' in line):
+                  print('EXISTING_TEST_REFERENCE', number, line.strip())
+          patch = 'scripts/patches/exact-message-refill.patch'
+          subprocess.run(['git', 'apply', '--check', '--whitespace=error-all', patch], check=True)
+          subprocess.run(['git', 'apply', '--whitespace=error-all', patch], check=True)
+          PY
+      - name: Compile and execute the exact production selection kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --version
+          rustfmt --edition 2024 src/search/query/message_topk.rs
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json, os, re
+          vector = Path('src/search/vector_index.rs').read_text()
+          matches = re.findall(r'#\[derive\(Debug, Clone\)\]\npub struct VectorSearchResult \{\n.*?^\}', vector, re.S | re.M)
+          if len(matches) != 1:
+              raise SystemExit('Missing or ambiguous production result type')
+          kernel = Path('src/search/query/message_topk.rs').resolve()
+          source = '#![allow(dead_code)]\n' + matches[0] + '\n#[path = ' + json.dumps(str(kernel)) + ']\nmod message_topk;\n'
+          (Path(os.environ['RUNNER_TEMP']) / 'message-topk-tests.rs').write_text(source)
+          print('production kernel SHA256:', hashlib.sha256(kernel.read_bytes()).hexdigest())
+          PY
+          rustc --edition 2024 --test -O "$RUNNER_TEMP/message-topk-tests.rs" -o "$RUNNER_TEMP/message-topk-tests"
+          "$RUNNER_TEMP/message-topk-tests" --nocapture --test-threads=2 | tee "$RUNNER_TEMP/message-topk-tests.log"
+          grep -Eq 'test result: ok\. 12 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/message-topk-tests.log"
+          # Parse the complete modified module without reformatting unrelated
+          # lines in the large query file. This is not a CASS type check.
+          rustfmt --edition 2024 --config skip_children=true --emit stdout src/search/query.rs > "$RUNNER_TEMP/query-formatted.rs"
+      - name: Commit the tested kernel and production wiring directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add -- src/search/query.rs src/search/query/message_topk.rs
+          python3 - <<'PY'
+          import subprocess
+          paths = set(subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines())
+          if not paths or not paths <= {'src/search/query.rs', 'src/search/query/message_topk.rs'}:
+              raise SystemExit('Unexpected staged paths')
+          PY
+          git diff --cached --check
+          git hash-object src/search/query.rs src/search/query/message_topk.rs
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit \
+            -m 'fix(search): refill chunk-dominated exact results by distinct message' \
+            -m 'Keep the proven first-window fast path. When omitted chunks may beat the requested message cutoff, refill exact readers with retained messages excluded and refine score ties by message ID. Preserve all metadata/session predicates. Cap retained state per message page, prune every shard merge, and share a 64-refill budget across shards. Budget or backend failure returns an error, never an incorrect exact-success page.' \
+            -m 'Executed 12 tests of the exact production selection kernel, including 1,920 deterministic oracle comparisons, under the pinned Rust toolchain. Full query syntax parsed. Full CASS compilation, FSVI integration, Clippy and RCH qualification are not established by this dependency-independent check.'
+          GIT_TERMINAL_PROMPT=0 git push origin HEAD:refs/heads/main
+          git rev-parse HEAD
