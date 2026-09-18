@@ -32,17 +32,22 @@ use super::{
     ActivatedSemanticSearch, AdmittedTier, SemanticGenerationReader, SemanticReaderError,
     SemanticReaderResult, SemanticSearchBatch, canonical_document,
 };
+use crate::search::semantic_manifest::selection::SemanticSelectionMetadata;
 use crate::search::semantic_manifest::{
     SemanticArtifactRole, SemanticCorpusSnapshotIdentity, SemanticCurrentPointerV1,
     SemanticGenerationArtifact, SemanticGenerationError, SemanticGenerationManifestV1, TierKind,
-    ValidatedSemanticGeneration, load_current_semantic_generation,
+    ValidatedSemanticGeneration,
 };
+
+#[cfg(test)]
+use crate::search::semantic_manifest::load_current_semantic_generation;
 
 /// Admission limits on manifest-declared vector images, not a total RSS limit.
 ///
-/// The upstream admission API performs its own complete file read. Concurrent
-/// source-file growth, parser scratch, manifest hashing, and a retained previous
-/// generation during refresh are outside this preflight bound.
+/// Checked after bounded pointer/manifest validation but BEFORE any artifact
+/// is opened or hashed. The upstream admission API performs its own complete
+/// file read. Concurrent source-file growth, parser scratch, graph bytes and a
+/// retained previous generation during refresh are outside this preflight bound.
 #[derive(Debug, Clone, Copy)]
 pub struct SemanticSelectionBudget {
     pub max_declared_vector_bytes: u64,
@@ -53,6 +58,28 @@ impl Default for SemanticSelectionBudget {
         Self {
             max_declared_vector_bytes: 512 * 1024 * 1024,
         }
+    }
+}
+
+impl SemanticSelectionBudget {
+    fn check(self, manifest: &SemanticGenerationManifestV1) -> SemanticSelectionResult<()> {
+        let declared = manifest
+            .artifacts
+            .iter()
+            .filter(|artifact| {
+                matches!(
+                    artifact.role,
+                    SemanticArtifactRole::FastVector | SemanticArtifactRole::QualityVector
+                )
+            })
+            .try_fold(0_u64, |total, artifact| {
+                total.checked_add(artifact.size_bytes)
+            })
+            .ok_or(SemanticSelectionError::BudgetExceeded)?;
+        if declared > self.max_declared_vector_bytes || usize::try_from(declared).is_err() {
+            return Err(SemanticSelectionError::BudgetExceeded);
+        }
+        Ok(())
     }
 }
 
@@ -146,24 +173,9 @@ impl SelectedSemanticGeneration {
         } else {
             std::env::current_dir()?.join(data_dir)
         };
-        let selected = load_current_semantic_generation(&data_dir, Some(expected_corpus))?;
-        let declared = selected
-            .manifest
-            .artifacts
-            .iter()
-            .filter(|artifact| {
-                matches!(
-                    artifact.role,
-                    SemanticArtifactRole::FastVector | SemanticArtifactRole::QualityVector
-                )
-            })
-            .try_fold(0_u64, |total, artifact| {
-                total.checked_add(artifact.size_bytes)
-            })
-            .ok_or(SemanticSelectionError::BudgetExceeded)?;
-        if declared > budget.max_declared_vector_bytes || usize::try_from(declared).is_err() {
-            return Err(SemanticSelectionError::BudgetExceeded);
-        }
+        let metadata = SemanticSelectionMetadata::read(&data_dir, Some(expected_corpus))?;
+        budget.check(&metadata.manifest)?;
+        let selected = metadata.validate_artifacts(&data_dir)?;
 
         let fast = admit_tier(&selected, SemanticArtifactRole::FastVector)?;
         let quality = admit_tier(&selected, SemanticArtifactRole::QualityVector)?;
@@ -202,10 +214,11 @@ impl SelectedSemanticGeneration {
             ann: Arc::new(super::ann::AnnSelection::default()),
         };
         after_admission();
-        // Reuse the authoritative loader rather than a second, weaker parser.
-        // This hashes the declared artifacts again but never reopens a serving
-        // VectorIndex. An epoch-changing A -> B -> A selection is rejected too.
-        let confirmed = load_current_semantic_generation(&data_dir, Some(expected_corpus))?;
+        // All serving bytes are now owned and witness-checked. Revalidate the
+        // pointer and manifest through the SAME metadata parser, not every
+        // artifact pathname again. A later path rewrite cannot change a sealed
+        // owner. An epoch-changing A -> B -> A selection is still rejected.
+        let confirmed = SemanticSelectionMetadata::read(&data_dir, Some(expected_corpus))?;
         if confirmed.pointer != selected.pointer || confirmed.manifest != selected.manifest {
             return Err(SemanticSelectionError::SelectionChanged);
         }

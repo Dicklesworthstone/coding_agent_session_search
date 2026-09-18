@@ -38,6 +38,8 @@ mod shards;
 
 pub use shards::{SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION, SemanticArtifactShardV2};
 
+pub(crate) mod selection;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
@@ -2870,53 +2872,17 @@ pub fn load_current_semantic_generation(
     let mut pointer_for_log = None;
     let mut manifest_for_log = None;
     let result = (|| {
-        let pointer_path = SemanticCurrentPointerV1::path(data_dir);
-        match fs::symlink_metadata(&pointer_path) {
-            Ok(metadata) if metadata_is_link_or_reparse(&metadata) => {
-                return Err(SemanticGenerationError::InvalidPointer {
-                    reason: "current pointer must not be a symlink or reparse point".to_owned(),
-                });
-            }
-            Ok(metadata) if !metadata.is_file() => {
-                return Err(SemanticGenerationError::InvalidPointer {
-                    reason: "current pointer is not a regular file".to_owned(),
-                });
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(SemanticGenerationError::MissingPointer);
-            }
-            Err(error) => {
-                return Err(SemanticGenerationError::PointerIo {
-                    source: error.to_string(),
-                });
-            }
-        }
-        let pointer_bytes =
-            read_bounded_file(&pointer_path, MAX_SEMANTIC_POINTER_BYTES).map_err(|error| {
-                if error.kind() == std::io::ErrorKind::InvalidData {
-                    SemanticGenerationError::PointerParse {
-                        source: error.to_string(),
-                    }
-                } else {
-                    SemanticGenerationError::PointerIo {
-                        source: error.to_string(),
-                    }
-                }
-            })?;
-        let pointer = parse_current_pointer_bytes(&pointer_bytes)?;
-        pointer_for_log = Some(pointer.clone());
-        pointer.validate()?;
-        let loaded = load_manifest_selected_by_pointer(data_dir, &pointer)?;
-        manifest_for_log = Some(loaded.manifest.clone());
-        if let Some(expected) = expected_corpus
-            && expected != &loaded.manifest.corpus
-        {
-            return Err(SemanticGenerationError::StaleCorpus {
-                expected: corpus_identity_sha256(expected)?,
-                actual: corpus_identity_sha256(&loaded.manifest.corpus)?,
-            });
-        }
+        let selected = selection::read_observed(
+            data_dir,
+            expected_corpus,
+            &mut pointer_for_log,
+            &mut manifest_for_log,
+        )?;
+        let pointer = selected.pointer;
+        let loaded = LoadedManifest {
+            manifest: selected.manifest,
+            generation_dir: selected.generation_dir,
+        };
         let artifact_paths = loaded
             .manifest
             .validate_artifacts_on_disk(data_dir, false)?;
