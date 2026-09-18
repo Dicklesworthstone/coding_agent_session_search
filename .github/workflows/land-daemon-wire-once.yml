@@ -58,7 +58,9 @@ jobs:
           # Both full compressed and decoded identities must then match review.
           old, new = 'RvLfLFroCeosu/yRy', 'RvLfLFLOcOSU/yRy'
           assert transport.count(old) == 1
-          compressed = base64.b64decode(transport.replace(old, new, 1), validate=True)
+          transport = transport.replace(old, new, 1)
+          transport += '=' * (-len(transport) % 4)
+          compressed = base64.b64decode(transport, validate=True)
           assert blob(compressed) == '28e11062865a1a8c17efd0bfc5d3e387bd6f2320'
           patch = gzip.decompress(compressed)
           assert len(patch) == 44661
