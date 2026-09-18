@@ -173,13 +173,16 @@ fn augment_modern_codex_messages(
             .get(&raw_signature)
             .copied()
             .or_else(|| {
+                modern_codex_message_call_ids(&message)
+                    .find_map(|call_id| message_indices_by_call_id.get(&call_id).copied())
+            })
+            .or_else(|| {
                 message_indices_by_signature
                     .get(&message_signature)
                     .copied()
-            })
-            .or_else(|| {
-                modern_codex_message_call_ids(&message)
-                    .find_map(|call_id| message_indices_by_call_id.get(&call_id).copied())
+                    .filter(|index| {
+                        compatible_tool_call_identity(&conversation.messages[*index], &message)
+                    })
             });
 
         if let Some(existing_index) = existing_index {
@@ -261,13 +264,31 @@ fn response_item_message(
                 ),
             ))
         }
-        Some("function_call") => {
+        Some("function_call" | "custom_tool_call") => {
+            let freeform = payload.get("type").and_then(Value::as_str) == Some("custom_tool_call");
             let tool_name = payload
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
-            let arguments = payload.get("arguments").cloned();
-            let content = tool_call_content(tool_name, arguments.as_ref());
+            // Custom tools (notably apply_patch) carry literal `input`, not
+            // JSON-encoded `arguments`. Preserve even JSON-looking freeform
+            // input as a string; the invocation and searchable body must not
+            // silently change its type or whitespace.
+            let arguments = if freeform {
+                Some(Value::String(payload.get("input")?.as_str()?.to_string()))
+            } else {
+                payload.get("arguments").cloned()
+            };
+            let content = if freeform {
+                let input = arguments.as_ref()?.as_str()?;
+                if input.is_empty() {
+                    format!("[Tool: {tool_name}]")
+                } else {
+                    format!("[Tool: {tool_name}]\n{input}")
+                }
+            } else {
+                tool_call_content(tool_name, arguments.as_ref())
+            };
             let call_id = payload
                 .get("call_id")
                 .or_else(|| payload.get("id"))
@@ -284,7 +305,11 @@ fn response_item_message(
                     name: tool_name.to_string(),
                     raw_name: None,
                     call_id,
-                    arguments: arguments.and_then(normalize_invocation_arguments),
+                    arguments: if freeform {
+                        arguments
+                    } else {
+                        arguments.and_then(normalize_invocation_arguments)
+                    },
                 }],
             ))
         }
@@ -526,6 +551,27 @@ fn modern_codex_message_call_ids(message: &NormalizedMessage) -> impl Iterator<I
         .filter_map(|invocation| invocation.call_id.clone())
 }
 
+/// Identical tool text is not identical tool activity. Prefer native call IDs
+/// over the text fallback, and never merge distinct native IDs just because
+/// their timestamps, tool names, and arguments happen to match.
+fn compatible_tool_call_identity(
+    existing: &NormalizedMessage,
+    candidate: &NormalizedMessage,
+) -> bool {
+    let existing_has_id = existing.invocations.iter().any(|call| call.call_id.is_some());
+    let candidate_has_id = candidate.invocations.iter().any(|call| call.call_id.is_some());
+    !existing_has_id
+        || !candidate_has_id
+        || candidate.invocations.iter().any(|candidate_call| {
+            candidate_call.call_id.as_ref().is_some_and(|candidate_id| {
+                existing
+                    .invocations
+                    .iter()
+                    .any(|call| call.call_id.as_ref() == Some(candidate_id))
+            })
+        })
+}
+
 fn merge_modern_codex_tool_call(
     existing: &mut NormalizedMessage,
     candidate: &NormalizedMessage,
@@ -553,7 +599,20 @@ fn merge_modern_codex_tool_call(
             matched_invocation = true;
             let matched_call_id = existing_invocation.call_id.is_some()
                 && existing_invocation.call_id == candidate_invocation.call_id;
-            if existing_invocation.arguments.is_none() && candidate_invocation.arguments.is_some() {
+            let literal_custom_input = matched_call_id
+                && candidate
+                    .extra
+                    .pointer("/payload/type")
+                    .and_then(Value::as_str)
+                    == Some("custom_tool_call")
+                && candidate_invocation
+                    .arguments
+                    .as_ref()
+                    .is_some_and(Value::is_string);
+            if (existing_invocation.arguments.is_none() || literal_custom_input)
+                && candidate_invocation.arguments.is_some()
+                && existing_invocation.arguments != candidate_invocation.arguments
+            {
                 existing_invocation
                     .arguments
                     .clone_from(&candidate_invocation.arguments);
@@ -729,5 +788,152 @@ mod tests {
         assert_eq!(owner_ticks.load(Ordering::Relaxed), 2);
         assert_eq!(unrelated_ticks.load(Ordering::Relaxed), 0);
         let _ = unrelated;
+    }
+
+    fn response(payload: Value) -> Value {
+        serde_json::json!({
+            "type": "response_item",
+            "timestamp": "2026-06-28T10:00:05.000Z",
+            "payload": payload
+        })
+    }
+
+    fn custom_call(call_id: &str, input: &str) -> Value {
+        response(serde_json::json!({
+            "type": "custom_tool_call", "name": "apply_patch",
+            "call_id": call_id, "input": input
+        }))
+    }
+
+    fn conversation_at(path: &std::path::Path) -> NormalizedConversation {
+        NormalizedConversation {
+            agent_slug: "codex".to_string(),
+            external_id: Some("freeform-test".to_string()),
+            title: Some("freeform patch history".to_string()),
+            workspace: None,
+            source_path: path.to_path_buf(),
+            started_at: None,
+            ended_at: None,
+            metadata: Value::Null,
+            messages: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn custom_tool_input_is_searchable_without_reinterpreting_freeform_bytes() {
+        for input in [
+            "*** Begin Patch\n*** Add File: 日本語.rs\n+scope_marker\n*** End Patch\n",
+            " {\"cmd\":\"not a function argument\"} \n",
+            "123",
+            "",
+        ] {
+            let raw = custom_call("patch-1", input);
+            let parsed = modern_codex_message(&raw).expect("custom tool message");
+            assert_eq!(parsed.role, "assistant");
+            assert_eq!(parsed.extra, raw);
+            assert_eq!(parsed.invocations.len(), 1);
+            assert_eq!(parsed.invocations[0].call_id.as_deref(), Some("patch-1"));
+            assert_eq!(parsed.invocations[0].name, "apply_patch");
+            assert_eq!(parsed.invocations[0].arguments, Some(Value::String(input.to_string())));
+            let expected = if input.is_empty() {
+                "[Tool: apply_patch]".to_string()
+            } else {
+                format!("[Tool: apply_patch]\n{input}")
+            };
+            assert_eq!(parsed.content, expected);
+        }
+    }
+
+    #[test]
+    fn malformed_custom_input_is_not_invented_or_read_from_arguments() {
+        for input in [Value::Null, serde_json::json!(123), serde_json::json!({"cmd": "x"})] {
+            let raw = response(serde_json::json!({
+                "type": "custom_tool_call", "name": "apply_patch",
+                "call_id": "patch-1", "input": input, "arguments": "wrong field"
+            }));
+            assert!(modern_codex_message(&raw).is_none());
+        }
+        let function = response(serde_json::json!({
+            "type": "function_call", "name": "exec_command", "call_id": "shell-1",
+            "arguments": "{\"cmd\":\"git status\"}"
+        }));
+        let parsed = modern_codex_message(&function).expect("function call");
+        assert_eq!(parsed.invocations[0].arguments, Some(serde_json::json!({"cmd": "git status"})));
+        assert_eq!(parsed.content, "[Tool: exec_command]\n{\"cmd\":\"git status\"}");
+    }
+
+    #[test]
+    fn freeform_enrichment_keeps_distinct_native_calls_and_is_replay_stable() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("rollout-freeform.jsonl");
+        let input = "*** Begin Patch\n+same_input_distinct_calls\n*** End Patch\n";
+        let first = custom_call("patch-1", input);
+        let second = custom_call("patch-2", input);
+        let output = response(serde_json::json!({
+            "type": "function_call_output", "call_id": "patch-1", "output": "patch applied"
+        }));
+        std::fs::write(&path, format!("{first}\n{second}\n{output}\n"))?;
+        let before = std::fs::read(&path)?;
+        let mut conversation = conversation_at(&path);
+        augment_modern_codex_messages(&mut conversation, None);
+        assert_eq!(conversation.messages.len(), 3);
+        for (index, expected) in ["patch-1", "patch-2"].into_iter().enumerate() {
+            let call = &conversation.messages[index];
+            assert_eq!(call.invocations.len(), 1);
+            assert_eq!(call.invocations[0].call_id.as_deref(), Some(expected));
+            assert!(call.content.contains("same_input_distinct_calls"));
+        }
+        assert_eq!(conversation.messages[2].role, "tool");
+        let snapshot = serde_json::to_value(&conversation)?;
+        augment_modern_codex_messages(&mut conversation, None);
+        assert_eq!(serde_json::to_value(&conversation)?, snapshot);
+        assert_eq!(std::fs::read(&path)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn freeform_enrichment_updates_fad_placeholders_in_place() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("rollout-placeholders.jsonl");
+        let first = custom_call("patch-1", "same patch bytes");
+        let second = custom_call("patch-2", "same patch bytes");
+        std::fs::write(&path, format!("{first}\n{second}\n"))?;
+        let mut conversation = conversation_at(&path);
+        for (idx, raw) in [&first, &second].into_iter().enumerate() {
+            let mut canonical = modern_codex_message(raw).expect("canonical call");
+            canonical.idx = idx as i64;
+            canonical.content = "[Tool: apply_patch]".to_string();
+            // FAD deliberately compacts extra on large rollouts, so raw-record
+            // matching cannot be the only way to find this canonical message.
+            canonical.extra = serde_json::json!({"compacted": true, "slot": idx});
+            conversation.messages.push(canonical);
+        }
+        let identity = conversation.messages.iter().map(|message| (
+            message.idx, message.created_at, message.extra.clone(), message.invocations.clone()
+        )).collect::<Vec<_>>();
+        augment_modern_codex_messages(&mut conversation, None);
+        assert_eq!(conversation.messages.len(), 2);
+        for (message, expected) in conversation.messages.iter().zip(identity) {
+            assert_eq!(message.content, "[Tool: apply_patch]\nsame patch bytes");
+            assert_eq!((message.idx, message.created_at, message.extra.clone(), message.invocations.clone()), expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn freeform_enrichment_repairs_json_looking_input_without_replacing_identity() {
+        let raw = custom_call("patch-1", " 123 \n");
+        let candidate = modern_codex_message(&raw).expect("literal custom input");
+        let mut canonical = candidate.clone();
+        canonical.idx = 12;
+        canonical.content = "[Tool: apply_patch]".to_string();
+        canonical.extra = serde_json::json!({"compacted": true});
+        canonical.invocations[0].arguments = Some(serde_json::json!(123));
+        assert!(merge_modern_codex_tool_call(&mut canonical, &candidate));
+        assert_eq!(canonical.invocations[0].arguments, Some(Value::String(" 123 \n".to_string())));
+        assert_eq!(canonical.idx, 12);
+        assert_eq!(canonical.extra, serde_json::json!({"compacted": true}));
+        assert_eq!(canonical.created_at, candidate.created_at);
+        assert!(!merge_modern_codex_tool_call(&mut canonical, &candidate));
     }
 }
