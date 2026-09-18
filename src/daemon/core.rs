@@ -6,6 +6,10 @@
 mod inference;
 mod job_requests;
 mod wire;
+mod startup;
+
+#[cfg(test)]
+mod startup_integration;
 
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder};
@@ -29,7 +33,7 @@ use tracing::{debug, error, info, warn};
 
 use super::models::ModelManager;
 use super::protocol::{
-    ErrorCode, ErrorResponse, FramedMessage, HealthStatus, MAX_FRAME_BYTES, ModelInfo,
+    ErrorCode, ErrorResponse, FramedMessage, HealthStatus, MAX_FRAME_BYTES,
     PROTOCOL_VERSION, Request, Response, StatusResponse, decode_message, default_socket_path,
     encode_message,
 };
@@ -551,8 +555,40 @@ impl ModelDaemon {
         Ok(())
     }
 
-    /// Start the daemon server.
+    /// Start serving control requests immediately while an owned worker warms
+    /// models. The worker is joined before the daemon can return.
     pub fn run(&self) -> std::io::Result<()> {
+        self.run_with_model_warmup(|| self.prewarm_models())
+    }
+
+    fn prewarm_models(&self) {
+        use startup::WarmupStage;
+        info!("Pre-warming models while control requests remain available");
+        startup::run_stages(&self.shutdown, |stage| match stage {
+            WarmupStage::Embedder => {
+                if let Err(error) = self.models.warm_embedder() {
+                    warn!(error = %error, "Failed to pre-warm embedder");
+                }
+            }
+            WarmupStage::Attestation => {
+                // Do not retry a failed native load merely to attest it.
+                if self.models.is_ready()
+                    && let Err(error) = self.initialize_attestation()
+                {
+                    warn!(error = %error, "Producer-attested daemon channel is unavailable");
+                }
+            }
+            WarmupStage::Reranker => {
+                if let Err(error) = self.models.warm_reranker() {
+                    warn!(error = %error, "Failed to pre-warm reranker");
+                }
+            }
+        });
+        self.touch_activity();
+        info!(cancelled = self.shutdown.load(Ordering::Acquire), "Model pre-warming finished");
+    }
+
+    fn run_with_model_warmup(&self, warmup: impl FnOnce() + Send) -> std::io::Result<()> {
         // Use a file lock to ensure only one daemon instance runs for this socket path
         let lock_path = daemon_run_lock_path(&self.config.socket_path);
 
@@ -631,23 +667,14 @@ impl ModelDaemon {
             "Daemon listening"
         );
 
-        // Pre-warm models if available
-        info!("Pre-warming models...");
-        if let Err(e) = self.models.warm_embedder() {
-            warn!(error = %e, "Failed to pre-warm embedder");
-        }
-        if let Err(e) = self.models.warm_reranker() {
-            warn!(error = %e, "Failed to pre-warm reranker");
-        }
-        if let Err(error) = self.initialize_attestation() {
-            warn!(error = %error, "Producer-attested daemon channel is unavailable");
-        }
-        info!("Model pre-warming complete");
-
-        // Start background embedding worker
+        // The worker is independently owned and can accept explicit jobs even
+        // while the foreground model is starting.
         self.init_worker();
 
-        std::thread::scope(|s| {
+        let serving_result = std::thread::scope(|s| -> std::io::Result<()> {
+            let startup = startup::StartupWarmup::spawn(
+                s, &self.inference_gate, &self.shutdown, warmup,
+            )?;
             loop {
                 // Check for shutdown
                 if self.shutdown.load(Ordering::SeqCst) {
@@ -656,7 +683,7 @@ impl ModelDaemon {
                 }
 
                 // Check for idle shutdown
-                if self.should_shutdown_idle() {
+                if startup.is_finished() && self.should_shutdown_idle() {
                     info!(
                         idle_secs = self.config.idle_timeout.as_secs(),
                         "Idle timeout reached, shutting down"
@@ -693,7 +720,7 @@ impl ModelDaemon {
                 // fresh"): checked at most once a second; the actual spawn is
                 // a detached `cass index --background` child so the daemon's
                 // own memory/latency profile is untouched.
-                if last_index_check.elapsed() >= Duration::from_secs(1) {
+                if startup.is_finished() && last_index_check.elapsed() >= Duration::from_secs(1) {
                     last_index_check = Instant::now();
                     if periodic_index_due(
                         self.config.index_interval,
@@ -742,15 +769,19 @@ impl ModelDaemon {
             // Idle and memory-limit exits must cancel socket reads and the
             // embedding worker before the scope joins connection handlers.
             self.request_shutdown();
+            startup.join()
         });
 
+        // A startup-thread spawn failure also needs to stop the already-owned
+        // background worker before cleanup. No abandoned loader/writer escapes.
+        self.request_shutdown();
         let worker_result = self.finish_worker();
 
         // Cleanup only after the owned worker has stopped writing.
         cleanup_bound_socket(&public_path, &bind_path);
 
         info!("Daemon stopped");
-        worker_result
+        serving_result.and(worker_result)
     }
 
     /// Handle a single client connection.
@@ -906,21 +937,8 @@ impl ModelDaemon {
             | Request::RerankAttested { .. }) => inference::handle(self, request, inference_timeout),
 
             Request::Status => {
-                let embedder_info = ModelInfo {
-                    id: self.models.embedder_id().to_string(),
-                    name: self.models.embedder_name().to_string(),
-                    dimension: Some(self.models.embedder_dimension()),
-                    loaded: self.models.embedder_loaded(),
-                    memory_bytes: 0, // Would need model-specific tracking
-                };
-
-                let reranker_info = ModelInfo {
-                    id: self.models.reranker_id().to_string(),
-                    name: self.models.reranker_name().to_string(),
-                    dimension: None,
-                    loaded: self.models.reranker_loaded(),
-                    memory_bytes: 0,
-                };
+                let embedder_info = self.models.embedder_info();
+                let reranker_info = self.models.reranker_info();
 
                 Response::Status(StatusResponse {
                     uptime_secs: self.uptime_secs(),
