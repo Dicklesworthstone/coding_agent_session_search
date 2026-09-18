@@ -1,19 +1,13 @@
-name: Qualify sharded corpus membership
+# Both runtime implementations landed; this workflow cannot modify repository refs.
+name: Verify semantic publications
 on:
-  push:
-    branches: [main]
-    paths: [.github/workflows/qualify-sharded-publication.yml]
+  workflow_dispatch:
 permissions:
   contents: read
-concurrency:
-  group: cass-sharded-publication-landing
-  cancel-in-progress: false
 jobs:
-  qualify-and-land:
+  production-components:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
-    permissions:
-      contents: write
+    timeout-minutes: 20
     env:
       RUSTUP_TOOLCHAIN: nightly-2026-08-31
       CARGO_BUILD_JOBS: '2'
@@ -21,166 +15,67 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_TERM_COLOR: never
       RUST_MIN_STACK: '16777216'
-      CARGO_TARGET_DIR: /tmp/cass-membership-target
-    defaults:
-      run:
-        working-directory: cass-source
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: main
+          ref: ${{ github.sha }}
           path: cass-source
+          persist-credentials: false
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: Dicklesworthstone/frankensearch
           ref: 6852e79a830c402ea4e55eb79eda3373c618dfc3
           path: fs-source
           persist-credentials: false
-      - name: Guard the published implementation and install seven regression tests only
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Execute actual immutable publication modules in the independent component package
+        shell: bash
         run: |
           set -euo pipefail
-          test "$(git branch --show-current)" = main
-          test -z "$(git status --porcelain)"
-          mkdir -p "$RUNNER_TEMP/membership-evidence"
-          python3 - <<'PY'
-          import base64, hashlib, json, lzma, os, subprocess
-          from pathlib import Path
-          def blob(data):
-              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-          before = {
-              'src/search/semantic_manifest.rs': 'fa8e9b01b7e2dd6fa005c1e4ef1725e88e427d5e',
-              'src/search/semantic_reader/publication.rs': 'b39fc380066cc22c64ac7a98aec495265c7127f5',
-              'src/search/semantic_reader/publication/live_docset.rs': '8a53b0e7e3613aab4b385099cb8f40d6dcacfe74',
-              'src/search/semantic_reader/publication/tests/sharded.rs': 'eb7faaf794fa6669d125e8329c6ac58e38036c6f',
-              'scripts/verify_sharded_publication.py': '9f83ca7ce9a71c439ced830ab38b58c9782dda30',
-          }
-          for name, sha in before.items():
-              assert not Path(name).is_symlink() and blob(Path(name).read_bytes()) == sha, name
-          for name in ['src/search/semantic_reader/publication/coverage.rs', 'src/search/semantic_reader/publication/tests/sharded/coverage.rs']:
-              assert not Path(name).exists() and not Path(name).is_symlink()
-          record = json.loads(subprocess.check_output(['gh', 'api', 'repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs/89c629cd99c332226f8c110b5f7e0e36c3f0f2ad'], text=True))
-          compressed = base64.b64decode(record['content'])
-          assert blob(compressed) == '89c629cd99c332226f8c110b5f7e0e36c3f0f2ad'
-          data = lzma.decompress(compressed)
-          assert blob(data) == 'bb6921179af447ad93dff127cfd0b97b7c233392'
-          text = data.decode()
-          old = '    assert!(matches!(result, Err(SemanticSelectionError::ArtifactMismatch { field: "partial_live_docset", .. })),\n        "partial tier admitted a document outside the authenticated full corpus");'
-          new = '    match result {\n        Err(SemanticSelectionError::ArtifactMismatch { field: "partial_live_docset", .. }) => {}\n        Ok(_) => panic!("partial tier admitted a document outside the authenticated full corpus"),\n        Err(error) => panic!("unexpected admission failure before membership check: {error}"),\n    }'
-          assert text.count(old) == 1
-          data = text.replace(old, new).encode()
-          assert blob(data) == '77729f4c54430df196963ecac8549cc724c60eaf'
-          path = Path('src/search/semantic_reader/publication/tests/sharded/coverage.rs')
-          path.parent.mkdir(parents=True, exist_ok=True)
-          path.write_bytes(data)
-          path = Path('src/search/semantic_reader/publication/tests/sharded.rs')
-          path.write_text(path.read_text() + '\nmod coverage;\n')
-          assert blob(path.read_bytes()) == 'e78e65452fd2936f38494a1de48f32721abbf594'
-          path = Path('scripts/verify_sharded_publication.py')
-          text = path.read_text()
-          needle = '    spec = importlib.util.spec_from_file_location'
-          assert text.count(needle) == 1
-          text = text.replace(needle, "    integration = root / 'tests/semantic_generation_manifest.rs'\n    (dest / 'tests').mkdir()\n    shutil.copy2(integration, dest / 'tests/semantic_generation_manifest.rs')\n    sources.append(integration)\n" + needle)
-          needle = "        '[dependencies]\\nfrankensearch="
-          assert text.count(needle) == 1
-          text = text.replace(needle, "        '[lib]\\nname=\"coding_agent_search\"\\n'\n" + needle)
-          path.write_text(text)
-          assert blob(path.read_bytes()) == '9288e799fa9dc2590c6167a20cb468da4c7e5c63'
-          evidence = Path(os.environ['RUNNER_TEMP']) / 'membership-evidence'
-          (evidence / 'base.txt').write_text(subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True))
-          (evidence / 'red-production-blob.txt').write_text(blob(Path('src/search/semantic_reader/publication.rs').read_bytes()))
-          PY
-          rustup component add rustfmt
-          rustfmt --edition 2024 --config skip_children=true src/search/semantic_reader/publication/tests/sharded.rs src/search/semantic_reader/publication/tests/sharded/coverage.rs
-      - name: RED - require both foreign partial tiers to be wrongly admitted by unchanged production code
-        run: |
-          set -euo pipefail
-          python3 scripts/verify_sharded_publication.py "$PWD" "$GITHUB_WORKSPACE/fs-source" "$RUNNER_TEMP/membership-red"
-          cd "$RUNNER_TEMP/membership-red"
+          mkdir -p "$RUNNER_TEMP/evidence"
+          python3 cass-source/scripts/verify_sharded_publication.py "$GITHUB_WORKSPACE/cass-source" "$GITHUB_WORKSPACE/fs-source" "$RUNNER_TEMP/components"
+          cp "$RUNNER_TEMP/components/source-receipt.json" "$RUNNER_TEMP/evidence/"
+          cd "$RUNNER_TEMP/components"
           cargo generate-lockfile
-          cp Cargo.lock "$RUNNER_TEMP/membership-evidence/component-Cargo.lock"
-          code=0
-          timeout 900 cargo test --locked --lib must_belong_to_the_complete -- --nocapture --test-threads=2 > "$RUNNER_TEMP/membership-evidence/red.log" 2>&1 || code=$?
-          cat "$RUNNER_TEMP/membership-evidence/red.log"
-          printf '%s\n' "$code" > "$RUNNER_TEMP/membership-evidence/red-exit.txt"
-          test "$code" = 101
-          grep -Eq 'test result: FAILED\. 0 passed; 2 failed; 0 ignored;' "$RUNNER_TEMP/membership-evidence/red.log"
-          test "$(grep -c '^partial tier admitted a document outside the authenticated full corpus$' "$RUNNER_TEMP/membership-evidence/red.log")" = 2
-      - name: GREEN - enforce subset membership and execute the complete suite on the same dependency lock
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
+          cp Cargo.lock "$RUNNER_TEMP/evidence/component-Cargo.lock"
+          cargo test --locked --lib -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/evidence/unit.log"
+          cargo test --locked --test semantic_generation_manifest -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/evidence/process.log"
           python3 - <<'PY'
-          import base64, hashlib, json, os, subprocess
+          import os, re
           from pathlib import Path
-          def blob(data):
-              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-          p = Path('src/search/semantic_reader/publication.rs')
-          assert blob(p.read_bytes()) == 'b39fc380066cc22c64ac7a98aec495265c7127f5'
-          record = json.loads(subprocess.check_output(['gh', 'api', 'repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs/fc586634768228875eac68e9416d4c8a1f9658d6'], text=True))
-          data = base64.b64decode(record['content'])
-          assert blob(data) == 'fc586634768228875eac68e9416d4c8a1f9658d6'
-          Path('src/search/semantic_reader/publication/coverage.rs').write_bytes(data)
-          text = p.read_text()
-          assert text.count('mod live_docset;') == 1
-          text = text.replace('mod live_docset;', 'mod live_docset;\nmod coverage;')
-          needle = '            let fast_images: HashSet<_> = fast'
-          assert text.count(needle) == 1
-          text = text.replace(needle, '            if selected.manifest.schema_version\n                == crate::search::semantic_manifest::SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION\n            {\n                coverage::validate(fast, quality, selected.manifest.corpus.document_count)?;\n            }\n' + needle)
-          p.write_text(text)
-          assert blob(p.read_bytes()) == 'e3510039129e0fa817b7d6a3650e7e52ae38dafd'
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'evidence'
+          for name, minimum in [('unit.log', 147), ('process.log', 4)]:
+              counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed; 0 ignored;', (evidence / name).read_text())
+              assert counts and max(map(int, counts)) >= minimum, name
           PY
-          rustfmt --edition 2024 --config skip_children=true src/search/semantic_reader/publication.rs src/search/semantic_reader/publication/coverage.rs
-          git diff --check
-          python3 scripts/verify_sharded_publication.py "$PWD" "$GITHUB_WORKSPACE/fs-source" "$RUNNER_TEMP/membership-green"
-          cp "$RUNNER_TEMP/membership-red/Cargo.lock" "$RUNNER_TEMP/membership-green/Cargo.lock"
-          cp "$RUNNER_TEMP/membership-green/source-receipt.json" "$RUNNER_TEMP/membership-evidence/source-receipt.json"
-          cd "$RUNNER_TEMP/membership-green"
-          timeout 180 cargo test --locked --lib -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/membership-evidence/green.log"
-          grep -Eq 'test result: ok\. 147 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/membership-evidence/green.log"
-          timeout 120 cargo test --locked --test semantic_generation_manifest -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/membership-evidence/process-contracts.log"
-          grep -Eq 'test result: ok\. 4 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/membership-evidence/process-contracts.log"
-          cmp Cargo.lock "$RUNNER_TEMP/membership-evidence/component-Cargo.lock"
-      - name: Record shipping locked-CASS result without modifying its dependency contract
-        run: |
-          set -euo pipefail
-          code=0
-          timeout 120 cargo test --locked --lib search::semantic_reader::publication::tests::sharded -- --nocapture > "$RUNNER_TEMP/membership-evidence/locked-cass.log" 2>&1 || code=$?
-          printf '%s\n' "$code" > "$RUNNER_TEMP/membership-evidence/locked-cass-exit.txt"
-          cat "$RUNNER_TEMP/membership-evidence/locked-cass.log"
-          git diff --exit-code -- Cargo.toml Cargo.lock build.rs
-      - name: Commit proved membership and restart changes directly to main
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import hashlib, json, os, subprocess
-          from pathlib import Path
-          paths = ['src/search/semantic_reader/publication.rs', 'src/search/semantic_reader/publication/coverage.rs', 'src/search/semantic_reader/publication/tests/sharded.rs', 'src/search/semantic_reader/publication/tests/sharded/coverage.rs', 'scripts/verify_sharded_publication.py']
-          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
-          untracked = set(subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard'], text=True).splitlines())
-          assert changed | untracked == set(paths)
-          evidence = Path(os.environ['RUNNER_TEMP']) / 'membership-evidence'
-          receipt = {}
-          for name in paths:
-              data = Path(name).read_bytes()
-              receipt[name] = {'git_blob': hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest(), 'sha256': hashlib.sha256(data).hexdigest()}
-              out = evidence / 'source' / name
-              out.parent.mkdir(parents=True, exist_ok=True)
-              out.write_bytes(data)
-          (evidence / 'published-source.json').write_text(json.dumps(receipt, indent=2))
-          subprocess.run(['git', 'add', '--', *paths], check=True)
-          PY
-          git diff --cached --check
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'fix(search): bind partial semantic tiers to the authenticated selected corpus' -m 'Require partial fast/quality tiers to be subsets of the complete companion corpus through retained FSVI-order merge walks. No extra corpus-sized ID set or file opens; two partial tiers still rely on publication commitments. Prove both previously accepted foreign-document cases RED against unchanged parent production code, then GREEN with the same engine and dependency lock. Add sparse-coverage, failed-refresh, cross-version rollback, retained-lease and fresh-process multi-shard retrieval tests. All 147 component unit tests and four existing public-manifest process contracts passed. These actual production modules in a separate package do not qualify the full CASS binary; shipping dependency publication and progressive CLI integration remain separate. No model, archive, dependency-pin or repository lockfile changes.'
-          git push origin HEAD:main
-          git rev-parse HEAD | tee "$RUNNER_TEMP/membership-evidence/runtime-commit.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: sharded-membership-evidence-${{ github.sha }}
-          path: ${{ runner.temp }}/membership-evidence/
+          name: semantic-publication-components-${{ github.sha }}
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 14
+  shipping-cass:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Test the complete CASS crate under its unchanged shipping lockfile
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          cargo test --locked --lib search::semantic_reader::publication::tests::sharded -- --nocapture 2>&1 | tee "$RUNNER_TEMP/evidence/shipping-unit.log"
+          cargo test --locked --test semantic_generation_manifest -- --nocapture 2>&1 | tee "$RUNNER_TEMP/evidence/shipping-process.log"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: semantic-publication-shipping-${{ github.sha }}
+          path: ${{ runner.temp }}/evidence/
           retention-days: 14
