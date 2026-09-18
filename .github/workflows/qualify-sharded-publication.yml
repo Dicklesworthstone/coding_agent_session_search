@@ -1,4 +1,4 @@
-name: Qualify sharded semantic publication
+name: Land qualified sharded publication
 on:
   push:
     branches: [main]
@@ -9,168 +9,95 @@ concurrency:
   group: cass-sharded-publication-landing
   cancel-in-progress: false
 jobs:
-  qualify-and-land:
+  land-tested-source:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 10
     permissions:
       contents: write
+      actions: read
     env:
+      GH_TOKEN: ${{ github.token }}
       RUSTUP_TOOLCHAIN: nightly-2026-08-31
       CARGO_BUILD_JOBS: '2'
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_TERM_COLOR: never
-      RUST_MIN_STACK: '16777216'
-    defaults:
-      run:
-        working-directory: cass-source
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: main
-          path: cass-source
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          repository: Dicklesworthstone/frankensearch
-          ref: 6852e79a830c402ea4e55eb79eda3373c618dfc3
-          path: fs-source
-          persist-credentials: false
-      - name: Guard and apply the complete shard-publication implementation
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Reuse only the exact immutable source that passed all 140 component tests
+        shell: bash
         run: |
           set -euo pipefail
           test "$(git branch --show-current)" = main
           test -z "$(git status --porcelain)"
-          mkdir -p "$RUNNER_TEMP/shard-evidence"
+          mkdir -p "$RUNNER_TEMP/landing-evidence"
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/10567499466/zip" > "$RUNNER_TEMP/qualified.zip"
           python3 - <<'PY'
-          import base64, hashlib, json, lzma, os, subprocess
+          import hashlib, json, os, subprocess, zipfile
           from pathlib import Path
           def blob(data):
               return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-          def patch_blob(sha, digest, name):
-              record = json.loads(subprocess.check_output(['gh', 'api', 'repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs/' + sha], text=True))
-              compressed = base64.b64decode(record['content'])
-              assert blob(compressed) == sha
-              patch = lzma.decompress(compressed)
-              assert hashlib.sha256(patch).hexdigest() == digest
-              path = evidence / name
-              path.write_bytes(patch)
-              subprocess.run(['git', 'apply', '--check', '--whitespace=error-all', str(path)], check=True)
-              subprocess.run(['git', 'apply', str(path)], check=True)
+          archive = Path(os.environ['RUNNER_TEMP']) / 'qualified.zip'
+          assert hashlib.sha256(archive.read_bytes()).hexdigest() == 'f2feba4ae1d2c96ca8addace054f9279abd36cb8391d531bb01a569e2a9e2966'
+          z = zipfile.ZipFile(archive)
+          assert z.read('base.txt').decode().strip() == 'cac29f8a1bb7f515dcd7c4dd97068813930e8230'
+          assert 'test result: ok. 140 passed; 0 failed; 0 ignored;' in z.read('tests.log').decode()
+          assert 'test result: ok. 14 passed; 0 failed; 0 ignored;' in z.read('new-tests.log').decode()
+          assert 'failed to select a version for the requirement `frankensearch = "=0.6.1"`' in z.read('locked-cass.log').decode()
           expected = {
-              'src/search/semantic_manifest.rs': ('45e12506457d0b9823d25fd65e08a9a7a3cc83a0', '259c5727ca9a6c001236bed10bd897cb69481288'),
-              'src/search/semantic_manifest/shards.rs': (None, '27a2b64f60018ea721b8e408f401c05792439f62'),
-              'src/search/semantic_reader/publication.rs': ('8b5f6cbbb48decf1e30e5450bd936a3252983243', '60586aec802c850f76f8de202bb2746ed33ea42d'),
-              'src/search/semantic_reader/ann.rs': ('404b7025c7c09bc977292715f23c287e3060a8fd', '02c35f4ba101be5b8904c049772a69f94ec33d39'),
-              'src/search/semantic_reader/publication/tests.rs': ('6a5c8b816c45752e57818661d01c31529a6fbaa5', 'f040dd2c470b2aa7a2d0d32192ba25fabd44d919'),
-              'src/search/semantic_reader/publication/tests/sharded.rs': (None, 'de5d3ee9f683751097925ebd4c44c656edabf61b'),
-              'tests/semantic_generation_manifest.rs': ('275709bdfe1df49f4196e5b5490e46b5648cc2d9', '6d576d8e2983884af3e93ae672d946e000ba1a3c'),
-              'scripts/verify_sharded_publication.py': (None, '1750c18e417cd390d1104128790ffd7c91c7095e'),
+              'src/search/semantic_manifest.rs': ('45e12506457d0b9823d25fd65e08a9a7a3cc83a0', 'fa8e9b01b7e2dd6fa005c1e4ef1725e88e427d5e'),
+              'src/search/semantic_manifest/shards.rs': (None, '77717470595071c9db20690624a77d3ff3dd9371'),
+              'src/search/semantic_reader/publication.rs': ('8b5f6cbbb48decf1e30e5450bd936a3252983243', 'b39fc380066cc22c64ac7a98aec495265c7127f5'),
+              'src/search/semantic_reader/ann.rs': ('404b7025c7c09bc977292715f23c287e3060a8fd', 'b5d9f79a1651ea0c03e3228ea195fe911304b7c8'),
+              'src/search/semantic_reader/publication/tests.rs': ('6a5c8b816c45752e57818661d01c31529a6fbaa5', 'b1c067fd1400f388002acf74ad8da12996c71885'),
+              'src/search/semantic_reader/publication/tests/sharded.rs': (None, 'eb7faaf794fa6669d125e8329c6ac58e38036c6f'),
+              'tests/semantic_generation_manifest.rs': ('275709bdfe1df49f4196e5b5490e46b5648cc2d9', '0f6e85cff06cba57da9c3bdebb8e1f5821a94308'),
+              'scripts/verify_sharded_publication.py': (None, '9f83ca7ce9a71c439ced830ab38b58c9782dda30'),
+              'src/search/semantic_reader/publication/live_docset.rs': (None, '8a53b0e7e3613aab4b385099cb8f40d6dcacfe74'),
           }
-          for name, (before, _) in expected.items():
+          for name, (before, after) in expected.items():
               path = Path(name)
               assert not path.is_symlink(), name
               assert (not path.exists()) if before is None else blob(path.read_bytes()) == before, name
-          extra_path = 'src/search/semantic_reader/publication/live_docset.rs'
-          assert not Path(extra_path).exists() and not Path(extra_path).is_symlink()
-          evidence = Path(os.environ['RUNNER_TEMP']) / 'shard-evidence'
-          (evidence / 'base.txt').write_text(subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True))
-          patch_blob('2ea2e9153a6a7191228f783c917cf88cf50ba76f', 'e508d597c1e83220a713b21e291e5fc59e87eab05fca8f69afa1bc28fb147658', 'reviewed.patch')
-          for name, (_, after) in expected.items():
-              assert blob(Path(name).read_bytes()) == after, name
-          script = Path('scripts/verify_sharded_publication.py')
-          text = script.read_text()
-          old = "        parts.append('#[derive(Debug, Clone, Default)]\\n' + helper.block"
-          new = "        derive = '#[derive(Debug, Clone, Default)]' if name == 'SemanticFilter' else '#[derive(Debug, Clone, Copy, PartialEq, Eq)]'\n        parts.append(derive + '\\n' + helper.block"
-          assert text.count(old) == 1
-          script.write_text(text.replace(old, new))
-          assert blob(script.read_bytes()) == '294ff0d02f3f82390ceb8085fa5eedb6cad0b49c'
-          text = script.read_text()
-          needle = "        '[profile.test]"
-          extra = '        \'[dev-dependencies]\\nproptest="1"\\ntracing-subscriber={version="0.3", features=["env-filter"]}\\nwait-timeout="0.2"\\n\'\n'
-          assert text.count(needle) == 1
-          script.write_text(text.replace(needle, extra + needle))
-          assert blob(script.read_bytes()) == '9f83ca7ce9a71c439ced830ab38b58c9782dda30'
-          patch_blob('c4d5fcba66efff7616370cf1645967c0fe367f88', '443480f8f29f3bd672e91570f3e59c8bb6902f4e063048dabbde62d3db6b3ddc', 'fsvi-order-fix.patch')
-          fixed = {
-              extra_path: '432769069df1bb6a70364e8941d58d5f3ba15cf7',
-              'src/search/semantic_reader/publication.rs': 'e38d4f2f2ea613b7fe0c4a9a69910ab18441eebf',
-              'src/search/semantic_manifest/shards.rs': '3c031244ff4eed3b7f862d1a8807a4fa20b0744b',
-              'src/search/semantic_reader/publication/tests/sharded.rs': '9226a2a94e7bb4ab721f499224802f563eaaf7d1',
-          }
-          for name, after in fixed.items():
-              assert blob(Path(name).read_bytes()) == after, name
-          (evidence / 'paths.json').write_text(json.dumps(list(expected) + [extra_path]))
-          beads = []
-          for line in Path('.beads/issues.jsonl').read_text().splitlines():
-              row = json.loads(line)
-              if row.get('id') in ['coding_agent_session_search-ds7uy.1', 'coding_agent_session_search-ds7uy.3']:
-                  beads.append(row)
-          (evidence / 'selected-beads.json').write_text(json.dumps(beads, indent=2))
-          PY
-          rustup component add rustfmt
-          python3 - <<'PY'
-          import json, os, subprocess
-          from pathlib import Path
-          evidence = Path(os.environ['RUNNER_TEMP']) / 'shard-evidence'
-          for name in json.loads((evidence / 'paths.json').read_text()):
-              if name.endswith('.rs'):
-                  subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', name], check=True)
-              output = evidence / 'source' / name
-              output.parent.mkdir(parents=True, exist_ok=True)
-              output.write_bytes(Path(name).read_bytes())
-          PY
-          git diff --check
-      - name: Compile and execute real manifest, retained-reader and native-ANN regressions
-        run: |
-          set -euo pipefail
-          python3 scripts/verify_sharded_publication.py "$PWD" "$GITHUB_WORKSPACE/fs-source" "$RUNNER_TEMP/shard-harness"
-          cp "$RUNNER_TEMP/shard-harness/source-receipt.json" "$RUNNER_TEMP/shard-evidence/source-receipt.json"
-          export CARGO_TARGET_DIR="$RUNNER_TEMP/shard-target"
-          cd "$RUNNER_TEMP/shard-harness"
-          cargo generate-lockfile
-          cp Cargo.lock "$RUNNER_TEMP/shard-evidence/component-Cargo.lock"
-          timeout 900 cargo test --locked --lib -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/shard-evidence/tests.log"
-          grep -Eq 'test result: ok\. 140 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/shard-evidence/tests.log"
-          timeout 120 cargo test --locked --lib sharded:: -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/shard-evidence/new-tests.log"
-          grep -Eq 'test result: ok\. 14 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/shard-evidence/new-tests.log"
-      - name: Record shipping locked-CASS qualification separately
-        run: |
-          set -uo pipefail
-          timeout 180 cargo test --locked --lib search::semantic_reader::publication::tests::sharded -- --nocapture > "$RUNNER_TEMP/shard-evidence/locked-cass.log" 2>&1
-          code=$?
-          printf '%s\n' "$code" > "$RUNNER_TEMP/shard-evidence/locked-cass-exit.txt"
-          cat "$RUNNER_TEMP/shard-evidence/locked-cass.log"
-          git diff --exit-code -- Cargo.toml Cargo.lock build.rs
-      - name: Publish only the tested source files directly to main
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import hashlib, json, os, subprocess
-          from pathlib import Path
-          evidence = Path(os.environ['RUNNER_TEMP']) / 'shard-evidence'
-          paths = json.loads((evidence / 'paths.json').read_text())
-          allowed = set(paths)
+              assert blob(z.read('source/' + name)) == after, name
+          for name in expected:
+              path = Path(name)
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_bytes(z.read('source/' + name))
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'landing-evidence'
+          for name in ['tests.log', 'new-tests.log', 'locked-cass.log', 'component-Cargo.lock', 'source-receipt.json', 'selected-beads.json']:
+              (evidence / name).write_bytes(z.read(name))
+          (evidence / 'source-blobs.json').write_text(json.dumps(expected, indent=2))
           changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
           untracked = set(subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard'], text=True).splitlines())
-          assert changed | untracked == allowed, (changed | untracked, allowed)
-          receipt = {}
-          for name in paths:
-              data = Path(name).read_bytes()
-              receipt[name] = {'git_blob': hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest(), 'sha256': hashlib.sha256(data).hexdigest()}
-          (evidence / 'published-source.json').write_text(json.dumps(receipt, indent=2))
-          subprocess.run(['git', 'add', '--', *paths], check=True)
+          assert changed | untracked == set(expected)
+          subprocess.run(['git', 'add', '--', *expected], check=True)
           PY
           git diff --cached --check
+      - name: Record the shipping dependency failure separately without losing its exit code
+        shell: bash
+        run: |
+          set -euo pipefail
+          code=0
+          timeout 120 cargo test --locked --lib search::semantic_reader::publication::tests::sharded -- --nocapture > "$RUNNER_TEMP/landing-evidence/locked-cass-retry.log" 2>&1 || code=$?
+          printf '%s\n' "$code" > "$RUNNER_TEMP/landing-evidence/locked-cass-exit.txt"
+          cat "$RUNNER_TEMP/landing-evidence/locked-cass-retry.log"
+          git diff --exit-code -- Cargo.toml Cargo.lock build.rs
+          git diff --cached --exit-code -- Cargo.toml Cargo.lock build.rs
+      - name: Commit the qualified implementation directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'feat(search): publish and retain complete ordered semantic shard cohorts' -m 'Add explicit version-2 partition metadata while preserving v1 JSON and digest behavior. Validate complete bounded lexical partitions and exact ordinal-specific ANN bases; admit every selected shard with immutable owner and checked live-row extrema. Reconstruct whole-corpus commitments by a bounded-head merge in native FSVI hash order, including multi-row and tombstoned images. Keep partial quality coverage explicit and missing graph receipts on exact fallback. All 140 component tests passed against pinned real upstream code, including 14 new real-file regressions. This separate dependency graph does not qualify the shipping CASS binary or enable its progressive CLI route. No repository dependency pins, lockfile, models or user archives changed.'
+          git commit -m 'feat(search): publish and retain complete ordered semantic shard cohorts' -m 'Add explicit version-2 partition metadata while preserving v1 JSON and digest behavior. Validate complete bounded lexical partitions and exact ordinal-specific ANN bases; admit every selected shard with immutable owner and checked live-row extrema. Reconstruct whole-corpus commitments by a bounded-head merge in native FSVI hash order, including multi-row and tombstoned images. Keep partial quality coverage explicit and missing graph receipts on exact fallback. All 140 component tests passed against pinned real upstream code in run 35396526034, including 14 new real-file regressions; all committed bytes match its immutable artifact. This separate dependency graph does not qualify the shipping CASS binary or enable its progressive CLI route. Shipping frankensearch =0.6.1 remains unpublished. No repository dependency pins, lockfile, models or user archives changed.'
           git push origin HEAD:main
-          git rev-parse HEAD | tee "$RUNNER_TEMP/shard-evidence/runtime-commit.txt"
+          git rev-parse HEAD | tee "$RUNNER_TEMP/landing-evidence/runtime-commit.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: sharded-publication-evidence-${{ github.sha }}
-          path: ${{ runner.temp }}/shard-evidence/
+          name: sharded-publication-landing-${{ github.sha }}
+          path: ${{ runner.temp }}/landing-evidence/
           retention-days: 14
