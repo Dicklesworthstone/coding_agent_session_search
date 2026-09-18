@@ -34,6 +34,10 @@
 //! - **[`model_manager`]**: Detects model availability; this module records
 //!   which model was used to build each artifact.
 
+mod shards;
+
+pub use shards::{SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION, SemanticArtifactShardV2};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
@@ -1355,6 +1359,9 @@ pub struct SemanticArtifactValidationEvidence {
 #[serde(deny_unknown_fields)]
 pub struct SemanticGenerationArtifact {
     pub role: SemanticArtifactRole,
+    /// Explicit ordered partition binding for schema v2; absent in schema v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard: Option<SemanticArtifactShardV2>,
     /// Manifest-relative path beneath the selected generation directory.
     pub relative_path: String,
     pub artifact_sha256: String,
@@ -1971,7 +1978,13 @@ impl SemanticGenerationManifestV1 {
     }
 
     fn canonical_digest_bytes(&self) -> Vec<u8> {
-        let mut encoder = SemanticCanonicalEncoder::new(b"cass.semantic-generation-manifest.v1");
+        let domain: &[u8] =
+            if self.schema_version == SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION {
+                b"cass.semantic-generation-manifest.v2"
+            } else {
+                b"cass.semantic-generation-manifest.v1"
+            };
+        let mut encoder = SemanticCanonicalEncoder::new(domain);
         encoder.u32(self.schema_version);
         encoder.text(&self.generation_id);
         encoder.text(&self.build_id);
@@ -1996,6 +2009,9 @@ impl SemanticGenerationManifestV1 {
         encoder.len(self.artifacts.len());
         for artifact in &self.artifacts {
             encode_generation_artifact(&mut encoder, artifact);
+            if self.schema_version == SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION {
+                shards::encode_shard(&mut encoder, artifact.shard.as_ref());
+            }
         }
         encoder.finish()
     }
@@ -2022,11 +2038,14 @@ impl SemanticGenerationManifestV1 {
 
     /// Validate every authoritative field without consulting the filesystem.
     pub fn validate(&self) -> Result<(), SemanticGenerationError> {
-        if self.schema_version != SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION {
-            if self.schema_version > SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION {
+        if !(SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION
+            ..=SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION)
+            .contains(&self.schema_version)
+        {
+            if self.schema_version > SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION {
                 return Err(SemanticGenerationError::UnsupportedManifestSchema {
                     found: u64::from(self.schema_version),
-                    supported: u64::from(SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION),
+                    supported: u64::from(SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION),
                 });
             }
             return invalid_manifest(
@@ -2116,7 +2135,12 @@ impl SemanticGenerationManifestV1 {
                 "sealed generations must declare artifacts",
             );
         }
-        if self.artifacts.len() > MAX_SEMANTIC_ARTIFACTS {
+        let artifact_limit = if self.schema_version == SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION {
+            MAX_SEMANTIC_ARTIFACTS
+        } else {
+            shards::MAX_SHARDS_PER_TIER * 4
+        };
+        if self.artifacts.len() > artifact_limit {
             return invalid_manifest(
                 SemanticManifestInvariantClass::Topology,
                 "semantic generation declares too many artifact roles",
@@ -2128,19 +2152,18 @@ impl SemanticGenerationManifestV1 {
         let mut portable_paths = BTreeSet::new();
         let mut previous_role = None;
         for artifact in &self.artifacts {
-            if previous_role.is_some_and(|previous| previous >= artifact.role) {
+            let key = (
+                artifact.role,
+                artifact.shard.as_ref().map_or(0, |shard| shard.ordinal),
+            );
+            if previous_role.is_some_and(|previous| previous >= key) {
                 return invalid_manifest(
                     SemanticManifestInvariantClass::Topology,
-                    "artifacts must be strictly sorted by role with no duplicates",
+                    "artifacts must be strictly sorted by role and shard ordinal with no duplicates",
                 );
             }
-            previous_role = Some(artifact.role);
-            if !roles.insert(artifact.role) {
-                return invalid_manifest(
-                    SemanticManifestInvariantClass::Topology,
-                    "duplicate artifact role",
-                );
-            }
+            previous_role = Some(key);
+            roles.insert(artifact.role);
             let normalized =
                 normalized_manifest_relative_path(&artifact.relative_path).map_err(|reason| {
                     SemanticGenerationError::InvalidManifest {
@@ -2168,6 +2191,8 @@ impl SemanticGenerationManifestV1 {
                 self.sealed_at_ms,
             )?;
         }
+
+        shards::validate(self)?;
 
         for required in required_vector_roles(self.realized_topology) {
             if !roles.contains(&required) {
@@ -2199,18 +2224,21 @@ impl SemanticGenerationManifestV1 {
             );
         }
 
-        for ann_role in [
-            SemanticArtifactRole::FastAnn,
-            SemanticArtifactRole::QualityAnn,
-        ] {
-            if let Some(ann) = self.artifact(ann_role) {
+        for ann in self
+            .artifacts
+            .iter()
+            .filter(|artifact| !artifact.role.is_vector())
+        {
+            let ann_role = ann.role;
+            {
                 let Some(base_role) = ann_role.base_vector_role() else {
                     return invalid_manifest(
                         SemanticManifestInvariantClass::AnnBinding,
                         "internal artifact-role contract is inconsistent",
                     );
                 };
-                let Some(base) = self.artifact(base_role) else {
+                let ordinal = ann.shard.as_ref().map_or(0, |shard| shard.ordinal);
+                let Some(base) = self.artifact_at(base_role, ordinal) else {
                     return invalid_manifest(
                         SemanticManifestInvariantClass::AnnBinding,
                         "ANN artifact has no manifest-declared base vector",
@@ -2230,7 +2258,8 @@ impl SemanticGenerationManifestV1 {
                         reason: "ANN embedding identity differs from its vector base".to_owned(),
                     });
                 }
-                if binding.base_role != base_role
+                if ann.shard != base.shard
+                    || binding.base_role != base_role
                     || binding.base_artifact_sha256 != base.artifact_sha256
                     || binding.base_storage_fingerprint
                         != base.embedding_identity.identity.storage.fingerprint()
@@ -2286,11 +2315,30 @@ impl SemanticGenerationManifestV1 {
         Ok(())
     }
 
+    /// Compatibility accessor for a single-artifact role. Never silently choose
+    /// one shard from a multi-shard tier; use artifacts_for/artifact_at instead.
     pub fn artifact(&self, role: SemanticArtifactRole) -> Option<&SemanticGenerationArtifact> {
+        let mut artifacts = self.artifacts_for(role);
+        let first = artifacts.next()?;
+        artifacts.next().is_none().then_some(first)
+    }
+
+    pub fn artifacts_for(
+        &self,
+        role: SemanticArtifactRole,
+    ) -> impl Iterator<Item = &SemanticGenerationArtifact> {
         self.artifacts
-            .binary_search_by_key(&role, |artifact| artifact.role)
-            .ok()
-            .and_then(|index| self.artifacts.get(index))
+            .iter()
+            .filter(move |artifact| artifact.role == role)
+    }
+
+    pub fn artifact_at(
+        &self,
+        role: SemanticArtifactRole,
+        ordinal: u32,
+    ) -> Option<&SemanticGenerationArtifact> {
+        self.artifacts_for(role)
+            .find(|artifact| artifact.shard.as_ref().map_or(0, |shard| shard.ordinal) == ordinal)
     }
 
     /// Durably seal an immutable generation manifest.
@@ -2590,7 +2638,12 @@ impl SemanticGenerationManifestV1 {
                     source: error.to_string(),
                 }
             })?;
-            resolved.insert(artifact.role, canonical);
+            // The historical role-keyed map can describe only a singleton.
+            // All shards were still validated above; never expose one arbitrary
+            // shard through the legacy accessor.
+            if self.artifact(artifact.role).is_some() {
+                resolved.insert(artifact.role, canonical);
+            }
         }
         Ok(resolved)
     }
@@ -3207,14 +3260,14 @@ fn parse_generation_manifest_bytes(
             generation_id: generation_id.to_owned(),
             source,
         })?;
-    let supported = u64::from(SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION);
+    let supported = u64::from(SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION);
     if schema_version > supported {
         return Err(SemanticGenerationError::UnsupportedManifestSchema {
             found: schema_version,
             supported,
         });
     }
-    if schema_version < supported {
+    if schema_version < u64::from(SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION) {
         return invalid_manifest(
             SemanticManifestInvariantClass::HistoricalSchema,
             &format!(
@@ -5081,6 +5134,7 @@ mod tests {
             covered_content_sha256: covered_content_sha256.clone(),
         };
         SemanticGenerationArtifact {
+            shard: None,
             role,
             relative_path: relative_path.to_owned(),
             artifact_sha256,
@@ -7145,7 +7199,7 @@ mod tests {
 
         let future = tempfile::tempdir().unwrap();
         let mut future_manifest = manifest;
-        future_manifest.schema_version = SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION + 1;
+        future_manifest.schema_version = SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION + 1;
         write_generation_artifacts(
             future.path(),
             &future_manifest,
@@ -8602,7 +8656,7 @@ mod tests {
             test_generation_manifest(SemanticGenerationTopology::FastOnly, vec![artifact]);
         let mut future_manifest = serde_json::to_value(&manifest).unwrap();
         future_manifest["schema_version"] =
-            serde_json::json!(u64::from(SEMANTIC_GENERATION_MANIFEST_SCHEMA_VERSION) + 1);
+            serde_json::json!(u64::from(SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION) + 1);
         future_manifest.as_object_mut().unwrap().insert(
             "future_provenance".to_owned(),
             serde_json::json!({"epoch": 2}),
