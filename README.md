@@ -1095,10 +1095,15 @@ Beads exports when run from the repository root without a fixture. Git uses
 porcelain-v2 with optional locks disabled. Beads uses `br 0.6.x --no-db`, so its
 JSONL snapshot is explicitly partial: unexported database changes may exist.
 Recheck Beads and reservations before claiming work. Child commands share a
-15-second budget per provider and each has an 8 MiB output cap; Beads categories
+single 15-second request budget and each has an 8 MiB output cap; Beads categories
 cap at 512 issues.
 Failures report unavailable providers and unknown summary counts, not zero work.
-Other live providers remain unwired. `swarm lint` still uses the placeholder
+RCH contributes aggregate active/queued job counts, fleet slots and posture from
+`rch status --json` (API 1.0, schema 1.0.0). Responses older than 60 seconds or
+more than 5 seconds in the future are unavailable. Worker addresses, commands
+and job details are omitted. This provider remains partial: local Cargo/CPU
+state and build admission are unknown, even when RCH reports no active jobs.
+Agent Mail and CASS evidence remain unwired. `swarm lint` still uses the placeholder
 live snapshot. Fixture selection (`--fixture <file>` or `--fixture-dir <dir>
 --fixture-id <id>`) retains deterministic behavior; `swarm dependency-drift`
 also has a live path.
