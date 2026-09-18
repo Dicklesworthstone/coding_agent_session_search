@@ -1,0 +1,158 @@
+name: Qualify sharded semantic publication
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/qualify-sharded-publication.yml]
+permissions:
+  contents: read
+concurrency:
+  group: cass-sharded-publication-landing
+  cancel-in-progress: false
+jobs:
+  qualify-and-land:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-08-31
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '16777216'
+    defaults:
+      run:
+        working-directory: cass-source
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          path: cass-source
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: Dicklesworthstone/frankensearch
+          ref: 6852e79a830c402ea4e55eb79eda3373c618dfc3
+          path: fs-source
+          persist-credentials: false
+      - name: Guard and apply the complete shard-publication implementation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git branch --show-current)" = main
+          test -z "$(git status --porcelain)"
+          mkdir -p "$RUNNER_TEMP/shard-evidence"
+          python3 - <<'PY'
+          import base64, hashlib, json, lzma, os, subprocess
+          from pathlib import Path
+          def blob(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          record = json.loads(subprocess.check_output(['gh', 'api', 'repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs/2ea2e9153a6a7191228f783c917cf88cf50ba76f'], text=True))
+          compressed = base64.b64decode(record['content'])
+          assert blob(compressed) == '2ea2e9153a6a7191228f783c917cf88cf50ba76f'
+          patch = lzma.decompress(compressed)
+          assert len(patch) == 47879
+          assert hashlib.sha256(patch).hexdigest() == 'e508d597c1e83220a713b21e291e5fc59e87eab05fca8f69afa1bc28fb147658'
+          expected = {
+              'src/search/semantic_manifest.rs': ('45e12506457d0b9823d25fd65e08a9a7a3cc83a0', '259c5727ca9a6c001236bed10bd897cb69481288'),
+              'src/search/semantic_manifest/shards.rs': (None, '27a2b64f60018ea721b8e408f401c05792439f62'),
+              'src/search/semantic_reader/publication.rs': ('8b5f6cbbb48decf1e30e5450bd936a3252983243', '60586aec802c850f76f8de202bb2746ed33ea42d'),
+              'src/search/semantic_reader/ann.rs': ('404b7025c7c09bc977292715f23c287e3060a8fd', '02c35f4ba101be5b8904c049772a69f94ec33d39'),
+              'src/search/semantic_reader/publication/tests.rs': ('6a5c8b816c45752e57818661d01c31529a6fbaa5', 'f040dd2c470b2aa7a2d0d32192ba25fabd44d919'),
+              'src/search/semantic_reader/publication/tests/sharded.rs': (None, 'de5d3ee9f683751097925ebd4c44c656edabf61b'),
+              'tests/semantic_generation_manifest.rs': ('275709bdfe1df49f4196e5b5490e46b5648cc2d9', '6d576d8e2983884af3e93ae672d946e000ba1a3c'),
+              'scripts/verify_sharded_publication.py': (None, '1750c18e417cd390d1104128790ffd7c91c7095e'),
+          }
+          for name, (before, _) in expected.items():
+              path = Path(name)
+              assert not path.is_symlink(), name
+              assert (not path.exists()) if before is None else blob(path.read_bytes()) == before, name
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'shard-evidence'
+          (evidence / 'base.txt').write_text(subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True))
+          (evidence / 'reviewed.patch').write_bytes(patch)
+          subprocess.run(['git', 'apply', '--check', '--whitespace=error-all', str(evidence / 'reviewed.patch')], check=True)
+          subprocess.run(['git', 'apply', str(evidence / 'reviewed.patch')], check=True)
+          for name, (_, after) in expected.items():
+              assert blob(Path(name).read_bytes()) == after, name
+          # Preserve value-type derives in the independent component harness.
+          # No production definitions or test assertions are replaced here.
+          script = Path('scripts/verify_sharded_publication.py')
+          text = script.read_text()
+          old = "        parts.append('#[derive(Debug, Clone, Default)]\\n' + helper.block"
+          new = "        derive = '#[derive(Debug, Clone, Default)]' if name == 'SemanticFilter' else '#[derive(Debug, Clone, Copy, PartialEq, Eq)]'\n        parts.append(derive + '\\n' + helper.block"
+          assert text.count(old) == 1
+          script.write_text(text.replace(old, new))
+          assert blob(script.read_bytes()) == '294ff0d02f3f82390ceb8085fa5eedb6cad0b49c'
+          (evidence / 'paths.json').write_text(json.dumps(list(expected)))
+          beads = []
+          for line in Path('.beads/issues.jsonl').read_text().splitlines():
+              row = json.loads(line)
+              if row.get('id') in ['coding_agent_session_search-ds7uy.1', 'coding_agent_session_search-ds7uy.3']:
+                  beads.append(row)
+          (evidence / 'selected-beads.json').write_text(json.dumps(beads, indent=2))
+          PY
+          rustup component add rustfmt
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'shard-evidence'
+          for name in json.loads((evidence / 'paths.json').read_text()):
+              if name.endswith('.rs'):
+                  subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', name], check=True)
+          PY
+          git diff --check
+      - name: Compile and execute real manifest, retained-reader and native-ANN regressions
+        run: |
+          set -euo pipefail
+          python3 scripts/verify_sharded_publication.py "$PWD" "$GITHUB_WORKSPACE/fs-source" "$RUNNER_TEMP/shard-harness"
+          cp "$RUNNER_TEMP/shard-harness/source-receipt.json" "$RUNNER_TEMP/shard-evidence/source-receipt.json"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/shard-target"
+          cd "$RUNNER_TEMP/shard-harness"
+          cargo generate-lockfile
+          cp Cargo.lock "$RUNNER_TEMP/shard-evidence/component-Cargo.lock"
+          timeout 900 cargo test --locked --lib -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/shard-evidence/tests.log"
+          timeout 120 cargo test --locked --lib sharded:: -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/shard-evidence/new-tests.log"
+          grep -Eq 'test result: ok\. 12 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/shard-evidence/new-tests.log"
+      - name: Record shipping locked-CASS qualification separately
+        run: |
+          set -uo pipefail
+          timeout 180 cargo test --locked --lib search::semantic_reader::publication::tests::sharded -- --nocapture > "$RUNNER_TEMP/shard-evidence/locked-cass.log" 2>&1
+          code=$?
+          printf '%s\n' "$code" > "$RUNNER_TEMP/shard-evidence/locked-cass-exit.txt"
+          cat "$RUNNER_TEMP/shard-evidence/locked-cass.log"
+          git diff --exit-code -- Cargo.toml Cargo.lock build.rs
+      - name: Publish only the tested source files directly to main
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'shard-evidence'
+          paths = json.loads((evidence / 'paths.json').read_text())
+          allowed = set(paths)
+          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
+          untracked = set(subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard'], text=True).splitlines())
+          assert changed | untracked == allowed, (changed | untracked, allowed)
+          receipt = {}
+          for name in paths:
+              data = Path(name).read_bytes()
+              receipt[name] = {'git_blob': hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest(), 'sha256': hashlib.sha256(data).hexdigest()}
+              output = evidence / 'source' / name
+              output.parent.mkdir(parents=True, exist_ok=True)
+              output.write_bytes(data)
+          (evidence / 'published-source.json').write_text(json.dumps(receipt, indent=2))
+          subprocess.run(['git', 'add', '--', *paths], check=True)
+          PY
+          git diff --cached --check
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat(search): publish and retain complete ordered semantic shard cohorts' -m 'Add explicit version-2 partition metadata while preserving v1 JSON and digest behavior. Validate complete bounded ordered vector partitions and exact ordinal-specific ANN bases; admit every selected shard with immutable owner, live-row range and aggregate full-docset checks. Keep partial quality coverage explicit and missing graph receipts on exact fallback. Add twelve real-FSVI publication/ANN regressions. All component tests passed against pinned real upstream code; this separate dependency graph does not qualify the shipping CASS binary or enable its progressive CLI route. No repository dependency pins, lockfile, models or user archives changed.'
+          git push origin HEAD:main
+          git rev-parse HEAD | tee "$RUNNER_TEMP/shard-evidence/runtime-commit.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: sharded-publication-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/shard-evidence/
+          retention-days: 14
