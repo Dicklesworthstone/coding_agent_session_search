@@ -86,7 +86,8 @@ pub(super) fn load_semantic_session_message_ids(
             .iter()
             .map(|path| ParamValue::from(*path))
             .collect::<Vec<_>>();
-        let rows: Vec<i64> = transaction.query_map_collect(&sql, &params, |row| row.get_typed(0))?;
+        let rows: Vec<i64> =
+            transaction.query_map_collect(&sql, &params, |row| row.get_typed(0))?;
         conversation_ids.extend(rows);
         if conversation_ids.len() > SEMANTIC_SESSION_SCOPE_MAX_CONVERSATIONS {
             bail!(
@@ -107,11 +108,10 @@ pub(super) fn load_semantic_session_message_ids(
             "SELECT id FROM messages WHERE conversation_id = ? ORDER BY id LIMIT {}",
             remaining + 1
         );
-        let rows: Vec<i64> = transaction.query_map_collect(
-            &sql,
-            &[ParamValue::from(conversation_id)],
-            |row| row.get_typed(0),
-        )?;
+        let rows: Vec<i64> =
+            transaction.query_map_collect(&sql, &[ParamValue::from(conversation_id)], |row| {
+                row.get_typed(0)
+            })?;
         // The SQL mapper returns FrankenError; ID range validation returns
         // io::Error. Convert outside the mapper through this function's
         // anyhow::Result rather than mixing the two error types.
@@ -340,9 +340,11 @@ mod tests {
             .index()
             .search_top_k(&[1.0, 0.0], 24, None)
             .unwrap();
-        assert!(global.iter().all(|hit| {
-            parse_semantic_doc_id(&hit.doc_id).unwrap().message_id < 129
-        }));
+        assert!(
+            global
+                .iter()
+                .all(|hit| { parse_semantic_doc_id(&hit.doc_id).unwrap().message_id < 129 })
+        );
         let context = SemanticCandidateContext {
             artifacts: Arc::new(vec![artifact]),
             filter_maps: SemanticFilterMaps::for_tests(
@@ -359,19 +361,20 @@ mod tests {
             ..Default::default()
         };
         for approximate in [false, true] {
-            let (hits, retry, stats) = client.search_semantic_candidates(
-                &context,
-                &[1.0, 0.0],
-                &filters,
-                SemanticCandidateSearchRequest {
-                    fetch_limit: 2,
-                    approximate,
-                    tier_mode: SemanticTierMode::Single,
-                    in_memory_two_tier_index: None,
-                    ann_index: None,
-                },
-            )
-            .unwrap();
+            let (hits, retry, stats) = client
+                .search_semantic_candidates(
+                    &context,
+                    &[1.0, 0.0],
+                    &filters,
+                    SemanticCandidateSearchRequest {
+                        fetch_limit: 2,
+                        approximate,
+                        tier_mode: SemanticTierMode::Single,
+                        in_memory_two_tier_index: None,
+                        ann_index: None,
+                    },
+                )
+                .unwrap();
             assert_eq!(
                 hits.iter().map(|hit| hit.message_id).collect::<Vec<_>>(),
                 vec![129, 130]
@@ -387,19 +390,20 @@ mod tests {
             source_filter: SourceFilter::SourceId("remote".into()),
             ..filters
         };
-        let (hits, _, _) = client.search_semantic_candidates(
-            &context,
-            &[1.0, 0.0],
-            &remote_only,
-            SemanticCandidateSearchRequest {
-                fetch_limit: 2,
-                approximate: false,
-                tier_mode: SemanticTierMode::Single,
-                in_memory_two_tier_index: None,
-                ann_index: None,
-            },
-        )
-        .unwrap();
+        let (hits, _, _) = client
+            .search_semantic_candidates(
+                &context,
+                &[1.0, 0.0],
+                &remote_only,
+                SemanticCandidateSearchRequest {
+                    fetch_limit: 2,
+                    approximate: false,
+                    tier_mode: SemanticTierMode::Single,
+                    in_memory_two_tier_index: None,
+                    ann_index: None,
+                },
+            )
+            .unwrap();
         assert_eq!(
             hits.iter().map(|hit| hit.message_id).collect::<Vec<_>>(),
             vec![129]
@@ -413,13 +417,20 @@ mod tests {
         insert_conversation(&conn, 1, "/negative");
         insert_message(&conn, -1, 1);
         let selected = HashSet::from(["/negative".to_string()]);
-        let error = load_semantic_session_message_ids(conn.connection(), &selected, 10).unwrap_err();
+        let error =
+            load_semantic_session_message_ids(conn.connection(), &selected, 10).unwrap_err();
         assert!(error.to_string().contains("negative message_id"));
         // A failed conversion must leave no transaction behind. A separate
         // missing session still has a complete, empty membership snapshot.
-        assert!(load_semantic_session_message_ids(
-            conn.connection(), &HashSet::from(["/missing".into()]), 10,
-        ).unwrap().is_empty());
+        assert!(
+            load_semantic_session_message_ids(
+                conn.connection(),
+                &HashSet::from(["/missing".into()]),
+                10,
+            )
+            .unwrap()
+            .is_empty()
+        );
     }
 
     #[test]
@@ -429,10 +440,14 @@ mod tests {
         insert_conversation(&conn, 2, "/one-message");
         insert_message(&conn, 1, 2);
         let empty = HashSet::from(["/empty".to_string()]);
-        assert!(load_semantic_session_message_ids(conn.connection(), &empty, 0)
-            .unwrap().is_empty());
+        assert!(
+            load_semantic_session_message_ids(conn.connection(), &empty, 0)
+                .unwrap()
+                .is_empty()
+        );
         let populated = HashSet::from(["/one-message".to_string()]);
-        let error = load_semantic_session_message_ids(conn.connection(), &populated, 0).unwrap_err();
+        let error =
+            load_semantic_session_message_ids(conn.connection(), &populated, 0).unwrap_err();
         assert!(error.to_string().contains("exceeds 0 messages"));
         assert_eq!(
             load_semantic_session_message_ids(conn.connection(), &populated, 1).unwrap(),
@@ -450,14 +465,16 @@ mod tests {
         insert_message(&conn, 3, 2);
         let dir = tempfile::tempdir().unwrap();
         let mut artifacts = Vec::new();
-        for (ordinal, selected_id, vector) in [
-            (0, 1_u64, [0.6, 0.8]),
-            (1, 2_u64, [0.8, 0.6]),
-        ] {
+        for (ordinal, selected_id, vector) in [(0, 1_u64, [0.6, 0.8]), (1, 2_u64, [0.8, 0.6])] {
             let path = dir.path().join(format!("shard-{ordinal}.fsvi"));
             let mut writer = FsVectorIndex::create_with_revision(
-                &path, "fnv1a-2", "scope-shards", 2, Quantization::F16,
-            ).unwrap();
+                &path,
+                "fnv1a-2",
+                "scope-shards",
+                2,
+                Quantization::F16,
+            )
+            .unwrap();
             writer.write_record(&id(3, 3), &[1.0, 0.0]).unwrap();
             writer.write_record(&id(selected_id, 3), &vector).unwrap();
             writer.finish().unwrap();
@@ -466,31 +483,74 @@ mod tests {
         let context = SemanticCandidateContext {
             artifacts: Arc::new(artifacts),
             filter_maps: SemanticFilterMaps::for_tests(
-                HashMap::new(), HashMap::new(), HashMap::new(), HashSet::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashSet::new(),
             ),
             roles: None,
         };
         let client = client(conn);
         for (path, expected) in [("/selected", vec![2, 1]), ("/missing", vec![])] {
-            let (hits, retry, stats) = client.search_semantic_candidates(
-                &context,
-                &[1.0, 0.0],
-                &SearchFilters {
-                    session_paths: HashSet::from([path.to_string()]),
-                    ..Default::default()
-                },
-                SemanticCandidateSearchRequest {
-                    fetch_limit: 2,
-                    approximate: true,
-                    tier_mode: SemanticTierMode::Single,
-                    in_memory_two_tier_index: None,
-                    ann_index: None,
-                },
-            ).unwrap();
-            assert_eq!(hits.iter().map(|hit| hit.message_id).collect::<Vec<_>>(), expected);
+            let (hits, retry, stats) = client
+                .search_semantic_candidates(
+                    &context,
+                    &[1.0, 0.0],
+                    &SearchFilters {
+                        session_paths: HashSet::from([path.to_string()]),
+                        ..Default::default()
+                    },
+                    SemanticCandidateSearchRequest {
+                        fetch_limit: 2,
+                        approximate: true,
+                        tier_mode: SemanticTierMode::Single,
+                        in_memory_two_tier_index: None,
+                        ann_index: None,
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                hits.iter().map(|hit| hit.message_id).collect::<Vec<_>>(),
+                expected
+            );
             assert!(!retry.has_more_candidates);
             assert!(!retry.exact_window_may_omit_competitor);
             assert!(stats.is_none());
         }
+    }
+
+    #[test]
+    fn message_budget_is_shared_across_distinct_conversations() {
+        let conn = archive();
+        insert_conversation(&conn, 1, "/selected");
+        insert_conversation(&conn, 2, "/selected");
+        insert_message(&conn, 11, 1);
+        insert_message(&conn, 22, 2);
+        let paths = HashSet::from(["/selected".to_string()]);
+        let error = load_semantic_session_message_ids(conn.connection(), &paths, 1).unwrap_err();
+        assert!(error.to_string().contains("exceeds 1 messages"));
+        assert_eq!(
+            load_semantic_session_message_ids(conn.connection(), &paths, 2).unwrap(),
+            HashSet::from([11, 22]),
+        );
+    }
+
+    #[test]
+    fn query_failure_is_not_an_empty_scope_and_releases_the_transaction() {
+        let conn = SearchSqliteFixture::in_memory().unwrap();
+        let paths = HashSet::from(["/selected".to_string()]);
+        // Missing schema is a failed lookup, not proof of an empty session.
+        assert!(load_semantic_session_message_ids(conn.connection(), &paths, 10).is_err());
+        conn.execute_batch(
+            "CREATE TABLE conversations (id INTEGER PRIMARY KEY, source_path TEXT NOT NULL);
+             CREATE TABLE messages (id INTEGER PRIMARY KEY, conversation_id INTEGER NOT NULL);",
+        )
+        .unwrap();
+        insert_conversation(&conn, 1, "/selected");
+        insert_message(&conn, 42, 1);
+        assert_eq!(
+            load_semantic_session_message_ids(conn.connection(), &paths, 10).unwrap(),
+            HashSet::from([42]),
+        );
     }
 }
