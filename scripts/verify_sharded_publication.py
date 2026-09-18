@@ -39,6 +39,10 @@ def main() -> None:
         if child.is_dir():
             shutil.copytree(child, target / name)
             sources.extend(child.rglob('*.rs'))
+    integration = root / 'tests/semantic_generation_manifest.rs'
+    (dest / 'tests').mkdir()
+    shutil.copy2(integration, dest / 'tests/semantic_generation_manifest.rs')
+    sources.append(integration)
     spec = importlib.util.spec_from_file_location('extract', root / 'scripts/verify_message_topk_fsvi.py')
     if spec is None or spec.loader is None:
         raise RuntimeError('cannot load existing source extractor')
@@ -59,6 +63,7 @@ def main() -> None:
     (dest / 'src/lib.rs').write_text('pub mod search { pub mod policy; pub mod vector_index; pub mod semantic_manifest; pub mod semantic_reader; }\n')
     (dest / 'Cargo.toml').write_text(
         '[package]\nname="cass-sharded-publication-check"\nversion="0.0.0"\nedition="2024"\n'
+        '[lib]\nname="coding_agent_search"\n'
         '[dependencies]\nfrankensearch={path=' + json.dumps(str(upstream / 'frankensearch')) + ', default-features=false, features=["hash", "ann"]}\n'
         'serde={version="1", features=["derive"]}\nserde_json="1"\nthiserror="2"\nsha2="0.10"\nhex="0.4"\nring="0.17"\nfs2="0.4"\ntempfile="3"\ndotenvy="0.15"\ntracing="0.1"\nitoa="1"\n'
         '[dev-dependencies]\nproptest="1"\ntracing-subscriber={version="0.3", features=["env-filter"]}\nwait-timeout="0.2"\n'

@@ -17,6 +17,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod coverage;
 mod live_docset;
 
 use frankensearch::core::TieredQueryEmbeddings;
@@ -175,6 +176,11 @@ impl SelectedSemanticGeneration {
         if let (Some(fast), Some(quality)) = (&fast, &quality) {
             if fast.binding.generation() != quality.binding.generation() {
                 return Err(SemanticReaderError::MixedGeneration.into());
+            }
+            if selected.manifest.schema_version
+                == crate::search::semantic_manifest::SEMANTIC_SHARDED_GENERATION_MANIFEST_SCHEMA_VERSION
+            {
+                coverage::validate(fast, quality, selected.manifest.corpus.document_count)?;
             }
             let fast_images: HashSet<_> = fast
                 .shards
