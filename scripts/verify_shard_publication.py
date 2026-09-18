@@ -39,7 +39,7 @@ def main():
         return matches[0]+'\n'
     preamble = '''#![allow(dead_code, unused_imports)]
 extern crate self as frankensearch;
-pub use frankensearch_core::{SearchError, SearchResult, SyncEmbed, ModelCategory, ModelTier};
+pub use frankensearch_core::{SearchError, SearchResult, SyncEmbed, ModelCategory, ModelTier, Embedder, SyncEmbedderAdapter};
 pub use frankensearch_embed::{HashAlgorithm, HashEmbedder};
 pub mod core { pub use frankensearch_core::*; }
 mod search { pub mod embedder {
@@ -125,7 +125,7 @@ hex = "0.4"
 itoa = "1"
 tempfile = "=3.27.0"
 frankensearch-core = {{ path = {json.dumps(str(upstream/'crates/frankensearch-core'))}, default-features = false }}
-frankensearch-embed = {{ path = {json.dumps(str(upstream/'crates/frankensearch-embed'))}, default-features = false }}
+frankensearch-embed = {{ path = {json.dumps(str(upstream/'crates/frankensearch-embed'))}, default-features = false, features = ["hash"] }}
 frankensearch-index = {{ path = {json.dumps(str(upstream/'crates/frankensearch-index'))}, default-features = false, features = ["ann"] }}
 [profile.test]
 debug = 0
