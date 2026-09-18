@@ -1,128 +1,23 @@
-# Source-only RED/GREEN landing. Retired through the connector after completion.
-name: Prove and fix deduplicated exact windows
+# Both source-only landings completed. No job retains repository-write access.
+name: Verify landed retrieval commits
 on:
-  push:
-    branches: [main]
-    paths: [.github/workflows/apply-ann-underfill-once.yml]
+  workflow_dispatch:
 permissions:
   contents: read
-concurrency:
-  group: cass-ann-underfill-landing
-  cancel-in-progress: false
 jobs:
-  qualify-and-land:
-    permissions:
-      contents: write
+  ancestry-only:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
-    env:
-      CARGO_BUILD_JOBS: '2'
-      CARGO_PROFILE_TEST_DEBUG: '0'
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_TERM_COLOR: never
-      RUST_MIN_STACK: '134217728'
-    defaults:
-      run:
-        shell: bash
-        working-directory: cass-source
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: main
-          path: cass-source
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          repository: Dicklesworthstone/frankensearch
-          ref: 6852e79a830c402ea4e55eb79eda3373c618dfc3
-          path: fs-source
+          ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
-      - name: Guard source identities and install the two regression tests only
+      - name: Verify commit ancestry, not runtime qualification
+        shell: bash
         run: |
           set -euo pipefail
-          test "$(git branch --show-current)" = main
-          test -z "$(git status --porcelain)"
-          mkdir -p "$RUNNER_TEMP/window-evidence"
-          git rev-parse HEAD | tee "$RUNNER_TEMP/window-evidence/parent.txt"
-          python3 - <<'PY'
-          from pathlib import Path
-          import subprocess
-          expected = {
-              'src/search/query.rs': 'c290d50ab85a8a57fdf16b8c872e5920a1d29bf4',
-              'src/search/query/message_topk_integration.rs': '6fd2e5ca66b0cf87116b2c9154013486accfd7b5',
-              'scripts/patches/initial-window-proof.patch': '99d34bb14b85df074b89a93ec388b3433e68cf81',
-          }
-          for path, sha in expected.items():
-              actual = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
-              if Path(path).is_symlink() or actual != sha:
-                  raise SystemExit('Changed source requires review: ' + path)
-          PY
-          git apply --check --whitespace=error-all scripts/patches/initial-window-proof.patch
-          git apply --include=src/search/query/message_topk_integration.rs --whitespace=error-all scripts/patches/initial-window-proof.patch
-          rustfmt --edition 2024 src/search/query/message_topk_integration.rs
-          test "$(git hash-object src/search/query.rs)" = c290d50ab85a8a57fdf16b8c872e5920a1d29bf4
-      - name: RED - require both regressions to fail at the original completeness assertions
-        run: |
-          set -euo pipefail
-          rustc --version | tee "$RUNNER_TEMP/window-evidence/toolchain.txt"
-          python3 scripts/verify_ann_shards.py "$PWD" "$GITHUB_WORKSPACE/fs-source" "$RUNNER_TEMP/window-red" | tee "$RUNNER_TEMP/window-evidence/red-source-receipt.txt"
-          export CARGO_TARGET_DIR="$RUNNER_TEMP/window-target"
-          cd "$RUNNER_TEMP/window-red"
-          cargo generate-lockfile
-          cp Cargo.lock "$RUNNER_TEMP/window-evidence/component-Cargo.lock"
-          set +e
-          cargo test --locked short_deduplicated_ -- --nocapture --test-threads=2 > "$RUNNER_TEMP/window-evidence/red.log" 2>&1
-          status=$?
-          set -e
-          cat "$RUNNER_TEMP/window-evidence/red.log"
-          test "$status" = 101
-          grep -F 'test result: FAILED. 0 passed; 2 failed;' "$RUNNER_TEMP/window-evidence/red.log"
-          grep -F 'short deduplication is not exhaustion' "$RUNNER_TEMP/window-evidence/red.log"
-          grep -F 'a filled page is not a proof after raw deduplication' "$RUNNER_TEMP/window-evidence/red.log"
-      - name: GREEN - apply the production fix and run all 43 component tests
-        run: |
-          set -euo pipefail
-          git apply --check --include=src/search/query.rs --whitespace=error-all scripts/patches/initial-window-proof.patch
-          git apply --include=src/search/query.rs --whitespace=error-all scripts/patches/initial-window-proof.patch
-          rustfmt --edition 2024 --check src/search/ann_index.rs src/search/query/ann_shards.rs src/search/query/message_topk.rs src/search/query/message_topk_integration.rs
-          rustfmt --edition 2024 --config skip_children=true --emit stdout src/search/query.rs > "$RUNNER_TEMP/query-parsed.rs"
-          git diff --check
-          python3 scripts/verify_ann_shards.py "$PWD" "$GITHUB_WORKSPACE/fs-source" "$RUNNER_TEMP/window-green" | tee "$RUNNER_TEMP/window-evidence/green-source-receipt.txt"
-          export CARGO_TARGET_DIR="$RUNNER_TEMP/window-target"
-          cd "$RUNNER_TEMP/window-green"
-          cp "$RUNNER_TEMP/window-evidence/component-Cargo.lock" Cargo.lock
-          cargo test --locked -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/window-evidence/green.log"
-          grep -Eq 'test result: ok\. 43 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/window-evidence/green.log"
-      - name: Commit the proved production fix directly to main
-        run: |
-          set -euo pipefail
-          git add -- src/search/query.rs src/search/query/message_topk_integration.rs
-          python3 - <<'PY'
-          import subprocess
-          actual = set(subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines())
-          assert actual == {'src/search/query.rs', 'src/search/query/message_topk_integration.rs'}, actual
-          PY
-          git diff --cached --check
-          git hash-object src/search/query.rs src/search/query/message_topk_integration.rs | tee "$RUNNER_TEMP/window-evidence/blobs.txt"
-          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit \
-            -m 'fix(search): preserve exact completeness bounds after raw candidate deduplication' \
-            -m 'Short nonempty FSVI results are not evidence of exhaustion: document-ID dedup runs after raw top-k. Keep the omitted-score bound in both single-shard and multi-shard initial windows so bounded exact refinement can recover hidden messages and correct a filled-but-wrong ranked page. Preserve source ownership, filters, request budgets, and the proven strict-score fast path.' \
-            -m 'RED: both new real-FSVI regressions failed against the unchanged parent at the intended completeness assertions. GREEN: all 43 production-component tests passed with the same pinned engine and dependency lock. This is not full CASS CLI/model/daemon or archive-scale qualification; the separate locked build remains blocked by frankensearch =0.6.1 publication. No dependency pins or user archive were modified.'
-          for attempt in 1 2 3; do
-            if GIT_TERMINAL_PROMPT=0 git push origin HEAD:refs/heads/main; then
-              git rev-parse HEAD | tee "$RUNNER_TEMP/window-evidence/commit.txt"
-              tar -czf "$RUNNER_TEMP/window-evidence/tested-source.tar.gz" src/search/query.rs src/search/query/message_topk_integration.rs
-              exit 0
-            fi
-            parent=$(git rev-parse HEAD^)
-            git fetch --depth=100 origin main
-            test -z "$(git diff --name-only "$parent" FETCH_HEAD -- src/search scripts/verify_ann_shards.py scripts/verify_message_topk_fsvi.py Cargo.toml Cargo.lock rust-toolchain.toml)"
-            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' rebase FETCH_HEAD
-          done
-          exit 1
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
-        with:
-          name: initial-window-evidence-${{ github.sha }}
-          path: ${{ runner.temp }}/window-evidence/
-          if-no-files-found: error
-          retention-days: 14
+          git merge-base --is-ancestor e36ad641e95df88c289d70fc467e5159542d9c92 HEAD
+          git merge-base --is-ancestor d671ab449af2d6bd34bac12a7992f79b3c2cc36c HEAD
+          printf '%s\n' 'Both retrieval fixes are present in this history.' 'This check proves ancestry only; use Verify search retrieval for component and locked CASS tests.'
