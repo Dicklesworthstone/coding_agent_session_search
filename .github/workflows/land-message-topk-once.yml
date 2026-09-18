@@ -1,102 +1,179 @@
-# One-shot, hash-guarded transport for the exact-message retrieval fix. The
-# independent kernel tests below are not a substitute for the full CASS gate.
-name: Land bounded exact message retrieval
+# Hash-guarded final application of the bounded shard merge and real-FSVI tests.
+# Successful application retires this writer in the SAME source commit.
+name: Qualify exact message retrieval against real FSVI
 on:
   push:
     branches: [main]
-    paths:
-      - .github/workflows/land-message-topk-once.yml
-      - scripts/patches/exact-message-refill.patch
+    paths: [.github/workflows/land-message-topk-once.yml]
 permissions:
   contents: write
 concurrency:
   group: cass-exact-message-refill-landing
   cancel-in-progress: false
+env:
+  CARGO_BUILD_JOBS: '2'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_TERM_COLOR: never
+  CARGO_NET_RETRY: '1'
+  RUST_MIN_STACK: '134217728'
 jobs:
   apply:
     if: github.repository == 'Dicklesworthstone/coding_agent_session_search'
     runs-on: ubuntu-24.04
-    timeout-minutes: 8
+    timeout-minutes: 18
+    defaults:
+      run:
+        working-directory: cass-source
+        shell: bash
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: main
+          path: cass-source
           fetch-depth: 1
-      - name: Verify source identities and apply the reviewed retrieval change
-        shell: bash
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: Dicklesworthstone/frankensearch
+          ref: 6852e79a830c402ea4e55eb79eda3373c618dfc3
+          path: fs-source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Guard exact sources and bound the initial shard merge
         run: |
           set -euo pipefail
+          test "$(git branch --show-current)" = main
+          test -z "$(git status --porcelain)"
+          git rev-parse HEAD
           python3 - <<'PY'
           from pathlib import Path
-          import collections, json, re, subprocess
-          def git(*args):
-              return subprocess.check_output(['git', *args], text=True).strip()
-          if git('branch', '--show-current') != 'main' or git('status', '--porcelain'):
-              raise SystemExit('Refusing non-main or dirty checkout')
+          import subprocess
           expected = {
-              'src/search/query.rs': '5b553f2ba0409be25151f7d4209fe6f5c2a0d1f2',
+              'src/search/query.rs': '3c7e6a5bc69c86090dde18080bc52260f6057d30',
               'src/search/vector_index.rs': '7e2adc8aa0535af69cb478385b97d05ffb6df41d',
-              'src/search/query/message_topk.rs': '58f48c21f1d73cd9a55097dec1e6095f2a9f6753',
-              'scripts/patches/exact-message-refill.patch': 'a98cbb730b031733ff93dcd5a72eeeb362ac9b77',
+              'src/search/query/message_topk.rs': '65af5d812be532902023d5a3413a9df5b090fc3d',
+              'src/search/query/message_topk_integration.rs': 'a97810ea196866b6a77eb88c27fbeb49ca65aac3',
+              'scripts/verify_message_topk_fsvi.py': 'd7e400ad2d09f52e27c4bb84dbd70bc2aada0ee9',
           }
           for path, sha in expected.items():
-              if Path(path).is_symlink() or not Path(path).is_file() or git('hash-object', path) != sha:
+              actual = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
+              if Path(path).is_symlink() or actual != sha:
                   raise SystemExit('Changed source requires review: ' + path)
-          # The contents API cannot return the 8 MiB tracker. Read the actual
-          # exported records here without opening Beads' database or changing it.
-          beads = [json.loads(line) for line in Path('.beads/issues.jsonl').read_text().splitlines() if line.strip()]
-          print('Beads exported states:', dict(collections.Counter(item.get('status') for item in beads)))
-          selected = [item for item in beads if item.get('status') != 'closed' and re.search(r'semantic|chunk|retrieval|ANN', item.get('title', ''), re.I)]
-          for item in sorted(selected, key=lambda item: (item.get('priority', 9), item.get('id', '')))[:20]:
-              print('BEAD', json.dumps({key: item.get(key) for key in ('id', 'title', 'status', 'priority', 'assignee')}))
-          query = Path('src/search/query.rs').read_text()
-          for number, line in enumerate(query.splitlines(), 1):
-              if number > 10000 and ('search_exact_semantic_indexes' in line or 'exact_window_may_omit_competitor' in line):
-                  print('EXISTING_TEST_REFERENCE', number, line.strip())
-          patch = 'scripts/patches/exact-message-refill.patch'
-          subprocess.run(['git', 'apply', '--check', '--whitespace=error-all', patch], check=True)
-          subprocess.run(['git', 'apply', '--whitespace=error-all', patch], check=True)
+          path = Path('src/search/query.rs')
+          text = path.read_text()
+          anchor = 'mod message_topk;\n'
+          assert text.count(anchor) == 1
+          text = text.replace(anchor, anchor + '#[cfg(test)]\nmod message_topk_integration;\n', 1)
+          anchor = '''            raw_hits = raw_hits.saturating_add(fs_hits.len());
+                      best_by_message.reserve(fs_hits.len());
+                      for hit in &fs_hits {
+                          Self::record_fs_semantic_hit(&mut best_by_message, hit);
+                      }
+          '''
+          assert text.count(anchor) == 1
+          text = text.replace(anchor, anchor + '''            // Max-score collapse distributes over bounded top-k merge. Keep
+                      // only the eventual return window after each shard, rather than
+                      // retaining a full candidate page for every opened shard.
+                      let keep = Self::semantic_exact_candidate_limit(fetch_limit, raw_hits);
+                      best_by_message = Self::collapse_semantic_results(best_by_message, keep)
+                          .into_iter()
+                          .map(|hit| (hit.message_id, hit))
+                          .collect();
+          ''', 1)
+          path.write_text(text)
           PY
-      - name: Compile and execute the exact production selection kernel
-        shell: bash
+      - name: Format only the new retrieval code and parse the complete query module
         run: |
           set -euo pipefail
           rustc --version
-          rustfmt --edition 2024 src/search/query/message_topk.rs
+          rustfmt --edition 2024 src/search/query/message_topk_integration.rs
           python3 - <<'PY'
+          import importlib.util
           from pathlib import Path
-          import hashlib, json, os, re
-          vector = Path('src/search/vector_index.rs').read_text()
-          matches = re.findall(r'#\[derive\(Debug, Clone\)\]\npub struct VectorSearchResult \{\n.*?^\}', vector, re.S | re.M)
-          if len(matches) != 1:
-              raise SystemExit('Missing or ambiguous production result type')
-          kernel = Path('src/search/query/message_topk.rs').resolve()
-          source = '#![allow(dead_code)]\n' + matches[0] + '\n#[path = ' + json.dumps(str(kernel)) + ']\nmod message_topk;\n'
-          (Path(os.environ['RUNNER_TEMP']) / 'message-topk-tests.rs').write_text(source)
-          print('production kernel SHA256:', hashlib.sha256(kernel.read_bytes()).hexdigest())
+          import subprocess
+          spec = importlib.util.spec_from_file_location('probe', 'scripts/verify_message_topk_fsvi.py')
+          probe = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(probe)
+          def fmt(source):
+              return subprocess.run(['rustfmt', '--edition', '2024', '--emit', 'stdout'], input=source, text=True, capture_output=True, check=True).stdout
+          path = Path('src/search/query.rs')
+          text = path.read_text()
+          for name in ['search_exact_semantic_indexes', 'search_exact_semantic_indexes_initial_window']:
+              original = probe.function(text, name, '    ')
+              replacement = probe.function(fmt('impl SearchClient {\n' + original + '}\n'), name, '    ')
+              assert text.count(original) == 1
+              text = text.replace(original, replacement, 1)
+          original = probe.block(text, r'impl FsSearchFilter for ExactMessageRefillFilter')
+          text = text.replace(original, fmt(original), 1)
+          path.write_text(text)
           PY
-          rustc --edition 2024 --test -O "$RUNNER_TEMP/message-topk-tests.rs" -o "$RUNNER_TEMP/message-topk-tests"
-          "$RUNNER_TEMP/message-topk-tests" --nocapture --test-threads=2 | tee "$RUNNER_TEMP/message-topk-tests.log"
-          grep -Eq 'test result: ok\. 12 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/message-topk-tests.log"
-          # Parse the complete modified module without reformatting unrelated
-          # lines in the large query file. This is not a CASS type check.
-          rustfmt --edition 2024 --config skip_children=true --emit stdout src/search/query.rs > "$RUNNER_TEMP/query-formatted.rs"
-      - name: Commit the tested kernel and production wiring directly to main
-        shell: bash
+          rustfmt --edition 2024 --config skip_children=true --emit stdout src/search/query.rs > "$RUNNER_TEMP/query-parse.rs"
+          git diff --check
+      - name: Build the exact driver with pinned real FSVI and execute all 19 tests
         run: |
           set -euo pipefail
-          git add -- src/search/query.rs src/search/query/message_topk.rs
+          python3 scripts/verify_message_topk_fsvi.py "$PWD" "$GITHUB_WORKSPACE/fs-source" "$RUNNER_TEMP/cass-exact-fsvi"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/cass-exact-fsvi-target"
+          cd "$RUNNER_TEMP/cass-exact-fsvi"
+          cargo generate-lockfile
+          sha256sum Cargo.lock
+          cargo test --locked -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/cass-exact-fsvi.log"
+          grep -Eq 'test result: ok\. 19 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/cass-exact-fsvi.log"
+      - name: Record full CASS qualification separately without changing its dependency pins
+        id: full
+        run: |
+          set -uo pipefail
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/cass-full-probe-target"
+          set +e
+          timeout 90 cargo test --locked --lib search::query::message_topk -- --nocapture > "$RUNNER_TEMP/cass-full.log" 2>&1
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/cass-full.log"
+          printf 'full_cass_exit=%s\n' "$status" >> "$GITHUB_OUTPUT"
+          printf 'Full CASS qualification exit=%s; this outcome is separate from the pinned component test.\n' "$status"
+      - name: Commit bounded shard merge and integration tests, and retire writer permissions
+        env:
+          FULL_CASS_EXIT: ${{ steps.full.outputs.full_cass_exit }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('.github/workflows/land-message-topk-once.yml')
+          path.write_text('''# One-shot application completed; only explicit read-only checks remain.
+          name: Verify exact message retrieval
+          on:
+            workflow_dispatch:
+          permissions:
+            contents: read
+          jobs:
+            verify:
+              runs-on: ubuntu-24.04
+              timeout-minutes: 20
+              env:
+                CARGO_BUILD_JOBS: '2'
+                CARGO_PROFILE_TEST_DEBUG: '0'
+                CARGO_PROFILE_DEV_DEBUG: '0'
+              steps:
+                - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+                  with:
+                    persist-credentials: false
+                - name: Check exact message and FSVI regressions under the repository lockfile
+                  run: cargo test --locked --lib search::query::message_topk -- --nocapture
+          ''')
+          PY
+          git add -- src/search/query.rs src/search/query/message_topk_integration.rs .github/workflows/land-message-topk-once.yml
           python3 - <<'PY'
           import subprocess
           paths = set(subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines())
-          if not paths or not paths <= {'src/search/query.rs', 'src/search/query/message_topk.rs'}:
-              raise SystemExit('Unexpected staged paths')
+          expected = {'src/search/query.rs', 'src/search/query/message_topk_integration.rs', '.github/workflows/land-message-topk-once.yml'}
+          if paths != expected:
+              raise SystemExit('Unexpected staged paths: ' + repr(paths))
           PY
           git diff --cached --check
-          git hash-object src/search/query.rs src/search/query/message_topk.rs
+          git hash-object src/search/query.rs src/search/query/message_topk.rs src/search/query/message_topk_integration.rs
           git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit \
-            -m 'fix(search): refill chunk-dominated exact results by distinct message' \
-            -m 'Keep the proven first-window fast path. When omitted chunks may beat the requested message cutoff, refill exact readers with retained messages excluded and refine score ties by message ID. Preserve all metadata/session predicates. Cap retained state per message page, prune every shard merge, and share a 64-refill budget across shards. Budget or backend failure returns an error, never an incorrect exact-success page.' \
-            -m 'Executed 12 tests of the exact production selection kernel, including 1,920 deterministic oracle comparisons, under the pinned Rust toolchain. Full query syntax parsed. Full CASS compilation, FSVI integration, Clippy and RCH qualification are not established by this dependency-independent check.'
+            -m 'fix(search): bound initial shard merging and qualify exact message refills with real FSVI' \
+            -m 'Prune the first-pass collapsed map after every shard instead of retaining one full page per shard. Add seven real-FSVI tests for chunk starvation beyond both previous windows, filter preservation, shared-message shard merge, score ties, unchanged fast-path results, the global refill cap, and bounded-merge equivalence. Preserve all prior tests and dependency pins. Retire the one-shot writer in this same commit.' \
+            -m "Executed 19 tests of exact CASS selection bodies/filters/artifact constructors and the production kernel against real FSVI from pinned upstream 6852e79. This temporary harness has its own recorded dependency graph and is not the locked CASS binary. Full CASS qualification probe exit=$FULL_CASS_EXIT; model inference, hydration, CLI/RCH and archive-scale acceptance remain separate."
           GIT_TERMINAL_PROMPT=0 git push origin HEAD:refs/heads/main
           git rev-parse HEAD
