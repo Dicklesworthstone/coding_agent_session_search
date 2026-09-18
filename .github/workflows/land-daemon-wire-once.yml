@@ -1,189 +1,24 @@
-# One-shot source-only application; retire writer permissions after completion.
-name: Land daemon wire lifetime fix
+# Source-only landing completed; no repository-write permissions remain.
+name: Verify daemon wire changes
 on:
-  push:
-    branches: [main]
-    paths: [.github/workflows/land-daemon-wire-once.yml]
+  workflow_dispatch:
 permissions:
-  contents: write
-concurrency:
-  group: cass-daemon-wire-landing
-  cancel-in-progress: false
+  contents: read
 jobs:
-  qualify-and-land:
-    if: github.repository == 'Dicklesworthstone/coding_agent_session_search'
+  locked-cass:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
-      RUSTUP_TOOLCHAIN: nightly-2026-08-31
       CARGO_BUILD_JOBS: '2'
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_TERM_COLOR: never
-      RUST_MIN_STACK: '134217728'
-    defaults:
-      run:
-        working-directory: cass-source
-        shell: bash
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: main
-          path: cass-source
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          repository: Dicklesworthstone/frankensearch
-          ref: 6852e79a830c402ea4e55eb79eda3373c618dfc3
-          path: fs-source
+          ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Verify and apply the complete reviewed patch
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Execute daemon tests under the repository dependency lock
+        shell: bash
         run: |
           set -euo pipefail
-          test "$(git branch --show-current)" = main
-          test -z "$(git status --porcelain)"
-          mkdir -p "$RUNNER_TEMP/daemon-wire-evidence"
-          python3 - <<'PY'
-          import base64, gzip, hashlib, json, os, subprocess
-          from pathlib import Path
-          def blob(data):
-              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-          encoded = json.loads(subprocess.check_output([
-              'gh', 'api', 'repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs/f59af26a576730aa08473e6307f3a0db48886f53'
-          ], text=True))
-          assert encoded['sha'] == 'f59af26a576730aa08473e6307f3a0db48886f53'
-          transport = ''.join(encoded['content'].split())
-          # Correct the encoded transport transcription, never source text.
-          # Both full compressed and decoded identities must then match review.
-          old, new = 'RvLfLFroCeosu/yRy', 'RvLfLFLOcOSU/yRy'
-          assert transport.count(old) == 1
-          transport = transport.replace(old, new, 1)
-          transport += '=' * (-len(transport) % 4)
-          compressed = base64.b64decode(transport, validate=True)
-          assert blob(compressed) == '28e11062865a1a8c17efd0bfc5d3e387bd6f2320'
-          patch = gzip.decompress(compressed)
-          assert len(patch) == 44661
-          assert hashlib.sha256(patch).hexdigest() == 'fe80efe4bd54d2f3dfca9cba2a9a1d6efbe8708711f3005dcc604fe2a3688b7e'
-          expected = {
-              'src/daemon/core.rs': ('14368af7214a7076144c57914f963986083f014e', '12a48c93c8019d6660a9d29eee0bfe570313a2f5'),
-              'src/daemon/core/inference.rs': ('a40b697fdf711dba478cfd59ebef4ac04de3e82f', '0642ad89ab12c9ec2f18e80419d0d5564f8e1fed'),
-              'src/daemon/core/wire.rs': (None, '9894ee8512af02fe3d97085f6bb75fe15647d513'),
-              'src/daemon/protocol.rs': ('0be8bc4af9cf6b8746e6890f8990f12d6a1f9c58', 'abf4b399b7be92f66126b689de3835249f0ea75c'),
-              'src/daemon/client/transport.rs': ('74407eae156fc35a598cf166746cba3d7d3ead0f', 'ee9799c5f3817972056c3142e1145ed28de676b9'),
-              'src/daemon/client/exchange/tests.rs': ('d65dfe52ccb425b3a77040302db9df397a9bc39f', 'bd3c313572abe9fdd6c38ba11c4ab9570ac74209'),
-          }
-          for name, (before, after) in expected.items():
-              path = Path(name)
-              assert not path.is_symlink(), name
-              if before is None:
-                  assert not path.exists(), name
-              else:
-                  assert blob(path.read_bytes()) == before, 'Concurrent source change: ' + name
-          evidence = Path(os.environ['RUNNER_TEMP']) / 'daemon-wire-evidence'
-          patch_path = evidence / 'reviewed.patch'
-          patch_path.write_bytes(patch)
-          print(patch.decode())
-          subprocess.run(['git', 'apply', '--check', '--whitespace=error-all', str(patch_path)], check=True)
-          subprocess.run(['git', 'apply', '--whitespace=error-all', str(patch_path)], check=True)
-          for name, (_, after) in expected.items():
-              assert blob(Path(name).read_bytes()) == after, name
-          (evidence / 'source-identities.json').write_text(json.dumps(expected, indent=2) + '\n')
-          (evidence / 'base-commit.txt').write_text(subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True))
-          PY
-          git diff --check
-      - name: Parse every changed source and execute real socket-budget tests
-        run: |
-          set -euo pipefail
-          rustup component add --toolchain "$RUSTUP_TOOLCHAIN" rustfmt
-          rustc --version
-          for source in src/daemon/core.rs src/daemon/core/inference.rs src/daemon/core/wire.rs src/daemon/protocol.rs src/daemon/client/transport.rs src/daemon/client/exchange/tests.rs; do
-            rustfmt --edition 2024 --config skip_children=true --emit stdout "$source" > "$RUNNER_TEMP/parsed.rs"
-          done
-          printf '#[path = "%s/src/daemon/core/wire.rs"]\nmod wire;\n' "$PWD" > "$RUNNER_TEMP/wire-check.rs"
-          rustc --edition 2024 --test "$RUNNER_TEMP/wire-check.rs" -o "$RUNNER_TEMP/wire-tests"
-          timeout 30 "$RUNNER_TEMP/wire-tests" --nocapture --test-threads=2 | tee "$RUNNER_TEMP/daemon-wire-evidence/wire-tests.log"
-          grep -Eq 'test result: ok\. 8 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/daemon-wire-evidence/wire-tests.log"
-      - name: Compile the complete production protocol with real pinned upstream types
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          root = Path.cwd()
-          dest = Path(os.environ['RUNNER_TEMP']) / 'daemon-wire-component'
-          (dest / 'src').mkdir(parents=True)
-          dependency = Path(os.environ['GITHUB_WORKSPACE']) / 'fs-source/frankensearch'
-          manifest = '''[package]
-          name = "cass-daemon-wire-component"
-          version = "0.0.0"
-          edition = "2024"
-          [dependencies]
-          serde = { version = "=1.0.229", features = ["derive"] }
-          serde_json = "=1.0.151"
-          rmp-serde = "=1.3.1"
-          thiserror = "2.0.18"
-          dotenvy = "=0.15.7"
-          '''
-          manifest += 'frankensearch = { path = ' + json.dumps(str(dependency)) + ', default-features = false, features = ["hash"] }\n'
-          (dest / 'Cargo.toml').write_text(manifest)
-          source = '#[path = ' + json.dumps(str(root / 'src/daemon/protocol.rs')) + ']\npub mod protocol;\n'
-          source += '#[path = ' + json.dumps(str(root / 'src/daemon/core/wire.rs')) + ']\nmod wire;\n'
-          (dest / 'src/lib.rs').write_text(source)
-          PY
-          export CARGO_TARGET_DIR="$RUNNER_TEMP/daemon-wire-target"
-          cd "$RUNNER_TEMP/daemon-wire-component"
-          cargo generate-lockfile
-          cp Cargo.toml Cargo.lock "$RUNNER_TEMP/daemon-wire-evidence/"
-          cargo test --locked -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/daemon-wire-evidence/component-tests.log"
-          grep -Eq 'test result: ok\. 27 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/daemon-wire-evidence/component-tests.log"
-      - name: Record the full CASS result separately without changing dependencies
-        id: full
-        run: |
-          set -uo pipefail
-          export CARGO_TARGET_DIR="$RUNNER_TEMP/daemon-full-target"
-          set +e
-          timeout 90 cargo test --locked --lib daemon:: -- --nocapture > "$RUNNER_TEMP/daemon-wire-evidence/full-cass.log" 2>&1
-          status=$?
-          set -e
-          cat "$RUNNER_TEMP/daemon-wire-evidence/full-cass.log"
-          echo "status=$status" >> "$GITHUB_OUTPUT"
-          echo "FULL_CASS_EXIT=$status; component success is not full daemon qualification"
-      - name: Commit the six complete source files directly to main
-        env:
-          FULL_CASS_EXIT: ${{ steps.full.outputs.status }}
-        run: |
-          set -euo pipefail
-          git add -- src/daemon/core.rs src/daemon/core/inference.rs src/daemon/core/wire.rs src/daemon/protocol.rs src/daemon/client/transport.rs src/daemon/client/exchange/tests.rs
-          python3 - <<'PY'
-          import json, os, subprocess
-          from pathlib import Path
-          expected = json.loads((Path(os.environ['RUNNER_TEMP']) / 'daemon-wire-evidence/source-identities.json').read_text())
-          actual = set(subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines())
-          assert actual == set(expected), actual
-          for name, (_, after) in expected.items():
-              assert subprocess.check_output(['git', 'rev-parse', ':' + name], text=True).strip() == after, name
-          PY
-          git diff --cached --check
-          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit \
-            -m 'fix(daemon): enforce request-owned wire deadlines and strict bounded frames' \
-            -m 'Land the reviewed six-file patch atomically: nonblocking prefix/payload/response I/O with one request budget, remaining-time inference admission, bounded shutdown acknowledgement, exact MessagePack consumption, byte/depth limits, and strict CASS envelope fields. Preserve existing tests and add 20 regressions. No dependency pin, lockfile, archive or model-asset changes.' \
-            -m "Executed 27 component tests: all 19 production protocol tests and all 8 real-socket budget tests, using unchanged full modules with pinned real upstream types and a separate dependency lock. All six Rust files parsed. Full CASS attempt exit=$FULL_CASS_EXIT; core dispatch, inference, client-exchange integration, model execution and RCH/UBS qualification remain separate."
-          for attempt in 1 2 3; do
-            if GIT_TERMINAL_PROMPT=0 git push origin HEAD:refs/heads/main; then
-              git rev-parse HEAD | tee "$RUNNER_TEMP/daemon-wire-evidence/published-commit.txt"
-              exit 0
-            fi
-            parent=$(git rev-parse HEAD^)
-            git fetch --depth=100 origin main
-            test -z "$(git diff --name-only "$parent" FETCH_HEAD -- src/daemon Cargo.toml Cargo.lock rust-toolchain.toml)"
-            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' rebase FETCH_HEAD
-          done
-          echo 'Source push failed; no force-push attempted' >&2
-          exit 1
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
-        with:
-          name: daemon-wire-evidence-${{ github.sha }}
-          path: ${{ runner.temp }}/daemon-wire-evidence/
-          retention-days: 14
+          cargo test --locked --lib daemon:: -- --nocapture
