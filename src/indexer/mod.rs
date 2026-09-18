@@ -33307,18 +33307,25 @@ pub mod persist {
                         kind: AgentKind::Cli,
                     };
 
-                    let agent_id = if cache_enabled {
-                        cache.get_or_insert_agent(writer, &agent)?
-                    } else {
-                        writer.ensure_agent(&agent)?
-                    };
+                    // These idempotent parent upserts precede the canonical
+                    // chunk transaction. They need their own bounded contention
+                    // retry when a warm writer encounters a new identity (GH473).
+                    let agent_id = with_concurrent_retry(SERIAL_CHUNK_CONTENTION_RETRIES, || {
+                        if cache_enabled {
+                            cache.get_or_insert_agent(writer, &agent)
+                        } else {
+                            writer.ensure_agent(&agent)
+                        }
+                    })?;
 
                     let workspace_id = if let Some(ws) = &conv.workspace {
-                        if cache_enabled {
-                            Some(cache.get_or_insert_workspace(writer, ws, None)?)
-                        } else {
-                            Some(writer.ensure_workspace(ws, None)?)
-                        }
+                        Some(with_concurrent_retry(SERIAL_CHUNK_CONTENTION_RETRIES, || {
+                            if cache_enabled {
+                                cache.get_or_insert_workspace(writer, ws, None)
+                            } else {
+                                writer.ensure_workspace(ws, None)
+                            }
+                        })?)
                     } else {
                         None
                     };

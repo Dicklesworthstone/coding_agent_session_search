@@ -428,6 +428,65 @@ mod gh473_preflight {
         storage.close().unwrap();
     }
 
+    fn warm_writer_parent_registration_retries(workspace_only: bool) {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("parent-retry.db");
+        let storage = FrankenStorage::open(&path).unwrap();
+        let mut conversation = norm_conv(Some("gh473-parent"), vec![norm_msg(0, 100)]);
+        conversation.workspace = Some(tmp.path().join("workspace"));
+        let completion = crate::storage::sqlite::SourceIngestLedgerEntry {
+            key: "source_ingest_v1:gh473-parent".into(),
+            observation: "complete".into(),
+        };
+        persist::with_ephemeral_writer(&storage, false, "GH473 warm setup", |writer| {
+            if workspace_only {
+                writer.ensure_agent(&crate::model::types::Agent {
+                    id: None,
+                    slug: conversation.agent_slug.clone(),
+                    name: conversation.agent_slug.clone(),
+                    version: None,
+                    kind: crate::model::types::AgentKind::Cli,
+                })?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(storage.ephemeral_writer_preflight_verified());
+        let (result, retries) = with_held_writer(&path, true, || {
+            persist::persist_conversations_batched_inner(
+                &storage,
+                None,
+                std::slice::from_ref(&conversation),
+                LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                false,
+                false,
+                None,
+                persist::PersistHeartbeat::NONE,
+                Some(&completion),
+            )
+        });
+        let result = result.unwrap();
+        assert_eq!(
+            retries, 1,
+            "warm setup must retry the uncached parent write"
+        );
+        assert_eq!(
+            (result.inserted_conversations, result.inserted_messages),
+            (1, 1)
+        );
+        assert_eq!(scalar(&storage, "SELECT COUNT(*) FROM workspaces"), 1);
+        assert_eq!(scalar(&storage, "SELECT COUNT(*) FROM conversations"), 1);
+        assert_eq!(scalar(&storage, "SELECT COUNT(*) FROM messages"), 1);
+        assert_eq!(
+            storage
+                .source_ingest_ledger_entries()
+                .unwrap()
+                .get(&completion.key),
+            Some(&completion.observation)
+        );
+        storage.close().unwrap();
+    }
+
     #[test]
     fn writer_preflight_contention_regression() {
         const CHILD: &str = "CASS_TEST_GH473_PREFLIGHT_CHILD";
@@ -440,6 +499,8 @@ mod gh473_preflight {
             }
             permanent_error_is_not_retried();
             writer_body_errors_are_never_replayed();
+            warm_writer_parent_registration_retries(false);
+            warm_writer_parent_registration_retries(true);
             canonical_contention_preserves_completion_and_lexical_state();
             canonical_write_and_replay_with_pinned_reader(expected);
             return;
