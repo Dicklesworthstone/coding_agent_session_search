@@ -1,0 +1,152 @@
+# Source-only landing of the direct writer fix; retire through the connector.
+name: Prove direct rebuild preservation
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [.github/workflows/qualify-shard-publication.yml]
+permissions:
+  contents: write
+concurrency:
+  group: cass-shard-publication-qualification
+  cancel-in-progress: false
+jobs:
+  qualify-and-land:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      CARGO_NET_RETRY: '1'
+      RUST_MIN_STACK: '134217728'
+    defaults:
+      run:
+        working-directory: cass-source
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          path: cass-source
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: Dicklesworthstone/frankensearch
+          ref: 6852e79a830c402ea4e55eb79eda3373c618dfc3
+          path: fs-source
+          persist-credentials: false
+      - name: Guard exact sources and install tests without changing the writer
+        run: |
+          set -euo pipefail
+          test "$(git branch --show-current)" = main
+          test -z "$(git status --porcelain)"
+          mkdir -p "$RUNNER_TEMP/direct-evidence"
+          git rev-parse HEAD > "$RUNNER_TEMP/direct-evidence/parent.txt"
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          expected = {
+              'src/indexer/semantic.rs': '093b88b1ee99531a2a9132e70d2d7bba9f4a85c1',
+              'src/indexer/semantic/shard_publication_tests.rs': '2c788888abc24b0086a7fafcfbbe6468dc1ecc5a',
+              'scripts/verify_shard_publication.py': 'e9a3beb214351ba5b3f41f9f549c9136da77301a',
+              'src/search/semantic_manifest.rs': '45e12506457d0b9823d25fd65e08a9a7a3cc83a0',
+              'src/search/hash_embedder.rs': 'e8487cf35172492e4ea609748572e7385bf0ee06',
+              'src/search/vector_index.rs': '7e2adc8aa0535af69cb478385b97d05ffb6df41d',
+              'src/search/fastembed_embedder.rs': 'c97185b2a38140e16680ecbb4cf8bd057ad2f819',
+              'src/search/policy.rs': '44b59c96535139a5df34801dfdd14ef3e21ecbe3',
+              'src/search/canonicalize.rs': '8ef9cf0a3fbecf7211f827b2d659f25f1bd711c5',
+              'scripts/patches/direct-writer-preservation.patch': 'a6b85a99ecc86ed9012a2f0bbf86462671bd36cc',
+              'scripts/patches/direct-writer-tests.patch': '925116a235975f4346a303f06226fb46b6a29147',
+          }
+          for path, sha in expected.items():
+              actual = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
+              if Path(path).is_symlink() or actual != sha:
+                  raise SystemExit('Changed source requires review: ' + path)
+          PY
+          cp src/indexer/semantic.rs "$RUNNER_TEMP/parent-semantic.rs"
+          git apply --check --whitespace=error-all scripts/patches/direct-writer-tests.patch
+          git apply --whitespace=error-all scripts/patches/direct-writer-tests.patch
+          rustc --version
+          rustfmt --edition 2024 src/indexer/semantic/shard_publication_tests.rs
+          git diff --check
+      - name: RED - require loss of the installed main with and without pending WAL
+        run: |
+          set -euo pipefail
+          python3 scripts/verify_shard_publication.py "$PWD" "$GITHUB_WORKSPACE/fs-source" "$RUNNER_TEMP/direct-red" --indexer-source "$RUNNER_TEMP/parent-semantic.rs"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/direct-target"
+          cd "$RUNNER_TEMP/direct-red"
+          cargo generate-lockfile
+          cp Cargo.lock "$RUNNER_TEMP/direct-evidence/component-Cargo.lock"
+          set +e
+          cargo test --locked direct_failed_rebuild_ -- --nocapture --test-threads=1 > "$RUNNER_TEMP/direct-evidence/red.log" 2>&1
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/direct-evidence/red.log"
+          test "$status" -ne 0
+          grep -F 'failed direct rebuild removed the installed FSVI' "$RUNNER_TEMP/direct-evidence/red.log"
+          grep -F "failed direct rebuild removed the WAL's installed main" "$RUNNER_TEMP/direct-evidence/red.log"
+          grep -F 'test result: FAILED. 0 passed; 2 failed;' "$RUNNER_TEMP/direct-evidence/red.log"
+          cp source-receipt.json "$RUNNER_TEMP/direct-evidence/red-source-receipt.json"
+      - name: GREEN - apply the runtime fix and execute all 32 tests
+        run: |
+          set -euo pipefail
+          git apply --check --whitespace=error-all scripts/patches/direct-writer-preservation.patch
+          git apply --whitespace=error-all scripts/patches/direct-writer-preservation.patch
+          rustfmt --edition 2024 --config skip_children=true --emit stdout src/indexer/semantic.rs > "$RUNNER_TEMP/semantic-parsed.rs"
+          git diff --check
+          python3 scripts/verify_shard_publication.py "$PWD" "$GITHUB_WORKSPACE/fs-source" "$RUNNER_TEMP/direct-green"
+          cp "$RUNNER_TEMP/direct-red/Cargo.lock" "$RUNNER_TEMP/direct-green/Cargo.lock"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/direct-target"
+          cd "$RUNNER_TEMP/direct-green"
+          cargo test --locked -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/direct-evidence/green.log"
+          grep -Eq 'test result: ok\. 32 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/direct-evidence/green.log"
+          cp source-receipt.json "$RUNNER_TEMP/direct-evidence/green-source-receipt.json"
+      - name: Record component lint and locked CASS results independently
+        id: checks
+        run: |
+          set -uo pipefail
+          set +e
+          CARGO_TARGET_DIR="$RUNNER_TEMP/direct-target" cargo clippy --manifest-path "$RUNNER_TEMP/direct-green/Cargo.toml" --locked --all-targets -- -D warnings > "$RUNNER_TEMP/direct-evidence/clippy.log" 2>&1
+          lint=$?
+          timeout 90 env CARGO_TARGET_DIR="$RUNNER_TEMP/direct-full-target" cargo test --locked --lib indexer::semantic::shard_publication_tests -- --nocapture > "$RUNNER_TEMP/direct-evidence/locked-cass.log" 2>&1
+          full=$?
+          set -e
+          cat "$RUNNER_TEMP/direct-evidence/clippy.log" "$RUNNER_TEMP/direct-evidence/locked-cass.log"
+          printf 'component_clippy=%s\nlocked_cass=%s\n' "$lint" "$full" | tee "$RUNNER_TEMP/direct-evidence/checks.txt" >> "$GITHUB_OUTPUT"
+      - name: Commit proved runtime changes directly to main
+        env:
+          LINT_EXIT: ${{ steps.checks.outputs.component_clippy }}
+          FULL_EXIT: ${{ steps.checks.outputs.locked_cass }}
+        run: |
+          set -euo pipefail
+          git add -- src/indexer/semantic.rs src/indexer/semantic/shard_publication_tests.rs scripts/verify_shard_publication.py
+          python3 - <<'PY'
+          import subprocess
+          paths = set(subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines())
+          assert paths == {'src/indexer/semantic.rs', 'src/indexer/semantic/shard_publication_tests.rs', 'scripts/verify_shard_publication.py'}, paths
+          PY
+          git diff --cached --check
+          git hash-object src/indexer/semantic.rs src/indexer/semantic/shard_publication_tests.rs scripts/verify_shard_publication.py > "$RUNNER_TEMP/direct-evidence/tested-blobs.txt"
+          tar -czf "$RUNNER_TEMP/direct-evidence/tested-source.tar.gz" src/indexer/semantic.rs src/indexer/semantic/shard_publication_tests.rs scripts/verify_shard_publication.py
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit \
+            -m 'fix(index): preserve installed vectors when a direct rebuild fails' \
+            -m 'The normal direct writer buffers records and publishes only during finish. Remove caller cleanup that unconditionally deleted the installed destination when validation or a buffered write failed. Propagate original backend causes with anyhow context; retain progress only for accepted records and let the engine own its temporary-file cleanup and WAL publication refusals. No dependency or schema changes.' \
+            -m "RED: both existing-main loss regressions failed against unchanged production code, with and without a real pending WAL. GREEN: all 32 tests passed using exact direct/shard writer methods, actual hash control producer and pinned real FSVI/HNSW. Seven new tests cover typed causes, progress, panic interruption, WAL refusal, successful replacement with retained reader, and failed first creation. Component Clippy exit=$LINT_EXIT; full locked CASS exit=$FULL_EXIT. This is not complete CLI/model/RCH/UBS qualification."
+          for attempt in 1 2 3; do
+            if GIT_TERMINAL_PROMPT=0 git push origin HEAD:refs/heads/main; then
+              git rev-parse HEAD | tee "$RUNNER_TEMP/direct-evidence/published-commit.txt"
+              exit 0
+            fi
+            parent=$(git rev-parse HEAD^)
+            git fetch --depth=100 origin main
+            test -z "$(git diff --name-only "$parent" FETCH_HEAD -- src/indexer/semantic.rs src/indexer/semantic/shard_publication_tests.rs src/search/semantic_manifest.rs src/search/hash_embedder.rs src/search/embedder.rs src/search/vector_index.rs src/search/policy.rs src/search/canonicalize.rs scripts/verify_shard_publication.py scripts/verify_message_topk_fsvi.py Cargo.toml Cargo.lock)"
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' rebase FETCH_HEAD
+          done
+          exit 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: direct-publication-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/direct-evidence
+          retention-days: 14

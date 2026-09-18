@@ -5114,8 +5114,11 @@ impl SearchClient {
                 Self::record_fs_semantic_hit(&mut best_by_message, hit);
             }
             let collapsed = Self::collapse_semantic_results(best_by_message, candidate_limit);
-            let has_more_candidates =
-                fs_hits.len() >= candidate_limit && candidate_limit < record_count;
+            // FSVI deduplicates document IDs after raw top-k. A short nonempty
+            // batch can therefore hide later messages even before our first
+            // refill. Only an empty batch or a full-record window proves that
+            // no candidates remain; retain the score bound in every other case.
+            let has_more_candidates = !fs_hits.is_empty() && candidate_limit < record_count;
             let max_omitted_score = if has_more_candidates {
                 fs_hits.last().map(|hit| hit.score)
             } else {
@@ -5154,8 +5157,7 @@ impl SearchClient {
             let fs_hits = index
                 .search_top_k(embedding, shard_limit, fs_filter)
                 .map_err(|err| anyhow!("frankensearch sharded semantic search failed: {err}"))?;
-            if fs_hits.len() >= shard_limit
-                && shard_limit < shard_record_count
+            if shard_limit < shard_record_count
                 && let Some(last_hit) = fs_hits.last()
             {
                 has_more_candidates = true;
@@ -5283,8 +5285,8 @@ impl SearchClient {
             let ann = request
                 .ann_index
                 .ok_or_else(|| anyhow!("HNSW cohort failed to initialize"))?;
-            return ann.search(
-                &context.artifacts,
+            return ann.search_with_exact_fallback(
+                context,
                 embedding,
                 request.fetch_limit,
                 semantic_filter_as_search_filter(&semantic_filter),

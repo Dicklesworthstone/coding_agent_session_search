@@ -1,0 +1,23 @@
+# Both source-only landings completed. No job retains repository-write access.
+name: Verify landed retrieval commits
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  ancestry-only:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify commit ancestry, not runtime qualification
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor e36ad641e95df88c289d70fc467e5159542d9c92 HEAD
+          git merge-base --is-ancestor d671ab449af2d6bd34bac12a7992f79b3c2cc36c HEAD
+          printf '%s\n' 'Both retrieval fixes are present in this history.' 'This check proves ancestry only; use Verify search retrieval for component and locked CASS tests.'

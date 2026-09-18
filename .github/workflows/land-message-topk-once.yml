@@ -1,22 +1,9 @@
-# Read-only verification; no runner has permission to publish source changes.
+# Explicit, read-only qualification. Component success is not a locked CASS pass.
 name: Verify search retrieval
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - .github/workflows/land-message-topk-once.yml
-      - src/search/query.rs
-      - src/search/query/**
-      - src/search/vector_index.rs
-      - src/search/ann_index.rs
-      - scripts/verify_ann_shards.py
-      - scripts/verify_message_topk_fsvi.py
 permissions:
   contents: read
-concurrency:
-  group: cass-search-retrieval-${{ github.ref }}
-  cancel-in-progress: false
 jobs:
   component:
     runs-on: ubuntu-24.04
@@ -33,34 +20,21 @@ jobs:
           ref: ${{ github.sha }}
           path: cass-source
           persist-credentials: false
-      - name: Preserve the exact source under review
-        shell: bash
-        working-directory: cass-source
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/search-source"
-          git rev-parse HEAD > "$RUNNER_TEMP/search-source/commit.txt"
-          git archive --format=tar.gz HEAD AGENTS.md README.md Cargo.toml Cargo.lock rust-toolchain.toml src scripts tests docs/planning .beads/issues.jsonl > "$RUNNER_TEMP/search-source/source.tar.gz"
-          sha256sum "$RUNNER_TEMP/search-source/source.tar.gz"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: search-source-${{ github.sha }}
-          path: ${{ runner.temp }}/search-source/
-          if-no-files-found: error
-          retention-days: 7
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: Dicklesworthstone/frankensearch
           ref: 6852e79a830c402ea4e55eb79eda3373c618dfc3
           path: fs-source
           persist-credentials: false
-      - name: Compile and execute the production retrieval components with real FSVI and HNSW
+      - name: Execute the real FSVI and HNSW component regressions
         shell: bash
         working-directory: cass-source
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/search-evidence"
+          git rev-parse HEAD | tee "$RUNNER_TEMP/search-evidence/commit.txt"
           rustc --version | tee "$RUNNER_TEMP/search-evidence/toolchain.txt"
+          rustfmt --edition 2024 --check src/search/ann_index.rs src/search/query/ann_shards.rs src/search/query/message_topk.rs src/search/query/message_topk_integration.rs
           python3 scripts/verify_ann_shards.py "$PWD" "$GITHUB_WORKSPACE/fs-source" "$RUNNER_TEMP/cass-search-components" | tee "$RUNNER_TEMP/search-evidence/source-receipt.txt"
           export CARGO_TARGET_DIR="$RUNNER_TEMP/cass-search-target"
           cd "$RUNNER_TEMP/cass-search-components"
@@ -72,9 +46,10 @@ jobs:
           from pathlib import Path
           text = (Path(os.environ['RUNNER_TEMP']) / 'search-evidence/tests.log').read_text()
           counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
-          if not counts or max(map(int, counts)) < 34:
-              raise SystemExit('Expected at least 34 passing production component tests')
+          if not counts or max(map(int, counts)) < 43:
+              raise SystemExit('Expected at least 43 passing production component tests')
           PY
+          cargo clippy --locked --lib --tests -- -D warnings 2>&1 | tee "$RUNNER_TEMP/search-evidence/clippy.log"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:

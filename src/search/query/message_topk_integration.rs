@@ -292,3 +292,74 @@ fn bounded_initial_shard_merge_matches_complete_candidate_reference() {
     .unwrap();
     assert_eq!(ranked(&actual), ranked(&reference));
 }
+
+#[test]
+fn short_deduplicated_initial_window_does_not_hide_later_messages() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("duplicate-docs.fsvi");
+    let mut records = vec![(doc(1, 0, 3), [1.0, 0.0]); 40];
+    records.extend([(doc(2, 0, 3), [0.8, 0.6]), (doc(3, 0, 3), [0.6, 0.8])]);
+    let ctx = context(vec![artifact(&path, &records)]);
+    let before = std::fs::read(&path).unwrap();
+    let (initial, state) =
+        SearchClient::search_exact_semantic_indexes_initial_window(&ctx, &[1.0, 0.0], 2, None)
+            .unwrap();
+    assert_eq!(
+        initial.len(),
+        1,
+        "FSVI deduplicates the raw candidate window"
+    );
+    assert!(
+        state.has_more_candidates,
+        "short deduplication is not exhaustion"
+    );
+    assert!(state.exact_window_may_omit_competitor);
+    let (hits, state) =
+        SearchClient::search_exact_semantic_indexes(&ctx, &[1.0, 0.0], 2, None).unwrap();
+    assert_eq!(
+        hits.iter()
+            .take(2)
+            .map(|hit| hit.message_id)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert!(!state.exact_window_may_omit_competitor);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn short_deduplicated_shard_cannot_certify_an_incorrect_global_ranking() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut first = vec![(doc(1, 0, 3), [1.0, 0.0]); 40];
+    first.push((doc(2, 0, 3), [0.9, 0.4358899]));
+    let second = [(doc(3, 0, 3), [0.6, 0.8]), (doc(4, 0, 3), [0.0, 1.0])];
+    let ctx = context(vec![
+        artifact(&temp.path().join("first.fsvi"), &first),
+        artifact(&temp.path().join("second.fsvi"), &second),
+    ]);
+    let (initial, state) =
+        SearchClient::search_exact_semantic_indexes_initial_window(&ctx, &[1.0, 0.0], 2, None)
+            .unwrap();
+    assert_eq!(
+        initial
+            .iter()
+            .take(2)
+            .map(|hit| hit.message_id)
+            .collect::<Vec<_>>(),
+        vec![1, 3]
+    );
+    assert!(
+        state.exact_window_may_omit_competitor,
+        "a filled page is not a proof after raw deduplication"
+    );
+    let (hits, state) =
+        SearchClient::search_exact_semantic_indexes(&ctx, &[1.0, 0.0], 2, None).unwrap();
+    assert_eq!(
+        hits.iter()
+            .take(2)
+            .map(|hit| hit.message_id)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert!(!state.exact_window_may_omit_competitor);
+}
