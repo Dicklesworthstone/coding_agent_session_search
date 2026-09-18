@@ -31973,6 +31973,8 @@ pub mod persist {
         apply_index_writer_checkpoint_policy(storage, defer_checkpoints);
 
         if storage.bulk_single_connection_enabled() {
+            // Preflight is a write too; tune it before entering the retryable operation.
+            apply_index_writer_busy_timeout(storage);
             if !storage.ephemeral_writer_preflight_verified() {
                 storage
                     .raw()
@@ -31985,7 +31987,6 @@ pub mod persist {
                     })?;
                 storage.mark_ephemeral_writer_preflight_verified();
             }
-            apply_index_writer_busy_timeout(storage);
             apply_index_writer_checkpoint_policy(storage, defer_checkpoints);
             if let Err(err) = storage.raw().execute("PRAGMA foreign_keys = OFF") {
                 tracing::debug!(
@@ -32026,6 +32027,8 @@ pub mod persist {
             }
         };
 
+        // A cold/reused writer must not inherit a long timeout for its first write.
+        apply_index_writer_busy_timeout(&writer);
         if !storage.ephemeral_writer_preflight_verified() {
             // CASS #162 item 2: Preflight write check to catch "attempt to write
             // a readonly database" early with a clear diagnostic instead of letting
@@ -32038,17 +32041,17 @@ pub mod persist {
                 .execute("UPDATE meta SET value = value WHERE key = 'schema_version'")
             {
                 discard_writer(writer);
-                anyhow::bail!(
-                    "ephemeral writer preflight write failed for {context} at {}: {err}. \
+                // Preserve the typed engine error for outer retry/fallback classification.
+                return Err(anyhow::Error::new(err).context(format!(
+                    "ephemeral writer preflight write failed for {context} at {}. \
                      The database may be locked by another process or opened in \
                      readonly mode. Try closing other cass instances and retrying.",
                     db_path.display()
-                );
+                )));
             }
             storage.mark_ephemeral_writer_preflight_verified();
         }
 
-        apply_index_writer_busy_timeout(&writer);
         apply_index_writer_checkpoint_policy(&writer, defer_checkpoints);
 
         // CASS #169: Disable database-level FK enforcement on ephemeral writers.
@@ -37235,6 +37238,7 @@ pub mod persist {
 
 #[cfg(test)]
 mod tests {
+    include!("gh473_tests.rs");
     use super::*;
     use crate::connectors::{
         Connector, DetectionResult, NormalizedConversation, NormalizedMessage, ScanContext,
