@@ -11942,13 +11942,26 @@ fn render_swarm_status_live() -> serde_json::Value {
             }
         }
     }
-    // Process collection is still unavailable. Never turn that absence into
-    // a recommendation to start a build on an apparently idle fleet.
+    // Fleet counts are observations, not local process coverage or admission.
+    payload["summary"]["build_pressure"] = serde_json::Value::Null;
     payload["build_pressure"] = serde_json::json!({
         "status": "unknown", "active_rch_jobs": null, "active_cargo_jobs": null,
+        "queued_rch_jobs": null, "slots_total": null, "slots_available": null,
+        "fleet_posture": null,
         "load_average_1m": null, "cpu_count": null,
         "recommended_action": "inspect-rch-state",
     });
+    if let Some(snapshot) = collection.snapshot(SwarmProviderName::Process) {
+        for field in [
+            "active_rch_jobs",
+            "queued_rch_jobs",
+            "slots_total",
+            "slots_available",
+            "fleet_posture",
+        ] {
+            payload["build_pressure"][field] = snapshot.payload[field].clone();
+        }
+    }
     payload["_meta"]["source_observations"] = serde_json::json!({});
     for snapshot in &collection.snapshots {
         let observed = &snapshot.payload;
@@ -11962,6 +11975,7 @@ fn render_swarm_status_live() -> serde_json::Value {
             "head": observed.get("head"),
             "version": observed.get("version"),
             "source_kind": observed.get("source_kind"),
+            "schema_version": observed.get("schema_version"),
             "export_age_ms": observed.get("export_age_ms"),
         });
     }
@@ -33883,6 +33897,9 @@ fn ann_fallback_human_warning(
     reason: crate::search::vector_index::SemanticAnnUnavailableReason,
 ) -> String {
     let action = match reason {
+        crate::search::vector_index::SemanticAnnUnavailableReason::SessionScopeRequiresExact => {
+            "The session filter requires exact candidate selection. No index repair is needed."
+        }
         crate::search::vector_index::SemanticAnnUnavailableReason::MultipleExactShards => {
             "Exact multi-shard results remain available; inspect `cass health --json` before enabling sharded ANN acceleration."
         }
@@ -33906,6 +33923,7 @@ mod ann_fallback_human_warning_tests {
     #[test]
     fn warning_uses_the_same_stable_reason_code_as_robot_metadata() {
         for reason in [
+            SemanticAnnUnavailableReason::SessionScopeRequiresExact,
             SemanticAnnUnavailableReason::MultipleExactShards,
             SemanticAnnUnavailableReason::SidecarMissing,
             SemanticAnnUnavailableReason::SidecarOpenFailed,
@@ -33921,6 +33939,18 @@ mod ann_fallback_human_warning_tests {
                 "human warning must name the realized fallback: {warning}"
             );
         }
+    }
+
+    #[test]
+    fn session_scope_fallback_preserves_filter_without_rebuild_advice() {
+        let warning =
+            ann_fallback_human_warning(SemanticAnnUnavailableReason::SessionScopeRequiresExact);
+        assert!(warning.contains("session_scope_requires_exact"));
+        assert!(warning.contains("exact semantic search"));
+        assert!(warning.contains("session filter"));
+        assert!(warning.contains("No index repair is needed"));
+        assert!(!warning.contains("build-hnsw"));
+        assert!(!warning.contains("remove"));
     }
 
     #[test]
