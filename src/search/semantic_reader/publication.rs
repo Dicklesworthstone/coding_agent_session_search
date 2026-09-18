@@ -39,7 +39,7 @@ use crate::search::semantic_manifest::{
     ValidatedSemanticGeneration,
 };
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 use crate::search::semantic_manifest::load_current_semantic_generation;
 
 /// Admission limits on manifest-declared vector images, not a total RSS limit.
@@ -271,7 +271,10 @@ impl SelectedSemanticGeneration {
         self.reader.tier(tier).map_or(0, |tier| tier.shards.len())
     }
 
-    /// Revalidate the entire successor before touching the current handle.
+    /// Revalidate a successor before touching the current handle. An unchanged
+    /// selection reuses its sealed vector/graph owners after a bounded metadata
+    /// recheck; it does not reread artifact paths or allocate duplicate images.
+    /// Use load_current_semantic_generation for a fresh audit of files on disk.
     ///
     /// Selection epochs, NOT vector-build sequence numbers, order refreshes.
     /// An explicitly published rollback to an older build is valid at a newer
@@ -283,16 +286,19 @@ impl SelectedSemanticGeneration {
         expected_corpus: &SemanticCorpusSnapshotIdentity,
         budget: SemanticSelectionBudget,
     ) -> SemanticSelectionResult<bool> {
-        let candidate = Self::open_current(&self.data_dir, expected_corpus, budget)?;
-        let previous = &self.identity.pointer;
-        let next = &candidate.identity.pointer;
-        if next.selection_epoch < previous.selection_epoch
-            || (next.selection_epoch == previous.selection_epoch
-                && (next != previous || candidate.identity.manifest != self.identity.manifest))
-        {
-            return Err(SemanticSelectionError::StaleSelection);
+        let selected = SemanticSelectionMetadata::read(&self.data_dir, Some(expected_corpus))?;
+        budget.check(&selected.manifest)?;
+        if !self.check_refresh_selection(&selected.pointer, &selected.manifest)? {
+            return Ok(false);
         }
-        if next == previous {
+
+        // Metadata is not an admission receipt. Every genuinely new selection
+        // still crosses complete artifact and sealed-owner validation. Recheck
+        // ordering afterward too: current.json may change while it is opened.
+        let candidate = Self::open_current(&self.data_dir, expected_corpus, budget)?;
+        if !self
+            .check_refresh_selection(&candidate.identity.pointer, &candidate.identity.manifest)?
+        {
             return Ok(false);
         }
         let candidate = match self.ann_budget {
@@ -301,6 +307,21 @@ impl SelectedSemanticGeneration {
         };
         *self = candidate;
         Ok(true)
+    }
+
+    fn check_refresh_selection(
+        &self,
+        next: &SemanticCurrentPointerV1,
+        manifest: &SemanticGenerationManifestV1,
+    ) -> SemanticSelectionResult<bool> {
+        let previous = &self.identity.pointer;
+        if next.selection_epoch < previous.selection_epoch
+            || (next.selection_epoch == previous.selection_epoch
+                && (next != previous || manifest != &self.identity.manifest))
+        {
+            return Err(SemanticSelectionError::StaleSelection);
+        }
+        Ok(next != previous)
     }
 
     pub fn selection(&self) -> &SemanticSelectionIdentity {

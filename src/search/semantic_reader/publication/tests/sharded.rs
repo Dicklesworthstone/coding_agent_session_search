@@ -562,3 +562,5 @@ fn merged_live_docset_matches_fsvi_order_and_rejects_duplicate_live_ids() -> Tes
 }
 
 mod coverage;
+
+mod refresh;
