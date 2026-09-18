@@ -1,79 +1,69 @@
-# One-shot transport for the reviewed session-scope implementation. This does
-# not run the Rust gate or change release/CI policy. Exact source and patch
-# identities prevent stale replays or overwriting another agent's edits.
-name: Apply reviewed session-scope patch once
+# The session-scope implementation was landed by this recipe's predecessor.
+# The writer is retired: this version only verifies an immutable revision and
+# cannot commit, push, repair an archive, or change the dependency lockfile.
+name: Verify landed session-scoped search
 
 on:
   push:
     branches: [main]
     paths:
       - .github/workflows/apply-session-scope-once.yml
-      - scripts/patches/session-scope.patch
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: cass-session-scope-patch-landing
+  group: cass-session-scope-verification
   cancel-in-progress: false
 
 jobs:
-  apply:
+  verify:
     if: github.repository == 'Dicklesworthstone/coding_agent_session_search'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_NET_RETRY: '1'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '134217728'
+      RUST_BACKTRACE: '1'
+      CARGO_TARGET_DIR: ${{ runner.temp }}/cass-session-scope-target
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 1
-      - name: Verify exact inputs and apply only the reviewed source changes
+          persist-credentials: false
+      - name: Record exact source and compiler identity
         shell: bash
         run: |
           set -euo pipefail
+          git rev-parse HEAD
+          git hash-object src/search/query.rs src/search/vector_index.rs src/search/query/session_scope.rs
+          rustc --version
+          cargo --version
+      - name: Check formatting and run nonempty scoped-search regressions
+        shell: bash
+        run: |
+          set +e
+          rustfmt --edition 2024 --check src/search/query/session_scope.rs
+          fmt_status=$?
+          set -o pipefail
+          cargo test --locked --lib search::query::session_scope::tests -- --nocapture 2>&1 | tee "$RUNNER_TEMP/session-scope-tests.log"
+          test_status=${PIPESTATUS[0]}
           python3 - <<'PY'
           import os
+          import re
           from pathlib import Path
-          import subprocess
-
-          def git(*args):
-              return subprocess.check_output(['git', *args], text=True).strip()
-
-          if git('branch', '--show-current') != 'main' or git('status', '--porcelain'):
-              raise SystemExit('Refusing a non-main or dirty checkout')
-          expected = {
-              'src/search/query.rs': '045768ee989828759e01d986637be8aeee942dc8',
-              'src/search/vector_index.rs': '7ee07d9cabc40698d350decb0e16936f3b7d02c6',
-              'scripts/patches/session-scope.patch': '38b37691effb5b393bfc83d68f28c5fa6f498e01',
-          }
-          for name, sha in expected.items():
-              path = Path(name)
-              if path.is_symlink() or not path.is_file() or git('hash-object', name) != sha:
-                  raise SystemExit(f'Review required: source or patch changed: {name}')
-          new_module = 'src/search/query/session_scope.rs'
-          if os.path.lexists(new_module):
-              raise SystemExit('Session-scope module already exists; refusing replacement')
-          patch = 'scripts/patches/session-scope.patch'
-          subprocess.run(['git', 'apply', '--check', '--whitespace=error-all', patch], check=True)
-          subprocess.run(['git', 'apply', '--whitespace=error-all', patch], check=True)
-          paths = ['src/search/query.rs', 'src/search/vector_index.rs', new_module]
-          subprocess.run(['git', 'add', '--', *paths], check=True)
-          actual = set(git('diff', '--cached', '--name-only').splitlines())
-          if actual != set(paths):
-              raise SystemExit(f'Unexpected staged paths: {sorted(actual)}')
-          subprocess.run(['git', 'diff', '--cached', '--check'], check=True)
-          for path in paths:
-              print(f'{path}: {git("hash-object", path)}')
+          text = (Path(os.environ['RUNNER_TEMP']) / 'session-scope-tests.log').read_text()
+          counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
+          if not counts or max(map(int, counts)) < 9:
+              raise SystemExit('No passing receipt for all nine scoped-search regressions')
+          print('Verified a nonzero passing test receipt:', counts)
           PY
-      - name: Commit directly to main without force or a pull request
-        shell: bash
-        run: |
-          set -euo pipefail
-          git -c user.name='github-actions[bot]' \
-              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-              commit -m 'fix(search): enforce session membership before semantic top-k' \
-              -m 'Resolve bounded session message IDs through the existing FrankenSQLite read snapshot and intersect them with metadata predicates inside exact vector selection. Skip unused ANN/two-tier allocation for scoped requests and report session_scope_requires_exact. Add nine regression tests for candidate starvation, metadata intersection, source restrictions, malformed IDs, literal paths, limits, rollback, and multi-shard merging.' \
-              -m 'The one-shot GitHub transport verified complete base blob identities, applied the reviewed patch with git apply, and checked the staged diff. Rust compilation, Rust tests, Clippy, rustfmt, UBS and the normal RCH gate were not executed by this transport workflow; no runtime pass is claimed.'
-          # A concurrent main update is a hard failure, never a force-push.
-          GIT_TERMINAL_PROMPT=0 git push origin HEAD:refs/heads/main
-          git rev-parse HEAD
+          receipt_status=$?
+          printf 'fmt_exit=%s test_exit=%s receipt_exit=%s\n' "$fmt_status" "$test_status" "$receipt_status"
+          printf 'The full RCH/UBS/archive-scale gate is separate and was not run here.\n'
+          test "$fmt_status" -eq 0 && test "$test_status" -eq 0 && test "$receipt_status" -eq 0
