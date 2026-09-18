@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::Value;
 use tracing::warn;
 
@@ -45,7 +45,7 @@ impl Connector for CodexConnector {
     ) -> Result<()> {
         self.inner
             .scan_with_source_boundaries(ctx, hooks, &mut |mut conversation| {
-                augment_modern_codex_messages(&mut conversation, ctx.progress_tick.as_deref());
+                augment_modern_codex_messages(&mut conversation, ctx.progress_tick.as_deref())?;
                 on_conversation(conversation)
             })
     }
@@ -57,7 +57,7 @@ impl Connector for CodexConnector {
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
         let mut conversations = self.inner.scan(ctx)?;
         for conversation in &mut conversations {
-            augment_modern_codex_messages(conversation, ctx.progress_tick.as_deref());
+            augment_modern_codex_messages(conversation, ctx.progress_tick.as_deref())?;
         }
         Ok(conversations)
     }
@@ -76,7 +76,7 @@ impl Connector for CodexConnector {
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
         self.inner.scan_with_callback(ctx, &mut |mut conversation| {
-            augment_modern_codex_messages(&mut conversation, ctx.progress_tick.as_deref());
+            augment_modern_codex_messages(&mut conversation, ctx.progress_tick.as_deref())?;
             on_conversation(conversation)
         })
     }
@@ -87,6 +87,10 @@ impl Connector for CodexConnector {
 /// watchdog fed while this second pass re-parses a giant rollout (~40k lines,
 /// minutes).
 const AUGMENT_HEARTBEAT_LINE_STRIDE: usize = 1024;
+
+/// Bound the enrichment pass independently of the upstream scan. In particular,
+/// a growing source must not turn the second pass into an unbounded stream.
+const MAX_AUGMENT_ROLLOUT_BYTES: u64 = 100 * 1024 * 1024;
 
 // TODO(gh373/oeu5a follow-up): this function is a full second parse of every
 // rollout — `franken_agent_detection`'s scan already read and parsed the same
@@ -99,20 +103,79 @@ const AUGMENT_HEARTBEAT_LINE_STRIDE: usize = 1024;
 fn augment_modern_codex_messages(
     conversation: &mut NormalizedConversation,
     progress_tick: Option<&(dyn Fn() + Send + Sync)>,
-) {
+) -> Result<()> {
     if conversation
         .source_path
         .extension()
         .and_then(|ext| ext.to_str())
         .is_none_or(|ext| !ext.eq_ignore_ascii_case("jsonl"))
     {
-        return;
+        return Ok(());
     }
 
-    let Ok(file) = File::open(&conversation.source_path) else {
-        return;
-    };
+    let file = File::open(&conversation.source_path)
+        .with_context(|| format!("open Codex enrichment source {}", conversation.source_path.display()))?;
+    let before = file.metadata().context("inspect Codex enrichment source")?;
+    if !before.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Codex enrichment source is not a regular file",
+        ).into());
+    }
+    if before.len() > MAX_AUGMENT_ROLLOUT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Codex enrichment source exceeds the 100 MiB read budget",
+        ).into());
+    }
 
+    // The first pass belongs to FAD; this pass owns only the opened prefix.
+    // Never follow appends indefinitely. Consumers receive the conversation
+    // only after enrichment and these observable-snapshot checks succeed.
+    let mut reader = BufReader::new((&file).take(before.len()));
+    let bytes_read = augment_modern_codex_reader(conversation, progress_tick, &mut reader)?;
+    if bytes_read != before.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "Codex enrichment source was truncated while reading; retry this source",
+        ).into());
+    }
+    let after = file.metadata().context("recheck opened Codex enrichment source")?;
+    let named = std::fs::metadata(&conversation.source_path)
+        .context("recheck Codex enrichment source path")?;
+    if !same_rollout_snapshot(&before, &after)? || !same_rollout_snapshot(&before, &named)? {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Codex enrichment source changed while reading; retry this source",
+        ).into());
+    }
+    Ok(())
+}
+
+/// Detect observable rewrites/replacements, not malicious timestamp-preserving
+/// edits. On Unix, inode/device checks also catch same-size path replacement.
+fn same_rollout_snapshot(before: &std::fs::Metadata, after: &std::fs::Metadata) -> io::Result<bool> {
+    if !after.is_file() || before.len() != after.len() || before.modified()? != after.modified()? {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if before.dev() != after.dev() || before.ino() != after.ino() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// An error may leave this private in-memory conversation partially enriched.
+/// Each public scan route propagates the error before publishing it; do not
+/// clone whole rollouts just to implement an in-memory rollback.
+fn augment_modern_codex_reader(
+    conversation: &mut NormalizedConversation,
+    progress_tick: Option<&(dyn Fn() + Send + Sync)>,
+    reader: &mut impl BufRead,
+) -> Result<u64> {
     let mut message_indices_by_signature: HashMap<ModernCodexMessageSignature, usize> =
         conversation
             .messages
@@ -135,21 +198,39 @@ fn augment_modern_codex_messages(
         .map(|(index, message)| (modern_codex_raw_signature(&message.extra), index))
         .collect();
     let mut added = false;
-    for (line_no_zero, line) in BufReader::new(file)
-        .lines()
-        .map_while(Result::ok)
-        .enumerate()
-    {
-        let line_no = line_no_zero + 1;
-        // gh373/oeu5a: connector-internal liveness during the minutes-long
-        // re-parse of one giant rollout (see AUGMENT_HEARTBEAT_LINE_STRIDE).
-        tick_augment_progress(progress_tick, line_no_zero);
-        let line = line.trim();
+    let mut line = String::new();
+    let mut bytes_read = 0_u64;
+    let mut line_no = 0_usize;
+    loop {
+        tick_augment_progress(progress_tick, line_no);
+        line.clear();
+        // Do not turn I/O errors or invalid UTF-8 into successful EOF.
+        let count = reader.read_line(&mut line)
+            .with_context(|| format!("read Codex enrichment line {}", line_no + 1))?;
+        if count == 0 {
+            break;
+        }
+        bytes_read += count as u64;
+        line_no += 1;
+        let terminated = line.ends_with('\n');
+        let line = if line_no == 1 {
+            line.trim_start_matches('\u{feff}').trim()
+        } else {
+            line.trim()
+        };
         if line.is_empty() {
             continue;
         }
         let raw = match serde_json::from_str::<Value>(line) {
             Ok(value) => value,
+            Err(parse_err) if !terminated && parse_err.is_eof() => {
+                // An active writer's unfinished last record is not malformed
+                // historical data. Refuse completion so it can be read again.
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("incomplete Codex enrichment record at line {line_no}; retry this source"),
+                ).into());
+            }
             Err(parse_err) => {
                 // Per gauntlet finding CONF-cass-003: surface malformed JSONL lines
                 // to tracing so operators can correlate `cass diag` reports against
@@ -217,6 +298,7 @@ fn augment_modern_codex_messages(
         });
         reindex_messages(&mut conversation.messages);
     }
+    Ok(bytes_read)
 }
 
 fn tick_augment_progress(progress_tick: Option<&(dyn Fn() + Send + Sync)>, line_no_zero: usize) {
@@ -875,7 +957,7 @@ mod tests {
         std::fs::write(&path, format!("{first}\n{second}\n{output}\n"))?;
         let before = std::fs::read(&path)?;
         let mut conversation = conversation_at(&path);
-        augment_modern_codex_messages(&mut conversation, None);
+        augment_modern_codex_messages(&mut conversation, None)?;
         assert_eq!(conversation.messages.len(), 3);
         for (index, expected) in ["patch-1", "patch-2"].into_iter().enumerate() {
             let call = &conversation.messages[index];
@@ -885,7 +967,7 @@ mod tests {
         }
         assert_eq!(conversation.messages[2].role, "tool");
         let snapshot = serde_json::to_value(&conversation)?;
-        augment_modern_codex_messages(&mut conversation, None);
+        augment_modern_codex_messages(&mut conversation, None)?;
         assert_eq!(serde_json::to_value(&conversation)?, snapshot);
         assert_eq!(std::fs::read(&path)?, before);
         Ok(())
@@ -911,7 +993,7 @@ mod tests {
         let identity = conversation.messages.iter().map(|message| (
             message.idx, message.created_at, message.extra.clone(), message.invocations.clone()
         )).collect::<Vec<_>>();
-        augment_modern_codex_messages(&mut conversation, None);
+        augment_modern_codex_messages(&mut conversation, None)?;
         assert_eq!(conversation.messages.len(), 2);
         for (message, expected) in conversation.messages.iter().zip(identity) {
             assert_eq!(message.content, "[Tool: apply_patch]\nsame patch bytes");
@@ -935,5 +1017,177 @@ mod tests {
         assert_eq!(canonical.extra, serde_json::json!({"compacted": true}));
         assert_eq!(canonical.created_at, candidate.created_at);
         assert!(!merge_modern_codex_tool_call(&mut canonical, &candidate));
+    }
+
+
+    #[test]
+    fn enrichment_missing_source_fails_instead_of_certifying_incomplete_history() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut conversation = conversation_at(&dir.path().join("rollout-missing.jsonl"));
+        let error = augment_modern_codex_messages(&mut conversation, None).unwrap_err();
+        assert_eq!(error.downcast_ref::<io::Error>().map(io::Error::kind), Some(io::ErrorKind::NotFound));
+        assert!(conversation.messages.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn enrichment_invalid_utf8_is_not_successful_eof() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut conversation = conversation_at(&dir.path().join("rollout-utf8.jsonl"));
+        let mut reader = io::Cursor::new(b"\xff\n");
+        let error = augment_modern_codex_reader(&mut conversation, None, &mut reader).unwrap_err();
+        assert_eq!(error.downcast_ref::<io::Error>().map(io::Error::kind), Some(io::ErrorKind::InvalidData));
+        Ok(())
+    }
+
+    #[test]
+    fn enrichment_propagates_read_failure_after_valid_records() -> Result<()> {
+        struct FailingRead(io::Cursor<Vec<u8>>);
+        impl Read for FailingRead {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                if self.0.position() == self.0.get_ref().len() as u64 {
+                    Err(io::Error::other("injected source read failure"))
+                } else {
+                    self.0.read(bytes)
+                }
+            }
+        }
+        let dir = tempfile::tempdir()?;
+        let raw = custom_call("patch-1", "read_failure_prefix");
+        let mut conversation = conversation_at(&dir.path().join("rollout-fault.jsonl"));
+        let mut reader = BufReader::new(FailingRead(io::Cursor::new(format!("{raw}\n").into_bytes())));
+        let error = augment_modern_codex_reader(&mut conversation, None, &mut reader).unwrap_err();
+        assert!(error.chain().any(|cause| cause.to_string().contains("injected source read failure")));
+        assert_eq!(conversation.messages.len(), 1, "test actually consumed a prefix before the fault");
+        Ok(())
+    }
+
+    #[test]
+    fn enrichment_accepts_bom_malformed_historical_lines_and_complete_eof_record() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("rollout-bom.jsonl");
+        let first = custom_call("patch-1", "first_patch");
+        let second = custom_call("patch-2", "last_patch_without_newline");
+        let bytes = format!("\u{feff}{first}\nnot-json\n\n{second}");
+        std::fs::write(&path, &bytes)?;
+        let mut conversation = conversation_at(&path);
+        augment_modern_codex_messages(&mut conversation, None)?;
+        assert_eq!(conversation.messages.len(), 2);
+        assert!(conversation.messages[0].content.contains("first_patch"));
+        assert!(conversation.messages[1].content.contains("last_patch_without_newline"));
+        assert_eq!(std::fs::read_to_string(&path)?, bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_last_record_fails_then_retry_reads_the_completed_append() -> Result<()> {
+        use std::io::Write;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("rollout-active.jsonl");
+        let first = custom_call("patch-1", "complete_prefix");
+        let second = custom_call("patch-2", "completed_tail").to_string();
+        let split = second.len() - 1;
+        std::fs::write(&path, format!("{first}\n{}", &second[..split]))?;
+        let mut partial = conversation_at(&path);
+        let error = augment_modern_codex_messages(&mut partial, None).unwrap_err();
+        assert_eq!(error.downcast_ref::<io::Error>().map(io::Error::kind), Some(io::ErrorKind::UnexpectedEof));
+        let mut writer = std::fs::OpenOptions::new().append(true).open(&path)?;
+        writer.write_all(second[split..].as_bytes())?;
+        writer.flush()?;
+        let before_retry = std::fs::read(&path)?;
+        let mut retry = conversation_at(&path);
+        augment_modern_codex_messages(&mut retry, None)?;
+        assert_eq!(retry.messages.len(), 2);
+        assert!(retry.messages[1].content.contains("completed_tail"));
+        assert_eq!(std::fs::read(&path)?, before_retry);
+        Ok(())
+    }
+
+    #[test]
+    fn enrichment_detects_appends_without_chasing_the_growing_file() -> Result<()> {
+        use std::io::Write;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("rollout-growing.jsonl");
+        let raw = custom_call("patch-1", "opened_prefix");
+        std::fs::write(&path, format!("{raw}\n"))?;
+        let ticks = AtomicUsize::new(0);
+        let append = || {
+            if ticks.fetch_add(1, Ordering::Relaxed) == 0 {
+                let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+                writeln!(file, "{}", custom_call("patch-2", "later_append")).unwrap();
+            }
+        };
+        let mut conversation = conversation_at(&path);
+        let error = augment_modern_codex_messages(&mut conversation, Some(&append)).unwrap_err();
+        assert!(error.to_string().contains("changed while reading"));
+        assert_eq!(conversation.messages.len(), 1, "read only the opened prefix");
+        let mut retry = conversation_at(&path);
+        augment_modern_codex_messages(&mut retry, None)?;
+        assert_eq!(retry.messages.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_enrichment_source_fails_before_parsing_or_allocating_its_body() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("rollout-oversized.jsonl");
+        let file = File::create(&path)?;
+        file.set_len(MAX_AUGMENT_ROLLOUT_BYTES + 1)?;
+        let ticks = AtomicUsize::new(0);
+        let tick = || { ticks.fetch_add(1, Ordering::Relaxed); };
+        let mut conversation = conversation_at(&path);
+        let error = augment_modern_codex_messages(&mut conversation, Some(&tick)).unwrap_err();
+        assert!(error.to_string().contains("100 MiB read budget"));
+        assert_eq!(ticks.load(Ordering::Relaxed), 0);
+        assert!(conversation.messages.is_empty());
+        assert_eq!(std::fs::metadata(&path)?.len(), MAX_AUGMENT_ROLLOUT_BYTES + 1);
+        Ok(())
+    }
+
+    #[test]
+    fn every_connector_route_withholds_an_unfinished_source_then_retries() -> Result<()> {
+        use super::super::ScanRoot;
+        use franken_agent_detection::connectors::{SourceCompletion, SourceScanHooks};
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("rollout-incomplete.jsonl");
+        let first = custom_call("patch-1", "canonical_prefix");
+        let second = custom_call("patch-2", "retried_tail").to_string();
+        std::fs::write(&path, format!("{first}\n{}", &second[..second.len() - 1]))?;
+        let ctx = ScanContext::with_roots(dir.path().join("cass-data"), vec![ScanRoot::local(path.clone())], None);
+        let connector = CodexConnector::new();
+        assert!(connector.scan(&ctx).is_err(), "batch scan must not return a partial success");
+        let mut emitted = Vec::new();
+        assert!(connector.scan_with_callback(&ctx, &mut |conversation| {
+            emitted.push(conversation);
+            Ok(())
+        }).is_err());
+        assert!(emitted.is_empty());
+        let mut completions = 0;
+        {
+            let mut complete = |_: &SourceCompletion| { completions += 1; Ok(()) };
+            let mut hooks = SourceScanHooks { should_scan_source: None, on_source_complete: Some(&mut complete) };
+            assert!(connector.scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {
+                emitted.push(conversation);
+                Ok(())
+            }).is_err());
+        }
+        assert!(emitted.is_empty());
+        assert_eq!(completions, 0, "failed enrichment must not certify source completion");
+        std::fs::write(&path, format!("{first}\n{second}\n"))?;
+        let before = std::fs::read(&path)?;
+        {
+            let mut complete = |_: &SourceCompletion| { completions += 1; Ok(()) };
+            let mut hooks = SourceScanHooks { should_scan_source: None, on_source_complete: Some(&mut complete) };
+            connector.scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {
+                emitted.push(conversation);
+                Ok(())
+            })?;
+        }
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(completions, 1);
+        assert_eq!(emitted[0].messages.len(), 2);
+        assert!(emitted[0].messages[1].content.contains("retried_tail"));
+        assert_eq!(std::fs::read(&path)?, before);
+        Ok(())
     }
 }
