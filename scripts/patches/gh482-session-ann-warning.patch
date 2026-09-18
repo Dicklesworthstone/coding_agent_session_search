@@ -1,0 +1,39 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -33883,6 +33883,9 @@
+     reason: crate::search::vector_index::SemanticAnnUnavailableReason,
+ ) -> String {
+     let action = match reason {
++        crate::search::vector_index::SemanticAnnUnavailableReason::SessionScopeRequiresExact => {
++            "The session filter requires exact candidate selection. No index repair is needed."
++        }
+         crate::search::vector_index::SemanticAnnUnavailableReason::MultipleExactShards => {
+             "Exact multi-shard results remain available; inspect `cass health --json` before enabling sharded ANN acceleration."
+         }
+@@ -33906,6 +33909,7 @@
+     #[test]
+     fn warning_uses_the_same_stable_reason_code_as_robot_metadata() {
+         for reason in [
++            SemanticAnnUnavailableReason::SessionScopeRequiresExact,
+             SemanticAnnUnavailableReason::MultipleExactShards,
+             SemanticAnnUnavailableReason::SidecarMissing,
+             SemanticAnnUnavailableReason::SidecarOpenFailed,
+@@ -33921,6 +33925,18 @@
+                 "human warning must name the realized fallback: {warning}"
+             );
+         }
++    }
++
++    #[test]
++    fn session_scope_fallback_preserves_filter_without_rebuild_advice() {
++        let warning =
++            ann_fallback_human_warning(SemanticAnnUnavailableReason::SessionScopeRequiresExact);
++        assert!(warning.contains("session_scope_requires_exact"));
++        assert!(warning.contains("exact semantic search"));
++        assert!(warning.contains("session filter"));
++        assert!(warning.contains("No index repair is needed"));
++        assert!(!warning.contains("build-hnsw"));
++        assert!(!warning.contains("remove"));
+     }
+ 
+     #[test]

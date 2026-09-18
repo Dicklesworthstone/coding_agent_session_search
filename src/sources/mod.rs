@@ -68,6 +68,9 @@
 //! }
 //! ```
 
+#[cfg(unix)]
+mod child_output;
+
 pub mod config;
 pub(crate) mod config_validation;
 pub mod index;
@@ -78,12 +81,19 @@ pub mod provenance;
 pub mod setup;
 pub mod sync;
 
-use std::io::{Read as IoRead, Seek, Write};
+#[cfg(not(unix))]
+use std::io::Read as IoRead;
+use std::io::{Seek, Write};
 use std::process::{Child, Command, Output, Stdio};
+#[cfg(not(unix))]
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+#[cfg(not(unix))]
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(unix))]
+use std::time::Instant;
 
+#[cfg(not(unix))]
 use wait_timeout::ChildExt;
 
 /// Canonical SSH stderr marker for host-key verification failures.
@@ -149,11 +159,13 @@ pub(crate) fn file_backed_child_stdin(contents: &[u8]) -> std::io::Result<Stdio>
     Ok(Stdio::from(file))
 }
 
+#[cfg(not(unix))]
 struct ChildPipeReader {
     receiver: Receiver<std::io::Result<Vec<u8>>>,
     handle: JoinHandle<()>,
 }
 
+#[cfg(not(unix))]
 fn drain_child_pipe<R>(mut pipe: R, max_bytes: Option<usize>) -> ChildPipeReader
 where
     R: IoRead + Send + 'static,
@@ -185,6 +197,7 @@ where
     ChildPipeReader { receiver, handle }
 }
 
+#[cfg(not(unix))]
 fn finish_child_pipe(
     pipe_reader: Option<ChildPipeReader>,
     deadline: Instant,
@@ -229,14 +242,19 @@ pub(crate) fn configure_child_process_group(cmd: &mut Command) {
 pub(crate) fn configure_child_process_group(_cmd: &mut Command) {}
 
 #[cfg(unix)]
+#[allow(unsafe_code)]
 fn kill_child_process_group(pid: u32) {
-    let process_group = format!("-{pid}");
-    let _ = Command::new("/bin/kill")
-        .args(["-KILL", &process_group])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    let Ok(pid) = i32::try_from(pid) else {
+        return;
+    };
+    if pid <= 1 {
+        return;
+    }
+    // SAFETY: a strictly positive owned child PID is negated to address only
+    // its process group, never PID 0 or -1. The Unix collector retains that
+    // child unreaped until cleanup; kill takes no pointers. Avoid spawning
+    // another process during timeout/error cleanup.
+    let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
 }
 
 #[cfg(not(unix))]
@@ -257,6 +275,21 @@ pub(crate) fn wait_for_child_output_with_timeout(
 }
 
 /// Limit each captured stream while retaining the same process deadline.
+/// Unix capture owns nonblocking pipes directly: overflow stops immediately,
+/// and cancellation cannot leave background reader threads behind. Process
+/// teardown/reaping itself can exceed the budget if the OS stalls.
+#[cfg(unix)]
+pub(crate) fn wait_for_child_output_with_limit(
+    child: Child,
+    timeout: Duration,
+    max_bytes: Option<usize>,
+) -> std::io::Result<Option<Output>> {
+    child_output::wait(child, timeout, max_bytes)
+}
+
+// Retain the existing non-Unix pipe implementation until native pipe
+// cancellation is available there; do not claim Unix ownership guarantees.
+#[cfg(not(unix))]
 pub(crate) fn wait_for_child_output_with_limit(
     mut child: Child,
     timeout: Duration,
@@ -469,20 +502,22 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn bounded_child_output_still_times_out_after_overflow() {
+    fn bounded_child_output_stops_immediately_after_overflow() {
         let mut command = Command::new("sh");
         command
             .args(["-c", "printf 12345; sleep 30"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         configure_child_process_group(&mut command);
-        let output = wait_for_child_output_with_limit(
+        let started = std::time::Instant::now();
+        let error = wait_for_child_output_with_limit(
             command.spawn().unwrap(),
-            Duration::from_secs(1),
+            Duration::from_secs(30),
             Some(4),
         )
-        .unwrap();
-        assert!(output.is_none());
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[cfg(unix)]

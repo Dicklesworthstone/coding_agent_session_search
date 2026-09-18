@@ -1,0 +1,67 @@
+# Component qualification is separate from the complete CASS dependency gate.
+name: Qualify retained multi-shard ANN
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/qualify-ann-shards.yml
+      - src/search/query/ann_shards.rs
+      - scripts/verify_ann_shards.py
+permissions:
+  contents: read
+concurrency:
+  group: cass-ann-shards-qualification
+  cancel-in-progress: false
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '134217728'
+    defaults:
+      run:
+        working-directory: cass-source
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          path: cass-source
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: Dicklesworthstone/frankensearch
+          ref: 6852e79a830c402ea4e55eb79eda3373c618dfc3
+          path: fs-source
+          persist-credentials: false
+      - name: Record current tracker and existing ANN integration obligations
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          beads = [json.loads(row) for row in Path('.beads/issues.jsonl').read_text().splitlines() if row.strip()]
+          for bead in beads:
+              if bead.get('id', '').endswith('ds7uy.3.3'):
+                  print(json.dumps(bead, ensure_ascii=False)[:30000])
+          text = Path('src/search/query.rs').read_text().splitlines()
+          for n, line in enumerate(text):
+              if 'SemanticAnnUnavailableReason::MultipleExactShards' in line or ('ann_index()' in line and n > 9000):
+                  print('ANN_SOURCE_CONTEXT', n + 1)
+                  print('\n'.join(f'{i+1}: {text[i]}' for i in range(max(0, n-25), min(len(text), n+15))))
+          PY
+      - name: Execute real native-graph admission and retrieval tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --version
+          rustfmt --edition 2024 --emit stdout src/search/query/ann_shards.rs > "$RUNNER_TEMP/ann-shards-formatted.rs"
+          python3 scripts/verify_ann_shards.py "$PWD" "$GITHUB_WORKSPACE/fs-source" "$RUNNER_TEMP/cass-ann-shards"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/cass-ann-shards-target"
+          cd "$RUNNER_TEMP/cass-ann-shards"
+          cargo generate-lockfile
+          sha256sum Cargo.lock
+          cargo test --locked -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/ann-shards-tests.log"
+          grep -Eq 'test result: ok\. 30 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/ann-shards-tests.log"

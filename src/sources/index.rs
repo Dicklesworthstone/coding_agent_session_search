@@ -25,6 +25,9 @@
 //! }
 //! ```
 
+mod job;
+
+use job::{JobState, RemoteIndexJob};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -35,7 +38,7 @@ use super::{
     configure_child_process_group, file_backed_child_stdin, host_key_verification_error,
     is_host_key_verification_failure,
     probe::{CassStatus, HostProbeResult},
-    strict_ssh_cli_tokens, wait_for_child_output_with_timeout,
+    strict_ssh_cli_tokens, wait_for_child_output_with_limit,
 };
 
 // =============================================================================
@@ -56,6 +59,9 @@ const REMOTE_INDEX_MAX_LOAD_PER_CPU: f64 = 1.50;
 
 /// Minimum remote MemAvailable before offloaded indexing defers (512 MiB).
 const REMOTE_INDEX_MIN_AVAILABLE_MEM_KIB: u64 = 512 * 1024;
+
+/// These commands return control/status output, never archive file contents.
+const REMOTE_COMMAND_OUTPUT_LIMIT: usize = 1024 * 1024;
 
 // =============================================================================
 // Error Types
@@ -102,7 +108,7 @@ impl IndexError {
         match self {
             IndexError::DiskFull => "Free disk space on remote and retry.",
             IndexError::Timeout(_) => {
-                "Index timed out. Try running manually: ssh host 'cass index'"
+                "Observation timed out. Inspect the retained remote job manually before retrying; the remote worker may still be running."
             }
             IndexError::PermissionDenied => "Check file permissions in agent data directories.",
             IndexError::CassNotFound => "cass is not installed. Run installation first.",
@@ -292,8 +298,10 @@ impl RemoteArtifactManifestCommandOutput {
     }
 
     fn has_complete_manifest_shape(&self) -> bool {
-        self.manifest_path.is_some()
-            && self.bundle_id.is_some()
+        self.manifest_path.as_deref().is_some_and(|path| !path.trim().is_empty())
+            && self.bundle_id.as_deref().is_some_and(|id| !id.trim().is_empty())
+            && self.chunk_count.is_some()
+            && self.expected_bytes.is_some()
             && self.verification_status.is_some()
     }
 }
@@ -302,7 +310,8 @@ impl RemoteArtifactManifestResult {
     fn from_command_output(output: &str) -> Self {
         match parse_remote_artifact_manifest_output(output) {
             Ok(parsed) => {
-                let complete = parsed.verification_status.as_deref() == Some("complete");
+                let complete = parsed.has_complete_manifest_shape()
+                    && parsed.verification_status.as_deref() == Some("complete");
                 Self {
                     success: complete,
                     manifest_path: parsed.manifest_path,
@@ -378,11 +387,18 @@ fn effective_ssh_command_timeout(requested: Duration, configured_secs: u64) -> D
     } else {
         Duration::from_secs(configured_secs)
     };
-    let effective = requested.min(configured);
-    if effective.is_zero() {
-        Duration::from_secs(1)
+    requested.min(configured)
+}
+
+/// One observation budget spans preflight, launch, polling, and artifact proof.
+/// A phase cap can shorten this budget but must never renew it.
+fn remaining_index_budget(elapsed: Duration, phase_cap: Duration) -> Result<Duration, IndexError> {
+    let remaining = Duration::from_secs(MAX_INDEX_WAIT_SECS).saturating_sub(elapsed);
+    let available = remaining.min(phase_cap);
+    if available.is_zero() {
+        Err(IndexError::Timeout(MAX_INDEX_WAIT_SECS))
     } else {
-        effective
+        Ok(available)
     }
 }
 
@@ -391,7 +407,8 @@ fn wait_for_command_output_with_timeout(
     timeout: Duration,
 ) -> Result<Output, IndexError> {
     let timeout_secs = timeout.as_secs().max(1);
-    wait_for_child_output_with_timeout(child, timeout)?.ok_or(IndexError::Timeout(timeout_secs))
+    wait_for_child_output_with_limit(child, timeout, Some(REMOTE_COMMAND_OUTPUT_LIMIT))?
+        .ok_or(IndexError::Timeout(timeout_secs))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -433,13 +450,6 @@ fn summarize_remote_output(output: &str) -> String {
     } else {
         summary
     }
-}
-
-fn poll_status(output: &str) -> Option<&str> {
-    output
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("STATUS="))
-        .next_back()
 }
 
 /// Indexer for triggering cass index on remote machines.
@@ -514,14 +524,15 @@ impl RemoteIndexer {
         });
 
         // First check if cass is available
-        self.verify_cass_installed()?;
-        self.verify_remote_host_pressure()?;
+        self.verify_cass_installed(start)?;
+        self.verify_remote_host_pressure(start)?;
 
         // Run indexing in background with log file for progress tracking
         let mut result = self.run_index_with_polling(&on_progress, start)?;
         if result.success {
-            result.artifact_manifest = Some(self.write_remote_artifact_manifest());
+            result.artifact_manifest = Some(self.write_remote_artifact_manifest(start));
         }
+        result.duration = start.elapsed();
 
         // Report final result
         if result.success {
@@ -558,14 +569,14 @@ impl RemoteIndexer {
     }
 
     /// Verify cass is installed on the remote.
-    fn verify_cass_installed(&self) -> Result<(), IndexError> {
+    fn verify_cass_installed(&self, start: Instant) -> Result<(), IndexError> {
         let script = r#"
 source ~/.cargo/env 2>/dev/null || true
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 command -v cass >/dev/null 2>&1 && echo "CASS_FOUND" || echo "CASS_NOT_FOUND"
 "#;
 
-        let output = self.run_ssh_command(script, Duration::from_secs(30))?;
+        let output = self.run_ssh_phase(script, start, Duration::from_secs(30))?;
 
         match parse_remote_cass_presence(&output) {
             RemoteCassPresence::Found => Ok(()),
@@ -588,8 +599,12 @@ printf 'MEM_AVAILABLE_KIB=%s\n' "$MEM_AVAILABLE_KIB"
 "#
     }
 
-    fn verify_remote_host_pressure(&self) -> Result<(), IndexError> {
-        let output = self.run_ssh_command(Self::host_pressure_script(), Duration::from_secs(15))?;
+    fn verify_remote_host_pressure(&self, start: Instant) -> Result<(), IndexError> {
+        let output = self.run_ssh_phase(
+            Self::host_pressure_script(),
+            start,
+            Duration::from_secs(15),
+        )?;
         let decision = RemoteHostPressureSnapshot::from_command_output(&output).decide();
         if decision.defer_index {
             Err(IndexError::HostPressure(decision.reason))
@@ -606,18 +621,20 @@ cass sources artifact-manifest --write --json
 "#
     }
 
-    fn write_remote_artifact_manifest(&self) -> RemoteArtifactManifestResult {
-        match self.run_ssh_command(Self::artifact_manifest_script(), Duration::from_secs(60)) {
+    fn write_remote_artifact_manifest(&self, start: Instant) -> RemoteArtifactManifestResult {
+        match self.run_ssh_phase(
+            Self::artifact_manifest_script(),
+            start,
+            Duration::from_secs(60),
+        ) {
             Ok(output) => RemoteArtifactManifestResult::from_command_output(&output),
             Err(err) => RemoteArtifactManifestResult::from_error(err.to_string()),
         }
     }
 
-    /// Run indexing with background execution and polling.
-    ///
-    /// This approach prevents SSH timeout for large indexes:
-    /// 1. Start `cass index` in background with nohup, logging to file
-    /// 2. Poll log file for progress and completion
+    /// Start an isolated remote job and observe only its exit receipt.
+    /// The remote worker is intentionally detached. Losing this observation
+    /// does not authorize killing it or starting another indexing mutation.
     fn run_index_with_polling<F>(
         &self,
         on_progress: &F,
@@ -626,191 +643,148 @@ cass sources artifact-manifest --write --json
     where
         F: Fn(IndexProgress),
     {
-        // Start indexing in background
-        let start_script = r#"
-source ~/.cargo/env 2>/dev/null || true
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-
-LOG_FILE=~/.cass_index.log
-rm -f "$LOG_FILE"
-
-nohup bash -c '
-set -o pipefail
-source "$HOME/.cargo/env" 2>/dev/null || true
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-cass index --progress 2>&1 | tee "$HOME/.cass_index.log"
-STATUS=${PIPESTATUS[0]}
-if [ "$STATUS" -eq 0 ]; then
-    echo "===INDEX_COMPLETE===" >> "$HOME/.cass_index.log"
-else
-    echo "===INDEX_FAILED:${STATUS}===" >> "$HOME/.cass_index.log"
-fi
-' > /dev/null 2>&1 &
-
-echo "INDEX_PID=$!"
-"#;
-
-        let output = self.run_ssh_command(start_script, Duration::from_secs(30))?;
-
-        // Extract PID (for potential future use)
-        let _pid = output
-            .lines()
-            .find(|l| l.starts_with("INDEX_PID="))
-            .and_then(|l| l.strip_prefix("INDEX_PID="))
-            .and_then(|p| p.trim().parse::<u32>().ok());
-
-        // Poll for progress and completion
-        self.poll_index_progress(on_progress, start)
+        let output = self.run_ssh_phase(job::START_SCRIPT, start, Duration::from_secs(30))?;
+        let job = RemoteIndexJob::from_start_output(&output).map_err(IndexError::SshFailed)?;
+        on_progress(IndexProgress {
+            stage: IndexStage::Starting,
+            message: format!(
+                "Observing remote index job {}; records retained under ~/.cache/cass/index-runs/{}",
+                job.id(),
+                job.id()
+            ),
+            sessions_found: 0,
+            sessions_indexed: 0,
+            percent: None,
+            elapsed: start.elapsed(),
+        });
+        let result = self.poll_index_progress(on_progress, start, &job);
+        if let Err(error) = &result {
+            let message = format!(
+                "Observation of remote index job {} stopped: {error}. The worker may still be running; inspect its retained records before retrying.",
+                job.id()
+            );
+            on_progress(IndexProgress {
+                stage: IndexStage::Failed {
+                    error: message.clone(),
+                },
+                message,
+                sessions_found: 0,
+                sessions_indexed: 0,
+                percent: None,
+                elapsed: start.elapsed(),
+            });
+        }
+        result
     }
 
-    /// Poll the remote log file for indexing progress.
     fn poll_index_progress<F>(
         &self,
         on_progress: &F,
         start: Instant,
+        job: &RemoteIndexJob,
     ) -> Result<IndexResult, IndexError>
     where
         F: Fn(IndexProgress),
     {
-        let poll_script = r#"
-LOG_FILE=~/.cass_index.log
-if [ -f "$LOG_FILE" ]; then
-    if grep -q "===INDEX_FAILED:" "$LOG_FILE"; then
-        echo "STATUS=ERROR"
-        tail -30 "$LOG_FILE"
-    elif grep -q "===INDEX_COMPLETE===" "$LOG_FILE"; then
-        echo "STATUS=COMPLETE"
-        # Get session count from health
-        source ~/.cargo/env 2>/dev/null || true
-        export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-        STATS=$(cass stats --json 2>/dev/null || echo '{}')
-        SESSIONS=$(echo "$STATS" | tr -d '\n' | sed -n 's/.*"conversations"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p')
-        echo "SESSIONS=${SESSIONS:-0}"
-    elif grep -qi "error" "$LOG_FILE" && ! grep -q "===INDEX_COMPLETE===" "$LOG_FILE"; then
-        # Check if it's a real error or just log noise
-        if grep -qE "(FATAL|panicked|No such file|Permission denied|disk full)" "$LOG_FILE"; then
-            echo "STATUS=ERROR"
-            tail -30 "$LOG_FILE"
-        else
-            echo "STATUS=RUNNING"
-            tail -10 "$LOG_FILE" | grep -E "(Scanning|Building|Indexed|Processing)" | tail -3
-        fi
-    else
-        echo "STATUS=RUNNING"
-        tail -10 "$LOG_FILE" | grep -E "(Scanning|Building|Indexed|Processing)" | tail -3
-    fi
-else
-    echo "STATUS=NOT_STARTED"
-fi
-"#;
-
-        let max_wait = Duration::from_secs(MAX_INDEX_WAIT_SECS);
+        let poll_script = job.poll_script();
         let poll_interval = Duration::from_secs(INDEX_POLL_INTERVAL_SECS);
-        let mut sessions_found: u64 = 0;
+        let mut sessions_found = 0;
         let mut last_agent = String::new();
-        let mut progress_pct: u8 = 5;
+        let mut reported_building = false;
 
         loop {
-            if start.elapsed() > max_wait {
-                return Err(IndexError::Timeout(max_wait.as_secs()));
-            }
-
-            std::thread::sleep(poll_interval);
-
-            let output = self.run_ssh_command(poll_script, Duration::from_secs(30))?;
-            // Track if we've seen Building this poll cycle (avoid multiple increments per poll)
-            let mut saw_building_this_poll = false;
-
-            if poll_status(&output) == Some("COMPLETE") {
-                // Extract session count
-                let sessions = output
-                    .lines()
-                    .find(|l| l.starts_with("SESSIONS="))
-                    .and_then(|l| l.strip_prefix("SESSIONS="))
-                    .and_then(|s| s.trim().parse::<u64>().ok())
-                    .unwrap_or(0);
-
-                return Ok(IndexResult {
-                    success: true,
-                    sessions_indexed: sessions,
-                    duration: start.elapsed(),
-                    error: None,
-                    artifact_manifest: None,
-                });
-            }
-
-            if poll_status(&output) == Some("ERROR") {
-                let error_lines: Vec<&str> = output
-                    .lines()
-                    .filter(|l| !l.trim_start().starts_with("STATUS="))
-                    .collect();
-                let error_msg = error_lines.join("\n");
-
-                // Detect specific errors
-                if error_msg.contains("disk full") || error_msg.contains("No space left") {
-                    return Err(IndexError::DiskFull);
+            // Poll immediately. Every subsequent sleep and SSH call consumes
+            // the original budget instead of receiving another full timeout.
+            let output = self.run_ssh_phase(&poll_script, start, Duration::from_secs(30))?;
+            let poll = job.parse_poll(&output).map_err(IndexError::SshFailed)?;
+            match poll.state {
+                JobState::Complete => {
+                    return Ok(IndexResult {
+                        success: true,
+                        sessions_indexed: poll.sessions.unwrap_or(0),
+                        duration: start.elapsed(),
+                        error: None,
+                        artifact_manifest: None,
+                    });
                 }
-                if error_msg.contains("Permission denied") {
-                    return Err(IndexError::PermissionDenied);
+                JobState::Running => {}
+                state => {
+                    let detail = match state {
+                        JobState::Failed(code) => format!("index command exited with code {code}"),
+                        JobState::Missing => "job records are missing".to_string(),
+                        JobState::Interrupted => "worker stopped without a complete exit receipt; indexing completion is unverified".to_string(),
+                        _ => "job records are invalid; indexing completion is unverified".to_string(),
+                    };
+                    let log = summarize_remote_output(&poll.log.join("\n"));
+                    return Ok(IndexResult {
+                        success: false,
+                        sessions_indexed: 0,
+                        duration: start.elapsed(),
+                        error: Some(format!("Remote index job {}: {detail}. {log}", job.id())),
+                        artifact_manifest: None,
+                    });
                 }
-
-                return Ok(IndexResult {
-                    success: false,
-                    sessions_indexed: 0,
-                    duration: start.elapsed(),
-                    error: Some(error_msg),
-                    artifact_manifest: None,
-                });
             }
 
-            // Parse progress from output
-            for line in output.lines() {
-                // Look for scanning progress
-                if line.contains("Scanning")
+            // Only explicitly prefixed diagnostic lines reach the advisory
+            // progress parser. They cannot override the typed terminal state.
+            for line in &poll.log {
+                if let Some(count) = extract_session_count(line) {
+                    sessions_found = count;
+                }
+                if !reported_building
+                    && line.contains("Scanning")
                     && let Some(agent) = extract_agent_from_line(line)
                     && agent != last_agent
                 {
-                    progress_pct = (progress_pct + 5).min(40);
                     on_progress(IndexProgress {
                         stage: IndexStage::Scanning {
                             agent: agent.clone(),
                         },
-                        message: format!("Scanning {}...", agent),
+                        message: format!("Scanning {agent}..."),
                         sessions_found,
                         sessions_indexed: 0,
-                        percent: Some(progress_pct),
+                        percent: None,
                         elapsed: start.elapsed(),
                     });
                     last_agent = agent;
                 }
-
-                // Look for session count updates
-                if let Some(count) = extract_session_count(line) {
-                    sessions_found = count;
-                }
-
-                // Look for building phase (only report once per poll to avoid racing progress)
-                if !saw_building_this_poll
-                    && (line.contains("Building") || line.contains("Indexing"))
-                {
-                    saw_building_this_poll = true;
-                    progress_pct = (progress_pct + 5).min(85);
+                if !reported_building && (line.contains("Building") || line.contains("Indexing")) {
+                    reported_building = true;
                     on_progress(IndexProgress {
                         stage: IndexStage::Building,
                         message: "Building search index...".into(),
                         sessions_found,
                         sessions_indexed: 0,
-                        percent: Some(progress_pct),
+                        percent: None,
                         elapsed: start.elapsed(),
                     });
                 }
             }
+            std::thread::sleep(remaining_index_budget(start.elapsed(), poll_interval)?);
         }
+    }
+
+    fn run_ssh_phase(
+        &self,
+        script: &str,
+        start: Instant,
+        phase_cap: Duration,
+    ) -> Result<String, IndexError> {
+        let timeout = remaining_index_budget(start.elapsed(), phase_cap)?;
+        let output = self.run_ssh_command(script, timeout)?;
+        // A late syscall or callback cannot certify success after the budget.
+        remaining_index_budget(start.elapsed(), phase_cap)?;
+        Ok(output)
     }
 
     /// Run an SSH command on the remote host.
     fn run_ssh_command(&self, script: &str, timeout: Duration) -> Result<String, IndexError> {
+        let started = Instant::now();
         let command_timeout = effective_ssh_command_timeout(timeout, self.ssh_timeout);
+        if command_timeout.is_zero() {
+            return Err(IndexError::Timeout(0));
+        }
         let connect_timeout_secs = command_timeout.as_secs().clamp(1, 30);
 
         let mut cmd = Command::new("ssh");
@@ -829,7 +803,10 @@ fi
 
         let child = cmd.spawn()?;
 
-        let output = wait_for_command_output_with_timeout(child, command_timeout)?;
+        let output = wait_for_command_output_with_timeout(
+            child,
+            command_timeout.saturating_sub(started.elapsed()),
+        )?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1068,7 +1045,7 @@ mod tests {
         );
         assert_eq!(
             effective_ssh_command_timeout(Duration::ZERO, 0),
-            Duration::from_secs(1)
+            Duration::ZERO
         );
     }
 
@@ -1093,17 +1070,36 @@ mod tests {
     }
 
     #[test]
-    fn test_poll_status_uses_exact_status_line() {
+    fn remaining_index_budget_never_renews_or_exceeds_the_phase_cap() {
+        let total = Duration::from_secs(MAX_INDEX_WAIT_SECS);
         assert_eq!(
-            poll_status("banner mentions STATUS=ERROR in prose\nSTATUS=COMPLETE\nSESSIONS=7\n"),
-            Some("COMPLETE")
+            remaining_index_budget(Duration::ZERO, Duration::from_secs(30)).unwrap(),
+            Duration::from_secs(30)
         );
         assert_eq!(
-            poll_status("STATUS=ERROR\nstartup banner\nSTATUS=COMPLETE\nSESSIONS=7\n"),
-            Some("COMPLETE")
+            remaining_index_budget(total - Duration::from_millis(50), Duration::from_secs(30))
+                .unwrap(),
+            Duration::from_millis(50)
         );
-        assert_eq!(poll_status("  STATUS=ERROR\npanic\n"), Some("ERROR"));
-        assert_eq!(poll_status("no structured status"), None);
+        assert!(remaining_index_budget(total, Duration::from_secs(30)).is_err());
+        assert!(remaining_index_budget(Duration::MAX, Duration::MAX).is_err());
+        assert!(remaining_index_budget(Duration::ZERO, Duration::ZERO).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_command_output_limit_stops_an_unbounded_producer() -> anyhow::Result<()> {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "yes diagnostic-noise"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_child_process_group(&mut cmd);
+        let started = Instant::now();
+        let error = wait_for_command_output_with_timeout(cmd.spawn()?, Duration::from_secs(30))
+            .expect_err("unbounded remote output must fail");
+        assert!(matches!(error, IndexError::Io(ref inner) if inner.kind() == std::io::ErrorKind::InvalidData));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -1340,4 +1336,29 @@ Welcome to remote host
         assert_eq!(result.expected_bytes, Some(123));
         assert_eq!(result.error, None);
     }
+
+    #[test]
+    fn complete_marker_without_artifact_identity_is_not_a_verified_manifest() {
+        for payload in [
+            r#"{"verification_status":"complete"}"#,
+            r#"{"manifest_path":"","bundle_id":"x","chunk_count":1,"expected_bytes":2,"verification_status":"complete"}"#,
+            r#"{"manifest_path":"manifest.json","bundle_id":" ","chunk_count":1,"expected_bytes":2,"verification_status":"complete"}"#,
+            r#"{"manifest_path":"manifest.json","bundle_id":"x","verification_status":"complete"}"#,
+        ] {
+            let result = RemoteArtifactManifestResult::from_command_output(payload);
+            assert!(!result.success, "incomplete artifact receipt passed: {payload}");
+            assert!(result.error.is_some());
+        }
+    }
+
+    #[test]
+    fn complete_empty_artifact_receipt_preserves_explicit_zero_counts() {
+        let result = RemoteArtifactManifestResult::from_command_output(
+            r#"{"manifest_path":"manifest.json","bundle_id":"empty","chunk_count":0,"expected_bytes":0,"verification_status":"complete"}"#,
+        );
+        assert!(result.success);
+        assert_eq!(result.chunk_count, Some(0));
+        assert_eq!(result.expected_bytes, Some(0));
+    }
+
 }
