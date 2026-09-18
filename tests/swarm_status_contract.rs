@@ -187,6 +187,9 @@ fn live_swarm_cli_reads_real_git_and_beads_without_authorizing_claims() {
     let status = cass(&["swarm", "status", "--json"]);
     assert_eq!(status["status"], "partial");
     assert_eq!(status["summary"]["dirty_worktree"], true);
+    let dirty_paths = status["git"]["dirty_paths"].as_array().unwrap();
+    assert!(dirty_paths.iter().all(|row| row["path"].is_string()));
+    assert!(dirty_paths.iter().any(|row| row["path"] == "tracked.txt"));
     for (category, id, count) in [
         ("ready", &ready, "ready_count"),
         ("in_progress", &active, "in_progress_count"),
@@ -222,6 +225,17 @@ fn live_swarm_cli_reads_real_git_and_beads_without_authorizing_claims() {
     assert_eq!(packet["summary"]["bead_id"], ready);
     assert_eq!(packet["summary"]["safe_to_start"], false);
     assert_eq!(packet["_meta"]["source_observations"]["git"]["head"], head);
+    assert_eq!(
+        packet["work_packet"]["collision_simulation"]["inputs"]["dirty_path_count"],
+        dirty_paths.len()
+    );
+    assert!(
+        packet["work_packet"]["collision_simulation"]["advisories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|advisory| advisory["kind"] == "peer-dirty-unrelated")
+    );
     for (path, bytes, modified) in &unchanged {
         assert_eq!(&fs::read(path).expect("source unchanged"), bytes);
         assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), *modified);
