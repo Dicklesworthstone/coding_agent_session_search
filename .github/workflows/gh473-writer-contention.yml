@@ -1,102 +1,131 @@
 name: GH473 writer contention regression
-
 on:
   push:
     branches: [main]
     paths:
       - .github/workflows/gh473-writer-contention.yml
+      - scripts/verify_gh473_core.py
       - src/indexer/**
       - src/storage/**
       - src/franken_sync.rs
-      - tests/gh473_writer_contention.rs
       - Cargo.toml
       - Cargo.lock
       - rust-toolchain.toml
   workflow_dispatch:
-
 permissions:
   contents: read
-
 concurrency:
   group: gh473-writer-contention-${{ github.ref }}
   cancel-in-progress: false
-
+env:
+  CARGO_BUILD_JOBS: '2'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_TERM_COLOR: never
+  CARGO_NET_RETRY: '1'
+  RUST_MIN_STACK: '134217728'
+  RUST_BACKTRACE: '1'
 jobs:
-  regression:
+  full-cass:
+    name: Full locked CASS persistence gate
     if: github.repository == 'Dicklesworthstone/coding_agent_session_search'
     runs-on: ubuntu-latest
     timeout-minutes: 35
-    env:
-      CARGO_BUILD_JOBS: '2'
-      CARGO_PROFILE_TEST_DEBUG: '0'
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_TERM_COLOR: never
-      CARGO_NET_RETRY: '1'
-      RUST_MIN_STACK: '134217728'
-      RUST_BACKTRACE: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Record exact source and current writer policy
-        shell: bash
+      - name: Record source and parse touched Rust
         run: |
           set -euo pipefail
           git rev-parse HEAD
-          git hash-object src/indexer/mod.rs src/storage/sqlite.rs Cargo.toml Cargo.lock
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-          source = Path('src/indexer/mod.rs').read_text()
-          names = [
-              'index_writer_busy_timeout_ms',
-              'apply_index_writer_busy_timeout',
-              'with_ephemeral_writer',
-              'is_retryable_franken_error',
-              'with_concurrent_retry',
-              'gh473_short_writer_wait_preserves_live_reader_ingest',
-          ]
-          for name in names:
-              matches = list(re.finditer(r'^( *)(?:pub(?:\([^)]*\))? )?fn ' + name + r'\b', source, re.M))
-              if len(matches) != 1:
-                  raise SystemExit(f'Missing or ambiguous production/test definition: {name}')
-              match = matches[0]
-              end = re.search('^' + match[1] + r'}$', source[match.end():], re.M)
-              if end is None:
-                  raise SystemExit(f'Unterminated definition: {name}')
-              definition = source[match.start():match.end() + end.end()]
-              print(f'=== {name} ===\n{definition}\n')
-          PY
-      - name: Record toolchain
-        run: |
+          git hash-object src/indexer/mod.rs src/indexer/gh473_tests.rs src/storage/sqlite.rs Cargo.toml Cargo.lock
           rustc --version
-          cargo --version
-      - name: Run real CASS live-reader, no-op, atomic ledger and held-writer regression
+          rustfmt --edition 2024 --check src/indexer/gh473_tests.rs
+          rustfmt --edition 2024 --config skip_children=true --emit stdout src/indexer/mod.rs > "$RUNNER_TEMP/gh473-parsed.rs"
+      - name: Run both real CASS GH473 regression suites
         shell: bash
         run: |
           set -euo pipefail
-          # No dependency rewrites, unlocked fallback, or substitute SQLite engine.
-          # A resolution/build failure is a failed gate, never a passing runtime receipt.
-          timeout 1800s cargo test --locked --lib gh473_short_writer_wait_preserves_live_reader_ingest -- --exact indexer::tests::gh473_short_writer_wait_preserves_live_reader_ingest --nocapture 2>&1 | tee "$RUNNER_TEMP/gh473-live-reader.log"
+          # No dependency rewrites or substitute engine. Build failure is failure.
+          timeout 1800s cargo test --locked --lib gh473 -- --nocapture 2>&1 | tee "$RUNNER_TEMP/gh473-cass.log"
           python3 - <<'PY'
-          import os
+          import os, re
           from pathlib import Path
-          import re
-          text = (Path(os.environ['RUNNER_TEMP']) / 'gh473-live-reader.log').read_text()
-          if not re.search(r'test result: ok\. [1-9][0-9]* passed; 0 failed;', text):
-              raise SystemExit('Missing nonzero passing CASS regression receipt')
+          text = (Path(os.environ['RUNNER_TEMP']) / 'gh473-cass.log').read_text()
+          counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
+          if not counts or max(map(int, counts)) < 2:
+              raise SystemExit('Both GH473 CASS suites must actually pass; zero tests is not success')
           PY
-      - name: Run additional production-path contention regressions when present
-        shell: bash
-        run: |
-          set -euo pipefail
-          if test -f tests/gh473_writer_contention.rs; then
-            timeout 900s cargo test --locked --test gh473_writer_contention -- --nocapture 2>&1 | tee "$RUNNER_TEMP/gh473-contention.log"
-          fi
-      - name: State qualification scope
+      - name: State full qualification boundary
         if: always()
         run: |
-          echo 'This job tests the committed CASS graph and synthetic temporary archives only.'
-          echo 'Original-archive index --all/MiniLM and final lexical/semantic/HNSW qualification remain separate.'
-          echo 'A failed dependency resolution or compilation is NOT runtime validation.'
+          echo 'A failed dependency resolution/compilation is NOT runtime validation.'
+          echo 'Original-archive canonical/lexical/semantic/HNSW qualification remains separate.'
+  extracted-core:
+    name: Narrow exact-source engine probe (not full CASS)
+    if: github.repository == 'Dicklesworthstone/coding_agent_session_search'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/gh473-core-target
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Extract exact production retry/error code and sync facade
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          python3 scripts/verify_gh473_core.py "$RUNNER_TEMP/gh473-core"
+      - name: Resolve and record the independent engine graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/gh473-core"
+          rustc --version
+          cargo generate-lockfile
+          sha256sum Cargo.lock
+          python3 - <<'PY'
+          import tomllib
+          from pathlib import Path
+          packages = tomllib.loads(Path('Cargo.lock').read_text())['package']
+          family = [(p['name'], p['version']) for p in packages if p['name'].startswith('fsqlite')]
+          print('Independent probe engine family:', family)
+          if not family or any(version != '0.4.4' for _, version in family):
+              raise SystemExit('Probe must use the same 0.4.4 engine family, never an older substitute')
+          PY
+      - name: Build the narrow production-source engine probe
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/gh473-core"
+          timeout 900s cargo build --locked
+      - name: Exercise real held locks, exhaustion, permanent errors and policy overrides
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, subprocess
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          binary = root / 'gh473-core-target/debug/cass-gh473-core-probe'
+          for value, expected in [(None, 10), ('0', 10), ('invalid', 10), ('-1', 10), ('18446744073709551616', 10), ('37', 37)]:
+              env = dict(os.environ)
+              env.pop('CASS_INDEX_WRITER_BUSY_TIMEOUT_MS', None)
+              if value is not None:
+                  env['CASS_INDEX_WRITER_BUSY_TIMEOUT_MS'] = value
+              result = subprocess.run([str(binary), str(expected)], cwd=root / 'gh473-core', env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)
+              print(f'policy_override={value!r}\n{result.stdout}', flush=True)
+              receipt = f'GH473_CORE_OK policy_ms={expected} released_attempts=2 exhausted_attempts=3 permanent_attempts=1'
+              if result.returncode != 0 or receipt not in result.stdout:
+                  raise SystemExit('Missing passing narrow-core runtime receipt')
+          print('6/6 policy cases passed the narrow real-engine retry/error-chain probe.')
+          PY
+      - name: State narrow evidence boundary
+        if: always()
+        run: |
+          echo 'This independently locked probe compiles exact production retry/policy/error code and the sync facade.'
+          echo 'It does NOT compile full CASS or validate storage caching, canonical atomic ledger, lexical indexing, embeddings or HNSW.'
+          echo 'The full-cass job remains mandatory and independently fails on a blocked dependency graph.'

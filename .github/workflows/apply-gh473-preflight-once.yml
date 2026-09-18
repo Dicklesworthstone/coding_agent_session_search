@@ -1,130 +1,17 @@
-# One-time exact-context patch application. Retire the write step after landing.
-name: Apply GH473 preflight hardening once
+# The one-time patch landed in 90a1bf2d. This workflow is now read-only.
+name: Verify GH473 preflight patch is present
 on:
-  push:
-    branches: [main]
-    paths: [.github/workflows/apply-gh473-preflight-once.yml]
+  workflow_dispatch:
 permissions:
-  contents: write
-concurrency:
-  group: cass-gh473-preflight-application
-  cancel-in-progress: false
+  contents: read
 jobs:
-  apply:
-    if: github.repository == 'Dicklesworthstone/coding_agent_session_search'
+  verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
-    env:
-      CARGO_BUILD_JOBS: '2'
-      CARGO_PROFILE_TEST_DEBUG: '0'
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_TERM_COLOR: never
-      CARGO_NET_RETRY: '1'
-      RUST_MIN_STACK: '134217728'
-      RUST_BACKTRACE: '1'
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: main
-          fetch-depth: 1
-      - name: Apply only the reviewed preflight changes
-        shell: bash
-        run: |
-          set -euo pipefail
-          git rev-parse HEAD
-          test -z "$(git status --porcelain)"
-          python3 - <<'PY'
-          from pathlib import Path
-          import difflib, hashlib, re
-          path = Path('src/indexer/mod.rs')
-          original = path.read_text()
-          def definition(text, name):
-              matches = list(re.finditer(r'^( *)(?:pub(?:\([^)]*\))? )?fn ' + re.escape(name) + r'\b', text, re.M))
-              if len(matches) != 1:
-                  raise SystemExit('Missing or ambiguous function: ' + name)
-              match = matches[0]
-              end = re.search('^' + match[1] + r'}$', text[match.end():], re.M)
-              if end is None:
-                  raise SystemExit('Unterminated function: ' + name)
-              return text[match.start():match.end() + end.end()]
-          def once(text, old, new):
-              if text.count(old) != 1:
-                  raise SystemExit('Unexpected GH473 context; refusing a blind rewrite: ' + repr(old))
-              return text.replace(old, new, 1)
-          before = definition(original, 'with_ephemeral_writer')
-          after = once(before, '\n            apply_index_writer_busy_timeout(storage);\n', '\n')
-          after = once(after, '\n        apply_index_writer_busy_timeout(&writer);\n', '\n')
-          after = once(after, '\n        if storage.bulk_single_connection_enabled() {\n', '\n        if storage.bulk_single_connection_enabled() {\n            // Preflight is a write too; tune it before entering the retryable operation.\n            apply_index_writer_busy_timeout(storage);\n')
-          after = once(after, '\n        if !storage.ephemeral_writer_preflight_verified() {\n', '\n        // A cold/reused writer must not inherit a long timeout for its first write.\n        apply_index_writer_busy_timeout(&writer);\n        if !storage.ephemeral_writer_preflight_verified() {\n')
-          old = '''                anyhow::bail!(
-                              "ephemeral writer preflight write failed for {context} at {}: {err}. \\
-                               The database may be locked by another process or opened in \\
-                               readonly mode. Try closing other cass instances and retrying.",
-                              db_path.display()
-                          );'''
-          new = old.replace('anyhow::bail!(', 'return Err(anyhow::Error::new(err).context(format!(').replace('at {}: {err}.', 'at {}.').replace('\n                );', '\n                )));')
-          new = '                // Preserve the typed engine error for outer retry/fallback classification.\n' + new
-          after = once(after, old, new)
-          source = once(original, before, after)
-          source = once(source, '\nmod tests {\n', '\nmod tests {\n    include!("gh473_tests.rs");\n')
-          for name in ['index_writer_busy_timeout_ms', 'with_concurrent_retry', 'is_retryable_franken_error', 'persist_conversations_batched_inner']:
-              a, b = definition(original, name), definition(source, name)
-              if a != b:
-                  raise SystemExit('Unexpected change to preserved policy: ' + name)
-              print('unchanged', name, hashlib.sha256(a.encode()).hexdigest())
-          primary = after[after.index('if storage.bulk_single_connection_enabled()'):after.index('let (writer, reusable)')]
-          assert primary.index('apply_index_writer_busy_timeout(storage)') < primary.index('.execute("UPDATE meta')
-          ephemeral = after[after.index('let (writer, reusable)'):]
-          assert ephemeral.index('apply_index_writer_busy_timeout(&writer)') < ephemeral.index('.execute("UPDATE meta')
-          assert 'anyhow::bail!' not in ephemeral
-          print(''.join(difflib.unified_diff(original.splitlines(True), source.splitlines(True), fromfile='a/src/indexer/mod.rs', tofile='b/src/indexer/mod.rs')))
-          path.write_text(source)
-          storage = Path('src/storage/sqlite.rs').read_text()
-          for name in ['acquire_cached_ephemeral_writer', 'release_cached_ephemeral_writer', 'discard_cached_ephemeral_writer', 'bulk_single_connection_enabled', 'set_bulk_single_connection_enabled']:
-              try:
-                  print('=== storage', name, '===\n', definition(storage, name))
-              except SystemExit as exc:
-                  print('inspection only:', exc)
-          for number, line in enumerate(storage.splitlines(), 1):
-              if 'bulk_single_connection' in line:
-                  print('bulk mode source', number, line)
-          PY
-      - name: Parse touched Rust and format new regressions
-        shell: bash
-        run: |
-          set -euo pipefail
-          rustc --version
-          rustfmt --edition 2024 src/indexer/gh473_tests.rs
-          # Parsing is not a compile/runtime receipt. Do not reformat the monolith.
-          rustfmt --edition 2024 --config skip_children=true --emit stdout src/indexer/mod.rs > "$RUNNER_TEMP/gh473-parsed.rs"
-          git diff --check
-      - name: Commit narrowly and fast-forward main without overwriting concurrent work
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -- src/indexer/mod.rs src/indexer/gh473_tests.rs
-          git diff --cached --stat
-          git commit -m 'fix(index): tune cold preflight waits and preserve retryable errors (GH473)'
-          git push origin HEAD:main
-          git rev-parse HEAD
-      - name: Attempt complete locked CASS regressions
-        shell: bash
-        run: |
-          set -euo pipefail
-          timeout 1800s cargo test --locked --lib gh473 -- --nocapture 2>&1 | tee "$RUNNER_TEMP/gh473-cass.log"
-          python3 - <<'PY'
-          import os, re
-          from pathlib import Path
-          text = (Path(os.environ['RUNNER_TEMP']) / 'gh473-cass.log').read_text()
-          counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
-          if not counts or max(map(int, counts)) < 2:
-              raise SystemExit('Both GH473 CASS regression suites must actually pass')
-          PY
-      - name: State qualification scope
-        if: always()
-        run: |
-          echo 'Rust parsing and source guards do not prove full compilation or runtime correctness.'
-          echo 'A blocked dependency graph is a failed qualification gate.'
-          echo 'Original-archive canonical/lexical/semantic/HNSW qualification remains separate.'
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify production source without mutations
+        run: python3 scripts/verify_gh473_core.py "$RUNNER_TEMP/gh473-source-check"
