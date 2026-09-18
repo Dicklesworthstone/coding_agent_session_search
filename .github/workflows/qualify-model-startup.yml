@@ -72,19 +72,25 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
-          import json, os
+          import hashlib, json, os
           root = Path.cwd()
           upstream = Path(os.environ['GITHUB_WORKSPACE']) / 'fs-source/frankensearch'
           dest = Path(os.environ['RUNNER_TEMP']) / 'model-harness'
-          (dest / 'src').mkdir(parents=True)
+          (dest / 'src/daemon/models').mkdir(parents=True)
+          # Normal mod declarations preserve Rust's production child lookup.
+          # Byte-identical copies, not substitutions or rewritten declarations.
+          copied = {}
+          for rel in ['src/daemon/models.rs', 'src/daemon/models/slot.rs']:
+              data = (root / rel).read_bytes()
+              (dest / rel).write_bytes(data)
+              copied[rel] = hashlib.sha256(data).hexdigest()
           lines = ['pub mod search {']
           for name in ['embedder', 'reranker', 'hash_embedder', 'fastembed_embedder', 'fastembed_reranker', 'policy']:
               lines.append('#[path = ' + json.dumps(str(root / ('src/search/' + name + '.rs'))) + '] pub mod ' + name + ';')
-          lines.append('}\npub mod daemon {')
-          for name in ['protocol', 'models']:
-              lines.append('#[path = ' + json.dumps(str(root / ('src/daemon/' + name + '.rs'))) + '] pub mod ' + name + ';')
-          lines.append('}')
+          lines.append('}\npub mod daemon {\npub mod models;')
+          lines.append('#[path = ' + json.dumps(str(root / 'src/daemon/protocol.rs')) + '] pub mod protocol;\n}')
           (dest / 'src/lib.rs').write_text('\n'.join(lines))
+          (Path(os.environ['RUNNER_TEMP']) / 'model-evidence/harness-source-identities.json').write_text(json.dumps(copied, indent=2))
           (dest / 'Cargo.toml').write_text('[package]\nname="cass-model-publication-check"\nversion="0.0.0"\nedition="2024"\n[dependencies]\nfrankensearch={path=' + json.dumps(str(upstream)) + ', default-features=false, features=["hash", "native"]}\nparking_lot="=0.12.5"\nserde={version="1", features=["derive"]}\nserde_json="1"\nrmp-serde="1.3"\ndotenvy="0.15"\nthiserror="2"\ntracing="0.1"\ntoml="0.9"\ntempfile="3"\n')
           PY
           export CARGO_TARGET_DIR="$RUNNER_TEMP/model-target"
@@ -96,8 +102,10 @@ jobs:
       - name: Record the unmodified locked-CASS result separately
         run: |
           set -uo pipefail
+          set +e
           timeout 90 cargo test --locked --lib daemon::models:: -- --nocapture > "$RUNNER_TEMP/model-evidence/full-cass.log" 2>&1
           status=$?
+          set -e
           printf '%s\n' "$status" > "$RUNNER_TEMP/model-evidence/full-cass-exit.txt"
           cat "$RUNNER_TEMP/model-evidence/full-cass.log"
           printf 'Full locked CASS exit=%s; component success is not full-binary qualification\n' "$status"
