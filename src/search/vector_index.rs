@@ -127,6 +127,9 @@ impl SemanticProgressiveUnavailableReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticAnnUnavailableReason {
+    /// Global ANN candidate selection cannot enforce an authoritative session
+    /// allowlist before top-k. This query uses the filtered exact FSVI reader.
+    SessionScopeRequiresExact,
     /// More than one exact shard is active, but no sharded ANN topology was
     /// explicitly selected.
     MultipleExactShards,
@@ -145,6 +148,7 @@ impl SemanticAnnUnavailableReason {
     #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
+            Self::SessionScopeRequiresExact => "session_scope_requires_exact",
             Self::MultipleExactShards => "multiple_exact_shards",
             Self::SidecarMissing => "ann_sidecar_missing",
             Self::SidecarOpenFailed => "ann_sidecar_open_failed",

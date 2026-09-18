@@ -731,6 +731,12 @@ impl SemanticTierMode {
     }
 }
 
+mod session_scope;
+use session_scope::{
+    SEMANTIC_SESSION_SCOPE_MAX_MESSAGES, SessionScopedSemanticFilter,
+    load_semantic_session_message_ids,
+};
+
 const PROGRESSIVE_EMBEDDING_CACHE_CAPACITY: usize = 64;
 const ANN_CANDIDATE_MULTIPLIER: usize = 4;
 const HYBRID_NO_LIMIT_PLANNING_WINDOW: usize = 64;
@@ -5069,6 +5075,47 @@ impl SearchClient {
             semantic_filter = semantic_filter.with_roles(Some(roles));
         }
 
+        if !filters.session_paths.is_empty() {
+            let message_ids = {
+                let sqlite_guard = self.sqlite_guard()?;
+                let conn = sqlite_guard.as_ref().ok_or_else(|| {
+                    anyhow!("session-scoped semantic search requires database connection")
+                })?;
+                load_semantic_session_message_ids(
+                    conn,
+                    &filters.session_paths,
+                    SEMANTIC_SESSION_SCOPE_MAX_MESSAGES,
+                )?
+            };
+            // No selected archive messages means no matching vector records.
+            // In particular, never interpret an empty allowlist as unrestricted.
+            if message_ids.is_empty() {
+                return Ok((
+                    Vec::new(),
+                    SemanticCandidateRetryState {
+                        has_more_candidates: false,
+                        exact_window_may_omit_competitor: false,
+                    },
+                    None,
+                ));
+            }
+            let scoped_filter = SessionScopedSemanticFilter {
+                metadata: &semantic_filter,
+                message_ids: &message_ids,
+            };
+            // The native ANN lane selects a global window before filtering.
+            // It cannot guarantee recall for a narrow session selection; use
+            // the retained exact owners with the filter inside top-k instead.
+            // None here means no ANN statistics: this was an exact search.
+            let (results, retry_state) = Self::search_exact_semantic_indexes(
+                context,
+                embedding,
+                request.fetch_limit,
+                Some(&scoped_filter),
+            )?;
+            return Ok((results, retry_state, None));
+        }
+
         if request.tier_mode.wants_two_tier() && !request.approximate {
             tracing::debug!(
                 tier_mode = ?request.tier_mode,
@@ -6316,12 +6363,21 @@ impl SearchClient {
                 if !Arc::ptr_eq(&embedding.context_token, &context_token) {
                     continue;
                 }
-                let in_memory_two_tier_index = if tier_mode.wants_two_tier() && !approximate {
+                let in_memory_two_tier_index = if tier_mode.wants_two_tier()
+                    && !approximate
+                    && filters.session_paths.is_empty()
+                {
                     self.in_memory_two_tier_index(tier_mode)?
                 } else {
                     None
                 };
-                let ann_index = if approximate { self.ann_index()? } else { None };
+                // Session-scoped selection uses exact filtered vectors. Do not
+                // load the global ANN graph for a query that cannot use it.
+                let ann_index = if approximate && filters.session_paths.is_empty() {
+                    self.ann_index()?
+                } else {
+                    None
+                };
                 let effective_approximate = approximate && ann_index.is_some();
                 let effective_tier_mode = if approximate {
                     SemanticTierMode::Single
@@ -6987,6 +7043,7 @@ impl SearchClient {
             }
             Err(err) => return Err(err),
         };
+        let session_scoped = !filters.session_paths.is_empty();
         let (semantic_hits, semantic_ann_stats) = self.search_semantic_with_tier(
             semantic_query,
             filters,
@@ -6996,7 +7053,9 @@ impl SearchClient {
             approximate,
             semantic_tier_mode,
         )?;
-        let semantic_ann_unavailable_reason = if approximate {
+        let semantic_ann_unavailable_reason = if approximate && session_scoped {
+            Some(SemanticAnnUnavailableReason::SessionScopeRequiresExact)
+        } else if approximate {
             self.ann_unavailability_reason()?
         } else {
             None
