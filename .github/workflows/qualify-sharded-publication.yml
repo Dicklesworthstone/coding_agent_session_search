@@ -48,12 +48,16 @@ jobs:
           from pathlib import Path
           def blob(data):
               return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-          record = json.loads(subprocess.check_output(['gh', 'api', 'repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs/2ea2e9153a6a7191228f783c917cf88cf50ba76f'], text=True))
-          compressed = base64.b64decode(record['content'])
-          assert blob(compressed) == '2ea2e9153a6a7191228f783c917cf88cf50ba76f'
-          patch = lzma.decompress(compressed)
-          assert len(patch) == 47879
-          assert hashlib.sha256(patch).hexdigest() == 'e508d597c1e83220a713b21e291e5fc59e87eab05fca8f69afa1bc28fb147658'
+          def patch_blob(sha, digest, name):
+              record = json.loads(subprocess.check_output(['gh', 'api', 'repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs/' + sha], text=True))
+              compressed = base64.b64decode(record['content'])
+              assert blob(compressed) == sha
+              patch = lzma.decompress(compressed)
+              assert hashlib.sha256(patch).hexdigest() == digest
+              path = evidence / name
+              path.write_bytes(patch)
+              subprocess.run(['git', 'apply', '--check', '--whitespace=error-all', str(path)], check=True)
+              subprocess.run(['git', 'apply', str(path)], check=True)
           expected = {
               'src/search/semantic_manifest.rs': ('45e12506457d0b9823d25fd65e08a9a7a3cc83a0', '259c5727ca9a6c001236bed10bd897cb69481288'),
               'src/search/semantic_manifest/shards.rs': (None, '27a2b64f60018ea721b8e408f401c05792439f62'),
@@ -68,11 +72,11 @@ jobs:
               path = Path(name)
               assert not path.is_symlink(), name
               assert (not path.exists()) if before is None else blob(path.read_bytes()) == before, name
+          extra_path = 'src/search/semantic_reader/publication/live_docset.rs'
+          assert not Path(extra_path).exists() and not Path(extra_path).is_symlink()
           evidence = Path(os.environ['RUNNER_TEMP']) / 'shard-evidence'
           (evidence / 'base.txt').write_text(subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True))
-          (evidence / 'reviewed.patch').write_bytes(patch)
-          subprocess.run(['git', 'apply', '--check', '--whitespace=error-all', str(evidence / 'reviewed.patch')], check=True)
-          subprocess.run(['git', 'apply', str(evidence / 'reviewed.patch')], check=True)
+          patch_blob('2ea2e9153a6a7191228f783c917cf88cf50ba76f', 'e508d597c1e83220a713b21e291e5fc59e87eab05fca8f69afa1bc28fb147658', 'reviewed.patch')
           for name, (_, after) in expected.items():
               assert blob(Path(name).read_bytes()) == after, name
           script = Path('scripts/verify_sharded_publication.py')
@@ -88,7 +92,16 @@ jobs:
           assert text.count(needle) == 1
           script.write_text(text.replace(needle, extra + needle))
           assert blob(script.read_bytes()) == '9f83ca7ce9a71c439ced830ab38b58c9782dda30'
-          (evidence / 'paths.json').write_text(json.dumps(list(expected)))
+          patch_blob('c4d5fcba66efff7616370cf1645967c0fe367f88', '443480f8f29f3bd672e91570f3e59c8bb6902f4e063048dabbde62d3db6b3ddc', 'fsvi-order-fix.patch')
+          fixed = {
+              extra_path: '432769069df1bb6a70364e8941d58d5f3ba15cf7',
+              'src/search/semantic_reader/publication.rs': 'e38d4f2f2ea613b7fe0c4a9a69910ab18441eebf',
+              'src/search/semantic_manifest/shards.rs': '3c031244ff4eed3b7f862d1a8807a4fa20b0744b',
+              'src/search/semantic_reader/publication/tests/sharded.rs': '9226a2a94e7bb4ab721f499224802f563eaaf7d1',
+          }
+          for name, after in fixed.items():
+              assert blob(Path(name).read_bytes()) == after, name
+          (evidence / 'paths.json').write_text(json.dumps(list(expected) + [extra_path]))
           beads = []
           for line in Path('.beads/issues.jsonl').read_text().splitlines():
               row = json.loads(line)
@@ -119,8 +132,9 @@ jobs:
           cargo generate-lockfile
           cp Cargo.lock "$RUNNER_TEMP/shard-evidence/component-Cargo.lock"
           timeout 900 cargo test --locked --lib -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/shard-evidence/tests.log"
+          grep -Eq 'test result: ok\. 140 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/shard-evidence/tests.log"
           timeout 120 cargo test --locked --lib sharded:: -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/shard-evidence/new-tests.log"
-          grep -Eq 'test result: ok\. 12 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/shard-evidence/new-tests.log"
+          grep -Eq 'test result: ok\. 14 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/shard-evidence/new-tests.log"
       - name: Record shipping locked-CASS qualification separately
         run: |
           set -uo pipefail
@@ -145,16 +159,13 @@ jobs:
           for name in paths:
               data = Path(name).read_bytes()
               receipt[name] = {'git_blob': hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest(), 'sha256': hashlib.sha256(data).hexdigest()}
-              output = evidence / 'source' / name
-              output.parent.mkdir(parents=True, exist_ok=True)
-              output.write_bytes(data)
           (evidence / 'published-source.json').write_text(json.dumps(receipt, indent=2))
           subprocess.run(['git', 'add', '--', *paths], check=True)
           PY
           git diff --cached --check
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'feat(search): publish and retain complete ordered semantic shard cohorts' -m 'Add explicit version-2 partition metadata while preserving v1 JSON and digest behavior. Validate complete bounded ordered vector partitions and exact ordinal-specific ANN bases; admit every selected shard with immutable owner, live-row range and aggregate full-docset checks. Keep partial quality coverage explicit and missing graph receipts on exact fallback. Add twelve real-FSVI publication/ANN regressions. All component tests passed against pinned real upstream code; this separate dependency graph does not qualify the shipping CASS binary or enable its progressive CLI route. No repository dependency pins, lockfile, models or user archives changed.'
+          git commit -m 'feat(search): publish and retain complete ordered semantic shard cohorts' -m 'Add explicit version-2 partition metadata while preserving v1 JSON and digest behavior. Validate complete bounded lexical partitions and exact ordinal-specific ANN bases; admit every selected shard with immutable owner and checked live-row extrema. Reconstruct whole-corpus commitments by a bounded-head merge in native FSVI hash order, including multi-row and tombstoned images. Keep partial quality coverage explicit and missing graph receipts on exact fallback. All 140 component tests passed against pinned real upstream code, including 14 new real-file regressions. This separate dependency graph does not qualify the shipping CASS binary or enable its progressive CLI route. No repository dependency pins, lockfile, models or user archives changed.'
           git push origin HEAD:main
           git rev-parse HEAD | tee "$RUNNER_TEMP/shard-evidence/runtime-commit.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
