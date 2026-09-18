@@ -21,60 +21,49 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: main
-      - name: Apply the reviewed GH482 patch with exact context
+      - name: Apply reviewed parent-registration retries after writer-setup hardening
         run: |
           set -euo pipefail
           test -z "$(git status --porcelain)"
-          if git apply --reverse --check scripts/patches/gh482-session-ann-warning.patch 2>/dev/null; then
-            echo 'GH482 patch already present'
+          cp src/indexer/mod.rs "$RUNNER_TEMP/indexer-before.rs"
+          grep -F 'fn with_held_writer<T>' src/indexer/gh473_tests.rs
+          if grep -q 'fn warm_writer_parent_registration_retries' src/indexer/gh473_tests.rs; then
+            echo 'Parent registration patch already present'
           else
-            git apply --check scripts/patches/gh482-session-ann-warning.patch
-            git apply scripts/patches/gh482-session-ann-warning.patch
+            git apply --check scripts/patches/gh473-parent-registration-retry.patch
+            git apply scripts/patches/gh473-parent-registration-retry.patch
           fi
-      - name: Compile the actual enum and warning functions and run their tests
-        run: |
-          set -euo pipefail
           python3 - <<'PY'
+          import hashlib, importlib.util, os
           from pathlib import Path
-          import os
-          vector = Path('src/search/vector_index.rs').read_text()
-          start = vector.index('pub enum SemanticAnnUnavailableReason {')
-          end = vector.index('/// One opened semantic index', start)
-          # Serde derives are serialization-only; the exact enum, code() and
-          # warning/test bodies are compiled below without the full dependency graph.
-          enum = '#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n' + vector[start:end]
-          lib = Path('src/lib.rs').read_text()
-          start = lib.index('fn ann_fallback_human_warning(')
-          end = lib.index('fn toon_encode_options_from_env()', start)
-          program = 'mod search { pub mod vector_index {\n' + enum + '\n}}\n' + lib[start:end]
-          Path(os.environ['RUNNER_TEMP'], 'gh482.rs').write_text(program)
+          spec = importlib.util.spec_from_file_location('probe', 'scripts/verify_gh473_core.py')
+          probe = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(probe)
+          before = Path(os.environ['RUNNER_TEMP'], 'indexer-before.rs').read_text()
+          after = Path('src/indexer/mod.rs').read_text()
+          for name in ['index_writer_busy_timeout_ms', 'with_concurrent_retry', 'is_retryable_franken_error', 'anyhow_chain_indicates_retryable_storage_contention', 'with_ephemeral_writer']:
+              old, new = probe.definition(before, name), probe.definition(after, name)
+              assert old == new, 'Unexpected change to retry policy: ' + name
+              print('UNCHANGED', name, hashlib.sha256(new.encode()).hexdigest())
+          name = 'persist_conversations_batched_inner'
+          old, new = probe.definition(before, name), probe.definition(after, name)
+          marker = '                let chunk_size = serial_batch_chunk_size()'
+          assert old[old.index(marker):] == new[new.index(marker):], 'Canonical transaction/completion/publication code changed'
+          assert 'retry when a warm writer encounters a new identity' in new
           PY
-          rustc --edition 2024 --test "$RUNNER_TEMP/gh482.rs" -o "$RUNNER_TEMP/gh482"
-          "$RUNNER_TEMP/gh482" --nocapture | tee "$RUNNER_TEMP/gh482.log"
-          grep -F '3 passed; 0 failed' "$RUNNER_TEMP/gh482.log"
+          rustfmt --edition 2024 src/indexer/gh473_tests.rs
+          rustfmt --edition 2024 --config skip_children=true --emit stdout src/indexer/mod.rs > "$RUNNER_TEMP/indexer-parsed.rs"
           git diff --check
-      - name: Commit only the reviewed production fix and its bead
+      - name: Commit only production registration retries and their regressions
         id: commit
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json
-          from datetime import datetime, timezone
-          from pathlib import Path
-          path = Path('.beads/issues.jsonl')
-          entries = [json.loads(line) for line in path.read_text().splitlines() if line]
-          bead_id = 'coding_agent_session_search-gh482-ann-warning'
-          if not any(entry['id'] == bead_id for entry in entries):
-              now = datetime.now(timezone.utc).isoformat()
-              bead = {'id': bead_id, 'title': 'gh482 handle intentional session-scoped exact ANN fallback in CLI diagnostics', 'description': 'GH482 reports E0004 on 89b68592 and 30ac51c7: SessionScopeRequiresExact was added without the CLI warning match arm. Add explicit non-repair guidance while retaining the session filter, extend all-reasons coverage, and qualify the full CASS candidate graph separately from unpublished registry dependency status.', 'status': 'in_progress', 'priority': 0, 'issue_type': 'bug', 'created_at': now, 'updated_at': now, 'created_by': 'github-actions', 'source_repo': '.'}
-              with path.open('a') as file:
-                  file.write(json.dumps(bead, separators=(',', ':')) + '\n')
-          PY
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -- src/lib.rs .beads/issues.jsonl
+          git add -- src/indexer/mod.rs src/indexer/gh473_tests.rs
           if ! git diff --cached --quiet; then
-            git commit -m 'fix(search): handle intentional session-scoped ANN fallback (GH482)'
+            git diff --cached --stat
+            git commit -m 'fix(index): retry idempotent parent registration before canonical transactions (GH473)'
             git push origin HEAD:main
           fi
           echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -82,7 +71,7 @@ jobs:
     name: Full CASS with pinned unpublished search candidate (not registry release proof)
     needs: land
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
     env:
       CARGO_BUILD_JOBS: '2'
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -96,10 +85,10 @@ jobs:
         with:
           ref: ${{ needs.land.outputs.revision }}
           persist-credentials: false
-      - name: Prepare an isolated, exact-revision search candidate overlay
+      - name: Prepare an isolated exact-revision same-version search candidate
         run: |
           set -euo pipefail
-          git rev-parse HEAD
+          git rev-parse HEAD | tee "$RUNNER_TEMP/cass-revision.txt"
           cp Cargo.lock "$RUNNER_TEMP/Cargo.registry.lock"
           git init "$RUNNER_TEMP/frankensearch"
           git -C "$RUNNER_TEMP/frankensearch" remote add origin https://github.com/Dicklesworthstone/frankensearch
@@ -118,26 +107,34 @@ jobs:
           cp Cargo.lock "$RUNNER_TEMP/Cargo.candidate.lock"
           sha256sum Cargo.lock
           git diff --exit-code -- Cargo.toml src
-      - name: Run full CASS GH473 persistence regressions
+      - name: Build the full CASS library test target
+        id: build
         run: |
           set -euo pipefail
-          timeout 1800s cargo --config "$RUNNER_TEMP/candidate.toml" test --locked --lib gh473 -- --nocapture 2>&1 | tee "$RUNNER_TEMP/gh473-full-cass.log"
-          grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed;' "$RUNNER_TEMP/gh473-full-cass.log"
-      - name: Run source-completion atomicity and CLI fallback regressions
+          timeout 2100s cargo --config "$RUNNER_TEMP/candidate.toml" test --locked --lib --no-run 2>&1 | tee "$RUNNER_TEMP/cass-build.log"
+      - name: Run production ingest, atomic completion, and CLI fallback suites
+        if: steps.build.outcome == 'success'
         run: |
-          set -euo pipefail
-          for test in gh426_source_completion ann_fallback_human_warning_tests; do
-            timeout 300s cargo --config "$RUNNER_TEMP/candidate.toml" test --locked --lib "$test" -- --nocapture 2>&1 | tee "$RUNNER_TEMP/$test.log"
-            grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed;' "$RUNNER_TEMP/$test.log"
+          set -uo pipefail
+          failed=0
+          for test in gh473 gh426_source_completion ann_fallback_human_warning_tests; do
+            timeout 360s cargo --config "$RUNNER_TEMP/candidate.toml" test --locked --lib "$test" -- --nocapture 2>&1 | tee "$RUNNER_TEMP/$test.log"
+            result=$?
+            if test "$result" -ne 0 || ! grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed;' "$RUNNER_TEMP/$test.log"; then
+              failed=1
+            fi
           done
-      - name: Archive exact graph and runtime results
+          exit "$failed"
+      - name: Archive exact graph and observed results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: cass-candidate-evidence-${{ github.run_id }}
           path: |
             ${{ runner.temp }}/Cargo.*.lock
-            ${{ runner.temp }}/gh473-full-cass.log
+            ${{ runner.temp }}/cass-revision.txt
+            ${{ runner.temp }}/cass-build.log
+            ${{ runner.temp }}/gh473.log
             ${{ runner.temp }}/gh426_source_completion.log
             ${{ runner.temp }}/ann_fallback_human_warning_tests.log
           retention-days: 7
@@ -145,5 +142,5 @@ jobs:
       - name: State evidence scope
         if: always()
         run: |
-          echo 'This lane uses full committed CASS source and a pinned same-version source overlay for unpublished frankensearch 0.6.1.'
-          echo 'It does not qualify the root registry lockfile, a release binary, or the original user archive.'
+          echo 'Full committed CASS source; pinned same-version source overlay for unpublished frankensearch 0.6.1.'
+          echo 'This does not qualify the root registry lockfile, a release binary, or the original user archive.'
