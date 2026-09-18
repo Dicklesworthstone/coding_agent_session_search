@@ -95,6 +95,7 @@ jobs:
       - name: Parse every changed source and execute real socket-budget tests
         run: |
           set -euo pipefail
+          rustup component add --toolchain "$RUSTUP_TOOLCHAIN" rustfmt
           rustc --version
           for source in src/daemon/core.rs src/daemon/core/inference.rs src/daemon/core/wire.rs src/daemon/protocol.rs src/daemon/client/transport.rs src/daemon/client/exchange/tests.rs; do
             rustfmt --edition 2024 --config skip_children=true --emit stdout "$source" > "$RUNNER_TEMP/parsed.rs"
