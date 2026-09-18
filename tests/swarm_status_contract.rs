@@ -63,6 +63,10 @@ fn live_swarm_status_reports_unknown_sources_without_zero_work_claims() {
         );
     }
     assert_eq!(value["build_pressure"]["status"], "unknown");
+    assert!(value["summary"]["build_pressure"].is_null());
+    for field in ["active_cargo_jobs", "cpu_count", "load_average_1m"] {
+        assert!(value["build_pressure"][field].is_null());
+    }
     assert_eq!(
         value["build_pressure"]["recommended_action"],
         "inspect-rch-state"

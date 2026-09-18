@@ -11942,13 +11942,26 @@ fn render_swarm_status_live() -> serde_json::Value {
             }
         }
     }
-    // Process collection is still unavailable. Never turn that absence into
-    // a recommendation to start a build on an apparently idle fleet.
+    // Fleet counts are observations, not local process coverage or admission.
+    payload["summary"]["build_pressure"] = serde_json::Value::Null;
     payload["build_pressure"] = serde_json::json!({
         "status": "unknown", "active_rch_jobs": null, "active_cargo_jobs": null,
+        "queued_rch_jobs": null, "slots_total": null, "slots_available": null,
+        "fleet_posture": null,
         "load_average_1m": null, "cpu_count": null,
         "recommended_action": "inspect-rch-state",
     });
+    if let Some(snapshot) = collection.snapshot(SwarmProviderName::Process) {
+        for field in [
+            "active_rch_jobs",
+            "queued_rch_jobs",
+            "slots_total",
+            "slots_available",
+            "fleet_posture",
+        ] {
+            payload["build_pressure"][field] = snapshot.payload[field].clone();
+        }
+    }
     payload["_meta"]["source_observations"] = serde_json::json!({});
     for snapshot in &collection.snapshots {
         let observed = &snapshot.payload;
@@ -11962,6 +11975,7 @@ fn render_swarm_status_live() -> serde_json::Value {
             "head": observed.get("head"),
             "version": observed.get("version"),
             "source_kind": observed.get("source_kind"),
+            "schema_version": observed.get("schema_version"),
             "export_age_ms": observed.get("export_age_ms"),
         });
     }
