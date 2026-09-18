@@ -1,4 +1,4 @@
-# Source-only publication; retire writer permissions through the connector after success.
+# Guarded source-only landing; the connector retires write permissions after success.
 name: Qualify immutable shard builds
 on:
   workflow_dispatch:
@@ -36,7 +36,7 @@ jobs:
           ref: 6852e79a830c402ea4e55eb79eda3373c618dfc3
           path: fs-source
           persist-credentials: false
-      - name: Guard source identities and apply the reviewed build isolation
+      - name: Guard source identities and apply reviewed patches
         run: |
           set -euo pipefail
           test "$(git branch --show-current)" = main
@@ -57,6 +57,7 @@ jobs:
               'src/indexer/semantic/shard_publication_tests.rs': '8b264b36fe34602d461fbdb092e902d9c81f6d77',
               'scripts/verify_shard_publication.py': '329774cc72af4c69dd9a50b5582939ccd4710512',
               'scripts/patches/shard-build-isolation.patch': 'dd3392d0ccc2642539f7c11824a0bda9f9e43d38',
+              'scripts/patches/shard-harness-bindings.patch': '830642631780845b7120b47fd10ec9fc2981aaf4',
           }
           for path, sha in expected.items():
               actual = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
@@ -64,13 +65,13 @@ jobs:
                   raise SystemExit('Changed source requires review: ' + path)
           PY
           cp src/indexer/semantic.rs "$RUNNER_TEMP/parent-semantic.rs"
-          git apply --check --whitespace=error-all scripts/patches/shard-build-isolation.patch
-          git apply --whitespace=error-all scripts/patches/shard-build-isolation.patch
+          git apply --check --whitespace=error-all scripts/patches/shard-build-isolation.patch scripts/patches/shard-harness-bindings.patch
+          git apply --whitespace=error-all scripts/patches/shard-build-isolation.patch scripts/patches/shard-harness-bindings.patch
           rustc --version
           rustfmt --edition 2024 src/indexer/semantic/shard_publication_tests.rs
           rustfmt --edition 2024 --config skip_children=true --emit stdout src/indexer/semantic.rs > "$RUNNER_TEMP/semantic-parsed.rs"
           git diff --check
-      - name: RED - reproduce installed shard overwrite with the unchanged parent writer
+      - name: RED - reproduce installed shard overwrite with unchanged production code
         run: |
           set -euo pipefail
           python3 scripts/verify_shard_publication.py "$PWD" "$GITHUB_WORKSPACE/fs-source" "$RUNNER_TEMP/shard-red" --indexer-source "$RUNNER_TEMP/parent-semantic.rs"
@@ -87,7 +88,7 @@ jobs:
           grep -F 'a rebuild must not reuse installed vector paths' "$RUNNER_TEMP/shard-evidence/red.log"
           grep -F 'test result: FAILED. 0 passed; 1 failed;' "$RUNNER_TEMP/shard-evidence/red.log"
           cp source-receipt.json "$RUNNER_TEMP/shard-evidence/red-source-receipt.json"
-      - name: GREEN - execute all production shard publication and hash producer tests
+      - name: GREEN - execute production publication and hash producer tests
         run: |
           set -euo pipefail
           python3 scripts/verify_shard_publication.py "$PWD" "$GITHUB_WORKSPACE/fs-source" "$RUNNER_TEMP/shard-green"
@@ -97,7 +98,7 @@ jobs:
           cargo test --locked -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/shard-evidence/green.log"
           grep -Eq 'test result: ok\. 25 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/shard-evidence/green.log"
           cp source-receipt.json "$RUNNER_TEMP/shard-evidence/green-source-receipt.json"
-      - name: Record component lint and locked CASS qualification separately
+      - name: Record component lint and locked CASS qualification independently
         id: checks
         run: |
           set -uo pipefail
@@ -109,26 +110,26 @@ jobs:
           set -e
           cat "$RUNNER_TEMP/shard-evidence/clippy.log" "$RUNNER_TEMP/shard-evidence/locked-cass.log"
           printf 'component_clippy=%s\nlocked_cass=%s\n' "$lint" "$full" | tee "$RUNNER_TEMP/shard-evidence/checks.txt" >> "$GITHUB_OUTPUT"
-      - name: Commit the tested runtime changes directly to main
+      - name: Commit tested source-only changes directly to main
         env:
           LINT_EXIT: ${{ steps.checks.outputs.component_clippy }}
           FULL_EXIT: ${{ steps.checks.outputs.locked_cass }}
         run: |
           set -euo pipefail
-          git add -- src/indexer/semantic.rs src/indexer/semantic/shard_publication_tests.rs
+          git add -- src/indexer/semantic.rs src/indexer/semantic/shard_publication_tests.rs scripts/verify_shard_publication.py
           python3 - <<'PY'
           import subprocess
           paths = set(subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines())
           assert 'src/indexer/semantic.rs' in paths
-          assert paths <= {'src/indexer/semantic.rs', 'src/indexer/semantic/shard_publication_tests.rs'}, paths
+          assert paths <= {'src/indexer/semantic.rs', 'src/indexer/semantic/shard_publication_tests.rs', 'scripts/verify_shard_publication.py'}, paths
           PY
           git diff --cached --check
-          git hash-object src/indexer/semantic.rs src/indexer/semantic/shard_publication_tests.rs > "$RUNNER_TEMP/shard-evidence/tested-blobs.txt"
+          git hash-object src/indexer/semantic.rs src/indexer/semantic/shard_publication_tests.rs scripts/verify_shard_publication.py > "$RUNNER_TEMP/shard-evidence/tested-blobs.txt"
           tar -czf "$RUNNER_TEMP/shard-evidence/tested-source.tar.gz" src/indexer/semantic.rs src/indexer/semantic/shard_publication_tests.rs scripts/verify_shard_publication.py
           git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit \
             -m 'fix(index): isolate semantic shard builds before manifest publication' \
-            -m 'Allocate a unique generation directory for every build, including rebuilds of the same database fingerprint. Publish only completed vector/ANN paths; failed builds cannot overwrite the files selected by the installed manifest. Strictly reject malformed/future manifests at preflight and publication, preserve other tiers, and avoid allocation from an untrusted shard-size limit before input arrives. Failed unreferenced generations remain for explicit inspection/GC; no old artifacts are removed.' \
-            -m "RED reproduced installed-path reuse with the unchanged production writer. GREEN ran 25 tests of exact production writer/manifest methods and the actual hash control producer against real pinned FSVI/HNSW. Component Clippy exit=$LINT_EXIT; locked CASS test exit=$FULL_EXIT. This independent graph is not full CLI/model/RCH/UBS or archive-scale qualification. Concurrent manifest publication remains a separate follow-up."
+            -m 'Allocate a unique generation directory for every build, including rebuilds of the same database fingerprint. Publish only completed vector/ANN paths; failed builds cannot overwrite installed files. Strictly reject malformed/future manifests at preflight and publication, preserve other tiers, and avoid allocation from the shard-size limit before input arrives. Failed unreferenced generations remain for explicit inspection/GC; no old artifacts are removed.' \
+            -m "RED reproduced installed-path reuse with the unchanged production writer. GREEN ran 25 tests of exact writer/manifest methods and the actual hash control producer against real pinned FSVI/HNSW. Component Clippy exit=$LINT_EXIT; locked CASS test exit=$FULL_EXIT. This independent graph is not full CLI/model/RCH/UBS or archive-scale qualification. Concurrent manifest publication remains separate."
           for attempt in 1 2 3; do
             if GIT_TERMINAL_PROMPT=0 git push origin HEAD:refs/heads/main; then
               git rev-parse HEAD | tee "$RUNNER_TEMP/shard-evidence/published-commit.txt"
