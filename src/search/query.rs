@@ -734,6 +734,9 @@ impl SemanticTierMode {
 mod message_topk;
 #[cfg(test)]
 mod message_topk_integration;
+mod ann_shards;
+#[cfg(test)]
+mod ann_shards_integration;
 mod session_scope;
 use session_scope::{
     SEMANTIC_SESSION_SCOPE_MAX_MESSAGES, SessionScopedSemanticFilter,
@@ -2636,7 +2639,7 @@ struct SemanticSearchState {
     embedder: Arc<dyn Embedder>,
     artifacts: Arc<Vec<SemanticIndexArtifact>>,
     quality_artifact: Option<SemanticIndexArtifact>,
-    fs_ann_index: Option<Arc<FsHnswIndex>>,
+    fs_ann_index: Option<Arc<ann_shards::SemanticAnnShardSet>>,
     fs_ann_unavailable: Option<SemanticAnnUnavailableReason>,
     fs_ann_fallback_reported: bool,
     fs_in_memory_two_tier_index: Option<Arc<FsInMemoryTwoTierIndex>>,
@@ -2707,7 +2710,7 @@ struct SemanticCandidateSearchRequest<'a> {
     approximate: bool,
     tier_mode: SemanticTierMode,
     in_memory_two_tier_index: Option<&'a Arc<FsInMemoryTwoTierIndex>>,
-    ann_index: Option<&'a Arc<FsHnswIndex>>,
+    ann_index: Option<&'a Arc<ann_shards::SemanticAnnShardSet>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -4584,15 +4587,7 @@ impl SearchClient {
         let embedder_id = artifacts[0].index().embedder_id().to_string();
         let dimension = artifacts[0].index().dimension();
         let shard_count = artifacts.len();
-        let fs_ann_unavailable = if shard_count != 1 {
-            Some(SemanticAnnUnavailableReason::MultipleExactShards)
-        } else if let Some(reason) = artifacts[0].ann_unavailable_reason() {
-            Some(reason)
-        } else if artifacts[0].ann_path().is_none() {
-            Some(SemanticAnnUnavailableReason::SidecarMissing)
-        } else {
-            None
-        };
+        let fs_ann_unavailable = ann_shards::SemanticAnnShardSet::unavailable_reason(&artifacts);
         let artifacts = Arc::new(artifacts);
 
         let capacity = NonZeroUsize::new(100).ok_or_else(|| anyhow!("invalid cache size"))?;
@@ -4847,9 +4842,9 @@ impl SearchClient {
         }
     }
 
-    fn ann_index(&self) -> Result<Option<Arc<FsHnswIndex>>> {
+    fn ann_index(&self) -> Result<Option<Arc<ann_shards::SemanticAnnShardSet>>> {
         loop {
-            let (ann_path, fs_semantic_index, context_token) = {
+            let (artifacts, context_token) = {
                 let mut guard = self
                     .semantic
                     .lock()
@@ -4870,24 +4865,13 @@ impl SearchClient {
                     }
                     return Ok(None);
                 }
-                if state.artifacts.len() != 1 {
-                    state.fs_ann_unavailable =
-                        Some(SemanticAnnUnavailableReason::MultipleExactShards);
-                    continue;
-                }
-                let artifact = &state.artifacts[0];
-                let Some(ann_path) = artifact.ann_path().map(Path::to_path_buf) else {
-                    state.fs_ann_unavailable = Some(SemanticAnnUnavailableReason::SidecarMissing);
-                    continue;
-                };
                 (
-                    ann_path,
-                    artifact.index_owner(),
+                    Arc::clone(&state.artifacts),
                     Arc::clone(&state.context_token),
                 )
             };
 
-            let opened = open_fs_semantic_ann_index(fs_semantic_index.as_ref(), &ann_path);
+            let opened = ann_shards::SemanticAnnShardSet::open(artifacts);
 
             let mut guard = self
                 .semantic
@@ -5296,65 +5280,15 @@ impl SearchClient {
                     "approximate search requested; bypassing two-tier mode"
                 );
             }
-
             let ann = request
                 .ann_index
-                .ok_or_else(|| anyhow!("HNSW index failed to initialize"))?;
-            let candidate = request
-                .fetch_limit
-                .saturating_mul(ANN_CANDIDATE_MULTIPLIER)
-                .max(request.fetch_limit);
-            let ef = FS_HNSW_DEFAULT_EF_SEARCH.max(candidate);
-            let (ann_results, search_stats) =
-                ann.knn_search_with_stats(embedding, candidate, ef)
-                    .map_err(|err| anyhow!("frankensearch approximate search failed: {err}"))?;
-            let ann_stats = Some(crate::search::ann_index::AnnSearchStats {
-                index_size: search_stats.index_size,
-                dimension: search_stats.dimension,
-                ef_search: search_stats.ef_search,
-                k_requested: search_stats.k_requested,
-                k_returned: search_stats.k_returned,
-                search_time_us: search_stats.search_time_us,
-                estimated_recall: search_stats.estimated_recall as f32,
-                is_approximate: search_stats.is_approximate,
-            });
-
-            let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
-
-            let mut best_by_message: HashMap<u64, VectorSearchResult> =
-                HashMap::with_capacity(ann_results.len());
-            for hit in ann_results.iter() {
-                if let Some(filter) = fs_filter
-                    && !filter.matches(&hit.doc_id, None)
-                {
-                    continue;
-                }
-                let Some(parsed) = parse_semantic_doc_id(&hit.doc_id) else {
-                    continue;
-                };
-                best_by_message
-                    .entry(parsed.message_id)
-                    .and_modify(|entry| {
-                        if hit.score > entry.score {
-                            entry.score = hit.score;
-                            entry.chunk_idx = parsed.chunk_idx;
-                        }
-                    })
-                    .or_insert(VectorSearchResult {
-                        message_id: parsed.message_id,
-                        chunk_idx: parsed.chunk_idx,
-                        score: hit.score,
-                    });
-            }
-
-            return Ok((
-                Self::collapse_semantic_results(best_by_message, request.fetch_limit),
-                SemanticCandidateRetryState {
-                    has_more_candidates: ann_results.len() >= candidate,
-                    exact_window_may_omit_competitor: false,
-                },
-                ann_stats,
-            ));
+                .ok_or_else(|| anyhow!("HNSW cohort failed to initialize"))?;
+            return ann.search(
+                &context.artifacts,
+                embedding,
+                request.fetch_limit,
+                semantic_filter_as_search_filter(&semantic_filter),
+            );
         }
 
         let fs_filter = semantic_filter_as_search_filter(&semantic_filter);
@@ -22548,7 +22482,7 @@ mod tests {
         assert_eq!(hits[2].source_path, fixture.source_paths[2]);
         assert_eq!(
             fixture.client.ann_unavailability_reason()?,
-            Some(SemanticAnnUnavailableReason::MultipleExactShards)
+            Some(SemanticAnnUnavailableReason::SidecarMissing)
         );
         assert_eq!(
             semantic_artifact_tree_snapshot(&fixture.vector_dir)?,
