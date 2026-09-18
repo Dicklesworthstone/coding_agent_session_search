@@ -1,0 +1,23 @@
+# Production changes landed in 93b149e0 and 44344e16. No repository writes remain.
+name: Verify GH473 writer setup source
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify the setup policy and its real-path regressions
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          python3 scripts/verify_gh473_core.py "$RUNNER_TEMP/gh473-source-check"
+          grep -F 'fn warm_writer_parent_registration_retries' src/indexer/gh473_tests.rs
+          grep -F 'fn writer_body_errors_are_never_replayed' src/indexer/gh473_tests.rs
+          grep -F 'fn canonical_contention_preserves_completion_and_lexical_state' src/indexer/gh473_tests.rs

@@ -1,0 +1,139 @@
+# Read-only qualification of the final GH473 fixes. The registry-release gate
+# remains separate: this lane pins the intended unpublished search source.
+name: Ingest source qualification
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/ingest-source-qualification.yml
+      - tests/gh473_writer_contention.rs
+permissions:
+  contents: read
+concurrency:
+  group: cass-ingest-source-qualification
+  cancel-in-progress: true
+jobs:
+  candidate-runtime:
+    name: Full CASS with pinned search candidate (not registry release proof)
+    if: github.repository == 'Dicklesworthstone/coding_agent_session_search'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '134217728'
+      RUST_BACKTRACE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Prepare the exact-revision same-version search candidate
+        id: graph
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD | tee "$RUNNER_TEMP/cass-revision.txt"
+          grep -F 'fn warm_writer_parent_registration_retries' src/indexer/gh473_tests.rs
+          cp Cargo.lock "$RUNNER_TEMP/Cargo.registry.lock"
+          git init "$RUNNER_TEMP/frankensearch"
+          git -C "$RUNNER_TEMP/frankensearch" remote add origin https://github.com/Dicklesworthstone/frankensearch
+          git -C "$RUNNER_TEMP/frankensearch" fetch --depth=1 origin 2de4b7f529670c9aad1a676f9641210276aff1fb
+          git -C "$RUNNER_TEMP/frankensearch" checkout --detach FETCH_HEAD
+          python3 - <<'PY'
+          import os, tomllib
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          package = tomllib.loads((root / 'frankensearch/frankensearch/Cargo.toml').read_text())['package']
+          assert package['version'] == '0.6.1'
+          config = '[patch.crates-io]\nfrankensearch = { path = ' + repr(str(root / 'frankensearch/frankensearch')) + ' }\n'
+          (root / 'candidate.toml').write_text(config)
+          PY
+          cargo --config "$RUNNER_TEMP/candidate.toml" generate-lockfile
+          cp Cargo.lock "$RUNNER_TEMP/Cargo.candidate.lock"
+          echo "sha=$(sha256sum Cargo.lock | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY'
+          import tomllib
+          from pathlib import Path
+          packages = tomllib.loads(Path('Cargo.lock').read_text())['package']
+          family = [(p['name'], p['version'], p.get('source')) for p in packages if p['name'].startswith('fsqlite')]
+          print('Actual engine graph:', family)
+          assert family and all(version == '0.4.4' and source.startswith('registry+') for _, version, source in family)
+          PY
+          git diff --exit-code -- Cargo.toml src
+      - name: Restore only the matching compiler and candidate-graph cache
+        id: cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: gh473-candidate-v1-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-${{ steps.graph.outputs.sha }}-${{ github.sha }}
+          restore-keys: |
+            gh473-candidate-v1-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-${{ steps.graph.outputs.sha }}-
+      - name: Parse the final tests and record their formatting
+        run: |
+          set -euo pipefail
+          rustc --version
+          rustfmt --edition 2024 --check src/indexer/gh473_tests.rs
+          rustfmt --edition 2024 --emit stdout tests/gh473_writer_contention.rs > "$RUNNER_TEMP/gh473_writer_contention.formatted.rs"
+          rustfmt --edition 2024 --config skip_children=true --emit stdout src/indexer/mod.rs > "$RUNNER_TEMP/indexer-parsed.rs"
+          git diff --exit-code -- Cargo.toml src tests
+      - name: Run the real CLI cross-process reader and lexical publication regression
+        id: cli
+        run: |
+          set -euo pipefail
+          timeout 2100s cargo --config "$RUNNER_TEMP/candidate.toml" test --locked --test gh473_writer_contention -- --nocapture 2>&1 | tee "$RUNNER_TEMP/gh473-cli.log"
+          grep -F 'test result: ok. 1 passed; 0 failed;' "$RUNNER_TEMP/gh473-cli.log"
+      - name: Compile the full library test target independently
+        id: library
+        if: always() && steps.graph.outcome == 'success'
+        run: |
+          set -euo pipefail
+          timeout 1200s cargo --config "$RUNNER_TEMP/candidate.toml" test --locked --lib --no-run 2>&1 | tee "$RUNNER_TEMP/cass-build.log"
+      - name: Run production retries, atomic completion and CLI warning suites
+        if: always() && steps.library.outcome == 'success'
+        run: |
+          set -uo pipefail
+          failed=0
+          for test in gh473 gh426_source_completion ann_fallback_human_warning_tests; do
+            timeout 360s cargo --config "$RUNNER_TEMP/candidate.toml" test --locked --lib "$test" -- --nocapture 2>&1 | tee "$RUNNER_TEMP/$test.log"
+            result=$?
+            if test "$result" -ne 0 || ! grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed;' "$RUNNER_TEMP/$test.log"; then
+              failed=1
+            fi
+          done
+          exit "$failed"
+      - name: Retain build cache even when a real regression fails
+        if: always() && steps.graph.outcome == 'success' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+      - name: Archive the exact graph and observed results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cass-candidate-evidence-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/Cargo.*.lock
+            ${{ runner.temp }}/cass-revision.txt
+            ${{ runner.temp }}/cass-build.log
+            ${{ runner.temp }}/gh473-cli.log
+            ${{ runner.temp }}/gh473.log
+            ${{ runner.temp }}/gh426_source_completion.log
+            ${{ runner.temp }}/ann_fallback_human_warning_tests.log
+            ${{ runner.temp }}/gh473_writer_contention.formatted.rs
+          retention-days: 7
+          if-no-files-found: warn
+      - name: State qualification scope
+        if: always()
+        run: |
+          echo 'Full committed CASS source; pinned same-version Frankensearch 0.6.1 source overlay.'
+          echo 'Real CLI and persistence tests use synthetic temporary archives and the registry FrankenSQLite 0.4.4 engine.'
+          echo 'This does not qualify the root registry lockfile, a release build, MiniLM/HNSW, or the original user archive.'

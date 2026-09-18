@@ -1,0 +1,177 @@
+# The implementation has landed. This recipe is read-only: no patch application,
+# commit, push, archive repair, or modification to the repository's lockfile.
+name: Verify landed session-scoped search
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/apply-session-scope-once.yml
+      - src/search/query/session_scope.rs
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cass-session-scope-verification
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.repository == 'Dicklesworthstone/coding_agent_session_search'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_NET_RETRY: '1'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '134217728'
+      RUST_BACKTRACE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Record exact source and compiler identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          git hash-object src/search/query.rs src/search/vector_index.rs src/search/query/session_scope.rs Cargo.toml Cargo.lock
+          rustc --version
+          cargo --version
+      - name: Check new source formatting
+        id: format
+        continue-on-error: true
+        run: rustfmt --edition 2024 --check src/search/query/session_scope.rs
+      - name: Full CASS scoped-search regressions under the repository lockfile
+        id: full
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/cass-session-scope-target"
+          cargo test --locked --lib search::query::session_scope::tests -- --nocapture 2>&1 | tee "$RUNNER_TEMP/session-scope-tests.log"
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+          text = (Path(os.environ['RUNNER_TEMP']) / 'session-scope-tests.log').read_text()
+          counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
+          if not counts or max(map(int, counts)) < 11:
+              raise SystemExit('No passing receipt for all eleven scoped-search regressions')
+          print('Full CASS test receipt:', counts)
+          PY
+      - name: Independently exercise unchanged scope SQL with published FrankenSQLite
+        id: sql
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import re
+          import textwrap
+          import tomllib
+
+          root = Path.cwd()
+          query = (root / 'src/search/query.rs').read_text()
+          scope = (root / 'src/search/query/session_scope.rs').read_text()
+          def function(text, name, indent=''):
+              pattern = '^' + re.escape(indent) + r'(?:pub(?:\(super\))? )?fn ' + re.escape(name) + r'\b'
+              matches = list(re.finditer(pattern, text, re.MULTILINE))
+              if len(matches) != 1:
+                  raise SystemExit('Missing or ambiguous source definition: ' + name)
+              start = matches[0].start()
+              end = re.search('^' + re.escape(indent) + r'}$', text[matches[0].end():], re.MULTILINE)
+              if end is None:
+                  raise SystemExit('Missing source definition terminator: ' + name)
+              return text[start:matches[0].end() + end.end()] + '\n'
+
+          # Compile the EXACT production lookup and connection/transaction
+          # definitions, not a rewritten SQL model or a rusqlite substitute.
+          # Vector selection and the complete CASS binary remain separate above.
+          definitions = query[query.index('trait SearchSqliteConnectionExt {'):query.index('type TantivyContentExactKey')]
+          constants = scope[scope.index('const SEMANTIC_SESSION_SCOPE_MAX_PATHS:'):scope.index('/// Intersect authoritative session membership')]
+          production = function(scope, 'load_semantic_session_message_ids')
+          names = [
+              'session_path_lookup_is_literal_case_sensitive_and_retains_distinct_conversations',
+              'path_batches_preserve_every_selected_message',
+              'an_exceeded_message_limit_fails_without_a_partial_allowlist_or_open_transaction',
+              'an_exceeded_path_limit_fails_before_querying_the_archive',
+              'invalid_archive_id_rejects_scope_and_rolls_back_the_snapshot',
+              'zero_message_budget_accepts_empty_sessions_but_not_a_partial_scope',
+              'message_budget_is_shared_across_distinct_conversations',
+              'query_failure_is_not_an_empty_scope_and_releases_the_transaction',
+          ]
+          helpers = ''.join(function(scope, name, '    ') for name in ['archive', 'insert_conversation', 'insert_message'])
+          tests = ''.join('    #[test]\n' + function(scope, name, '    ') for name in names)
+          source = '''#![allow(dead_code)]
+          use anyhow::{Result, bail};
+          use std::collections::HashSet;
+          use frankensqlite::AsyncConnection as SearchSqliteConnection;
+          use frankensqlite::compat::{ParamValue, RowExt, param_slice_to_values};
+          mod franken_sync {
+              pub use frankensqlite::{FrankenError, Row, SqliteValue};
+          }
+          mod extracted {
+          use super::*;
+          ''' + definitions + constants + function(query, 'semantic_message_id_from_db') + function(query, 'sql_placeholders') + production + '\n#[cfg(test)]\nmod tests {\nuse super::*;\n' + helpers + tests + '\n}\n}\n'
+          manifest = '''[package]
+          name = "cass-scope-sql-check"
+          version = "0.0.0"
+          edition = "2024"
+          [dependencies]
+          anyhow = "=1.0.102"
+          tracing = "=0.1.44"
+          frankensqlite = { package = "fsqlite", version = "=0.4.4", features = ["fts5", "async-api"] }
+          [profile.test]
+          debug = 0
+          [profile.test.package."*"]
+          opt-level = 1
+          '''
+          destination = Path(os.environ['RUNNER_TEMP']) / 'cass-scope-sql-check'
+          destination.mkdir(exist_ok=False)
+          (destination / 'src').mkdir()
+          (destination / 'src/lib.rs').write_text(source)
+          (destination / 'Cargo.toml').write_text(textwrap.dedent(manifest))
+          channel = tomllib.loads((root / 'rust-toolchain.toml').read_text())['toolchain']['channel']
+          (destination / 'rust-toolchain.toml').write_text(f'[toolchain]\nchannel = "{channel}"\n')
+          for name, text in [('production_lookup', production), ('connection_definitions', definitions), ('extracted_harness', source)]:
+              print(name, hashlib.sha256(text.encode()).hexdigest())
+          print('SQL-only tests:', names)
+          print('This is a narrow FrankenSQLite runtime check, not full CASS/vector/ANN validation.')
+          PY
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/cass-scope-sql-target"
+          cd "$RUNNER_TEMP/cass-scope-sql-check"
+          # The temporary harness has its own recorded resolution; the CASS
+          # Cargo.toml/Cargo.lock and unpublished search pin remain unchanged.
+          cargo generate-lockfile
+          sha256sum Cargo.lock
+          cargo test --locked -- --nocapture 2>&1 | tee "$RUNNER_TEMP/session-scope-sql-tests.log"
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+          text = (Path(os.environ['RUNNER_TEMP']) / 'session-scope-sql-tests.log').read_text()
+          counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
+          if not counts or max(map(int, counts)) < 8:
+              raise SystemExit('No passing receipt for all eight isolated SQL tests')
+          print('Isolated SQL test receipt:', counts)
+          PY
+      - name: Report independent outcomes without masking the full-build blocker
+        if: always()
+        shell: bash
+        env:
+          FORMAT_OUTCOME: ${{ steps.format.outcome }}
+          FULL_OUTCOME: ${{ steps.full.outcome }}
+          SQL_OUTCOME: ${{ steps.sql.outcome }}
+        run: |
+          printf 'format=%s full_cass=%s isolated_sql=%s\n' "$FORMAT_OUTCOME" "$FULL_OUTCOME" "$SQL_OUTCOME"
+          printf 'The full RCH/UBS/archive-scale gate is separate and was not run here.\n'
+          test "$FORMAT_OUTCOME" = success && test "$FULL_OUTCOME" = success && test "$SQL_OUTCOME" = success
