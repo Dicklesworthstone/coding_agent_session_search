@@ -19,14 +19,19 @@ use std::time::{Duration, Instant, SystemTime};
 /// snapshot is explicitly partial because unexported database changes may exist.
 #[must_use]
 pub fn collect_live_swarm_sources(repo: &Path) -> SwarmSourceCollection {
+    let started = Instant::now();
     let snapshots = REQUIRED_SWARM_SOURCE_PROVIDERS
         .iter()
         .copied()
         .map(|name| {
-            if matches!(name, SwarmProviderName::Git | SwarmProviderName::Beads) {
+            if matches!(
+                name,
+                SwarmProviderName::Git | SwarmProviderName::Beads | SwarmProviderName::Process
+            ) {
                 LiveSwarmSourceAdapter {
                     repo: repo.to_path_buf(),
                     name,
+                    started,
                 }
                 .collect()
             } else {
@@ -45,6 +50,7 @@ pub fn collect_live_swarm_sources(repo: &Path) -> SwarmSourceCollection {
 struct LiveSwarmSourceAdapter {
     repo: PathBuf,
     name: SwarmProviderName,
+    started: Instant,
 }
 
 impl SwarmSourceAdapter for LiveSwarmSourceAdapter {
@@ -56,8 +62,9 @@ impl SwarmSourceAdapter for LiveSwarmSourceAdapter {
         let started = Instant::now();
         let source = format!("live:{}", self.name);
         let result = match self.name {
-            SwarmProviderName::Git => collect_live_git(&self.repo, started),
-            SwarmProviderName::Beads => collect_exported_beads(&self.repo, started),
+            SwarmProviderName::Git => collect_live_git(&self.repo, self.started),
+            SwarmProviderName::Beads => collect_exported_beads(&self.repo, self.started),
+            SwarmProviderName::Process => collect_live_rch(&self.repo, self.started),
             _ => Err("unsupported live provider".to_string()),
         };
         let mut snapshot = match result {
@@ -65,6 +72,12 @@ impl SwarmSourceAdapter for LiveSwarmSourceAdapter {
                 self.name,
                 source,
                 "Read-only exported JSONL snapshot; unexported Beads database changes are not observed. Recheck br before claiming work.",
+                payload,
+            ),
+            Ok(payload) if self.name == SwarmProviderName::Process => SwarmSourceSnapshot::partial(
+                self.name,
+                source,
+                "RCH status only; local processes and build admission are not observed.",
                 payload,
             ),
             Ok(payload) => SwarmSourceSnapshot::ok(self.name, source, payload),
@@ -99,6 +112,7 @@ fn live_command(
     let mut command = match program {
         "git" => Command::new("git"),
         "br" => Command::new("br"),
+        "rch" => Command::new("rch"),
         #[cfg(test)]
         "sh" => Command::new("sh"),
         _ => return Err("unsupported live provider executable".to_string()),
@@ -135,6 +149,60 @@ fn live_command(
         return Err(format!("{program} exited with {}", output.status));
     }
     Ok(output.stdout)
+}
+
+fn collect_live_rch(repo: &Path, started: Instant) -> Result<Value, String> {
+    let bytes = live_command(repo, "rch", &["status", "--json"], started)?;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|_| "system clock precedes epoch")?
+        .as_secs();
+    parse_live_rch(&bytes, now)
+}
+
+fn parse_live_rch(bytes: &[u8], now_secs: u64) -> Result<Value, String> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| "invalid RCH JSON")?;
+    if value["api_version"] != "1.0"
+        || value["command"] != "status"
+        || value["success"] != true
+        || value["data"]["schema_version"] != "1.0.0"
+    {
+        return Err("unsupported or unsuccessful RCH status envelope".into());
+    }
+    let timestamp = value["timestamp"].as_u64().ok_or("missing RCH timestamp")?;
+    if now_secs.saturating_sub(timestamp) > 60 || timestamp.saturating_sub(now_secs) > 5 {
+        return Err("stale or future RCH status timestamp".into());
+    }
+    let data = &value["data"];
+    let daemon = &data["daemon"];
+    let active = daemon["active_builds"]
+        .as_array()
+        .ok_or("missing RCH active builds")?
+        .len();
+    let queued = daemon["queued_builds"]
+        .as_array()
+        .ok_or("missing RCH queued builds")?
+        .len();
+    let total = daemon["daemon"]["slots_total"]
+        .as_u64()
+        .ok_or("missing RCH total slots")?;
+    let available = daemon["daemon"]["slots_available"]
+        .as_u64()
+        .ok_or("missing RCH available slots")?;
+    if available > total {
+        return Err("inconsistent RCH slot counts".into());
+    }
+    let posture = data["posture"].as_str().ok_or("missing RCH posture")?;
+    if !matches!(posture, "remote_ready" | "degraded" | "local_only") {
+        return Err("unknown RCH posture".into());
+    }
+    // Project an allowlist: worker addresses, commands and job details stay private.
+    Ok(serde_json::json!({
+        "source_kind": "rch-status", "schema_version": "1.0.0",
+        "observed_at_ms": timestamp.checked_mul(1000).ok_or("RCH timestamp overflow")?,
+        "active_rch_jobs": active, "queued_rch_jobs": queued,
+        "slots_total": total, "slots_available": available, "fleet_posture": posture,
+    }))
 }
 
 fn collect_live_git(repo: &Path, started: Instant) -> Result<Value, String> {
@@ -877,6 +945,94 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
     }
 
+    fn rch_status_example() -> Value {
+        json!({"api_version":"1.0", "command":"status", "success":true,
+            "timestamp":1000, "data":{"schema_version":"1.0.0", "posture":"remote_ready",
+                "daemon":{"daemon":{"slots_total":8,"slots_available":6,"socket_path":"private-socket"},
+                    "active_builds":[{"command":"private-command"}], "queued_builds":[],
+                    "workers":[{"host":"private-host"}]}}})
+    }
+
+    #[test]
+    fn rch_status_projects_only_aggregate_observations() {
+        let input = rch_status_example();
+        let value = parse_live_rch(&serde_json::to_vec(&input).unwrap(), 1060).unwrap();
+        assert_eq!(value["active_rch_jobs"], 1);
+        assert_eq!(value["queued_rch_jobs"], 0);
+        assert_eq!(value["slots_available"], 6);
+        assert_eq!(value["observed_at_ms"], 1_000_000);
+        assert!(!value.to_string().contains("private-"));
+        assert!(value.get("active_cargo_jobs").is_none());
+        assert!(value.get("recommended_action").is_none());
+    }
+
+    #[test]
+    fn rch_status_rejects_stale_failed_and_incomplete_responses() {
+        let input = rch_status_example();
+        let bytes = serde_json::to_vec(&input).unwrap();
+        assert!(parse_live_rch(&bytes, 1061).is_err());
+        assert!(parse_live_rch(&bytes, 994).is_err());
+        assert!(parse_live_rch(&bytes, 995).is_ok());
+        assert!(parse_live_rch(b"not JSON", 1000).is_err());
+        for (pointer, replacement) in [
+            ("/api_version", json!("2.0")),
+            ("/command", json!("status-fleet")),
+            ("/success", json!(false)),
+            ("/timestamp", Value::Null),
+            ("/data/schema_version", json!("2.0.0")),
+            ("/data/posture", json!("unknown")),
+            ("/data/daemon/active_builds", Value::Null),
+            ("/data/daemon/queued_builds", json!({})),
+            ("/data/daemon/daemon/slots_total", json!(-1)),
+            ("/data/daemon/daemon/slots_available", json!(9)),
+        ] {
+            let mut bad = input.clone();
+            *bad.pointer_mut(pointer).unwrap() = replacement;
+            assert!(
+                parse_live_rch(&serde_json::to_vec(&bad).unwrap(), 1000).is_err(),
+                "{pointer}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_adapter_does_not_reset_the_request_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Instant::now().checked_sub(Duration::from_secs(16)).unwrap();
+        for name in [SwarmProviderName::Git, SwarmProviderName::Process] {
+            let snapshot = LiveSwarmSourceAdapter {
+                repo: dir.path().into(),
+                name,
+                started,
+            }
+            .collect();
+            assert_eq!(snapshot.status, SwarmProviderStatus::Unavailable);
+            assert!(snapshot.payload.is_null());
+        }
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[ignore = "requires a live RCH daemon; run explicitly through RCH"]
+    fn live_rch_status_is_partial_and_never_build_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = LiveSwarmSourceAdapter {
+            repo: dir.path().into(),
+            name: SwarmProviderName::Process,
+            started: Instant::now(),
+        }
+        .collect();
+        assert_eq!(
+            snapshot.status,
+            SwarmProviderStatus::Partial,
+            "{snapshot:?}"
+        );
+        assert!(snapshot.payload["active_rch_jobs"].is_u64());
+        assert!(snapshot.payload.get("active_cargo_jobs").is_none());
+        assert!(snapshot.payload.get("recommended_action").is_none());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
     #[test]
     fn live_git_porcelain_preserves_rename_paths_and_unknown_upstream() {
         let bytes = b"# branch.oid 0123456789012345678901234567890123456789\0# branch.head main\02 R. N... 100644 100644 100644 abc def R100 new name\0old\nname\0? untracked\0";
@@ -1190,6 +1346,7 @@ mod tests {
         let snapshot = LiveSwarmSourceAdapter {
             repo: dir.path().to_path_buf(),
             name: SwarmProviderName::Beads,
+            started: Instant::now(),
         }
         .collect();
         assert_eq!(
