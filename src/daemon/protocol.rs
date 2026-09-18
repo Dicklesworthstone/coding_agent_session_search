@@ -9,6 +9,7 @@
 //! Protocol uses MessagePack for efficient binary serialization over Unix Domain Sockets.
 
 use serde::{Deserialize, Serialize};
+use std::io::{self, Cursor, Write};
 use std::path::PathBuf;
 
 use frankensearch::{
@@ -19,6 +20,11 @@ use frankensearch::{
 /// Protocol version for compatibility checks.
 /// Clients and the CASS daemon must use the same version.
 pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Maximum encoded payload size, excluding the four-byte length prefix.
+/// Enforced on both directions and by direct codec callers, not just sockets.
+pub const MAX_FRAME_BYTES: usize = 10 * 1024 * 1024;
+const MAX_FRAME_DEPTH: usize = 64;
 
 /// Default CASS-owned socket path.
 pub fn default_socket_path() -> PathBuf {
@@ -43,6 +49,7 @@ fn sanitize_socket_user(user: &str) -> String {
 
 /// Request types for the daemon protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Request {
     /// Health check - returns daemon status.
     Health,
@@ -115,6 +122,7 @@ pub enum Request {
 
 /// Response types from the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Response {
     /// Health check response.
     Health(HealthStatus),
@@ -156,6 +164,7 @@ pub enum Response {
 
 /// Health status of the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HealthStatus {
     /// Daemon uptime in seconds.
     pub uptime_secs: u64,
@@ -169,6 +178,7 @@ pub struct HealthStatus {
 
 /// Response containing embeddings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EmbedResponse {
     /// Embeddings as Vec<Vec<f32>>.
     pub embeddings: Vec<Vec<f32>>,
@@ -180,6 +190,7 @@ pub struct EmbedResponse {
 
 /// Response containing rerank scores.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RerankResponse {
     /// Scores for each document (same order as input).
     pub scores: Vec<f32>,
@@ -191,6 +202,7 @@ pub struct RerankResponse {
 
 /// Daemon status response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StatusResponse {
     /// Daemon uptime in seconds.
     pub uptime_secs: u64,
@@ -208,6 +220,7 @@ pub struct StatusResponse {
 
 /// Information about a loaded model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelInfo {
     /// Model ID.
     pub id: String,
@@ -223,6 +236,7 @@ pub struct ModelInfo {
 
 /// Error response from daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ErrorResponse {
     /// Error code for programmatic handling.
     pub code: ErrorCode,
@@ -255,12 +269,14 @@ pub enum ErrorCode {
 
 /// Status information for embedding jobs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EmbeddingJobInfo {
     pub jobs: Vec<EmbeddingJobDetail>,
 }
 
 /// Detail for a single embedding job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EmbeddingJobDetail {
     pub job_id: i64,
     pub model_id: String,
@@ -272,6 +288,7 @@ pub struct EmbeddingJobDetail {
 
 /// Framed message wrapper for length-prefixed protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FramedMessage<T> {
     /// Protocol version.
     pub version: u32,
@@ -291,22 +308,72 @@ impl<T> FramedMessage<T> {
     }
 }
 
-/// Encode a message to MessagePack bytes with length prefix.
+/// Encode a message without ever materializing an oversized wire payload.
+/// The caller still owns the input objects and its wall-clock budget.
 pub fn encode_message<T: Serialize>(msg: &FramedMessage<T>) -> Result<Vec<u8>, EncodeError> {
-    let payload = rmp_serde::to_vec(msg)?;
-    let len = u32::try_from(payload.len())
-        .map_err(|_| EncodeError::Message("payload exceeds maximum size of 4GB".to_string()))?;
-    let mut buf = Vec::with_capacity(4 + payload.len());
-    buf.extend_from_slice(&len.to_be_bytes());
-    buf.extend_from_slice(&payload);
-    Ok(buf)
+    struct FrameWriter(Vec<u8>);
+    impl Write for FrameWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let total = self
+                .0
+                .len()
+                .checked_add(bytes.len())
+                .filter(|total| *total <= MAX_FRAME_BYTES + 4)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "daemon frame exceeds 10 MiB")
+                })?;
+            if total > self.0.capacity() {
+                let capacity = self
+                    .0
+                    .capacity()
+                    .saturating_mul(2)
+                    .max(total)
+                    .min(MAX_FRAME_BYTES + 4);
+                self.0
+                    .try_reserve_exact(capacity - self.0.len())
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::OutOfMemory, "cannot allocate daemon frame")
+                    })?;
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = FrameWriter(vec![0; 4]);
+    msg.serialize(&mut rmp_serde::Serializer::new(&mut writer))?;
+    let length = u32::try_from(writer.0.len() - 4)
+        .map_err(|_| EncodeError::Message("daemon frame size overflow".into()))?;
+    writer.0[..4].copy_from_slice(&length.to_be_bytes());
+    Ok(writer.0)
 }
 
-/// Decode a message from MessagePack bytes (without length prefix).
+/// Admit exactly one complete message, not a valid prefix followed by ignored
+/// bytes. Unknown fields in CASS envelopes/payloads are rejected by their typed
+/// definitions. Byte/depth bounds are not a whole-process memory or time cap.
+/// Version and request correlation remain explicit dispatcher/client checks.
 pub fn decode_message<T: for<'de> Deserialize<'de>>(
     data: &[u8],
 ) -> Result<FramedMessage<T>, DecodeError> {
-    rmp_serde::from_slice(data).map_err(DecodeError::from)
+    if data.is_empty() || data.len() > MAX_FRAME_BYTES {
+        return Err(DecodeError::Message(
+            "empty or oversized daemon frame".into(),
+        ));
+    }
+    let mut decoder = rmp_serde::Deserializer::new(Cursor::new(data));
+    decoder.set_max_depth(MAX_FRAME_DEPTH);
+    let decoded = FramedMessage::<T>::deserialize(&mut decoder)
+        // Serde errors can contain unknown field names or rejected values from
+        // the peer. Never put those bytes into daemon logs or error responses.
+        .map_err(|_| DecodeError::Message("invalid daemon message structure".into()))?;
+    if decoder.position() != data.len() as u64 {
+        return Err(DecodeError::Message("trailing data in daemon frame".into()));
+    }
+    Ok(decoded)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -657,5 +724,170 @@ mod tests {
             return Err(test_error("expected rerank response payload"));
         };
         ensure_eq(resp.scores, vec![0.95, 0.72, 0.31], "rerank scores")
+    }
+
+    #[test]
+    fn frame_rejects_both_junk_and_a_second_message_after_a_valid_request() -> TestResult {
+        let encoded = encode_message(&FramedMessage::new("first", Request::Health))?;
+        let second = encode_message(&FramedMessage::new("second", Request::Shutdown))?;
+        for trailer in [&[0xc0][..], &second[4..], &[0xff, 0x00][..]] {
+            let mut payload = encoded[4..].to_vec();
+            payload.extend_from_slice(trailer);
+            let error = decode_message::<Request>(&payload).unwrap_err();
+            ensure_eq(
+                error.to_string(),
+                "decode error: trailing data in daemon frame".into(),
+                "trailing data",
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_truncated_prefix_of_a_complete_request_is_rejected() -> TestResult {
+        let encoded = encode_message(&FramedMessage::new(
+            "unicode",
+            Request::Embed {
+                texts: vec!["日本語 — café".into(), "line one\nline two".into()],
+                model: "default".into(),
+                dims: Some(384),
+            },
+        ))?;
+        let bytes = &encoded[4..];
+        for end in 0..bytes.len() {
+            ensure(
+                decode_message::<Request>(&bytes[..end]).is_err(),
+                format!("accepted truncation at {end}"),
+            )?;
+        }
+        ensure(
+            decode_message::<Request>(bytes).is_ok(),
+            "complete message rejected",
+        )
+    }
+
+    #[test]
+    fn named_and_compact_protocol_messages_have_identical_meaning() -> TestResult {
+        let original = FramedMessage::new(
+            "named",
+            Request::EmbeddingJobStatus {
+                db_path: "/tmp/会話.db".into(),
+            },
+        );
+        let named = rmp_serde::to_vec_named(&original)?;
+        let compact = encode_message(&original)?;
+        let left = decode_message::<Request>(&named)?;
+        let right = decode_message::<Request>(&compact[4..])?;
+        ensure_eq(
+            serde_json::to_value(left)?,
+            serde_json::to_value(right)?,
+            "wire representation",
+        )
+    }
+
+    #[test]
+    fn unknown_envelope_and_command_fields_are_rejected_without_echoing_them() -> TestResult {
+        const PRIVATE: &str = "private-unknown-field-value";
+        let original = FramedMessage::new(
+            "strict",
+            Request::Embed {
+                texts: vec!["hello".into()],
+                model: "default".into(),
+                dims: None,
+            },
+        );
+        for nested in [false, true] {
+            let mut value = serde_json::to_value(&original)?;
+            if nested {
+                value["payload"]["Embed"][PRIVATE] = serde_json::json!(PRIVATE);
+            } else {
+                value[PRIVATE] = serde_json::json!(PRIVATE);
+            }
+            let bytes = rmp_serde::to_vec_named(&value)?;
+            let error = decode_message::<Request>(&bytes).unwrap_err();
+            ensure(
+                !error.to_string().contains(PRIVATE),
+                "peer bytes leaked into diagnostic",
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_response_fields_are_not_silently_accepted() -> TestResult {
+        let mut value = serde_json::to_value(FramedMessage::new(
+            "reply",
+            Response::Health(HealthStatus {
+                uptime_secs: 0,
+                version: PROTOCOL_VERSION,
+                ready: true,
+                memory_bytes: 0,
+            }),
+        ))?;
+        value["payload"]["Health"]["unverified_authority"] = serde_json::json!(true);
+        ensure(
+            decode_message::<Response>(&rmp_serde::to_vec_named(&value)?).is_err(),
+            "unknown response field accepted",
+        )
+    }
+
+    #[test]
+    fn codec_enforces_payload_extent_and_nesting_before_releasing_a_message() -> TestResult {
+        ensure(
+            decode_message::<Request>(&vec![0; super::MAX_FRAME_BYTES + 1]).is_err(),
+            "oversized direct decode",
+        )?;
+        // A valid generic envelope whose payload is a deeply nested array.
+        let mut nested = vec![0x93, PROTOCOL_VERSION as u8, 0xa1, b'r'];
+        nested.extend(std::iter::repeat_n(0x91, super::MAX_FRAME_DEPTH + 8));
+        nested.push(0xc0);
+        ensure(
+            decode_message::<serde_json::Value>(&nested).is_err(),
+            "depth cap ignored",
+        )
+    }
+
+    #[test]
+    fn maximum_sized_frame_round_trips_and_the_next_byte_is_rejected() -> TestResult {
+        // Compact [version, "r", str32]: 1 + 1 + 2 + 5 bytes of overhead.
+        let content = "x".repeat(super::MAX_FRAME_BYTES - 9);
+        let encoded = encode_message(&FramedMessage::new("r", &content))?;
+        ensure_eq(
+            encoded.len(),
+            super::MAX_FRAME_BYTES + 4,
+            "maximum encoded size",
+        )?;
+        let decoded = decode_message::<String>(&encoded[4..])?;
+        ensure_eq(decoded.payload, content.clone(), "maximum payload")?;
+        ensure(
+            encode_message(&FramedMessage::new("r", content + "x")).is_err(),
+            "oversized encode accepted",
+        )
+    }
+
+    #[test]
+    fn oversized_streaming_serialization_stops_before_materializing_every_item() -> TestResult {
+        use serde::ser::SerializeSeq;
+        struct Streaming(std::cell::Cell<usize>);
+        impl serde::Serialize for Streaming {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut sequence = serializer.serialize_seq(Some(20_000))?;
+                let block = "x".repeat(1024);
+                for _ in 0..20_000 {
+                    self.0.set(self.0.get() + 1);
+                    sequence.serialize_element(&block)?;
+                }
+                sequence.end()
+            }
+        }
+        let streaming = Streaming(std::cell::Cell::new(0));
+        ensure(
+            encode_message(&FramedMessage::new("stream", &streaming)).is_err(),
+            "oversized serialization accepted",
+        )?;
+        ensure(
+            streaming.0.get() > 0 && streaming.0.get() < 20_000,
+            "serializer did not stop at the frame budget",
+        )
     }
 }
