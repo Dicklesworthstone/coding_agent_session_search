@@ -1,5 +1,5 @@
-# Guarded source-only landing; no PR, force-push, dependency change, or graph rebuild.
-name: Land exact recovery for sparse ANN
+# Source-only RED/GREEN landing. Retired through the connector after completion.
+name: Prove and fix deduplicated exact windows
 on:
   push:
     branches: [main]
@@ -36,80 +36,81 @@ jobs:
           ref: 6852e79a830c402ea4e55eb79eda3373c618dfc3
           path: fs-source
           persist-credentials: false
-      - name: Apply only the reviewed patch to matching source blobs
+      - name: Guard source identities and install the two regression tests only
         run: |
           set -euo pipefail
           test "$(git branch --show-current)" = main
           test -z "$(git status --porcelain)"
-          mkdir -p "$RUNNER_TEMP/ann-recovery-evidence"
-          git rev-parse HEAD | tee "$RUNNER_TEMP/ann-recovery-evidence/parent.txt"
+          mkdir -p "$RUNNER_TEMP/window-evidence"
+          git rev-parse HEAD | tee "$RUNNER_TEMP/window-evidence/parent.txt"
           python3 - <<'PY'
           from pathlib import Path
           import subprocess
           expected = {
-              'src/search/query.rs': 'c42377d654a7b7ad9a3b0134e53f543424f59314',
-              'src/search/query/ann_shards.rs': 'b8f1bb9c81d6174cf38bfd61f8fd6c7600070ff5',
-              'src/search/ann_index.rs': '9565940c76e0e3d62735357b401c5cc9ab024fa7',
-              'scripts/verify_ann_shards.py': '05ebba3de0c8f3147fd4b8c960c09acf23f8a959',
-              'scripts/patches/ann-underfill.patch': 'b02a2571618af3ef9ad4b2ab35941ca27349ad9f',
+              'src/search/query.rs': 'c290d50ab85a8a57fdf16b8c872e5920a1d29bf4',
+              'src/search/query/message_topk_integration.rs': '6fd2e5ca66b0cf87116b2c9154013486accfd7b5',
+              'scripts/patches/initial-window-proof.patch': '99d34bb14b85df074b89a93ec388b3433e68cf81',
           }
-          for path, expected_hash in expected.items():
+          for path, sha in expected.items():
               actual = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
-              if Path(path).is_symlink() or actual != expected_hash:
+              if Path(path).is_symlink() or actual != sha:
                   raise SystemExit('Changed source requires review: ' + path)
           PY
-          git apply --check --whitespace=error-all scripts/patches/ann-underfill.patch
-          git apply --whitespace=error-all scripts/patches/ann-underfill.patch
-          rustfmt --edition 2024 src/search/ann_index.rs src/search/query/ann_shards.rs
+          git apply --check --whitespace=error-all scripts/patches/initial-window-proof.patch
+          git apply --include=src/search/query/message_topk_integration.rs --whitespace=error-all scripts/patches/initial-window-proof.patch
+          rustfmt --edition 2024 src/search/query/message_topk_integration.rs
+          test "$(git hash-object src/search/query.rs)" = c290d50ab85a8a57fdf16b8c872e5920a1d29bf4
+      - name: RED - require both regressions to fail at the original completeness assertions
+        run: |
+          set -euo pipefail
+          rustc --version | tee "$RUNNER_TEMP/window-evidence/toolchain.txt"
+          python3 scripts/verify_ann_shards.py "$PWD" "$GITHUB_WORKSPACE/fs-source" "$RUNNER_TEMP/window-red" | tee "$RUNNER_TEMP/window-evidence/red-source-receipt.txt"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/window-target"
+          cd "$RUNNER_TEMP/window-red"
+          cargo generate-lockfile
+          cp Cargo.lock "$RUNNER_TEMP/window-evidence/component-Cargo.lock"
+          set +e
+          cargo test --locked short_deduplicated_ -- --nocapture --test-threads=2 > "$RUNNER_TEMP/window-evidence/red.log" 2>&1
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/window-evidence/red.log"
+          test "$status" = 101
+          grep -F 'test result: FAILED. 0 passed; 2 failed;' "$RUNNER_TEMP/window-evidence/red.log"
+          grep -F 'short deduplication is not exhaustion' "$RUNNER_TEMP/window-evidence/red.log"
+          grep -F 'a filled page is not a proof after raw deduplication' "$RUNNER_TEMP/window-evidence/red.log"
+      - name: GREEN - apply the production fix and run all 43 component tests
+        run: |
+          set -euo pipefail
+          git apply --check --include=src/search/query.rs --whitespace=error-all scripts/patches/initial-window-proof.patch
+          git apply --include=src/search/query.rs --whitespace=error-all scripts/patches/initial-window-proof.patch
+          rustfmt --edition 2024 --check src/search/ann_index.rs src/search/query/ann_shards.rs src/search/query/message_topk.rs src/search/query/message_topk_integration.rs
           rustfmt --edition 2024 --config skip_children=true --emit stdout src/search/query.rs > "$RUNNER_TEMP/query-parsed.rs"
           git diff --check
-      - name: Compile and execute all 41 production component regressions
+          python3 scripts/verify_ann_shards.py "$PWD" "$GITHUB_WORKSPACE/fs-source" "$RUNNER_TEMP/window-green" | tee "$RUNNER_TEMP/window-evidence/green-source-receipt.txt"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/window-target"
+          cd "$RUNNER_TEMP/window-green"
+          cp "$RUNNER_TEMP/window-evidence/component-Cargo.lock" Cargo.lock
+          cargo test --locked -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/window-evidence/green.log"
+          grep -Eq 'test result: ok\. 43 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/window-evidence/green.log"
+      - name: Commit the proved production fix directly to main
         run: |
           set -euo pipefail
-          rustc --version | tee "$RUNNER_TEMP/ann-recovery-evidence/toolchain.txt"
-          python3 scripts/verify_ann_shards.py "$PWD" "$GITHUB_WORKSPACE/fs-source" "$RUNNER_TEMP/ann-recovery-check" | tee "$RUNNER_TEMP/ann-recovery-evidence/source-receipt.txt"
-          export CARGO_TARGET_DIR="$RUNNER_TEMP/ann-recovery-target"
-          cd "$RUNNER_TEMP/ann-recovery-check"
-          cargo generate-lockfile
-          cp Cargo.lock "$RUNNER_TEMP/ann-recovery-evidence/component-Cargo.lock"
-          cargo test --locked -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/ann-recovery-evidence/tests.log"
-          grep -Eq 'test result: ok\. 41 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/ann-recovery-evidence/tests.log"
-      - name: Record component Clippy separately from full CASS qualification
-        id: lint
-        run: |
-          set -uo pipefail
-          export CARGO_TARGET_DIR="$RUNNER_TEMP/ann-recovery-target"
-          cd "$RUNNER_TEMP/ann-recovery-check"
-          set +e
-          cargo clippy --locked --lib --tests -- -D warnings > "$RUNNER_TEMP/ann-recovery-evidence/clippy.log" 2>&1
-          result=$?
-          set -e
-          cat "$RUNNER_TEMP/ann-recovery-evidence/clippy.log"
-          echo "status=$result" >> "$GITHUB_OUTPUT"
-          printf 'COMPONENT_CLIPPY_EXIT=%s\n' "$result"
-      - name: Commit the tested source-only changes directly to main
-        env:
-          COMPONENT_CLIPPY_EXIT: ${{ steps.lint.outputs.status }}
-        run: |
-          set -euo pipefail
-          git add -- src/search/query.rs src/search/query/ann_shards.rs src/search/ann_index.rs scripts/verify_ann_shards.py
+          git add -- src/search/query.rs src/search/query/message_topk_integration.rs
           python3 - <<'PY'
           import subprocess
-          changed = set(subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines())
-          expected = {'src/search/query.rs', 'src/search/query/ann_shards.rs', 'src/search/ann_index.rs', 'scripts/verify_ann_shards.py'}
-          if changed != expected:
-              raise SystemExit('Unexpected staged paths: ' + repr(changed))
+          actual = set(subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines())
+          assert actual == {'src/search/query.rs', 'src/search/query/message_topk_integration.rs'}, actual
           PY
           git diff --cached --check
-          git hash-object src/search/query.rs src/search/query/ann_shards.rs src/search/ann_index.rs scripts/verify_ann_shards.py | tee "$RUNNER_TEMP/ann-recovery-evidence/blobs.txt"
+          git hash-object src/search/query.rs src/search/query/message_topk_integration.rs | tee "$RUNNER_TEMP/window-evidence/blobs.txt"
           git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit \
-            -m 'fix(search): recover filtered and chunk-starved ANN pages through exact retrieval' \
-            -m 'When a valid native cohort underfills its message page with unsearched candidates remaining, execute the existing bounded exact driver over every retained shard with the same filter. Replace rather than mix native/exact scores, preserve native work counters, and emit a typed exact-fallback receipt. Preserve full native pages, exhausted scopes, zero requests, invalid-owner rejection, and read-only artifact ownership.' \
-            -m "Executed 41 production-component tests against real pinned FSVI/HNSW, including six new recovery regressions and complete production receipt serialization. Component Clippy exit=$COMPONENT_CLIPPY_EXIT. This separate dependency graph does not qualify the full CASS binary; its locked build remains independently blocked by frankensearch =0.6.1 publication. No model/CLI/RCH or archive-scale pass is claimed."
+            -m 'fix(search): preserve exact completeness bounds after raw candidate deduplication' \
+            -m 'Short nonempty FSVI results are not evidence of exhaustion: document-ID dedup runs after raw top-k. Keep the omitted-score bound in both single-shard and multi-shard initial windows so bounded exact refinement can recover hidden messages and correct a filled-but-wrong ranked page. Preserve source ownership, filters, request budgets, and the proven strict-score fast path.' \
+            -m 'RED: both new real-FSVI regressions failed against the unchanged parent at the intended completeness assertions. GREEN: all 43 production-component tests passed with the same pinned engine and dependency lock. This is not full CASS CLI/model/daemon or archive-scale qualification; the separate locked build remains blocked by frankensearch =0.6.1 publication. No dependency pins or user archive were modified.'
           for attempt in 1 2 3; do
             if GIT_TERMINAL_PROMPT=0 git push origin HEAD:refs/heads/main; then
-              git rev-parse HEAD | tee "$RUNNER_TEMP/ann-recovery-evidence/commit.txt"
-              tar -czf "$RUNNER_TEMP/ann-recovery-evidence/tested-source.tar.gz" src/search/query.rs src/search/query/ann_shards.rs src/search/ann_index.rs scripts/verify_ann_shards.py
+              git rev-parse HEAD | tee "$RUNNER_TEMP/window-evidence/commit.txt"
+              tar -czf "$RUNNER_TEMP/window-evidence/tested-source.tar.gz" src/search/query.rs src/search/query/message_topk_integration.rs
               exit 0
             fi
             parent=$(git rev-parse HEAD^)
@@ -121,7 +122,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: ann-recovery-evidence-${{ github.sha }}
-          path: ${{ runner.temp }}/ann-recovery-evidence/
+          name: initial-window-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/window-evidence/
           if-no-files-found: error
           retention-days: 14
