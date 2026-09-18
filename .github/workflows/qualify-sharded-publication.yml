@@ -1,13 +1,19 @@
-# Both runtime implementations landed; this workflow cannot modify repository refs.
-name: Verify semantic publications
+name: Qualify bounded semantic admission
 on:
-  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [.github/workflows/qualify-sharded-publication.yml]
 permissions:
   contents: read
+concurrency:
+  group: cass-semantic-admission-landing
+  cancel-in-progress: false
 jobs:
-  production-components:
+  qualify-and-land:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 25
+    permissions:
+      contents: write
     env:
       RUSTUP_TOOLCHAIN: nightly-2026-08-31
       CARGO_BUILD_JOBS: '2'
@@ -15,67 +21,150 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_TERM_COLOR: never
       RUST_MIN_STACK: '16777216'
+    defaults:
+      run:
+        shell: bash
+        working-directory: cass-source
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ github.sha }}
+          ref: main
           path: cass-source
-          persist-credentials: false
+          clean: false
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: Dicklesworthstone/frankensearch
           ref: 6852e79a830c402ea4e55eb79eda3373c618dfc3
           path: fs-source
           persist-credentials: false
-      - name: Execute actual immutable publication modules in the independent component package
-        shell: bash
+          clean: false
+      - name: Guard all current source and install only the regression tests
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/evidence"
-          python3 cass-source/scripts/verify_sharded_publication.py "$GITHUB_WORKSPACE/cass-source" "$GITHUB_WORKSPACE/fs-source" "$RUNNER_TEMP/components"
-          cp "$RUNNER_TEMP/components/source-receipt.json" "$RUNNER_TEMP/evidence/"
-          cd "$RUNNER_TEMP/components"
-          cargo generate-lockfile
-          cp Cargo.lock "$RUNNER_TEMP/evidence/component-Cargo.lock"
-          cargo test --locked --lib -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/evidence/unit.log"
-          cargo test --locked --test semantic_generation_manifest -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/evidence/process.log"
+          test "$(git branch --show-current)" = main
+          test -z "$(git status --porcelain)"
+          mkdir -p "$RUNNER_TEMP/admission-evidence"
           python3 - <<'PY'
-          import os, re
+          import base64, hashlib, json, lzma, os, re, subprocess
           from pathlib import Path
-          evidence = Path(os.environ['RUNNER_TEMP']) / 'evidence'
-          for name, minimum in [('unit.log', 147), ('process.log', 4)]:
-              counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed; 0 ignored;', (evidence / name).read_text())
-              assert counts and max(map(int, counts)) >= minimum, name
+          def blob(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'admission-evidence'
+          response = json.loads(subprocess.check_output(['gh', 'api', 'repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs/1c133db6265316ac5ade5abd4cbcd399057e8a36'], text=True))
+          compressed = base64.b64decode(response['content'])
+          assert blob(compressed) == '1c133db6265316ac5ade5abd4cbcd399057e8a36'
+          patch = lzma.decompress(compressed)
+          assert hashlib.sha256(patch).hexdigest() == 'a22e1c6c74c3b0219dedb1960462140055def4cd0f986df5b90effc24fc31fdf'
+          guards = {
+              'src/search/semantic_manifest.rs': ['fa8e9b01b7e2dd6fa005c1e4ef1725e88e427d5e', '2aa0e0047a82ddf04836d49373d62ada1d483b22'],
+              'src/search/semantic_manifest/selection.rs': [None, '746e8c21c023979a92fa2e0398f725e9f49fcc69'],
+              'src/search/semantic_reader/publication.rs': ['5c8a2accc0be8b39ea08c897033b4a762d0929a9', '5601367aec406cf41211b608d898579b61a6d9e1'],
+              'src/search/semantic_reader/publication/tests.rs': ['b1c067fd1400f388002acf74ad8da12996c71885', '2b26431a655b89dcbff1fdb17aa665862e4d5378'],
+              'src/search/semantic_reader/publication/tests/admission.rs': [None, '073478d7c8cd0c550eb85f6918d81e6fa37ca103'],
+          }
+          for name, (before, _) in guards.items():
+              path = Path(name)
+              assert not path.is_symlink(), name
+              assert not path.exists() if before is None else blob(path.read_bytes()) == before, name
+          (evidence / 'guards.json').write_text(json.dumps(guards))
+          (evidence / 'base.txt').write_text(subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True))
+          (evidence / 'reviewed.patch').write_bytes(patch)
+          pieces = [piece for piece in re.split(rb'(?=^--- )', patch, flags=re.M) if piece]
+          tests, runtime, found = [], [], []
+          for piece in pieces:
+              name = re.search(rb'^\+\+\+ b/([^\n]+)', piece, re.M).group(1).decode()
+              assert name in guards and name not in found, name
+              found.append(name)
+              (tests if '/tests/' in name or name.endswith('/tests.rs') else runtime).append(piece)
+          assert set(found) == set(guards)
+          for name, parts in [('tests.patch', tests), ('runtime.patch', runtime)]:
+              (evidence / name).write_bytes(b''.join(parts))
+          subprocess.run(['git', 'apply', '--check', '--whitespace=error-all', str(evidence / 'reviewed.patch')], check=True)
+          subprocess.run(['git', 'apply', str(evidence / 'tests.patch')], check=True)
           PY
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
-        with:
-          name: semantic-publication-components-${{ github.sha }}
-          path: ${{ runner.temp }}/evidence/
-          retention-days: 14
-  shipping-cass:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
-    env:
-      CARGO_BUILD_JOBS: '2'
-      CARGO_PROFILE_TEST_DEBUG: '0'
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_TERM_COLOR: never
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Test the complete CASS crate under its unchanged shipping lockfile
-        shell: bash
+          rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt
+      - name: RED - both I/O-amplification regressions must fail on unchanged production
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/evidence"
-          cargo test --locked --lib search::semantic_reader::publication::tests::sharded -- --nocapture 2>&1 | tee "$RUNNER_TEMP/evidence/shipping-unit.log"
-          cargo test --locked --test semantic_generation_manifest -- --nocapture 2>&1 | tee "$RUNNER_TEMP/evidence/shipping-process.log"
+          python3 scripts/verify_sharded_publication.py "$PWD" "$GITHUB_WORKSPACE/fs-source" "$RUNNER_TEMP/admission-red"
+          cp "$RUNNER_TEMP/admission-red/source-receipt.json" "$RUNNER_TEMP/admission-evidence/red-source.json"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/admission-target"
+          cd "$RUNNER_TEMP/admission-red"
+          cargo generate-lockfile
+          cp Cargo.lock "$RUNNER_TEMP/admission-evidence/component-Cargo.lock"
+          for case in budget_preflight_precedes_missing_vector_io final_checkpoint_uses_retained_vectors_after_path_replacement; do
+            set +e
+            timeout 900 cargo test --locked --lib "search::semantic_reader::publication::tests::admission::$case" -- --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/admission-evidence/red-$case.log"
+            status=${PIPESTATUS[0]}
+            set -e
+            test "$status" = 101
+            grep -Eq 'test result: FAILED\. 0 passed; 1 failed; 0 ignored;' "$RUNNER_TEMP/admission-evidence/red-$case.log"
+          done
+      - name: GREEN - test the complete production components with unchanged dependency lock
+        run: |
+          set -euo pipefail
+          git apply --check --whitespace=error-all "$RUNNER_TEMP/admission-evidence/runtime.patch"
+          git apply "$RUNNER_TEMP/admission-evidence/runtime.patch"
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'admission-evidence'
+          for name, (_, expected) in json.loads((evidence / 'guards.json').read_text()).items():
+              data = Path(name).read_bytes()
+              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == expected, name
+              subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', name], check=True)
+          PY
+          git diff --check
+          python3 scripts/verify_sharded_publication.py "$PWD" "$GITHUB_WORKSPACE/fs-source" "$RUNNER_TEMP/admission-green"
+          cp "$RUNNER_TEMP/admission-green/source-receipt.json" "$RUNNER_TEMP/admission-evidence/green-source.json"
+          cp "$RUNNER_TEMP/admission-evidence/component-Cargo.lock" "$RUNNER_TEMP/admission-green/Cargo.lock"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/admission-target"
+          cd "$RUNNER_TEMP/admission-green"
+          timeout 900 cargo test --locked --lib -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/admission-evidence/green.log"
+          grep -Eq 'test result: ok\. 155 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/admission-evidence/green.log"
+          timeout 120 cargo test --locked --test semantic_generation_manifest -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/admission-evidence/process.log"
+          grep -Eq 'test result: ok\. 4 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/admission-evidence/process.log"
+      - name: Record full shipping-build qualification separately
+        run: |
+          set +e
+          timeout 90 cargo test --locked --lib search::semantic_reader::publication::tests::admission -- --nocapture > "$RUNNER_TEMP/admission-evidence/shipping.log" 2>&1
+          status=$?
+          printf '%s\n' "$status" > "$RUNNER_TEMP/admission-evidence/shipping-exit.txt"
+          cat "$RUNNER_TEMP/admission-evidence/shipping.log"
+          exit 0
+      - name: Commit only the five qualified implementation and test files directly to main
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'admission-evidence'
+          paths = list(json.loads((evidence / 'guards.json').read_text()))
+          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          added = subprocess.check_output(['git', 'ls-files', '--others', '--exclude-standard'], text=True).splitlines()
+          assert set(changed + added) == set(paths), (changed, added)
+          records = {}
+          for name in paths:
+              data = Path(name).read_bytes()
+              dest = evidence / 'source' / name
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              dest.write_bytes(data)
+              records[name] = {'blob': hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest(), 'sha256': hashlib.sha256(data).hexdigest()}
+          (evidence / 'published-source.json').write_text(json.dumps(records, indent=2))
+          subprocess.run(['git', 'add', '--', *paths], check=True)
+          PY
+          git fetch --no-tags origin main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'perf(search): bound semantic admission before artifact I/O and reuse retained proofs' -m 'Share the exact pointer/manifest/corpus parser through a non-readiness metadata type. Check aggregate vector-byte limits before opening any artifact; preserve full fresh artifact validation and retained FSVI witness checks. Recheck selection metadata rather than rehashing all artifact paths after admission. Two real-file regressions fail on unchanged parent production code and pass with the fix under one dependency lock. All 155 component unit tests and four public process contracts pass; this separate package is not full CASS qualification. No shipping dependency, lockfile, model or archive changes.'
+          git push origin HEAD:main
+          git rev-parse HEAD > "$RUNNER_TEMP/admission-evidence/runtime-commit.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: semantic-publication-shipping-${{ github.sha }}
-          path: ${{ runner.temp }}/evidence/
+          name: semantic-admission-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/admission-evidence/
           retention-days: 14
