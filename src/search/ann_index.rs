@@ -8,6 +8,27 @@ use std::path::{Path, PathBuf};
 
 use crate::search::vector_index::VECTOR_INDEX_DIR;
 
+/// Why native candidates could not fill the requested message page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnnExactFallbackReason {
+    /// Metadata filtering removed candidates before the message page filled.
+    FilteredCandidateUnderfill,
+    /// Multiple chunks or duplicate messages occupied the native windows.
+    MessageCandidateUnderfill,
+}
+
+/// Work done by the complete exact cohort after native candidate underfill.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AnnExactFallbackStats {
+    pub reason: AnnExactFallbackReason,
+    pub shard_count: usize,
+    /// Includes exact refills, not the preceding native search time.
+    pub search_time_us: u64,
+    /// Distinct candidates before hydration, noise filtering, and pagination.
+    pub returned_messages: usize,
+}
+
 /// Statistics from an ANN search operation.
 ///
 /// These metrics help users understand the quality/speed tradeoff of approximate search.
@@ -23,15 +44,22 @@ pub struct AnnSearchStats {
     pub k_requested: usize,
     /// Number of results returned.
     pub k_returned: usize,
-    /// Search time in microseconds.
+    /// Native backend search time in microseconds, including its own repairs.
+    /// Additional CASS exact recovery is measured in `exact_fallback`.
     pub search_time_us: u64,
     /// Estimated recall based on ef/k ratio.
     ///
     /// Formula: min(1.0, 0.9 + 0.1 * log2(ef / k))
     /// This is an empirical estimate; actual recall depends on data distribution.
     pub estimated_recall: f32,
-    /// Whether this was an approximate (HNSW) or exact search.
+    /// Whether the returned candidate ranking remains approximate. False when
+    /// the complete retained exact cohort replaced the native candidates.
     pub is_approximate: bool,
+    /// Native counters above remain measurements of native work, not counts of
+    /// exact results. This receipt identifies the separate recovery operation;
+    /// `estimated_recall` remains the native heuristic, not an exact certificate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exact_fallback: Option<AnnExactFallbackStats>,
 }
 
 /// Default on-disk location for the HNSW index for a given embedder.

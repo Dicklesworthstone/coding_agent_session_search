@@ -5283,8 +5283,8 @@ impl SearchClient {
             let ann = request
                 .ann_index
                 .ok_or_else(|| anyhow!("HNSW cohort failed to initialize"))?;
-            return ann.search(
-                &context.artifacts,
+            return ann.search_with_exact_fallback(
+                context,
                 embedding,
                 request.fetch_limit,
                 semantic_filter_as_search_filter(&semantic_filter),

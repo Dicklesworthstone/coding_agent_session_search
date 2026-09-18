@@ -36,11 +36,14 @@ def main() -> None:
     helper = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(helper)
     query = (root / "src/search/query.rs").read_text()
-    reporting = (root / "src/search/ann_index.rs").read_text()
+    reporting = root / "src/search/ann_index.rs"
     source_path = dest / "src/lib.rs"
     source = source_path.read_text()
-    stats = "#[derive(Debug, Clone, Default)]\n" + helper.block(reporting, r"pub struct AnnSearchStats\b")
-    source = once(source, "mod search { pub mod vector_index {", "mod search { pub mod ann_index {\n" + stats + "}\npub mod vector_index {")
+    vector = (root / "src/search/vector_index.rs").read_text()
+    directory = next(line for line in vector.splitlines() if line.startswith("pub const VECTOR_INDEX_DIR:"))
+    # Include the complete production reporting module, including Serialize and
+    # its exact fallback receipt. Do not substitute harness-only reporting types.
+    source = once(source, "mod search { pub mod vector_index {", "mod search { #[path = " + json.dumps(str(reporting)) + "] pub mod ann_index;\npub mod vector_index {\n" + directory + "\n")
     source = once(source, "mod frankensearch { pub mod core {", "mod frankensearch { pub mod index { pub use frankensearch_index::*; } pub mod core {")
     source = once(source, "struct SemanticCandidateRetryState {", "#[derive(Debug, Default)]\nstruct SemanticCandidateRetryState {")
     source = once(source, "mod extracted {\nuse super::*;", "mod extracted {\nuse super::*;\nuse frankensearch_index::{HnswIndex as FsHnswIndex, HNSW_DEFAULT_EF_SEARCH as FS_HNSW_DEFAULT_EF_SEARCH};")
@@ -55,7 +58,8 @@ def main() -> None:
     manifest_path = dest / "Cargo.toml"
     manifest = manifest_path.read_text()
     old = next(line for line in manifest.splitlines() if line.startswith("frankensearch-index ="))
-    manifest_path.write_text(once(manifest, old, old.replace("default-features = false", 'default-features = false, features = ["ann"]')))
+    manifest = once(manifest, old, old.replace("default-features = false", 'default-features = false, features = ["ann"]'))
+    manifest_path.write_text(manifest + '\n[dependencies.serde]\nversion = "1"\nfeatures = ["derive"]\n')
     receipt = {"scope": "actual CASS all-shard admission and merge with native HNSW; not full CASS or model/CLI qualification",
                "source_sha256": {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
                                  for path in [module, root / "src/search/query.rs", root / "src/search/vector_index.rs", root / "src/search/ann_index.rs"]},
