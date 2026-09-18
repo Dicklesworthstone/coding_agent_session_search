@@ -1,0 +1,200 @@
+diff --git a/src/indexer/semantic.rs b/src/indexer/semantic.rs
+index e004640..093b88b 100644
+--- a/src/indexer/semantic.rs
++++ b/src/indexer/semantic.rs
+@@ -46,6 +46,9 @@ use crate::search::vector_index::{
+ };
+ use crate::storage::sqlite::FrankenStorage;
+ 
++#[cfg(test)]
++mod shard_publication_tests;
++
+ /// Default embedder batch size — the **maximum row count** per embed batch.
+ /// 128 is a sweet spot for short messages: big enough to amortize dispatch
+ /// overhead and keep the tensor kernels saturated. It is no longer the sole
+@@ -710,40 +713,41 @@ fn semantic_generation_fingerprint_component(db_fingerprint: &str) -> String {
+         .collect()
+ }
+ 
+-fn semantic_shard_generation_dir(
++fn create_semantic_shard_generation_dir(
+     data_dir: &Path,
+     tier: TierKind,
+     embedder_id: &str,
+     db_fingerprint: &str,
+-) -> PathBuf {
++) -> Result<PathBuf> {
+     let fingerprint_hash = semantic_generation_fingerprint_component(db_fingerprint);
+-    data_dir.join(VECTOR_INDEX_DIR).join("shards").join(format!(
+-        "{}-{}-{fingerprint_hash}",
++    let root = data_dir.join(VECTOR_INDEX_DIR).join("shards");
++    fs::create_dir_all(&root).context("create semantic shard generation root")?;
++    let prefix = format!(
++        "{}-{}-{fingerprint_hash}-",
+         tier.as_str(),
+         safe_path_component(embedder_id),
+-    ))
++    );
++    // A source fingerprint is not a build identity. Allocate exclusively so
++    // repeated/concurrent builds cannot overwrite an installed shard set.
++    let generation = tempfile::Builder::new()
++        .prefix(&prefix)
++        .tempdir_in(&root)
++        .context("allocate private semantic shard generation")?
++        .keep();
++    // Retain failed builds for explicit inspection/GC. Directory existence is
++    // not authority: only the atomically installed manifest selects a build.
++    sync_parent_directory(&generation)?;
++    sync_parent_directory(&root)?;
++    sync_parent_directory(&data_dir.join(VECTOR_INDEX_DIR))?;
++    Ok(generation)
+ }
+ 
+-fn semantic_shard_index_path(
+-    data_dir: &Path,
+-    tier: TierKind,
+-    embedder_id: &str,
+-    db_fingerprint: &str,
+-    shard_index: u32,
+-) -> PathBuf {
+-    semantic_shard_generation_dir(data_dir, tier, embedder_id, db_fingerprint)
+-        .join(format!("shard-{shard_index:05}.fsvi"))
++fn semantic_shard_index_path(generation_dir: &Path, shard_index: u32) -> PathBuf {
++    generation_dir.join(format!("shard-{shard_index:05}.fsvi"))
+ }
+ 
+-fn semantic_shard_ann_index_path(
+-    data_dir: &Path,
+-    tier: TierKind,
+-    embedder_id: &str,
+-    db_fingerprint: &str,
+-    shard_index: u32,
+-) -> PathBuf {
+-    semantic_shard_generation_dir(data_dir, tier, embedder_id, db_fingerprint)
+-        .join(format!("shard-{shard_index:05}.chsw"))
++fn semantic_shard_ann_index_path(generation_dir: &Path, shard_index: u32) -> PathBuf {
++    generation_dir.join(format!("shard-{shard_index:05}.chsw"))
+ }
+ 
+ #[cfg(not(windows))]
+@@ -2705,10 +2709,22 @@ impl SemanticIndexer {
+             bail!("semantic shard build requires max_records_per_shard > 0");
+         }
+ 
++        // Corrupt/newer metadata is not an empty archive. Refuse before
++        // consuming input, rather than erasing other tiers via load_or_default.
++        SemanticShardManifest::load(data_dir).map_err(|err| {
++            anyhow::anyhow!("loading semantic shard manifest before build: {err}")
++        })?;
++        let generation_dir = create_semantic_shard_generation_dir(
++            data_dir,
++            plan.tier,
++            self.embedder_id(),
++            &plan.db_fingerprint,
++        )?;
+         let mut shard_records = Vec::new();
+         let mut index_paths = Vec::new();
+         let mut ann_index_paths = Vec::new();
+-        let mut current_records = Vec::with_capacity(plan.max_records_per_shard);
++        // A limit is not a request for an archive-sized up-front allocation.
++        let mut current_records = Vec::new();
+         let mut shard_index = 0u32;
+         let mut total_docs = 0u64;
+ 
+@@ -2716,8 +2732,13 @@ impl SemanticIndexer {
+             current_records.push(embedded);
+             if current_records.len() >= plan.max_records_per_shard {
+                 let records = std::mem::take(&mut current_records);
+-                let (record, path, ann_path) =
+-                    self.write_semantic_shard(records, data_dir, &plan, shard_index)?;
++                let (record, path, ann_path) = self.write_semantic_shard(
++                    records,
++                    data_dir,
++                    &generation_dir,
++                    &plan,
++                    shard_index,
++                )?;
+                 total_docs = total_docs.saturating_add(record.doc_count);
+                 shard_records.push(record);
+                 index_paths.push(path);
+@@ -2732,8 +2753,13 @@ impl SemanticIndexer {
+ 
+         if !current_records.is_empty() {
+             let records = std::mem::take(&mut current_records);
+-            let (record, path, ann_path) =
+-                self.write_semantic_shard(records, data_dir, &plan, shard_index)?;
++            let (record, path, ann_path) = self.write_semantic_shard(
++                records,
++                data_dir,
++                &generation_dir,
++                &plan,
++                shard_index,
++            )?;
+             total_docs = total_docs.saturating_add(record.doc_count);
+             shard_records.push(record);
+             index_paths.push(path);
+@@ -2748,8 +2774,11 @@ impl SemanticIndexer {
+             record.shard_count = shard_count;
+         }
+ 
+-        let mut shard_manifest = SemanticShardManifest::load_or_default(data_dir)
+-            .map_err(|err| anyhow::anyhow!("loading semantic shard manifest for publish: {err}"))?;
++        // Finish shard directory entries before their first public reference.
++        sync_parent_directory(&generation_dir.join("shard-00000.fsvi"))?;
++        let mut shard_manifest = SemanticShardManifest::load(data_dir)
++            .map_err(|err| anyhow::anyhow!("loading semantic shard manifest for publish: {err}"))?
++            .unwrap_or_default();
+         shard_manifest.replace_shards_for_generation(
+             plan.tier,
+             self.embedder_id(),
+@@ -2787,29 +2816,18 @@ impl SemanticIndexer {
+         &self,
+         embedded_messages: Vec<EmbeddedMessage>,
+         data_dir: &Path,
++        generation_dir: &Path,
+         plan: &SemanticShardBuildPlan,
+         shard_index: u32,
+     ) -> Result<(SemanticShardRecord, PathBuf, Option<PathBuf>)> {
+         let started_at_ms = now_ms();
+-        let shard_path = semantic_shard_index_path(
+-            data_dir,
+-            plan.tier,
+-            self.embedder_id(),
+-            &plan.db_fingerprint,
+-            shard_index,
+-        );
++        let shard_path = semantic_shard_index_path(generation_dir, shard_index);
+         let shard_index_file = self.build_and_save_index_at_path(embedded_messages, &shard_path)?;
+         let size_bytes = fs::metadata(&shard_path)
+             .with_context(|| format!("stat semantic shard {}", shard_path.display()))?
+             .len();
+         let (ann_index_path, ann_size_bytes, ann_ready, ann_absolute_path) = if plan.build_ann {
+-            let ann_path = semantic_shard_ann_index_path(
+-                data_dir,
+-                plan.tier,
+-                self.embedder_id(),
+-                &plan.db_fingerprint,
+-                shard_index,
+-            );
++            let ann_path = semantic_shard_ann_index_path(generation_dir, shard_index);
+             let config = FsHnswConfig {
+                 m: FS_HNSW_DEFAULT_M,
+                 ef_construction: FS_HNSW_DEFAULT_EF_CONSTRUCTION,
+@@ -2824,7 +2842,7 @@ impl SemanticIndexer {
+                 .len();
+             let relative_ann_path = ann_path
+                 .strip_prefix(data_dir)
+-                .unwrap_or(ann_path.as_path())
++                .context("semantic ANN shard escaped its data directory")?
+                 .to_string_lossy()
+                 .to_string();
+             (
+@@ -2838,7 +2856,7 @@ impl SemanticIndexer {
+         };
+         let relative_index_path = shard_path
+             .strip_prefix(data_dir)
+-            .unwrap_or(shard_path.as_path())
++            .context("semantic vector shard escaped its data directory")?
+             .to_string_lossy()
+             .to_string();
+         let record = SemanticShardRecord {
