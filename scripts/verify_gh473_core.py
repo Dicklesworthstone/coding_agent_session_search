@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import re
+import tomllib
 from pathlib import Path
 
 
@@ -23,6 +24,24 @@ def definition(text: str, name: str) -> str:
     if end is None:
         raise ValueError(f"Unterminated production definition: {name}")
     return text[match.start():match.end() + end.end()] + "\n"
+
+
+def production_dependencies(manifest_source: str, names: list[str]) -> list[str]:
+    """Keep original declarations, excluding same-named dev/target dependencies."""
+    parsed = tomllib.loads(manifest_source)["dependencies"]
+    sections = re.findall(r"^\[dependencies\][ \t]*\n(.*?)(?=^\[|\Z)", manifest_source, re.MULTILINE | re.DOTALL)
+    if len(sections) != 1:
+        raise ValueError("Missing unique normal dependency section")
+    declarations = []
+    for name in names:
+        matches = re.findall(r"^" + re.escape(name) + r"[ \t]*=.*$", sections[0], re.MULTILINE)
+        if len(matches) != 1:
+            raise ValueError(f"Missing or ambiguous production dependency: {name}")
+        declaration = matches[0]
+        if tomllib.loads(declaration).get(name) != parsed[name]:
+            raise ValueError(f"Incomplete production dependency declaration: {name}")
+        declarations.append(declaration)
+    return declarations
 
 
 def generate(root: Path, destination: Path) -> None:
@@ -121,12 +140,9 @@ fn main() -> anyhow::Result<()> {
 }
 '''
     manifest_source = (root / "Cargo.toml").read_text()
-    dependencies = []
-    for name in ["anyhow", "tracing", "asupersync", "frankensqlite", "dotenvy", "tempfile", "rand"]:
-        matches = re.findall(r"^" + re.escape(name) + r"\s*=.*$", manifest_source, re.MULTILINE)
-        if len(matches) != 1:
-            raise ValueError(f"Missing or ambiguous dependency declaration: {name}")
-        dependencies.append(matches[0])
+    dependencies = production_dependencies(manifest_source, [
+        "anyhow", "tracing", "asupersync", "frankensqlite", "dotenvy", "tempfile", "rand",
+    ])
     manifest = '[package]\nname = "cass-gh473-core-probe"\nversion = "0.0.0"\nedition = "2024"\n[dependencies]\n'
     manifest += "\n".join(dependencies) + '\n[profile.dev]\ndebug = 0\n'
     destination.mkdir(parents=True, exist_ok=False)
@@ -139,8 +155,12 @@ fn main() -> anyhow::Result<()> {
     for label, contents in [("exact_definitions", definitions.encode()), ("exact_error_expression", error_blocks[0].encode()), ("exact_sync_facade", facade), ("probe", program.encode())]:
         print(label, hashlib.sha256(contents).hexdigest())
     print("SCOPE: engine + exact timeout/retry/error-chain code only; NOT full CASS, cache, atomic ledger, or index validation.")
+    storage = (root / "src/storage/sqlite.rs").read_text()
     print("=== primary-mode activation ===")
-    print(definition((root / "src/storage/sqlite.rs").read_text(), "enable_bulk_single_connection"))
+    print(definition(storage, "enable_bulk_single_connection"))
+    print("=== outer fallback classifier (inspection only) ===")
+    print(definition(source, "anyhow_chain_indicates_retryable_storage_contention"))
+    print(definition(storage, "retryable_storage_error_message"))
 
 
 if __name__ == "__main__":
