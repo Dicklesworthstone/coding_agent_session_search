@@ -54,11 +54,11 @@ jobs:
               return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
           repository = 'repos/' + os.environ['GITHUB_REPOSITORY']
           evidence = Path(os.environ['RUNNER_TEMP']) / 'refresh-evidence'
-          response = json.loads(subprocess.check_output(['gh', 'api', repository + '/git/blobs/faa32cd8e04194fa21acad9df7d2e66f45987c90'], text=True))
+          response = json.loads(subprocess.check_output(['gh', 'api', repository + '/git/blobs/934a977ff4d7113a286b96b9ac8b188d32abfd34'], text=True))
           compressed = base64.b64decode(response['content'])
-          assert blob(compressed) == 'faa32cd8e04194fa21acad9df7d2e66f45987c90'
+          assert blob(compressed) == '934a977ff4d7113a286b96b9ac8b188d32abfd34'
           data = lzma.decompress(compressed)
-          assert hashlib.sha256(data).hexdigest() == '35f29b83f3816a9d1640ec6a5c75141a67864f4dd8b1f5c42bc432be9beb84a5'
+          assert hashlib.sha256(data).hexdigest() == '8eabaedd3fbc0f0165362815e0e03de605830cd753faf2e49efba9a50d0859ae'
           payload = json.loads(data)
           guards = payload['guards']
           assert set(guards) == {'src/search/semantic_reader/publication.rs', 'src/search/semantic_reader/publication/tests/sharded.rs', 'src/search/semantic_reader/publication/tests/sharded/refresh.rs'}
