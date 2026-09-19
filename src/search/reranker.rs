@@ -207,26 +207,45 @@ mod tests {
     }
 
     impl Reranker for ResponseReranker {
-        fn rerank_sync(&self, _query: &str, documents: &[RerankDocument]) -> RerankerResult<Vec<RerankScore>> {
+        fn rerank_sync(
+            &self,
+            _query: &str,
+            documents: &[RerankDocument],
+        ) -> RerankerResult<Vec<RerankScore>> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             for (index, document) in documents.iter().enumerate() {
                 assert_eq!(document.doc_id, index.to_string());
             }
             if self.fail {
-                return Err(RerankerError::RerankerUnavailable { model: self.id().to_string() });
+                return Err(RerankerError::RerankerUnavailable {
+                    model: self.id().to_string(),
+                });
             }
             Ok(self.scores.clone())
         }
-        fn id(&self) -> &str { "synthetic-score-contract" }
-        fn model_name(&self) -> &str { self.id() }
-        fn is_available(&self) -> bool { !self.fail }
+        fn id(&self) -> &str {
+            "synthetic-score-contract"
+        }
+        fn model_name(&self) -> &str {
+            self.id()
+        }
+        fn is_available(&self) -> bool {
+            !self.fail
+        }
     }
 
     fn response_reranker(entries: &[(&str, f32)]) -> ResponseReranker {
         ResponseReranker {
-            scores: entries.iter().enumerate().map(|(rank, (id, score))| RerankScore {
-                doc_id: (*id).to_string(), score: *score, original_rank: rank, raw_logit: None,
-            }).collect(),
+            scores: entries
+                .iter()
+                .enumerate()
+                .map(|(rank, (id, score))| RerankScore {
+                    doc_id: (*id).to_string(),
+                    score: *score,
+                    original_rank: rank,
+                    raw_logit: None,
+                })
+                .collect(),
             calls: std::sync::atomic::AtomicUsize::new(0),
             fail: false,
         }
@@ -235,7 +254,10 @@ mod tests {
     #[test]
     fn bridge_restores_score_order_without_replacing_real_zero_or_negative_values() {
         let backend = response_reranker(&[("2", -0.5), ("0", 0.75), ("1", 0.0)]);
-        assert_eq!(rerank_texts(&backend, "query", &["a", "b", "c"]).unwrap(), [0.75, 0.0, -0.5]);
+        assert_eq!(
+            rerank_texts(&backend, "query", &["a", "b", "c"]).unwrap(),
+            [0.75, 0.0, -0.5]
+        );
         assert_eq!(backend.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -252,7 +274,13 @@ mod tests {
             vec![("0", 1.0), ("-1", 2.0)],
         ] {
             let backend = response_reranker(&entries);
-            assert!(matches!(rerank_texts(&backend, "query", &["private-a", "private-b"]), Err(RerankerError::RerankFailed { .. })), "accepted invalid mapping: {entries:?}");
+            assert!(
+                matches!(
+                    rerank_texts(&backend, "query", &["private-a", "private-b"]),
+                    Err(RerankerError::RerankFailed { .. })
+                ),
+                "accepted invalid mapping: {entries:?}"
+            );
             assert_eq!(backend.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         }
     }
@@ -271,7 +299,10 @@ mod tests {
     fn bridge_propagates_backend_failure_without_retry_or_fabricated_scores() {
         let mut backend = response_reranker(&[]);
         backend.fail = true;
-        assert!(matches!(rerank_texts(&backend, "query", &["document"]), Err(RerankerError::RerankerUnavailable { .. })));
+        assert!(matches!(
+            rerank_texts(&backend, "query", &["document"]),
+            Err(RerankerError::RerankerUnavailable { .. })
+        ));
         assert_eq!(backend.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

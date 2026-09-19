@@ -132,24 +132,25 @@ impl SqliteEmbeddingSource {
             ),
         };
         let mut messages = Vec::with_capacity(selected_rows);
-        self.connection.query_with_params_for_each(sql, &params, |row| {
-            let source_id = row
-                .get_typed::<Option<String>>(4)?
-                .unwrap_or_else(|| "local".to_string());
-            messages.push(MessageForEmbedding {
-                message_id: row.get_typed(0)?,
-                created_at: row.get_typed(1)?,
-                agent_id: row.get_typed(2)?,
-                workspace_id: row.get_typed(3)?,
-                source_id_hash: crc32fast::hash(source_id.as_bytes()),
-                role: row.get_typed(5)?,
-                content: row.get_typed(6)?,
-            });
-            Ok(())
-        })?;
-        let actual_bytes = messages
-            .iter()
-            .fold(0usize, |sum, message| sum.saturating_add(message.content.len()));
+        self.connection
+            .query_with_params_for_each(sql, &params, |row| {
+                let source_id = row
+                    .get_typed::<Option<String>>(4)?
+                    .unwrap_or_else(|| "local".to_string());
+                messages.push(MessageForEmbedding {
+                    message_id: row.get_typed(0)?,
+                    created_at: row.get_typed(1)?,
+                    agent_id: row.get_typed(2)?,
+                    workspace_id: row.get_typed(3)?,
+                    source_id_hash: crc32fast::hash(source_id.as_bytes()),
+                    role: row.get_typed(5)?,
+                    content: row.get_typed(6)?,
+                });
+                Ok(())
+            })?;
+        let actual_bytes = messages.iter().fold(0usize, |sum, message| {
+            sum.saturating_add(message.content.len())
+        });
         // Orphans may make the joined page smaller, but never larger. Both
         // queries share the pinned snapshot, including concurrent WAL writes.
         if messages.len() > selected_rows || actual_bytes > planned_bytes {
@@ -184,11 +185,16 @@ impl EmbeddingMessageSource for SqliteEmbeddingSource {
                     return Ok(false);
                 }
                 visitor(&message)?;
-                visited = visited.checked_add(1).context("embedding row count overflow")?;
+                visited = visited
+                    .checked_add(1)
+                    .context("embedding row count overflow")?;
             }
         }
         if visited != self.total_docs {
-            bail!("embedding snapshot row count changed: expected {}, visited {visited}", self.total_docs);
+            bail!(
+                "embedding snapshot row count changed: expected {}, visited {visited}",
+                self.total_docs
+            );
         }
         Ok(!cancelled())
     }
@@ -252,7 +258,12 @@ mod tests {
     #[test]
     fn pages_preserve_projection_sparse_ids_and_legacy_nulls() -> Result<()> {
         let (temp, writer) = fixture()?;
-        insert(&writer, i64::MIN, 1, "invalid ID remains visible to the worker")?;
+        insert(
+            &writer,
+            i64::MIN,
+            1,
+            "invalid ID remains visible to the worker",
+        )?;
         insert(&writer, 0, 1, "Unicode café")?;
         insert(&writer, 9, 999, "orphan is not eligible")?;
         insert(&writer, i64::MAX, 2, "remote message")?;
@@ -262,15 +273,35 @@ mod tests {
         for _ in 0..2 {
             let mut values = Vec::new();
             assert!(source.visit(&|| false, &mut |message| {
-                values.push((message.message_id, message.agent_id, message.workspace_id,
-                    message.source_id_hash, message.content.clone()));
+                values.push((
+                    message.message_id,
+                    message.agent_id,
+                    message.workspace_id,
+                    message.source_id_hash,
+                    message.content.clone(),
+                ));
                 Ok(())
             })?);
-            assert_eq!(values, vec![
-                (i64::MIN, 0, None, crc32fast::hash(b"local"), "invalid ID remains visible to the worker".into()),
-                (0, 0, None, crc32fast::hash(b"local"), "Unicode café".into()),
-                (i64::MAX, 7, Some(9), crc32fast::hash(b"remote"), "remote message".into()),
-            ]);
+            assert_eq!(
+                values,
+                vec![
+                    (
+                        i64::MIN,
+                        0,
+                        None,
+                        crc32fast::hash(b"local"),
+                        "invalid ID remains visible to the worker".into()
+                    ),
+                    (0, 0, None, crc32fast::hash(b"local"), "Unicode café".into()),
+                    (
+                        i64::MAX,
+                        7,
+                        Some(9),
+                        crc32fast::hash(b"remote"),
+                        "remote message".into()
+                    ),
+                ]
+            );
         }
         Ok(())
     }
@@ -278,7 +309,12 @@ mod tests {
     #[test]
     fn page_body_budget_counts_utf8_bytes_and_admits_one_oversized_row() -> Result<()> {
         let (temp, writer) = fixture()?;
-        for (id, text) in [(1, "éé"), (2, "abcd"), (3, "oversized message"), (4, "tail")] {
+        for (id, text) in [
+            (1, "éé"),
+            (2, "abcd"),
+            (3, "oversized message"),
+            (4, "tail"),
+        ] {
             insert(&writer, id, 1, text)?;
         }
         let mut source = SqliteEmbeddingSource::open(&temp.path().join("archive.db"))?;
@@ -286,11 +322,15 @@ mod tests {
         let first = source.page_after(None)?.context("first page")?;
         assert_eq!(first.last_id, 2);
         assert_eq!(first.messages.len(), 2);
-        let second = source.page_after(Some(first.last_id))?.context("oversized page")?;
+        let second = source
+            .page_after(Some(first.last_id))?
+            .context("oversized page")?;
         assert_eq!(second.last_id, 3);
         assert_eq!(second.messages.len(), 1);
         assert_eq!(second.messages[0].content, "oversized message");
-        let third = source.page_after(Some(second.last_id))?.context("tail page")?;
+        let third = source
+            .page_after(Some(second.last_id))?
+            .context("tail page")?;
         assert_eq!(third.messages[0].content, "tail");
         assert!(source.page_after(Some(third.last_id))?.is_none());
         Ok(())
@@ -316,7 +356,14 @@ mod tests {
         drop(source);
         let reopened = SqliteEmbeddingSource::open(&path)?;
         assert_eq!(reopened.total_docs(), 2);
-        assert_eq!(reopened.page_after(None)?.context("reopened page")?.messages[0].content, "after");
+        assert_eq!(
+            reopened
+                .page_after(None)?
+                .context("reopened page")?
+                .messages[0]
+                .content,
+            "after"
+        );
         Ok(())
     }
 
@@ -336,7 +383,11 @@ mod tests {
             Ok(())
         })?);
         assert_eq!(seen, [1]);
-        assert!(source.visit(&|| false, &mut |_| bail!("visitor failure")).is_err());
+        assert!(
+            source
+                .visit(&|| false, &mut |_| bail!("visitor failure"))
+                .is_err()
+        );
         let mut replay = Vec::new();
         assert!(source.visit(&|| false, &mut |message| {
             replay.push(message.message_id);

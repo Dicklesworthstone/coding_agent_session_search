@@ -298,8 +298,13 @@ impl RemoteArtifactManifestCommandOutput {
     }
 
     fn has_complete_manifest_shape(&self) -> bool {
-        self.manifest_path.as_deref().is_some_and(|path| !path.trim().is_empty())
-            && self.bundle_id.as_deref().is_some_and(|id| !id.trim().is_empty())
+        self.manifest_path
+            .as_deref()
+            .is_some_and(|path| !path.trim().is_empty())
+            && self
+                .bundle_id
+                .as_deref()
+                .is_some_and(|id| !id.trim().is_empty())
             && self.chunk_count.is_some()
             && self.expected_bytes.is_some()
             && self.verification_status.is_some()
@@ -600,11 +605,8 @@ printf 'MEM_AVAILABLE_KIB=%s\n' "$MEM_AVAILABLE_KIB"
     }
 
     fn verify_remote_host_pressure(&self, start: Instant) -> Result<(), IndexError> {
-        let output = self.run_ssh_phase(
-            Self::host_pressure_script(),
-            start,
-            Duration::from_secs(15),
-        )?;
+        let output =
+            self.run_ssh_phase(Self::host_pressure_script(), start, Duration::from_secs(15))?;
         let decision = RemoteHostPressureSnapshot::from_command_output(&output).decide();
         if decision.defer_index {
             Err(IndexError::HostPressure(decision.reason))
@@ -1097,7 +1099,9 @@ mod tests {
         let started = Instant::now();
         let error = wait_for_command_output_with_timeout(cmd.spawn()?, Duration::from_secs(30))
             .expect_err("unbounded remote output must fail");
-        assert!(matches!(error, IndexError::Io(ref inner) if inner.kind() == std::io::ErrorKind::InvalidData));
+        assert!(
+            matches!(error, IndexError::Io(ref inner) if inner.kind() == std::io::ErrorKind::InvalidData)
+        );
         assert!(started.elapsed() < Duration::from_secs(5));
         Ok(())
     }
@@ -1346,7 +1350,10 @@ Welcome to remote host
             r#"{"manifest_path":"manifest.json","bundle_id":"x","verification_status":"complete"}"#,
         ] {
             let result = RemoteArtifactManifestResult::from_command_output(payload);
-            assert!(!result.success, "incomplete artifact receipt passed: {payload}");
+            assert!(
+                !result.success,
+                "incomplete artifact receipt passed: {payload}"
+            );
             assert!(result.error.is_some());
         }
     }
@@ -1360,5 +1367,4 @@ Welcome to remote host
         assert_eq!(result.chunk_count, Some(0));
         assert_eq!(result.expected_bytes, Some(0));
     }
-
 }

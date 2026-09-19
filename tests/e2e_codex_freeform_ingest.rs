@@ -113,9 +113,16 @@ fn custom_patch_input_survives_index_search_and_incremental_replay() {
     assert_eq!(indexed["success"], true, "{indexed}");
     let first = search(home, &data_dir);
     let first_hits = first["hits"].as_array().expect("search hits");
-    assert_eq!(first_hits.len(), 1, "marker occurs only in freeform input: {first}");
+    assert_eq!(
+        first_hits.len(),
+        1,
+        "marker occurs only in freeform input: {first}"
+    );
     assert_eq!(first_hits[0]["agent"], "codex");
-    assert_eq!(first_hits[0]["source_path"], path.to_string_lossy().as_ref());
+    assert_eq!(
+        first_hits[0]["source_path"],
+        path.to_string_lossy().as_ref()
+    );
     let first_line = first_hits[0]["line_number"].clone();
     assert!(first_line.as_u64().is_some(), "canonical message locator");
     json_output(
@@ -125,7 +132,11 @@ fn custom_patch_input_survives_index_search_and_incremental_replay() {
     );
     let replay = search(home, &data_dir);
     let replay_hits = replay["hits"].as_array().expect("replay hits");
-    assert_eq!(replay_hits.len(), 1, "replay must not duplicate patch records: {replay}");
+    assert_eq!(
+        replay_hits.len(),
+        1,
+        "replay must not duplicate patch records: {replay}"
+    );
     assert_eq!(replay_hits[0]["line_number"], first_line);
     assert_eq!(std::fs::read_to_string(&path).expect("read source"), source);
 }

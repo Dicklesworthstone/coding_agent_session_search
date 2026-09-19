@@ -30,13 +30,15 @@ use frankensearch::core::{
     BoundQueryEmbedding, RetrievalTopology, SearchError, SpaceIdentityAdmission,
     TieredQueryEmbeddings,
 };
-use frankensearch::index::{FsviAdmissionError, FsviV2IdentityBinding, FsviV2Witness, ValidatedFsviBytes};
+use frankensearch::index::{
+    FsviAdmissionError, FsviV2IdentityBinding, FsviV2Witness, ValidatedFsviBytes,
+};
 
-use ann::{AnnSearchPolicy, SemanticShardEngine, SemanticShardExecution};
 use super::semantic_manifest::TierKind;
 use super::vector_index::{
     ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER, SemanticDocId, parse_semantic_doc_id,
 };
+use ann::{AnnSearchPolicy, SemanticShardEngine, SemanticShardExecution};
 
 /// A publication's expected artifact, not a claim derived while opening it.
 #[derive(Debug, Clone)]
@@ -148,14 +150,16 @@ impl AdmittedTier {
             }
         }
         drop(ids);
-        Ok(Self { binding: first.binding.clone(), shards, live_count })
+        Ok(Self {
+            binding: first.binding.clone(),
+            shards,
+            live_count,
+        })
     }
 
     fn activate(&self, query: &BoundQueryEmbedding, kind: TierKind) -> SemanticReaderResult<()> {
-        let admission = query.verify_producer_conformance(
-            &self.binding.frozen_identity().identity,
-            kind.as_str(),
-        )?;
+        let admission = query
+            .verify_producer_conformance(&self.binding.frozen_identity().identity, kind.as_str())?;
         if !matches!(admission, SpaceIdentityAdmission::SameProducer) {
             // A certified-compatible foreign producer is comparison telemetry,
             // never permission to serve its vectors against this artifact.
@@ -165,7 +169,8 @@ impl AdmittedTier {
             return Err(SearchError::DimensionMismatch {
                 expected: self.binding.dimension(),
                 found: query.vector().len(),
-            }.into());
+            }
+            .into());
         }
         Ok(())
     }
@@ -173,7 +178,10 @@ impl AdmittedTier {
     fn same_selection(&self, other: &Self) -> bool {
         self.binding == other.binding
             && self.shards.len() == other.shards.len()
-            && self.shards.iter().zip(&other.shards)
+            && self
+                .shards
+                .iter()
+                .zip(&other.shards)
                 .all(|(left, right)| left.witness() == right.witness())
     }
 
@@ -194,12 +202,24 @@ impl AdmittedTier {
             // k is a requested maximum, never an allocation hint larger than
             // the actual shard. Preserve identity checks even for empty shards.
             let report = SemanticShardExecution {
-                tier: kind, shard, engine: SemanticShardEngine::Skipped,
-                fallback_reason: None, graph_sha256: None, ann_windows: 0,
-                candidate_rows: 0, final_candidate_limit: 0, returned_candidates: 0,
+                tier: kind,
+                shard,
+                engine: SemanticShardEngine::Skipped,
+                fallback_reason: None,
+                graph_sha256: None,
+                ann_windows: 0,
+                candidate_rows: 0,
+                final_candidate_limit: 0,
+                returned_candidates: 0,
             };
             let (local, report) = ann::search_shard(
-                owner, ann.shard(kind, shard), query, local_limit, filter, policy, report,
+                owner,
+                ann.shard(kind, shard),
+                query,
+                local_limit,
+                filter,
+                policy,
+                report,
             )?;
             execution.push(report);
             if local.len() > local_limit {
@@ -231,7 +251,10 @@ impl AdmittedTier {
                 }
             }
         }
-        Ok(TierResult { candidates: best.into_sorted_vec(), execution })
+        Ok(TierResult {
+            candidates: best.into_sorted_vec(),
+            execution,
+        })
     }
 }
 
@@ -242,11 +265,13 @@ struct TierResult {
 }
 
 fn canonical_document(id: &str) -> SemanticReaderResult<SemanticDocId> {
-    let parsed = parse_semantic_doc_id(id)
-        .ok_or(SemanticReaderError::NonCanonicalDocuments)?;
+    let parsed = parse_semantic_doc_id(id).ok_or(SemanticReaderError::NonCanonicalDocuments)?;
     if parsed.content_hash.is_none()
         || parsed.message_id > i64::MAX as u64
-        || !matches!(parsed.role, ROLE_USER | ROLE_ASSISTANT | ROLE_SYSTEM | ROLE_TOOL)
+        || !matches!(
+            parsed.role,
+            ROLE_USER | ROLE_ASSISTANT | ROLE_SYSTEM | ROLE_TOOL
+        )
         || parsed.to_doc_id_string() != id
     {
         return Err(SemanticReaderError::NonCanonicalDocuments);
@@ -274,8 +299,11 @@ impl SemanticGenerationReader {
         fast: Option<&[SemanticShardExpectation]>,
         quality: Option<&[SemanticShardExpectation]>,
     ) -> SemanticReaderResult<Self> {
-        let first = fast.or(quality).ok_or(SemanticReaderError::NoTiers)?
-            .first().ok_or(SemanticReaderError::EmptyTier)?;
+        let first = fast
+            .or(quality)
+            .ok_or(SemanticReaderError::NoTiers)?
+            .first()
+            .ok_or(SemanticReaderError::EmptyTier)?;
         let generation = first.binding.generation();
         // Refuse a mixed pair before opening any artifact. Compare the nonce
         // as well as the sequence: equal low-width counters prove nothing.
@@ -283,24 +311,41 @@ impl SemanticGenerationReader {
             if selected.is_empty() {
                 return Err(SemanticReaderError::EmptyTier);
             }
-            if selected.iter().any(|shard| shard.binding.generation() != generation) {
+            if selected
+                .iter()
+                .any(|shard| shard.binding.generation() != generation)
+            {
                 return Err(SemanticReaderError::MixedGeneration);
             }
         }
-        let fast = fast.map(|selected| AdmittedTier::open(TierKind::Fast, selected))
-            .transpose()?.map(Arc::new);
-        let quality = quality.map(|selected| AdmittedTier::open(TierKind::Quality, selected))
-            .transpose()?.map(Arc::new);
+        let fast = fast
+            .map(|selected| AdmittedTier::open(TierKind::Fast, selected))
+            .transpose()?
+            .map(Arc::new);
+        let quality = quality
+            .map(|selected| AdmittedTier::open(TierKind::Quality, selected))
+            .transpose()?
+            .map(Arc::new);
         if let (Some(fast), Some(quality)) = (&fast, &quality) {
-            let fast_images: HashSet<_> = fast.shards.iter()
-                .map(|owner| owner.witness().whole_image_sha256).collect();
-            if quality.shards.iter().any(|owner| {
-                fast_images.contains(&owner.witness().whole_image_sha256)
-            }) {
+            let fast_images: HashSet<_> = fast
+                .shards
+                .iter()
+                .map(|owner| owner.witness().whole_image_sha256)
+                .collect();
+            if quality
+                .shards
+                .iter()
+                .any(|owner| fast_images.contains(&owner.witness().whole_image_sha256))
+            {
                 return Err(SemanticReaderError::ArtifactRoleAlias);
             }
         }
-        Ok(Self { fast, quality, generation, ann: Arc::new(ann::AnnSelection::default()) })
+        Ok(Self {
+            fast,
+            quality,
+            generation,
+            ann: Arc::new(ann::AnnSelection::default()),
+        })
     }
 
     /// Install only a completely admitted successor. Previously returned batches
@@ -311,12 +356,12 @@ impl SemanticGenerationReader {
         quality: Option<&[SemanticShardExpectation]>,
     ) -> SemanticReaderResult<()> {
         let candidate = Self::open(fast, quality)?;
-        let same_tier = |left: &Option<Arc<AdmittedTier>>, right: &Option<Arc<AdmittedTier>>| {
-            match (left, right) {
-                (None, None) => true,
-                (Some(left), Some(right)) => left.same_selection(right),
-                _ => false,
-            }
+        let same_tier = |left: &Option<Arc<AdmittedTier>>, right: &Option<Arc<AdmittedTier>>| match (
+            left, right,
+        ) {
+            (None, None) => true,
+            (Some(left), Some(right)) => left.same_selection(right),
+            _ => false,
         };
         if candidate.generation.sequence <= self.generation.sequence
             && !(same_tier(&self.fast, &candidate.fast)
@@ -334,7 +379,10 @@ impl SemanticGenerationReader {
 
     /// Read an exact retained witness without reopening its publication path.
     pub fn witness(&self, tier: TierKind, shard: usize) -> Option<&FsviV2Witness> {
-        self.tier(tier)?.shards.get(shard).map(|owner| owner.witness())
+        self.tier(tier)?
+            .shards
+            .get(shard)
+            .map(|owner| owner.witness())
     }
 
     fn tier(&self, kind: TierKind) -> Option<&AdmittedTier> {
@@ -351,16 +399,23 @@ impl SemanticGenerationReader {
         &'reader self,
         queries: &'query TieredQueryEmbeddings,
     ) -> SemanticReaderResult<ActivatedSemanticSearch<'reader, 'query>> {
-        for (kind, query) in [(TierKind::Fast, queries.fast()), (TierKind::Quality, queries.quality())] {
+        for (kind, query) in [
+            (TierKind::Fast, queries.fast()),
+            (TierKind::Quality, queries.quality()),
+        ] {
             if let Some(query) = query {
-                self.tier(kind).ok_or(SemanticReaderError::MissingTier(kind))?
+                self.tier(kind)
+                    .ok_or(SemanticReaderError::MissingTier(kind))?
                     .activate(query, kind)?;
             }
         }
         if queries.fast().is_none() && queries.quality().is_none() {
             return Err(SemanticReaderError::NoTiers);
         }
-        Ok(ActivatedSemanticSearch { reader: self, queries })
+        Ok(ActivatedSemanticSearch {
+            reader: self,
+            queries,
+        })
     }
 }
 
@@ -405,8 +460,14 @@ impl<'reader, 'query> ActivatedSemanticSearch<'reader, 'query> {
     ) -> SemanticReaderResult<SemanticSearchBatch> {
         let fast = self.search_tier(TierKind::Fast, k, filter, policy)?;
         let quality = self.search_tier(TierKind::Quality, k, filter, policy)?;
-        Ok(make_batch(self.reader, self.queries.supported_topology(), SemanticResultPhase::Complete,
-            fast, quality, k))
+        Ok(make_batch(
+            self.reader,
+            self.queries.supported_topology(),
+            SemanticResultPhase::Complete,
+            fast,
+            quality,
+            k,
+        ))
     }
 
     /// Yield fast results before scanning quality vectors. On the next call,
@@ -444,7 +505,11 @@ impl<'reader, 'query> ActivatedSemanticSearch<'reader, 'query> {
             return Err(SemanticReaderError::ProgressiveRequiresBothTiers);
         }
         Ok(ProgressiveSemanticSearch {
-            search: self, k, filter, policy, state: ProgressiveState::Initial,
+            search: self,
+            k,
+            filter,
+            policy,
+            state: ProgressiveState::Initial,
         })
     }
 
@@ -459,10 +524,14 @@ impl<'reader, 'query> ActivatedSemanticSearch<'reader, 'query> {
             TierKind::Fast => self.queries.fast(),
             TierKind::Quality => self.queries.quality(),
         };
-        query.map(|query| {
-            self.reader.tier(kind).ok_or(SemanticReaderError::MissingTier(kind))?
-                .search(kind, query, k, filter, &self.reader.ann, policy)
-        }).transpose()
+        query
+            .map(|query| {
+                self.reader
+                    .tier(kind)
+                    .ok_or(SemanticReaderError::MissingTier(kind))?
+                    .search(kind, query, k, filter, &self.reader.ann, policy)
+            })
+            .transpose()
     }
 }
 
@@ -489,8 +558,10 @@ impl std::fmt::Debug for ProgressiveSemanticSearch<'_, '_, '_> {
             ProgressiveState::Refine(_) => "refine",
             ProgressiveState::Done => "done",
         };
-        formatter.debug_struct("ProgressiveSemanticSearch")
-            .field("limit", &self.k).field("next_phase", &phase)
+        formatter
+            .debug_struct("ProgressiveSemanticSearch")
+            .field("limit", &self.k)
+            .field("next_phase", &phase)
             .finish_non_exhaustive()
     }
 }
@@ -502,22 +573,40 @@ impl Iterator for ProgressiveSemanticSearch<'_, '_, '_> {
         let state = std::mem::replace(&mut self.state, ProgressiveState::Done);
         match state {
             ProgressiveState::Initial => {
-                let result = self.search.search_tier(TierKind::Fast, self.k, self.filter, self.policy)
+                let result = self
+                    .search
+                    .search_tier(TierKind::Fast, self.k, self.filter, self.policy)
                     .and_then(|hits| hits.ok_or(SemanticReaderError::MissingTier(TierKind::Fast)));
                 Some(result.map(|fast| {
-                    let batch = make_batch(self.search.reader,
-                        self.search.queries.supported_topology(), SemanticResultPhase::Initial,
-                        Some(fast.clone()), None, self.k);
+                    let batch = make_batch(
+                        self.search.reader,
+                        self.search.queries.supported_topology(),
+                        SemanticResultPhase::Initial,
+                        Some(fast.clone()),
+                        None,
+                        self.k,
+                    );
                     self.state = ProgressiveState::Refine(fast);
                     batch
                 }))
             }
             ProgressiveState::Refine(fast) => {
-                let result = self.search.search_tier(TierKind::Quality, self.k, self.filter, self.policy)
-                    .and_then(|hits| hits.ok_or(SemanticReaderError::MissingTier(TierKind::Quality)));
-                Some(result.map(|quality| make_batch(self.search.reader,
-                    self.search.queries.supported_topology(), SemanticResultPhase::Refined,
-                    Some(fast), Some(quality), self.k)))
+                let result = self
+                    .search
+                    .search_tier(TierKind::Quality, self.k, self.filter, self.policy)
+                    .and_then(|hits| {
+                        hits.ok_or(SemanticReaderError::MissingTier(TierKind::Quality))
+                    });
+                Some(result.map(|quality| {
+                    make_batch(
+                        self.search.reader,
+                        self.search.queries.supported_topology(),
+                        SemanticResultPhase::Refined,
+                        Some(fast),
+                        Some(quality),
+                        self.k,
+                    )
+                }))
             }
             ProgressiveState::Done => None,
         }
@@ -527,7 +616,11 @@ impl Iterator for ProgressiveSemanticSearch<'_, '_, '_> {
 impl std::iter::FusedIterator for ProgressiveSemanticSearch<'_, '_, '_> {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SemanticResultPhase { Initial, Refined, Complete }
+pub enum SemanticResultPhase {
+    Initial,
+    Refined,
+    Complete,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SemanticScoreKind {
@@ -587,11 +680,19 @@ pub struct SemanticSearchBatch {
 }
 
 impl SemanticSearchBatch {
-    pub fn hits(&self) -> &[SemanticPassageHit] { &self.hits }
-    pub fn coverage(&self) -> &SemanticSearchCoverage { &self.coverage }
-    pub fn score_kind(&self) -> SemanticScoreKind { self.score_kind }
+    pub fn hits(&self) -> &[SemanticPassageHit] {
+        &self.hits
+    }
+    pub fn coverage(&self) -> &SemanticSearchCoverage {
+        &self.coverage
+    }
+    pub fn score_kind(&self) -> SemanticScoreKind {
+        self.score_kind
+    }
     /// Per-shard execution for the phase(s) represented by this batch.
-    pub fn execution(&self) -> &[SemanticShardExecution] { &self.execution }
+    pub fn execution(&self) -> &[SemanticShardExecution] {
+        &self.execution
+    }
     pub fn witness(&self, tier: TierKind, shard: usize) -> Option<&FsviV2Witness> {
         self.reader.witness(tier, shard)
     }
@@ -613,7 +714,9 @@ struct Candidate {
 // the engine may already have excluded other equal-scoring physical rows.
 impl Ord for Candidate {
     fn cmp(&self, other: &Self) -> Ordering {
-        other.score.total_cmp(&self.score)
+        other
+            .score
+            .total_cmp(&self.score)
             .then_with(|| self.shard.cmp(&other.shard))
             .then_with(|| self.source_rank.cmp(&other.source_rank))
             .then_with(|| self.physical_index.cmp(&other.physical_index))
@@ -621,10 +724,14 @@ impl Ord for Candidate {
     }
 }
 impl PartialOrd for Candidate {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 impl PartialEq for Candidate {
-    fn eq(&self, other: &Self) -> bool { self.cmp(other) == Ordering::Equal }
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
 }
 impl Eq for Candidate {}
 
@@ -639,9 +746,14 @@ fn make_batch(
     let fast_count = fast.as_ref().map(|tier| tier.candidates.len());
     let quality_count = quality.as_ref().map(|tier| tier.candidates.len());
     let fused = fast.is_some() && quality.is_some();
-    let execution: Vec<_> = fast.iter().chain(quality.iter())
-        .flat_map(|tier| tier.execution.iter().cloned()).collect();
-    let used_ann = execution.iter().any(|report| report.engine == SemanticShardEngine::NativeAnn);
+    let execution: Vec<_> = fast
+        .iter()
+        .chain(quality.iter())
+        .flat_map(|tier| tier.execution.iter().cloned())
+        .collect();
+    let used_ann = execution
+        .iter()
+        .any(|report| report.engine == SemanticShardEngine::NativeAnn);
     let fast = fast.map(|tier| tier.candidates);
     let quality = quality.map(|tier| tier.candidates);
     let mut merged = BTreeMap::<String, SemanticPassageHit>::new();
@@ -654,16 +766,22 @@ fn make_batch(
                 tier_rank: rank + 1,
                 score: candidate.score,
             };
-            let contribution = if fused { 1.0 / (60.0 + (rank + 1) as f64) }
-                else { f64::from(candidate.score) };
+            let contribution = if fused {
+                1.0 / (60.0 + (rank + 1) as f64)
+            } else {
+                f64::from(candidate.score)
+            };
             if fused {
-                let hit = merged.entry(candidate.doc_id.clone()).or_insert_with(|| SemanticPassageHit {
-                    doc_id: candidate.doc_id,
-                    document: candidate.document,
-                    ranking_score: 0.0,
-                    fast: None,
-                    quality: None,
-                });
+                let hit =
+                    merged
+                        .entry(candidate.doc_id.clone())
+                        .or_insert_with(|| SemanticPassageHit {
+                            doc_id: candidate.doc_id,
+                            document: candidate.document,
+                            ranking_score: 0.0,
+                            fast: None,
+                            quality: None,
+                        });
                 hit.ranking_score += contribution;
                 match kind {
                     TierKind::Fast => hit.fast = Some(source),
@@ -671,8 +789,11 @@ fn make_batch(
                 }
             } else {
                 let mut hit = SemanticPassageHit {
-                    doc_id: candidate.doc_id, document: candidate.document,
-                    ranking_score: contribution, fast: None, quality: None,
+                    doc_id: candidate.doc_id,
+                    document: candidate.document,
+                    ranking_score: contribution,
+                    fast: None,
+                    quality: None,
                 };
                 match kind {
                     TierKind::Fast => hit.fast = Some(source),
@@ -684,10 +805,16 @@ fn make_batch(
     }
     let mut hits = if fused {
         let mut hits: Vec<_> = merged.into_values().collect();
-        hits.sort_by(|left, right| right.ranking_score.total_cmp(&left.ranking_score)
-            .then_with(|| left.doc_id.cmp(&right.doc_id)));
+        hits.sort_by(|left, right| {
+            right
+                .ranking_score
+                .total_cmp(&left.ranking_score)
+                .then_with(|| left.doc_id.cmp(&right.doc_id))
+        });
         hits
-    } else { single };
+    } else {
+        single
+    };
     hits.truncate(k);
     let coverage_for = |kind: TierKind, count: Option<usize>| {
         count.and_then(|retrieved_candidates| {
@@ -696,22 +823,33 @@ fn make_batch(
                 selected_shards: tier.shards.len(),
                 witnessed_live_passages: tier.live_count,
                 retrieved_candidates,
-                contributed_candidates: hits.iter().filter(|hit| match kind {
-                    TierKind::Fast => hit.fast.is_some(),
-                    TierKind::Quality => hit.quality.is_some(),
-                }).count(),
+                contributed_candidates: hits
+                    .iter()
+                    .filter(|hit| match kind {
+                        TierKind::Fast => hit.fast.is_some(),
+                        TierKind::Quality => hit.quality.is_some(),
+                    })
+                    .count(),
             })
         })
     };
     let coverage = SemanticSearchCoverage {
-        requested_topology: topology, phase,
+        requested_topology: topology,
+        phase,
         fast: coverage_for(TierKind::Fast, fast_count),
         quality: coverage_for(TierKind::Quality, quality_count),
     };
     SemanticSearchBatch {
-        reader: reader.clone(), hits, coverage,
-        score_kind: if fused { SemanticScoreKind::ReciprocalRankFusion }
-            else if used_ann { SemanticScoreKind::AnnRescored } else { SemanticScoreKind::Exact },
+        reader: reader.clone(),
+        hits,
+        coverage,
+        score_kind: if fused {
+            SemanticScoreKind::ReciprocalRankFusion
+        } else if used_ann {
+            SemanticScoreKind::AnnRescored
+        } else {
+            SemanticScoreKind::Exact
+        },
         execution,
     }
 }

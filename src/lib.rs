@@ -41,8 +41,8 @@ pub mod guide_planner;
 pub mod guide_runner;
 pub mod html_export;
 pub mod incident_discovery;
-pub mod indexer;
 mod index_result;
+pub mod indexer;
 pub mod lessons;
 pub mod lessons_extraction;
 pub mod metric_integrity;
@@ -106374,10 +106374,8 @@ fn run_index_with_data(
     // events and idempotency writes; do not reopen the archive to find out.
     if res.is_ok()
         && let Ok(stats) = index_progress.stats.lock()
-        && let Err(error) = index_result::require_complete_scan(
-            stats.scan_had_errors,
-            &stats.connectors,
-        )
+        && let Err(error) =
+            index_result::require_complete_scan(stats.scan_had_errors, &stats.connectors)
     {
         res = Err(error);
     }

@@ -32,7 +32,9 @@ fn unavailable(name: SwarmProviderName, kind: &'static str) -> SwarmSourceSnapsh
 /// targets. A linked worktree's regular `.git` file is a valid marker. Without
 /// Git, the nearest `.beads` directory is an explicitly local project boundary.
 fn repository_root(start: &Path) -> Result<PathBuf, &'static str> {
-    let start = start.canonicalize().map_err(|_| "repository-root-unreadable")?;
+    let start = start
+        .canonicalize()
+        .map_err(|_| "repository-root-unreadable")?;
     if !start.is_dir() {
         return Err("repository-root-not-directory");
     }
@@ -88,7 +90,15 @@ fn collect_git(root: &Path) -> SwarmSourceSnapshot {
     let started = Instant::now();
     let deadline = started + GIT_BUDGET;
     let probes = [
-        &["diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--"][..],
+        &[
+            "diff",
+            "--cached",
+            "--quiet",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-submodules=all",
+            "--",
+        ][..],
         &["symbolic-ref", "--quiet", "HEAD"][..],
         &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"][..],
     ];
@@ -104,7 +114,8 @@ fn collect_git(root: &Path) -> SwarmSourceSnapshot {
         }
     }
     let mut result = SwarmSourceSnapshot::partial(
-        SwarmProviderName::Git, "live:git",
+        SwarmProviderName::Git,
+        "live:git",
         "Only staged changes and HEAD/merge state were inspected; unstaged worktree and untracked files were not scanned.",
         json!({
             "staged_changes": states[0] == 1,
@@ -127,15 +138,29 @@ fn git_exit(root: &Path, args: &[&str], deadline: Instant) -> Result<i32, &'stat
     // Keep PATH/system loader settings, but remove inherited Git routing,
     // injected config, tracing destinations and redirected stdio handles.
     for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().to_ascii_uppercase().starts_with("GIT_") {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
             command.env_remove(key);
         }
     }
     command
         .args(["--no-pager", "--no-optional-locks", "-C"])
         .arg(root)
-        .args(["-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
-            "-c", "core.hooksPath=", "-c", "diff.external=", "-c", "protocol.allow=never"])
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "-c",
+            "core.hooksPath=",
+            "-c",
+            "diff.external=",
+            "-c",
+            "protocol.allow=never",
+        ])
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -144,18 +169,25 @@ fn git_exit(root: &Path, args: &[&str], deadline: Instant) -> Result<i32, &'stat
         // partial-clone lazy fetch on Git versions predating NO_LAZY_FETCH.
         .env("GIT_ALLOW_PROTOCOL", "")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", if cfg!(windows) { "NUL" } else { "/dev/null" })
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
         .env("GIT_TRACE2", "0")
         .env("GIT_TRACE2_EVENT", "0")
         .env("GIT_TRACE2_PERF", "0")
-        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let mut child = command.spawn().map_err(|_| "git-spawn-failed")?;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return match status.code() {
-                Some(code @ (0 | 1)) => Ok(code),
-                _ => Err("git-probe-failed"),
-            },
+            Ok(Some(status)) => {
+                return match status.code() {
+                    Some(code @ (0 | 1)) => Ok(code),
+                    _ => Err("git-probe-failed"),
+                };
+            }
             Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -167,7 +199,11 @@ fn git_exit(root: &Path, args: &[&str], deadline: Instant) -> Result<i32, &'stat
                 if killed.is_err() || reaped.is_err() {
                     return Err("git-child-cleanup-failed");
                 }
-                return Err(if outcome.is_err() { "git-wait-failed" } else { "git-deadline-exceeded" });
+                return Err(if outcome.is_err() {
+                    "git-wait-failed"
+                } else {
+                    "git-deadline-exceeded"
+                });
             }
         }
     }
@@ -197,14 +233,21 @@ struct Dependency {
 }
 
 fn valid_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 160
-        && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+    !id.is_empty()
+        && id.len() <= 160
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
 }
 
 fn bounded_text(text: &str, chars: usize) -> String {
     // Redact before truncating, so cutting a credential cannot defeat the
     // redactor's full-token pattern. Control characters never reach the TUI.
-    redact_swarm_text(text).chars().filter(|c| !c.is_control()).take(chars).collect()
+    redact_swarm_text(text)
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(chars)
+        .collect()
 }
 
 fn collect_beads(root: &Path) -> SwarmSourceSnapshot {
@@ -216,8 +259,12 @@ fn collect_beads(root: &Path) -> SwarmSourceSnapshot {
             let mut snapshot = if rejected == 0 {
                 SwarmSourceSnapshot::ok(SwarmProviderName::Beads, "live:beads", payload)
             } else {
-                SwarmSourceSnapshot::partial(SwarmProviderName::Beads, "live:beads",
-                    "Some records were rejected; counts are lower bounds and runnable candidates are suppressed.", payload)
+                SwarmSourceSnapshot::partial(
+                    SwarmProviderName::Beads,
+                    "live:beads",
+                    "Some records were rejected; counts are lower bounds and runnable candidates are suppressed.",
+                    payload,
+                )
             };
             snapshot.freshness_ms = freshness;
             snapshot
@@ -244,7 +291,10 @@ fn same_metadata(left: &Metadata, right: &Metadata) -> bool {
     true
 }
 
-fn read_beads(root: &Path, deadline: Instant) -> Result<(BTreeMap<String, Bead>, usize, Option<u64>), &'static str> {
+/// Beads keyed by id, the number of records scanned, and the newest mtime seen.
+type ReadBeadsOutcome = (BTreeMap<String, Bead>, usize, Option<u64>);
+
+fn read_beads(root: &Path, deadline: Instant) -> Result<ReadBeadsOutcome, &'static str> {
     let directory = root.join(".beads");
     let parent = fs::symlink_metadata(&directory).map_err(|_| "beads-directory-unavailable")?;
     if !parent.is_dir() {
@@ -265,7 +315,9 @@ fn read_beads(root: &Path, deadline: Instant) -> Result<(BTreeMap<String, Bead>,
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    let file = options.open(&path).map_err(|_| "beads-snapshot-open-failed")?;
+    let file = options
+        .open(&path)
+        .map_err(|_| "beads-snapshot-open-failed")?;
     let opened = file.metadata().map_err(|_| "beads-snapshot-stat-failed")?;
     if !opened.is_file() || !same_metadata(&before, &opened) {
         return Err("beads-snapshot-changed");
@@ -274,19 +326,26 @@ fn read_beads(root: &Path, deadline: Instant) -> Result<(BTreeMap<String, Bead>,
     let after = file.metadata().map_err(|_| "beads-snapshot-stat-failed")?;
     let path_after = fs::symlink_metadata(&path).map_err(|_| "beads-snapshot-changed")?;
     let parent_after = fs::symlink_metadata(&directory).map_err(|_| "beads-snapshot-changed")?;
-    if !path_after.is_file() || !parent_after.is_dir()
-        || !same_metadata(&before, &after) || !same_metadata(&before, &path_after)
+    if !path_after.is_file()
+        || !parent_after.is_dir()
+        || !same_metadata(&before, &after)
+        || !same_metadata(&before, &path_after)
         || !same_metadata(&parent, &parent_after)
     {
         return Err("beads-snapshot-changed");
     }
-    let freshness = before.modified().ok()
+    let freshness = before
+        .modified()
+        .ok()
         .and_then(|modified| SystemTime::now().duration_since(modified).ok())
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64);
     Ok((result.0, result.1, freshness))
 }
 
-fn parse_beads(reader: impl Read, deadline: Instant) -> Result<(BTreeMap<String, Bead>, usize), &'static str> {
+fn parse_beads(
+    reader: impl Read,
+    deadline: Instant,
+) -> Result<(BTreeMap<String, Bead>, usize), &'static str> {
     let mut reader = BufReader::new(reader.take(MAX_BYTES + 1));
     let mut records = BTreeMap::new();
     let mut rejected = 0usize;
@@ -298,30 +357,53 @@ fn parse_beads(reader: impl Read, deadline: Instant) -> Result<(BTreeMap<String,
             return Err("beads-read-budget-exceeded");
         }
         line.clear();
-        let read = reader.by_ref().take((MAX_LINE_BYTES + 1) as u64)
-            .read_until(b'\n', &mut line).map_err(|_| "beads-read-failed")?;
-        if read == 0 { break; }
+        let read = reader
+            .by_ref()
+            .take((MAX_LINE_BYTES + 1) as u64)
+            .read_until(b'\n', &mut line)
+            .map_err(|_| "beads-read-failed")?;
+        if read == 0 {
+            break;
+        }
         bytes += read as u64;
-        if bytes > MAX_BYTES { return Err("beads-byte-limit"); }
-        if line.len() > MAX_LINE_BYTES { return Err("beads-record-byte-limit"); }
-        if line.iter().all(u8::is_ascii_whitespace) { continue; }
+        if bytes > MAX_BYTES {
+            return Err("beads-byte-limit");
+        }
+        if line.len() > MAX_LINE_BYTES {
+            return Err("beads-record-byte-limit");
+        }
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
         count += 1;
-        if count > MAX_RECORDS { return Err("beads-record-count-limit"); }
+        if count > MAX_RECORDS {
+            return Err("beads-record-count-limit");
+        }
         let Ok(mut bead) = serde_json::from_slice::<Bead>(&line) else {
             rejected += 1;
             continue;
         };
-        if !valid_id(&bead.id) || bead.priority.is_some_and(|priority| priority > 4)
+        if !valid_id(&bead.id)
+            || bead.priority.is_some_and(|priority| priority > 4)
             || bead.issue_type.len() > 64
             || bead.dependencies.len() > 1024
-            || bead.dependencies.iter().any(|dependency| !valid_id(&dependency.depends_on_id))
-            || !matches!(bead.status.as_str(), "open" | "in_progress" | "blocked" | "deferred" | "closed" | "tombstone")
+            || bead
+                .dependencies
+                .iter()
+                .any(|dependency| !valid_id(&dependency.depends_on_id))
+            || !matches!(
+                bead.status.as_str(),
+                "open" | "in_progress" | "blocked" | "deferred" | "closed" | "tombstone"
+            )
         {
             rejected += 1;
             continue;
         }
         bead.title = bounded_text(&bead.title, 240);
-        bead.assignee = bead.assignee.as_deref().filter(|value| !value.trim().is_empty())
+        bead.assignee = bead
+            .assignee
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
             .map(|value| bounded_text(value, 160));
         if records.insert(bead.id.clone(), bead).is_some() {
             // Last-write-wins would make stale/duplicated snapshots authorize
@@ -340,7 +422,9 @@ fn project_beads(records: &BTreeMap<String, Bead>, rejected: usize) -> Value {
     let mut review_count = 0usize;
     for bead in records.values() {
         *counts.entry(&bead.status).or_default() += 1;
-        if !matches!(bead.status.as_str(), "open" | "in_progress" | "blocked") { continue; }
+        if !matches!(bead.status.as_str(), "open" | "in_progress" | "blocked") {
+            continue;
+        }
         let mut blockers = Vec::new();
         let mut unknown = false;
         for dependency in &bead.dependencies {
@@ -348,7 +432,10 @@ fn project_beads(records: &BTreeMap<String, Bead>, rejected: usize) -> Value {
                 "blocks" => match records.get(&dependency.depends_on_id) {
                     Some(predecessor) if predecessor.status == "closed" => {}
                     Some(_) => blockers.push(dependency.depends_on_id.clone()),
-                    None => { unknown = true; blockers.push(dependency.depends_on_id.clone()); }
+                    None => {
+                        unknown = true;
+                        blockers.push(dependency.depends_on_id.clone());
+                    }
                 },
                 "related" | "parent-child" | "discovered-from" => {}
                 _ => unknown = true,
@@ -380,12 +467,29 @@ fn project_beads(records: &BTreeMap<String, Bead>, rejected: usize) -> Value {
         })));
     }
     tasks.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)));
-    let ready = tasks.iter().filter(|(_, _, task)| task["readiness"] == "locally-unblocked")
-        .take(MAX_VISIBLE_TASKS).map(|(_, _, task)| task.clone()).collect::<Vec<_>>();
-    let active = tasks.iter().filter(|(_, _, task)| task["status"] == "in_progress" || !task["assignee"].is_null())
-        .take(MAX_VISIBLE_TASKS).map(|(_, _, task)| task.clone()).collect::<Vec<_>>();
-    let attention = tasks.iter().filter(|(_, _, task)| matches!(task["readiness"].as_str(), Some("blocked" | "review-required")))
-        .take(MAX_VISIBLE_TASKS).map(|(_, _, task)| task.clone()).collect::<Vec<_>>();
+    let ready = tasks
+        .iter()
+        .filter(|(_, _, task)| task["readiness"] == "locally-unblocked")
+        .take(MAX_VISIBLE_TASKS)
+        .map(|(_, _, task)| task.clone())
+        .collect::<Vec<_>>();
+    let active = tasks
+        .iter()
+        .filter(|(_, _, task)| task["status"] == "in_progress" || !task["assignee"].is_null())
+        .take(MAX_VISIBLE_TASKS)
+        .map(|(_, _, task)| task.clone())
+        .collect::<Vec<_>>();
+    let attention = tasks
+        .iter()
+        .filter(|(_, _, task)| {
+            matches!(
+                task["readiness"].as_str(),
+                Some("blocked" | "review-required")
+            )
+        })
+        .take(MAX_VISIBLE_TASKS)
+        .map(|(_, _, task)| task.clone())
+        .collect::<Vec<_>>();
     json!({
         "complete": rejected == 0, "accepted_records": records.len(), "rejected_records": rejected,
         "counts": counts, "locally_unblocked_count": runnable_count,
@@ -407,8 +511,14 @@ pub(super) fn project(source: Option<&Value>) -> Option<Value> {
     let beads = source.get("beads");
     let gp = git.and_then(|value| value.get("payload"));
     let bp = beads.and_then(|value| value.get("payload"));
-    let complete = bp.and_then(|value| value.get("complete")).and_then(Value::as_bool) == Some(true)
-        && beads.and_then(|value| value.get("status")).and_then(Value::as_str) == Some("ok");
+    let complete = bp
+        .and_then(|value| value.get("complete"))
+        .and_then(Value::as_bool)
+        == Some(true)
+        && beads
+            .and_then(|value| value.get("status"))
+            .and_then(Value::as_str)
+            == Some("ok");
     let task_list = |key: &str| -> Vec<Value> {
         bp.and_then(|value| value.get(key)).and_then(Value::as_array).into_iter().flatten()
             .take(MAX_VISIBLE_TASKS).map(|task| json!({
@@ -423,19 +533,53 @@ pub(super) fn project(source: Option<&Value>) -> Option<Value> {
                     .filter_map(Value::as_str).take(20).map(|value| bounded_text(value, 160)).collect::<Vec<_>>()
             })).collect()
     };
-    let candidates = if complete { task_list("candidate_tasks") } else { Vec::new() };
+    let candidates = if complete {
+        task_list("candidate_tasks")
+    } else {
+        Vec::new()
+    };
     let mut counts = serde_json::Map::new();
-    for status in ["open", "in_progress", "blocked", "deferred", "closed", "tombstone"] {
-        let count = bp.and_then(|value| value.get("counts")).and_then(|value| value.get(status)).and_then(Value::as_u64);
-        counts.insert(status.into(), if complete { json!(count.unwrap_or(0)) } else { json!(count) });
+    for status in [
+        "open",
+        "in_progress",
+        "blocked",
+        "deferred",
+        "closed",
+        "tombstone",
+    ] {
+        let count = bp
+            .and_then(|value| value.get("counts"))
+            .and_then(|value| value.get(status))
+            .and_then(Value::as_u64);
+        counts.insert(
+            status.into(),
+            if complete {
+                json!(count.unwrap_or(0))
+            } else {
+                json!(count)
+            },
+        );
     }
-    let staged = gp.and_then(|value| value.get("staged_changes")).and_then(Value::as_bool);
-    let merge = gp.and_then(|value| value.get("merge_in_progress")).and_then(Value::as_bool);
-    let blocked = bp.and_then(|value| value.get("dependency_blocked_count")).and_then(Value::as_u64);
-    let review = bp.and_then(|value| value.get("review_required_count")).and_then(Value::as_u64);
-    let status = if merge == Some(true) || blocked.is_some_and(|count| count > 0) || review.is_some_and(|count| count > 0) {
+    let staged = gp
+        .and_then(|value| value.get("staged_changes"))
+        .and_then(Value::as_bool);
+    let merge = gp
+        .and_then(|value| value.get("merge_in_progress"))
+        .and_then(Value::as_bool);
+    let blocked = bp
+        .and_then(|value| value.get("dependency_blocked_count"))
+        .and_then(Value::as_u64);
+    let review = bp
+        .and_then(|value| value.get("review_required_count"))
+        .and_then(Value::as_u64);
+    let status = if merge == Some(true)
+        || blocked.is_some_and(|count| count > 0)
+        || review.is_some_and(|count| count > 0)
+    {
         "warning"
-    } else { "partial" }; // Reservation and worktree coverage are always missing.
+    } else {
+        "partial"
+    }; // Reservation and worktree coverage are always missing.
     Some(json!({
         "status": status,
         "git": {
@@ -458,11 +602,16 @@ pub(super) fn project(source: Option<&Value>) -> Option<Value> {
 }
 
 fn display_field(source: Option<&Value>, field: &str, max: usize) -> Option<String> {
-    source.and_then(|value| value.get(field)).and_then(Value::as_str).map(|value| bounded_text(value, max))
+    source
+        .and_then(|value| value.get(field))
+        .and_then(Value::as_str)
+        .map(|value| bounded_text(value, max))
 }
 
 fn provider_fields(source: Option<&Value>) -> Value {
-    let status = source.and_then(|value| value.get("status")).and_then(Value::as_str);
+    let status = source
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str);
     json!({
         "status": status.filter(|value| matches!(*value, "ok" | "partial" | "unavailable" | "skipped")).unwrap_or("unavailable"),
         "error_kind": display_field(source, "error_kind", 80),
@@ -473,24 +622,46 @@ fn provider_fields(source: Option<&Value>) -> Value {
 }
 
 pub(super) fn html(card: &Value) -> String {
-    let field = |pointer: &str| card.pointer(pointer).and_then(Value::as_str).unwrap_or("unavailable");
+    let field = |pointer: &str| {
+        card.pointer(pointer)
+            .and_then(Value::as_str)
+            .unwrap_or("unavailable")
+    };
     let boolean = |pointer: &str| match card.pointer(pointer).and_then(Value::as_bool) {
-        Some(true) => "yes", Some(false) => "no", None => "unknown",
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unknown",
     };
     let mut body = format!(
         "<p><strong>Git:</strong> {}. Staged changes: {}; merge in progress: {}.</p><p><strong>Beads:</strong> {}. Complete local snapshot: {}.</p>",
-        super::html_escape(field("/git/provider/status")), boolean("/git/staged_changes"), boolean("/git/merge_in_progress"),
-        super::html_escape(field("/beads/provider/status")), boolean("/beads/complete")
+        super::html_escape(field("/git/provider/status")),
+        boolean("/git/staged_changes"),
+        boolean("/git/merge_in_progress"),
+        super::html_escape(field("/beads/provider/status")),
+        boolean("/beads/complete")
     );
-    for (key, title) in [("candidate_tasks", "Locally unblocked candidates"), ("active_tasks", "Assigned or active tasks"), ("attention_tasks", "Blocked or review required")] {
+    for (key, title) in [
+        ("candidate_tasks", "Locally unblocked candidates"),
+        ("active_tasks", "Assigned or active tasks"),
+        ("attention_tasks", "Blocked or review required"),
+    ] {
         body.push_str(&format!("<h3>{title}</h3><ul>"));
-        let tasks = card.pointer(&format!("/beads/{key}")).and_then(Value::as_array);
+        let tasks = card
+            .pointer(&format!("/beads/{key}"))
+            .and_then(Value::as_array);
         if tasks.is_none_or(Vec::is_empty) {
             body.push_str("<li class=\"muted\">None reported by this snapshot.</li>");
         }
         for task in tasks.into_iter().flatten().take(MAX_VISIBLE_TASKS) {
-            let text = |key| super::html_escape(task.get(key).and_then(Value::as_str).unwrap_or("unknown"));
-            body.push_str(&format!("<li><code>{}</code> — {}<br><span class=\"muted\">{}</span></li>", text("id"), text("title"), text("readiness")));
+            let text = |key| {
+                super::html_escape(task.get(key).and_then(Value::as_str).unwrap_or("unknown"))
+            };
+            body.push_str(&format!(
+                "<li><code>{}</code> — {}<br><span class=\"muted\">{}</span></li>",
+                text("id"),
+                text("title"),
+                text("readiness")
+            ));
         }
         body.push_str("</ul>");
     }
@@ -513,7 +684,11 @@ mod tests {
         json!({"id": id, "title": id, "status": status, "issue_type": "task", "priority": priority})
     }
     fn lines(records: &[Value]) -> String {
-        records.iter().map(Value::to_string).collect::<Vec<_>>().join("\n")
+        records
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -523,14 +698,31 @@ mod tests {
         blocked["dependencies"] = json!([{"depends_on_id": "open", "type": "blocks"}]);
         let mut ready = bead("ready", "open", 1);
         ready["dependencies"] = json!([{"depends_on_id": "done", "type": "blocks"}]);
-        let p = payload(&lines(&[done, blocked, ready, bead("open", "open", 2), bead("alpha", "open", 1)]));
-        assert_eq!(p["candidate_tasks"].as_array().unwrap().iter().map(|task| task["id"].as_str().unwrap()).collect::<Vec<_>>(), ["alpha", "ready", "open"]);
+        let p = payload(&lines(&[
+            done,
+            blocked,
+            ready,
+            bead("open", "open", 2),
+            bead("alpha", "open", 1),
+        ]));
+        assert_eq!(
+            p["candidate_tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|task| task["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["alpha", "ready", "open"]
+        );
         assert_eq!(p["dependency_blocked_count"], 1);
     }
 
     #[test]
     fn unknown_dependency_semantics_and_missing_predecessors_require_review() {
-        for dependency in [json!({"depends_on_id": "missing", "type": "blocks"}), json!({"depends_on_id": "done", "type": "conditional-blocks"})] {
+        for dependency in [
+            json!({"depends_on_id": "missing", "type": "blocks"}),
+            json!({"depends_on_id": "done", "type": "conditional-blocks"}),
+        ] {
             let mut task = bead("task", "open", 0);
             task["dependencies"] = json!([dependency]);
             let p = payload(&lines(&[task, bead("done", "closed", 0)]));
@@ -552,7 +744,11 @@ mod tests {
 
     #[test]
     fn malformed_or_unknown_records_suppress_all_runnable_claims() {
-        for invalid in ["{not-json}", r#"{"id":"bad","status":"unknown"}"#, r#"{"id":"bad","status":"open","priority":9}"#] {
+        for invalid in [
+            "{not-json}",
+            r#"{"id":"bad","status":"unknown"}"#,
+            r#"{"id":"bad","status":"open","priority":9}"#,
+        ] {
             let p = payload(&format!("{}\n{invalid}\n", bead("valid", "open", 0)));
             assert_eq!(p["complete"], false);
             assert_eq!(p["rejected_records"], 1);
@@ -563,32 +759,56 @@ mod tests {
     #[test]
     fn duplicate_ids_are_rejected_instead_of_last_write_wins() {
         let input = lines(&[bead("same", "closed", 0), bead("same", "open", 0)]);
-        assert!(matches!(parse_beads(input.as_bytes(), Instant::now() + READ_BUDGET), Err("beads-duplicate-identity")));
+        assert!(matches!(
+            parse_beads(input.as_bytes(), Instant::now() + READ_BUDGET),
+            Err("beads-duplicate-identity")
+        ));
     }
 
     #[test]
     fn record_byte_and_elapsed_budgets_fail_without_partial_ready_output() {
         let oversized = vec![b' '; MAX_LINE_BYTES + 1];
-        assert!(matches!(parse_beads(oversized.as_slice(), Instant::now() + READ_BUDGET), Err("beads-record-byte-limit")));
-        assert!(matches!(parse_beads(&b""[..], Instant::now()), Err("beads-read-budget-exceeded")));
+        assert!(matches!(
+            parse_beads(oversized.as_slice(), Instant::now() + READ_BUDGET),
+            Err("beads-record-byte-limit")
+        ));
+        assert!(matches!(
+            parse_beads(&b""[..], Instant::now()),
+            Err("beads-read-budget-exceeded")
+        ));
     }
 
     #[test]
     fn visible_task_lists_are_bounded_but_total_counts_are_not_truncated() {
-        let input = lines(&(0..57).map(|id| bead(&format!("task-{id:03}"), "open", 1)).collect::<Vec<_>>());
+        let input = lines(
+            &(0..57)
+                .map(|id| bead(&format!("task-{id:03}"), "open", 1))
+                .collect::<Vec<_>>(),
+        );
         let p = payload(&input);
         assert_eq!(p["locally_unblocked_count"], 57);
-        assert_eq!(p["candidate_tasks"].as_array().unwrap().len(), MAX_VISIBLE_TASKS);
+        assert_eq!(
+            p["candidate_tasks"].as_array().unwrap().len(),
+            MAX_VISIBLE_TASKS
+        );
     }
 
     #[test]
     fn projection_rejects_arbitrary_content_and_does_not_infer_missing_counts() {
-        let card = project(Some(&json!({"beads": {"status": "unavailable", "payload": {
+        let card = project(Some(
+            &json!({"beads": {"status": "unavailable", "payload": {
             "complete": true, "candidate_tasks": [{"id": "forged", "title": "not eligible"}],
             "description": "private body"
-        }}, "unknown": "private body"}))).unwrap();
+        }}, "unknown": "private body"}),
+        ))
+        .unwrap();
         assert!(card["beads"]["counts"]["open"].is_null());
-        assert!(card["beads"]["candidate_tasks"].as_array().unwrap().is_empty());
+        assert!(
+            card["beads"]["candidate_tasks"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         assert!(!card.to_string().contains("private body"));
         assert_eq!(card["coordination_verified"], false);
     }
@@ -599,16 +819,28 @@ mod tests {
         fs::create_dir(temp.path().join(".beads"))?;
         let nested = temp.path().join("one/two");
         fs::create_dir_all(&nested)?;
-        assert_eq!(repository_root(&nested).unwrap(), temp.path().canonicalize()?);
-        fs::write(temp.path().join(".git"), "gitdir: /unused-worktree-metadata\n")?;
-        assert_eq!(repository_root(&nested).unwrap(), temp.path().canonicalize()?);
+        assert_eq!(
+            repository_root(&nested).unwrap(),
+            temp.path().canonicalize()?
+        );
+        fs::write(
+            temp.path().join(".git"),
+            "gitdir: /unused-worktree-metadata\n",
+        )?;
+        assert_eq!(
+            repository_root(&nested).unwrap(),
+            temp.path().canonicalize()?
+        );
         Ok(())
     }
 
     #[test]
     fn file_reader_preserves_bytes_and_reports_missing_sources() -> std::io::Result<()> {
         let temp = tempfile::tempdir()?;
-        assert_eq!(collect_beads(temp.path()).status, crate::swarm_status::SwarmProviderStatus::Unavailable);
+        assert_eq!(
+            collect_beads(temp.path()).status,
+            crate::swarm_status::SwarmProviderStatus::Unavailable
+        );
         let directory = temp.path().join(".beads");
         fs::create_dir(&directory)?;
         let path = directory.join("issues.jsonl");
@@ -629,15 +861,27 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let private = temp.path().join("private");
         fs::create_dir(&private)?;
-        fs::write(private.join("issues.jsonl"), lines(&[bead("secret", "open", 0)]))?;
+        fs::write(
+            private.join("issues.jsonl"),
+            lines(&[bead("secret", "open", 0)]),
+        )?;
         let root = temp.path().join("root");
         fs::create_dir(&root)?;
         std::os::unix::fs::symlink(&private, root.join(".beads"))?;
-        assert_eq!(collect_beads(&root).error_kind.as_deref(), Some("beads-directory-not-regular"));
+        assert_eq!(
+            collect_beads(&root).error_kind.as_deref(),
+            Some("beads-directory-not-regular")
+        );
         let other = temp.path().join("other");
         fs::create_dir_all(other.join(".beads"))?;
-        std::os::unix::fs::symlink(private.join("issues.jsonl"), other.join(".beads/issues.jsonl"))?;
-        assert_eq!(collect_beads(&other).error_kind.as_deref(), Some("beads-snapshot-not-regular"));
+        std::os::unix::fs::symlink(
+            private.join("issues.jsonl"),
+            other.join(".beads/issues.jsonl"),
+        )?;
+        assert_eq!(
+            collect_beads(&other).error_kind.as_deref(),
+            Some("beads-snapshot-not-regular")
+        );
         Ok(())
     }
 

@@ -7,7 +7,9 @@
 
 use std::path::Path;
 
-use crate::daemon::protocol::{EmbeddingJobDetail, EmbeddingJobInfo, ErrorCode, ErrorResponse, Response};
+use crate::daemon::protocol::{
+    EmbeddingJobDetail, EmbeddingJobInfo, ErrorCode, ErrorResponse, Response,
+};
 use crate::daemon::worker::{EmbeddingJobConfig, EmbeddingWorkerHandle};
 use crate::franken_sync::compat::{ConnectionExt, OpenFlags, ParamValue, RowExt, open_with_flags};
 
@@ -45,7 +47,11 @@ pub(super) fn submit(
     worker: Option<&EmbeddingWorkerHandle>,
 ) -> Response {
     let Some(worker) = worker else {
-        return error(ErrorCode::Internal, "embedding worker not initialized", true);
+        return error(
+            ErrorCode::Internal,
+            "embedding worker not initialized",
+            true,
+        );
     };
     match worker.submit(config) {
         Ok(()) => Response::JobSubmitted {
@@ -62,7 +68,11 @@ pub(super) fn cancel(
     worker: Option<&EmbeddingWorkerHandle>,
 ) -> Response {
     let Some(worker) = worker else {
-        return error(ErrorCode::Internal, "embedding worker not initialized; cancellation was not admitted", true);
+        return error(
+            ErrorCode::Internal,
+            "embedding worker not initialized; cancellation was not admitted",
+            true,
+        );
     };
     match worker.cancel_with_count(db_path, model_id) {
         Ok(count) => Response::JobCancelled {
@@ -77,24 +87,42 @@ pub(super) fn cancel(
 
 pub(super) fn status(db_path: &str) -> Response {
     if db_path.trim().is_empty() || db_path.len() > MAX_PATH_BYTES || db_path.contains('\0') {
-        return error(ErrorCode::InvalidInput, "job status requires a valid bounded database path", false);
+        return error(
+            ErrorCode::InvalidInput,
+            "job status requires a valid bounded database path",
+            false,
+        );
     }
     match std::fs::metadata(Path::new(db_path)) {
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
             return Response::JobStatus(EmbeddingJobInfo { jobs: Vec::new() });
         }
         Ok(metadata) if metadata.is_file() => {}
-        Ok(_) => return error(ErrorCode::InvalidInput, "job status target is not a regular file", false),
+        Ok(_) => {
+            return error(
+                ErrorCode::InvalidInput,
+                "job status target is not a regular file",
+                false,
+            );
+        }
         Err(source) => {
             tracing::warn!(error = %source, "Cannot inspect embedding job status target");
-            return error(ErrorCode::Internal, "could not inspect job status database", false);
+            return error(
+                ErrorCode::Internal,
+                "could not inspect job status database",
+                false,
+            );
         }
     }
     match read_status(db_path) {
         Ok(jobs) => Response::JobStatus(EmbeddingJobInfo { jobs }),
         Err(source) => {
             tracing::warn!(error = %source, "Cannot read bounded embedding job status");
-            error(ErrorCode::Internal, format!("could not read job status: {source}"), false)
+            error(
+                ErrorCode::Internal,
+                format!("could not read job status: {source}"),
+                false,
+            )
         }
     }
 }
@@ -116,14 +144,16 @@ fn read_status(db_path: &str) -> anyhow::Result<Vec<EmbeddingJobDetail>> {
             ParamValue::from((MAX_ERROR_CHARS + 1) as i64),
             ParamValue::from((MAX_STATUS_ROWS + 1) as i64),
         ],
-        |row| Ok(EmbeddingJobDetail {
-            job_id: row.get_typed(0)?,
-            model_id: row.get_typed(1)?,
-            status: row.get_typed(2)?,
-            total_docs: row.get_typed(3)?,
-            completed_docs: row.get_typed(4)?,
-            error_message: row.get_typed(5)?,
-        }),
+        |row| {
+            Ok(EmbeddingJobDetail {
+                job_id: row.get_typed(0)?,
+                model_id: row.get_typed(1)?,
+                status: row.get_typed(2)?,
+                total_docs: row.get_typed(3)?,
+                completed_docs: row.get_typed(4)?,
+                error_message: row.get_typed(5)?,
+            })
+        },
     )?;
     if jobs.len() > MAX_STATUS_ROWS {
         anyhow::bail!("embedding job status exceeds the {MAX_STATUS_ROWS}-row response limit");
@@ -175,19 +205,28 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("absent.db").to_string_lossy().into_owned();
         assert!(matches!(status(&path), Response::JobStatus(info) if info.jobs.is_empty()));
-        assert!(matches!(cancel(path.clone(), None, None), Response::Error(error) if error.retryable));
+        assert!(
+            matches!(cancel(path.clone(), None, None), Response::Error(error) if error.retryable)
+        );
         assert!(!Path::new(&path).exists());
         assert_eq!(std::fs::read_dir(temp.path())?.count(), 0);
         Ok(())
     }
 
     #[test]
-    fn accepted_cancellation_reports_signalled_passes_not_completed_cleanup() -> anyhow::Result<()> {
+    fn accepted_cancellation_reports_signalled_passes_not_completed_cleanup() -> anyhow::Result<()>
+    {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("absent.db").to_string_lossy().into_owned();
         let (_worker, handle) = EmbeddingWorker::new();
-        let job = config(path.clone(), temp.path().join("index").to_string_lossy().into_owned());
-        assert!(matches!(submit(job, "request-one", Some(&handle)), Response::JobSubmitted { .. }));
+        let job = config(
+            path.clone(),
+            temp.path().join("index").to_string_lossy().into_owned(),
+        );
+        assert!(matches!(
+            submit(job, "request-one", Some(&handle)),
+            Response::JobSubmitted { .. }
+        ));
         match cancel(path.clone(), None, Some(&handle)) {
             Response::JobCancelled { cancelled, message } => {
                 assert_eq!(cancelled, 2);
@@ -196,7 +235,10 @@ mod tests {
             }
             other => panic!("expected an admission receipt, got {other:?}"),
         }
-        assert!(matches!(cancel(path.clone(), None, Some(&handle)), Response::JobCancelled { cancelled: 0, .. }));
+        assert!(matches!(
+            cancel(path.clone(), None, Some(&handle)),
+            Response::JobCancelled { cancelled: 0, .. }
+        ));
         assert!(!Path::new(&path).exists());
         Ok(())
     }
@@ -206,24 +248,36 @@ mod tests {
         let (_worker, handle) = EmbeddingWorker::new();
         for index in 0..32 {
             let job = config(format!("/archive/{index}.db"), format!("/index/{index}"));
-            assert!(matches!(submit(job, "request", Some(&handle)), Response::JobSubmitted { .. }));
+            assert!(matches!(
+                submit(job, "request", Some(&handle)),
+                Response::JobSubmitted { .. }
+            ));
         }
         let overflow = config("/archive/overflow.db".into(), "/index/overflow".into());
-        assert!(matches!(submit(overflow, "overflow", Some(&handle)), Response::Error(error)
-            if error.code == ErrorCode::Overloaded && error.retryable && error.retry_after_ms.is_some()));
+        assert!(
+            matches!(submit(overflow, "overflow", Some(&handle)), Response::Error(error)
+            if error.code == ErrorCode::Overloaded && error.retryable && error.retry_after_ms.is_some())
+        );
         let invalid = config(String::new(), "/index/invalid".into());
-        assert!(matches!(submit(invalid, "invalid", Some(&handle)), Response::Error(error)
-            if error.code == ErrorCode::InvalidInput && !error.retryable));
+        assert!(
+            matches!(submit(invalid, "invalid", Some(&handle)), Response::Error(error)
+            if error.code == ErrorCode::InvalidInput && !error.retryable)
+        );
     }
 
     #[test]
     fn refused_cancellation_is_an_error_not_a_successful_zero_count() {
         let (_worker, handle) = EmbeddingWorker::new();
         for index in 0..32 {
-            assert!(matches!(cancel(format!("/archive/{index}.db"), None, Some(&handle)), Response::JobCancelled { .. }));
+            assert!(matches!(
+                cancel(format!("/archive/{index}.db"), None, Some(&handle)),
+                Response::JobCancelled { .. }
+            ));
         }
-        assert!(matches!(cancel("/archive/overflow.db".into(), None, Some(&handle)), Response::Error(error)
-            if error.code == ErrorCode::Overloaded && error.retryable));
+        assert!(
+            matches!(cancel("/archive/overflow.db".into(), None, Some(&handle)), Response::Error(error)
+            if error.code == ErrorCode::Overloaded && error.retryable)
+        );
     }
 
     #[test]
@@ -233,10 +287,19 @@ mod tests {
         let path_text = path.to_string_lossy().into_owned();
         let connection = Connection::open(path_text.clone())?;
         schema(&connection)?;
-        for (id, model, state, done) in [(1_i64, "hash", "completed", 10_i64), (2, "minilm", "running", 4)] {
+        for (id, model, state, done) in [
+            (1_i64, "hash", "completed", 10_i64),
+            (2, "minilm", "running", 4),
+        ] {
             connection.execute_compat(
                 "INSERT INTO embedding_jobs VALUES (?1, ?2, ?3, ?4, 10, ?5, NULL)",
-                &[ParamValue::from(id), ParamValue::from(path_text.as_str()), ParamValue::from(model), ParamValue::from(state), ParamValue::from(done)],
+                &[
+                    ParamValue::from(id),
+                    ParamValue::from(path_text.as_str()),
+                    ParamValue::from(model),
+                    ParamValue::from(state),
+                    ParamValue::from(done),
+                ],
             )?;
         }
         connection.close()?;
@@ -263,11 +326,17 @@ mod tests {
         let diagnostic = "界".repeat(MAX_ERROR_CHARS + 100);
         connection.execute_compat(
             "INSERT INTO embedding_jobs VALUES (1, ?1, 'minilm', 'failed', 10, 0, ?2)",
-            &[ParamValue::from(path.as_str()), ParamValue::from(diagnostic.as_str())],
+            &[
+                ParamValue::from(path.as_str()),
+                ParamValue::from(diagnostic.as_str()),
+            ],
         )?;
         connection.close()?;
         let rows = read_status(&path)?;
-        assert_eq!(rows[0].error_message.as_deref(), Some(("界".repeat(MAX_ERROR_CHARS) + " [truncated]").as_str()));
+        assert_eq!(
+            rows[0].error_message.as_deref(),
+            Some(("界".repeat(MAX_ERROR_CHARS) + " [truncated]").as_str())
+        );
         let connection = Connection::open(path.clone())?;
         let oversized = "m".repeat(MAX_MODEL_CHARS + 1);
         connection.execute_compat(
@@ -280,7 +349,8 @@ mod tests {
     }
 
     #[test]
-    fn status_refuses_excess_rows_instead_of_claiming_an_incomplete_list_is_complete() -> anyhow::Result<()> {
+    fn status_refuses_excess_rows_instead_of_claiming_an_incomplete_list_is_complete()
+    -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("jobs.db").to_string_lossy().into_owned();
         let connection = Connection::open(path.clone())?;

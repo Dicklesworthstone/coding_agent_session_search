@@ -479,10 +479,10 @@ fn admit_tier(
             .ok_or(SemanticSelectionError::UnsupportedArtifact { role })?
             .generation;
         let expected = FsviV2IdentityBinding::new(generation, artifact.embedding_identity.clone())?;
-        if let Some(first) = binding.as_ref() {
-            if first != &expected {
-                return Err(SemanticReaderError::MixedTierIdentity.into());
-            }
+        if let Some(first) = binding.as_ref()
+            && first != &expected
+        {
+            return Err(SemanticReaderError::MixedTierIdentity.into());
         }
         let owner = ValidatedFsviBytes::open_published(&path, &expected).map_err(|source| {
             SemanticSelectionError::Admission {
@@ -517,15 +517,14 @@ fn admit_tier(
             first_live = Some(first_live.map_or(id, |first| first.min(id)));
             last_live = Some(last_live.map_or(id, |last| last.max(id)));
         }
-        if let Some(shard) = &artifact.shard {
-            if first_live != Some(shard.first_document_id.as_str())
-                || last_live != Some(shard.last_document_id.as_str())
-            {
-                return Err(SemanticSelectionError::ArtifactMismatch {
-                    role,
-                    field: "shard_document_range",
-                });
-            }
+        if let Some(shard) = &artifact.shard
+            && (first_live != Some(shard.first_document_id.as_str())
+                || last_live != Some(shard.last_document_id.as_str()))
+        {
+            return Err(SemanticSelectionError::ArtifactMismatch {
+                role,
+                field: "shard_document_range",
+            });
         }
     }
     if artifacts[0].shard.is_some()

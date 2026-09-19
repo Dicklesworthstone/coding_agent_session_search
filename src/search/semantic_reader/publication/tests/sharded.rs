@@ -223,7 +223,8 @@ fn partial_quality_partition_does_not_claim_full_coverage() -> TestResult {
 fn malformed_partitions_fail_before_any_publication() -> TestResult {
     let root = tempfile::tempdir()?;
     let good = partitioned(root.path(), "structural", 1, None);
-    let mutations: Vec<Box<dyn Fn(&mut SemanticGenerationManifestV1)>> = vec![
+    type ManifestMutation = Box<dyn Fn(&mut SemanticGenerationManifestV1)>;
+    let mutations: Vec<ManifestMutation> = vec![
         Box::new(|m| m.artifacts[1].shard.as_mut().unwrap().ordinal = 2),
         Box::new(|m| m.artifacts[1].shard.as_mut().unwrap().shard_count = 4),
         Box::new(|m| {

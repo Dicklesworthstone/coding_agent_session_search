@@ -2753,13 +2753,8 @@ impl SemanticIndexer {
 
         if !current_records.is_empty() {
             let records = std::mem::take(&mut current_records);
-            let (record, path, ann_path) = self.write_semantic_shard(
-                records,
-                data_dir,
-                &generation_dir,
-                &plan,
-                shard_index,
-            )?;
+            let (record, path, ann_path) =
+                self.write_semantic_shard(records, data_dir, &generation_dir, &plan, shard_index)?;
             total_docs = total_docs.saturating_add(record.doc_count);
             shard_records.push(record);
             index_paths.push(path);
