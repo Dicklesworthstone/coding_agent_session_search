@@ -42,6 +42,7 @@ pub mod guide_runner;
 pub mod html_export;
 pub mod incident_discovery;
 pub mod indexer;
+mod index_result;
 pub mod lessons;
 pub mod lessons_extraction;
 pub mod metric_integrity;
@@ -105582,6 +105583,11 @@ fn run_lexical_gc_cli(
 fn cached_index_payload(result_json: &str, key: &str) -> Option<serde_json::Value> {
     let mut payload =
         serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(result_json).ok()?;
+    // Older versions could cache success despite nested connector failures.
+    // Do not replay those receipts as a successful invocation after upgrading.
+    if index_result::cached_scan_is_incomplete(&payload) {
+        return None;
+    }
     payload.insert("cached".to_string(), serde_json::Value::Bool(true));
     payload.insert(
         "idempotency_key".to_string(),
@@ -106316,6 +106322,18 @@ fn run_index_with_data(
     if let Some(previous) = previous_robot_trace_ingest {
         let _ = indexer::set_robot_trace_ingest_enabled(previous);
     }
+    // Persisted neighbors are useful, but a failed source scan is not a
+    // complete index invocation. Decide before success progress, completion
+    // events and idempotency writes; do not reopen the archive to find out.
+    if res.is_ok()
+        && let Ok(stats) = index_progress.stats.lock()
+        && let Err(error) = index_result::require_complete_scan(
+            stats.scan_had_errors,
+            &stats.connectors,
+        )
+    {
+        res = Err(error);
+    }
     if res.is_ok()
         && let Err(err) =
             validate_successful_index_artifacts(&data_dir, &db_path, full, force_rebuild)
@@ -106351,6 +106369,17 @@ fn run_index_with_data(
         );
         if let Some(fmt) = structured_format {
             let mut payload = cli_error_json_payload(err, elapsed_ms);
+            if let Ok(stats) = index_progress.stats.lock()
+                && index_result::annotate_partial_scan(
+                    &mut payload,
+                    stats.scan_had_errors,
+                    &stats.connectors,
+                )
+            {
+                // Include the original bounded connector diagnostics, not
+                // just a generic command error. Counts remain run observations.
+                payload["indexing_stats"] = serde_json::to_value(&*stats).unwrap_or_default();
+            }
             if let Some(active_index) = &active_index_error {
                 payload["active_index"] = active_index.to_json();
             }

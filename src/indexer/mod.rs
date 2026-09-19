@@ -939,6 +939,10 @@ pub struct IndexingStats {
     /// bytes or an attribution to one storage layer. Omitted when unavailable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_written: Option<u64>,
+    /// True when any attempted source/connector scan failed. Successful
+    /// source commits are retained, but this run must not report complete
+    /// coverage or cache a successful command result (GH #484).
+    pub scan_had_errors: bool,
     /// Per-connector breakdown
     pub connectors: Vec<ConnectorStats>,
     /// Per-provider source outcomes; unlike conversation counts this preserves
@@ -14413,6 +14417,7 @@ fn run_streaming_consumer(
             .quarantined_conversations
             .saturating_add(ingest_outcome.quarantined_conversations);
         stats.lexical_update_deferred |= ingest_outcome.lexical_update_deferred;
+        stats.scan_had_errors |= ingest_outcome.scan_had_errors;
     }
 
     tracing::info!(
@@ -15258,6 +15263,7 @@ fn run_batch_index_with_connector_factories(
             .quarantined_conversations
             .saturating_add(ingest_outcome.quarantined_conversations);
         stats.lexical_update_deferred |= ingest_outcome.lexical_update_deferred;
+        stats.scan_had_errors |= ingest_outcome.scan_had_errors || scan_had_errors;
     }
 
     ingest_outcome.scanned_connectors.extend(scanned_connectors);
@@ -47716,6 +47722,7 @@ mod tests {
         );
         assert!(mutations.scan_had_errors);
         let stats = progress.stats.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(stats.scan_had_errors, "CLI must observe the failed scan");
         assert_eq!(stats.agents_discovered, vec!["claude".to_string()]);
         assert_eq!(
             stats
