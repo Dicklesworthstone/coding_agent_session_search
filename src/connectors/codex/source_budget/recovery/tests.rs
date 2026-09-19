@@ -3,14 +3,14 @@ use crate::connectors::codex::CodexConnector;
 use std::fs;
 use std::path::PathBuf;
 
-fn message(text: &str) -> String {
+pub(super) fn message(text: &str) -> String {
     format!(
         "{}\n",
         serde_json::json!({"type":"response_item","payload":{"role":"user","content":text}})
     )
 }
 
-fn corpus() -> Result<(tempfile::TempDir, Vec<PathBuf>, ScanContext)> {
+pub(super) fn corpus() -> Result<(tempfile::TempDir, Vec<PathBuf>, ScanContext)> {
     let root = tempfile::tempdir()?;
     let sessions = root.path().join(".codex/sessions/2026/09/19");
     fs::create_dir_all(&sessions)?;
@@ -74,10 +74,7 @@ fn unfinished_middle_source_does_not_starve_later_sessions() -> Result<()> {
         let report = error.downcast_ref::<FailureReport>().unwrap();
         assert_eq!(report.failed_source_count, 1);
         assert_eq!(report.failed_sources[0].reason, "unfinished_source");
-        assert_eq!(
-            report.failed_sources[0].source_path,
-            paths[1].to_string_lossy()
-        );
+        assert_eq!(PathBuf::from(&report.failed_sources[0].source_path), paths[1]);
         assert!(!error.to_string().contains("unfinished-private-prefix"));
         assert!(
             connector.scan(&ctx).is_err(),
@@ -154,7 +151,11 @@ fn consumer_errors_abort_even_after_a_source_local_failure() -> Result<()> {
             .unwrap_err();
         assert_eq!(error.to_string(), "consumer failure");
         assert!(error.downcast_ref::<FailureReport>().is_none());
-        assert_eq!(delivered, [paths[1].clone()], "later storage writes must stop");
+        assert_eq!(
+            delivered,
+            [paths[1].clone()],
+            "later storage writes must stop"
+        );
     }
     Ok(())
 }
@@ -185,7 +186,10 @@ fn disappeared_inventory_source_is_not_a_successful_empty_scan() -> Result<()> {
         io::ErrorKind::NotFound
     );
     assert_eq!(
-        error.downcast_ref::<FailureReport>().unwrap().failed_source_count,
+        error
+            .downcast_ref::<FailureReport>()
+            .unwrap()
+            .failed_source_count,
         1
     );
     Ok(())

@@ -12,9 +12,9 @@ use franken_agent_detection::ScanRoot;
 use serde::Serialize;
 
 use super::{
-    Connector, DiscoveredSourceFile, DiscoveredSourceRole, IncompleteScan,
-    MAX_REJECTION_SAMPLES, NormalizedConversation, RejectedSource, Result, ScanContext,
-    ScanExclusions, SourceCompletion, SourceScanHooks, scan_with_exclusions,
+    Connector, DiscoveredSourceFile, DiscoveredSourceRole, IncompleteScan, MAX_REJECTION_SAMPLES,
+    NormalizedConversation, RejectedSource, Result, ScanContext, ScanExclusions, SourceCompletion,
+    SourceScanHooks, scan_with_exclusions,
 };
 
 #[derive(Debug, Serialize)]
@@ -68,10 +68,14 @@ impl Failures {
                 .saturating_add(budget.rejected_source_count);
             let available = MAX_REJECTION_SAMPLES - self.budgets.rejected_sources.len();
             self.budgets.rejected_sources.extend(
-                budget.rejected_sources.iter().take(available).map(|sample| RejectedSource {
-                    source_path: sample.source_path.clone(),
-                    observed_bytes: sample.observed_bytes,
-                }),
+                budget
+                    .rejected_sources
+                    .iter()
+                    .take(available)
+                    .map(|sample| RejectedSource {
+                        source_path: sample.source_path.clone(),
+                        observed_bytes: sample.observed_bytes,
+                    }),
             );
             self.budgets.omitted_source_count = self
                 .budgets
@@ -127,7 +131,13 @@ fn scoped_context(ctx: &ScanContext, source: &DiscoveredSourceFile) -> ScanConte
                     || root.path.starts_with(&source.scan_root))
         })
         .map_or_else(
-            || ScanRoot::remote(source.source_path.clone(), source.origin.clone(), source.platform),
+            || {
+                ScanRoot::remote(
+                    source.source_path.clone(),
+                    source.origin.clone(),
+                    source.platform,
+                )
+            },
             |root| root.with_path(source.source_path.clone()),
         );
     // Discovery already applied the incremental cutoff. Applying it twice
@@ -149,6 +159,21 @@ fn original_identity(
     observed
 }
 
+fn directory_session_id(source: &DiscoveredSourceFile) -> Option<String> {
+    // FAD's directory scan derives the ID relative to root/sessions when that
+    // is the selected subtree, otherwise relative to the root itself. Its
+    // explicit-file API instead finds the nearest sessions ancestor. Preserve
+    // the original directory contract for dated subroots and custom mirrors;
+    // changing the scope for recovery must not create duplicate stored sessions.
+    source
+        .source_path
+        .strip_prefix(source.scan_root.join("sessions"))
+        .or_else(|_| source.source_path.strip_prefix(&source.scan_root))
+        .ok()
+        .and_then(|relative| relative.with_extension("").to_str().map(str::to_owned))
+        .or_else(|| source.source_path.file_stem()?.to_str().map(str::to_owned))
+}
+
 fn scan_source(
     inner: &dyn Connector,
     ctx: &ScanContext,
@@ -161,6 +186,8 @@ fn scan_source(
     let consumer_failed = Cell::new(false);
     let visited = Cell::new(false);
     let scope_changed = Cell::new(false);
+    let directory_id = (source.scan_root != source.source_path)
+        .then(|| directory_session_id(source));
     let SourceScanHooks {
         should_scan_source,
         on_source_complete,
@@ -174,7 +201,9 @@ fn scan_source(
         }
         visited.set(true);
         let observed = original_identity(observed.clone(), source);
-        should_scan_source.as_mut().is_none_or(|predicate| predicate(&observed))
+        should_scan_source
+            .as_mut()
+            .is_none_or(|predicate| predicate(&observed))
     };
     let mut complete = |done: &SourceCompletion| {
         let done = SourceCompletion {
@@ -187,7 +216,10 @@ fn scan_source(
             .map_or(Ok(()), |sink| sink(&done))
             .inspect_err(|_| consumer_failed.set(true))
     };
-    let mut deliver = |conversation| {
+    let mut deliver = |mut conversation: NormalizedConversation| {
+        if let Some(id) = &directory_id {
+            conversation.external_id.clone_from(id);
+        }
         on_conversation(conversation).inspect_err(|_| consumer_failed.set(true))
     };
     let mut guarded = SourceScanHooks {
@@ -229,7 +261,10 @@ pub(super) fn scan(
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     mut enrich: impl FnMut(&mut NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
-    anyhow::ensure!(inner.supports_source_boundaries(), "Codex recovery requires source boundaries");
+    anyhow::ensure!(
+        inner.supports_source_boundaries(),
+        "Codex recovery requires source boundaries"
+    );
     let exclusions = ScanExclusions::from_env();
     let sources = inner.discover_source_files(ctx)?;
     let mut failures = Failures::default();
@@ -238,11 +273,18 @@ pub(super) fn scan(
             continue;
         }
         anyhow::ensure!(
-            source.provider_slug == "codex" && source.role == DiscoveredSourceRole::PrimarySessionLog,
+            source.provider_slug == "codex"
+                && source.role == DiscoveredSourceRole::PrimarySessionLog,
             "Codex recovery requires independent rollout sources"
         );
         let (result, consumer_failed) = scan_source(
-            inner, ctx, &source, hooks, on_conversation, &exclusions, &mut enrich,
+            inner,
+            ctx,
+            &source,
+            hooks,
+            on_conversation,
+            &exclusions,
+            &mut enrich,
         );
         if let Err(error) = result {
             // Classify by where the error originated, never its type or text:
@@ -257,5 +299,7 @@ pub(super) fn scan(
     failures.finish()
 }
 
+#[cfg(test)]
+mod contract_tests;
 #[cfg(test)]
 mod tests;
