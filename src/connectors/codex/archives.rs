@@ -20,9 +20,11 @@ fn default_home(ctx: &ScanContext) -> PathBuf {
     if is_codex && ctx.data_dir.join("sessions").exists() {
         return ctx.data_dir.clone();
     }
+    // Match FAD's env_path_nonempty(), including surrounding whitespace.
     dotenvy::var("CODEX_HOME")
         .ok()
-        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".codex"))
 }
@@ -106,9 +108,9 @@ pub(super) fn session_id(ctx: &ScanContext, source: &DiscoveredSourceFile) -> Op
     {
         return None;
     }
-    let root = archive_candidates(ctx).into_iter().find(|root| {
-        root.origin == source.origin && source.source_path.starts_with(&root.path)
-    })?;
+    let root = archive_candidates(ctx)
+        .into_iter()
+        .find(|root| root.origin == source.origin && source.source_path.starts_with(&root.path))?;
     let relative = source.source_path.strip_prefix(&root.path).ok()?;
     if relative.components().count() == 1
         && let Some(id) = native_session_id(&source.source_path)
