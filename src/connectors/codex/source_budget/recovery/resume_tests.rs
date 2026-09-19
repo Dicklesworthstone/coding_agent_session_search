@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-use super::*;
 use super::tests::{corpus, message};
+use super::*;
 use crate::connectors::codex::CodexConnector;
 
 #[test]

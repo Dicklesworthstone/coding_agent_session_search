@@ -46,8 +46,8 @@ def main() -> None:
     manifest = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
     dependencies = manifest["dependencies"]
     names = (
-        "anyhow", "blake3", "dotenvy", "franken-agent-detection", "serde",
-        "serde_json", "tempfile", "thiserror", "tracing",
+        "anyhow", "blake3", "chrono", "dirs", "dotenvy", "franken-agent-detection",
+        "serde", "serde_json", "tempfile", "thiserror", "tracing",
     )
     tests = ("connector_codex_exclusions", "codex_source_containment")
     lines = [

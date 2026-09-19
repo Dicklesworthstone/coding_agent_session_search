@@ -11,6 +11,7 @@ use std::io;
 use franken_agent_detection::ScanRoot;
 use serde::Serialize;
 
+use crate::connectors::codex::archives;
 use super::{
     Connector, DiscoveredSourceFile, DiscoveredSourceRole, IncompleteScan, MAX_REJECTION_SAMPLES,
     NormalizedConversation, RejectedSource, Result, ScanContext, ScanExclusions, SourceCompletion,
@@ -186,8 +187,9 @@ fn scan_source(
     let consumer_failed = Cell::new(false);
     let visited = Cell::new(false);
     let scope_changed = Cell::new(false);
-    let directory_id =
-        (source.scan_root != source.source_path).then(|| directory_session_id(source));
+    let directory_id = archives::session_id(ctx, source).map(Some).or_else(|| {
+        (source.scan_root != source.source_path).then(|| directory_session_id(source))
+    });
     let SourceScanHooks {
         should_scan_source,
         on_source_complete,
@@ -266,7 +268,7 @@ pub(super) fn scan(
         "Codex recovery requires source boundaries"
     );
     let exclusions = ScanExclusions::from_env();
-    let sources = inner.discover_source_files(ctx)?;
+    let sources = archives::discover(inner, ctx)?;
     let mut failures = Failures::default();
     for source in sources {
         if exclusions.excludes(&source.source_path) {
