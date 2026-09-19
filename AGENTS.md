@@ -169,12 +169,15 @@ The `.env` file exists and **MUST NEVER be overwritten**.
 
 **Dependency source contract:**
 
-Release-candidate transition (2026-09-17): Cargo.toml prepares the entire
+Dependency update (2026-09-19): Cargo.toml and Cargo.lock pin the entire
 SQLite family, including `fsqlite-types`, at `=0.4.4`, with Asupersync `=0.5.0`.
 All 25 SQLite packages are published and non-yanked; the v0.4.4 tag points to
 `9d3d98778a372aba95d76d05c5c974ac0238c96a`. FAD `=0.3.0` is also published.
-Frankensearch `=0.6.1` is pending publication. Do not commit or publish
-the release candidate until it exists, Cargo.lock is regenerated, and runtime gates pass.
+Frankensearch `=0.6.1` now resolves from crates.io alongside FAD `=0.3.0`.
+The regenerated lockfile contains all 20 SQLite packages used by CASS at 0.4.4.
+Registry resolution and selected consumer checks have passed; full runtime
+qualification and the strict UBS gate remain pending. Do not publish a
+release candidate until those gates pass.
 SQLite `0.4.2` adds explicit derived WAL-index recovery for read-only opens
 (GH#477); upstream recovery, compiler, and package gates passed. CASS consumer
 runtime qualification remains pending.
@@ -182,8 +185,8 @@ The table below is historical during this transition; its GH#411-open statement
 is superseded by upstream closure. The published SQLite 0.4.1 includes the
 GH#462 reserved-page WAL repair, but damaged-archive recovery remains unproven.
 SQLite 0.4.4 adds durable pending-freelist repairs. The strict family guard
-requires uniform 0.4.4 registry versions. Cargo.lock still describes the previous
-graph: resolution on 2026-09-17 failed because FrankenSearch 0.6.1 is unpublished.
+requires uniform 0.4.4 registry versions. The September 17 publication blocker
+is resolved; the historical table below does not describe the current lockfile.
 
 | Dependency | Pinned source |
 |------------|-----------------|
