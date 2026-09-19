@@ -752,7 +752,10 @@ mod tests {
                 let restored = Cx::current().expect("restored row callback context");
                 assert_eq!(restored.task_id(), context.task_id());
                 assert_eq!(restored.region_id(), context.region_id());
-                Ok((row.get_typed::<i64>(0)? + extra, row.get_typed::<String>(1)?))
+                Ok((
+                    row.get_typed::<i64>(0)? + extra,
+                    row.get_typed::<String>(1)?,
+                ))
             },
         )?;
         assert_eq!(values, vec![(13, "third".into()), (12, "second".into())]);
@@ -770,25 +773,21 @@ mod tests {
              INSERT INTO mapped_errors VALUES (1), (2), (3);",
         )?;
         let mut seen = Vec::new();
-        let result: Result<Vec<i64>, FrankenError> = conn.query_map_collect(
-            "SELECT id FROM mapped_errors ORDER BY id",
-            &[],
-            |row| {
+        let result: Result<Vec<i64>, FrankenError> =
+            conn.query_map_collect("SELECT id FROM mapped_errors ORDER BY id", &[], |row| {
                 let id = row.get_typed::<i64>(0)?;
                 seen.push(id);
                 if id == 2 {
                     return Err(FrankenError::BusyRecovery);
                 }
                 Ok(id)
-            },
-        );
+            });
         assert!(matches!(result, Err(FrankenError::BusyRecovery)));
         assert_eq!(seen, vec![1, 2]);
-        let recovered: Vec<i64> = conn.query_map_collect(
-            "SELECT id FROM mapped_errors ORDER BY id",
-            &[],
-            |row| row.get_typed(0),
-        )?;
+        let recovered: Vec<i64> =
+            conn.query_map_collect("SELECT id FROM mapped_errors ORDER BY id", &[], |row| {
+                row.get_typed(0)
+            })?;
         assert_eq!(recovered, vec![1, 2, 3]);
         Ok(())
     }

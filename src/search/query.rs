@@ -731,12 +731,12 @@ impl SemanticTierMode {
     }
 }
 
-mod message_topk;
-#[cfg(test)]
-mod message_topk_integration;
 mod ann_shards;
 #[cfg(test)]
 mod ann_shards_integration;
+mod message_topk;
+#[cfg(test)]
+mod message_topk_integration;
 mod session_scope;
 use session_scope::{
     SEMANTIC_SESSION_SCOPE_MAX_MESSAGES, SessionScopedSemanticFilter,

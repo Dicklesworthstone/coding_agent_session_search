@@ -53,9 +53,10 @@ impl JobControl {
 
     pub(super) fn is_cancelled(&self, model: &str) -> bool {
         let key = model_key(model);
-        self.0.models.iter().any(|(candidate, cancelled)| {
-            candidate == &key && cancelled.load(Ordering::SeqCst)
-        })
+        self.0
+            .models
+            .iter()
+            .any(|(candidate, cancelled)| candidate == &key && cancelled.load(Ordering::SeqCst))
     }
 
     pub(super) fn all_cancelled(&self) -> bool {
@@ -240,7 +241,10 @@ impl Sender {
                 });
                 if !duplicate {
                     if state.pending.len() >= MAX_PENDING_JOBS {
-                        return Err("embedding job queue is full; retry after pending work completes".to_string());
+                        return Err(
+                            "embedding job queue is full; retry after pending work completes"
+                                .to_string(),
+                        );
                     }
                     let control = JobControl::new(&config);
                     state.pending.push_back(PendingJob { config, control });
@@ -251,8 +255,14 @@ impl Sender {
                 if db_path.trim().is_empty() {
                     return Err("embedding cancellation requires a database path".to_string());
                 }
-                let scope = CancelScope { db_path, model: model_id };
-                let duplicate = state.cancellations.iter().any(|pending| pending.covers(&scope));
+                let scope = CancelScope {
+                    db_path,
+                    model: model_id,
+                };
+                let duplicate = state
+                    .cancellations
+                    .iter()
+                    .any(|pending| pending.covers(&scope));
                 let retained = state
                     .cancellations
                     .iter()
@@ -269,7 +279,9 @@ impl Sender {
                 for pending in &state.pending {
                     cancelled_passes += pending.control.cancel(&scope);
                 }
-                state.pending.retain(|pending| !pending.control.all_cancelled());
+                state
+                    .pending
+                    .retain(|pending| !pending.control.all_cancelled());
                 if !duplicate {
                     state.cancellations.retain(|pending| !scope.covers(pending));
                     state.cancellations.push_back(scope);
@@ -287,7 +299,9 @@ impl Sender {
         drop(state);
         match self.wake.try_send(()) {
             Ok(()) | Err(TrySendError::Full(())) => Ok(cancelled_passes),
-            Err(TrySendError::Disconnected(())) => Err("embedding worker channel closed".to_string()),
+            Err(TrySendError::Disconnected(())) => {
+                Err("embedding worker channel closed".to_string())
+            }
         }
     }
 }
@@ -296,8 +310,13 @@ impl EmbeddingWorkerHandle {
     /// Return the exact number of queued/running passes newly signalled by
     /// this request. Durable job-row cleanup is queued before later jobs;
     /// callers must not report this receipt as completed database cleanup.
-    pub fn cancel_with_count(&self, db_path: String, model_id: Option<String>) -> Result<usize, String> {
-        self.sender.send_counted(WorkerMessage::Cancel { db_path, model_id })
+    pub fn cancel_with_count(
+        &self,
+        db_path: String,
+        model_id: Option<String>,
+    ) -> Result<usize, String> {
+        self.sender
+            .send_counted(WorkerMessage::Cancel { db_path, model_id })
     }
 }
 
@@ -313,10 +332,13 @@ impl Receiver {
                     return Ok((WorkerMessage::Shutdown, None));
                 }
                 if let Some(scope) = state.cancellations.pop_front() {
-                    return Ok((WorkerMessage::Cancel {
-                        db_path: scope.db_path,
-                        model_id: scope.model,
-                    }, None));
+                    return Ok((
+                        WorkerMessage::Cancel {
+                            db_path: scope.db_path,
+                            model_id: scope.model,
+                        },
+                        None,
+                    ));
                 }
                 if state.active.is_some() {
                     return Err("previous embedding job permit is still active".to_string());
@@ -365,10 +387,12 @@ mod tests {
     }
 
     fn cancel(sender: &Sender, id: usize, model: Option<&str>) {
-        sender.send(WorkerMessage::Cancel {
-            db_path: job(id).db_path,
-            model_id: model.map(str::to_string),
-        }).unwrap();
+        sender
+            .send(WorkerMessage::Cancel {
+                db_path: job(id).db_path,
+                model_id: model.map(str::to_string),
+            })
+            .unwrap();
     }
 
     #[test]
@@ -378,7 +402,11 @@ mod tests {
             sender.send(WorkerMessage::Submit(job(id))).unwrap();
         }
         sender.send(WorkerMessage::Submit(job(0))).unwrap();
-        assert!(sender.send(WorkerMessage::Submit(job(MAX_PENDING_JOBS))).is_err());
+        assert!(
+            sender
+                .send(WorkerMessage::Submit(job(MAX_PENDING_JOBS)))
+                .is_err()
+        );
         let (first, permit) = receiver.recv().unwrap();
         assert!(matches!(first, WorkerMessage::Submit(config) if config.db_path == job(0).db_path));
         // A rerun accepted while the old job is active must not disappear.
@@ -387,7 +415,9 @@ mod tests {
         drop(permit);
         for id in 1..MAX_PENDING_JOBS {
             let (message, permit) = receiver.recv().unwrap();
-            assert!(matches!(message, WorkerMessage::Submit(config) if config.db_path == job(id).db_path));
+            assert!(
+                matches!(message, WorkerMessage::Submit(config) if config.db_path == job(id).db_path)
+            );
             drop(permit);
         }
         let (last, permit) = receiver.recv().unwrap();
@@ -401,9 +431,14 @@ mod tests {
         sender.send(WorkerMessage::Submit(job(1))).unwrap();
         sender.send(WorkerMessage::Submit(job(2))).unwrap();
         cancel(&sender, 1, None);
-        assert!(matches!(receiver.recv().unwrap().0, WorkerMessage::Cancel { .. }));
+        assert!(matches!(
+            receiver.recv().unwrap().0,
+            WorkerMessage::Cancel { .. }
+        ));
         let (message, permit) = receiver.recv().unwrap();
-        assert!(matches!(message, WorkerMessage::Submit(config) if config.db_path == job(2).db_path));
+        assert!(
+            matches!(message, WorkerMessage::Submit(config) if config.db_path == job(2).db_path)
+        );
         drop(permit);
         assert!(sender.state.lock().unwrap().pending.is_empty());
     }
@@ -421,11 +456,20 @@ mod tests {
         assert!(!old.is_cancelled("hash"));
         sender.send(WorkerMessage::Submit(job(1))).unwrap();
         drop(old_permit);
-        assert!(matches!(receiver.recv().unwrap().0, WorkerMessage::Cancel { .. }));
-        assert!(matches!(receiver.recv().unwrap().0, WorkerMessage::Cancel { .. }));
+        assert!(matches!(
+            receiver.recv().unwrap().0,
+            WorkerMessage::Cancel { .. }
+        ));
+        assert!(matches!(
+            receiver.recv().unwrap().0,
+            WorkerMessage::Cancel { .. }
+        ));
         let (_, new_permit) = receiver.recv().unwrap();
         let new = new_permit.as_ref().unwrap().control();
-        assert!(!new.any_cancelled(), "a retry admitted after cancellation is a new job");
+        assert!(
+            !new.any_cancelled(),
+            "a retry admitted after cancellation is a new job"
+        );
         assert!(old.is_cancelled("minilm"));
         drop(new_permit);
     }
@@ -436,7 +480,10 @@ mod tests {
         sender.send(WorkerMessage::Submit(job(1))).unwrap();
         cancel(&sender, 1, Some("fnv1a-384"));
         sender.send(WorkerMessage::Submit(job(1))).unwrap();
-        assert!(matches!(receiver.recv().unwrap().0, WorkerMessage::Cancel { .. }));
+        assert!(matches!(
+            receiver.recv().unwrap().0,
+            WorkerMessage::Cancel { .. }
+        ));
         let (_, first) = receiver.recv().unwrap();
         let first_control = first.as_ref().unwrap().control();
         assert!(first_control.is_cancelled("hash"));
@@ -461,7 +508,10 @@ mod tests {
         }
         sender.send(WorkerMessage::Shutdown).unwrap();
         assert!(active.all_cancelled());
-        assert!(matches!(receiver.recv().unwrap().0, WorkerMessage::Shutdown));
+        assert!(matches!(
+            receiver.recv().unwrap().0,
+            WorkerMessage::Shutdown
+        ));
         assert!(sender.send(WorkerMessage::Submit(job(999))).is_err());
         assert!(sender.state.lock().unwrap().pending.is_empty());
         assert!(sender.state.lock().unwrap().cancellations.is_empty());
@@ -485,7 +535,10 @@ mod tests {
         assert!(!active.any_cancelled());
         cancel(&sender, 0, None);
         cancel(&sender, 0, Some("hash"));
-        assert_eq!(sender.state.lock().unwrap().cancellations.len(), MAX_PENDING_CANCELLATIONS);
+        assert_eq!(
+            sender.state.lock().unwrap().cancellations.len(),
+            MAX_PENDING_CANCELLATIONS
+        );
         drop(permit);
     }
 
@@ -525,15 +578,20 @@ mod tests {
     fn concurrent_senders_cannot_over_admit() {
         let (sender, _receiver) = channel();
         let barrier = Arc::new(std::sync::Barrier::new(MAX_PENDING_JOBS * 2));
-        let threads = (0..MAX_PENDING_JOBS * 2).map(|id| {
-            let sender = sender.clone();
-            let barrier = Arc::clone(&barrier);
-            std::thread::spawn(move || {
-                barrier.wait();
-                sender.send(WorkerMessage::Submit(job(id))).is_ok()
+        let threads = (0..MAX_PENDING_JOBS * 2)
+            .map(|id| {
+                let sender = sender.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    sender.send(WorkerMessage::Submit(job(id))).is_ok()
+                })
             })
-        }).collect::<Vec<_>>();
-        let admitted = threads.into_iter().map(|thread| usize::from(thread.join().unwrap())).sum::<usize>();
+            .collect::<Vec<_>>();
+        let admitted = threads
+            .into_iter()
+            .map(|thread| usize::from(thread.join().unwrap()))
+            .sum::<usize>();
         assert_eq!(admitted, MAX_PENDING_JOBS);
         assert_eq!(sender.state.lock().unwrap().pending.len(), MAX_PENDING_JOBS);
     }
@@ -542,8 +600,18 @@ mod tests {
     fn cancellation_receipts_count_only_newly_signalled_passes() {
         let (worker, handle) = super::super::EmbeddingWorker::new();
         handle.submit(job(1)).unwrap();
-        assert_eq!(handle.cancel_with_count(job(1).db_path, Some("minilm-384".into())).unwrap(), 1);
-        assert_eq!(handle.cancel_with_count(job(1).db_path, Some("minilm".into())).unwrap(), 0);
+        assert_eq!(
+            handle
+                .cancel_with_count(job(1).db_path, Some("minilm-384".into()))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            handle
+                .cancel_with_count(job(1).db_path, Some("minilm".into()))
+                .unwrap(),
+            0
+        );
         assert_eq!(handle.cancel_with_count(job(1).db_path, None).unwrap(), 1);
         assert_eq!(handle.cancel_with_count(job(1).db_path, None).unwrap(), 0);
         // A fresh job is not swallowed by an older coalesced control message.

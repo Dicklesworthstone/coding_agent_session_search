@@ -210,11 +210,13 @@ mod tests {
 
     #[test]
     fn zero_limit_accepts_empty_streams_but_rejects_the_first_byte() {
-        assert!(wait(child("exit 0"), Duration::from_secs(5), Some(0))
-            .unwrap()
-            .unwrap()
-            .stdout
-            .is_empty());
+        assert!(
+            wait(child("exit 0"), Duration::from_secs(5), Some(0))
+                .unwrap()
+                .unwrap()
+                .stdout
+                .is_empty()
+        );
         for script in ["printf x", "printf x >&2"] {
             assert_eq!(
                 wait(child(script), Duration::from_secs(5), Some(0))
@@ -284,9 +286,11 @@ mod tests {
     #[test]
     fn zero_deadline_cancels_instead_of_granting_an_extra_second() {
         let started = Instant::now();
-        assert!(wait(child("sleep 30"), Duration::ZERO, Some(1024))
-            .unwrap()
-            .is_none());
+        assert!(
+            wait(child("sleep 30"), Duration::ZERO, Some(1024))
+                .unwrap()
+                .is_none()
+        );
         assert!(started.elapsed() < Duration::from_millis(900));
     }
 
@@ -308,7 +312,12 @@ mod tests {
             .stderr(Stdio::piped());
         crate::sources::configure_child_process_group(&mut command);
         let mut child = command.spawn().unwrap();
-        child.stdin.as_mut().unwrap().write_all(b"input\0bytes").unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"input\0bytes")
+            .unwrap();
         let output = wait(child, Duration::from_secs(5), Some(1024))
             .unwrap()
             .unwrap();

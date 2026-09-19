@@ -25,7 +25,8 @@ fn binding(sequence: u64, nonce: u8, dimension: usize) -> FsviV2IdentityBinding 
     FsviV2IdentityBinding::new(
         ArtifactGenerationIdentityV1::new(sequence, [nonce; 16]).unwrap(),
         identity.freeze().unwrap(),
-    ).unwrap()
+    )
+    .unwrap()
 }
 
 fn query_identity(binding: &FsviV2IdentityBinding) -> EmbeddingIdentityBundleV1 {
@@ -75,34 +76,57 @@ fn shard(
     records: &[(u64, f32)],
 ) -> SemanticShardExpectation {
     let path = directory.join(name);
-    let records: Vec<_> = records.iter().map(|(id, score)| {
-        let mut vector = vec![0.0; binding.dimension()];
-        vector[0] = *score;
-        // Avoid the intentional zero-signal case in ordinary rank fixtures.
-        if *score == 0.0 { vector[1] = 1.0; }
-        (document(*id).to_doc_id_string(), vector)
-    }).collect();
+    let records: Vec<_> = records
+        .iter()
+        .map(|(id, score)| {
+            let mut vector = vec![0.0; binding.dimension()];
+            vector[0] = *score;
+            // Avoid the intentional zero-signal case in ordinary rank fixtures.
+            if *score == 0.0 {
+                vector[1] = 1.0;
+            }
+            (document(*id).to_doc_id_string(), vector)
+        })
+        .collect();
     write_at(&path, binding, &records).unwrap();
-    let witness = ValidatedFsviBytes::open_published(&path, binding).unwrap()
-        .witness().clone();
-    SemanticShardExpectation { path, binding: binding.clone(), witness }
+    let witness = ValidatedFsviBytes::open_published(&path, binding)
+        .unwrap()
+        .witness()
+        .clone();
+    SemanticShardExpectation {
+        path,
+        binding: binding.clone(),
+        witness,
+    }
 }
 
 fn ids(batch: &SemanticSearchBatch) -> Vec<u64> {
-    batch.hits().iter().map(|hit| hit.document.message_id).collect()
+    batch
+        .hits()
+        .iter()
+        .map(|hit| hit.document.message_id)
+        .collect()
 }
 
 #[test]
 fn quality_only_reads_its_own_shards_without_any_fast_artifact() -> TestResult {
     let temp = tempfile::tempdir()?;
     let space = binding(7, 1, 4);
-    let quality = [shard(temp.path(), "quality.fsvi", &space, &[(7, 1.0), (8, 0.0)])];
+    let quality = [shard(
+        temp.path(),
+        "quality.fsvi",
+        &space,
+        &[(7, 1.0), (8, 0.0)],
+    )];
     let reader = SemanticGenerationReader::open(None, Some(&quality))?;
     let queries = TieredQueryEmbeddings::quality_only(query(&space));
     let batch = reader.activate(&queries)?.search(1, None)?;
     assert_eq!(ids(&batch), [7]);
     assert_eq!(batch.score_kind(), SemanticScoreKind::Exact);
-    assert_eq!(batch.coverage().requested_topology, RetrievalTopology::HashControl);
+    assert_eq!(
+        batch.coverage().requested_topology,
+        RetrievalTopology::HashControl
+    );
     assert!(batch.coverage().fast.is_none());
     let observed = batch.coverage().quality.as_ref().unwrap();
     assert_eq!(observed.witnessed_live_passages, 2);
@@ -111,7 +135,10 @@ fn quality_only_reads_its_own_shards_without_any_fast_artifact() -> TestResult {
     assert!(batch.hits()[0].fast.is_none());
     assert_eq!(batch.hits()[0].quality.as_ref().unwrap().tier_rank, 1);
     let wrong = TieredQueryEmbeddings::fast_only(query(&space));
-    assert!(matches!(reader.activate(&wrong), Err(SemanticReaderError::MissingTier(TierKind::Fast))));
+    assert!(matches!(
+        reader.activate(&wrong),
+        Err(SemanticReaderError::MissingTier(TierKind::Fast))
+    ));
     Ok(())
 }
 
@@ -128,12 +155,23 @@ fn global_top_k_keeps_shard_and_physical_provenance() -> TestResult {
     let queries = TieredQueryEmbeddings::fast_only(query(&space));
     let result = reader.activate(&queries)?.search(3, None)?;
     assert_eq!(ids(&result), [3, 5, 4]);
-    assert_eq!(result.coverage().fast.as_ref().unwrap().witnessed_live_passages, 5);
+    assert_eq!(
+        result
+            .coverage()
+            .fast
+            .as_ref()
+            .unwrap()
+            .witnessed_live_passages,
+        5
+    );
     for hit in result.hits() {
         let source = hit.fast.as_ref().unwrap();
         let owner = &reader.fast.as_ref().unwrap().shards[source.shard];
         assert_eq!(owner.doc_id_at(source.physical_index)?, hit.doc_id);
-        assert_eq!(result.witness(TierKind::Fast, source.shard), Some(owner.witness()));
+        assert_eq!(
+            result.witness(TierKind::Fast, source.shard),
+            Some(owner.witness())
+        );
     }
     Ok(())
 }
@@ -158,26 +196,42 @@ fn ties_use_selection_order_not_an_invented_global_row_number() -> TestResult {
 fn canonical_filters_apply_before_each_shards_top_k() -> TestResult {
     let temp = tempfile::tempdir()?;
     let space = binding(10, 4, 4);
-    let selected = [shard(temp.path(), "index.fsvi", &space, &[(1, 1.0), (2, 0.75)])];
+    let selected = [shard(
+        temp.path(),
+        "index.fsvi",
+        &space,
+        &[(1, 1.0), (2, 0.75)],
+    )];
     let mut second = document(2);
     second.agent_id = 9;
     second.role = ROLE_TOOL;
-    write_at(&selected[0].path, &space, &[
-        (document(1).to_doc_id_string(), vec![1.0, 0.0, 0.0, 0.0]),
-        (second.to_doc_id_string(), vec![0.75, 0.0, 0.0, 0.0]),
-    ])?;
+    write_at(
+        &selected[0].path,
+        &space,
+        &[
+            (document(1).to_doc_id_string(), vec![1.0, 0.0, 0.0, 0.0]),
+            (second.to_doc_id_string(), vec![0.75, 0.0, 0.0, 0.0]),
+        ],
+    )?;
     let mut selected = selected;
-    selected[0].witness = ValidatedFsviBytes::open_published(&selected[0].path, &space)?.witness().clone();
+    selected[0].witness = ValidatedFsviBytes::open_published(&selected[0].path, &space)?
+        .witness()
+        .clone();
     let reader = SemanticGenerationReader::open(Some(&selected), None)?;
     let queries = TieredQueryEmbeddings::fast_only(query(&space));
     let filter = SemanticFilter {
-        agents: Some(HashSet::from([9])), roles: Some(HashSet::from([ROLE_TOOL])),
-        created_from: Some(second.created_at_ms), created_to: Some(second.created_at_ms),
+        agents: Some(HashSet::from([9])),
+        roles: Some(HashSet::from([ROLE_TOOL])),
+        created_from: Some(second.created_at_ms),
+        created_to: Some(second.created_at_ms),
         ..Default::default()
     };
     let result = reader.activate(&queries)?.search(1, Some(&filter))?;
     assert_eq!(ids(&result), [2]);
-    let no_match = SemanticFilter { agents: Some(HashSet::new()), ..Default::default() };
+    let no_match = SemanticFilter {
+        agents: Some(HashSet::new()),
+        ..Default::default()
+    };
     let result = reader.activate(&queries)?.search(10, Some(&no_match))?;
     assert!(result.hits().is_empty());
     let observed = result.coverage().fast.as_ref().unwrap();
@@ -195,15 +249,27 @@ impl SearchFilter for CountQualityScans {
         }
         true
     }
-    fn name(&self) -> &str { "count-quality-scans" }
+    fn name(&self) -> &str {
+        "count-quality-scans"
+    }
 }
 
 #[test]
 fn progressive_retrieval_is_lazy_and_quality_contributes_outside_the_fast_pool() -> TestResult {
     let temp = tempfile::tempdir()?;
     let space = binding(11, 5, 4);
-    let fast = [shard(temp.path(), "fast.fsvi", &space, &[(1, 1.0), (2, 0.25)])];
-    let quality = [shard(temp.path(), "quality.fsvi", &space, &[(100, 1.0), (101, 0.25)])];
+    let fast = [shard(
+        temp.path(),
+        "fast.fsvi",
+        &space,
+        &[(1, 1.0), (2, 0.25)],
+    )];
+    let quality = [shard(
+        temp.path(),
+        "quality.fsvi",
+        &space,
+        &[(100, 1.0), (101, 0.25)],
+    )];
     let reader = SemanticGenerationReader::open(Some(&fast), Some(&quality))?;
     let queries = TieredQueryEmbeddings::progressive(query(&space), query(&space));
     let active = reader.activate(&queries)?;
@@ -218,11 +284,26 @@ fn progressive_retrieval_is_lazy_and_quality_contributes_outside_the_fast_pool()
     assert_eq!(filter.0.load(AtomicOrdering::SeqCst), 0);
     let refined = phases.next().unwrap()?;
     assert_eq!(refined.coverage().phase, SemanticResultPhase::Refined);
-    assert_eq!(refined.score_kind(), SemanticScoreKind::ReciprocalRankFusion);
+    assert_eq!(
+        refined.score_kind(),
+        SemanticScoreKind::ReciprocalRankFusion
+    );
     assert!(ids(&refined).contains(&100));
     assert!(filter.0.load(AtomicOrdering::SeqCst) > 0);
-    assert_eq!(refined.coverage().quality.as_ref().unwrap().contributed_candidates, 1);
-    assert_eq!(ids(&first), [1, 2], "refinement must not mutate the initial result");
+    assert_eq!(
+        refined
+            .coverage()
+            .quality
+            .as_ref()
+            .unwrap()
+            .contributed_candidates,
+        1
+    );
+    assert_eq!(
+        ids(&first),
+        [1, 2],
+        "refinement must not mutate the initial result"
+    );
     assert!(phases.next().is_none());
     assert!(phases.next().is_none());
 
@@ -230,7 +311,11 @@ fn progressive_retrieval_is_lazy_and_quality_contributes_outside_the_fast_pool()
     let mut phases = active.progressive(2, Some(&filter))?;
     assert!(phases.next().unwrap().is_ok());
     drop(phases);
-    assert_eq!(filter.0.load(AtomicOrdering::SeqCst), 0, "abandoning refinement must not scan quality");
+    assert_eq!(
+        filter.0.load(AtomicOrdering::SeqCst),
+        0,
+        "abandoning refinement must not scan quality"
+    );
     Ok(())
 }
 
@@ -238,8 +323,18 @@ fn progressive_retrieval_is_lazy_and_quality_contributes_outside_the_fast_pool()
 fn fusion_retains_both_contributors_and_agrees_with_two_phase_retrieval() -> TestResult {
     let temp = tempfile::tempdir()?;
     let space = binding(12, 6, 4);
-    let fast = [shard(temp.path(), "fast.fsvi", &space, &[(1, 1.0), (2, 0.25)])];
-    let quality = [shard(temp.path(), "quality.fsvi", &space, &[(1, 0.25), (3, 1.0)])];
+    let fast = [shard(
+        temp.path(),
+        "fast.fsvi",
+        &space,
+        &[(1, 1.0), (2, 0.25)],
+    )];
+    let quality = [shard(
+        temp.path(),
+        "quality.fsvi",
+        &space,
+        &[(1, 0.25), (3, 1.0)],
+    )];
     let reader = SemanticGenerationReader::open(Some(&fast), Some(&quality))?;
     let queries = TieredQueryEmbeddings::progressive(query(&space), query(&space));
     let active = reader.activate(&queries)?;
@@ -248,8 +343,24 @@ fn fusion_retains_both_contributors_and_agrees_with_two_phase_retrieval() -> Tes
     assert_eq!(result.hits()[0].fast.as_ref().unwrap().tier_rank, 1);
     assert_eq!(result.hits()[0].quality.as_ref().unwrap().tier_rank, 2);
     assert_eq!(result.hits()[0].ranking_score, 1.0 / 61.0 + 1.0 / 62.0);
-    assert_eq!(result.coverage().fast.as_ref().unwrap().contributed_candidates, 1);
-    assert_eq!(result.coverage().quality.as_ref().unwrap().contributed_candidates, 2);
+    assert_eq!(
+        result
+            .coverage()
+            .fast
+            .as_ref()
+            .unwrap()
+            .contributed_candidates,
+        1
+    );
+    assert_eq!(
+        result
+            .coverage()
+            .quality
+            .as_ref()
+            .unwrap()
+            .contributed_candidates,
+        2
+    );
     let mut phases = active.progressive(2, None)?;
     let _ = phases.next().unwrap()?;
     assert_eq!(phases.next().unwrap()?.hits(), result.hits());
@@ -266,19 +377,28 @@ fn foreign_quality_producer_is_rejected_before_any_fast_scan() -> TestResult {
     let mut foreign = query_identity(&space);
     foreign.producer.backend.push_str("-foreign");
     let foreign = BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0, 0.0], foreign)?;
-    assert!(matches!(foreign.verify_producer_conformance(
-        &space.frozen_identity().identity, "quality")?,
-        SpaceIdentityAdmission::ConformanceCompatibleProducer { .. }));
+    assert!(matches!(
+        foreign.verify_producer_conformance(&space.frozen_identity().identity, "quality")?,
+        SpaceIdentityAdmission::ConformanceCompatibleProducer { .. }
+    ));
     let queries = TieredQueryEmbeddings::progressive(query(&space), foreign);
     let filter = CountQualityScans(AtomicUsize::new(0));
     for k in [0, 1] {
-        let result = reader.activate(&queries).and_then(|active| active.search(k, Some(&filter)));
-        assert!(matches!(result, Err(SemanticReaderError::ForeignProducer(TierKind::Quality))));
+        let result = reader
+            .activate(&queries)
+            .and_then(|active| active.search(k, Some(&filter)));
+        assert!(matches!(
+            result,
+            Err(SemanticReaderError::ForeignProducer(TierKind::Quality))
+        ));
     }
     assert_eq!(filter.0.load(AtomicOrdering::SeqCst), 0);
     let valid = TieredQueryEmbeddings::fast_only(query(&space));
     reader.activate(&valid)?.search(1, Some(&filter))?;
-    assert!(filter.0.load(AtomicOrdering::SeqCst) > 0, "the scan detector must observe real work");
+    assert!(
+        filter.0.load(AtomicOrdering::SeqCst) > 0,
+        "the scan detector must observe real work"
+    );
     Ok(())
 }
 
@@ -292,13 +412,26 @@ fn wrong_space_and_missing_requested_tier_are_errors_not_empty_hits() -> TestRes
     let bad = TieredQueryEmbeddings::fast_only(query(&foreign_space));
     assert!(reader.activate(&bad).is_err());
     let missing = TieredQueryEmbeddings::quality_only(query(&space));
-    assert!(matches!(reader.activate(&missing), Err(SemanticReaderError::MissingTier(TierKind::Quality))));
+    assert!(matches!(
+        reader.activate(&missing),
+        Err(SemanticReaderError::MissingTier(TierKind::Quality))
+    ));
     let valid = TieredQueryEmbeddings::fast_only(query(&space));
     let result = reader.activate(&valid)?.search(0, None)?;
     assert!(result.hits().is_empty());
-    assert_eq!(result.coverage().fast.as_ref().unwrap().witnessed_live_passages, 0);
-    assert!(matches!(reader.activate(&valid)?.progressive(1, None),
-        Err(SemanticReaderError::ProgressiveRequiresBothTiers)));
+    assert_eq!(
+        result
+            .coverage()
+            .fast
+            .as_ref()
+            .unwrap()
+            .witnessed_live_passages,
+        0
+    );
+    assert!(matches!(
+        reader.activate(&valid)?.progressive(1, None),
+        Err(SemanticReaderError::ProgressiveRequiresBothTiers)
+    ));
     Ok(())
 }
 
@@ -311,17 +444,28 @@ fn retained_reader_ignores_path_replacement_and_batches_pin_the_old_owner() -> T
     let weak = Arc::downgrade(reader.fast.as_ref().unwrap());
     let queries = TieredQueryEmbeddings::fast_only(query(&space));
     let old_batch = reader.activate(&queries)?.search(1, None)?;
-    fs::rename(&selected[0].path, temp.path().join("retained-original.fsvi"))?;
+    fs::rename(
+        &selected[0].path,
+        temp.path().join("retained-original.fsvi"),
+    )?;
     fs::write(&selected[0].path, b"not an index")?;
     assert_eq!(ids(&reader.activate(&queries)?.search(1, None)?), [1]);
     assert!(SemanticGenerationReader::open(Some(&selected), None).is_err());
 
     let successor_space = binding(16, 10, 4);
-    let successor = [shard(temp.path(), "successor.fsvi", &successor_space, &[(2, 1.0)])];
+    let successor = [shard(
+        temp.path(),
+        "successor.fsvi",
+        &successor_space,
+        &[(2, 1.0)],
+    )];
     reader.try_replace(Some(&successor), None)?;
     assert_eq!(reader.generation(), successor_space.generation());
     assert!(weak.upgrade().is_some());
-    assert_eq!(old_batch.witness(TierKind::Fast, 0), Some(&selected[0].witness));
+    assert_eq!(
+        old_batch.witness(TierKind::Fast, 0),
+        Some(&selected[0].witness)
+    );
     assert_eq!(ids(&old_batch), [1]);
     drop(old_batch);
     assert!(weak.upgrade().is_none());
@@ -339,7 +483,11 @@ fn failed_pair_replacement_preserves_the_last_good_reader() -> TestResult {
     let mut bad_quality = fast[0].clone();
     bad_quality.path = temp.path().join("missing-quality.fsvi");
     let original = Arc::as_ptr(reader.fast.as_ref().unwrap());
-    assert!(reader.try_replace(Some(&fast), Some(&[bad_quality])).is_err());
+    assert!(
+        reader
+            .try_replace(Some(&fast), Some(&[bad_quality]))
+            .is_err()
+    );
     assert_eq!(Arc::as_ptr(reader.fast.as_ref().unwrap()), original);
     assert_eq!(reader.generation(), old_space.generation());
     let queries = TieredQueryEmbeddings::fast_only(query(&old_space));
@@ -354,15 +502,25 @@ fn same_sequence_different_nonce_and_mixed_tier_bundles_are_rejected() -> TestRe
     let b_space = binding(19, 14, 4);
     let a = shard(temp.path(), "a.fsvi", &a_space, &[(1, 1.0)]);
     let b = shard(temp.path(), "b.fsvi", &b_space, &[(2, 1.0)]);
-    assert!(matches!(SemanticGenerationReader::open(Some(&[a.clone()]), Some(&[b.clone()])),
-        Err(SemanticReaderError::MixedGeneration)));
+    assert!(matches!(
+        SemanticGenerationReader::open(
+            Some(std::slice::from_ref(&a)),
+            Some(std::slice::from_ref(&b))
+        ),
+        Err(SemanticReaderError::MixedGeneration)
+    ));
     let mut reader = SemanticGenerationReader::open(Some(std::slice::from_ref(&a)), None)?;
-    assert!(matches!(reader.try_replace(Some(&[b]), None), Err(SemanticReaderError::StaleReplacement)));
+    assert!(matches!(
+        reader.try_replace(Some(&[b]), None),
+        Err(SemanticReaderError::StaleReplacement)
+    ));
     reader.try_replace(Some(std::slice::from_ref(&a)), None)?;
     let different_width = binding(19, 13, 8);
     let c = shard(temp.path(), "c.fsvi", &different_width, &[(3, 1.0)]);
-    assert!(matches!(SemanticGenerationReader::open(Some(&[a, c]), None),
-        Err(SemanticReaderError::MixedTierIdentity)));
+    assert!(matches!(
+        SemanticGenerationReader::open(Some(&[a, c]), None),
+        Err(SemanticReaderError::MixedTierIdentity)
+    ));
     Ok(())
 }
 
@@ -372,12 +530,22 @@ fn exact_witness_rejects_changed_vectors_under_an_unchanged_binding() -> TestRes
     let space = binding(20, 15, 4);
     let selected = [shard(temp.path(), "index.fsvi", &space, &[(1, 1.0)])];
     let expected = selected[0].witness.clone();
-    write_at(&selected[0].path, &space, &[(document(1).to_doc_id_string(), vec![0.0, 1.0, 0.0, 0.0])])?;
+    write_at(
+        &selected[0].path,
+        &space,
+        &[(document(1).to_doc_id_string(), vec![0.0, 1.0, 0.0, 0.0])],
+    )?;
     let new = ValidatedFsviBytes::open_published(&selected[0].path, &space)?;
     assert_eq!(new.witness().generation, expected.generation);
-    assert_eq!(new.witness().ordered_live_docset_digest, expected.ordered_live_docset_digest);
+    assert_eq!(
+        new.witness().ordered_live_docset_digest,
+        expected.ordered_live_docset_digest
+    );
     assert_ne!(new.witness(), &expected);
-    assert!(matches!(SemanticGenerationReader::open(Some(&selected), None), Err(SemanticReaderError::Admission { .. })));
+    assert!(matches!(
+        SemanticGenerationReader::open(Some(&selected), None),
+        Err(SemanticReaderError::Admission { .. })
+    ));
     Ok(())
 }
 
@@ -400,7 +568,10 @@ fn legacy_v1_and_adjacent_wal_never_become_admitted_generations() -> TestResult 
     let mut legacy = selected[0].clone();
     legacy.path = v1.clone();
     let before = fs::read(&v1)?;
-    assert!(matches!(SemanticGenerationReader::open(Some(&[legacy]), None), Err(SemanticReaderError::Admission { .. })));
+    assert!(matches!(
+        SemanticGenerationReader::open(Some(&[legacy]), None),
+        Err(SemanticReaderError::Admission { .. })
+    ));
     assert_eq!(fs::read(v1)?, before);
     Ok(())
 }
@@ -411,18 +582,32 @@ fn duplicate_passages_across_shards_and_noncanonical_ids_are_rejected() -> TestR
     let space = binding(22, 17, 4);
     let a = shard(temp.path(), "a.fsvi", &space, &[(1, 1.0)]);
     let b = shard(temp.path(), "b.fsvi", &space, &[(1, 0.5)]);
-    assert!(matches!(SemanticGenerationReader::open(Some(&[a, b]), None), Err(SemanticReaderError::DuplicateDocument)));
+    assert!(matches!(
+        SemanticGenerationReader::open(Some(&[a, b]), None),
+        Err(SemanticReaderError::DuplicateDocument)
+    ));
     for (name, id) in [
         ("foreign.fsvi", "not-a-cass-document".to_owned()),
         ("prefix.fsvi", "m|1|0|4|5|6|0|1700000000000".to_owned()),
-        ("noncanonical.fsvi", document(1).to_doc_id_string().replacen("m|1|", "m|01|", 1)),
+        (
+            "noncanonical.fsvi",
+            document(1).to_doc_id_string().replacen("m|1|", "m|01|", 1),
+        ),
     ] {
         let path = temp.path().join(name);
         write_at(&path, &space, &[(id, vec![1.0, 0.0, 0.0, 0.0])])?;
-        let witness = ValidatedFsviBytes::open_published(&path, &space)?.witness().clone();
-        let selection = SemanticShardExpectation { path, binding: space.clone(), witness };
-        assert!(matches!(SemanticGenerationReader::open(Some(&[selection]), None),
-            Err(SemanticReaderError::NonCanonicalDocuments)));
+        let witness = ValidatedFsviBytes::open_published(&path, &space)?
+            .witness()
+            .clone();
+        let selection = SemanticShardExpectation {
+            path,
+            binding: space.clone(),
+            witness,
+        };
+        assert!(matches!(
+            SemanticGenerationReader::open(Some(&[selection]), None),
+            Err(SemanticReaderError::NonCanonicalDocuments)
+        ));
     }
     Ok(())
 }
@@ -444,9 +629,18 @@ fn witness_round_trip_preserves_all_fields_not_just_content_count() -> TestResul
 
 #[test]
 fn absent_and_empty_selections_are_not_successful_empty_archives() {
-    assert!(matches!(SemanticGenerationReader::open(None, None), Err(SemanticReaderError::NoTiers)));
-    assert!(matches!(SemanticGenerationReader::open(Some(&[]), None), Err(SemanticReaderError::EmptyTier)));
-    assert!(matches!(SemanticGenerationReader::open(None, Some(&[])), Err(SemanticReaderError::EmptyTier)));
+    assert!(matches!(
+        SemanticGenerationReader::open(None, None),
+        Err(SemanticReaderError::NoTiers)
+    ));
+    assert!(matches!(
+        SemanticGenerationReader::open(Some(&[]), None),
+        Err(SemanticReaderError::EmptyTier)
+    ));
+    assert!(matches!(
+        SemanticGenerationReader::open(None, Some(&[])),
+        Err(SemanticReaderError::EmptyTier)
+    ));
 }
 
 #[test]
@@ -454,14 +648,18 @@ fn role_alias_cannot_masquerade_as_an_independent_quality_artifact() -> TestResu
     let temp = tempfile::tempdir()?;
     let space = binding(24, 19, 4);
     let selected = [shard(temp.path(), "index.fsvi", &space, &[(1, 1.0)])];
-    assert!(matches!(SemanticGenerationReader::open(Some(&selected), Some(&selected)),
-        Err(SemanticReaderError::ArtifactRoleAlias)));
+    assert!(matches!(
+        SemanticGenerationReader::open(Some(&selected), Some(&selected)),
+        Err(SemanticReaderError::ArtifactRoleAlias)
+    ));
     // A separate pathname containing the exact same image is not independent.
     let mut copied = selected[0].clone();
     copied.path = temp.path().join("copy.fsvi");
     fs::copy(&selected[0].path, &copied.path)?;
-    assert!(matches!(SemanticGenerationReader::open(Some(&selected), Some(&[copied])),
-        Err(SemanticReaderError::ArtifactRoleAlias)));
+    assert!(matches!(
+        SemanticGenerationReader::open(Some(&selected), Some(&[copied])),
+        Err(SemanticReaderError::ArtifactRoleAlias)
+    ));
     Ok(())
 }
 
@@ -469,11 +667,24 @@ fn role_alias_cannot_masquerade_as_an_independent_quality_artifact() -> TestResu
 fn limits_larger_than_the_corpus_return_only_real_passages() -> TestResult {
     let temp = tempfile::tempdir()?;
     let space = binding(25, 20, 4);
-    let selected = [shard(temp.path(), "index.fsvi", &space, &[(1, 1.0), (2, 0.5)])];
+    let selected = [shard(
+        temp.path(),
+        "index.fsvi",
+        &space,
+        &[(1, 1.0), (2, 0.5)],
+    )];
     let reader = SemanticGenerationReader::open(Some(&selected), None)?;
     let queries = TieredQueryEmbeddings::fast_only(query(&space));
     let result = reader.activate(&queries)?.search(usize::MAX, None)?;
     assert_eq!(ids(&result), [1, 2]);
-    assert_eq!(result.coverage().fast.as_ref().unwrap().retrieved_candidates, 2);
+    assert_eq!(
+        result
+            .coverage()
+            .fast
+            .as_ref()
+            .unwrap()
+            .retrieved_candidates,
+        2
+    );
     Ok(())
 }

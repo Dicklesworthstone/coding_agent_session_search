@@ -80,10 +80,7 @@ fn seed_archive(home: &Path, data_dir: &Path) {
         PRIVATE_BODY,
         true,
     );
-    let (success, output) = run(
-        cass(home).args(["index", "--full", "--json"]),
-        data_dir,
-    );
+    let (success, output) = run(cass(home).args(["index", "--full", "--json"]), data_dir);
     assert!(success, "seed index failed: {output}");
     assert_eq!(output["success"].as_bool(), Some(true));
 }
@@ -131,9 +128,12 @@ fn live_readiness_and_coverage_use_the_running_binary_and_leave_archive_bytes_un
     let empty_path = home.path().join("empty-path");
     std::fs::create_dir_all(&empty_path).expect("empty PATH");
     let (_, output) = run(
-        cass(home.path())
-            .env("PATH", &empty_path)
-            .args(["guide", "investigate-search-miss", "--apply", "--json"]),
+        cass(home.path()).env("PATH", &empty_path).args([
+            "guide",
+            "investigate-search-miss",
+            "--apply",
+            "--json",
+        ]),
         &data_dir,
     );
     let readiness = step(&output, "search.readiness");

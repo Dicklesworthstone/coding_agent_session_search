@@ -237,6 +237,10 @@ impl SemanticIndexArtifact {
 
     /// Clone the opened reader owner for a search operation.
     #[must_use]
+    // Currently uncalled. Retained deliberately as the owning-handle accessor
+    // beside the borrowing ones; deleting a crate-internal API is a design
+    // decision, not a lint fix.
+    #[allow(dead_code)]
     pub(crate) fn index_owner(&self) -> Arc<VectorIndex> {
         Arc::clone(&self.index)
     }

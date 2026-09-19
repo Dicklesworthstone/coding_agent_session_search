@@ -384,12 +384,14 @@ fn evaluate_read_only_proof(
             source: "operator-and-preflight",
             detail: "requires an available key and exact privacy-tier acceptance".to_string(),
         },
-        Adapter::SearchCoverage | Adapter::SupportBundle | Adapter::ObservationOnly => ProofResult {
-            result: "not-run",
-            observation: None,
-            source: "none",
-            detail: "no automatic read-only proof adapter".to_string(),
-        },
+        Adapter::SearchCoverage | Adapter::SupportBundle | Adapter::ObservationOnly => {
+            ProofResult {
+                result: "not-run",
+                observation: None,
+                source: "none",
+                detail: "no automatic read-only proof adapter".to_string(),
+            }
+        }
     }
 }
 
@@ -431,9 +433,10 @@ fn run_bounded_cass(argv: &[String], timeout: Duration) -> Result<Output, Comman
     #[cfg(target_os = "linux")]
     let mut child = Command::new("/proc/self/exe");
     #[cfg(not(target_os = "linux"))]
-    let mut child = Command::new(std::env::current_exe().map_err(|_| {
-        CommandFailure::before_start("cannot resolve the running cass executable")
-    })?);
+    let mut child =
+        Command::new(std::env::current_exe().map_err(|_| {
+            CommandFailure::before_start("cannot resolve the running cass executable")
+        })?);
     child
         .args(args)
         .stdin(Stdio::null())
@@ -472,7 +475,9 @@ fn evaluate_live_proof(command: AllowedCommand, data_dir: &Path, deadline: Insta
     };
     let payload = match serde_json::from_slice::<Value>(&output.stdout) {
         Ok(payload) => payload,
-        Err(_) => return unavailable_live_proof("live proof returned malformed or non-JSON output"),
+        Err(_) => {
+            return unavailable_live_proof("live proof returned malformed or non-JSON output");
+        }
     };
     classify_live_proof(command.adapter, output.status.code(), &payload)
 }
@@ -539,7 +544,9 @@ fn classify_live_proof(adapter: Adapter, exit_code: Option<i32>, payload: &Value
         detail: match adapter {
             Adapter::Readiness if passed => "live health confirms search readiness",
             Adapter::Readiness => "live health is not ready; inspect health before mutating",
-            Adapter::DoctorTruth => "live doctor classified assets; this is not repair authorization",
+            Adapter::DoctorTruth => {
+                "live doctor classified assets; this is not repair authorization"
+            }
             Adapter::SearchCoverage => {
                 "live status reported search coverage; unknown counts remain null"
             }
@@ -615,8 +622,8 @@ fn support_bundle_receipt(payload: &Value, data_dir: &Path) -> Result<Value, &'s
     if bytes.len() as u64 > LIMIT {
         return Err("support manifest exceeds the receipt byte budget");
     }
-    let manifest_json: Value = serde_json::from_slice(&bytes)
-        .map_err(|_| "support manifest is not valid JSON")?;
+    let manifest_json: Value =
+        serde_json::from_slice(&bytes).map_err(|_| "support manifest is not valid JSON")?;
     if !manifest_json.is_object() {
         return Err("support manifest must be a JSON object");
     }
@@ -645,7 +652,11 @@ fn receipt_relative_path(path: &Path) -> String {
     format!("<data-dir>/{relative}")
 }
 
-fn classify_support_bundle(exit_code: Option<i32>, stdout: &[u8], data_dir: &Path) -> MutationResult {
+fn classify_support_bundle(
+    exit_code: Option<i32>,
+    stdout: &[u8],
+    data_dir: &Path,
+) -> MutationResult {
     if exit_code != Some(0) {
         return failed_mutation(
             true,
@@ -668,8 +679,9 @@ fn classify_support_bundle(exit_code: Option<i32>, stdout: &[u8], data_dir: &Pat
     MutationResult {
         status: "executed",
         proof_result: "passed",
-        detail: "support bundle produced; bounded manifest receipt recorded without private contents"
-            .to_string(),
+        detail:
+            "support bundle produced; bounded manifest receipt recorded without private contents"
+                .to_string(),
         started: true,
         observation: Some(observation),
     }
@@ -766,8 +778,8 @@ pub fn render_execution(mut plan: Value, request: &GuideRunRequest<'_>) -> Value
         })
         .map(str::to_string)
         .collect::<Vec<_>>();
-    let fixture_declared_stops = fixture_context
-        .is_some_and(|context| context.get("triggered_stop_conditions").is_some());
+    let fixture_declared_stops =
+        fixture_context.is_some_and(|context| context.get("triggered_stop_conditions").is_some());
     let stops_clear = triggered_stops.is_empty()
         && (request.stop_conditions_clear || fixture_declared_stops || declared_stops.is_empty());
 
@@ -1227,26 +1239,53 @@ mod tests {
     fn live_readiness_requires_a_healthy_successful_non_rebuilding_report() {
         use super::{Adapter, classify_live_proof};
         let ready = json!({"healthy": true, "rebuild_progress": {"active": false}});
-        assert_eq!(classify_live_proof(Adapter::Readiness, Some(0), &ready).result, "passed");
+        assert_eq!(
+            classify_live_proof(Adapter::Readiness, Some(0), &ready).result,
+            "passed"
+        );
         for (code, payload) in [
             (Some(1), ready.clone()),
             (Some(0), json!({"healthy": false})),
-            (Some(0), json!({"healthy": true, "rebuild_progress": {"active": true}})),
+            (
+                Some(0),
+                json!({"healthy": true, "rebuild_progress": {"active": true}}),
+            ),
             (None, ready),
         ] {
-            assert_ne!(classify_live_proof(Adapter::Readiness, code, &payload).result, "passed");
+            assert_ne!(
+                classify_live_proof(Adapter::Readiness, code, &payload).result,
+                "passed"
+            );
         }
     }
 
     #[test]
     fn live_diagnostics_reject_error_envelopes_and_incomplete_schemas() {
         use super::{Adapter, classify_live_proof};
-        for payload in [Value::Null, json!({}), json!({"healthy": "true"}),
-            json!({"healthy": true, "error": {"message": "private"}})] {
-            assert_ne!(classify_live_proof(Adapter::Readiness, Some(0), &payload).result, "passed");
+        for payload in [
+            Value::Null,
+            json!({}),
+            json!({"healthy": "true"}),
+            json!({"healthy": true, "error": {"message": "private"}}),
+        ] {
+            assert_ne!(
+                classify_live_proof(Adapter::Readiness, Some(0), &payload).result,
+                "passed"
+            );
         }
-        assert_ne!(classify_live_proof(Adapter::DoctorTruth, Some(0), &json!({"healthy": true, "checks": []})).result, "passed");
-        assert_ne!(classify_live_proof(Adapter::SearchCoverage, Some(0), &json!({"healthy": true})).result, "passed");
+        assert_ne!(
+            classify_live_proof(
+                Adapter::DoctorTruth,
+                Some(0),
+                &json!({"healthy": true, "checks": []})
+            )
+            .result,
+            "passed"
+        );
+        assert_ne!(
+            classify_live_proof(Adapter::SearchCoverage, Some(0), &json!({"healthy": true})).result,
+            "passed"
+        );
     }
 
     #[test]
@@ -1255,10 +1294,20 @@ mod tests {
         let payload = json!({"healthy": false, "needs_rebuild": true,
             "checks": [{"name": "lexical", "status": "warning"}],
             "index": {"status": "hollow", "hollow": true, "documents": 1}});
-        for adapter in [Adapter::DoctorTruth, Adapter::SupportEvidence, Adapter::SearchCoverage] {
-            assert_eq!(classify_live_proof(adapter, Some(1), &payload).result, "passed");
+        for adapter in [
+            Adapter::DoctorTruth,
+            Adapter::SupportEvidence,
+            Adapter::SearchCoverage,
+        ] {
+            assert_eq!(
+                classify_live_proof(adapter, Some(1), &payload).result,
+                "passed"
+            );
         }
-        assert_eq!(classify_live_proof(Adapter::Readiness, Some(1), &payload).result, "failed");
+        assert_eq!(
+            classify_live_proof(Adapter::Readiness, Some(1), &payload).result,
+            "failed"
+        );
     }
 
     #[test]
@@ -1270,7 +1319,10 @@ mod tests {
         let proof = classify_live_proof(Adapter::SearchCoverage, Some(0), &payload);
         let observation = proof.observation.expect("live receipt");
         assert_eq!(observation.pointer("/lexical/documents"), Some(&json!(12)));
-        assert_eq!(observation.pointer("/lexical/live_documents"), Some(&Value::Null));
+        assert_eq!(
+            observation.pointer("/lexical/live_documents"),
+            Some(&Value::Null)
+        );
         let text = observation.to_string();
         for private in ["private", "secret", "sensitive"] {
             assert!(!text.contains(private));
@@ -1286,8 +1338,15 @@ mod tests {
         request.source_kind = "live";
         request.fixture_context = Some(&context);
         let command = allowed_command("search.readiness").expect("allowed proof");
-        let proof = evaluate_read_only_proof(command, "readiness-ok", &json!({"readiness": "ready"}),
-            &request, true, true, Instant::now());
+        let proof = evaluate_read_only_proof(
+            command,
+            "readiness-ok",
+            &json!({"readiness": "ready"}),
+            &request,
+            true,
+            true,
+            Instant::now(),
+        );
         assert_eq!(proof.result, "not-run");
         assert_eq!(proof.source, "live-command");
         assert!(proof.detail.contains("deadline"));
@@ -1298,9 +1357,21 @@ mod tests {
         use super::evaluate_read_only_proof;
         use std::time::Instant;
         let request = request(Path::new("/unread/missing/archive"));
-        for id in ["search.readiness", "doctor.asset-truth-table", "diag.search-coverage", "support.gather-evidence"] {
-            let proof = evaluate_read_only_proof(allowed_command(id).expect("allowed proof"), "missing",
-                &json!({}), &request, true, true, Instant::now());
+        for id in [
+            "search.readiness",
+            "doctor.asset-truth-table",
+            "diag.search-coverage",
+            "support.gather-evidence",
+        ] {
+            let proof = evaluate_read_only_proof(
+                allowed_command(id).expect("allowed proof"),
+                "missing",
+                &json!({}),
+                &request,
+                true,
+                true,
+                Instant::now(),
+            );
             assert_ne!(proof.source, "live-command");
             assert!(proof.observation.is_none());
         }
@@ -1309,20 +1380,28 @@ mod tests {
     #[test]
     fn coverage_and_doctor_argv_are_explicit_read_only_commands() {
         for id in ["doctor.asset-truth-table", "diag.search-coverage"] {
-            let argv = allowlisted_argv(allowed_command(id).expect("allowed"), Path::new("/archive with spaces")).expect("argv");
+            let argv = allowlisted_argv(
+                allowed_command(id).expect("allowed"),
+                Path::new("/archive with spaces"),
+            )
+            .expect("argv");
             assert!(argv.iter().any(|arg| arg == "/archive with spaces"));
             assert!(argv.iter().any(|arg| arg == "--json"));
-            assert!(!argv.iter().any(|arg| matches!(arg.as_str(), "--fix" | "--yes" | "repair" | "index")));
+            assert!(
+                !argv
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "--fix" | "--yes" | "repair" | "index"))
+            );
         }
     }
-
 
     fn capsule_fixture() -> (tempfile::TempDir, Value) {
         let root = tempfile::tempdir().expect("capsule fixture");
         let bundle = root.path().join("doctor/support/capsule-1");
         std::fs::create_dir_all(&bundle).expect("bundle directory");
         let manifest = bundle.join("manifest.json");
-        std::fs::write(&manifest, br#"{"private_content":"must not be echoed"}"#).expect("manifest");
+        std::fs::write(&manifest, br#"{"private_content":"must not be echoed"}"#)
+            .expect("manifest");
         let payload = json!({"bundle_path": bundle, "manifest_path": manifest});
         (root, payload)
     }
@@ -1330,24 +1409,42 @@ mod tests {
     #[test]
     fn capsule_success_requires_a_readable_in_scope_manifest_and_returns_a_receipt() {
         let (root, payload) = capsule_fixture();
-        let result = super::classify_support_bundle(Some(0), &serde_json::to_vec(&payload).expect("JSON"), root.path());
+        let result = super::classify_support_bundle(
+            Some(0),
+            &serde_json::to_vec(&payload).expect("JSON"),
+            root.path(),
+        );
         assert_eq!(result.status, "executed");
         assert!(result.started);
         let receipt = result.observation.expect("receipt");
         assert_eq!(receipt["manifest_readable"], true);
         assert_eq!(receipt["contents_independently_verified"], false);
-        assert_eq!(receipt["bundle_path"], "<data-dir>/doctor/support/capsule-1");
-        assert_eq!(receipt["manifest_blake3"].as_str().expect("digest").len(), 64);
+        assert_eq!(
+            receipt["bundle_path"],
+            "<data-dir>/doctor/support/capsule-1"
+        );
+        assert_eq!(
+            receipt["manifest_blake3"].as_str().expect("digest").len(),
+            64
+        );
         assert!(!receipt.to_string().contains("private_content"));
         assert!(!receipt.to_string().contains("must not be echoed"));
-        assert!(!receipt.to_string().contains(&root.path().display().to_string()));
+        assert!(
+            !receipt
+                .to_string()
+                .contains(&root.path().display().to_string())
+        );
     }
 
     #[test]
     fn capsule_exit_zero_without_artifacts_is_not_success() {
         let (root, mut payload) = capsule_fixture();
         payload["manifest_path"] = json!(root.path().join("missing.json"));
-        for stdout in [b"not JSON".to_vec(), b"{}".to_vec(), serde_json::to_vec(&payload).expect("JSON")] {
+        for stdout in [
+            b"not JSON".to_vec(),
+            b"{}".to_vec(),
+            serde_json::to_vec(&payload).expect("JSON"),
+        ] {
             let result = super::classify_support_bundle(Some(0), &stdout, root.path());
             assert_eq!(result.status, "failed");
             assert!(result.started);
@@ -1364,8 +1461,10 @@ mod tests {
         payload["manifest_path"] = json!(manifest);
         assert!(super::support_bundle_receipt(&payload, root.path()).is_err());
         let manifest = root.path().join("doctor/support/capsule-1/large.json");
-        std::fs::File::create(&manifest).expect("large manifest")
-            .set_len(2 * 1024 * 1024 + 1).expect("large length");
+        std::fs::File::create(&manifest)
+            .expect("large manifest")
+            .set_len(2 * 1024 * 1024 + 1)
+            .expect("large length");
         payload["manifest_path"] = json!(manifest);
         assert!(super::support_bundle_receipt(&payload, root.path()).is_err());
     }
@@ -1398,7 +1497,11 @@ mod tests {
 
     #[test]
     fn malformed_bounded_commands_do_not_start_processes() {
-        for argv in [Vec::new(), vec!["cass".to_string()], vec!["sh".to_string(), "health".to_string()]] {
+        for argv in [
+            Vec::new(),
+            vec!["cass".to_string()],
+            vec!["sh".to_string(), "health".to_string()],
+        ] {
             match super::run_bounded_cass(&argv, std::time::Duration::ZERO) {
                 Err(error) => assert!(!error.started),
                 Ok(_) => panic!("invalid command must not start"),
@@ -1420,8 +1523,17 @@ mod tests {
                 "steps": [{"order": 1, "command": "support.produce-capsule",
                     "mutates": true, "proof_gate": "capsule-produced", "rch_rule": "none"}]}});
         let output = render_execution(plan, &request);
-        assert_eq!(output.pointer("/execution/overall_status"), Some(&json!("blocked")));
-        assert_eq!(output.pointer("/execution/attempted_mutation_count"), Some(&json!(0)));
-        assert_eq!(output.pointer("/mutation_contract/read_only"), Some(&json!(true)));
+        assert_eq!(
+            output.pointer("/execution/overall_status"),
+            Some(&json!("blocked"))
+        );
+        assert_eq!(
+            output.pointer("/execution/attempted_mutation_count"),
+            Some(&json!(0))
+        );
+        assert_eq!(
+            output.pointer("/mutation_contract/read_only"),
+            Some(&json!(true))
+        );
     }
 }

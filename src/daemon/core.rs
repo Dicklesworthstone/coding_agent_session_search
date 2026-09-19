@@ -5,8 +5,8 @@
 
 mod inference;
 mod job_requests;
-mod wire;
 mod startup;
+mod wire;
 
 #[cfg(test)]
 mod startup_integration;
@@ -33,9 +33,8 @@ use tracing::{debug, error, info, warn};
 
 use super::models::ModelManager;
 use super::protocol::{
-    ErrorCode, ErrorResponse, FramedMessage, HealthStatus, MAX_FRAME_BYTES,
-    PROTOCOL_VERSION, Request, Response, StatusResponse, decode_message, default_socket_path,
-    encode_message,
+    ErrorCode, ErrorResponse, FramedMessage, HealthStatus, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    Request, Response, StatusResponse, decode_message, default_socket_path, encode_message,
 };
 use super::resource::ResourceMonitor;
 use super::worker::{EmbeddingJobConfig, EmbeddingWorker, EmbeddingWorkerHandle};
@@ -550,7 +549,9 @@ impl ModelDaemon {
         }
         let thread = self.worker_thread.lock().take();
         if let Some(thread) = thread {
-            thread.join().map_err(|_| std::io::Error::other("embedding worker panicked"))?;
+            thread
+                .join()
+                .map_err(|_| std::io::Error::other("embedding worker panicked"))?;
         }
         Ok(())
     }
@@ -585,7 +586,10 @@ impl ModelDaemon {
             }
         });
         self.touch_activity();
-        info!(cancelled = self.shutdown.load(Ordering::Acquire), "Model pre-warming finished");
+        info!(
+            cancelled = self.shutdown.load(Ordering::Acquire),
+            "Model pre-warming finished"
+        );
     }
 
     fn run_with_model_warmup(&self, warmup: impl FnOnce() + Send) -> std::io::Result<()> {
@@ -672,9 +676,8 @@ impl ModelDaemon {
         self.init_worker();
 
         let serving_result = std::thread::scope(|s| -> std::io::Result<()> {
-            let startup = startup::StartupWarmup::spawn(
-                s, &self.inference_gate, &self.shutdown, warmup,
-            )?;
+            let startup =
+                startup::StartupWarmup::spawn(s, &self.inference_gate, &self.shutdown, warmup)?;
             loop {
                 // Check for shutdown
                 if self.shutdown.load(Ordering::SeqCst) {
@@ -934,7 +937,9 @@ impl ModelDaemon {
             request @ (Request::Embed { .. }
             | Request::EmbedAttested { .. }
             | Request::Rerank { .. }
-            | Request::RerankAttested { .. }) => inference::handle(self, request, inference_timeout),
+            | Request::RerankAttested { .. }) => {
+                inference::handle(self, request, inference_timeout)
+            }
 
             Request::Status => {
                 let embedder_info = self.models.embedder_info();
@@ -1572,7 +1577,14 @@ mod tests {
         };
         handle.submit(config.clone()).map_err(anyhow::Error::msg)?;
         *daemon.worker_handle.lock() = Some(handle.clone());
-        assert!(matches!(daemon.handle_request("shutdown".into(), Request::Shutdown, daemon.config.request_timeout), Response::Shutdown { .. }));
+        assert!(matches!(
+            daemon.handle_request(
+                "shutdown".into(),
+                Request::Shutdown,
+                daemon.config.request_timeout
+            ),
+            Response::Shutdown { .. }
+        ));
         assert!(handle.submit(config.clone()).is_err());
         worker.run();
         assert!(!Path::new(&config.db_path).exists());
@@ -1585,17 +1597,28 @@ mod tests {
         let temp = TempDir::new()?;
         let daemon = ModelDaemon::new(DaemonConfig::default(), ModelManager::new(temp.path()));
         daemon.init_worker();
-        let first = daemon.worker_thread.lock().as_ref().map(|thread| thread.thread().id());
+        let first = daemon
+            .worker_thread
+            .lock()
+            .as_ref()
+            .map(|thread| thread.thread().id());
         assert!(first.is_some(), "the worker thread must actually start");
         daemon.init_worker();
-        let second = daemon.worker_thread.lock().as_ref().map(|thread| thread.thread().id());
+        let second = daemon
+            .worker_thread
+            .lock()
+            .as_ref()
+            .map(|thread| thread.thread().id());
         assert_eq!(first, second);
         daemon.request_shutdown();
         daemon.finish_worker()?;
         assert!(daemon.worker_thread.lock().is_none());
         assert!(daemon.worker_handle.lock().is_none());
         daemon.init_worker();
-        assert!(daemon.worker_thread.lock().is_none(), "shutdown cannot resurrect a worker");
+        assert!(
+            daemon.worker_thread.lock().is_none(),
+            "shutdown cannot resurrect a worker"
+        );
         Ok(())
     }
 
@@ -1606,23 +1629,45 @@ mod tests {
         let daemon = ModelDaemon::new(DaemonConfig::default(), ModelManager::new(temp.path()));
         let (_worker, handle) = EmbeddingWorker::new();
         *daemon.worker_handle.lock() = Some(handle);
-        assert!(matches!(daemon.handle_request("status".into(), Request::EmbeddingJobStatus { db_path: path.clone() }, daemon.config.request_timeout), Response::JobStatus(info) if info.jobs.is_empty()));
-        let response = daemon.handle_request("submit".into(), Request::SubmitEmbeddingJob {
-            db_path: path.clone(), index_path: temp.path().join("index").to_string_lossy().into_owned(),
-            two_tier: false, fast_model: Some("hash".into()), quality_model: None,
-        }, daemon.config.request_timeout);
+        assert!(
+            matches!(daemon.handle_request("status".into(), Request::EmbeddingJobStatus { db_path: path.clone() }, daemon.config.request_timeout), Response::JobStatus(info) if info.jobs.is_empty())
+        );
+        let response = daemon.handle_request(
+            "submit".into(),
+            Request::SubmitEmbeddingJob {
+                db_path: path.clone(),
+                index_path: temp.path().join("index").to_string_lossy().into_owned(),
+                two_tier: false,
+                fast_model: Some("hash".into()),
+                quality_model: None,
+            },
+            daemon.config.request_timeout,
+        );
         assert!(matches!(response, Response::JobSubmitted { .. }));
-        let response = daemon.handle_request("cancel".into(), Request::CancelEmbeddingJob { db_path: path.clone(), model_id: None }, daemon.config.request_timeout);
-        assert!(matches!(response, Response::JobCancelled { cancelled: 1, message } if message.contains("cleanup is pending")));
+        let response = daemon.handle_request(
+            "cancel".into(),
+            Request::CancelEmbeddingJob {
+                db_path: path.clone(),
+                model_id: None,
+            },
+            daemon.config.request_timeout,
+        );
+        assert!(
+            matches!(response, Response::JobCancelled { cancelled: 1, message } if message.contains("cleanup is pending"))
+        );
         assert!(!Path::new(&path).exists());
         Ok(())
     }
 
     #[test]
-    fn trailing_shutdown_bytes_are_rejected_before_dispatch_and_valid_frames_still_work() -> anyhow::Result<()> {
+    fn trailing_shutdown_bytes_are_rejected_before_dispatch_and_valid_frames_still_work()
+    -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let daemon = Arc::new(ModelDaemon::new(
-            DaemonConfig { request_timeout: Duration::from_secs(2), ..Default::default() },
+            DaemonConfig {
+                request_timeout: Duration::from_secs(2),
+                ..Default::default()
+            },
             ModelManager::new(temp.path()),
         ));
         let (server, mut peer) = UnixStream::pair()?;
@@ -1630,7 +1675,8 @@ mod tests {
         let owner = Arc::clone(&daemon);
         let handler = std::thread::spawn(move || owner.handle_connection(server));
         let outcome = (|| -> anyhow::Result<()> {
-            let mut encoded = encode_message(&FramedMessage::new("invalid-shutdown", Request::Shutdown))?;
+            let mut encoded =
+                encode_message(&FramedMessage::new("invalid-shutdown", Request::Shutdown))?;
             encoded.push(0xc0);
             let length = u32::try_from(encoded.len() - 4)?;
             encoded[..4].copy_from_slice(&length.to_be_bytes());
@@ -1642,10 +1688,15 @@ mod tests {
             let mut bytes = vec![0; length];
             peer.read_exact(&mut bytes)?;
             let response = decode_message::<Response>(&bytes)?;
-            anyhow::ensure!(matches!(response.payload, Response::Error(error) if error.code == ErrorCode::InvalidInput));
+            anyhow::ensure!(
+                matches!(response.payload, Response::Error(error) if error.code == ErrorCode::InvalidInput)
+            );
             anyhow::ensure!(!daemon.shutdown.load(Ordering::Acquire));
             anyhow::ensure!(daemon.total_requests.load(Ordering::Relaxed) == 0);
-            peer.write_all(&encode_message(&FramedMessage::new("health", Request::Health))?)?;
+            peer.write_all(&encode_message(&FramedMessage::new(
+                "health",
+                Request::Health,
+            ))?)?;
             peer.read_exact(&mut prefix)?;
             let length = u32::from_be_bytes(prefix) as usize;
             anyhow::ensure!(length <= MAX_FRAME_BYTES);
@@ -1659,7 +1710,9 @@ mod tests {
         })();
         daemon.request_shutdown();
         drop(peer);
-        handler.join().map_err(|_| anyhow::anyhow!("connection handler panicked"))??;
+        handler
+            .join()
+            .map_err(|_| anyhow::anyhow!("connection handler panicked"))??;
         outcome
     }
 
@@ -1667,7 +1720,10 @@ mod tests {
     fn trickled_payload_expires_without_dispatching_or_loading_a_model() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let daemon = Arc::new(ModelDaemon::new(
-            DaemonConfig { request_timeout: Duration::from_millis(100), ..Default::default() },
+            DaemonConfig {
+                request_timeout: Duration::from_millis(100),
+                ..Default::default()
+            },
             ModelManager::new(temp.path()),
         ));
         let (server, mut peer) = UnixStream::pair()?;
@@ -1685,8 +1741,13 @@ mod tests {
         let expired_without_shutdown = handler.is_finished();
         daemon.request_shutdown();
         drop(peer);
-        handler.join().map_err(|_| anyhow::anyhow!("connection handler panicked"))??;
-        anyhow::ensure!(expired_without_shutdown, "payload progress extended the request indefinitely");
+        handler
+            .join()
+            .map_err(|_| anyhow::anyhow!("connection handler panicked"))??;
+        anyhow::ensure!(
+            expired_without_shutdown,
+            "payload progress extended the request indefinitely"
+        );
         anyhow::ensure!(daemon.total_requests.load(Ordering::Relaxed) == 0);
         anyhow::ensure!(!daemon.models.embedder_loaded());
         anyhow::ensure!(std::fs::read_dir(temp.path())?.count() == 0);

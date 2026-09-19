@@ -95,8 +95,8 @@ impl RemoteIndexJob {
             ("INVALID", None) => JobState::Invalid,
             _ => return Err("inconsistent remote indexing state and exit receipt".to_string()),
         };
-        let sessions = field(output, "CASS_INDEX_SESSIONS=")?
-            .and_then(|value| value.parse::<u64>().ok());
+        let sessions =
+            field(output, "CASS_INDEX_SESSIONS=")?.and_then(|value| value.parse::<u64>().ok());
         let log = output
             .lines()
             .filter_map(|line| line.strip_prefix("CASS_INDEX_LOG="))
@@ -235,7 +235,8 @@ mod tests {
 
     #[test]
     fn start_receipt_requires_version_identity_and_pid() {
-        let output = "banner\nCASS_INDEX_PROTOCOL=1\nCASS_INDEX_RUN=run-ABC123xyz9\nCASS_INDEX_PID=42\n";
+        let output =
+            "banner\nCASS_INDEX_PROTOCOL=1\nCASS_INDEX_RUN=run-ABC123xyz9\nCASS_INDEX_PID=42\n";
         assert_eq!(
             RemoteIndexJob::from_start_output(output).unwrap().id(),
             job().id()
@@ -294,7 +295,9 @@ mod tests {
             "CASS_INDEX_PROTOCOL=1",
             "CASS_INDEX_EXIT=0",
         ] {
-            let output = receipt(&format!("CASS_INDEX_STATE=COMPLETE\nCASS_INDEX_EXIT=0\n{extra}"));
+            let output = receipt(&format!(
+                "CASS_INDEX_STATE=COMPLETE\nCASS_INDEX_EXIT=0\n{extra}"
+            ));
             assert!(job().parse_poll(&output).is_err());
         }
     }
@@ -319,7 +322,10 @@ mod tests {
             ("CASS_INDEX_STATE=MISSING", JobState::Missing),
             ("CASS_INDEX_STATE=INTERRUPTED", JobState::Interrupted),
             ("CASS_INDEX_STATE=INVALID", JobState::Invalid),
-            ("CASS_INDEX_STATE=FAILED\nCASS_INDEX_EXIT=7", JobState::Failed(7)),
+            (
+                "CASS_INDEX_STATE=FAILED\nCASS_INDEX_EXIT=7",
+                JobState::Failed(7),
+            ),
         ] {
             assert_eq!(job().parse_poll(&receipt(state)).unwrap().state, expected);
         }

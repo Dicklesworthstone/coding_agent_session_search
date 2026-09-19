@@ -1285,7 +1285,7 @@ mod tests {
 
     #[test]
     fn live_git_porcelain_preserves_rename_paths_and_unknown_upstream() {
-        let bytes = b"# branch.oid 0123456789012345678901234567890123456789\0# branch.head main\02 R. N... 100644 100644 100644 abc def R100 new name\0old\nname\0? untracked\0";
+        let bytes = b"# branch.oid 0123456789012345678901234567890123456789\0# branch.head main\x002 R. N... 100644 100644 100644 abc def R100 new name\0old\nname\0? untracked\0";
         let value = parse_git_status(bytes).expect("valid porcelain");
         assert_eq!(value["branch"], "main");
         assert_eq!(value["dirty"], true);
@@ -1309,7 +1309,7 @@ mod tests {
             b"# branch.oid (initial)\0# branch.head main\0# branch.head other\0".as_slice(),
             b"# branch.oid (initial)\0# branch.head main\0? \0".as_slice(),
             b"# branch.head main\0x future-record\0".as_slice(),
-            b"# branch.head main\02 R. N... 100644 100644 100644 a b R100 new\0".as_slice(),
+            b"# branch.head main\x002 R. N... 100644 100644 100644 a b R100 new\0".as_slice(),
             b"# branch.head main\0# branch.ab +wrong -0\0".as_slice(),
         ] {
             assert!(

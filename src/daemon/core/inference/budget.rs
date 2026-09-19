@@ -35,7 +35,13 @@ impl InferenceGate {
         self.0
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .map(|_| Permit(&self.0))
-            .map_err(|_| error(ErrorCode::Overloaded, "foreground inference is busy; retry later", true))
+            .map_err(|_| {
+                error(
+                    ErrorCode::Overloaded,
+                    "foreground inference is busy; retry later",
+                    true,
+                )
+            })
     }
 }
 
@@ -53,15 +59,27 @@ pub(super) struct Budget<'a> {
 
 impl<'a> Budget<'a> {
     pub(super) fn new(timeout: Duration, shutdown: &'a AtomicBool) -> Self {
-        Self { start: Instant::now(), timeout, shutdown }
+        Self {
+            start: Instant::now(),
+            timeout,
+            shutdown,
+        }
     }
 
     pub(super) fn check(&self) -> Result<(), ErrorResponse> {
         if self.shutdown.load(Ordering::Acquire) {
-            return Err(error(ErrorCode::Overloaded, "daemon is shutting down", true));
+            return Err(error(
+                ErrorCode::Overloaded,
+                "daemon is shutting down",
+                true,
+            ));
         }
         if self.start.elapsed() >= self.timeout {
-            return Err(error(ErrorCode::Timeout, "daemon inference deadline exceeded", true));
+            return Err(error(
+                ErrorCode::Timeout,
+                "daemon inference deadline exceeded",
+                true,
+            ));
         }
         Ok(())
     }
@@ -81,7 +99,11 @@ pub(super) fn plan(
 ) -> Result<Vec<Range<usize>>, ErrorResponse> {
     budget.check()?;
     if texts.len() > MAX_ITEMS {
-        return Err(error(ErrorCode::InvalidInput, "inference request exceeds 1024 items", false));
+        return Err(error(
+            ErrorCode::InvalidInput,
+            "inference request exceeds 1024 items",
+            false,
+        ));
     }
     let mut total_bytes = 0usize;
     let mut query_chars = 0usize;
@@ -97,10 +119,18 @@ pub(super) fn plan(
         budget.check()?;
         validate_text(text)?;
         total_bytes = total_bytes.checked_add(text.len()).ok_or_else(|| {
-            error(ErrorCode::InvalidInput, "inference input size overflow", false)
+            error(
+                ErrorCode::InvalidInput,
+                "inference input size overflow",
+                false,
+            )
         })?;
         if total_bytes > MAX_INPUT_BYTES {
-            return Err(error(ErrorCode::InvalidInput, "inference request exceeds 4 MiB of input text", false));
+            return Err(error(
+                ErrorCode::InvalidInput,
+                "inference request exceeds 4 MiB of input text",
+                false,
+            ));
         }
         let chars = text.chars().count().saturating_add(query_chars).max(1);
         let next_longest = longest.max(chars);
@@ -124,10 +154,18 @@ pub(super) fn plan(
 
 fn validate_text(text: &str) -> Result<(), ErrorResponse> {
     if text.is_empty() {
-        return Err(error(ErrorCode::InvalidInput, "inference input contains an empty text", false));
+        return Err(error(
+            ErrorCode::InvalidInput,
+            "inference input contains an empty text",
+            false,
+        ));
     }
     if text.len() > MAX_TEXT_BYTES {
-        return Err(error(ErrorCode::InvalidInput, "inference text exceeds 64 KiB", false));
+        return Err(error(
+            ErrorCode::InvalidInput,
+            "inference text exceeds 64 KiB",
+            false,
+        ));
     }
     Ok(())
 }
@@ -147,13 +185,21 @@ pub(super) fn collect_batches<T>(
         let batch = infer(&texts[range.clone()])?;
         budget.check()?;
         if batch.len() != range.len() {
-            return Err(error(ErrorCode::Internal, "native inference returned an incomplete or oversized batch", false));
+            return Err(error(
+                ErrorCode::Internal,
+                "native inference returned an incomplete or oversized batch",
+                false,
+            ));
         }
         result.extend(batch);
     }
     budget.check()?;
     if result.len() != texts.len() {
-        return Err(error(ErrorCode::Internal, "native inference returned an inconsistent result count", false));
+        return Err(error(
+            ErrorCode::Internal,
+            "native inference returned an inconsistent result count",
+            false,
+        ));
     }
     Ok(result)
 }
@@ -186,7 +232,9 @@ mod tests {
                 scope.spawn(|| {
                     barrier.wait();
                     let permit = gate.try_enter();
-                    if permit.is_ok() { admitted.fetch_add(1, Ordering::SeqCst); }
+                    if permit.is_ok() {
+                        admitted.fetch_add(1, Ordering::SeqCst);
+                    }
                     // Hold the winner until all contenders have attempted.
                     barrier.wait();
                     drop(permit);
@@ -203,33 +251,61 @@ mod tests {
     fn planner_bounds_rows_padded_text_and_rerank_query_pairs() {
         let shutdown = AtomicBool::new(false);
         let budget = Budget::new(Duration::from_secs(30), &shutdown);
-        for query in [None, Some("a long query ") ] {
-            let texts = (0..101).map(|index| "é".repeat(if index % 7 == 0 { 12000 } else { 600 }))
+        for query in [None, Some("a long query ")] {
+            let texts = (0..101)
+                .map(|index| "é".repeat(if index % 7 == 0 { 12000 } else { 600 }))
                 .collect::<Vec<_>>();
             let ranges = plan(&texts, query, &budget).unwrap();
-            assert_eq!(ranges.iter().flat_map(|range| range.clone()).collect::<Vec<_>>(), (0..101).collect::<Vec<_>>());
+            assert_eq!(
+                ranges
+                    .iter()
+                    .flat_map(|range| range.clone())
+                    .collect::<Vec<_>>(),
+                (0..101).collect::<Vec<_>>()
+            );
             for range in ranges {
-                let longest = texts[range.clone()].iter().map(|text| text.chars().count() + query.map_or(0, |q| q.chars().count())).max().unwrap();
+                let longest = texts[range.clone()]
+                    .iter()
+                    .map(|text| text.chars().count() + query.map_or(0, |q| q.chars().count()))
+                    .max()
+                    .unwrap();
                 assert!(range.len() <= MAX_BATCH_ITEMS);
                 assert!(range.len() == 1 || range.len() * longest <= MAX_PADDED_CHARS);
             }
         }
         let texts = vec!["x".into(); 33];
-        assert_eq!(plan(&texts, None, &budget).unwrap(), [0..16, 16..32, 32..33]);
+        assert_eq!(
+            plan(&texts, None, &budget).unwrap(),
+            [0..16, 16..32, 32..33]
+        );
         let texts = vec!["x".into(); 3];
-        assert_eq!(plan(&texts, Some(&"q".repeat(10000)), &budget).unwrap(), [0..1, 1..2, 2..3]);
+        assert_eq!(
+            plan(&texts, Some(&"q".repeat(10000)), &budget).unwrap(),
+            [0..1, 1..2, 2..3]
+        );
     }
 
     #[test]
     fn invalid_final_input_is_rejected_before_any_inference() {
         let shutdown = AtomicBool::new(false);
         let budget = Budget::new(Duration::from_secs(30), &shutdown);
-        for texts in [vec!["x".into(); MAX_ITEMS + 1], vec!["a".repeat(MAX_TEXT_BYTES + 1)], vec!["a".repeat(MAX_TEXT_BYTES); 65], vec!["valid".into(), String::new()]] {
-            assert_eq!(plan(&texts, None, &budget).unwrap_err().code, ErrorCode::InvalidInput);
+        for texts in [
+            vec!["x".into(); MAX_ITEMS + 1],
+            vec!["a".repeat(MAX_TEXT_BYTES + 1)],
+            vec!["a".repeat(MAX_TEXT_BYTES); 65],
+            vec!["valid".into(), String::new()],
+        ] {
+            assert_eq!(
+                plan(&texts, None, &budget).unwrap_err().code,
+                ErrorCode::InvalidInput
+            );
         }
         assert!(plan(&vec!["a".repeat(MAX_TEXT_BYTES); 64], None, &budget).is_ok());
         assert!(plan(&[], None, &budget).unwrap().is_empty());
-        assert_eq!(plan(&[], Some(""), &budget).unwrap_err().code, ErrorCode::InvalidInput);
+        assert_eq!(
+            plan(&[], Some(""), &budget).unwrap_err().code,
+            ErrorCode::InvalidInput
+        );
     }
 
     #[test]
@@ -238,7 +314,10 @@ mod tests {
         let budget = Budget::new(Duration::from_secs(30), &shutdown);
         let texts = (0..37).map(|index| index.to_string()).collect::<Vec<_>>();
         let ranges = plan(&texts, None, &budget).unwrap();
-        assert_eq!(collect_batches(&texts, &ranges, &budget, |batch| Ok(batch.to_vec())).unwrap(), texts);
+        assert_eq!(
+            collect_batches(&texts, &ranges, &budget, |batch| Ok(batch.to_vec())).unwrap(),
+            texts
+        );
         for delta in [-1isize, 1] {
             let mut calls = 0;
             let result = collect_batches(&texts, &ranges, &budget, |batch| {
@@ -259,7 +338,9 @@ mod tests {
         let mut calls = 0;
         let result = collect_batches(&texts, &ranges, &budget, |batch| {
             calls += 1;
-            if calls == 2 { return Err(error(ErrorCode::Internal, "synthetic failure", false)); }
+            if calls == 2 {
+                return Err(error(ErrorCode::Internal, "synthetic failure", false));
+            }
             Ok(batch.to_vec())
         });
         assert_eq!(result.unwrap_err().message, "synthetic failure");
@@ -279,8 +360,13 @@ mod tests {
         assert_eq!(result.unwrap_err().code, ErrorCode::Overloaded);
         shutdown.store(false, Ordering::Release);
         let expired = Budget::new(Duration::ZERO, &shutdown);
-        assert_eq!(plan(&texts, None, &expired).unwrap_err().code, ErrorCode::Timeout);
-        let result = collect_batches::<String>(&texts, &ranges, &expired, |_| panic!("expired request reached backend"));
+        assert_eq!(
+            plan(&texts, None, &expired).unwrap_err().code,
+            ErrorCode::Timeout
+        );
+        let result = collect_batches::<String>(&texts, &ranges, &expired, |_| {
+            panic!("expired request reached backend")
+        });
         assert_eq!(result.unwrap_err().code, ErrorCode::Timeout);
     }
 }

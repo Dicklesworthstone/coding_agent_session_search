@@ -25,12 +25,40 @@ the evidence; [CHANGELOG_RESEARCH.md](CHANGELOG_RESEARCH.md) records coverage.
 
 | Version | Date | Publication state |
 |---------|------|-------------------|
+| [v0.9.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.9.0) | 2026-09-19 | Sharded native ANN semantic search, bounded-admission daemon, responsive transcript pages |
 | [v0.8.0](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.8.0) | 2026-09-10 | Published GitHub Release: Linux x86_64/arm64, macOS arm64, Windows x86_64 |
 | [v0.7.1](https://github.com/Dicklesworthstone/coding_agent_session_search/releases/tag/v0.7.1) | 2026-08-31 | Published GitHub Release and binary baseline for the changes below |
 
-## [Unreleased]
+## [v0.9.0] -- 2026-09-19
 
 ### Added
+
+- **Sharded native ANN semantic search.** Semantic retrieval is now served from
+  an immutable, owner-backed sharded reader. Complete ordered shard cohorts are
+  published and retained together, approximate retrieval routes across every
+  retained shard and merges globally rather than per-shard, and a reader keeps
+  serving the publication it opened while a newer one is published beside it.
+  Exact-owner ANN admission means a shard's vectors are only used by the owner
+  that produced them.
+- **Exact recovery when the approximate path cannot answer.** Filtered and
+  chunk-starved ANN pages fall back to a bounded exact message refill instead of
+  returning short results, and chunk-dominated result sets are refilled back to
+  whole messages.
+- **A daemon that stays answerable while it is busy.** Health, shutdown and
+  control-plane requests are served during owned model warm-up rather than
+  blocking behind it. Embedding and inference work runs under bounded admission
+  with job-scoped cancellation and cooperative batch budgets, jobs report
+  truthful controls and exact cancellation receipts, the client transport is
+  deadline-owned and nonblocking, and model publication is staged without
+  blocking readers. Model contracts are validated and MiniLM quality aliases are
+  canonicalized before admission.
+- **Transcript pages that stay responsive on large sessions.** Transcript
+  sources load lazily with metadata-only deep links, only visible messages are
+  hydrated, stale deep links are cancelled, and complete result sets paginate
+  under bounded cancellable navigation.
+- **Codex freeform session ingest.** Freeform session files are ingested and
+  their tool input is searchable, without merging distinct tool calls into one
+  another.
 
 - Linux index summaries report physical write bytes across the indexing run,
   including final checkpointing, to help diagnose disk write amplification (#479).

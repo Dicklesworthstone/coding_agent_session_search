@@ -32028,12 +32028,13 @@ pub mod persist {
         // Retry only setup: replaying f or close here could lose the outcomes
         // of already-committed chunks and therefore skip lexical publication.
         let (writer, reusable) = with_concurrent_retry(SERIAL_CHUNK_CONTENTION_RETRIES, || {
-            let (writer, reusable) = storage.acquire_cached_ephemeral_writer().with_context(|| {
-                format!(
-                    "opening short-lived frankensqlite writer for {context}: {}",
-                    db_path.display()
-                )
-            })?;
+            let (writer, reusable) =
+                storage.acquire_cached_ephemeral_writer().with_context(|| {
+                    format!(
+                        "opening short-lived frankensqlite writer for {context}: {}",
+                        db_path.display()
+                    )
+                })?;
 
             let discard_writer = |mut writer: FrankenStorage| {
                 if reusable {
@@ -33325,13 +33326,16 @@ pub mod persist {
                     })?;
 
                     let workspace_id = if let Some(ws) = &conv.workspace {
-                        Some(with_concurrent_retry(SERIAL_CHUNK_CONTENTION_RETRIES, || {
-                            if cache_enabled {
-                                cache.get_or_insert_workspace(writer, ws, None)
-                            } else {
-                                writer.ensure_workspace(ws, None)
-                            }
-                        })?)
+                        Some(with_concurrent_retry(
+                            SERIAL_CHUNK_CONTENTION_RETRIES,
+                            || {
+                                if cache_enabled {
+                                    cache.get_or_insert_workspace(writer, ws, None)
+                                } else {
+                                    writer.ensure_workspace(ws, None)
+                                }
+                            },
+                        )?)
                     } else {
                         None
                     };

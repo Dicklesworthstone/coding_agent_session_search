@@ -179,7 +179,10 @@ fn gh473_real_cli_write_and_noop_replays_preserve_pinned_reader_and_lexical_stat
             checkpoint["committed_meta_fingerprint"].as_str(),
             Some(fingerprint.as_str())
         );
-        assert_eq!(searchable_index_summary(&index_path).unwrap().unwrap().docs, 2);
+        assert_eq!(
+            searchable_index_summary(&index_path).unwrap().unwrap().docs,
+            2
+        );
         current.close_without_checkpoint().unwrap();
     }
     reader.raw().execute("ROLLBACK").unwrap();
