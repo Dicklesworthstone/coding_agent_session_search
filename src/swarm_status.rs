@@ -19,12 +19,37 @@ use std::time::{Duration, Instant, SystemTime};
 /// Live collection never opens Beads' writable database. Its exported JSONL
 /// snapshot is explicitly partial because unexported database changes may exist.
 #[must_use]
-pub fn collect_live_swarm_sources(repo: &Path) -> SwarmSourceCollection {
+pub fn collect_live_swarm_sources(
+    repo: &Path,
+    cass_paths: Option<(&Path, &Path)>,
+) -> SwarmSourceCollection {
     let started = Instant::now();
+    // Observe CASS first so an unavailable external daemon cannot consume its
+    // entire budget. Both CASS surfaces share one strictly passive child read.
+    let cass = cass_paths
+        .map(|(data_dir, db_path)| collect_passive_cass(repo, data_dir, db_path, started));
     let snapshots = REQUIRED_SWARM_SOURCE_PROVIDERS
         .iter()
         .copied()
         .map(|name| {
+            if matches!(name, SwarmProviderName::CassHealth | SwarmProviderName::CassStatus)
+                && let Some(result) = &cass
+            {
+                return match result {
+                    Ok(payload) => SwarmSourceSnapshot::partial(
+                        name,
+                        format!("live:{name}"),
+                        "Passive filesystem observations only; database integrity and query readiness are not tested.",
+                        payload.clone(),
+                    ),
+                    Err(error) => SwarmSourceSnapshot::unavailable(
+                        name,
+                        format!("live:{name}"),
+                        "live-provider-read-failed",
+                        error.clone(),
+                    ),
+                };
+            }
             if matches!(
                 name,
                 SwarmProviderName::Git
@@ -49,6 +74,93 @@ pub fn collect_live_swarm_sources(repo: &Path) -> SwarmSourceCollection {
         })
         .collect();
     SwarmSourceCollection { snapshots }
+}
+
+fn cass_archive_id(data_dir: &Path, db_path: &Path) -> String {
+    let mut hash = blake3::Hasher::new();
+    for path in [data_dir, db_path] {
+        let bytes = path.as_os_str().as_encoded_bytes();
+        hash.update(&(bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    }
+    hash.finalize().to_hex().to_string()
+}
+
+/// Called only by the early, non-runtime CLI observer branch. Never opens the
+/// database or invokes status/health, whose normal maintenance may write.
+pub(crate) fn passive_cass_observation(data_dir: &Path, db_path: &Path) -> Value {
+    let absent =
+        fs::metadata(db_path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+    let lock_path = crate::search::asset_state::index_run_lock_path(data_dir);
+    let active_rebuild = match fs::metadata(&lock_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Ok(metadata) if metadata.is_file() => {
+            let lock = crate::search::asset_state::read_search_maintenance_snapshot(data_dir);
+            // The existing probe hides stale metadata and I/O errors alike.
+            // An inactive result therefore cannot prove a negative here.
+            if lock.active {
+                lock.mode.map(|mode| mode.rebuild_active())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    serde_json::json!({
+        "schema_version": "cass-passive-v1",
+        "archive_id": cass_archive_id(data_dir, db_path),
+        "source_kind": "passive-filesystem",
+        "observed_at_ms": SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis(),
+        "status": if absent { "uninitialized" } else { "unprobed" },
+        "healthy": absent.then_some(false),
+        "initialized": absent.then_some(false),
+        "search_ready": absent.then_some(false),
+        "active_rebuild": active_rebuild,
+    })
+}
+
+fn collect_passive_cass(
+    repo: &Path,
+    data_dir: &Path,
+    db_path: &Path,
+    started: Instant,
+) -> Result<Value, String> {
+    let remaining = Duration::from_secs(15)
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or("live provider deadline exceeded")?;
+    let executable = std::env::current_exe().map_err(|_| "CASS executable unavailable")?;
+    let mut command = Command::new(executable);
+    command
+        .args(["swarm", "observe-cass", "--data-dir"])
+        .arg(data_dir)
+        .arg("--db-path")
+        .arg(db_path)
+        .current_dir(repo)
+        .env_remove("CASS_TRACE_FILE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::sources::configure_child_process_group(&mut command);
+    let child = command.spawn().map_err(|_| "CASS observer spawn failed")?;
+    let output = crate::sources::wait_for_child_output_with_limit(
+        child,
+        remaining.min(Duration::from_secs(3)),
+        Some(64 * 1024),
+    )
+    .map_err(|_| "CASS observer output failed")?
+    .ok_or("CASS observer deadline exceeded")?;
+    if !output.status.success() {
+        return Err("CASS observer failed".to_string());
+    }
+    let payload: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| "CASS observer returned invalid JSON")?;
+    if payload["schema_version"] != "cass-passive-v1"
+        || payload["archive_id"] != cass_archive_id(data_dir, db_path)
+    {
+        return Err("CASS observer identity mismatch".to_string());
+    }
+    Ok(payload)
 }
 
 struct LiveSwarmSourceAdapter {
@@ -1471,7 +1583,7 @@ mod tests {
     #[test]
     fn live_collection_reports_missing_sources_without_initializing_them() {
         let dir = tempfile::tempdir().expect("empty directory");
-        let collection = collect_live_swarm_sources(dir.path());
+        let collection = collect_live_swarm_sources(dir.path(), None);
         for name in [SwarmProviderName::Git, SwarmProviderName::Beads] {
             let snapshot = collection.snapshot(name).expect("provider retained");
             assert_eq!(snapshot.status, SwarmProviderStatus::Unavailable);

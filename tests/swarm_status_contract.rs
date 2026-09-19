@@ -53,11 +53,16 @@ fn live_swarm_status_reports_unknown_sources_without_zero_work_claims() {
     let value: Value = serde_json::from_slice(&output.stdout).expect("status JSON");
     assert_eq!(value["status"], "partial");
     for field in ["healthy", "initialized", "search_ready", "active_rebuild"] {
-        assert!(
-            value["cass"][field].is_null(),
-            "unobserved {field}: {value}"
+        assert_eq!(
+            value["cass"][field], false,
+            "absent archive {field}: {value}"
         );
     }
+    assert_eq!(value["cass"]["health_status"], "uninitialized");
+    assert_eq!(
+        value["_meta"]["source_observations"]["cass_health"]["source_kind"],
+        "passive-filesystem"
+    );
     for field in [
         "ready_count",
         "in_progress_count",
@@ -86,6 +91,140 @@ fn live_swarm_status_reports_unknown_sources_without_zero_work_claims() {
     );
     assert!(!root.path().join(".beads").exists());
     assert!(!root.path().join(".git").exists());
+    assert!(!root.path().join("cass-data").exists());
+}
+
+#[test]
+fn passive_cass_observer_preserves_archive_stale_lock_and_trace_files() {
+    let root = TempDir::new().expect("observer environment");
+    let db = root.path().join("archive.db");
+    let lock = root.path().join("index-run.lock");
+    let sidecar = root.path().join("index-run.lock.meta");
+    let trace = root.path().join("trace.jsonl");
+    let env_trace = root.path().join("env-trace.jsonl");
+    // Deliberately not a valid database: observing it must never open, repair,
+    // or infer query readiness from the mere presence of a file.
+    fs::write(&db, b"unprobed archive sentinel").unwrap();
+    fs::write(&lock, b"pid=4294967295\nmode=index\n").unwrap();
+    fs::write(&sidecar, b"pid=4294967295\nmode=index\n").unwrap();
+    fs::write(&trace, b"existing trace\n").unwrap();
+    let before: Vec<_> = [&db, &lock, &sidecar, &trace]
+        .into_iter()
+        .map(|path| {
+            (
+                path,
+                fs::read(path).unwrap(),
+                fs::metadata(path).unwrap().modified().unwrap(),
+            )
+        })
+        .collect();
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .current_dir(root.path())
+        .env("CASS_TRACE_FILE", &env_trace)
+        .arg("--trace-file")
+        .arg(&trace)
+        .args(["swarm", "observe-cass", "--data-dir"])
+        .arg(root.path())
+        .arg("--db-path")
+        .arg(&db)
+        .timeout(Duration::from_secs(5))
+        .output()
+        .expect("passive child");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    for field in ["healthy", "initialized", "search_ready", "active_rebuild"] {
+        assert!(value[field].is_null(), "unprobed {field}: {value}");
+    }
+    assert_eq!(value["source_kind"], "passive-filesystem");
+    assert_eq!(value["archive_id"].as_str().unwrap().len(), 64);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("archive sentinel"));
+    assert!(!env_trace.exists());
+    for (path, bytes, modified) in before {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+        assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), modified);
+    }
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 4);
+}
+
+#[test]
+#[cfg(unix)]
+fn passive_cass_observer_reads_held_lock_without_releasing_the_owner() {
+    let root = TempDir::new().expect("locked archive");
+    let lock = root.path().join("index-run.lock");
+    fs::write(&lock, format!("pid={}\nmode=index\n", std::process::id())).unwrap();
+    let owner = fs::File::options()
+        .read(true)
+        .write(true)
+        .open(&lock)
+        .unwrap();
+    owner.lock().unwrap();
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .current_dir(root.path())
+        .args(["swarm", "observe-cass", "--data-dir"])
+        .arg(root.path())
+        .arg("--db-path")
+        .arg(root.path().join("missing.db"))
+        .timeout(Duration::from_secs(5))
+        .output()
+        .expect("passive child");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["active_rebuild"], true);
+    assert_eq!(value["initialized"], false);
+    let contender = fs::File::open(&lock).unwrap();
+    assert!(matches!(
+        contender.try_lock_shared(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    owner.unlock().unwrap();
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn live_swarm_observes_explicit_database_without_opening_it() {
+    let root = TempDir::new().expect("explicit archive");
+    let db = root.path().join("explicit.db");
+    fs::write(&db, b"unprobed archive sentinel").unwrap();
+    let modified = fs::metadata(&db).unwrap().modified().unwrap();
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .current_dir(root.path())
+        .env("HOME", root.path().join("home"))
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("XDG_DATA_HOME", root.path().join("data"))
+        .env("CASS_DATA_DIR", root.path().join("absent-default"))
+        .env("CASS_AUTO_REFRESH", "0")
+        .env_remove("CASS_TRACE_FILE")
+        .env_remove("CASS_SWARM_AGENT_MAIL_URL")
+        .env_remove("CASS_SWARM_AGENT_MAIL_TOKEN")
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .arg("--db")
+        .arg(&db)
+        .args(["swarm", "status", "--json"])
+        .timeout(Duration::from_secs(40))
+        .output()
+        .expect("live status child");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["cass"]["health_status"], "unprobed");
+    for field in ["healthy", "initialized", "search_ready"] {
+        assert!(value["cass"][field].is_null(), "unprobed {field}: {value}");
+    }
+    assert_eq!(value["cass"]["active_rebuild"], false);
+    assert_eq!(fs::read(&db).unwrap(), b"unprobed archive sentinel");
+    assert_eq!(fs::metadata(&db).unwrap().modified().unwrap(), modified);
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
 }
 
 #[test]

@@ -1897,6 +1897,14 @@ pub enum MirrorCommand {
 /// Read-only swarm operations commands.
 #[derive(Subcommand, Debug, Clone)]
 pub enum SwarmCommand {
+    /// Internal passive observer, isolated under the parent provider deadline.
+    #[command(hide = true)]
+    ObserveCass {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        db_path: PathBuf,
+    },
     /// Summarize Beads, Agent Mail, git, build, cass, and evidence state.
     Status {
         /// Output as JSON (`--robot` also works)
@@ -6934,6 +6942,17 @@ pub fn try_run_with_parsed_fast(parsed: ParsedCli) -> Result<CliResult<()>, Box<
         heuristic_note,
     } = parsed;
 
+    // This observer must return before runtime/logging/trace initialization.
+    // Even an explicitly supplied trace path must not turn inspection into a write.
+    if let Some(Commands::Swarm(SwarmCommand::ObserveCass { data_dir, db_path })) =
+        cli.command.as_ref()
+    {
+        return Ok(output_structured_value(
+            crate::swarm_status::passive_cass_observation(data_dir, db_path),
+            RobotFormat::Compact,
+        ));
+    }
+
     let command = cli.command.clone();
     if !matches!(
         command.as_ref(),
@@ -10679,6 +10698,10 @@ fn run_lessons_view(
 
 fn run_swarm_command(cmd: SwarmCommand, cli: &Cli) -> CliResult<()> {
     match cmd {
+        SwarmCommand::ObserveCass { data_dir, db_path } => output_structured_value(
+            crate::swarm_status::passive_cass_observation(&data_dir, &db_path),
+            RobotFormat::Compact,
+        ),
         SwarmCommand::Status {
             json,
             fixture,
@@ -10905,7 +10928,7 @@ fn run_swarm_status(
         let collection = set.collect_required();
         render_swarm_status_fixture(set.input(), &collection, privacy_probe.as_ref())
     } else {
-        render_swarm_status_live()
+        render_swarm_status_live(cli)
     };
 
     if let Some(fmt) = structured_format {
@@ -10961,7 +10984,7 @@ fn run_swarm_work_packet(
         let collection = set.collect_required();
         render_swarm_work_packet_fixture(set.input(), &collection, privacy_probe.as_ref(), bead)
     } else {
-        render_swarm_work_packet_live_partial(bead)
+        render_swarm_work_packet_live_partial(cli, bead)
     };
 
     if let Some(fmt) = structured_format {
@@ -11849,14 +11872,21 @@ pub fn render_swarm_status_live_partial() -> serde_json::Value {
 }
 
 /// CLI-only collection; the TUI's initial model must remain allocation-only.
-fn render_swarm_status_live() -> serde_json::Value {
+fn render_swarm_status_live(cli: &Cli) -> serde_json::Value {
     use crate::swarm_status::{
         REQUIRED_SWARM_SOURCE_PROVIDERS, SwarmProviderName, SwarmProviderStatus,
         SwarmSourceCollection, SwarmSourceSnapshot,
     };
     let started = std::time::Instant::now();
+    let data_dir = resolve_data_dir(&None, cli.db.as_ref());
+    let db_path = cli
+        .db
+        .clone()
+        .unwrap_or_else(|| data_dir.join("agent_search.db"));
     let collection = match std::env::current_dir() {
-        Ok(repo) => crate::swarm_status::collect_live_swarm_sources(&repo),
+        Ok(repo) => {
+            crate::swarm_status::collect_live_swarm_sources(&repo, Some((&data_dir, &db_path)))
+        }
         Err(_) => SwarmSourceCollection {
             snapshots: REQUIRED_SWARM_SOURCE_PROVIDERS
                 .iter()
@@ -11975,6 +12005,7 @@ fn render_swarm_status_live() -> serde_json::Value {
             "observed_at_ms": observed.get("observed_at_ms"),
             "repository": observed.get("repository"),
             "repository_id": observed.get("repository_id"),
+            "archive_id": observed.get("archive_id"),
             "head": observed.get("head"),
             "version": observed.get("version"),
             "source_kind": observed.get("source_kind"),
@@ -12014,8 +12045,8 @@ fn render_swarm_status_fixture(
     )
 }
 
-fn render_swarm_work_packet_live_partial(bead_filter: Option<&str>) -> serde_json::Value {
-    let status = render_swarm_status_live();
+fn render_swarm_work_packet_live_partial(cli: &Cli, bead_filter: Option<&str>) -> serde_json::Value {
+    let status = render_swarm_status_live(cli);
     let mut packet = render_swarm_work_packet_from_status(&status, bead_filter);
     packet["_meta"]["source_observations"] = status["_meta"]["source_observations"].clone();
     packet
