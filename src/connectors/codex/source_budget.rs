@@ -1,11 +1,12 @@
-//! Contain the explicitly typed rollout-size rejection (GH #484).
+//! Guard source integrity and contain explicitly typed rollout-size rejection.
 //!
-//! A rejected rollout must neither stop later sources nor receive a successful
-//! completion. Other parse, I/O, cancellation and sink errors still abort. The
-//! final aggregate error keeps connector/global watermarks behind and makes a
-//! partial scan distinguishable from success. Rejection samples are bounded;
-//! this is not a quarantine and never changes the source files.
+//! Each guarded attempt fails immediately on parse, I/O, or callback errors.
+//! The recovery driver isolates attempts by discovered file: healthy sources
+//! continue after source-local failures, but consumer errors still abort the
+//! entire scan. Any incomplete coverage returns an error, keeping watermarks
+//! conservative. Diagnostics are bounded and source files are never modified.
 
+mod recovery;
 mod snapshot;
 
 use std::cell::RefCell;
@@ -154,9 +155,31 @@ pub(super) fn scan(
     ctx: &ScanContext,
     hooks: &mut SourceScanHooks<'_>,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
-    mut enrich: impl FnMut(&mut NormalizedConversation) -> Result<()>,
+    enrich: impl FnMut(&mut NormalizedConversation) -> Result<()>,
+) -> Result<()> {
+    recovery::scan(inner, ctx, hooks, on_conversation, enrich)
+}
+
+#[cfg(test)]
+fn scan_guarded(
+    inner: &dyn Connector,
+    ctx: &ScanContext,
+    hooks: &mut SourceScanHooks<'_>,
+    on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    enrich: impl FnMut(&mut NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
     let exclusions = ScanExclusions::from_env();
+    scan_with_exclusions(inner, ctx, hooks, on_conversation, &exclusions, enrich)
+}
+
+fn scan_with_exclusions(
+    inner: &dyn Connector,
+    ctx: &ScanContext,
+    hooks: &mut SourceScanHooks<'_>,
+    on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
+    exclusions: &ScanExclusions,
+    mut enrich: impl FnMut(&mut NormalizedConversation) -> Result<()>,
+) -> Result<()> {
     let state = RefCell::new(ScanState::default());
     let SourceScanHooks {
         should_scan_source,
@@ -281,6 +304,12 @@ pub(super) fn scan(
 }
 
 #[cfg(test)]
-mod coverage_tests;
+mod coverage_tests {
+    use super::scan_guarded as scan;
+    include!("source_budget/coverage_tests.rs");
+}
 #[cfg(test)]
-mod tests;
+mod tests {
+    use super::scan_guarded as scan;
+    include!("source_budget/tests.rs");
+}

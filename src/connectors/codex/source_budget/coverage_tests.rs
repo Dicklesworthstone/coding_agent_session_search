@@ -1,4 +1,4 @@
-//! Source-coverage regressions exercise the real published Codex parser.
+// Source-coverage regressions exercise the real published Codex parser.
 
 use super::*;
 use franken_agent_detection::{DetectionResult, ScanRoot};
