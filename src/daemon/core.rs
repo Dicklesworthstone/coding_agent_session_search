@@ -5,10 +5,17 @@
 
 mod inference;
 mod job_requests;
+mod wire;
+mod startup;
+
+#[cfg(test)]
+mod startup_integration;
 
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder};
-use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(test)]
+use std::io::Read;
+use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -26,8 +33,9 @@ use tracing::{debug, error, info, warn};
 
 use super::models::ModelManager;
 use super::protocol::{
-    ErrorCode, ErrorResponse, FramedMessage, HealthStatus, ModelInfo, PROTOCOL_VERSION, Request,
-    Response, StatusResponse, decode_message, default_socket_path, encode_message,
+    ErrorCode, ErrorResponse, FramedMessage, HealthStatus, MAX_FRAME_BYTES,
+    PROTOCOL_VERSION, Request, Response, StatusResponse, decode_message, default_socket_path,
+    encode_message,
 };
 use super::resource::ResourceMonitor;
 use super::worker::{EmbeddingJobConfig, EmbeddingWorker, EmbeddingWorkerHandle};
@@ -547,8 +555,40 @@ impl ModelDaemon {
         Ok(())
     }
 
-    /// Start the daemon server.
+    /// Start serving control requests immediately while an owned worker warms
+    /// models. The worker is joined before the daemon can return.
     pub fn run(&self) -> std::io::Result<()> {
+        self.run_with_model_warmup(|| self.prewarm_models())
+    }
+
+    fn prewarm_models(&self) {
+        use startup::WarmupStage;
+        info!("Pre-warming models while control requests remain available");
+        startup::run_stages(&self.shutdown, |stage| match stage {
+            WarmupStage::Embedder => {
+                if let Err(error) = self.models.warm_embedder() {
+                    warn!(error = %error, "Failed to pre-warm embedder");
+                }
+            }
+            WarmupStage::Attestation => {
+                // Do not retry a failed native load merely to attest it.
+                if self.models.is_ready()
+                    && let Err(error) = self.initialize_attestation()
+                {
+                    warn!(error = %error, "Producer-attested daemon channel is unavailable");
+                }
+            }
+            WarmupStage::Reranker => {
+                if let Err(error) = self.models.warm_reranker() {
+                    warn!(error = %error, "Failed to pre-warm reranker");
+                }
+            }
+        });
+        self.touch_activity();
+        info!(cancelled = self.shutdown.load(Ordering::Acquire), "Model pre-warming finished");
+    }
+
+    fn run_with_model_warmup(&self, warmup: impl FnOnce() + Send) -> std::io::Result<()> {
         // Use a file lock to ensure only one daemon instance runs for this socket path
         let lock_path = daemon_run_lock_path(&self.config.socket_path);
 
@@ -627,23 +667,14 @@ impl ModelDaemon {
             "Daemon listening"
         );
 
-        // Pre-warm models if available
-        info!("Pre-warming models...");
-        if let Err(e) = self.models.warm_embedder() {
-            warn!(error = %e, "Failed to pre-warm embedder");
-        }
-        if let Err(e) = self.models.warm_reranker() {
-            warn!(error = %e, "Failed to pre-warm reranker");
-        }
-        if let Err(error) = self.initialize_attestation() {
-            warn!(error = %error, "Producer-attested daemon channel is unavailable");
-        }
-        info!("Model pre-warming complete");
-
-        // Start background embedding worker
+        // The worker is independently owned and can accept explicit jobs even
+        // while the foreground model is starting.
         self.init_worker();
 
-        std::thread::scope(|s| {
+        let serving_result = std::thread::scope(|s| -> std::io::Result<()> {
+            let startup = startup::StartupWarmup::spawn(
+                s, &self.inference_gate, &self.shutdown, warmup,
+            )?;
             loop {
                 // Check for shutdown
                 if self.shutdown.load(Ordering::SeqCst) {
@@ -652,7 +683,7 @@ impl ModelDaemon {
                 }
 
                 // Check for idle shutdown
-                if self.should_shutdown_idle() {
+                if startup.is_finished() && self.should_shutdown_idle() {
                     info!(
                         idle_secs = self.config.idle_timeout.as_secs(),
                         "Idle timeout reached, shutting down"
@@ -689,7 +720,7 @@ impl ModelDaemon {
                 // fresh"): checked at most once a second; the actual spawn is
                 // a detached `cass index --background` child so the daemon's
                 // own memory/latency profile is untouched.
-                if last_index_check.elapsed() >= Duration::from_secs(1) {
+                if startup.is_finished() && last_index_check.elapsed() >= Duration::from_secs(1) {
                     last_index_check = Instant::now();
                     if periodic_index_due(
                         self.config.index_interval,
@@ -738,125 +769,59 @@ impl ModelDaemon {
             // Idle and memory-limit exits must cancel socket reads and the
             // embedding worker before the scope joins connection handlers.
             self.request_shutdown();
+            startup.join()
         });
 
+        // A startup-thread spawn failure also needs to stop the already-owned
+        // background worker before cleanup. No abandoned loader/writer escapes.
+        self.request_shutdown();
         let worker_result = self.finish_worker();
 
         // Cleanup only after the owned worker has stopped writing.
         cleanup_bound_socket(&public_path, &bind_path);
 
         info!("Daemon stopped");
-        worker_result
-    }
-
-    fn read_frame_bytes_with_shutdown(
-        &self,
-        stream: &mut UnixStream,
-        buf: &mut [u8],
-        poll_timeout: Duration,
-        request_timeout: Duration,
-        reset_timeout_on_progress: bool,
-    ) -> std::io::Result<bool> {
-        if buf.is_empty() {
-            return Ok(true);
-        }
-
-        stream.set_read_timeout(Some(poll_timeout))?;
-        let started_at = Instant::now();
-        let mut last_progress_at = started_at;
-        let mut filled = 0usize;
-
-        loop {
-            if self.shutdown.load(Ordering::SeqCst) {
-                debug!("Shutdown requested, closing connection read");
-                return Ok(false);
-            }
-
-            match stream.read(&mut buf[filled..]) {
-                Ok(0) => {
-                    debug!("Client disconnected");
-                    return Ok(false);
-                }
-                Ok(n) => {
-                    filled += n;
-                    last_progress_at = Instant::now();
-                    if filled == buf.len() {
-                        return Ok(true);
-                    }
-                }
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    let timeout_started_at = if reset_timeout_on_progress {
-                        last_progress_at
-                    } else {
-                        started_at
-                    };
-                    if timeout_started_at.elapsed() >= request_timeout {
-                        debug!("Connection timed out");
-                        return Ok(false);
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-            }
-        }
+        serving_result.and(worker_result)
     }
 
     /// Handle a single client connection.
     fn handle_connection(&self, mut stream: UnixStream) -> std::io::Result<()> {
-        // Bounded idle-poll interval so `std::thread::scope` shutdown does
-        // not stall behind a client that opened the socket and never sent
-        // bytes. The configured `request_timeout` still bounds the total
-        // idle wait; this just breaks the single long blocking read into
-        // short chunks and checks `self.shutdown` between them.
-        const IDLE_SHUTDOWN_POLL: Duration = Duration::from_millis(250);
-        let request_timeout = self.config.request_timeout;
-        let idle_poll = IDLE_SHUTDOWN_POLL.min(request_timeout);
-        stream.set_write_timeout(Some(request_timeout))?;
-
         loop {
-            // Idle read (length prefix): short-poll so shutdown cancels
-            // promptly. Track `filled` manually because `read_exact`
-            // discards partial bytes on timeout.
+            // One budget covers the prefix, payload, decode, dispatch, and
+            // response. Neither byte progress nor a new phase resets it.
+            let budget = wire::RequestBudget::new(self.config.request_timeout, &self.shutdown);
             let mut len_buf = [0u8; 4];
-            if !self.read_frame_bytes_with_shutdown(
-                &mut stream,
-                &mut len_buf,
-                idle_poll,
-                request_timeout,
-                false,
-            )? {
+            if !budget.read_exact(&mut stream, &mut len_buf)? {
                 return Ok(());
             }
 
             let len = u32::from_be_bytes(len_buf) as usize;
-            if len > 10 * 1024 * 1024 {
+            if len == 0 || len > MAX_FRAME_BYTES {
                 warn!(
                     len = len,
-                    "Request too large (max 10MB), closing connection"
+                    "Invalid request frame length (expected 1..=10 MiB), closing connection"
                 );
                 return Ok(());
             }
 
-            // Payload read: bytes are in flight, so keep the timeout as an
-            // idle-progress budget while still short-polling shutdown.
-            let mut payload = vec![0u8; len];
-            if !self.read_frame_bytes_with_shutdown(
-                &mut stream,
-                &mut payload,
-                idle_poll,
-                request_timeout,
-                true,
-            )? {
+            let mut payload = Vec::new();
+            payload.try_reserve_exact(len).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::OutOfMemory,
+                    "cannot allocate daemon request frame",
+                )
+            })?;
+            payload.resize(len, 0);
+            if !budget.read_exact(&mut stream, &mut payload)? {
                 return Ok(());
             }
 
             // Decode and handle request
-            let response = match decode_message::<Request>(&payload) {
+            let decoded = decode_message::<Request>(&payload);
+            let Some(inference_timeout) = budget.remaining() else {
+                return Ok(());
+            };
+            let response = match decoded {
                 Ok(msg) => {
                     if msg.version != PROTOCOL_VERSION {
                         warn!(
@@ -877,7 +842,11 @@ impl ModelDaemon {
                     } else {
                         self.total_requests.fetch_add(1, Ordering::Relaxed);
                         self.touch_activity();
-                        let response = self.handle_request(msg.request_id.clone(), msg.payload);
+                        let response = self.handle_request(
+                            msg.request_id.clone(),
+                            msg.payload,
+                            inference_timeout,
+                        );
                         FramedMessage::new(msg.request_id, response)
                     }
                 }
@@ -895,20 +864,33 @@ impl ModelDaemon {
                 }
             };
 
-            // Send response
+            // A completed model call or serialization may cross the deadline;
+            // do not release its late result. Shutdown gets a narrowly bounded
+            // acknowledgement even though dispatch has set cancellation.
+            let shutdown_ack = matches!(response.payload, Response::Shutdown { .. });
+            if !shutdown_ack && budget.remaining().is_none() {
+                return Ok(());
+            }
             let encoded =
                 encode_message(&response).map_err(|e| std::io::Error::other(e.to_string()))?;
-            stream.write_all(&encoded)?;
+            if !budget.write_all(&mut stream, &encoded, shutdown_ack)? {
+                return Ok(());
+            }
 
             // Check if this was a shutdown request
-            if matches!(response.payload, Response::Shutdown { .. }) {
+            if shutdown_ack {
                 return Ok(());
             }
         }
     }
 
     /// Handle a single request.
-    fn handle_request(&self, request_id: String, request: Request) -> Response {
+    fn handle_request(
+        &self,
+        request_id: String,
+        request: Request,
+        inference_timeout: Duration,
+    ) -> Response {
         match request {
             Request::Health => Response::Health(HealthStatus {
                 uptime_secs: self.uptime_secs(),
@@ -952,24 +934,11 @@ impl ModelDaemon {
             request @ (Request::Embed { .. }
             | Request::EmbedAttested { .. }
             | Request::Rerank { .. }
-            | Request::RerankAttested { .. }) => inference::handle(self, request),
+            | Request::RerankAttested { .. }) => inference::handle(self, request, inference_timeout),
 
             Request::Status => {
-                let embedder_info = ModelInfo {
-                    id: self.models.embedder_id().to_string(),
-                    name: self.models.embedder_name().to_string(),
-                    dimension: Some(self.models.embedder_dimension()),
-                    loaded: self.models.embedder_loaded(),
-                    memory_bytes: 0, // Would need model-specific tracking
-                };
-
-                let reranker_info = ModelInfo {
-                    id: self.models.reranker_id().to_string(),
-                    name: self.models.reranker_name().to_string(),
-                    dimension: None,
-                    loaded: self.models.reranker_loaded(),
-                    memory_bytes: 0,
-                };
+                let embedder_info = self.models.embedder_info();
+                let reranker_info = self.models.reranker_info();
 
                 Response::Status(StatusResponse {
                     uptime_secs: self.uptime_secs(),
@@ -1603,7 +1572,7 @@ mod tests {
         };
         handle.submit(config.clone()).map_err(anyhow::Error::msg)?;
         *daemon.worker_handle.lock() = Some(handle.clone());
-        assert!(matches!(daemon.handle_request("shutdown".into(), Request::Shutdown), Response::Shutdown { .. }));
+        assert!(matches!(daemon.handle_request("shutdown".into(), Request::Shutdown, daemon.config.request_timeout), Response::Shutdown { .. }));
         assert!(handle.submit(config.clone()).is_err());
         worker.run();
         assert!(!Path::new(&config.db_path).exists());
@@ -1637,15 +1606,90 @@ mod tests {
         let daemon = ModelDaemon::new(DaemonConfig::default(), ModelManager::new(temp.path()));
         let (_worker, handle) = EmbeddingWorker::new();
         *daemon.worker_handle.lock() = Some(handle);
-        assert!(matches!(daemon.handle_request("status".into(), Request::EmbeddingJobStatus { db_path: path.clone() }), Response::JobStatus(info) if info.jobs.is_empty()));
+        assert!(matches!(daemon.handle_request("status".into(), Request::EmbeddingJobStatus { db_path: path.clone() }, daemon.config.request_timeout), Response::JobStatus(info) if info.jobs.is_empty()));
         let response = daemon.handle_request("submit".into(), Request::SubmitEmbeddingJob {
             db_path: path.clone(), index_path: temp.path().join("index").to_string_lossy().into_owned(),
             two_tier: false, fast_model: Some("hash".into()), quality_model: None,
-        });
+        }, daemon.config.request_timeout);
         assert!(matches!(response, Response::JobSubmitted { .. }));
-        let response = daemon.handle_request("cancel".into(), Request::CancelEmbeddingJob { db_path: path.clone(), model_id: None });
+        let response = daemon.handle_request("cancel".into(), Request::CancelEmbeddingJob { db_path: path.clone(), model_id: None }, daemon.config.request_timeout);
         assert!(matches!(response, Response::JobCancelled { cancelled: 1, message } if message.contains("cleanup is pending")));
         assert!(!Path::new(&path).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn trailing_shutdown_bytes_are_rejected_before_dispatch_and_valid_frames_still_work() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let daemon = Arc::new(ModelDaemon::new(
+            DaemonConfig { request_timeout: Duration::from_secs(2), ..Default::default() },
+            ModelManager::new(temp.path()),
+        ));
+        let (server, mut peer) = UnixStream::pair()?;
+        peer.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let owner = Arc::clone(&daemon);
+        let handler = std::thread::spawn(move || owner.handle_connection(server));
+        let outcome = (|| -> anyhow::Result<()> {
+            let mut encoded = encode_message(&FramedMessage::new("invalid-shutdown", Request::Shutdown))?;
+            encoded.push(0xc0);
+            let length = u32::try_from(encoded.len() - 4)?;
+            encoded[..4].copy_from_slice(&length.to_be_bytes());
+            peer.write_all(&encoded)?;
+            let mut prefix = [0; 4];
+            peer.read_exact(&mut prefix)?;
+            let length = u32::from_be_bytes(prefix) as usize;
+            anyhow::ensure!(length <= MAX_FRAME_BYTES);
+            let mut bytes = vec![0; length];
+            peer.read_exact(&mut bytes)?;
+            let response = decode_message::<Response>(&bytes)?;
+            anyhow::ensure!(matches!(response.payload, Response::Error(error) if error.code == ErrorCode::InvalidInput));
+            anyhow::ensure!(!daemon.shutdown.load(Ordering::Acquire));
+            anyhow::ensure!(daemon.total_requests.load(Ordering::Relaxed) == 0);
+            peer.write_all(&encode_message(&FramedMessage::new("health", Request::Health))?)?;
+            peer.read_exact(&mut prefix)?;
+            let length = u32::from_be_bytes(prefix) as usize;
+            anyhow::ensure!(length <= MAX_FRAME_BYTES);
+            let mut bytes = vec![0; length];
+            peer.read_exact(&mut bytes)?;
+            let response = decode_message::<Response>(&bytes)?;
+            anyhow::ensure!(response.request_id == "health");
+            anyhow::ensure!(matches!(response.payload, Response::Health(_)));
+            anyhow::ensure!(daemon.total_requests.load(Ordering::Relaxed) == 1);
+            Ok(())
+        })();
+        daemon.request_shutdown();
+        drop(peer);
+        handler.join().map_err(|_| anyhow::anyhow!("connection handler panicked"))??;
+        outcome
+    }
+
+    #[test]
+    fn trickled_payload_expires_without_dispatching_or_loading_a_model() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let daemon = Arc::new(ModelDaemon::new(
+            DaemonConfig { request_timeout: Duration::from_millis(100), ..Default::default() },
+            ModelManager::new(temp.path()),
+        ));
+        let (server, mut peer) = UnixStream::pair()?;
+        peer.set_nonblocking(true)?;
+        // Prebuffer the header and first byte before the handler's clock starts.
+        peer.write_all(&1000_u32.to_be_bytes())?;
+        peer.write_all(&[0x93])?;
+        let owner = Arc::clone(&daemon);
+        let handler = std::thread::spawn(move || owner.handle_connection(server));
+        let started = Instant::now();
+        while !handler.is_finished() && started.elapsed() < Duration::from_millis(700) {
+            let _ = peer.write(&[0]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let expired_without_shutdown = handler.is_finished();
+        daemon.request_shutdown();
+        drop(peer);
+        handler.join().map_err(|_| anyhow::anyhow!("connection handler panicked"))??;
+        anyhow::ensure!(expired_without_shutdown, "payload progress extended the request indefinitely");
+        anyhow::ensure!(daemon.total_requests.load(Ordering::Relaxed) == 0);
+        anyhow::ensure!(!daemon.models.embedder_loaded());
+        anyhow::ensure!(std::fs::read_dir(temp.path())?.count() == 0);
         Ok(())
     }
 }

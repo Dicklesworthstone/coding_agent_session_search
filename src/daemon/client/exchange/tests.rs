@@ -54,6 +54,30 @@ fn invalidated(client: &UdsDaemonClient) {
 }
 
 #[test]
+fn trailing_response_bytes_invalidate_the_stream_without_replaying_the_request() -> io::Result<()> {
+    let (client, mut peer) = pair(Duration::from_secs(2))?;
+    let server = std::thread::spawn(move || -> io::Result<()> {
+        let request = receive(&mut peer)?;
+        let mut encoded = encode_message(&health(request.request_id)).map_err(io::Error::other)?;
+        // The trailing object is inside the declared frame, not a second
+        // valid frame in a persistent stream. A prefix-only decoder misses it.
+        encoded.push(0xc0);
+        let length = u32::try_from(encoded.len() - 4).map_err(io::Error::other)?;
+        encoded[..4].copy_from_slice(&length.to_be_bytes());
+        peer.write_all(&encoded)?;
+        let count = peer.read(&mut [0])?;
+        assert_eq!(count, 0, "client must close, not reuse or replay this exchange");
+        Ok(())
+    });
+    let result = client.health();
+    server.join().unwrap()?;
+    assert!(matches!(result, Err(DaemonError::Failed(_))));
+    invalidated(&client);
+    assert_eq!(client.request_counter.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[test]
 fn waiting_caller_times_out_without_clearing_the_owned_connection() -> io::Result<()> {
     let (client, mut peer) = pair(Duration::from_millis(100))?;
     let client = Arc::new(client);

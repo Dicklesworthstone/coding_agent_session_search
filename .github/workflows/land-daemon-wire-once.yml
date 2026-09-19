@@ -1,0 +1,24 @@
+# Source-only landing completed; no repository-write permissions remain.
+name: Verify daemon wire changes
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  locked-cass:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Execute daemon tests under the repository dependency lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib daemon:: -- --nocapture

@@ -14,8 +14,10 @@ use crate::search::fastembed_reranker::FastEmbedReranker;
 pub(super) use budget::InferenceGate;
 use budget::{Budget, collect_batches, error, plan};
 
-pub(super) fn handle(daemon: &ModelDaemon, request: Request) -> Response {
-    let budget = Budget::new(daemon.config.request_timeout, &daemon.shutdown);
+pub(super) fn handle(daemon: &ModelDaemon, request: Request, timeout: std::time::Duration) -> Response {
+    // The wire owner supplies only the time left after reading and decoding.
+    // A slow upload must not acquire a fresh full inference budget.
+    let budget = Budget::new(timeout.min(daemon.config.request_timeout), &daemon.shutdown);
     let result = (|| {
         budget.check()?;
         let _permit = daemon.inference_gate.try_enter()?;
@@ -307,7 +309,7 @@ mod tests {
             Request::Rerank { query: "q".into(), documents: vec!["x".repeat(budget::MAX_TEXT_BYTES + 1)], model: "default".into() },
         ];
         for request in requests {
-            assert!(matches!(daemon.handle_request("invalid".into(), request), Response::Error(error) if error.code == ErrorCode::InvalidInput && !error.retryable));
+            assert!(matches!(daemon.handle_request("invalid".into(), request, daemon.config.request_timeout), Response::Error(error) if error.code == ErrorCode::InvalidInput && !error.retryable));
             assert!(!daemon.models.embedder_loaded());
             assert!(!daemon.models.reranker_loaded());
         }
@@ -321,11 +323,28 @@ mod tests {
         let daemon = ModelDaemon::new(DaemonConfig::default(), ModelManager::new(temp.path()));
         let permit = daemon.inference_gate.try_enter().unwrap();
         let request = Request::Embed { texts: vec!["hello".into()], model: "default".into(), dims: None };
-        assert!(matches!(daemon.handle_request("busy".into(), request), Response::Error(error) if error.code == ErrorCode::Overloaded && error.retryable));
-        assert!(matches!(daemon.handle_request("health".into(), Request::Health), Response::Health(_)));
-        assert!(matches!(daemon.handle_request("shutdown".into(), Request::Shutdown), Response::Shutdown { .. }));
+        assert!(matches!(daemon.handle_request("busy".into(), request, daemon.config.request_timeout), Response::Error(error) if error.code == ErrorCode::Overloaded && error.retryable));
+        assert!(matches!(daemon.handle_request("health".into(), Request::Health, daemon.config.request_timeout), Response::Health(_)));
+        assert!(matches!(daemon.handle_request("shutdown".into(), Request::Shutdown, daemon.config.request_timeout), Response::Shutdown { .. }));
         drop(permit);
         assert!(!daemon.models.embedder_loaded());
+        Ok(())
+    }
+
+    #[test]
+    fn expired_wire_budget_cannot_load_or_execute_a_model() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let daemon = ModelDaemon::new(DaemonConfig::default(), ModelManager::new(temp.path()));
+        let request = Request::Embed {
+            texts: vec!["do not infer after upload deadline".into()],
+            model: "default".into(),
+            dims: None,
+        };
+        let response = daemon.handle_request("expired".into(), request, std::time::Duration::ZERO);
+        assert!(matches!(response, Response::Error(error) if error.code == ErrorCode::Timeout));
+        assert!(!daemon.models.embedder_loaded());
+        assert!(!daemon.models.reranker_loaded());
+        assert_eq!(std::fs::read_dir(temp.path())?.count(), 0);
         Ok(())
     }
 }

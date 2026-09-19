@@ -1,0 +1,35 @@
+# Implementation commits landed. This workflow cannot publish repository changes.
+name: Verify daemon startup
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  locked-daemon:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Test production model publication and the real daemon serving loop
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib daemon::models:: -- --nocapture 2>&1 | tee "$RUNNER_TEMP/models.log"
+          cargo test --locked --lib daemon::core::startup -- --nocapture 2>&1 | tee "$RUNNER_TEMP/startup.log"
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          for name, minimum in [('models.log', 18), ('startup.log', 9)]:
+              text = (Path(os.environ['RUNNER_TEMP']) / name).read_text()
+              counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed; 0 ignored;', text)
+              if not counts or max(map(int, counts)) < minimum:
+                  raise SystemExit('Missing passing regression receipt: ' + name)
+          PY

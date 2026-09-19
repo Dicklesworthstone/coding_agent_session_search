@@ -28,10 +28,10 @@ pub(super) fn error(code: ErrorCode, message: &str, retryable: bool) -> ErrorRes
 #[derive(Default)]
 pub(in crate::daemon::core) struct InferenceGate(AtomicBool);
 
-pub(super) struct Permit<'a>(&'a AtomicBool);
+pub(in crate::daemon::core) struct Permit<'a>(&'a AtomicBool);
 
 impl InferenceGate {
-    pub(super) fn try_enter(&self) -> Result<Permit<'_>, ErrorResponse> {
+    pub(in crate::daemon::core) fn try_enter(&self) -> Result<Permit<'_>, ErrorResponse> {
         self.0
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .map(|_| Permit(&self.0))

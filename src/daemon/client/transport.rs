@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-pub(super) const MAX_FRAME_BYTES: usize = 10 * 1024 * 1024;
+pub(super) use crate::daemon::protocol::MAX_FRAME_BYTES;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 #[derive(Clone, Copy)]

@@ -65,7 +65,8 @@ fn artifact(corpus: &SemanticCorpusSnapshotIdentity, bytes: &[u8]) -> SemanticGe
         content_sha256: corpus.content_sha256.clone(),
     };
     SemanticGenerationArtifact {
-        role: SemanticArtifactRole::FastVector,
+        shard: None,
+            role: SemanticArtifactRole::FastVector,
         relative_path: "fast/primary.fsvi".to_owned(),
         artifact_sha256,
         size_bytes,
@@ -446,6 +447,7 @@ fn accepted_manifest(data_dir: &Path) -> SemanticGenerationManifestV1 {
         covered_content_sha256: corpus.content_sha256.clone(),
     };
     let artifact = SemanticGenerationArtifact {
+        shard: None,
         role: SemanticArtifactRole::FastVector,
         relative_path: relative_path.to_owned(),
         artifact_sha256,

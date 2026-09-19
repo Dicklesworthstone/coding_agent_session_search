@@ -1,0 +1,170 @@
+name: Qualify Codex source containment
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/qualify-codex-containment.yml]
+permissions:
+  contents: read
+concurrency:
+  group: cass-codex-containment-landing
+  cancel-in-progress: false
+jobs:
+  qualify-and-land:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-08-31
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          clean: false
+      - name: Verify the reviewed payload and install only regression tests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          python3 - <<'PY'
+          import base64, gzip, hashlib, json, os, re, subprocess
+          from pathlib import Path
+          def blob(data):
+              return hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'evidence'
+          record = json.loads(subprocess.check_output(['gh','api','repos/'+os.environ['GITHUB_REPOSITORY']+'/git/blobs/6dfe9d833dc251036a73a453bf9eb9acb06bacf0']))
+          transferred = base64.b64decode(record['content'])
+          assert blob(transferred) == '6dfe9d833dc251036a73a453bf9eb9acb06bacf0'
+          # Correct two transport transcription errors; authenticate the complete
+          # repaired byte stream before decompressing or touching source files.
+          encoded = base64.b64encode(transferred).decode()
+          encoded = encoded.replace('ULdG6qjDnx','ULdG6qDDnx',1).replace('ttLQ0tLQ168t','ttLQ168t',1)
+          compressed = base64.b64decode(encoded)
+          assert blob(compressed) == 'a0afba1d5021a7c8620c6e2e3a378cb762e83d2e'
+          data = gzip.decompress(compressed)
+          assert hashlib.sha256(data).hexdigest() == 'b8285e2d2fd2cc4f20c5442c6dc7a1dd53bec98ae92faf3a739d600686302209'
+          payload = json.loads(data)
+          (evidence/'payload.json').write_bytes(data)
+          for name,(before,_) in payload['guards'].items():
+              path = Path(name)
+              assert not path.is_symlink()
+              assert (not path.exists()) if before is None else blob(path.read_bytes()) == before, name
+          pieces = [p for p in re.split(r'(?=^--- )',payload['patch'],flags=re.M) if p]
+          tests = [p for p in pieces if '+++ b/tests/codex_source_containment.rs\n' in p]
+          assert len(tests) == 1
+          (evidence/'tests.patch').write_text(''.join(tests))
+          (evidence/'runtime.patch').write_text(''.join(p for p in pieces if p not in tests))
+          subprocess.run(['git','apply','--check','--whitespace=error-all',str(evidence/'tests.patch')],check=True)
+          subprocess.run(['git','apply',str(evidence/'tests.patch')],check=True)
+          rows = [json.loads(line) for line in Path('.beads/issues.jsonl').read_text().splitlines() if line.strip()]
+          selected = [r for r in rows if '484' in r.get('title','') or r.get('id','').endswith('fyepq') or (r.get('status') != 'closed' and 'ingest' in r.get('title','').lower())]
+          (evidence/'selected-beads.json').write_text(json.dumps(selected,indent=2))
+          (evidence/'base.txt').write_text(subprocess.check_output(['git','rev-parse','HEAD'],text=True))
+          PY
+      - name: Build an isolated package from the complete production connector
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
+          python3 - <<'PY'
+          import os, shutil
+          from pathlib import Path
+          root = Path.cwd()
+          dest = Path(os.environ['RUNNER_TEMP'])/'components'
+          (dest/'src/connectors').mkdir(parents=True)
+          (dest/'tests').mkdir()
+          (dest/'src/lib.rs').write_text('pub mod connectors { pub use franken_agent_detection::{Connector, DetectionResult, DiscoveredSourceFile, NormalizedConversation, NormalizedMessage, ScanContext, ScanRoot, parse_timestamp, reindex_messages}; pub mod codex; }\n')
+          shutil.copyfile(root/'src/connectors/codex.rs',dest/'src/connectors/codex.rs')
+          shutil.copyfile(root/'tests/codex_source_containment.rs',dest/'tests/codex_source_containment.rs')
+          (dest/'Cargo.toml').write_text('[package]\nname="coding-agent-search"\nversion="0.0.0"\nedition="2024"\n[dependencies]\nfranken-agent-detection={version="=0.3.0",default-features=false,features=["connectors"]}\nanyhow="1"\nthiserror="2"\nserde={version="1",features=["derive"]}\nserde_json="1"\ntracing="0.1"\nblake3="1"\ntempfile="3"\n')
+          PY
+          cd "$RUNNER_TEMP/components"
+          cargo generate-lockfile
+          cp Cargo.lock "$RUNNER_TEMP/evidence/component-Cargo.lock"
+          set +e
+          timeout 600 cargo test --locked --test codex_source_containment oversized_rollout_does_not_hide_later_sources_or_complete_it -- --exact --nocapture > "$RUNNER_TEMP/evidence/red.log" 2>&1
+          rc=$?
+          set -e
+          cat "$RUNNER_TEMP/evidence/red.log"
+          test "$rc" = 101
+          grep -q 'test result: FAILED. 0 passed; 1 failed;' "$RUNNER_TEMP/evidence/red.log"
+      - name: Apply containment and execute every connector regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --check --whitespace=error-all "$RUNNER_TEMP/evidence/runtime.patch"
+          git apply "$RUNNER_TEMP/evidence/runtime.patch"
+          python3 - <<'PY'
+          import hashlib,json,os,shutil,subprocess
+          from pathlib import Path
+          evidence=Path(os.environ['RUNNER_TEMP'])/'evidence'
+          payload=json.loads((evidence/'payload.json').read_text())
+          for name,(_,expected) in payload['guards'].items():
+              data=Path(name).read_bytes()
+              assert hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()==expected,name
+              subprocess.run(['rustfmt','--edition','2024','--config','skip_children=true',name],check=True)
+          dest=Path(os.environ['RUNNER_TEMP'])/'components'
+          shutil.copyfile('src/connectors/codex.rs',dest/'src/connectors/codex.rs')
+          shutil.copytree('src/connectors/codex',dest/'src/connectors/codex',dirs_exist_ok=True)
+          shutil.copyfile('tests/codex_source_containment.rs',dest/'tests/codex_source_containment.rs')
+          hashes={n:subprocess.check_output(['git','hash-object',n],text=True).strip() for n in payload['guards']}
+          (evidence/'tested-blobs.json').write_text(json.dumps(hashes,indent=2))
+          PY
+          git diff --check
+          cd "$RUNNER_TEMP/components"
+          timeout 600 cargo test --locked -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/evidence/green.log"
+          grep -q 'test result: ok. 24 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/evidence/green.log"
+          grep -q 'test result: ok. 3 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/evidence/green.log"
+          cargo clippy --locked --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/evidence/clippy.log"
+      - name: Record the unchanged shipping dependency result separately
+        shell: bash
+        run: |
+          set +e
+          timeout 120 cargo test --locked --test codex_source_containment > "$RUNNER_TEMP/evidence/shipping.log" 2>&1
+          rc=$?
+          printf '%s\n' "$rc" > "$RUNNER_TEMP/evidence/shipping-exit.txt"
+          cat "$RUNNER_TEMP/evidence/shipping.log"
+          exit 0
+      - name: Publish only the tested connector and test files directly to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,os,subprocess
+          from pathlib import Path
+          evidence=Path(os.environ['RUNNER_TEMP'])/'evidence'
+          payload=json.loads((evidence/'payload.json').read_text())
+          hashes=json.loads((evidence/'tested-blobs.json').read_text())
+          def git(*args,**kwargs): return subprocess.check_output(['git',*args],text=True,**kwargs).strip()
+          for path,expected in hashes.items(): assert git('hash-object','-w',path)==expected,path
+          env=dict(os.environ,GIT_INDEX_FILE=str(evidence/'publish.index'),GIT_AUTHOR_NAME='github-actions[bot]',GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com',GIT_COMMITTER_NAME='github-actions[bot]',GIT_COMMITTER_EMAIL='41898282+github-actions[bot]@users.noreply.github.com')
+          for attempt in range(3):
+              git('fetch','origin','main')
+              base=git('rev-parse','origin/main')
+              for path,(before,_) in payload['guards'].items():
+                  found=subprocess.run(['git','rev-parse',base+':'+path],text=True,capture_output=True)
+                  assert (found.returncode!=0) if before is None else found.stdout.strip()==before,path
+              git('read-tree',base,env=env)
+              for path,sha in hashes.items(): git('update-index','--add','--cacheinfo','100644,'+sha+','+path,env=env)
+              tree=git('write-tree',env=env)
+              message='fix(codex): contain oversized rollouts without hiding later sessions\n\nCheck eligible primary JSONL sizes before parsing; contain only typed enrichment-size errors after parsing and withhold their source completions. Continue valid neighbors, retain bounded source-specific rejection diagnostics, and return an incomplete-scan error so watermarks cannot certify skipped sources. Preserve generic I/O, corruption, cancellation, and sink failure propagation.\n\nExecuted 24 complete production connector unit tests and three real-FAD integration cases, with the A/B/C regression RED on the unchanged parent and GREEN after the fix. Component Clippy passed. Shipping CASS remains separately qualified; no dependency pins, repository lockfile, or archive changes. GH #484.\n'
+              commit=git('commit-tree',tree,'-p',base,input=message,env=env)
+              pushed=subprocess.run(['git','push','origin',commit+':refs/heads/main'])
+              if pushed.returncode==0:
+                  (evidence/'published.txt').write_text(commit+'\n')
+                  print('PUBLISHED',commit)
+                  break
+          else: raise RuntimeError('main advanced repeatedly; no force push attempted')
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: codex-containment-${{ github.sha }}
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 14

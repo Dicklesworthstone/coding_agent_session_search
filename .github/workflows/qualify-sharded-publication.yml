@@ -1,0 +1,81 @@
+# Admission and refresh implementations landed; this workflow cannot modify repository refs.
+name: Verify semantic publications
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  production-components:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-08-31
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '16777216'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          path: cass-source
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: Dicklesworthstone/frankensearch
+          ref: 6852e79a830c402ea4e55eb79eda3373c618dfc3
+          path: fs-source
+          persist-credentials: false
+      - name: Execute actual immutable publication modules in the independent component package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          python3 cass-source/scripts/verify_sharded_publication.py "$GITHUB_WORKSPACE/cass-source" "$GITHUB_WORKSPACE/fs-source" "$RUNNER_TEMP/components"
+          cp "$RUNNER_TEMP/components/source-receipt.json" "$RUNNER_TEMP/evidence/"
+          cd "$RUNNER_TEMP/components"
+          cargo generate-lockfile
+          cp Cargo.lock "$RUNNER_TEMP/evidence/component-Cargo.lock"
+          cargo test --locked --lib -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/evidence/unit.log"
+          cargo test --locked --test semantic_generation_manifest -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/evidence/process.log"
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'evidence'
+          for name, minimum in [('unit.log', 162), ('process.log', 4)]:
+              counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed; 0 ignored;', (evidence / name).read_text())
+              assert counts and max(map(int, counts)) >= minimum, name
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: semantic-publication-components-${{ github.sha }}
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 14
+  shipping-cass:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Test the complete CASS crate under its unchanged shipping lockfile
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          cargo test --locked --lib search::semantic_reader::publication::tests:: -- --nocapture 2>&1 | tee "$RUNNER_TEMP/evidence/shipping-unit.log"
+          cargo test --locked --test semantic_generation_manifest -- --nocapture 2>&1 | tee "$RUNNER_TEMP/evidence/shipping-process.log"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: semantic-publication-shipping-${{ github.sha }}
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 14
