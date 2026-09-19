@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -26,7 +27,10 @@ pub fn collect_live_swarm_sources(repo: &Path) -> SwarmSourceCollection {
         .map(|name| {
             if matches!(
                 name,
-                SwarmProviderName::Git | SwarmProviderName::Beads | SwarmProviderName::Process
+                SwarmProviderName::Git
+                    | SwarmProviderName::Beads
+                    | SwarmProviderName::Process
+                    | SwarmProviderName::AgentMail
             ) {
                 LiveSwarmSourceAdapter {
                     repo: repo.to_path_buf(),
@@ -65,6 +69,7 @@ impl SwarmSourceAdapter for LiveSwarmSourceAdapter {
             SwarmProviderName::Git => collect_live_git(&self.repo, self.started),
             SwarmProviderName::Beads => collect_exported_beads(&self.repo, self.started),
             SwarmProviderName::Process => collect_live_rch(&self.repo, self.started),
+            SwarmProviderName::AgentMail => collect_live_mail(&self.repo, self.started),
             _ => Err("unsupported live provider".to_string()),
         };
         let mut snapshot = match result {
@@ -80,6 +85,14 @@ impl SwarmSourceAdapter for LiveSwarmSourceAdapter {
                 "RCH status only; local processes and build admission are not observed.",
                 payload,
             ),
+            Ok(payload) if self.name == SwarmProviderName::AgentMail => {
+                SwarmSourceSnapshot::partial(
+                    self.name,
+                    source,
+                    "Read-only roster and reservation observations; messages and proof evidence are not collected. Recheck coordination before claiming.",
+                    payload,
+                )
+            }
             Ok(payload) => SwarmSourceSnapshot::ok(self.name, source, payload),
             Err(error) => SwarmSourceSnapshot::unavailable(
                 self.name,
@@ -149,6 +162,157 @@ fn live_command(
         return Err(format!("{program} exited with {}", output.status));
     }
     Ok(output.stdout)
+}
+
+fn collect_live_mail(repo: &Path, started: Instant) -> Result<Value, String> {
+    let endpoint = dotenvy::var("CASS_SWARM_AGENT_MAIL_URL")
+        .map_err(|_| "CASS_SWARM_AGENT_MAIL_URL is not configured")?;
+    let token = dotenvy::var("CASS_SWARM_AGENT_MAIL_TOKEN").ok();
+    let project = repo
+        .canonicalize()
+        .map_err(|_| "cannot identify Mail project")?;
+    let project = project.to_str().ok_or("Mail project is not UTF-8")?;
+    let encoded: String = project.bytes().map(|byte| format!("%{byte:02X}")).collect();
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "cannot construct Mail HTTP client")?;
+    let mail_started = Instant::now();
+    let read = |uri: &str| -> Result<Value, String> {
+        let remaining = Duration::from_secs(15)
+            .checked_sub(started.elapsed())
+            .ok_or("live provider deadline exceeded")?
+            .min(
+                Duration::from_secs(3)
+                    .checked_sub(mail_started.elapsed())
+                    .ok_or("Mail provider deadline exceeded")?,
+            );
+        if remaining.is_zero() {
+            return Err("Mail provider deadline exceeded".into());
+        }
+        let mut request = client
+            .post(&endpoint)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .timeout(remaining)
+            .json(&serde_json::json!({
+                "jsonrpc":"2.0", "id":"cass-swarm-read", "method":"resources/read",
+                "params":{"uri":uri}
+            }));
+        if let Some(token) = &token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().map_err(|_| "Mail resource request failed")?;
+        if !response.status().is_success() {
+            return Err("Mail resource HTTP failure".into());
+        }
+        let mut bytes = Vec::new();
+        response
+            .take(8 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "Mail resource body read failed")?;
+        if bytes.len() > 8 * 1024 * 1024 {
+            return Err("Mail response exceeds output cap".into());
+        }
+        parse_mail_resource(&bytes, uri)
+    };
+    let roster = read(&format!("resource://agents/{encoded}"))?;
+    let reservations = read(&format!(
+        "resource://file_reservations/{encoded}?active_only=true&limit=250"
+    ))?;
+    project_mail_observations(&roster, &reservations, project, chrono::Utc::now())
+}
+
+fn parse_mail_resource(bytes: &[u8], uri: &str) -> Result<Value, String> {
+    let envelope: Value = serde_json::from_slice(bytes).map_err(|_| "invalid Mail JSON")?;
+    if envelope["jsonrpc"] != "2.0"
+        || envelope["id"] != "cass-swarm-read"
+        || envelope.get("error").is_some()
+    {
+        return Err("invalid or rejected Mail response".into());
+    }
+    let contents = envelope["result"]["contents"]
+        .as_array()
+        .ok_or("missing Mail resource contents")?;
+    if contents.len() != 1 || contents[0]["uri"] != uri {
+        return Err("Mail resource identity mismatch".into());
+    }
+    serde_json::from_str(
+        contents[0]["text"]
+            .as_str()
+            .ok_or("missing Mail resource text")?,
+    )
+    .map_err(|_| "invalid Mail resource JSON".into())
+}
+
+fn project_mail_observations(
+    roster: &Value,
+    reservations: &Value,
+    project: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Value, String> {
+    if roster["project"]["human_key"] != project {
+        return Err("Mail project identity mismatch".into());
+    }
+    let agents = roster["agents"]
+        .as_array()
+        .ok_or("missing Mail agent roster")?;
+    let reservations = reservations.as_array().ok_or("missing Mail reservations")?;
+    // The reservation resource caps pages at 250 without a continuation flag.
+    // A full page cannot prove a complete inventory.
+    if agents.len() > 512 || reservations.len() >= 250 {
+        return Err("Mail inventory exceeds bounded complete page".into());
+    }
+    let timestamp = |row: &Value,
+                     field: &str|
+     -> Result<chrono::DateTime<chrono::FixedOffset>, String> {
+        chrono::DateTime::parse_from_rfc3339(row[field].as_str().ok_or("missing Mail timestamp")?)
+            .map_err(|_| "invalid Mail timestamp".into())
+    };
+    let mut projected_agents = Vec::new();
+    for agent in agents {
+        let age = now.signed_duration_since(timestamp(agent, "last_active_ts")?);
+        let name = agent["name"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .ok_or("missing Mail agent name")?;
+        projected_agents.push(serde_json::json!({"name":name,
+            "last_active_ts":agent["last_active_ts"],
+            "active":age >= chrono::Duration::zero() && age <= chrono::Duration::seconds(600)}));
+    }
+    let mut projected_reservations = Vec::new();
+    for reservation in reservations {
+        let expires = timestamp(reservation, "expires_ts")?;
+        let id = reservation["id"]
+            .as_u64()
+            .ok_or("invalid Mail reservation id")?;
+        let agent = reservation["agent"]
+            .as_str()
+            .ok_or("missing Mail reservation agent")?;
+        let path = reservation["path_pattern"]
+            .as_str()
+            .ok_or("missing Mail reservation path")?;
+        let exclusive = reservation["exclusive"]
+            .as_bool()
+            .ok_or("missing Mail lock type")?;
+        if reservation.get("released_ts").is_none() {
+            return Err("missing Mail release state".into());
+        }
+        projected_reservations.push(
+            serde_json::json!({"id":id,"agent":agent,"path_pattern":path,
+            "exclusive":exclusive,"expires_ts":reservation["expires_ts"],
+            "active":reservation["released_ts"].is_null() && expires > now}),
+        );
+    }
+    let observed_active_reservation_count = projected_reservations
+        .iter()
+        .filter(|row| row["active"] == true)
+        .count();
+    Ok(
+        serde_json::json!({"source_kind":"agent-mail-resources", "repository":project,
+        "observed_at_ms":now.timestamp_millis(), "agents":projected_agents,
+        "observed_active_reservation_count":observed_active_reservation_count,
+        "reservations":projected_reservations}),
+    )
 }
 
 fn collect_live_rch(repo: &Path, started: Instant) -> Result<Value, String> {
@@ -949,6 +1113,86 @@ mod tests {
 
     fn repo_path(relative: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
+    }
+
+    #[test]
+    fn mail_resource_rejects_wrong_identity_and_rpc_errors() {
+        let uri = "resource://agents/%2Fproject";
+        let response = json!({"jsonrpc":"2.0","id":"cass-swarm-read",
+            "result":{"contents":[{"uri":uri,"text":"{\"agents\":[]}"}]}});
+        assert_eq!(
+            parse_mail_resource(&serde_json::to_vec(&response).unwrap(), uri).unwrap(),
+            json!({"agents":[]})
+        );
+        assert!(parse_mail_resource(&serde_json::to_vec(&response).unwrap(), "other").is_err());
+        for (pointer, replacement) in [
+            ("/id", json!("other")),
+            ("/jsonrpc", json!("1.0")),
+            ("/result/contents/0/text", json!("bad JSON")),
+            ("/result/contents", json!([])),
+        ] {
+            let mut bad = response.clone();
+            *bad.pointer_mut(pointer).unwrap() = replacement;
+            assert!(parse_mail_resource(&serde_json::to_vec(&bad).unwrap(), uri).is_err());
+        }
+        let mut failed = response;
+        failed["error"] = json!({"message":"private failure"});
+        assert!(parse_mail_resource(&serde_json::to_vec(&failed).unwrap(), uri).is_err());
+    }
+
+    #[test]
+    fn mail_observations_use_live_time_and_omit_private_metadata() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-19T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let roster = json!({"project":{"human_key":"/project"},"agents":[
+            {"name":"ActiveAgent","last_active_ts":"2026-09-18T23:50:00Z","task_description":"private task"},
+            {"name":"OldAgent","last_active_ts":"2026-09-18T23:49:59Z"},
+            {"name":"FutureAgent","last_active_ts":"2026-09-19T00:01:00Z"}
+        ]});
+        let reservation = json!({"id":1,"agent":"ActiveAgent","path_pattern":"src/**","exclusive":true,
+            "expires_ts":"2026-09-19T00:00:01Z","released_ts":null,"reason":"private reason"});
+        let mut expired = reservation.clone();
+        expired["expires_ts"] = json!("2026-09-19T00:00:00Z");
+        let mut released = reservation.clone();
+        released["released_ts"] = json!("2026-09-18T23:59:00Z");
+        let result = project_mail_observations(
+            &roster,
+            &json!([reservation, expired, released]),
+            "/project",
+            now,
+        )
+        .unwrap();
+        assert_eq!(result["agents"][0]["active"], true);
+        assert_eq!(result["agents"][1]["active"], false);
+        assert_eq!(result["agents"][2]["active"], false);
+        assert_eq!(result["reservations"][0]["active"], true);
+        assert_eq!(result["reservations"][1]["active"], false);
+        assert_eq!(result["reservations"][2]["active"], false);
+        assert!(!result.to_string().contains("private"));
+        assert!(project_mail_observations(&roster, &json!([]), "/wrong", now).is_err());
+        assert!(
+            project_mail_observations(&roster, &json!(vec![Value::Null; 250]), "/project", now)
+                .is_err()
+        );
+        let mut bad = roster;
+        bad["agents"][0]["last_active_ts"] = json!("invalid");
+        assert!(project_mail_observations(&bad, &json!([]), "/project", now).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires explicitly configured live Mail HTTP endpoint; run through RCH"]
+    fn live_mail_resource_read_preserves_metadata_only_contract() {
+        let repo = std::env::current_dir().unwrap();
+        let value = collect_live_mail(&repo, Instant::now()).expect("live Mail resources");
+        assert_eq!(value["source_kind"], "agent-mail-resources");
+        assert!(value["agents"].is_array());
+        assert!(value["reservations"].is_array());
+        assert!(value.get("messages").is_none());
+        for agent in value["agents"].as_array().unwrap() {
+            assert!(agent.get("task_description").is_none());
+            assert!(agent["active"].is_boolean());
+        }
     }
 
     fn rch_status_example() -> Value {

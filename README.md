@@ -1103,7 +1103,16 @@ RCH contributes aggregate active/queued job counts, fleet slots and posture from
 more than 5 seconds in the future are unavailable. Worker addresses, commands
 and job details are omitted. This provider remains partial: local Cargo/CPU
 state and build admission are unknown, even when RCH reports no active jobs.
-Agent Mail and CASS evidence remain unwired. `swarm lint` still uses the placeholder
+Agent Mail roster and reservation reads are opt-in: set `CASS_SWARM_AGENT_MAIL_URL`
+to the server's HTTP MCP endpoint and, if required, `CASS_SWARM_AGENT_MAIL_TOKEN`.
+The reader uses only `resources/read`, never a local database fallback or inbox
+read. Mail shares the total request budget with a 3-second cap of its own;
+responses are capped at 8 MiB, rosters at 512 agents, and full 250-row reservation
+pages are refused. The total reservation count remains unknown; source metadata
+reports only the observed active count. Activity and expiry use
+the observation time. Task descriptions, reservation reasons and message bodies
+are omitted. These observations do not authorize claims or establish proof.
+CASS evidence remains unwired. `swarm lint` still uses the placeholder
 live snapshot. Fixture selection (`--fixture <file>` or `--fixture-dir <dir>
 --fixture-id <id>`) retains deterministic behavior; `swarm dependency-drift`
 also has a live path.

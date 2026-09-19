@@ -11943,6 +11943,8 @@ fn render_swarm_status_live() -> serde_json::Value {
         }
     }
     // Fleet counts are observations, not local process coverage or admission.
+    // Mail's bounded resource page has no complete-inventory attestation.
+    payload["summary"]["active_reservation_count"] = serde_json::Value::Null;
     payload["summary"]["build_pressure"] = serde_json::Value::Null;
     payload["build_pressure"] = serde_json::json!({
         "status": "unknown", "active_rch_jobs": null, "active_cargo_jobs": null,
@@ -11976,6 +11978,7 @@ fn render_swarm_status_live() -> serde_json::Value {
             "version": observed.get("version"),
             "source_kind": observed.get("source_kind"),
             "schema_version": observed.get("schema_version"),
+            "observed_active_reservation_count": observed.get("observed_active_reservation_count"),
             "export_age_ms": observed.get("export_age_ms"),
         });
     }
@@ -13090,6 +13093,9 @@ fn swarm_agents(
 }
 
 fn swarm_agent_active(agent: &serde_json::Value) -> bool {
+    if let Some(active) = agent.get("active").and_then(serde_json::Value::as_bool) {
+        return active;
+    }
     agent
         .get("last_active_ts")
         .and_then(serde_json::Value::as_str)
@@ -13190,6 +13196,12 @@ fn swarm_active_reservation_count(reservations: &[serde_json::Value]) -> usize {
 }
 
 fn swarm_reservation_active(reservation: &serde_json::Value) -> bool {
+    if let Some(active) = reservation
+        .get("active")
+        .and_then(serde_json::Value::as_bool)
+    {
+        return active;
+    }
     reservation
         .get("expires_ts")
         .and_then(serde_json::Value::as_str)
@@ -17301,6 +17313,22 @@ fn swarm_signed_age_seconds(ts: &str) -> Option<i64> {
 mod swarm_status_cli_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn live_mail_activity_overrides_fixture_clock() {
+        assert!(!swarm_agent_active(
+            &json!({"active":false,"last_active_ts":"2026-09-19T00:00:00Z"})
+        ));
+        assert!(swarm_agent_active(
+            &json!({"active":true,"last_active_ts":"2026-09-19T00:00:00Z"})
+        ));
+        assert!(!swarm_reservation_active(
+            &json!({"active":false,"expires_ts":"2026-09-19T00:00:00Z"})
+        ));
+        assert!(swarm_reservation_active(
+            &json!({"active":true,"expires_ts":"2026-09-19T00:00:00Z"})
+        ));
+    }
 
     #[test]
     fn failure_pattern_redaction_handles_nested_structured_credentials() {
