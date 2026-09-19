@@ -1,3 +1,4 @@
+mod exclusions;
 mod source_budget;
 
 use std::collections::HashMap;
@@ -70,7 +71,12 @@ impl Connector for CodexConnector {
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
-        self.inner.discover_source_files(ctx)
+        // GH #486: the published FAD pin does not filter Codex discovery yet.
+        // Keep excluded sources out of pre-mirroring as well as parsing.
+        let exclusions = exclusions::ScanExclusions::from_env();
+        let mut sources = self.inner.discover_source_files(ctx)?;
+        sources.retain(|source| !exclusions.excludes(&source.source_path));
+        Ok(sources)
     }
 
     fn scan_with_callback(

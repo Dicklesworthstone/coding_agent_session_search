@@ -15,6 +15,7 @@ use franken_agent_detection::DiscoveredSourceRole;
 use franken_agent_detection::connectors::{SourceCompletion, SourceScanHooks};
 use serde::Serialize;
 
+use super::exclusions::ScanExclusions;
 use super::{
     Connector, DiscoveredSourceFile, MAX_AUGMENT_ROLLOUT_BYTES, NormalizedConversation, ScanContext,
 };
@@ -119,12 +120,19 @@ pub(super) fn scan(
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     mut enrich: impl FnMut(&mut NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
+    let exclusions = ScanExclusions::from_env();
     let state = RefCell::new(ScanState::default());
     let SourceScanHooks {
         should_scan_source,
         on_source_complete,
     } = hooks;
     let mut should_scan = |source: &DiscoveredSourceFile| {
+        // GH #486: filter before host hooks, budget rejection, or either parse.
+        // Explicit-file roots pass through this hook too. An excluded oversized
+        // file must not turn an otherwise successful scan into IncompleteScan.
+        if exclusions.excludes(&source.source_path) {
+            return false;
+        }
         {
             let mut state = state.borrow_mut();
             state.current_source = Some(source.source_path.clone());
