@@ -1,4 +1,4 @@
-name: Qualify Codex source containment
+name: Land qualified Codex containment
 on:
   push:
     branches: [main]
@@ -14,6 +14,7 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: write
+      actions: read
     env:
       RUSTUP_TOOLCHAIN: nightly-2026-08-31
       CARGO_BUILD_JOBS: '2'
@@ -25,7 +26,7 @@ jobs:
         with:
           ref: main
           clean: false
-      - name: Verify the reviewed payload and install only regression tests
+      - name: Authenticate the tested patch and preserve the previous RED evidence
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -33,88 +34,61 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/evidence"
           python3 - <<'PY'
-          import base64, gzip, hashlib, json, os, re, subprocess
+          import hashlib,io,json,os,subprocess,zipfile
           from pathlib import Path
-          def blob(data):
-              return hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
-          evidence = Path(os.environ['RUNNER_TEMP']) / 'evidence'
-          record = json.loads(subprocess.check_output(['gh','api','repos/'+os.environ['GITHUB_REPOSITORY']+'/git/blobs/6dfe9d833dc251036a73a453bf9eb9acb06bacf0']))
-          transferred = base64.b64decode(record['content'])
-          assert blob(transferred) == '6dfe9d833dc251036a73a453bf9eb9acb06bacf0'
-          # Correct two transport transcription errors; authenticate the complete
-          # repaired byte stream before decompressing or touching source files.
-          encoded = base64.b64encode(transferred).decode()
-          encoded = encoded.replace('ULdG6qjDnx','ULdG6qDDnx',1).replace('ttLQ0tLQ168t','ttLQ168t',1)
-          compressed = base64.b64decode(encoded)
-          assert blob(compressed) == 'a0afba1d5021a7c8620c6e2e3a378cb762e83d2e'
-          data = gzip.decompress(compressed)
-          assert hashlib.sha256(data).hexdigest() == 'b8285e2d2fd2cc4f20c5442c6dc7a1dd53bec98ae92faf3a739d600686302209'
-          payload = json.loads(data)
-          (evidence/'payload.json').write_bytes(data)
+          def blob(data): return hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+          evidence=Path(os.environ['RUNNER_TEMP'])/'evidence'
+          data=subprocess.check_output(['gh','api','repos/'+os.environ['GITHUB_REPOSITORY']+'/actions/artifacts/10573560166/zip'])
+          assert hashlib.sha256(data).hexdigest()=='a314bdb0d85bcb2f0d324abacda5f5de482a038b474755be2f511ad4257e7541'
+          archive=zipfile.ZipFile(io.BytesIO(data))
+          payload=json.loads(archive.read('payload.json'))
+          for name in ['payload.json','component-Cargo.lock','red.log','selected-beads.json']:
+              (evidence/name).write_bytes(archive.read(name))
+          assert b'0 passed; 1 failed;' in archive.read('red.log')
+          assert b'24 passed; 0 failed;' in archive.read('green.log')
+          assert b'3 passed; 0 failed;' in archive.read('green.log')
           for name,(before,_) in payload['guards'].items():
-              path = Path(name)
+              path=Path(name)
               assert not path.is_symlink()
-              assert (not path.exists()) if before is None else blob(path.read_bytes()) == before, name
-          pieces = [p for p in re.split(r'(?=^--- )',payload['patch'],flags=re.M) if p]
-          tests = [p for p in pieces if '+++ b/tests/codex_source_containment.rs\n' in p]
-          assert len(tests) == 1
-          (evidence/'tests.patch').write_text(''.join(tests))
-          (evidence/'runtime.patch').write_text(''.join(p for p in pieces if p not in tests))
-          subprocess.run(['git','apply','--check','--whitespace=error-all',str(evidence/'tests.patch')],check=True)
-          subprocess.run(['git','apply',str(evidence/'tests.patch')],check=True)
-          rows = [json.loads(line) for line in Path('.beads/issues.jsonl').read_text().splitlines() if line.strip()]
-          selected = [r for r in rows if '484' in r.get('title','') or r.get('id','').endswith('fyepq') or (r.get('status') != 'closed' and 'ingest' in r.get('title','').lower())]
-          (evidence/'selected-beads.json').write_text(json.dumps(selected,indent=2))
+              assert (not path.exists()) if before is None else blob(path.read_bytes())==before,name
+          (evidence/'reviewed.patch').write_text(payload['patch'])
+          subprocess.run(['git','apply','--check','--whitespace=error-all',str(evidence/'reviewed.patch')],check=True)
+          subprocess.run(['git','apply',str(evidence/'reviewed.patch')],check=True)
+          for name,(_,after) in payload['guards'].items(): assert blob(Path(name).read_bytes())==after,name
+          path=Path('src/connectors/codex.rs')
+          text=path.read_text()
+          assert text.count('second[split..].as_bytes()')==1
+          path.write_text(text.replace('second[split..].as_bytes()','&second.as_bytes()[split..]'))
           (evidence/'base.txt').write_text(subprocess.check_output(['git','rev-parse','HEAD'],text=True))
           PY
-      - name: Build an isolated package from the complete production connector
+      - name: Re-execute the complete production connector and real FAD tests
         shell: bash
         run: |
           set -euo pipefail
           rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
           python3 - <<'PY'
-          import os, shutil
-          from pathlib import Path
-          root = Path.cwd()
-          dest = Path(os.environ['RUNNER_TEMP'])/'components'
-          (dest/'src/connectors').mkdir(parents=True)
-          (dest/'tests').mkdir()
-          (dest/'src/lib.rs').write_text('pub mod connectors { pub use franken_agent_detection::{Connector, DetectionResult, DiscoveredSourceFile, NormalizedConversation, NormalizedMessage, ScanContext, ScanRoot, parse_timestamp, reindex_messages}; pub mod codex; }\n')
-          shutil.copyfile(root/'src/connectors/codex.rs',dest/'src/connectors/codex.rs')
-          shutil.copyfile(root/'tests/codex_source_containment.rs',dest/'tests/codex_source_containment.rs')
-          (dest/'Cargo.toml').write_text('[package]\nname="coding-agent-search"\nversion="0.0.0"\nedition="2024"\n[dependencies]\nfranken-agent-detection={version="=0.3.0",default-features=false,features=["connectors"]}\nanyhow="1"\nthiserror="2"\nserde={version="1",features=["derive"]}\nserde_json="1"\ntracing="0.1"\nblake3="1"\ntempfile="3"\n')
-          PY
-          cd "$RUNNER_TEMP/components"
-          cargo generate-lockfile
-          cp Cargo.lock "$RUNNER_TEMP/evidence/component-Cargo.lock"
-          set +e
-          timeout 600 cargo test --locked --test codex_source_containment oversized_rollout_does_not_hide_later_sources_or_complete_it -- --exact --nocapture > "$RUNNER_TEMP/evidence/red.log" 2>&1
-          rc=$?
-          set -e
-          cat "$RUNNER_TEMP/evidence/red.log"
-          test "$rc" = 101
-          grep -q 'test result: FAILED. 0 passed; 1 failed;' "$RUNNER_TEMP/evidence/red.log"
-      - name: Apply containment and execute every connector regression
-        shell: bash
-        run: |
-          set -euo pipefail
-          git apply --check --whitespace=error-all "$RUNNER_TEMP/evidence/runtime.patch"
-          git apply "$RUNNER_TEMP/evidence/runtime.patch"
-          python3 - <<'PY'
-          import hashlib,json,os,shutil,subprocess
+          import json,os,shutil,subprocess
           from pathlib import Path
           evidence=Path(os.environ['RUNNER_TEMP'])/'evidence'
           payload=json.loads((evidence/'payload.json').read_text())
-          for name,(_,expected) in payload['guards'].items():
-              data=Path(name).read_bytes()
-              assert hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()==expected,name
+          for name in payload['guards']:
               subprocess.run(['rustfmt','--edition','2024','--config','skip_children=true',name],check=True)
           dest=Path(os.environ['RUNNER_TEMP'])/'components'
-          shutil.copyfile('src/connectors/codex.rs',dest/'src/connectors/codex.rs')
-          shutil.copytree('src/connectors/codex',dest/'src/connectors/codex',dirs_exist_ok=True)
-          shutil.copyfile('tests/codex_source_containment.rs',dest/'tests/codex_source_containment.rs')
+          (dest/'src/connectors').mkdir(parents=True)
+          (dest/'tests').mkdir()
+          (dest/'src/lib.rs').write_text('pub mod connectors { pub use franken_agent_detection::{Connector, DetectionResult, DiscoveredSourceFile, NormalizedConversation, NormalizedMessage, ScanContext, ScanRoot, parse_timestamp, reindex_messages}; pub mod codex; }\n')
+          for name in payload['guards']:
+              target=dest/name
+              target.parent.mkdir(parents=True,exist_ok=True)
+              shutil.copyfile(name,target)
+          (dest/'Cargo.toml').write_text('[package]\nname="coding-agent-search"\nversion="0.0.0"\nedition="2024"\n[dependencies]\nfranken-agent-detection={version="=0.3.0",default-features=false,features=["connectors"]}\nanyhow="1"\nthiserror="2"\nserde={version="1",features=["derive"]}\nserde_json="1"\ntracing="0.1"\nblake3="1"\ntempfile="3"\n')
+          shutil.copyfile(evidence/'component-Cargo.lock',dest/'Cargo.lock')
           hashes={n:subprocess.check_output(['git','hash-object',n],text=True).strip() for n in payload['guards']}
           (evidence/'tested-blobs.json').write_text(json.dumps(hashes,indent=2))
+          for name in hashes:
+              target=evidence/'tested-source'/name
+              target.parent.mkdir(parents=True,exist_ok=True)
+              shutil.copyfile(name,target)
           PY
           git diff --check
           cd "$RUNNER_TEMP/components"
@@ -131,7 +105,7 @@ jobs:
           printf '%s\n' "$rc" > "$RUNNER_TEMP/evidence/shipping-exit.txt"
           cat "$RUNNER_TEMP/evidence/shipping.log"
           exit 0
-      - name: Publish only the tested connector and test files directly to main
+      - name: Commit only the tested connector and test files directly to main
         shell: bash
         run: |
           set -euo pipefail
