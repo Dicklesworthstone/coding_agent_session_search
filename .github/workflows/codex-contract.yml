@@ -7,6 +7,7 @@ on:
       - 'src/connectors/codex.rs'
       - 'src/connectors/codex/**'
       - 'tests/connector_codex_exclusions.rs'
+      - 'tests/codex_source_containment.rs'
       - 'scripts/test_codex_contract.py'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -17,6 +18,7 @@ on:
       - 'src/connectors/codex.rs'
       - 'src/connectors/codex/**'
       - 'tests/connector_codex_exclusions.rs'
+      - 'tests/codex_source_containment.rs'
       - 'scripts/test_codex_contract.py'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -48,3 +50,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Test production Codex wrapper and exclusion contract
         run: python scripts/test_codex_contract.py
+      - name: Checkout upstream reader compatibility baseline
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/franken_agent_detection
+          ref: 8d9eebf47d6d548474d3103e04ace041cd8dd5ef
+          path: consumer/fad
+          persist-credentials: false
+      - name: Test CASS source boundaries with the upstream snapshot reader
+        run: python scripts/test_codex_contract.py --fad-checkout consumer/fad
