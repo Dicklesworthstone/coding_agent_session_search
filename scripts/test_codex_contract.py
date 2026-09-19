@@ -3,10 +3,11 @@
 
     python3 scripts/test_codex_contract.py
 
-The temporary crate includes production Rust files by absolute path; it does
-not copy or mock the connector. Dependency versions and the initial lockfile
-come from CASS itself. Only FAD's unrelated SQLite/crypto features are omitted.
-The integration test also remains a normal CASS cargo test target.
+The temporary crate stages byte-identical production Rust files with their
+normal module layout; there is no maintained fork or mock connector.
+Dependency versions and the initial lockfile come from CASS itself. Only
+FAD's unrelated SQLite/crypto features are omitted. The integration tests
+also remain normal CASS cargo test targets.
 Requires Python 3.11+ and the repository's Rust toolchain.
 """
 
@@ -29,14 +30,18 @@ def main() -> None:
         "anyhow", "blake3", "dotenvy", "franken-agent-detection", "serde",
         "serde_json", "tempfile", "thiserror", "tracing",
     )
+    tests = ("connector_codex_exclusions", "codex_source_containment")
     lines = [
         "[package]", 'name = "cass-codex-contract"', 'version = "0.0.0"',
         'edition = "2024"', "publish = false", "", "[lib]",
-        'name = "coding_agent_search"', 'path = "lib.rs"', "", "[[test]]",
-        'name = "connector_codex_exclusions"',
-        "path = " + json.dumps((root / "tests/connector_codex_exclusions.rs").as_posix()),
-        "", "[dependencies]",
+        'name = "coding_agent_search"', 'path = "lib.rs"',
     ]
+    for test in tests:
+        lines.extend([
+            "", "[[test]]", f'name = "{test}"',
+            "path = " + json.dumps((root / f"tests/{test}.rs").as_posix(), ensure_ascii=False),
+        ])
+    lines.extend(["", "[dependencies]"])
     for name in names:
         spec = dependencies[name]
         version = spec if isinstance(spec, str) else spec["version"]
@@ -51,29 +56,38 @@ def main() -> None:
             lines.append(f"{name} = {json.dumps(version)}")
     lines.extend(["", "[lints.rust]", 'unsafe_code = "forbid"', ""])
 
-    source = json.dumps((root / "src/connectors/codex.rs").as_posix())
-    library = f'''// Includes production code and its existing unit tests, not a fork.
-pub use franken_agent_detection::{{
+    library = '''// Re-exports only; the Codex implementation is unmodified production code.
+pub use franken_agent_detection::{
     Connector, DetectionResult, DiscoveredSourceFile, NormalizedConversation,
     NormalizedMessage, ScanContext, ScanRoot, parse_timestamp, reindex_messages,
-}};
-#[path = {source}]
+};
 pub mod codex;
-pub mod connectors {{
-    pub use super::{{
+pub mod connectors {
+    pub use super::{
         Connector, DetectionResult, DiscoveredSourceFile, NormalizedConversation,
         NormalizedMessage, ScanContext, ScanRoot, codex,
-    }};
-}}
+    };
+}
 '''
     cargo = shutil.which("cargo")
     if cargo is None:
         raise SystemExit("cargo is required; install the repository's Rust toolchain")
+    source_dir = root / "src/connectors"
+    source_files = [source_dir / "codex.rs", *sorted((source_dir / "codex").rglob("*.rs"))]
     with tempfile.TemporaryDirectory(prefix="cass-codex-contract-") as directory:
         work = Path(directory)
         project = work / "Cargo.toml"
         project.write_text("\n".join(lines), encoding="utf-8")
         (work / "lib.rs").write_text(library, encoding="utf-8")
+        # Normal `mod codex` preserves the nested lookup rules that #[path]
+        # overrides. Check equality rather than rewriting source to fit a stub.
+        for original in source_files:
+            staged = work / original.relative_to(source_dir)
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            source = original.read_bytes()
+            staged.write_bytes(source)
+            if staged.read_bytes() != source:
+                raise RuntimeError(f"staged source differs from {original}")
         for name in ("Cargo.lock", "rust-toolchain.toml", "rustfmt.toml", ".rustfmt.toml"):
             original = root / name
             if original.is_file():
@@ -89,14 +103,15 @@ pub mod connectors {{
         for command in commands:
             print("+ " + " ".join(command), flush=True)
             subprocess.run(command, cwd=root, env=env, check=True)
-        # Check only tracked production/test files, not generated scaffolding.
+        # Each file is checked individually, so do not resolve its children as
+        # if that file were a crate root. Never reformat the actual working tree.
         rustfmt = shutil.which("rustfmt")
         if rustfmt is None:
             raise SystemExit("rustfmt is required")
         command = [
-            rustfmt, "--edition", "2024", "--check",
-            str(root / "src/connectors/codex.rs"),
-            str(root / "tests/connector_codex_exclusions.rs"),
+            rustfmt, "--edition", "2024", "--check", "--config", "skip_children=true",
+            *map(str, source_files),
+            *(str(root / f"tests/{test}.rs") for test in tests),
         ]
         print("+ " + " ".join(command), flush=True)
         subprocess.run(command, cwd=root, env=env, check=True)
