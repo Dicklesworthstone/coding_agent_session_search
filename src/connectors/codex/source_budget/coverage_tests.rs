@@ -32,7 +32,8 @@ fn corpus(extension: &str) -> Result<(tempfile::TempDir, Vec<PathBuf>, ScanConte
 }
 
 #[test]
-fn oversized_legacy_rollouts_report_partial_coverage_without_hiding_healthy_sources() -> Result<()> {
+fn oversized_legacy_rollouts_report_partial_coverage_without_hiding_healthy_sources() -> Result<()>
+{
     let (_root, paths, ctx) = corpus("json")?;
     let size = MAX_AUGMENT_ROLLOUT_BYTES + 1;
     fs::File::create(&paths[1])?.set_len(size)?;
@@ -106,8 +107,11 @@ impl Connector for RewriteAfterAdmission {
                 .as_mut()
                 .is_none_or(|predicate| predicate(source));
             if admitted && source.source_path == self.target {
-                fs::write(&self.target, "{\"type\":\"session_meta\",\"payload\":{}}\n\n\n")
-                    .unwrap();
+                fs::write(
+                    &self.target,
+                    "{\"type\":\"session_meta\",\"payload\":{}}\n\n\n",
+                )
+                .unwrap();
             }
             admitted
         };

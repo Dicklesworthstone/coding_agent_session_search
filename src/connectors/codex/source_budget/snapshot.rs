@@ -26,11 +26,20 @@ impl SourceSnapshot {
             )
             .into());
         }
+        if before.len() > super::MAX_AUGMENT_ROLLOUT_BYTES {
+            return Err(super::EnrichmentBudgetExceeded {
+                observed_bytes: before.len(),
+            }
+            .into());
+        }
         Ok(Self { file, before })
     }
 
     pub(super) fn validate(&self, path: &Path) -> Result<()> {
-        let opened = self.file.metadata().context("recheck opened Codex source")?;
+        let opened = self
+            .file
+            .metadata()
+            .context("recheck opened Codex source")?;
         let named = fs::metadata(path).with_context(|| format!("recheck Codex source {path:?}"))?;
         // Reuse the same full-resolution size/mtime and Unix object-identity
         // checks as enrichment. Keep the original handle alive until the next
@@ -59,7 +68,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::super::super::augment_modern_codex_messages;
-    use super::super::scan;
+    use super::super::{EnrichmentBudgetExceeded, MAX_AUGMENT_ROLLOUT_BYTES, scan};
 
     fn content(extension: &str, text: &str) -> String {
         let message = serde_json::json!({"role": "user", "content": text});
@@ -194,7 +203,10 @@ mod tests {
         )
         .unwrap_err();
         assert_kind(&error, io::ErrorKind::Interrupted);
-        assert_eq!(delivered, 1, "delivery cannot be rolled back by the connector");
+        assert_eq!(
+            delivered, 1,
+            "delivery cannot be rolled back by the connector"
+        );
         assert_eq!(completed, 0);
         Ok(())
     }
@@ -244,6 +256,31 @@ mod tests {
     }
 
     #[test]
+    fn capture_rechecks_opened_size_after_an_earlier_small_stat() -> Result<()> {
+        for extension in ["jsonl", "json"] {
+            let (_root, path, _ctx) = fixture(extension)?;
+            assert!(fs::metadata(&path)?.len() < MAX_AUGMENT_ROLLOUT_BYTES);
+            let size = MAX_AUGMENT_ROLLOUT_BYTES + 1;
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)?
+                .set_len(size)?;
+            let error = SourceSnapshot::capture(&path)
+                .err()
+                .expect("opened source exceeds the budget");
+            assert_eq!(
+                error
+                    .downcast_ref::<EnrichmentBudgetExceeded>()
+                    .unwrap()
+                    .observed_bytes,
+                size
+            );
+            assert_eq!(fs::metadata(&path)?.len(), size);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn same_length_rewrite_is_detected() -> Result<()> {
         let (_root, path, _ctx) = fixture("jsonl")?;
         let snapshot = SourceSnapshot::capture(&path)?;
@@ -270,7 +307,10 @@ mod tests {
         fs::write(&path, content("jsonl", "replaced"))?;
         File::open(&path)?.set_modified(snapshot.before.modified()?)?;
         assert_eq!(fs::metadata(&path)?.len(), snapshot.before.len());
-        assert_eq!(fs::metadata(&path)?.modified()?, snapshot.before.modified()?);
+        assert_eq!(
+            fs::metadata(&path)?.modified()?,
+            snapshot.before.modified()?
+        );
         assert_kind(
             &snapshot.validate(&path).unwrap_err(),
             io::ErrorKind::Interrupted,

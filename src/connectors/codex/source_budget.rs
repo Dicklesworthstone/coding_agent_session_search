@@ -204,7 +204,14 @@ pub(super) fn scan(
         match SourceSnapshot::capture(&source.source_path) {
             Ok(snapshot) => state.borrow_mut().snapshot = Some(snapshot),
             Err(error) => {
-                state.borrow_mut().preflight_error = Some(error);
+                let mut state = state.borrow_mut();
+                // Capture rechecks the opened object's size after the cheap
+                // path-based preflight, closing the intervening growth race.
+                if let Some(rejection) = error.downcast_ref::<EnrichmentBudgetExceeded>() {
+                    state.reject(&source.source_path, rejection.observed_bytes);
+                } else {
+                    state.preflight_error = Some(error);
+                }
                 return false;
             }
         }
