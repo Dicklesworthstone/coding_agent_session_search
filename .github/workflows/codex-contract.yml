@@ -1,0 +1,50 @@
+name: Codex consumer contract
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/connectors/codex.rs'
+      - 'src/connectors/codex/**'
+      - 'tests/connector_codex_exclusions.rs'
+      - 'scripts/test_codex_contract.py'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/codex-contract.yml'
+  pull_request:
+    paths:
+      - 'src/connectors/codex.rs'
+      - 'src/connectors/codex/**'
+      - 'tests/connector_codex_exclusions.rs'
+      - 'scripts/test_codex_contract.py'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/codex-contract.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  codex:
+    name: Codex consumer (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test production Codex wrapper and exclusion contract
+        run: python scripts/test_codex_contract.py
