@@ -274,7 +274,9 @@ fn codex_exclusions_precede_enrichment_and_size_rejection() {
         .unwrap()
         .set_len(size)
         .unwrap();
-    fixture.files.extend([unfinished.clone(), oversized.clone()]);
+    fixture
+        .files
+        .extend([unfinished.clone(), oversized.clone()]);
     let exclusions = format!("{},{}", unfinished.display(), oversized.display());
     fixture.run(&exclusions, &[0, 1, 2, 3, 4]);
     assert_eq!(std::fs::read_to_string(&unfinished).unwrap(), content);

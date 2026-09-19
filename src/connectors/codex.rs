@@ -177,17 +177,15 @@ fn same_rollout_snapshot(
     before: &std::fs::Metadata,
     after: &std::fs::Metadata,
 ) -> io::Result<bool> {
-    if !after.is_file() || before.len() != after.len() || before.modified()? != after.modified()? {
-        return Ok(false);
-    }
+    let same = after.is_file()
+        && before.len() == after.len()
+        && before.modified()? == after.modified()?;
     #[cfg(unix)]
-    {
+    let same = {
         use std::os::unix::fs::MetadataExt;
-        if before.dev() != after.dev() || before.ino() != after.ino() {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+        same && before.dev() == after.dev() && before.ino() == after.ino()
+    };
+    Ok(same)
 }
 
 /// An error may leave this private in-memory conversation partially enriched.
