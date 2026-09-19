@@ -3394,7 +3394,7 @@ Update check state is stored in the data directory:
 
 ## Dependency Source Contract
 
-The next release candidate prepares the entire SQLite family (including
+The manifests and lockfile pin the entire SQLite family used by CASS (including
 `fsqlite-types`) at `=0.4.4`, with `asupersync =0.5.0`.
 The published SQLite repair covers the reserved-page WAL conflict in GH#462;
 upstream GH#411 is also closed. Neither proves recovery of an already damaged
@@ -3402,13 +3402,16 @@ archive. `franken-agent-detection =0.3.0` is published. SQLite `0.4.2` adds
 explicit derived WAL-index recovery for read-only opens (GH#477); its
 upstream recovery, compiler, and package gates passed. All 25 SQLite packages
 are now published at 0.4.4, which adds durable pending-freelist repairs.
-`frankensearch =0.6.1` publication and CASS consumer runtime qualification
-remain pending.
-Until those complete, the lockfile and table below describe the previous graph;
-the candidate must not be released. The build guard enforces the reviewed
+As of September 19, `frankensearch =0.6.1` resolves from crates.io, and the
+regenerated lockfile includes all 20 SQLite packages used by CASS at 0.4.4.
+Registry resolution and selected consumer checks have passed; full runtime
+qualification and the strict UBS gate remain pending. Selected checks do not
+qualify a release or prove recovery of a damaged archive.
+The candidate must not be released until the remaining gates pass.
+The table below records the previous graph for historical context.
+The build guard enforces the reviewed
 uniform SQLite 0.4.4 versions, a single resolution per package, and registry sources.
-Cargo resolution on 2026-09-17 stopped at unpublished FrankenSearch 0.6.1;
-the SQLite update is not yet locked or runtime-qualified.
+The September 17 FrankenSearch publication blocker is resolved.
 
 `cass` pins its contract-critical ecosystem dependencies with exact registry requirements in [`Cargo.toml`](Cargo.toml); other direct dependencies use normal semver requirements, and `Cargo.lock` freezes the complete resolved graph. No active dependency or patch currently resolves from git. Optional sibling-path overrides stay commented out by default and must never be committed active.
 

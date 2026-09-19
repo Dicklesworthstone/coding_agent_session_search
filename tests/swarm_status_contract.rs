@@ -41,9 +41,8 @@ fn live_swarm_status_reports_unknown_sources_without_zero_work_claims() {
         .env_remove("CASS_SWARM_AGENT_MAIL_URL")
         .env_remove("CASS_SWARM_AGENT_MAIL_TOKEN")
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .arg("--data-dir")
-        .arg(root.path().join("cass-data"))
         .args(["swarm", "status", "--json"])
+        .timeout(Duration::from_secs(40))
         .output()
         .expect("live status command");
     assert!(
@@ -53,6 +52,12 @@ fn live_swarm_status_reports_unknown_sources_without_zero_work_claims() {
     );
     let value: Value = serde_json::from_slice(&output.stdout).expect("status JSON");
     assert_eq!(value["status"], "partial");
+    for field in ["healthy", "initialized", "search_ready", "active_rebuild"] {
+        assert!(
+            value["cass"][field].is_null(),
+            "unobserved {field}: {value}"
+        );
+    }
     for field in [
         "ready_count",
         "in_progress_count",
@@ -171,12 +176,11 @@ fn live_swarm_cli_reads_real_git_and_beads_without_authorizing_claims() {
             .env("HOME", sandbox.path().join("home"))
             .env("XDG_CONFIG_HOME", sandbox.path().join("config"))
             .env("XDG_DATA_HOME", sandbox.path().join("data"))
+            .env("CASS_DATA_DIR", sandbox.path().join("cass-data"))
             .env("CASS_AUTO_REFRESH", "0")
             .env_remove("CASS_SWARM_AGENT_MAIL_URL")
             .env_remove("CASS_SWARM_AGENT_MAIL_TOKEN")
             .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-            .arg("--data-dir")
-            .arg(sandbox.path().join("cass-data"))
             .args(args)
             .timeout(Duration::from_secs(40))
             .output()

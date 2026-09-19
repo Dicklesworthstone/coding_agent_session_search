@@ -529,9 +529,8 @@ fn collect_exported_beads(repo: &Path, started: Instant) -> Result<Value, String
         "513",
     ])?;
     let blocked = read(&["blocked", "--json", "--limit", "513"])?;
-    if blocked.get("has_more").and_then(Value::as_bool) != Some(false) {
-        return Err("blocked Beads snapshot is truncated or has an unsupported schema".to_string());
-    }
+    let active = beads_issue_page(&active)?;
+    let blocked = beads_issue_page(&blocked)?;
     let project_rows = |rows: &Value| -> Result<Vec<Value>, String> {
         let rows = rows.as_array().ok_or("unsupported br issue schema")?;
         if rows.len() > 512 {
@@ -566,12 +565,21 @@ fn collect_exported_beads(repo: &Path, started: Instant) -> Result<Value, String
     };
     let after = unchanged_beads_export(&path, &before)?;
     Ok(
-        serde_json::json!({"ready": project_rows(&ready)?, "in_progress": project_rows(&active)?,
-        "blocked": project_rows(blocked.get("issues").ok_or("missing blocked issues")?)?,
+        serde_json::json!({"ready": project_rows(&ready)?, "in_progress": project_rows(active)?,
+        "blocked": project_rows(blocked)?,
         "graph": null, "version": version, "source_kind": "exported-jsonl",
         "observed_at_ms": SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis(),
         "export_age_ms": after.modified().ok().and_then(|time| time.elapsed().ok()).map(|age| age.as_millis())}),
     )
+}
+
+fn beads_issue_page(page: &Value) -> Result<&Value, String> {
+    if page.get("has_more").and_then(Value::as_bool) != Some(false) {
+        return Err("Beads page is truncated or has an unsupported schema".to_string());
+    }
+    page.get("issues")
+        .filter(|issues| issues.is_array())
+        .ok_or_else(|| "Beads page lacks an issues array".to_string())
 }
 
 fn unchanged_beads_export(path: &Path, before: &fs::Metadata) -> Result<fs::Metadata, String> {
@@ -1524,6 +1532,25 @@ mod tests {
         fs::write(&path, "a changed export with a different length").expect("concurrent export");
         let error = unchanged_beads_export(&path, &before).expect_err("reject mixed snapshot");
         assert!(error.contains("changed during collection"));
+    }
+
+    #[test]
+    fn live_beads_issue_pages_require_complete_pagination_metadata() {
+        for issues in [json!([]), json!([{"id":"live-1", "status":"in_progress"}])] {
+            let page = json!({"issues":issues, "has_more":false});
+            assert_eq!(beads_issue_page(&page).unwrap(), &issues);
+        }
+        for page in [
+            json!([]),
+            json!({"issues":[]}),
+            json!({"issues":[], "has_more":true}),
+            json!({"issues":[], "has_more":"false"}),
+            json!({"has_more":false}),
+            json!({"issues":null, "has_more":false}),
+            json!({"issues":{}, "has_more":false}),
+        ] {
+            assert!(beads_issue_page(&page).is_err(), "accepted page: {page}");
+        }
     }
 
     #[test]
