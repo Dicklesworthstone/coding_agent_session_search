@@ -1,182 +1,14 @@
-name: Qualify partial index results
+# Runtime fixes landed. This workflow cannot write repository contents or refs.
+name: Verify partial index results
 on:
-  push:
-    branches: [main]
-    paths: [.github/workflows/qualify-codex-containment.yml]
+  workflow_dispatch:
 permissions:
   contents: read
-concurrency:
-  group: cass-codex-containment-landing
-  cancel-in-progress: false
 jobs:
-  qualify-and-land:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    permissions:
-      contents: write
-    outputs:
-      commit: ${{ steps.land.outputs.commit }}
-    env:
-      RUSTUP_TOOLCHAIN: nightly-2026-08-31
-      CARGO_BUILD_JOBS: '2'
-      CARGO_PROFILE_TEST_DEBUG: '0'
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_TERM_COLOR: never
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: main
-          clean: false
-      - name: Authenticate and apply the four-path command-completion change
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/evidence"
-          python3 - <<'PY'
-          import base64,hashlib,json,lzma,os,subprocess
-          from pathlib import Path
-          def blob(data): return hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
-          evidence=Path(os.environ['RUNNER_TEMP'])/'evidence'
-          record=json.loads(subprocess.check_output(['gh','api','repos/'+os.environ['GITHUB_REPOSITORY']+'/git/blobs/2705be7d6fceb99a9efee7df78607aee117d0139']))
-          compressed=base64.b64decode(record['content'])
-          assert blob(compressed)=='2705be7d6fceb99a9efee7df78607aee117d0139'
-          data=lzma.decompress(compressed)
-          assert hashlib.sha256(data).hexdigest()=='78f4206cd6a68e3f1946f9bc38a42a94abb9f29b313a13b677afc58b156ba780'
-          payload=json.loads(data)
-          assert set(payload['guards'])=={'src/lib.rs','src/indexer/mod.rs','src/index_result.rs','tests/e2e_codex_partial_index.rs'}
-          for name,(before,_) in payload['guards'].items():
-              path=Path(name)
-              assert not path.is_symlink()
-              assert (not path.exists()) if before is None else blob(path.read_bytes())==before,name
-          (evidence/'payload.json').write_bytes(data)
-          (evidence/'reviewed.patch').write_text(payload['patch'])
-          (evidence/'base.txt').write_text(subprocess.check_output(['git','rev-parse','HEAD'],text=True))
-          subprocess.run(['git','apply','--check','--whitespace=error-all',str(evidence/'reviewed.patch')],check=True)
-          subprocess.run(['git','apply',str(evidence/'reviewed.patch')],check=True)
-          for name,(_,after) in payload['guards'].items(): assert blob(Path(name).read_bytes())==after,name
-          PY
-      - name: Compile actual completion policy, cache decoder, error envelope and connector regressions
-        shell: bash
-        run: |
-          set -euo pipefail
-          rustup toolchain install nightly-2026-08-31 --profile minimal --component rustfmt --component clippy
-          rustfmt --edition 2024 src/index_result.rs tests/e2e_codex_partial_index.rs
-          rustfmt --edition 2024 --config skip_children=true --emit stdout src/lib.rs > /dev/null
-          rustfmt --edition 2024 --config skip_children=true --emit stdout src/indexer/mod.rs > /dev/null
-          git diff --check
-          python3 - <<'PY'
-          import hashlib,json,os,re,shutil,subprocess
-          from pathlib import Path
-          root=Path.cwd()
-          evidence=Path(os.environ['RUNNER_TEMP'])/'evidence'
-          dest=Path(os.environ['RUNNER_TEMP'])/'components'
-          (dest/'src/connectors').mkdir(parents=True)
-          (dest/'src/model').mkdir()
-          (dest/'tests').mkdir()
-          lib=(root/'src/lib.rs').read_text()
-          indexer=(root/'src/indexer/mod.rs').read_text()
-          def item(text,anchor):
-              assert text.count(anchor)==1,anchor
-              start=text.index(anchor)
-              return text[start:text.index('\n}',start)+2]
-          # Whole production definitions and bodies; no substitute result type,
-          # cache implementation, or envelope. The giant dispatcher/consumer is
-          # intentionally NOT included in this component qualification.
-          parts=['#![allow(dead_code)]','mod index_result;',
-              'pub mod model { pub mod cli_error_kind; }',
-              'pub mod connectors { pub use franken_agent_detection::{Connector, DetectionResult, DiscoveredSourceFile, NormalizedConversation, NormalizedMessage, ScanContext, ScanRoot, parse_timestamp, reindex_messages}; pub mod codex; }',
-              '#[derive(Debug, Clone)]\n'+item(lib,'pub struct CliError {'),
-              'pub type CliResult<T = ()> = std::result::Result<T, CliError>;',
-              item(lib,'fn cli_error_json_payload('),item(lib,'fn cached_index_payload('),
-              'pub mod indexer { #[derive(Debug, Clone, Default, serde::Serialize)]\n'+item(indexer,'pub struct ConnectorStats {')+'\n}']
-          (dest/'src/lib.rs').write_text('\n'.join(parts))
-          for name in ['src/index_result.rs','src/model/cli_error_kind.rs','src/connectors/codex.rs','tests/codex_source_containment.rs']:
-              shutil.copyfile(root/name,dest/name)
-          shutil.copytree(root/'src/connectors/codex',dest/'src/connectors/codex')
-          (dest/'Cargo.toml').write_text('[package]\nname="coding-agent-search"\nversion="0.0.0"\nedition="2024"\n[dependencies]\nfranken-agent-detection={version="=0.3.0",default-features=false,features=["connectors"]}\nanyhow="1"\nthiserror="2"\nserde={version="1",features=["derive"]}\nserde_json="1"\ntracing="0.1"\nblake3="1"\ntempfile="3"\n')
-          (evidence/'compiled-definitions.rs').write_text('\n'.join(parts))
-          guards=json.loads((evidence/'payload.json').read_text())['guards']
-          hashes={n:subprocess.check_output(['git','hash-object',n],text=True).strip() for n in guards}
-          (evidence/'tested-blobs.json').write_text(json.dumps(hashes,indent=2))
-          for name in hashes:
-              path=evidence/'tested-source'/name
-              path.parent.mkdir(parents=True,exist_ok=True)
-              shutil.copyfile(name,path)
-          # Assert the connection points as well as parsing the entire files.
-          boundary=lib.index('index_result::require_complete_scan(')
-          assert boundary < lib.index('if let Some((pb, conversations, agents)) = progress_completion',boundary)
-          assert boundary < lib.index('"success": true',boundary) < lib.index('// Store idempotency key if provided',boundary)
-          assert 'stats.scan_had_errors |= ingest_outcome.scan_had_errors;' in indexer
-          assert 'stats.scan_had_errors |= ingest_outcome.scan_had_errors || scan_had_errors;' in indexer
-          assert '&& !scan_had_errors;' in indexer
-          PY
-          cd "$RUNNER_TEMP/components"
-          cargo generate-lockfile
-          cp Cargo.lock "$RUNNER_TEMP/evidence/component-Cargo.lock"
-          timeout 600 cargo test --locked --lib index_result:: -- --nocapture 2>&1 | tee "$RUNNER_TEMP/evidence/completion.log"
-          grep -q 'test result: ok. 9 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/evidence/completion.log"
-          cargo test --locked --lib connectors::codex:: -- --nocapture 2>&1 | tee "$RUNNER_TEMP/evidence/connector.log"
-          grep -q 'test result: ok. 24 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/evidence/connector.log"
-          cargo test --locked --test codex_source_containment -- --nocapture 2>&1 | tee "$RUNNER_TEMP/evidence/real-fad.log"
-          grep -q 'test result: ok. 3 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/evidence/real-fad.log"
-          cargo clippy --locked --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/evidence/clippy.log"
-      - name: Record the unmodified shipping-lockfile result
-        shell: bash
-        run: |
-          set +e
-          timeout 120 cargo test --locked --test e2e_codex_partial_index > "$RUNNER_TEMP/evidence/shipping.log" 2>&1
-          rc=$?
-          printf '%s\n' "$rc" > "$RUNNER_TEMP/evidence/shipping-exit.txt"
-          cat "$RUNNER_TEMP/evidence/shipping.log"
-          exit 0
-      - name: Commit only the four qualified files directly to main
-        id: land
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import json,os,subprocess
-          from pathlib import Path
-          evidence=Path(os.environ['RUNNER_TEMP'])/'evidence'
-          payload=json.loads((evidence/'payload.json').read_text())
-          hashes=json.loads((evidence/'tested-blobs.json').read_text())
-          def git(*args,**kwargs): return subprocess.check_output(['git',*args],text=True,**kwargs).strip()
-          for path,expected in hashes.items(): assert git('hash-object','-w',path)==expected,path
-          env=dict(os.environ,GIT_INDEX_FILE=str(evidence/'publish.index'),GIT_AUTHOR_NAME='github-actions[bot]',GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com',GIT_COMMITTER_NAME='github-actions[bot]',GIT_COMMITTER_EMAIL='41898282+github-actions[bot]@users.noreply.github.com')
-          for attempt in range(3):
-              git('fetch','origin','main')
-              base=git('rev-parse','origin/main')
-              for path,(before,_) in payload['guards'].items():
-                  found=subprocess.run(['git','rev-parse',base+':'+path],text=True,capture_output=True)
-                  assert (found.returncode!=0) if before is None else found.stdout.strip()==before,path
-              git('read-tree',base,env=env)
-              for path,sha in hashes.items(): git('update-index','--add','--cacheinfo','100644,'+sha+','+path,env=env)
-              tree=git('write-tree',env=env)
-              message='fix(index): report incomplete scans as partial failures without caching success\n\nCarry the existing scan-error outcome into public statistics for both modes. Convert incomplete coverage to exit 9 before success progress, completion events, or idempotency writes; retain completed source work and include connector diagnostics in the ordinary error envelope. Ignore old cached success objects that already record scan failures.\n\nNine actual completion/cache/error-envelope component regressions, 24 full connector unit tests and three real-FAD scan tests pass; component Clippy passes. Added two full CLI index/search/retry/cache tests for streaming and batch modes; whole-binary qualification remains separate. No shipping dependency pins, lockfile, or source archives changed. GH #484.\n'
-              commit=git('commit-tree',tree,'-p',base,input=message,env=env)
-              if subprocess.run(['git','push','origin',commit+':refs/heads/main']).returncode==0:
-                  (evidence/'published.txt').write_text(commit+'\n')
-                  with open(os.environ['GITHUB_OUTPUT'],'a') as out: out.write('commit='+commit+'\n')
-                  print('PUBLISHED',commit)
-                  break
-          else: raise RuntimeError('main advanced repeatedly; no force push attempted')
-          PY
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
-        with:
-          name: partial-index-components-${{ github.sha }}
-          path: ${{ runner.temp }}/evidence/
-          retention-days: 14
-  full-source-probe:
-    needs: qualify-and-land
+  shipping-cass:
     runs-on: ubuntu-24.04
     timeout-minutes: 35
-    permissions:
-      contents: read
     env:
-      RUSTUP_TOOLCHAIN: nightly-2026-08-31
       CARGO_BUILD_JOBS: '3'
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -185,36 +17,30 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ needs.qualify-and-land.outputs.commit }}
-          path: cass-source
+          ref: ${{ github.sha }}
           persist-credentials: false
           clean: false
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          repository: Dicklesworthstone/frankensearch
-          ref: 6852e79a830c402ea4e55eb79eda3373c618dfc3
-          path: fs-source
-          persist-credentials: false
-          clean: false
-      - name: Attempt the complete CLI journey with a development-only source override
+      - name: Test production completion, real source containment and complete CLI journeys
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/evidence"
-          cd cass-source
           git rev-parse HEAD > "$RUNNER_TEMP/evidence/commit.txt"
-          cp Cargo.lock "$RUNNER_TEMP/evidence/shipping-Cargo.lock"
-          rustup toolchain install nightly-2026-08-31 --profile minimal
-          set +e
-          timeout 1800 cargo --config "patch.crates-io.frankensearch.path='$GITHUB_WORKSPACE/fs-source/frankensearch'" test --test e2e_codex_partial_index -- --nocapture --test-threads=1 > "$RUNNER_TEMP/evidence/full-cli.log" 2>&1
-          rc=$?
-          printf '%s\n' "$rc" > "$RUNNER_TEMP/evidence/exit.txt"
-          cp Cargo.lock "$RUNNER_TEMP/evidence/development-Cargo.lock"
-          cat "$RUNNER_TEMP/evidence/full-cli.log"
-          exit "$rc"
+          cargo test --locked --lib index_result:: -- --nocapture 2>&1 | tee "$RUNNER_TEMP/evidence/completion.log"
+          cargo test --locked --lib connectors::codex:: -- --nocapture 2>&1 | tee "$RUNNER_TEMP/evidence/connector.log"
+          cargo test --locked --test codex_source_containment -- --nocapture 2>&1 | tee "$RUNNER_TEMP/evidence/source.log"
+          cargo test --locked --test e2e_codex_partial_index -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/evidence/cli.log"
+          python3 - <<'PY'
+          import os,re
+          from pathlib import Path
+          evidence=Path(os.environ['RUNNER_TEMP'])/'evidence'
+          for name,minimum in [('completion.log',9),('connector.log',24),('source.log',3),('cli.log',2)]:
+              counts=re.findall(r'test result: ok\. (\d+) passed; 0 failed; 0 ignored;', (evidence/name).read_text())
+              assert counts and max(map(int,counts)) >= minimum,name
+          PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: partial-index-full-source-${{ github.sha }}
+          name: partial-index-shipping-${{ github.sha }}
           path: ${{ runner.temp }}/evidence/
           retention-days: 14
