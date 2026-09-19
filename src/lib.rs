@@ -13740,12 +13740,12 @@ fn swarm_cass(
 ) -> serde_json::Value {
     serde_json::json!({
         "health_status": cass_health.get("status").cloned().unwrap_or_else(|| serde_json::json!("unavailable")),
-        "healthy": cass_health.get("healthy").cloned().unwrap_or_else(|| serde_json::json!(false)),
-        "initialized": cass_health.get("initialized").cloned().unwrap_or_else(|| serde_json::json!(false)),
+        "healthy": cass_health.get("healthy").cloned().unwrap_or(serde_json::Value::Null),
+        "initialized": cass_health.get("initialized").cloned().unwrap_or(serde_json::Value::Null),
         "recommended_action": cass_health.get("recommended_action").cloned().unwrap_or(serde_json::Value::Null),
-        "search_ready": cass_status.get("search_ready").cloned().unwrap_or_else(|| serde_json::json!(false)),
+        "search_ready": cass_status.get("search_ready").cloned().unwrap_or(serde_json::Value::Null),
         "semantic_fallback_mode": cass_status.get("semantic_fallback_mode").cloned().unwrap_or(serde_json::Value::Null),
-        "active_rebuild": cass_status.get("active_rebuild").cloned().unwrap_or_else(|| serde_json::json!(false)),
+        "active_rebuild": cass_status.get("active_rebuild").cloned().unwrap_or(serde_json::Value::Null),
     })
 }
 
@@ -17360,6 +17360,25 @@ mod swarm_status_cli_tests {
                 .len(),
             6
         );
+    }
+
+    #[test]
+    fn swarm_cass_distinguishes_unobserved_readiness_from_negative_observations() {
+        let missing = swarm_cass(&json!({}), &json!({}));
+        for field in ["healthy", "initialized", "search_ready", "active_rebuild"] {
+            assert!(missing[field].is_null(), "unobserved {field}: {missing}");
+        }
+        let partial = swarm_cass(
+            &json!({"healthy": false, "initialized": true}),
+            &json!({"active_rebuild": false}),
+        );
+        assert_eq!(partial["healthy"], false);
+        assert_eq!(partial["initialized"], true);
+        assert_eq!(partial["active_rebuild"], false);
+        assert!(partial["search_ready"].is_null());
+        let ready = swarm_cass(&json!({}), &json!({"search_ready": true}));
+        assert_eq!(ready["search_ready"], true);
+        assert!(ready["healthy"].is_null());
     }
 
     #[test]

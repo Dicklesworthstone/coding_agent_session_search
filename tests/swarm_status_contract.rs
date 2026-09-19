@@ -53,6 +53,9 @@ fn live_swarm_status_reports_unknown_sources_without_zero_work_claims() {
     );
     let value: Value = serde_json::from_slice(&output.stdout).expect("status JSON");
     assert_eq!(value["status"], "partial");
+    for field in ["healthy", "initialized", "search_ready", "active_rebuild"] {
+        assert!(value["cass"][field].is_null(), "unobserved {field}: {value}");
+    }
     for field in [
         "ready_count",
         "in_progress_count",
