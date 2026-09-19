@@ -1,3 +1,0 @@
-repo_path=.
-timestamp=20260730T003928Z
-issue_id=coding_agent_session_search-ds7uy.4.1
