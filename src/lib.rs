@@ -12045,7 +12045,10 @@ fn render_swarm_status_fixture(
     )
 }
 
-fn render_swarm_work_packet_live_partial(cli: &Cli, bead_filter: Option<&str>) -> serde_json::Value {
+fn render_swarm_work_packet_live_partial(
+    cli: &Cli,
+    bead_filter: Option<&str>,
+) -> serde_json::Value {
     let status = render_swarm_status_live(cli);
     let mut packet = render_swarm_work_packet_from_status(&status, bead_filter);
     packet["_meta"]["source_observations"] = status["_meta"]["source_observations"].clone();
