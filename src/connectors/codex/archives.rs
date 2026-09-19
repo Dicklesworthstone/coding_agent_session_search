@@ -12,6 +12,16 @@ use super::{Connector, DiscoveredSourceFile, Result, ScanContext, ScanRoot};
 
 const ARCHIVE: &str = "archived_sessions";
 
+fn configured_home() -> PathBuf {
+    // Match FAD's env_path_nonempty(), including surrounding whitespace.
+    dotenvy::var("CODEX_HOME")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".codex"))
+}
+
 fn default_home(ctx: &ScanContext) -> PathBuf {
     // Retain FAD's legacy data_dir-as-Codex-root override.
     let is_codex = ctx.data_dir.to_str().is_some_and(|path| {
@@ -20,13 +30,31 @@ fn default_home(ctx: &ScanContext) -> PathBuf {
     if is_codex && ctx.data_dir.join("sessions").exists() {
         return ctx.data_dir.clone();
     }
-    // Match FAD's env_path_nonempty(), including surrounding whitespace.
-    dotenvy::var("CODEX_HOME")
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".codex"))
+    configured_home()
+}
+
+pub(super) fn detect(inner: &dyn Connector) -> super::DetectionResult {
+    let mut detection = inner.detect();
+    let home = configured_home();
+    let archive = home.join(ARCHIVE);
+    if archive.is_dir() {
+        detection.detected = true;
+        detection
+            .evidence
+            .push("Codex archived_sessions directory exists".to_owned());
+        // A host may turn detection roots into explicit ScanRoots. Returning
+        // only sessions/ would then hide the sibling archive again, while
+        // returning only archived_sessions/ loses full-home ID/cutoff policy.
+        // Use the common home for this profile and retain other native roots.
+        let sessions = home.join("sessions");
+        detection
+            .root_paths
+            .retain(|path| path != &sessions && path != &archive);
+        if !detection.root_paths.contains(&home) {
+            detection.root_paths.push(home);
+        }
+    }
+    detection
 }
 
 fn archive_candidates(ctx: &ScanContext) -> Vec<ScanRoot> {
@@ -148,5 +176,7 @@ fn native_session_id(path: &Path) -> Option<String> {
         .map(str::to_owned)
 }
 
+#[cfg(test)]
+mod detection_tests;
 #[cfg(test)]
 mod tests;

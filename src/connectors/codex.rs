@@ -30,7 +30,7 @@ impl CodexConnector {
 
 impl Connector for CodexConnector {
     fn detect(&self) -> DetectionResult {
-        self.inner.detect()
+        archives::detect(&self.inner)
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
