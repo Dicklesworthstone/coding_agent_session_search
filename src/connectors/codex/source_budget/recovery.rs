@@ -186,8 +186,8 @@ fn scan_source(
     let consumer_failed = Cell::new(false);
     let visited = Cell::new(false);
     let scope_changed = Cell::new(false);
-    let directory_id = (source.scan_root != source.source_path)
-        .then(|| directory_session_id(source));
+    let directory_id =
+        (source.scan_root != source.source_path).then(|| directory_session_id(source));
     let SourceScanHooks {
         should_scan_source,
         on_source_complete,
@@ -301,5 +301,7 @@ pub(super) fn scan(
 
 #[cfg(test)]
 mod contract_tests;
+#[cfg(test)]
+mod resume_tests;
 #[cfg(test)]
 mod tests;

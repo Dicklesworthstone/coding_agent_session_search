@@ -74,7 +74,10 @@ fn unfinished_middle_source_does_not_starve_later_sessions() -> Result<()> {
         let report = error.downcast_ref::<FailureReport>().unwrap();
         assert_eq!(report.failed_source_count, 1);
         assert_eq!(report.failed_sources[0].reason, "unfinished_source");
-        assert_eq!(PathBuf::from(&report.failed_sources[0].source_path), paths[1]);
+        assert_eq!(
+            PathBuf::from(&report.failed_sources[0].source_path),
+            paths[1]
+        );
         assert!(!error.to_string().contains("unfinished-private-prefix"));
         assert!(
             connector.scan(&ctx).is_err(),
@@ -129,7 +132,7 @@ fn consumer_errors_abort_even_after_a_source_local_failure() -> Result<()> {
         let mut complete = |_: &SourceCompletion| -> Result<()> {
             if completion_error {
                 return Err(
-                    io::Error::new(io::ErrorKind::UnexpectedEof, "consumer failure").into()
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "consumer failure").into(),
                 );
             }
             Ok(())
@@ -143,7 +146,7 @@ fn consumer_errors_abort_even_after_a_source_local_failure() -> Result<()> {
                 delivered.push(conversation.source_path);
                 if !completion_error {
                     return Err(
-                        io::Error::new(io::ErrorKind::UnexpectedEof, "consumer failure").into()
+                        io::Error::new(io::ErrorKind::UnexpectedEof, "consumer failure").into(),
                     );
                 }
                 Ok(())

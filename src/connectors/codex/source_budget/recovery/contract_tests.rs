@@ -54,12 +54,8 @@ fn custom_remote_roots_keep_distinct_ids_and_original_provenance() -> Result<()>
     let ctx = ScanContext::with_roots(
         root.path().join("cass"),
         vec![
-            ScanRoot::remote(
-                mirror,
-                Origin::remote("workstation"),
-                Some(Platform::Linux),
-            )
-            .with_rewrite("/remote/project", "/local/project"),
+            ScanRoot::remote(mirror, Origin::remote("workstation"), Some(Platform::Linux))
+                .with_rewrite("/remote/project", "/local/project"),
         ],
         None,
     );
@@ -83,7 +79,10 @@ fn custom_remote_roots_keep_distinct_ids_and_original_provenance() -> Result<()>
     })?;
     let actual = identities(delivered);
     assert_eq!(actual.len(), 2);
-    assert_ne!(actual[0].1, actual[1].1, "distinct nested sessions collided");
+    assert_ne!(
+        actual[0].1, actual[1].1,
+        "distinct nested sessions collided"
+    );
     assert_eq!(actual, expected);
     let scoped = scoped_context(&ctx, &inventory[0]);
     assert_eq!(
