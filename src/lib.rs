@@ -1897,6 +1897,9 @@ pub enum MirrorCommand {
 /// Read-only swarm operations commands.
 #[derive(Subcommand, Debug, Clone)]
 pub enum SwarmCommand {
+    /// Internal metadata-only proof observer.
+    #[command(hide = true)]
+    ObserveEvidence,
     /// Internal passive observer, isolated under the parent provider deadline.
     #[command(hide = true)]
     ObserveCass {
@@ -6942,6 +6945,13 @@ pub fn try_run_with_parsed_fast(parsed: ParsedCli) -> Result<CliResult<()>, Box<
         heuristic_note,
     } = parsed;
 
+    if matches!(
+        cli.command.as_ref(),
+        Some(Commands::Swarm(SwarmCommand::ObserveEvidence))
+    ) {
+        return Ok(run_passive_proof_observer());
+    }
+
     // This observer must return before runtime/logging/trace initialization.
     // Even an explicitly supplied trace path must not turn inspection into a write.
     if let Some(Commands::Swarm(SwarmCommand::ObserveCass { data_dir, db_path })) =
@@ -10698,6 +10708,7 @@ fn run_lessons_view(
 
 fn run_swarm_command(cmd: SwarmCommand, cli: &Cli) -> CliResult<()> {
     match cmd {
+        SwarmCommand::ObserveEvidence => run_passive_proof_observer(),
         SwarmCommand::ObserveCass { data_dir, db_path } => output_structured_value(
             crate::swarm_status::passive_cass_observation(&data_dir, &db_path),
             RobotFormat::Compact,
@@ -10897,6 +10908,16 @@ fn run_swarm_command(cmd: SwarmCommand, cli: &Cli) -> CliResult<()> {
             &fixture_id,
         ),
     }
+}
+
+fn run_passive_proof_observer() -> CliResult<()> {
+    let result = std::env::current_dir()
+        .map_err(|_| "repository unavailable")
+        .and_then(|repo| crate::swarm_status::passive_proof_observation(&repo));
+    let payload = result.unwrap_or_else(
+        |error| serde_json::json!({"schema_version": "cass-proof-metadata-v1", "error": error}),
+    );
+    output_structured_value(payload, RobotFormat::Compact)
 }
 
 fn run_swarm_status(
@@ -11976,6 +11997,8 @@ fn render_swarm_status_live(cli: &Cli) -> serde_json::Value {
     // Fleet counts are observations, not local process coverage or admission.
     // Mail's bounded resource page has no complete-inventory attestation.
     payload["summary"]["active_reservation_count"] = serde_json::Value::Null;
+    // A bounded manifest is an observation, not a complete proof-gap audit.
+    payload["summary"]["proof_gap_count"] = serde_json::Value::Null;
     payload["summary"]["build_pressure"] = serde_json::Value::Null;
     payload["build_pressure"] = serde_json::json!({
         "status": "unknown", "active_rch_jobs": null, "active_cargo_jobs": null,
@@ -12006,6 +12029,8 @@ fn render_swarm_status_live(cli: &Cli) -> serde_json::Value {
             "repository": observed.get("repository"),
             "repository_id": observed.get("repository_id"),
             "archive_id": observed.get("archive_id"),
+            "manifest_digest": observed.get("manifest_digest"),
+            "rejected_records": observed.get("rejected_records"),
             "head": observed.get("head"),
             "version": observed.get("version"),
             "source_kind": observed.get("source_kind"),

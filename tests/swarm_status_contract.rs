@@ -29,6 +29,61 @@ const GOLDEN_REVIEW_COMMAND_SHAPE: &str = "git diff -- tests/fixtures/swarm_stat
 const STRESS_SAMPLE_COUNT: usize = 5;
 
 #[test]
+fn live_swarm_reads_proof_metadata_without_following_artifact_paths() {
+    let root = TempDir::new().unwrap();
+    let proofs = root.path().join(".cass/proofs");
+    fs::create_dir_all(&proofs).unwrap();
+    let manifest = proofs.join("proof-manifest.jsonl");
+    let content = format!(
+        "{}\n{{bad\n",
+        json!({
+            "label":"selected test", "status":"pass", "command":"PRIVATE_COMMAND",
+            "path":"/private/never-read.json"
+        })
+    );
+    fs::write(&manifest, &content).unwrap();
+    let before = fs::metadata(&manifest).unwrap().modified().unwrap();
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .current_dir(root.path())
+        .env("HOME", root.path().join("home"))
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("XDG_DATA_HOME", root.path().join("data"))
+        .env("CASS_DATA_DIR", root.path().join("archive"))
+        .env_remove("CASS_TRACE_FILE")
+        .env_remove("CASS_SWARM_AGENT_MAIL_URL")
+        .env_remove("CASS_SWARM_AGENT_MAIL_TOKEN")
+        .args(["swarm", "status", "--json"])
+        .timeout(Duration::from_secs(40))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["evidence"]["recent_proofs"][0]["reported_status"],
+        "pass"
+    );
+    assert_eq!(
+        value["evidence"]["recent_proofs"][0]["status"],
+        "unverified"
+    );
+    assert!(value["summary"]["proof_gap_count"].is_null());
+    assert_eq!(
+        value["_meta"]["source_observations"]["evidence"]["rejected_records"],
+        1
+    );
+    let rendered = String::from_utf8(output.stdout).unwrap();
+    assert!(!rendered.contains("PRIVATE_COMMAND"));
+    assert!(!rendered.contains("/private/"));
+    assert_eq!(fs::read_to_string(&manifest).unwrap(), content);
+    assert_eq!(fs::metadata(&manifest).unwrap().modified().unwrap(), before);
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+}
+
+#[test]
 fn live_swarm_status_reports_unknown_sources_without_zero_work_claims() {
     let root = TempDir::new().expect("empty working directory");
     let output = Command::new(assert_cmd::cargo::cargo_bin!("cass"))

@@ -28,10 +28,35 @@ pub fn collect_live_swarm_sources(
     // entire budget. Both CASS surfaces share one strictly passive child read.
     let cass = cass_paths
         .map(|(data_dir, db_path)| collect_passive_cass(repo, data_dir, db_path, started));
+    let evidence = run_swarm_observer(repo, "observe-evidence", &[], started).and_then(|payload| {
+        if payload["schema_version"] != "cass-proof-metadata-v1" {
+            return Err("unsupported proof observer schema".to_string());
+        }
+        if let Some(error) = payload["error"].as_str() {
+            return Err(error.to_string());
+        }
+        Ok(payload)
+    });
     let snapshots = REQUIRED_SWARM_SOURCE_PROVIDERS
         .iter()
         .copied()
         .map(|name| {
+            if name == SwarmProviderName::Evidence {
+                return match &evidence {
+                    Ok(payload) => SwarmSourceSnapshot::partial(
+                        name,
+                        "live:evidence",
+                        "Reported proof metadata only; artifacts, current revision coverage, and completeness are unverified.",
+                        payload.clone(),
+                    ),
+                    Err(error) => SwarmSourceSnapshot::unavailable(
+                        name,
+                        "live:evidence",
+                        "live-provider-read-failed",
+                        error.clone(),
+                    ),
+                };
+            }
             if matches!(name, SwarmProviderName::CassHealth | SwarmProviderName::CassStatus)
                 && let Some(result) = &cass
             {
@@ -125,17 +150,37 @@ fn collect_passive_cass(
     db_path: &Path,
     started: Instant,
 ) -> Result<Value, String> {
+    let payload = run_swarm_observer(
+        repo,
+        "observe-cass",
+        &[("--data-dir", data_dir), ("--db-path", db_path)],
+        started,
+    )?;
+    if payload["schema_version"] != "cass-passive-v1"
+        || payload["archive_id"] != cass_archive_id(data_dir, db_path)
+    {
+        return Err("CASS observer identity mismatch".to_string());
+    }
+    Ok(payload)
+}
+
+fn run_swarm_observer(
+    repo: &Path,
+    subcommand: &str,
+    paths: &[(&str, &Path)],
+    started: Instant,
+) -> Result<Value, String> {
     let remaining = Duration::from_secs(15)
         .checked_sub(started.elapsed())
         .filter(|remaining| !remaining.is_zero())
         .ok_or("live provider deadline exceeded")?;
     let executable = std::env::current_exe().map_err(|_| "CASS executable unavailable")?;
     let mut command = Command::new(executable);
+    command.args(["swarm", subcommand]);
+    for (flag, path) in paths {
+        command.arg(flag).arg(path);
+    }
     command
-        .args(["swarm", "observe-cass", "--data-dir"])
-        .arg(data_dir)
-        .arg("--db-path")
-        .arg(db_path)
         .current_dir(repo)
         .env_remove("CASS_TRACE_FILE")
         .stdin(Stdio::null())
@@ -153,14 +198,131 @@ fn collect_passive_cass(
     if !output.status.success() {
         return Err("CASS observer failed".to_string());
     }
-    let payload: Value = serde_json::from_slice(&output.stdout)
-        .map_err(|_| "CASS observer returned invalid JSON")?;
-    if payload["schema_version"] != "cass-passive-v1"
-        || payload["archive_id"] != cass_archive_id(data_dir, db_path)
-    {
-        return Err("CASS observer identity mismatch".to_string());
+    serde_json::from_slice(&output.stdout)
+        .map_err(|_| "CASS observer returned invalid JSON".to_string())
+}
+
+const MAX_PROOF_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_PROOF_MANIFEST_ROWS: usize = 128;
+
+fn same_proof_metadata(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    if left.len() != right.len() || left.modified().ok() != right.modified().ok() {
+        return false;
     }
-    Ok(payload)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if (left.dev(), left.ino(), left.ctime(), left.ctime_nsec())
+            != (right.dev(), right.ino(), right.ctime(), right.ctime_nsec())
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Read only the canonical manifest. Never follow artifact/log references or
+/// promote a producer's reported pass into proof for the current revision.
+pub(crate) fn passive_proof_observation(repo: &Path) -> Result<Value, &'static str> {
+    let mut directories = Vec::new();
+    for path in [repo.join(".cass"), repo.join(".cass/proofs")] {
+        let metadata = fs::symlink_metadata(&path).map_err(|_| "proof directory unavailable")?;
+        if !metadata.is_dir() {
+            return Err("proof directory is not a regular directory");
+        }
+        directories.push((path, metadata));
+    }
+    let path = repo.join(".cass/proofs/proof-manifest.jsonl");
+    let before = fs::symlink_metadata(&path).map_err(|_| "proof manifest unavailable")?;
+    if !before.is_file() || before.len() > MAX_PROOF_MANIFEST_BYTES {
+        return Err("proof manifest is not a bounded regular file");
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(&path)
+        .map_err(|_| "proof manifest open failed")?;
+    let opened = file.metadata().map_err(|_| "proof manifest stat failed")?;
+    if !opened.is_file() || !same_proof_metadata(&before, &opened) {
+        return Err("proof manifest changed during open");
+    }
+    let mut bytes = Vec::new();
+    (&file)
+        .take(MAX_PROOF_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "proof manifest read failed")?;
+    if bytes.len() as u64 > MAX_PROOF_MANIFEST_BYTES {
+        return Err("proof manifest exceeds byte limit");
+    }
+    let after = file.metadata().map_err(|_| "proof manifest stat failed")?;
+    let named = fs::symlink_metadata(&path).map_err(|_| "proof manifest disappeared")?;
+    if !same_proof_metadata(&opened, &after) || !same_proof_metadata(&opened, &named) {
+        return Err("proof manifest changed during read");
+    }
+    for (directory, metadata) in directories {
+        let after = fs::symlink_metadata(directory).map_err(|_| "proof directory disappeared")?;
+        if !after.is_dir() || !same_proof_metadata(&metadata, &after) {
+            return Err("proof directory changed during read");
+        }
+    }
+    project_proof_manifest(&bytes)
+}
+
+fn project_proof_manifest(bytes: &[u8]) -> Result<Value, &'static str> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "proof manifest is not UTF-8")?;
+    let mut proofs = Vec::new();
+    let mut rejected = 0;
+    for (index, line) in text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .enumerate()
+    {
+        if index >= MAX_PROOF_MANIFEST_ROWS {
+            return Err("proof manifest exceeds row limit");
+        }
+        let record =
+            if let Ok(proof) = serde_json::from_str::<crate::proof_artifact::EmittedProof>(line) {
+                Some((proof.label, serde_json::json!(proof.status), None))
+            } else if let Ok(proof) =
+                serde_json::from_str::<crate::search::proof_log::ProofLogRecord>(line)
+            {
+                Some((
+                    proof.scenario_id,
+                    serde_json::json!(proof.outcome),
+                    Some(proof.finished_at_ms),
+                ))
+            } else {
+                None
+            };
+        let Some((label, reported_status, finished_at_ms)) = record else {
+            rejected += 1;
+            continue;
+        };
+        proofs.push(serde_json::json!({
+            "kind": "manifest-record",
+            "proof_id": format!("manifest-record-{}", index + 1),
+            "label": redact_swarm_text(&label).chars().take(256).collect::<String>(),
+            "status": "unverified",
+            "reported_status": reported_status,
+            "finished_at_ms": finished_at_ms,
+            "freshness_status": "unverified",
+            "redaction_status": "metadata_only",
+        }));
+    }
+    Ok(serde_json::json!({
+        "schema_version": "cass-proof-metadata-v1",
+        "source_kind": "proof-manifest",
+        "manifest_digest": blake3::hash(bytes).to_hex().to_string(),
+        "observed_at_ms": SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis(),
+        "recent_proofs": proofs,
+        "rejected_records": rejected,
+        "redaction_applied": true,
+    }))
 }
 
 struct LiveSwarmSourceAdapter {
@@ -1238,6 +1400,75 @@ mod tests {
 
     fn repo_path(relative: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
+    }
+
+    #[test]
+    fn proof_manifest_keeps_reported_results_unverified_and_omits_private_fields() {
+        let lightweight = json!({"label":"selected test", "status":"pass",
+            "path":"/private/never-read.json", "command":"PRIVATE_COMMAND"});
+        let structured = json!({
+            "run_id":"run", "scenario_id":"timeout", "command_id":"test", "phase":"test",
+            "started_at_ms":1, "finished_at_ms":2, "elapsed_ms":1,
+            "meta":{"cass_binary_path":"PRIVATE_BINARY", "cass_version":"0.9.0",
+                "cargo_profile":"test", "target_dir":"PRIVATE_TARGET", "data_dir":"PRIVATE_DATA",
+                "config_dir":"PRIVATE_CONFIG"},
+            "execution":{"argv":["PRIVATE_ARG"], "timeout_ms":1, "timed_out":true, "retry_count":0},
+            "artifacts":{"stdout_path":"PRIVATE_STDOUT", "stderr_path":"PRIVATE_STDERR",
+                "robot_contract_ok":false, "ansi_free_stdout_ok":true},
+            "outcome":"timed_out_partial"
+        });
+        let bytes = format!("{lightweight}\n{{bad\n{structured}\n");
+        let projected = project_proof_manifest(bytes.as_bytes()).unwrap();
+        assert_eq!(projected["rejected_records"], 1);
+        assert_eq!(projected["recent_proofs"][0]["reported_status"], "pass");
+        assert_eq!(
+            projected["recent_proofs"][1]["reported_status"],
+            "timed_out_partial"
+        );
+        for proof in projected["recent_proofs"].as_array().unwrap() {
+            assert_eq!(proof["status"], "unverified");
+            assert_eq!(proof["freshness_status"], "unverified");
+        }
+        let serialized = projected.to_string();
+        assert!(!serialized.contains("PRIVATE_"));
+        assert!(!serialized.contains("/private/"));
+    }
+
+    #[test]
+    fn proof_manifest_enforces_row_byte_and_file_type_limits() {
+        let row =
+            "{\"label\":\"test\",\"status\":\"pass\",\"path\":\"absent\",\"command\":\"test\"}\n";
+        assert!(project_proof_manifest(row.repeat(MAX_PROOF_MANIFEST_ROWS).as_bytes()).is_ok());
+        assert!(
+            project_proof_manifest(row.repeat(MAX_PROOF_MANIFEST_ROWS + 1).as_bytes()).is_err()
+        );
+        assert!(project_proof_manifest(&[0xff]).is_err());
+        assert_eq!(
+            project_proof_manifest(b"\n").unwrap()["recent_proofs"],
+            json!([])
+        );
+        let root = tempfile::tempdir().unwrap();
+        assert!(passive_proof_observation(root.path()).is_err());
+        let proofs = root.path().join(".cass/proofs");
+        fs::create_dir_all(&proofs).unwrap();
+        let path = proofs.join("proof-manifest.jsonl");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(MAX_PROOF_MANIFEST_BYTES + 1).unwrap();
+        assert!(passive_proof_observation(root.path()).is_err());
+        assert_eq!(file.metadata().unwrap().len(), MAX_PROOF_MANIFEST_BYTES + 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn proof_manifest_rejects_symlinked_control_files() {
+        let root = tempfile::tempdir().unwrap();
+        let proofs = root.path().join(".cass/proofs");
+        fs::create_dir_all(&proofs).unwrap();
+        let outside = root.path().join("outside.jsonl");
+        fs::write(&outside, b"private sentinel").unwrap();
+        std::os::unix::fs::symlink(&outside, proofs.join("proof-manifest.jsonl")).unwrap();
+        assert!(passive_proof_observation(root.path()).is_err());
+        assert_eq!(fs::read(outside).unwrap(), b"private sentinel");
     }
 
     #[test]
