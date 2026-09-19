@@ -1,3 +1,5 @@
+mod source_budget;
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read};
@@ -43,11 +45,9 @@ impl Connector for CodexConnector {
         hooks: &mut franken_agent_detection::connectors::SourceScanHooks<'_>,
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
-        self.inner
-            .scan_with_source_boundaries(ctx, hooks, &mut |mut conversation| {
-                augment_modern_codex_messages(&mut conversation, ctx.progress_tick.as_deref())?;
-                on_conversation(conversation)
-            })
+        source_budget::scan(&self.inner, ctx, hooks, on_conversation, |conversation| {
+            augment_modern_codex_messages(conversation, ctx.progress_tick.as_deref())
+        })
     }
 
     fn detect(&self) -> DetectionResult {
@@ -55,10 +55,13 @@ impl Connector for CodexConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-        let mut conversations = self.inner.scan(ctx)?;
-        for conversation in &mut conversations {
-            augment_modern_codex_messages(conversation, ctx.progress_tick.as_deref())?;
-        }
+        let mut conversations = Vec::new();
+        self.scan_with_callback(ctx, &mut |conversation| {
+            conversations.push(conversation);
+            Ok(())
+        })?;
+        // This legacy all-or-error API must not label a partial vector complete.
+        // Streaming/batch collectors retain delivered conversations separately.
         Ok(conversations)
     }
 
@@ -75,10 +78,11 @@ impl Connector for CodexConnector {
         ctx: &ScanContext,
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
-        self.inner.scan_with_callback(ctx, &mut |mut conversation| {
-            augment_modern_codex_messages(&mut conversation, ctx.progress_tick.as_deref())?;
-            on_conversation(conversation)
-        })
+        self.scan_with_source_boundaries(
+            ctx,
+            &mut franken_agent_detection::connectors::SourceScanHooks::default(),
+            on_conversation,
+        )
     }
 }
 
@@ -113,20 +117,25 @@ fn augment_modern_codex_messages(
         return Ok(());
     }
 
-    let file = File::open(&conversation.source_path)
-        .with_context(|| format!("open Codex enrichment source {}", conversation.source_path.display()))?;
+    let file = File::open(&conversation.source_path).with_context(|| {
+        format!(
+            "open Codex enrichment source {}",
+            conversation.source_path.display()
+        )
+    })?;
     let before = file.metadata().context("inspect Codex enrichment source")?;
     if !before.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "Codex enrichment source is not a regular file",
-        ).into());
+        )
+        .into());
     }
     if before.len() > MAX_AUGMENT_ROLLOUT_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Codex enrichment source exceeds the 100 MiB read budget",
-        ).into());
+        return Err(source_budget::EnrichmentBudgetExceeded {
+            observed_bytes: before.len(),
+        }
+        .into());
     }
 
     // The first pass belongs to FAD; this pass owns only the opened prefix.
@@ -138,23 +147,30 @@ fn augment_modern_codex_messages(
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "Codex enrichment source was truncated while reading; retry this source",
-        ).into());
+        )
+        .into());
     }
-    let after = file.metadata().context("recheck opened Codex enrichment source")?;
+    let after = file
+        .metadata()
+        .context("recheck opened Codex enrichment source")?;
     let named = std::fs::metadata(&conversation.source_path)
         .context("recheck Codex enrichment source path")?;
     if !same_rollout_snapshot(&before, &after)? || !same_rollout_snapshot(&before, &named)? {
         return Err(io::Error::new(
             io::ErrorKind::Interrupted,
             "Codex enrichment source changed while reading; retry this source",
-        ).into());
+        )
+        .into());
     }
     Ok(())
 }
 
 /// Detect observable rewrites/replacements, not malicious timestamp-preserving
 /// edits. On Unix, inode/device checks also catch same-size path replacement.
-fn same_rollout_snapshot(before: &std::fs::Metadata, after: &std::fs::Metadata) -> io::Result<bool> {
+fn same_rollout_snapshot(
+    before: &std::fs::Metadata,
+    after: &std::fs::Metadata,
+) -> io::Result<bool> {
     if !after.is_file() || before.len() != after.len() || before.modified()? != after.modified()? {
         return Ok(false);
     }
@@ -205,7 +221,8 @@ fn augment_modern_codex_reader(
         tick_augment_progress(progress_tick, line_no);
         line.clear();
         // Do not turn I/O errors or invalid UTF-8 into successful EOF.
-        let count = reader.read_line(&mut line)
+        let count = reader
+            .read_line(&mut line)
             .with_context(|| format!("read Codex enrichment line {}", line_no + 1))?;
         if count == 0 {
             break;
@@ -228,8 +245,11 @@ fn augment_modern_codex_reader(
                 // historical data. Refuse completion so it can be read again.
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    format!("incomplete Codex enrichment record at line {line_no}; retry this source"),
-                ).into());
+                    format!(
+                        "incomplete Codex enrichment record at line {line_no}; retry this source"
+                    ),
+                )
+                .into());
             }
             Err(parse_err) => {
                 // Per gauntlet finding CONF-cass-003: surface malformed JSONL lines
@@ -640,8 +660,14 @@ fn compatible_tool_call_identity(
     existing: &NormalizedMessage,
     candidate: &NormalizedMessage,
 ) -> bool {
-    let existing_has_id = existing.invocations.iter().any(|call| call.call_id.is_some());
-    let candidate_has_id = candidate.invocations.iter().any(|call| call.call_id.is_some());
+    let existing_has_id = existing
+        .invocations
+        .iter()
+        .any(|call| call.call_id.is_some());
+    let candidate_has_id = candidate
+        .invocations
+        .iter()
+        .any(|call| call.call_id.is_some());
     !existing_has_id
         || !candidate_has_id
         || candidate.invocations.iter().any(|candidate_call| {
@@ -916,7 +942,10 @@ mod tests {
             assert_eq!(parsed.invocations.len(), 1);
             assert_eq!(parsed.invocations[0].call_id.as_deref(), Some("patch-1"));
             assert_eq!(parsed.invocations[0].name, "apply_patch");
-            assert_eq!(parsed.invocations[0].arguments, Some(Value::String(input.to_string())));
+            assert_eq!(
+                parsed.invocations[0].arguments,
+                Some(Value::String(input.to_string()))
+            );
             let expected = if input.is_empty() {
                 "[Tool: apply_patch]".to_string()
             } else {
@@ -928,7 +957,11 @@ mod tests {
 
     #[test]
     fn malformed_custom_input_is_not_invented_or_read_from_arguments() {
-        for input in [Value::Null, serde_json::json!(123), serde_json::json!({"cmd": "x"})] {
+        for input in [
+            Value::Null,
+            serde_json::json!(123),
+            serde_json::json!({"cmd": "x"}),
+        ] {
             let raw = response(serde_json::json!({
                 "type": "custom_tool_call", "name": "apply_patch",
                 "call_id": "patch-1", "input": input, "arguments": "wrong field"
@@ -940,8 +973,14 @@ mod tests {
             "arguments": "{\"cmd\":\"git status\"}"
         }));
         let parsed = modern_codex_message(&function).expect("function call");
-        assert_eq!(parsed.invocations[0].arguments, Some(serde_json::json!({"cmd": "git status"})));
-        assert_eq!(parsed.content, "[Tool: exec_command]\n{\"cmd\":\"git status\"}");
+        assert_eq!(
+            parsed.invocations[0].arguments,
+            Some(serde_json::json!({"cmd": "git status"}))
+        );
+        assert_eq!(
+            parsed.content,
+            "[Tool: exec_command]\n{\"cmd\":\"git status\"}"
+        );
     }
 
     #[test]
@@ -990,14 +1029,31 @@ mod tests {
             canonical.extra = serde_json::json!({"compacted": true, "slot": idx});
             conversation.messages.push(canonical);
         }
-        let identity = conversation.messages.iter().map(|message| (
-            message.idx, message.created_at, message.extra.clone(), message.invocations.clone()
-        )).collect::<Vec<_>>();
+        let identity = conversation
+            .messages
+            .iter()
+            .map(|message| {
+                (
+                    message.idx,
+                    message.created_at,
+                    message.extra.clone(),
+                    message.invocations.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
         augment_modern_codex_messages(&mut conversation, None)?;
         assert_eq!(conversation.messages.len(), 2);
         for (message, expected) in conversation.messages.iter().zip(identity) {
             assert_eq!(message.content, "[Tool: apply_patch]\nsame patch bytes");
-            assert_eq!((message.idx, message.created_at, message.extra.clone(), message.invocations.clone()), expected);
+            assert_eq!(
+                (
+                    message.idx,
+                    message.created_at,
+                    message.extra.clone(),
+                    message.invocations.clone()
+                ),
+                expected
+            );
         }
         Ok(())
     }
@@ -1012,20 +1068,25 @@ mod tests {
         canonical.extra = serde_json::json!({"compacted": true});
         canonical.invocations[0].arguments = Some(serde_json::json!(123));
         assert!(merge_modern_codex_tool_call(&mut canonical, &candidate));
-        assert_eq!(canonical.invocations[0].arguments, Some(Value::String(" 123 \n".to_string())));
+        assert_eq!(
+            canonical.invocations[0].arguments,
+            Some(Value::String(" 123 \n".to_string()))
+        );
         assert_eq!(canonical.idx, 12);
         assert_eq!(canonical.extra, serde_json::json!({"compacted": true}));
         assert_eq!(canonical.created_at, candidate.created_at);
         assert!(!merge_modern_codex_tool_call(&mut canonical, &candidate));
     }
 
-
     #[test]
     fn enrichment_missing_source_fails_instead_of_certifying_incomplete_history() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let mut conversation = conversation_at(&dir.path().join("rollout-missing.jsonl"));
         let error = augment_modern_codex_messages(&mut conversation, None).unwrap_err();
-        assert_eq!(error.downcast_ref::<io::Error>().map(io::Error::kind), Some(io::ErrorKind::NotFound));
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::NotFound)
+        );
         assert!(conversation.messages.is_empty());
         Ok(())
     }
@@ -1036,7 +1097,10 @@ mod tests {
         let mut conversation = conversation_at(&dir.path().join("rollout-utf8.jsonl"));
         let mut reader = io::Cursor::new(b"\xff\n");
         let error = augment_modern_codex_reader(&mut conversation, None, &mut reader).unwrap_err();
-        assert_eq!(error.downcast_ref::<io::Error>().map(io::Error::kind), Some(io::ErrorKind::InvalidData));
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::InvalidData)
+        );
         Ok(())
     }
 
@@ -1055,10 +1119,20 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let raw = custom_call("patch-1", "read_failure_prefix");
         let mut conversation = conversation_at(&dir.path().join("rollout-fault.jsonl"));
-        let mut reader = BufReader::new(FailingRead(io::Cursor::new(format!("{raw}\n").into_bytes())));
+        let mut reader = BufReader::new(FailingRead(io::Cursor::new(
+            format!("{raw}\n").into_bytes(),
+        )));
         let error = augment_modern_codex_reader(&mut conversation, None, &mut reader).unwrap_err();
-        assert!(error.chain().any(|cause| cause.to_string().contains("injected source read failure")));
-        assert_eq!(conversation.messages.len(), 1, "test actually consumed a prefix before the fault");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("injected source read failure"))
+        );
+        assert_eq!(
+            conversation.messages.len(),
+            1,
+            "test actually consumed a prefix before the fault"
+        );
         Ok(())
     }
 
@@ -1074,7 +1148,11 @@ mod tests {
         augment_modern_codex_messages(&mut conversation, None)?;
         assert_eq!(conversation.messages.len(), 2);
         assert!(conversation.messages[0].content.contains("first_patch"));
-        assert!(conversation.messages[1].content.contains("last_patch_without_newline"));
+        assert!(
+            conversation.messages[1]
+                .content
+                .contains("last_patch_without_newline")
+        );
         assert_eq!(std::fs::read_to_string(&path)?, bytes);
         Ok(())
     }
@@ -1090,9 +1168,12 @@ mod tests {
         std::fs::write(&path, format!("{first}\n{}", &second[..split]))?;
         let mut partial = conversation_at(&path);
         let error = augment_modern_codex_messages(&mut partial, None).unwrap_err();
-        assert_eq!(error.downcast_ref::<io::Error>().map(io::Error::kind), Some(io::ErrorKind::UnexpectedEof));
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::UnexpectedEof)
+        );
         let mut writer = std::fs::OpenOptions::new().append(true).open(&path)?;
-        writer.write_all(second[split..].as_bytes())?;
+        writer.write_all(&second.as_bytes()[split..])?;
         writer.flush()?;
         let before_retry = std::fs::read(&path)?;
         let mut retry = conversation_at(&path);
@@ -1113,14 +1194,21 @@ mod tests {
         let ticks = AtomicUsize::new(0);
         let append = || {
             if ticks.fetch_add(1, Ordering::Relaxed) == 0 {
-                let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap();
                 writeln!(file, "{}", custom_call("patch-2", "later_append")).unwrap();
             }
         };
         let mut conversation = conversation_at(&path);
         let error = augment_modern_codex_messages(&mut conversation, Some(&append)).unwrap_err();
         assert!(error.to_string().contains("changed while reading"));
-        assert_eq!(conversation.messages.len(), 1, "read only the opened prefix");
+        assert_eq!(
+            conversation.messages.len(),
+            1,
+            "read only the opened prefix"
+        );
         let mut retry = conversation_at(&path);
         augment_modern_codex_messages(&mut retry, None)?;
         assert_eq!(retry.messages.len(), 2);
@@ -1134,13 +1222,18 @@ mod tests {
         let file = File::create(&path)?;
         file.set_len(MAX_AUGMENT_ROLLOUT_BYTES + 1)?;
         let ticks = AtomicUsize::new(0);
-        let tick = || { ticks.fetch_add(1, Ordering::Relaxed); };
+        let tick = || {
+            ticks.fetch_add(1, Ordering::Relaxed);
+        };
         let mut conversation = conversation_at(&path);
         let error = augment_modern_codex_messages(&mut conversation, Some(&tick)).unwrap_err();
         assert!(error.to_string().contains("100 MiB read budget"));
         assert_eq!(ticks.load(Ordering::Relaxed), 0);
         assert!(conversation.messages.is_empty());
-        assert_eq!(std::fs::metadata(&path)?.len(), MAX_AUGMENT_ROLLOUT_BYTES + 1);
+        assert_eq!(
+            std::fs::metadata(&path)?.len(),
+            MAX_AUGMENT_ROLLOUT_BYTES + 1
+        );
         Ok(())
     }
 
@@ -1153,31 +1246,61 @@ mod tests {
         let first = custom_call("patch-1", "canonical_prefix");
         let second = custom_call("patch-2", "retried_tail").to_string();
         std::fs::write(&path, format!("{first}\n{}", &second[..second.len() - 1]))?;
-        let ctx = ScanContext::with_roots(dir.path().join("cass-data"), vec![ScanRoot::local(path.clone())], None);
+        let ctx = ScanContext::with_roots(
+            dir.path().join("cass-data"),
+            vec![ScanRoot::local(path.clone())],
+            None,
+        );
         let connector = CodexConnector::new();
-        assert!(connector.scan(&ctx).is_err(), "batch scan must not return a partial success");
+        assert!(
+            connector.scan(&ctx).is_err(),
+            "batch scan must not return a partial success"
+        );
         let mut emitted = Vec::new();
-        assert!(connector.scan_with_callback(&ctx, &mut |conversation| {
-            emitted.push(conversation);
-            Ok(())
-        }).is_err());
+        assert!(
+            connector
+                .scan_with_callback(&ctx, &mut |conversation| {
+                    emitted.push(conversation);
+                    Ok(())
+                })
+                .is_err()
+        );
         assert!(emitted.is_empty());
         let mut completions = 0;
         {
-            let mut complete = |_: &SourceCompletion| { completions += 1; Ok(()) };
-            let mut hooks = SourceScanHooks { should_scan_source: None, on_source_complete: Some(&mut complete) };
-            assert!(connector.scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {
-                emitted.push(conversation);
+            let mut complete = |_: &SourceCompletion| {
+                completions += 1;
                 Ok(())
-            }).is_err());
+            };
+            let mut hooks = SourceScanHooks {
+                should_scan_source: None,
+                on_source_complete: Some(&mut complete),
+            };
+            assert!(
+                connector
+                    .scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {
+                        emitted.push(conversation);
+                        Ok(())
+                    })
+                    .is_err()
+            );
         }
         assert!(emitted.is_empty());
-        assert_eq!(completions, 0, "failed enrichment must not certify source completion");
+        assert_eq!(
+            completions, 0,
+            "failed enrichment must not certify source completion"
+        );
         std::fs::write(&path, format!("{first}\n{second}\n"))?;
         let before = std::fs::read(&path)?;
         {
-            let mut complete = |_: &SourceCompletion| { completions += 1; Ok(()) };
-            let mut hooks = SourceScanHooks { should_scan_source: None, on_source_complete: Some(&mut complete) };
+            let mut complete = |_: &SourceCompletion| {
+                completions += 1;
+                Ok(())
+            };
+            let mut hooks = SourceScanHooks {
+                should_scan_source: None,
+                on_source_complete: Some(&mut complete),
+            };
             connector.scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {
                 emitted.push(conversation);
                 Ok(())
