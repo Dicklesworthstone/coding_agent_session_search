@@ -251,6 +251,11 @@ fn live_command(
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("BEADS_DIR", repo.join(".beads"));
+    if program == "rch" {
+        // Even `rch status` otherwise writes its parsed configuration cache.
+        // Inspection must not create or refresh files in the caller's home.
+        command.env("RCH_DISABLE_CONFIG_CACHE", "1");
+    }
     // Caller-specific overrides must not redirect a project snapshot elsewhere.
     for key in [
         "GIT_DIR",

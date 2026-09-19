@@ -201,6 +201,9 @@ fn live_swarm_observes_explicit_database_without_opening_it() {
         .env("XDG_DATA_HOME", root.path().join("data"))
         .env("CASS_DATA_DIR", root.path().join("absent-default"))
         .env("CASS_AUTO_REFRESH", "0")
+        // The observer must override this inherited preference, rather than
+        // relying on the operator to disable RCH's status-time cache writes.
+        .env("RCH_DISABLE_CONFIG_CACHE", "0")
         .env_remove("CASS_TRACE_FILE")
         .env_remove("CASS_SWARM_AGENT_MAIL_URL")
         .env_remove("CASS_SWARM_AGENT_MAIL_TOKEN")
@@ -224,7 +227,11 @@ fn live_swarm_observes_explicit_database_without_opening_it() {
     assert_eq!(value["cass"]["active_rebuild"], false);
     assert_eq!(fs::read(&db).unwrap(), b"unprobed archive sentinel");
     assert_eq!(fs::metadata(&db).unwrap().modified().unwrap(), modified);
-    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    let entries: Vec<_> = fs::read_dir(root.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(entries, [std::ffi::OsString::from("explicit.db")]);
 }
 
 #[test]
