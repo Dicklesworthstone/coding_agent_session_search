@@ -219,7 +219,7 @@ fn gh458_rebuild_contract_stays_strict_without_erasing_retained_fsvi() -> Result
 #[test]
 fn gh458_old_passage_contract_rejects_append_without_relabeling_vectors() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let indexer = SemanticIndexer::new("hash", dir.path())?;
+    let indexer = SemanticIndexer::new("hash", Some(dir.path()))?;
     let path = write_index(
         dir.path(),
         "fnv1a-384",
