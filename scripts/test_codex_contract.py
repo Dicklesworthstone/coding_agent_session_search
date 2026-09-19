@@ -2,17 +2,21 @@
 """Run the real CASS Codex module and its tests without the storage/TUI build.
 
     python3 scripts/test_codex_contract.py
+    python3 scripts/test_codex_contract.py --fad-checkout ../franken_agent_detection
 
 The temporary crate stages byte-identical production Rust files with their
 normal module layout; there is no maintained fork or mock connector.
-Dependency versions and the initial lockfile come from CASS itself. Only
-FAD's unrelated SQLite/crypto features are omitted. The integration tests
-also remain normal CASS cargo test targets.
+By default dependency versions and the initial lockfile come from CASS.
+--fad-checkout tests an upstream change before publication, verifies Cargo
+selected that checkout, and changes only the temporary crate's dependency.
+Only FAD's unrelated SQLite/crypto features are omitted. The integration
+tests also remain normal CASS cargo test targets.
 Requires Python 3.11+ and the repository's Rust toolchain.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 from pathlib import Path
@@ -23,6 +27,21 @@ import tomllib
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--fad-checkout", type=Path, help="Test this local FAD checkout without changing CASS's published dependency pin")
+    args = parser.parse_args()
+    fad_checkout = None
+    fad_version = ""
+    if args.fad_checkout is not None:
+        try:
+            fad_checkout = args.fad_checkout.resolve(strict=True)
+            package = tomllib.loads((fad_checkout / "Cargo.toml").read_text(encoding="utf-8"))["package"]
+            if package.get("name") != "franken-agent-detection" or not isinstance(package.get("version"), str):
+                raise ValueError("expected the franken-agent-detection package with an explicit version")
+            fad_version = package["version"]
+        except (OSError, KeyError, ValueError) as error:
+            parser.error(f"invalid --fad-checkout: {error}")
+
     root = Path(__file__).resolve().parents[1]
     manifest = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
     dependencies = manifest["dependencies"]
@@ -46,8 +65,11 @@ def main() -> None:
         spec = dependencies[name]
         version = spec if isinstance(spec, str) else spec["version"]
         if name == "franken-agent-detection":
+            source = f'version = {json.dumps(version)}'
+            if fad_checkout is not None:
+                source = f'version = {json.dumps("=" + fad_version)}, path = {json.dumps(fad_checkout.as_posix(), ensure_ascii=False)}'
             lines.append(
-                f'{name} = {{ version = {json.dumps(version)}, '
+                f'{name} = {{ {source}, '
                 'default-features = false, features = ["connectors"] }'
             )
         elif name == "serde":
@@ -96,6 +118,15 @@ pub mod connectors {
         # The ordinary unit tests must not inherit operator scan exclusions.
         # Integration tests supply each child's own real exclusion value.
         env["CASS_EXCLUDE_PATHS"] = ""
+        if fad_checkout is not None:
+            metadata = json.loads(subprocess.check_output(
+                [cargo, "metadata", "--manifest-path", str(project), "--format-version", "1"],
+                cwd=root, env=env, text=True,
+            ))
+            selected = [package for package in metadata["packages"] if package["name"] == "franken-agent-detection"]
+            if len(selected) != 1 or Path(selected[0]["manifest_path"]).resolve() != fad_checkout / "Cargo.toml":
+                raise RuntimeError("Cargo did not select the requested local FAD checkout")
+            print(f"Verified local FAD {fad_version}: {selected[0]['manifest_path']}", flush=True)
         commands = [
             [cargo, "test", "--manifest-path", str(project), "--all-targets"],
             [cargo, "clippy", "--manifest-path", str(project), "--all-targets", "--", "-D", "warnings"],
