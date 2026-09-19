@@ -177,9 +177,8 @@ fn same_rollout_snapshot(
     before: &std::fs::Metadata,
     after: &std::fs::Metadata,
 ) -> io::Result<bool> {
-    let same = after.is_file()
-        && before.len() == after.len()
-        && before.modified()? == after.modified()?;
+    let same =
+        after.is_file() && before.len() == after.len() && before.modified()? == after.modified()?;
     #[cfg(unix)]
     let same = {
         use std::os::unix::fs::MetadataExt;
