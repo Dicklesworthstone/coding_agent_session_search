@@ -34,13 +34,13 @@ jobs:
           python-version: '3.12'
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Format the new regression before qualification
-        run: rustfmt --edition 2024 tests/connector_openclaw_sqlite.rs
+      - name: Format the new sources before qualification
+        run: rustfmt --edition 2024 src/connectors/openclaw.rs tests/connector_openclaw_sqlite.rs
       - name: Qualify the native feature with production modules and locked engines
         run: python scripts/test_openclaw_contract.py --qualify-feature --candidate-output candidate/Cargo.toml
-      - name: Verify regression formatting
-        run: rustfmt --edition 2024 --check tests/connector_openclaw_sqlite.rs
-      - name: Retain the exact tested manifest and regression
+      - name: Verify source formatting
+        run: rustfmt --edition 2024 --check src/connectors/openclaw.rs tests/connector_openclaw_sqlite.rs
+      - name: Retain the exact tested sources
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
@@ -48,6 +48,7 @@ jobs:
           retention-days: 2
           path: |
             candidate/Cargo.toml
+            src/connectors/openclaw.rs
             tests/connector_openclaw_sqlite.rs
 
   stage:
@@ -67,6 +68,7 @@ jobs:
             const fs = require('fs');
             for (const [input, path] of [
               ['candidate/Cargo.toml', 'Cargo.toml'],
+              ['src/connectors/openclaw.rs', 'src/connectors/openclaw.rs'],
               ['tests/connector_openclaw_sqlite.rs', 'tests/connector_openclaw_sqlite.rs'],
             ]) {
               const content = fs.readFileSync(`validated/${input}`).toString('base64');

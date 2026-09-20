@@ -83,6 +83,7 @@ pub fn shutdown_contract_driver() -> bool { franken_sync::shutdown_driver() }
             if (root / name).is_file():
                 shutil.copyfile(root / name, work / name)
         env = os.environ.copy()
+        env["CARGO_TARGET_DIR"] = str(root / "target/openclaw-contract")
         env["RUST_MIN_STACK"] = "16777216"
         env["CASS_EXCLUDE_PATHS"] = ""
         metadata = json.loads(subprocess.check_output([
@@ -98,8 +99,9 @@ pub fn shutdown_contract_driver() -> bool { franken_sync::shutdown_driver() }
                     raise RuntimeError(f"dependency is not from the CASS lockfile: {key}")
                 print("LOCKED_CONSUMER", key, flush=True)
         for command in [
+            [cargo, "test", "--locked", "--manifest-path", str(project), "--lib", "connectors::openclaw::tests"],
             [cargo, "test", "--locked", "--manifest-path", str(project), "--test", "connector_openclaw_sqlite"],
-            [cargo, "clippy", "--locked", "--manifest-path", str(project), "--test", "connector_openclaw_sqlite", "--", "-D", "warnings"],
+            [cargo, "clippy", "--locked", "--manifest-path", str(project), "--all-targets", "--", "-D", "warnings"],
         ]:
             print("+", " ".join(command), flush=True)
             subprocess.run(command, cwd=root, env=env, check=True)
