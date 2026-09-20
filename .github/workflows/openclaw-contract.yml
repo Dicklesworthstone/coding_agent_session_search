@@ -41,6 +41,9 @@ jobs:
           python-version: '3.12'
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: openclaw-target-v2
+          cache-on-failure: true
       - name: Format the new sources before qualification
         run: rustfmt --edition 2024 src/connectors/openclaw.rs tests/connector_openclaw_sqlite.rs
       - name: Qualify the native feature with production modules and locked engines

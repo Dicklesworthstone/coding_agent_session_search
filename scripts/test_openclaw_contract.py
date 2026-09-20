@@ -46,7 +46,7 @@ def main() -> None:
         if candidate == fad:
             raise SystemExit("unrecognized dependency declaration; not modifying it")
         manifest = manifest.replace(fad, candidate, 1)
-    names = ["anyhow", "dirs", "dotenvy", "asupersync", "frankensqlite", "fsqlite-types", "franken-agent-detection", "serde_json", "tempfile"]
+    names = ["anyhow", "chrono", "dirs", "dotenvy", "asupersync", "frankensqlite", "fsqlite-types", "franken-agent-detection", "serde_json", "tempfile"]
     dependencies = [declaration(manifest, name) for name in names]
     cargo = shutil.which("cargo")
     if cargo is None:
