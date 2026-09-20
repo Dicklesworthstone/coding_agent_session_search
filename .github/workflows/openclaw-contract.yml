@@ -1,0 +1,78 @@
+name: OpenClaw native consumer
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/connectors/openclaw.rs'
+      - 'src/franken_sync.rs'
+      - 'tests/connector_openclaw_sqlite.rs'
+      - 'scripts/test_openclaw_contract.py'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/openclaw-contract.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Native transcripts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Format the new regression before qualification
+        run: rustfmt --edition 2024 tests/connector_openclaw_sqlite.rs
+      - name: Qualify the native feature with production modules and locked engines
+        run: python scripts/test_openclaw_contract.py --qualify-feature --candidate-output candidate/Cargo.toml
+      - name: Verify regression formatting
+        run: rustfmt --edition 2024 --check tests/connector_openclaw_sqlite.rs
+      - name: Retain the exact tested manifest and regression
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: openclaw-qualified-sources
+          retention-days: 2
+          path: |
+            candidate/Cargo.toml
+            tests/connector_openclaw_sqlite.rs
+
+  stage:
+    name: Stage tested blobs only
+    needs: native
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: openclaw-qualified-sources
+          path: validated
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            for (const [input, path] of [
+              ['candidate/Cargo.toml', 'Cargo.toml'],
+              ['tests/connector_openclaw_sqlite.rs', 'tests/connector_openclaw_sqlite.rs'],
+            ]) {
+              const content = fs.readFileSync(`validated/${input}`).toString('base64');
+              const {data} = await github.rest.git.createBlob({
+                owner: context.repo.owner, repo: context.repo.repo,
+                content, encoding: 'base64',
+              });
+              core.notice(`TESTED_BLOB ${path} ${data.sha}`);
+            }
