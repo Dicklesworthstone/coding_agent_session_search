@@ -287,6 +287,7 @@ fn grok_bot_connector_factory() -> Box<dyn Connector + Send> {
 /// arguments reach the production indexer. OMP passes through its profile
 /// provenance adapter, and Pi Agent passes through the OMP identity boundary
 /// that prevents broad explicit roots from indexing the same store twice.
+/// OpenClaw passes through its native-store WAL and state-directory adapter.
 #[must_use]
 pub fn get_connector_factories() -> Vec<(&'static str, ConnectorFactory)> {
     franken_agent_detection::get_connector_factories()
@@ -300,7 +301,7 @@ pub fn get_connector_factories() -> Vec<(&'static str, ConnectorFactory)> {
                 "grok_bot" => grok_bot_connector_factory as ConnectorFactory,
                 _ => factory,
             };
-            (name, factory)
+            (name, openclaw::with_wal_freshness(name, factory))
         })
         .collect()
 }
