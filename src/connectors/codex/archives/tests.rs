@@ -383,7 +383,7 @@ fn archive_inventory_reuses_completed_sources_and_admits_new_old_mtime_moves() -
                 active_id.clone_from(&delivered[0].external_id);
             }
             2 => {
-                assert_eq!(admitted, [moved.clone()]);
+                assert_eq!(admitted.as_slice(), std::slice::from_ref(&moved));
                 assert_eq!(delivered.len(), 1);
                 assert_eq!(delivered[0].external_id, active_id);
             }
