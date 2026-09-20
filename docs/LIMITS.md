@@ -31,6 +31,45 @@ This document describes the tested performance limits and resource constraints f
 - Very long lines (>10,000 chars): Wrapped in display
 - Binary content: Skipped during indexing
 
+## Codex Source-File Admission (GH #489)
+
+Modern lowercase `.jsonl` rollouts default to a **104857600-byte (100 MiB)**
+source limit. Larger complete histories can be admitted explicitly, for example
+with a 512 MiB budget:
+
+```bash
+CASS_CODEX_MAX_SOURCE_BYTES=536870912 cass index --json
+```
+
+The value is a decimal integer byte count from **1 through 1073741824 (1 GiB)**.
+Whitespace around the value is accepted; zero, negative values, unit suffixes,
+empty values and overflow are errors, not an unlimited mode. Unset the variable
+to restore the default. Configuration is read once before each Codex scan and
+remains fixed across its source attempts and enrichment passes. A larger budget
+does not require `--full`: the normal incremental path retries excluded history
+under the existing conservative watermark policy.
+
+This override is specific to modern `.jsonl` rollouts. Legacy `.json` sources
+retain the published FAD parser's 100 MiB ceiling (or the configured limit when
+smaller). Raising only CASS's legacy limit would falsely certify files that the
+upstream parser skipped. Other providers' limits are unaffected.
+
+An over-budget source is not parsed into a partial conversation or reported as
+complete. Healthy neighboring sources can still be ingested, but incomplete
+coverage remains an error. The diagnostic's top-level `limit_bytes` is the
+configured budget; a sampled rejected source additionally carries `limit_bytes`
+when its format has a lower effective cap. Source bytes are never rewritten,
+split or truncated to fit the limit. Observable source changes and unfinished
+tails continue to prevent source completion, and consumer/storage failures
+still stop the scan rather than being converted into ordinary source skips.
+
+**This is an input-file admission limit, not an RSS ceiling or a wall-clock
+deadline.** The primary parser retains normalized messages and runs before CASS
+enrichment; the latter reads only the admitted snapshot's finite prefix. A larger
+budget can therefore increase memory and CPU use. This setting does not
+establish the older performance estimates elsewhere in this document, and does
+not add a `--partial-ok` policy or suppress exit 9 for other incomplete scans.
+
 ## Memory Usage
 
 | Operation | Expected Memory | Notes |
@@ -106,6 +145,7 @@ This document describes the tested performance limits and resource constraints f
 | `CASS_WARM_DEBOUNCE_MS` | 120 | Debounce for warm worker |
 | `CASS_SEMANTIC_EMBEDDER` | auto | Force hash/ml embedder |
 | `CASS_STREAMING_INDEX` | true | Enable streaming indexer |
+| `CASS_CODEX_MAX_SOURCE_BYTES` | 104857600 | Modern Codex JSONL source-byte admission; 1..1073741824, legacy JSON at most 100 MiB |
 
 ## Tested Configurations
 
