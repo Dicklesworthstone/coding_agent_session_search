@@ -36,7 +36,7 @@ pub struct SemanticAnnExpectation {
 /// digest invented from a subset of HNSW parameters or inferred from a filename.
 pub const NATIVE_ANN_ARTIFACT_FORMAT: &str = "native-hnsw-v2";
 
-/// Preflight cap across all manifest-selected graph images. The loaded graph,
+/// Preflight cap across graph images selected for the retained tiers. The loaded graph,
 /// parser scratch, already-retained vectors and concurrent file growth are NOT
 /// covered by this declared-byte limit. Zero explicitly disables graph loading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,7 +132,15 @@ fn graph_bytes_within_budget(
     mut sizes: impl Iterator<Item = u64>,
     budget: AnnAdmissionBudget,
 ) -> bool {
-    sizes
+    let Some(first) = sizes.next() else {
+        return true;
+    };
+    // Zero disables any selected graph, even one claiming an empty image.
+    if budget.max_declared_graph_bytes == 0 {
+        return false;
+    }
+    std::iter::once(first)
+        .chain(sizes)
         .try_fold(0_u64, |total, bytes| total.checked_add(bytes))
         .is_some_and(|total| {
             total <= budget.max_declared_graph_bytes && usize::try_from(total).is_ok()
@@ -237,7 +245,11 @@ pub(super) enum ShardAnn {
 }
 
 impl ShardAnn {
-    fn load(owner: Arc<ValidatedFsviBytes>, expected: Option<&SemanticAnnExpectation>) -> Self {
+    fn load(
+        owner: Arc<ValidatedFsviBytes>,
+        expected: Option<&SemanticAnnExpectation>,
+        within_budget: bool,
+    ) -> Self {
         let Some(expected) = expected else {
             return Self::Unavailable(AnnFallbackReason::NotSelected);
         };
@@ -251,6 +263,12 @@ impl ShardAnn {
         {
             return Self::Unavailable(AnnFallbackReason::InvalidExpectation);
         }
+        // Refuse the complete selection before opening either tier. Checking
+        // only each graph separately would allow their combined size to exceed
+        // the command's declared-byte allowance.
+        if !within_budget {
+            return Self::Unavailable(AnnFallbackReason::AdmissionBudget);
+        }
         let graph_path = if expected.graph_path.is_absolute() {
             expected.graph_path.clone()
         } else {
@@ -259,13 +277,8 @@ impl ShardAnn {
             };
             root.join(&expected.graph_path)
         };
-        let Ok(receipt_path) = native_hnsw_generation_receipt_path(&graph_path) else {
-            return Self::Unavailable(AnnFallbackReason::UnsafePath);
-        };
-        // Read-only preflight, not a race-free filesystem or allocation budget.
-        // Cryptographic/structural admission below remains authoritative.
-        if !single_link_regular(&graph_path) || !single_link_regular(&receipt_path) {
-            return Self::Unavailable(AnnFallbackReason::SidecarUnavailable);
+        if let Err(reason) = preflight_sidecars(&graph_path, expected.receipt.graph_byte_len) {
+            return Self::Unavailable(reason);
         }
         match ValidatedNativeHnsw::load(owner, &graph_path) {
             Ok((graph, receipt)) if receipt == expected.receipt => {
@@ -297,22 +310,8 @@ impl ShardAnn {
             return Self::Unavailable(AnnFallbackReason::InvalidExpectation);
         }
         let graph_path = generation_dir.join(&artifact.relative_path);
-        let Ok(receipt_path) = native_hnsw_generation_receipt_path(&graph_path) else {
-            return Self::Unavailable(AnnFallbackReason::UnsafePath);
-        };
-        if !single_link_regular(&graph_path) || !single_link_regular(&receipt_path) {
-            return Self::Unavailable(AnnFallbackReason::SidecarUnavailable);
-        }
-        // Fixed-format receipts are small. Do not feed an obviously oversized
-        // sidecar to the upstream read-all loader. This is a preflight, not a
-        // race-free allocation ceiling; upstream byte/identity checks still run.
-        let graph_size = std::fs::metadata(&graph_path).ok().map(|meta| meta.len());
-        let receipt_size = std::fs::metadata(&receipt_path).ok().map(|meta| meta.len());
-        if graph_size != Some(artifact.size_bytes) {
-            return Self::Unavailable(AnnFallbackReason::ReceiptMismatch);
-        }
-        if receipt_size.is_none_or(|bytes| bytes > 64 * 1024) {
-            return Self::Unavailable(AnnFallbackReason::AdmissionBudget);
+        if let Err(reason) = preflight_sidecars(&graph_path, artifact.size_bytes) {
+            return Self::Unavailable(reason);
         }
         // The upstream loader performs structural and cryptographic admission
         // with this exact owner. Keep that loaded graph: no second graph open.
@@ -339,6 +338,37 @@ impl ShardAnn {
             },
         }
     }
+}
+
+/// Refuse obvious read-all amplification on EVERY graph admission route.
+/// This does not read payload bytes or create files. Files can still change
+/// after these metadata checks; upstream structural/cryptographic admission
+/// remains mandatory, and this is not a race-free allocation or RSS ceiling.
+fn preflight_sidecars(
+    graph_path: &Path,
+    declared_graph_bytes: u64,
+) -> Result<(), AnnFallbackReason> {
+    if usize::try_from(declared_graph_bytes).is_err() {
+        return Err(AnnFallbackReason::AdmissionBudget);
+    }
+    let receipt_path = native_hnsw_generation_receipt_path(graph_path)
+        .map_err(|_| AnnFallbackReason::UnsafePath)?;
+    if !single_link_regular(graph_path) || !single_link_regular(&receipt_path) {
+        return Err(AnnFallbackReason::SidecarUnavailable);
+    }
+    let graph_size = std::fs::metadata(graph_path)
+        .map_err(|_| AnnFallbackReason::SidecarUnavailable)?
+        .len();
+    let receipt_size = std::fs::metadata(&receipt_path)
+        .map_err(|_| AnnFallbackReason::SidecarUnavailable)?
+        .len();
+    if graph_size != declared_graph_bytes {
+        return Err(AnnFallbackReason::ReceiptMismatch);
+    }
+    if receipt_size > 64 * 1024 {
+        return Err(AnnFallbackReason::AdmissionBudget);
+    }
+    Ok(())
 }
 
 fn single_link_regular(path: &Path) -> bool {
@@ -382,10 +412,26 @@ impl SemanticGenerationReader {
     ///
     /// Consumes this reader value but does not alter existing clones or batches.
     /// No graph build/save, model acquisition, or canonical DB access occurs.
+    /// The default aggregate graph-image allowance is 256 MiB. Use
+    /// [`Self::with_ann_budget`] to select a different explicit allowance.
     pub fn with_ann(
+        self,
+        fast: Option<&[Option<SemanticAnnExpectation>]>,
+        quality: Option<&[Option<SemanticAnnExpectation>]>,
+    ) -> SemanticReaderResult<Self> {
+        self.with_ann_budget(fast, quality, AnnAdmissionBudget::default())
+    }
+
+    /// Attach receipted graphs under one aggregate declared-byte allowance.
+    /// Shape/identity errors retain their existing diagnostics. An over-budget
+    /// selection loads neither tier's graphs, keeps every exact owner, and
+    /// reports `admission_budget` for selected graphs. Unselected shards remain
+    /// `not_selected`. This bounds admitted file sizes, not loaded graph RSS.
+    pub fn with_ann_budget(
         mut self,
         fast: Option<&[Option<SemanticAnnExpectation>]>,
         quality: Option<&[Option<SemanticAnnExpectation>]>,
+        budget: AnnAdmissionBudget,
     ) -> SemanticReaderResult<Self> {
         for (kind, selected) in [(TierKind::Fast, fast), (TierKind::Quality, quality)] {
             if let Some(selected) = selected {
@@ -397,6 +443,14 @@ impl SemanticGenerationReader {
                 }
             }
         }
+        let within_budget = graph_bytes_within_budget(
+            [fast, quality]
+                .into_iter()
+                .flatten()
+                .flat_map(|selected| selected.iter().flatten())
+                .map(|expected| expected.receipt.graph_byte_len),
+            budget,
+        );
         let load_tier = |kind, selected: Option<&[Option<SemanticAnnExpectation>]>| {
             self.tier(kind).map_or_else(Vec::new, |tier| {
                 tier.shards
@@ -406,6 +460,7 @@ impl SemanticGenerationReader {
                         ShardAnn::load(
                             Arc::clone(owner),
                             selected.and_then(|list| list[position].as_ref()),
+                            within_budget,
                         )
                     })
                     .collect()
@@ -425,6 +480,8 @@ impl SemanticGenerationReader {
     /// graphs, reopens vector paths, or treats graph failure as loss of a tier.
     /// V2 pairs each graph with the exact vector ordinal in that tier. Missing
     /// or invalid graphs retain their exact shard, never a neighboring graph.
+    /// Only retained tiers count against the aggregate graph-image allowance;
+    /// an unselected quality tier cannot disable a fast-only ANN selection.
     pub fn with_manifest_ann(
         mut self,
         manifest: &SemanticGenerationManifestV1,
@@ -436,11 +493,10 @@ impl SemanticGenerationReader {
             manifest
                 .artifacts
                 .iter()
-                .filter(|artifact| {
-                    matches!(
-                        artifact.role,
-                        SemanticArtifactRole::FastAnn | SemanticArtifactRole::QualityAnn
-                    )
+                .filter(|artifact| match artifact.role {
+                    SemanticArtifactRole::FastAnn => self.fast.is_some(),
+                    SemanticArtifactRole::QualityAnn => self.quality.is_some(),
+                    _ => false,
                 })
                 .map(|artifact| artifact.size_bytes),
             budget,
@@ -654,6 +710,7 @@ mod publication_budget_tests {
         };
         assert!(graph_bytes_within_budget(std::iter::empty(), budget));
         assert!(!graph_bytes_within_budget([1].into_iter(), budget));
+        assert!(!graph_bytes_within_budget([0].into_iter(), budget));
     }
 
     #[test]
@@ -664,6 +721,97 @@ mod publication_budget_tests {
         assert_eq!(
             serde_json::to_value(admission).unwrap(),
             serde_json::json!({"state": "unavailable", "reason": "admission_budget"})
+        );
+    }
+
+    fn sidecar_fixture(graph_bytes: u64, receipt_bytes: u64) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join("graph.chsw");
+        let receipt = native_hnsw_generation_receipt_path(&graph).unwrap();
+        std::fs::File::create(&graph)
+            .unwrap()
+            .set_len(graph_bytes)
+            .unwrap();
+        std::fs::File::create(&receipt)
+            .unwrap()
+            .set_len(receipt_bytes)
+            .unwrap();
+        (dir, graph)
+    }
+
+    #[test]
+    fn sidecar_preflight_accepts_the_exact_byte_boundaries_without_mutation() {
+        let (_dir, graph) = sidecar_fixture(17, 64 * 1024);
+        let receipt = native_hnsw_generation_receipt_path(&graph).unwrap();
+        let before_graph = std::fs::read(&graph).unwrap();
+        let before_receipt = std::fs::read(&receipt).unwrap();
+        assert_eq!(preflight_sidecars(&graph, 17), Ok(()));
+        assert_eq!(std::fs::read(&graph).unwrap(), before_graph);
+        assert_eq!(std::fs::read(&receipt).unwrap(), before_receipt);
+    }
+
+    #[test]
+    fn sidecar_preflight_rejects_both_larger_and_smaller_graph_images() {
+        let (_dir, graph) = sidecar_fixture(17, 1);
+        for declared in [0, 16, 18] {
+            assert_eq!(
+                preflight_sidecars(&graph, declared),
+                Err(AnnFallbackReason::ReceiptMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn sidecar_preflight_refuses_oversized_receipts_before_payload_loading() {
+        let (_dir, graph) = sidecar_fixture(17, 64 * 1024 + 1);
+        assert_eq!(
+            preflight_sidecars(&graph, 17),
+            Err(AnnFallbackReason::AdmissionBudget)
+        );
+    }
+
+    #[test]
+    fn sidecar_preflight_does_not_create_a_missing_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join("graph.chsw");
+        std::fs::write(&graph, b"graph").unwrap();
+        let receipt = native_hnsw_generation_receipt_path(&graph).unwrap();
+        assert_eq!(
+            preflight_sidecars(&graph, 5),
+            Err(AnnFallbackReason::SidecarUnavailable)
+        );
+        assert!(!receipt.exists());
+        assert_eq!(std::fs::read(&graph).unwrap(), b"graph");
+    }
+
+    #[test]
+    fn sidecar_preflight_refuses_directory_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join("graph.chsw");
+        std::fs::create_dir(&graph).unwrap();
+        assert_eq!(
+            preflight_sidecars(&graph, 0),
+            Err(AnnFallbackReason::SidecarUnavailable)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_preflight_refuses_linked_graphs_and_receipts() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, graph) = sidecar_fixture(17, 1);
+        let alias = dir.path().join("alias.chsw");
+        symlink(&graph, &alias).unwrap();
+        assert_eq!(
+            preflight_sidecars(&alias, 17),
+            Err(AnnFallbackReason::SidecarUnavailable)
+        );
+        let receipt = native_hnsw_generation_receipt_path(&graph).unwrap();
+        std::fs::hard_link(&receipt, dir.path().join("receipt-alias")).unwrap();
+        assert_eq!(
+            preflight_sidecars(&graph, 17),
+            Err(AnnFallbackReason::SidecarUnavailable)
         );
     }
 }
