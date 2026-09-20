@@ -1,0 +1,99 @@
+name: Qualify OpenClaw feature contract
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/openclaw-feature-contract.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Prepare exact feature and validator candidates
+        shell: python
+        run: |
+          import json, pathlib, re, tomllib
+          root = pathlib.Path.cwd()
+          manifest = (root / 'Cargo.toml').read_text()
+          build = (root / 'build.rs').read_text()
+          anchor = '            "opencode",\n            "shelley",\n'
+          assert build.count(anchor) == 1
+          build = build.replace(anchor, '            "openclaw-sqlite",\n' + anchor, 1)
+          fad = re.search(r'(?m)^franken-agent-detection = .*$', manifest)[0]
+          assert '"openclaw-sqlite"' not in fad
+          manifest = manifest.replace(fad, fad.replace('features = [', 'features = ["openclaw-sqlite", ', 1), 1)
+          candidate = root / 'candidate'
+          candidate.mkdir()
+          (candidate / 'Cargo.toml').write_text(manifest)
+          (candidate / 'build.rs').write_text(build)
+          (candidate / 'without-native.toml').write_text((root / 'Cargo.toml').read_text())
+          section = re.search(r'(?ms)^\[build-dependencies\]\n(.*?)(?=^\[)', manifest)[1]
+          dependencies = []
+          for name in ['toml', 'blake3']:
+              line = re.search(r'(?m)^' + name + r'\s*=.*$', section)[0]
+              assert tomllib.loads(line)[name] == tomllib.loads(manifest)['build-dependencies'][name]
+              dependencies.append(line)
+          probe = root / 'contract-probe'
+          (probe / 'src').mkdir(parents=True)
+          (probe / 'Cargo.toml').write_text('\n'.join([
+              '[package]', 'name = "openclaw-feature-contract"', 'version = "0.0.0"',
+              'edition = "2024"', 'publish = false', '[dependencies]', *dependencies, '',
+          ]))
+          source = '''mod production {
+              include!(BUILD_PATH);
+              pub fn check(path: &std::path::Path) {
+                  let manifest: toml::Value = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+                  let contract = CONTRACTS.iter().find(|c| c.dep_key == "franken-agent-detection").unwrap();
+                  validate_manifest_dependency_spec(&manifest, contract, false);
+              }
+          }
+          fn main() {
+              production::check(std::path::Path::new(&std::env::args().nth(1).unwrap()));
+          }
+          '''.replace('BUILD_PATH', json.dumps(str(candidate / 'build.rs')))
+          (probe / 'src/main.rs').write_text(source)
+      - name: Candidate passes the production validator
+        run: cargo run --manifest-path contract-probe/Cargo.toml -- candidate/Cargo.toml
+      - name: Removing the native feature fails the same validator
+        shell: bash
+        run: |
+          if cargo run --manifest-path contract-probe/Cargo.toml -- candidate/without-native.toml >negative.log 2>&1; then
+            echo 'missing feature unexpectedly accepted'; exit 1
+          fi
+          grep 'must enable features' negative.log
+      - name: Check candidate build script formatting
+        run: rustfmt --edition 2024 --check candidate/build.rs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openclaw-build-contract
+          retention-days: 2
+          path: candidate/build.rs
+
+  stage:
+    needs: contract
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: openclaw-build-contract
+          path: validated
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const {data} = await github.rest.git.createBlob({
+              owner: context.repo.owner, repo: context.repo.repo,
+              content: fs.readFileSync('validated/build.rs').toString('base64'), encoding: 'base64',
+            });
+            core.notice(`TESTED_BLOB build.rs ${data.sha}`);
