@@ -8,9 +8,11 @@ on:
       - 'src/connectors/mod.rs'
       - 'src/franken_sync.rs'
       - 'tests/connector_openclaw_sqlite.rs'
+      - 'tests/connector_openclaw.rs'
       - 'scripts/test_openclaw_contract.py'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'rust-toolchain.toml'
       - '.github/workflows/openclaw-contract.yml'
   workflow_dispatch:
 
@@ -25,7 +27,7 @@ jobs:
   native:
     name: Native transcripts (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

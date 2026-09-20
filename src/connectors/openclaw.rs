@@ -3,6 +3,7 @@
 //! FAD 0.3.0's SQLite mtime prefilter ignores WAL-only commits. Recover only
 //! those skipped stores here; do not fork its schema admission or event parser.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -42,6 +43,37 @@ impl OpenClawConnector {
     }
 }
 
+// OpenClaw documents OPENCLAW_STATE_DIR as the mutable-state override.
+// Resolve it once per operation, and never append the real profile as fallback.
+fn state_override() -> Option<PathBuf> {
+    let value = dotenvy::var("OPENCLAW_STATE_DIR").ok()?;
+    state_path(&value, dirs::home_dir().as_deref())
+}
+
+fn state_path(value: &str, home: Option<&Path>) -> Option<PathBuf> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(value);
+    match (path.strip_prefix("~"), home) {
+        (Ok(tail), Some(home)) => Some(home.join(tail)),
+        _ => Some(path),
+    }
+}
+
+fn selected_context(ctx: &ScanContext) -> Cow<'_, ScanContext> {
+    if !ctx.use_default_detection() {
+        return Cow::Borrowed(ctx);
+    }
+    let Some(state) = state_override() else {
+        return Cow::Borrowed(ctx);
+    };
+    let mut selected = ctx.clone();
+    selected.scan_roots = vec![ScanRoot::local(state.join("agents"))];
+    Cow::Owned(selected)
+}
+
 /// Final registry adapter shared by the application and focused consumer gate.
 pub(super) fn with_wal_freshness(
     name: &str,
@@ -62,10 +94,24 @@ fn wal_path(database: &Path) -> PathBuf {
 
 impl Connector for OpenClawConnector {
     fn detect(&self) -> DetectionResult {
+        if let Some(state) = state_override() {
+            let agents = state.join("agents");
+            return if agents.is_dir() {
+                DetectionResult {
+                    detected: true,
+                    evidence: vec![format!("OpenClaw state override: {}", state.display())],
+                    root_paths: vec![agents],
+                }
+            } else {
+                DetectionResult::not_found()
+            };
+        }
         franken_agent_detection::OpenClawConnector::new().detect()
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        let selected = selected_context(ctx);
+        let ctx = selected.as_ref();
         let inner = franken_agent_detection::OpenClawConnector::new();
         let mut sources = inner.discover_source_files(ctx)?;
         let mut paths: HashSet<_> = sources.iter().map(|s| s.source_path.clone()).collect();
@@ -95,6 +141,8 @@ impl Connector for OpenClawConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
+        let selected = selected_context(ctx);
+        let ctx = selected.as_ref();
         let inner = franken_agent_detection::OpenClawConnector::new();
         let pending = Self::wal_only_sources(ctx)?;
         let mut conversations = inner.scan(ctx)?;
@@ -206,6 +254,15 @@ mod tests {
         assert!(conversations.iter().any(|c| c.external_id.as_deref() == Some("main/legacy-only")));
         assert_eq!((fs::read(&database)?, fs::read(&wal)?, fs::metadata(&database)?.modified()?, fs::metadata(&wal)?.modified()?), before);
         Ok(())
+    }
+
+    #[test]
+    fn state_override_trims_and_expands_only_the_home_component() {
+        let home = Path::new("profile");
+        assert_eq!(state_path("  ~/openclaw-state  ", Some(home)), Some(home.join("openclaw-state")));
+        assert_eq!(state_path("~other/state", Some(home)), Some(PathBuf::from("~other/state")));
+        assert_eq!(state_path(" custom/state ", None), Some(PathBuf::from("custom/state")));
+        assert_eq!(state_path("  ", Some(home)), None);
     }
 
     #[test]

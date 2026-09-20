@@ -205,6 +205,9 @@ fn native_only_profile_is_detected_in_an_isolated_home() -> Result<()> {
         assert_eq!(detected.root_paths.len(), 1);
         let ctx = ScanContext::with_roots(home.join("cass-data"), detected.root_paths.into_iter().map(ScanRoot::local).collect(), None);
         assert_eq!(connector.scan(&ctx)?.len(), 1);
+        assert_eq!(connector.scan(&ScanContext::local_default(home.join("cass-data"), None))?.len(), 1);
+        // Explicit roots must stay narrow even when a configured profile exists.
+        assert!(connector.scan(&context(&home.join("missing-store"), None))?.is_empty());
         return Ok(());
     }
     let temp = tempfile::tempdir()?;
@@ -214,7 +217,8 @@ fn native_only_profile_is_detected_in_an_isolated_home() -> Result<()> {
     let result = Command::new(std::env::current_exe()?)
         .args(["--exact", "native_only_profile_is_detected_in_an_isolated_home", "--nocapture"])
         .current_dir(temp.path()).env(CHILD, temp.path())
-        .env("HOME", temp.path()).env("USERPROFILE", temp.path()).output()?;
+        .env("HOME", temp.path()).env("USERPROFILE", temp.path())
+        .env("OPENCLAW_STATE_DIR", temp.path().join(".openclaw")).output()?;
     assert!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
     Ok(())
 }

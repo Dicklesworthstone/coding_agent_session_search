@@ -46,7 +46,7 @@ def main() -> None:
         if candidate == fad:
             raise SystemExit("unrecognized dependency declaration; not modifying it")
         manifest = manifest.replace(fad, candidate, 1)
-    names = ["anyhow", "asupersync", "frankensqlite", "fsqlite-types", "franken-agent-detection", "serde_json", "tempfile"]
+    names = ["anyhow", "dirs", "dotenvy", "asupersync", "frankensqlite", "fsqlite-types", "franken-agent-detection", "serde_json", "tempfile"]
     dependencies = [declaration(manifest, name) for name in names]
     cargo = shutil.which("cargo")
     if cargo is None:
@@ -55,10 +55,10 @@ def main() -> None:
     registry = (root / "src/connectors/mod.rs").read_text(encoding="utf-8")
     seam = "(name, openclaw::with_wal_freshness(name, factory))"
     if registry.count(seam) != 1:
-        old = "(name, factory)"
+        old = "            (name, factory)\n"
         if not args.qualify_feature or registry.count(old) != 1:
             raise RuntimeError("application registry no longer uses the tested OpenClaw adapter")
-        registry = registry.replace(old, seam, 1)
+        registry = registry.replace(old, "            " + seam + "\n", 1)
     with tempfile.TemporaryDirectory(prefix="cass-openclaw-contract-") as directory:
         work = Path(directory)
         (work / "connectors").mkdir()
@@ -93,7 +93,8 @@ pub fn shutdown_contract_driver() -> bool { franken_sync::shutdown_driver() }
             'path = ' + json.dumps(test.as_posix(), ensure_ascii=False),
             '[[test]]', 'name = "connector_openclaw"',
             'path = ' + json.dumps((root / "tests/connector_openclaw.rs").as_posix(), ensure_ascii=False),
-            '[dependencies]', *dependencies, '[profile.dev.package."*"]', 'opt-level = 1',
+            '[dependencies]', *dependencies, '[profile.dev]', 'debug = 0',
+            '[profile.dev.package."*"]', 'opt-level = 1',
             '[lints.rust]', 'unsafe_code = "forbid"', '',
         ]), encoding="utf-8")
         for name in ["Cargo.lock", "rust-toolchain.toml"]:
@@ -103,6 +104,7 @@ pub fn shutdown_contract_driver() -> bool { franken_sync::shutdown_driver() }
         env["CARGO_TARGET_DIR"] = str(root / "target/openclaw-contract")
         env.setdefault("RUST_MIN_STACK", "134217728")
         env["CASS_EXCLUDE_PATHS"] = ""
+        env["OPENCLAW_STATE_DIR"] = ""
         metadata = json.loads(subprocess.check_output([
             cargo, "metadata", "--manifest-path", str(project), "--format-version", "1",
         ], cwd=root, env=env))
