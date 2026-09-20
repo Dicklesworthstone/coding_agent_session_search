@@ -46,7 +46,7 @@ jobs:
           (probe / 'src').mkdir(parents=True)
           (probe / 'Cargo.toml').write_text('\n'.join([
               '[package]', 'name = "openclaw-feature-contract"', 'version = "0.0.0"',
-              'edition = "2024"', 'publish = false', '[dependencies]', *dependencies, '',
+              'edition = "2024"', 'publish = false', '[dependencies]', *dependencies, '[workspace]', '',
           ]))
           source = '''mod production {
               include!(BUILD_PATH);
