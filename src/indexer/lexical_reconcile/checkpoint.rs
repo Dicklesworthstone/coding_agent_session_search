@@ -1,7 +1,7 @@
 //! Bind a recovery attempt to its complete lexical projection, not row counts.
 
 use anyhow::{Result, ensure};
-use crate::search::quill_bridge::TantivyDocument;
+use frankensearch::quill::cass::CassDocument;
 use super::LexicalReconcileCheckpoint;
 
 pub(super) const VERSION: u32 = 2;
@@ -9,7 +9,7 @@ pub(super) const VERSION: u32 = 2;
 /// Hash every projected field in order without copying large message bodies.
 /// Length prefixes and option tags make the encoding unambiguous; fixed-width
 /// little-endian lengths keep it independent of the host's pointer width.
-pub(super) fn projection_fingerprint(docs: &[TantivyDocument]) -> String {
+pub(super) fn projection_fingerprint(docs: &[CassDocument]) -> String {
     fn text(hasher: &mut blake3::Hasher, value: &str) {
         hasher.update(&(value.len() as u64).to_le_bytes());
         hasher.update(value.as_bytes());
@@ -23,20 +23,28 @@ pub(super) fn projection_fingerprint(docs: &[TantivyDocument]) -> String {
             None => { hasher.update(&[0]); }
         }
     }
+    fn optional_text(hasher: &mut blake3::Hasher, value: Option<&str>) {
+        match value {
+            Some(value) => { hasher.update(&[1]); text(hasher, value); }
+            None => { hasher.update(&[0]); }
+        }
+    }
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"cass-lexical-reconcile-projection-v2\0");
     hasher.update(&(docs.len() as u64).to_le_bytes());
     for doc in docs {
         for value in [
-            &doc.title, &doc.content, &doc.agent, &doc.workspace,
-            &doc.source_path, &doc.source_id, &doc.origin_kind, &doc.origin_host,
+            &doc.content, &doc.agent, &doc.source_path, &doc.source_id, &doc.origin_kind,
         ] {
             text(&mut hasher, value);
+        }
+        for value in [doc.title.as_deref(), doc.workspace.as_deref(),
+            doc.workspace_original.as_deref(), doc.origin_host.as_deref()] {
+            optional_text(&mut hasher, value);
         }
         optional_i64(&mut hasher, doc.created_at);
         optional_i64(&mut hasher, doc.conversation_id);
         hasher.update(&doc.msg_idx.to_le_bytes());
-        text(&mut hasher, &doc.role);
     }
     hasher.finalize().to_hex().to_string()
 }
@@ -88,15 +96,16 @@ pub(super) fn resume(
 mod tests {
     use super::*;
 
-    fn document() -> TantivyDocument {
-        TantivyDocument {
-            title: "title".into(), content: "alpha".into(), agent: "codex".into(),
-            workspace: "/work".into(), source_path: "/source".into(), source_id: "local".into(),
-            origin_kind: "local".into(), origin_host: String::new(),
-            created_at: Some(42), conversation_id: Some(7), msg_idx: 3, role: "user".into(),
+    fn document() -> CassDocument {
+        CassDocument {
+            title: Some("title".into()), content: "alpha".into(), agent: "codex".into(),
+            workspace: Some("/work".into()), workspace_original: Some("/Work".into()),
+            source_path: "/source".into(), source_id: "local".into(),
+            origin_kind: "local".into(), origin_host: None,
+            created_at: Some(42), conversation_id: Some(7), msg_idx: 3,
         }
     }
-    fn checkpoint(docs: &[TantivyDocument]) -> LexicalReconcileCheckpoint {
+    fn checkpoint(docs: &[CassDocument]) -> LexicalReconcileCheckpoint {
         LexicalReconcileCheckpoint {
             version: VERSION, conversation_id: 7, source_id: "local".into(),
             source_path: "/source".into(), message_count: docs.len(), max_message_idx: 3,
@@ -112,18 +121,18 @@ mod tests {
         for field in 0..12 {
             let mut changed = original.clone();
             match field {
-                0 => changed.title = "other".into(),
+                0 => changed.title = Some("other".into()),
                 1 => changed.content = "bravo".into(),
                 2 => changed.agent = "other".into(),
-                3 => changed.workspace = "/else".into(),
+                3 => changed.workspace = Some("/else".into()),
                 4 => changed.source_path = "/other".into(),
                 5 => changed.source_id = "other".into(),
                 6 => changed.origin_kind = "remote".into(),
-                7 => changed.origin_host = "host".into(),
+                7 => changed.origin_host = Some("host".into()),
                 8 => changed.created_at = None,
                 9 => changed.conversation_id = Some(8),
                 10 => changed.msg_idx = 4,
-                _ => changed.role = "tool".into(),
+                _ => changed.workspace_original = Some("/Other".into()),
             }
             let current = checkpoint(&[changed]);
             assert_ne!(current.projection_blake3, expected.projection_blake3, "field {field}");
@@ -134,9 +143,9 @@ mod tests {
     #[test]
     fn fingerprint_framing_preserves_boundaries_options_and_order() {
         let mut a = document();
-        a.title = "ab".into(); a.content = "c".into(); a.created_at = None;
+        a.title = Some("ab".into()); a.content = "c".into(); a.created_at = None;
         let mut b = a.clone();
-        b.title = "a".into(); b.content = "bc".into();
+        b.title = Some("a".into()); b.content = "bc".into();
         assert_ne!(projection_fingerprint(&[a.clone()]), projection_fingerprint(&[b.clone()]));
         b = a.clone(); b.created_at = Some(0);
         assert_ne!(projection_fingerprint(&[a.clone()]), projection_fingerprint(&[b.clone()]));

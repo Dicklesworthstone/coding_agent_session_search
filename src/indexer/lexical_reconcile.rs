@@ -16,7 +16,7 @@
 //!    then publish a successor generation;
 //! 4. on retry, re-read the checkpoint and converge to exactly one live doc
 //!    per identity (upsert replaces; never appends);
-//! 5. verify early/late canaries and the live-doc count before clearing the
+//! 5. verify exact endpoint canaries and the replay live-doc count before clearing the
 //!    durable checkpoint.
 
 use std::collections::HashMap;
@@ -31,6 +31,7 @@ use crate::search::tantivy::{TantivyIndex, expected_index_dir};
 use crate::storage::sqlite::FrankenStorage;
 
 mod checkpoint;
+mod canary;
 
 const CHECKPOINT_MAX_BYTES: u64 = 64 * 1024;
 
@@ -67,11 +68,11 @@ pub(crate) struct LexicalReconcileReport {
     pub upserted_docs: usize,
     pub doc_count_before: u64,
     pub doc_count_after: u64,
-    /// True when a second upsert of the identical set left the live-doc
-    /// count unchanged — the converge-to-one-doc-per-identity proof.
+    /// True when a second upsert of the identical set left the live-doc count
+    /// unchanged. This is a replay invariant, not a full content-witness audit.
     pub converged: bool,
-    /// Early/late content canaries observed in the published snapshot with a
-    /// matching stored conversation id. `None` when the message carried no
+    /// Early/late content canaries observed at the exact source/message identity
+    /// with a matching stored preview. `None` when the message carried no
     /// usable search token (vacuously accepted).
     pub early_canary_ok: Option<bool>,
     pub late_canary_ok: Option<bool>,
@@ -120,41 +121,6 @@ fn canary_token(content: &str) -> Option<String> {
         .split(|c: char| !c.is_alphanumeric())
         .find(|word| word.chars().count() >= 4 && word.chars().any(|c| c.is_alphabetic()))
         .map(str::to_lowercase)
-}
-
-/// Search the published snapshot for `token` and require a hit whose stored
-/// conversation id matches. `Ok(None)` when no token was derivable.
-fn verify_canary(
-    index: &TantivyIndex,
-    conversation_id: i64,
-    token: Option<&str>,
-) -> Result<Option<bool>> {
-    let Some(token) = token else {
-        return Ok(None);
-    };
-    let parser = frankensearch::quill::query::CassQueryParser::new(
-        frankensearch::quill::schema::CASS_SEMANTIC_SCHEMA,
-    )
-    .map_err(|error| anyhow!("building the CASS query parser for canary: {error}"))?;
-    let parsed = parser.parse(
-        token,
-        &frankensearch::quill::query::CassQueryFilters::default(),
-    );
-    let reader = index.reader()?;
-    let page = crate::search::quill_bridge::search_paginated(&reader, &parsed.query, 25, 0, false)?;
-    let fields = &index.fields;
-    for hit in &page.hits {
-        let stored = crate::search::quill_bridge::stored_i64(
-            &reader,
-            fields.conversation_id,
-            hit.global_docid,
-        )
-        .unwrap_or(None);
-        if stored.is_some_and(|id| id.cmp(&conversation_id).is_eq()) {
-            return Ok(Some(true));
-        }
-    }
-    Ok(Some(false))
 }
 
 /// Run the targeted reconcile for one canonical conversation.
@@ -254,16 +220,20 @@ pub(crate) fn run_lexical_conversation_reconcile(
     index.commit()?;
     let doc_count_after_first = index.doc_count()?;
 
-    // 4. Converge proof: replaying the identical set must not grow the live
-    // set — one live document per identity, never append.
+    // 4. Preserve the existing replay invariant until the CASS adapter exposes
+    // Quill's writer-side per-document witnesses. Counts alone do not prove
+    // that every expected projected document is present with matching content.
     index.upsert_prebuilt_documents_slice(&docs)?;
     index.commit()?;
-    let doc_count_after = index.doc_count()?;
+    // Reuse one admitted reader for final accounting and both endpoint checks.
+    // No refresh or path reopen may split these observations across generations.
+    let reader = index.reader()?;
+    let doc_count_after = reader.doc_count()?;
     let converged = doc_count_after.cmp(&doc_count_after_first).is_eq();
 
     // 5. Early/late canaries against the published snapshot.
-    let early_canary_ok = verify_canary(&index, conversation_id, early_token.as_deref())?;
-    let late_canary_ok = verify_canary(&index, conversation_id, late_token.as_deref())?;
+    let early_canary_ok = canary::verify(&reader, &docs[0], early_token.as_deref())?;
+    let late_canary_ok = canary::verify(&reader, &docs[docs.len() - 1], late_token.as_deref())?;
 
     let canaries_ok = early_canary_ok.unwrap_or(true) && late_canary_ok.unwrap_or(true);
     let checkpoint_cleared = if converged && canaries_ok {
@@ -380,10 +350,13 @@ mod tests {
         // Canaries: early and late markers resolve to this conversation.
         let early = canary_token(&docs[0].content);
         let late = canary_token(&docs[9].content);
-        assert_eq!(verify_canary(&index, 42, early.as_deref())?, Some(true));
-        assert_eq!(verify_canary(&index, 42, late.as_deref())?, Some(true));
+        let reader = index.reader()?;
+        assert_eq!(canary::verify(&reader, &docs[0], early.as_deref())?, Some(true));
+        assert_eq!(canary::verify(&reader, &docs[9], late.as_deref())?, Some(true));
         // A wrong conversation id must not satisfy the canary.
-        assert_eq!(verify_canary(&index, 43, early.as_deref())?, Some(false));
+        let mut wrong = docs[0].clone();
+        wrong.conversation_id = Some(43);
+        assert_eq!(canary::verify(&reader, &wrong, early.as_deref())?, Some(false));
         Ok(())
     }
 
