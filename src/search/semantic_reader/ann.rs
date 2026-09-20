@@ -310,6 +310,12 @@ impl ShardAnn {
             return Self::Unavailable(AnnFallbackReason::InvalidExpectation);
         }
         let graph_path = generation_dir.join(&artifact.relative_path);
+        if !crate::search::semantic_manifest::selection::optional_ann_path_is_safe(
+            generation_dir,
+            &graph_path,
+        ) {
+            return Self::Unavailable(AnnFallbackReason::UnsafePath);
+        }
         if let Err(reason) = preflight_sidecars(&graph_path, artifact.size_bytes) {
             return Self::Unavailable(reason);
         }
@@ -726,7 +732,7 @@ mod publication_budget_tests {
 
     fn sidecar_fixture(graph_bytes: u64, receipt_bytes: u64) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let graph = dir.path().join("graph.chsw");
+        let graph = dir.path().join("graph.fshnsw");
         let receipt = native_hnsw_generation_receipt_path(&graph).unwrap();
         std::fs::File::create(&graph)
             .unwrap()
@@ -773,7 +779,7 @@ mod publication_budget_tests {
     #[test]
     fn sidecar_preflight_does_not_create_a_missing_receipt() {
         let dir = tempfile::tempdir().unwrap();
-        let graph = dir.path().join("graph.chsw");
+        let graph = dir.path().join("graph.fshnsw");
         std::fs::write(&graph, b"graph").unwrap();
         let receipt = native_hnsw_generation_receipt_path(&graph).unwrap();
         assert_eq!(
@@ -787,7 +793,7 @@ mod publication_budget_tests {
     #[test]
     fn sidecar_preflight_refuses_directory_images() {
         let dir = tempfile::tempdir().unwrap();
-        let graph = dir.path().join("graph.chsw");
+        let graph = dir.path().join("graph.fshnsw");
         std::fs::create_dir(&graph).unwrap();
         assert_eq!(
             preflight_sidecars(&graph, 0),
@@ -801,7 +807,7 @@ mod publication_budget_tests {
         use std::os::unix::fs::symlink;
 
         let (dir, graph) = sidecar_fixture(17, 1);
-        let alias = dir.path().join("alias.chsw");
+        let alias = dir.path().join("alias.fshnsw");
         symlink(&graph, &alias).unwrap();
         assert_eq!(
             preflight_sidecars(&alias, 17),

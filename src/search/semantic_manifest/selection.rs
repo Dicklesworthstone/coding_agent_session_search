@@ -14,6 +14,16 @@ pub(crate) struct SemanticSelectionMetadata {
     pub(crate) generation_dir: PathBuf,
 }
 
+/// Vector-only disk validation for retained serving. This is intentionally NOT
+/// ValidatedSemanticGeneration: optional ANN bytes have not been opened, hashed,
+/// or certified healthy. Keep the complete authenticated manifest for selection
+/// identity and for a separate, budgeted graph admission against exact owners.
+pub(crate) struct ValidatedSemanticVectors {
+    pub(crate) pointer: SemanticCurrentPointerV1,
+    pub(crate) manifest: SemanticGenerationManifestV1,
+    pub(crate) generation_dir: PathBuf,
+}
+
 impl SemanticSelectionMetadata {
     pub(crate) fn read(
         data_dir: &Path,
@@ -29,15 +39,22 @@ impl SemanticSelectionMetadata {
         result
     }
 
-    /// Preflight callers must explicitly cross the full artifact-validation
-    /// boundary before this value can become a disk-validation receipt.
-    pub(crate) fn validate_artifacts(
+    /// Validate every mandatory vector through the SAME disk validator used by
+    /// sealing and full audits, without accessing optional graph bytes. A lost
+    /// graph must not prevent exact serving or defeat an ANN admission budget.
+    /// This does not produce the public full-generation validation receipt.
+    pub(crate) fn validate_vectors(
         self,
         data_dir: &Path,
-    ) -> Result<ValidatedSemanticGeneration, SemanticGenerationError> {
+    ) -> Result<ValidatedSemanticVectors, SemanticGenerationError> {
         let started = Instant::now();
-        let artifact_paths = self
-            .manifest
+        // read_observed already authenticated and structurally validated the
+        // complete manifest, including every ANN-to-base binding. This private
+        // projection selects disk work only; never publish or return it as the
+        // manifest identity, and never certify its optional graphs as healthy.
+        let mut vectors = self.manifest.clone();
+        vectors.artifacts.retain(|artifact| artifact.role.is_vector());
+        vectors
             .validate_artifacts_on_disk(data_dir, false)
             .inspect_err(|error| {
                 log_generation_validation_failure(
@@ -47,11 +64,10 @@ impl SemanticSelectionMetadata {
                     started,
                 );
             })?;
-        Ok(ValidatedSemanticGeneration {
+        Ok(ValidatedSemanticVectors {
             pointer: self.pointer,
             manifest: self.manifest,
             generation_dir: self.generation_dir,
-            artifact_paths,
         })
     }
 }
@@ -116,4 +132,44 @@ pub(super) fn read_observed(
         manifest: loaded.manifest,
         generation_dir: loaded.generation_dir,
     })
+}
+
+/// Read-only path preflight for optional ANN loading, after its byte budget.
+/// The manifest already requires safe relative paths. Recheck each actual path
+/// component here because exact serving deliberately did not touch ANN files.
+/// Missing entries are left to the sidecar loader's unavailable diagnostic.
+/// This is not race-free: cryptographic/structural graph admission still runs.
+pub(crate) fn optional_ann_path_is_safe(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    if relative.as_os_str().is_empty()
+        || !relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return false;
+    }
+    let Ok(root_metadata) = fs::symlink_metadata(root) else {
+        return false;
+    };
+    if !root_metadata.is_dir() || metadata_is_link_or_reparse(&root_metadata) {
+        return false;
+    }
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata_is_link_or_reparse(&metadata)
+                    || (current != path && !metadata.is_dir())
+                {
+                    return false;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(_) => return false,
+        }
+    }
+    true
 }
