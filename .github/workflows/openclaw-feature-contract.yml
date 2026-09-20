@@ -37,16 +37,12 @@ jobs:
           (candidate / 'build.rs').write_text(build)
           (candidate / 'without-native.toml').write_text((root / 'Cargo.toml').read_text())
           section = re.search(r'(?ms)^\[build-dependencies\]\n(.*?)(?=^\[)', manifest)[1]
-          dependencies = []
-          for name in ['toml', 'blake3']:
-              line = re.search(r'(?m)^' + name + r'\s*=.*$', section)[0]
-              assert tomllib.loads(line)[name] == tomllib.loads(manifest)['build-dependencies'][name]
-              dependencies.append(line)
+          assert tomllib.loads('[dependencies]\n' + section)['dependencies'] == tomllib.loads(manifest)['build-dependencies']
           probe = root / 'contract-probe'
           (probe / 'src').mkdir(parents=True)
           (probe / 'Cargo.toml').write_text('\n'.join([
               '[package]', 'name = "openclaw-feature-contract"', 'version = "0.0.0"',
-              'edition = "2024"', 'publish = false', '[dependencies]', *dependencies, '[workspace]', '',
+              'edition = "2024"', 'publish = false', '[dependencies]', section, '[workspace]', '',
           ]))
           source = '''mod production {
               include!(BUILD_PATH);
