@@ -8,7 +8,7 @@
 //! with no corpus-wide replay:
 //!
 //! 1. bind one canonical conversation/source identity plus an immutable
-//!    source fingerprint (message count, max idx, capped content bytes);
+//!    content-bound fingerprint of every projected lexical document;
 //! 2. persist a durable recovery checkpoint with the expected doc count
 //!    BEFORE any publication;
 //! 3. upsert the full source doc set under Quill's stable CASS document
@@ -20,6 +20,7 @@
 //!    durable checkpoint.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -29,6 +30,10 @@ use crate::search::asset_state::SearchMaintenanceMode;
 use crate::search::tantivy::{TantivyIndex, expected_index_dir};
 use crate::storage::sqlite::FrankenStorage;
 
+mod checkpoint;
+
+const CHECKPOINT_MAX_BYTES: u64 = 64 * 1024;
+
 /// Durable recovery checkpoint written before the first publication and
 /// cleared only after convergence + canary verification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,12 +42,15 @@ pub(crate) struct LexicalReconcileCheckpoint {
     pub conversation_id: i64,
     pub source_id: String,
     pub source_path: String,
-    /// Immutable source fingerprint: capped message rows the reconcile bound.
+    /// Shape diagnostics, not proof that the underlying content is unchanged.
     pub message_count: usize,
     pub max_message_idx: i64,
     pub content_bytes: usize,
     /// Lexical docs the bound source set projects to (post noise filter).
     pub expected_docs: usize,
+    /// Version two binds all projected content/metadata. Absent only in v1.
+    #[serde(default)]
+    pub projection_blake3: Option<String>,
     pub started_at_ms: i64,
     pub attempt: u32,
 }
@@ -78,15 +86,20 @@ pub(crate) fn lexical_reconcile_checkpoint_path(
 }
 
 fn load_checkpoint(path: &Path) -> Result<Option<LexicalReconcileCheckpoint>> {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => raw,
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(err) if matches!(err.kind(), std::io::ErrorKind::NotFound) => return Ok(None),
         Err(err) => {
             return Err(err)
                 .with_context(|| format!("reading reconcile checkpoint {}", path.display()));
         }
     };
-    serde_json::from_str(&raw)
+    anyhow::ensure!(file.metadata()?.is_file(), "reconcile checkpoint is not a regular file");
+    let mut raw = Vec::new();
+    file.take(CHECKPOINT_MAX_BYTES + 1).read_to_end(&mut raw)?;
+    anyhow::ensure!(raw.len() as u64 <= CHECKPOINT_MAX_BYTES,
+        "reconcile checkpoint exceeds its 64 KiB budget; checkpoint retained");
+    serde_json::from_slice(&raw)
         .map(Some)
         .with_context(|| format!("parsing reconcile checkpoint {}", path.display()))
 }
@@ -154,6 +167,7 @@ pub(crate) fn run_lexical_conversation_reconcile(
     db_path: &Path,
     conversation_id: i64,
 ) -> Result<LexicalReconcileReport> {
+    anyhow::ensure!(conversation_id > 0, "reconcile conversation id must be positive");
     let _run_lock = super::acquire_index_run_lock(data_dir, db_path, SearchMaintenanceMode::Index)?;
 
     let storage = FrankenStorage::open_readonly(db_path)
@@ -190,7 +204,7 @@ pub(crate) fn run_lexical_conversation_reconcile(
     let source_map: HashMap<String, (crate::sources::provenance::SourceKind, Option<String>)> =
         storage
             .list_sources()
-            .unwrap_or_default()
+            .context("loading canonical source provenance for reconcile")?
             .into_iter()
             .map(|source| (source.id, (source.kind, source.host_label)))
             .collect();
@@ -211,44 +225,14 @@ pub(crate) fn run_lexical_conversation_reconcile(
     let late_token = docs.last().and_then(|doc| canary_token(&doc.content));
 
     // 2. Durable checkpoint BEFORE publication; on retry, converge only when
-    // the bound source set is byte-for-byte the same shape.
+    // the complete projected content and metadata are unchanged. A legacy
+    // shape-only checkpoint is rebound before the full replay, never trusted
+    // as evidence that any document was already published.
     let checkpoint_path = lexical_reconcile_checkpoint_path(&index_path, conversation_id);
     std::fs::create_dir_all(&index_path)
         .with_context(|| format!("creating index directory {}", index_path.display()))?;
-    let attempt = match load_checkpoint(&checkpoint_path)? {
-        Some(existing) => {
-            let identity_matches = existing.source_id.cmp(&row.source_id).is_eq()
-                && existing
-                    .source_path
-                    .cmp(&row.source_path.to_string_lossy().to_string())
-                    .is_eq();
-            let fingerprint_matches = matches!(
-                (existing.message_count, existing.max_message_idx, existing.content_bytes),
-                (mc, mi, cb) if mc.cmp(&message_count).is_eq()
-                    && mi.cmp(&max_message_idx).is_eq()
-                    && cb.cmp(&content_bytes).is_eq()
-            );
-            if !identity_matches || !fingerprint_matches {
-                bail!(
-                    "reconcile checkpoint {} was bound to a different source shape \
-                     (checkpoint: {} msgs / max idx {} / {} bytes; live: {} / {} / {}); \
-                     the canonical source changed — run a normal `cass index` instead, \
-                     then retry, or remove the checkpoint to rebind",
-                    checkpoint_path.display(),
-                    existing.message_count,
-                    existing.max_message_idx,
-                    existing.content_bytes,
-                    message_count,
-                    max_message_idx,
-                    content_bytes,
-                );
-            }
-            existing.attempt.saturating_add(1)
-        }
-        None => 1,
-    };
-    let checkpoint = LexicalReconcileCheckpoint {
-        version: 1,
+    let checkpoint = checkpoint::resume(LexicalReconcileCheckpoint {
+        version: checkpoint::VERSION,
         conversation_id,
         source_id: row.source_id.clone(),
         source_path: row.source_path.to_string_lossy().to_string(),
@@ -256,9 +240,11 @@ pub(crate) fn run_lexical_conversation_reconcile(
         max_message_idx,
         content_bytes,
         expected_docs: docs.len(),
+        projection_blake3: Some(checkpoint::projection_fingerprint(&docs)),
         started_at_ms: FrankenStorage::now_millis(),
-        attempt,
-    };
+        attempt: 1,
+    }, load_checkpoint(&checkpoint_path)?)?;
+    let attempt = checkpoint.attempt;
     super::write_json_pretty_atomically(&checkpoint_path, &checkpoint)?;
 
     // 3. Upsert the full source doc set and publish a successor generation.
@@ -418,6 +404,7 @@ mod tests {
             max_message_idx: 9,
             content_bytes: 320,
             expected_docs: 10,
+            projection_blake3: None,
             started_at_ms: 1,
             attempt: 1,
         };
