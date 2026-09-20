@@ -9,7 +9,10 @@ mod artifacts;
 mod delegate;
 mod engine;
 
-pub use artifacts::{BackfillArtifactReclaimReport, reclaim_backfill_artifacts};
+pub use artifacts::{
+    BackfillArtifactCandidate, BackfillArtifactReclaimPlan, BackfillArtifactReclaimReport,
+    apply_backfill_artifact_plan, plan_backfill_artifacts, reclaim_backfill_artifacts,
+};
 pub use engine::*;
 
 use std::path::Path;

@@ -17,6 +17,13 @@ use crate::search::semantic_manifest::{
 };
 use crate::search::vector_index::VECTOR_INDEX_DIR;
 
+mod inspection;
+
+pub use inspection::{
+    BackfillArtifactCandidate, BackfillArtifactReclaimPlan, apply_backfill_artifact_plan,
+    plan_backfill_artifacts,
+};
+
 const ARTIFACT_LOCK: &str = "semantic-backfill-artifacts.lock";
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -57,7 +64,8 @@ impl BackfillArtifacts {
         let root = data_dir.join(VECTOR_INDEX_DIR);
         fs::create_dir_all(&root)?;
         ensure!(
-            fs::symlink_metadata(&root)?.is_dir(),
+            fs::symlink_metadata(&root)?.is_dir()
+                && !is_link_or_reparse(&fs::symlink_metadata(&root)?),
             "refusing to reclaim through a symlinked vector_index directory"
         );
         Ok(Self {
@@ -89,10 +97,30 @@ impl BackfillArtifacts {
         input: Option<&SemanticManifest>,
         output: Option<&Path>,
     ) -> Result<BackfillArtifactReclaimReport> {
+        let discovery = self.discover(input, output, true)?;
+        if discovery.checkpoint_missing {
+            return Ok(BackfillArtifactReclaimReport {
+                checkpoint_missing: true,
+                ..Default::default()
+            });
+        }
+        self.remove_candidates(discovery.candidates)
+    }
+
+    // One ownership classifier for automatic GC, operator preview and apply.
+    // Preview observes metadata without fsync; apply pins the same authority
+    // before it can authorize removal of any superseded checkpoint.
+    fn discover(
+        &self,
+        input: Option<&SemanticManifest>,
+        output: Option<&Path>,
+        durable: bool,
+    ) -> Result<Discovery> {
         let root = self.data_dir.join(VECTOR_INDEX_DIR);
+        let mut metadata = RecoveryMetadata::new(durable);
         let mut protected = ProtectedPaths::default();
         if let Some(manifest) =
-            read_durable_json::<SemanticManifest>(&SemanticManifest::path(&self.data_dir))?
+            metadata.read::<SemanticManifest>(&SemanticManifest::path(&self.data_dir))?
         {
             ensure!(
                 manifest.manifest_version <= MANIFEST_FORMAT_VERSION,
@@ -104,10 +132,12 @@ impl BackfillArtifacts {
                 // previous copy. A dangling checkpoint is a recovery problem,
                 // not permission to delete possible fallback staging files.
                 let path = checkpoint_path(&self.data_dir, checkpoint);
-                if !sync_checkpoint(&path)? {
-                    return Ok(BackfillArtifactReclaimReport {
+                if !inspect_checkpoint(&path, durable)? {
+                    return Ok(Discovery {
+                        candidates: BTreeSet::new(),
+                        protected,
+                        metadata_fingerprint: metadata.fingerprint(),
                         checkpoint_missing: true,
-                        ..Default::default()
                     });
                 }
             }
@@ -119,7 +149,7 @@ impl BackfillArtifacts {
             protected.index(output)?;
         }
         if let Some(shards) =
-            read_durable_json::<SemanticShardManifest>(&SemanticShardManifest::path(&self.data_dir))?
+            metadata.read::<SemanticShardManifest>(&SemanticShardManifest::path(&self.data_dir))?
         {
             ensure!(
                 shards.manifest_version <= MANIFEST_FORMAT_VERSION,
@@ -132,7 +162,7 @@ impl BackfillArtifacts {
                 }
             }
         }
-        protect_selected_generation(&self.data_dir, &mut protected)?;
+        protect_selected_generation(&self.data_dir, &mut protected, &mut metadata)?;
 
         // Plan the complete sweep before the first removal. Never traverse
         // generations/, shards/, quarantine/backup directories, or foreign data.
@@ -141,6 +171,9 @@ impl BackfillArtifacts {
             let entry = entry?;
             let kind = entry.file_type()?;
             let path = entry.path();
+            if is_link_or_reparse(&fs::symlink_metadata(&path)?) {
+                continue;
+            }
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
                 continue;
@@ -160,9 +193,7 @@ impl BackfillArtifacts {
                     }
                 }
             } else if kind.is_dir()
-                && name.strip_prefix(".backfill-reuse-").is_some_and(|suffix| {
-                    !suffix.is_empty() && suffix.bytes().all(|ch| ch.is_ascii_alphanumeric())
-                })
+                && reuse_name(name)
                 && !protected.contains(&path)
             {
                 candidates.insert(path);
@@ -170,14 +201,30 @@ impl BackfillArtifacts {
             // Symlinks are never candidates, including dangling ones.
         }
 
+        Ok(Discovery {
+            candidates,
+            protected,
+            metadata_fingerprint: metadata.fingerprint(),
+            checkpoint_missing: false,
+        })
+    }
+
+    fn remove_candidates(&self, candidates: BTreeSet<PathBuf>) -> Result<BackfillArtifactReclaimReport> {
+        let root = self.data_dir.join(VECTOR_INDEX_DIR);
         let mut report = BackfillArtifactReclaimReport::default();
         for path in candidates {
             let removed = (|| -> Result<(bool, u64)> {
                 let metadata = fs::symlink_metadata(&path)?;
                 let directory = metadata.is_dir();
+                // A staging file swapped for a directory must never turn a
+                // planned unlink into a recursive deletion (or vice versa).
+                let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
                 ensure!(
-                    directory || metadata.is_file(),
-                    "artifact type changed during recovery"
+                    path.parent() == Some(root.as_path())
+                        && !is_link_or_reparse(&metadata)
+                        && ((directory && reuse_name(name))
+                            || (metadata.is_file() && staging_base(&path, name).is_some())),
+                    "artifact type or scope changed during recovery"
                 );
                 let bytes = logical_bytes(&path)?;
                 if directory {
@@ -217,10 +264,23 @@ impl BackfillArtifacts {
     }
 }
 
+struct Discovery {
+    candidates: BTreeSet<PathBuf>,
+    protected: ProtectedPaths,
+    metadata_fingerprint: String,
+    checkpoint_missing: bool,
+}
+
+fn reuse_name(name: &str) -> bool {
+    name.strip_prefix(".backfill-reuse-").is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|ch| ch.is_ascii_alphanumeric())
+    })
+}
+
 fn lock_file(path: &Path) -> Result<File> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => ensure!(
-            metadata.is_file(),
+            metadata.is_file() && !is_link_or_reparse(&metadata),
             "lock is not a regular file: {}",
             path.display()
         ),
@@ -383,43 +443,83 @@ fn normalize(path: &Path) -> PathBuf {
     result
 }
 
-fn read_durable_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
-    };
-    ensure!(
-        metadata.is_file(),
-        "manifest is not a regular file: {}",
-        path.display()
-    );
-    ensure!(
-        metadata.len() <= MAX_MANIFEST_BYTES,
-        "manifest too large for safe recovery: {}",
-        path.display()
-    );
-    let mut file = File::open(path)?;
-    let mut bytes = Vec::new();
-    (&mut file)
-        .take(MAX_MANIFEST_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= MAX_MANIFEST_BYTES,
-        "manifest grew during recovery"
-    );
-    let value = serde_json::from_slice(&bytes)
-        .with_context(|| format!("invalid {}; refusing artifact reclamation", path.display()))?;
-    // After a killed process, visibility of rename alone is not durability.
-    // Pin the selected metadata and directory before deleting superseded data.
-    sync_file(path, &file)?;
-    sync_directory(path.parent().context("manifest has no directory")?)?;
-    Ok(Some(value))
+struct RecoveryMetadata {
+    durable: bool,
+    observed: blake3::Hasher,
 }
 
-fn protect_selected_generation(data_dir: &Path, protected: &mut ProtectedPaths) -> Result<()> {
+impl RecoveryMetadata {
+    fn new(durable: bool) -> Self {
+        let mut observed = blake3::Hasher::new();
+        observed.update(b"cass-backfill-reclaim-authority-v1\0");
+        Self { durable, observed }
+    }
+
+    fn observe(&mut self, path: &Path, bytes: Option<&[u8]>) {
+        // Automatic recovery must also work in non-UTF-8 archive directories.
+        // These bytes are only a local approval witness, never a decoded path.
+        let name = path.as_os_str().as_encoded_bytes();
+        self.observed.update(&(name.len() as u64).to_le_bytes());
+        self.observed.update(name);
+        self.observed.update(&[u8::from(bytes.is_some())]);
+        if let Some(bytes) = bytes {
+            self.observed.update(&(bytes.len() as u64).to_le_bytes());
+            self.observed.update(bytes);
+        }
+    }
+
+    fn fingerprint(&self) -> String {
+        self.observed.finalize().to_hex().to_string()
+    }
+
+    fn read<T: DeserializeOwned>(&mut self, path: &Path) -> Result<Option<T>> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.observe(path, None);
+                return Ok(None);
+            },
+            Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+        };
+        ensure!(
+            metadata.is_file() && !is_link_or_reparse(&metadata),
+            "manifest is not a regular file: {}",
+            path.display()
+        );
+        ensure!(
+            metadata.len() <= MAX_MANIFEST_BYTES,
+            "manifest too large for safe recovery: {}",
+            path.display()
+        );
+        let mut file = File::open(path)?;
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(MAX_MANIFEST_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() as u64 <= MAX_MANIFEST_BYTES,
+            "manifest grew during recovery"
+        );
+        let value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid {}; refusing artifact reclamation", path.display()))?;
+        // After a killed process, visibility of rename alone is not durability.
+        // Pin the selected metadata and directory before deleting superseded data.
+        self.observe(path, Some(&bytes));
+        if self.durable {
+            sync_file(path, &file)?;
+            sync_directory(path.parent().context("manifest has no directory")?)?;
+        }
+        Ok(Some(value))
+    }
+}
+
+fn protect_selected_generation(
+    data_dir: &Path,
+    protected: &mut ProtectedPaths,
+    metadata: &mut RecoveryMetadata,
+) -> Result<()> {
     let pointer_path = SemanticCurrentPointerV1::path(data_dir);
-    let Some(pointer) = read_durable_json::<SemanticCurrentPointerV1>(&pointer_path)? else {
+    let Some(pointer) = metadata.read::<SemanticCurrentPointerV1>(&pointer_path)? else {
         return Ok(());
     };
     // Share serving's exact bounded pointer/manifest authentication. This does
@@ -430,7 +530,7 @@ fn protect_selected_generation(data_dir: &Path, protected: &mut ProtectedPaths) 
         selected.pointer == pointer,
         "semantic selection changed during recovery; refusing reclamation"
     );
-    let manifest = read_durable_json::<SemanticGenerationManifestV1>(
+    let manifest = metadata.read::<SemanticGenerationManifestV1>(
         &selected.generation_dir.join("manifest.json"),
     )?
     .context("selected generation manifest missing; refusing artifact reclamation")?;
@@ -452,25 +552,33 @@ fn protect_selected_generation(data_dir: &Path, protected: &mut ProtectedPaths) 
     Ok(())
 }
 
-fn sync_checkpoint(path: &Path) -> Result<bool> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error).context("open resumable checkpoint before reclamation"),
+fn inspect_checkpoint(path: &Path, durable: bool) -> Result<bool> {
+    // Check types before opening: a FIFO masquerading as a checkpoint/WAL
+    // must fail closed, not hang recovery while waiting for a writer.
+    let Some(file) = open_checkpoint_file(path)? else {
+        return Ok(false);
     };
-    ensure!(
-        file.metadata()?.is_file(),
-        "checkpoint is not a regular file"
-    );
-    sync_file(path, &file)?;
     let wal = wal_path_for(path);
-    match File::open(&wal) {
-        Ok(file) => sync_file(&wal, &file)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("pin resumable checkpoint WAL"),
+    let wal_file = open_checkpoint_file(&wal)?;
+    if durable {
+        sync_file(path, &file)?;
+        if let Some(file) = wal_file {
+            sync_file(&wal, &file)?;
+        }
+        sync_directory(path.parent().context("checkpoint has no directory")?)?;
     }
-    sync_directory(path.parent().context("checkpoint has no directory")?)?;
     Ok(true)
+}
+
+fn open_checkpoint_file(path: &Path) -> Result<Option<File>> {
+    match fs::metadata(path) {
+        Ok(metadata) => ensure!(metadata.is_file(), "checkpoint/WAL is not a regular file"),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("inspect checkpoint before reclamation"),
+    }
+    let file = File::open(path).context("open checkpoint before reclamation")?;
+    ensure!(file.metadata()?.is_file(), "checkpoint/WAL type changed during recovery");
+    Ok(Some(file))
 }
 
 #[cfg(not(windows))]
@@ -498,8 +606,23 @@ fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
 fn logical_bytes(path: &Path) -> Result<u64> {
     let metadata = fs::symlink_metadata(path)?;
+    if is_link_or_reparse(&metadata) {
+        return Ok(0);
+    }
     if metadata.is_file() {
         return Ok(metadata.len());
     }
