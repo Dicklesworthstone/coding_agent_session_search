@@ -52,6 +52,13 @@ def main() -> None:
     if cargo is None:
         raise SystemExit("cargo is required")
     test = root / "tests/connector_openclaw_sqlite.rs"
+    registry = (root / "src/connectors/mod.rs").read_text(encoding="utf-8")
+    seam = "(name, openclaw::with_wal_freshness(name, factory))"
+    if registry.count(seam) != 1:
+        old = "(name, factory)"
+        if not args.qualify_feature or registry.count(old) != 1:
+            raise RuntimeError("application registry no longer uses the tested OpenClaw adapter")
+        registry = registry.replace(old, seam, 1)
     with tempfile.TemporaryDirectory(prefix="cass-openclaw-contract-") as directory:
         work = Path(directory)
         (work / "connectors").mkdir()
@@ -64,6 +71,14 @@ def main() -> None:
 pub mod connectors {
     pub use franken_agent_detection::{Connector, ScanContext, ScanRoot};
     pub mod openclaw;
+    // Same final registry adapter as CASS; unrelated CASS wrappers are not
+    // needed here, and this probe makes no claims about those providers.
+    pub type ConnectorFactory = fn() -> Box<dyn Connector + Send>;
+    pub fn get_connector_factories() -> Vec<(&'static str, ConnectorFactory)> {
+        franken_agent_detection::get_connector_factories().into_iter()
+            .map(|(name, factory)| (name, openclaw::with_wal_freshness(name, factory)))
+            .collect()
+    }
 }
 // The full application calls this private production teardown. Keep it used
 // in this small crate too, without changing or suppressing its diagnostics.
@@ -108,6 +123,7 @@ pub fn shutdown_contract_driver() -> bool { franken_sync::shutdown_driver() }
     if args.candidate_output is not None:
         args.candidate_output.parent.mkdir(parents=True, exist_ok=True)
         args.candidate_output.write_text(manifest, encoding="utf-8")
+        args.candidate_output.with_name("connectors_mod.rs").write_text(registry, encoding="utf-8")
 
 
 if __name__ == "__main__":

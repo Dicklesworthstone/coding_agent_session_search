@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'src/connectors/openclaw.rs'
+      - 'src/connectors/mod.rs'
       - 'src/franken_sync.rs'
       - 'tests/connector_openclaw_sqlite.rs'
       - 'scripts/test_openclaw_contract.py'
@@ -15,6 +16,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   native:
@@ -48,6 +53,7 @@ jobs:
           retention-days: 2
           path: |
             candidate/Cargo.toml
+            candidate/connectors_mod.rs
             src/connectors/openclaw.rs
             tests/connector_openclaw_sqlite.rs
 
@@ -68,6 +74,7 @@ jobs:
             const fs = require('fs');
             for (const [input, path] of [
               ['candidate/Cargo.toml', 'Cargo.toml'],
+              ['candidate/connectors_mod.rs', 'src/connectors/mod.rs'],
               ['src/connectors/openclaw.rs', 'src/connectors/openclaw.rs'],
               ['tests/connector_openclaw_sqlite.rs', 'tests/connector_openclaw_sqlite.rs'],
             ]) {

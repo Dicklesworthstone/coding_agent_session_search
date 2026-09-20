@@ -42,6 +42,18 @@ impl OpenClawConnector {
     }
 }
 
+/// Final registry adapter shared by the application and focused consumer gate.
+pub(super) fn with_wal_freshness(
+    name: &str,
+    factory: fn() -> Box<dyn Connector + Send>,
+) -> fn() -> Box<dyn Connector + Send> {
+    if name == "openclaw" {
+        || Box::new(OpenClawConnector::new())
+    } else {
+        factory
+    }
+}
+
 fn wal_path(database: &Path) -> PathBuf {
     let mut path = database.as_os_str().to_owned();
     path.push("-wal");
@@ -178,7 +190,9 @@ mod tests {
         let before = (fs::read(&database)?, fs::read(&wal)?, fs::metadata(&database)?.modified()?, fs::metadata(&wal)?.modified()?);
         let ctx = ScanContext::with_roots(temp.path().join("cass"), vec![ScanRoot::local(temp.path().to_path_buf())], Some(NEW - 1_000));
         assert!(!file_modified_since(&database, ctx.since_ts), "fixture must exercise the stale database gate");
-        let connector = OpenClawConnector::new();
+        let (_, factory) = crate::connectors::get_connector_factories()
+            .into_iter().find(|(name, _)| *name == "openclaw").unwrap();
+        let connector = factory();
         let sources = connector.discover_source_files(&ctx)?;
         assert!(sources.iter().any(|s| s.source_path == database && s.role == DiscoveredSourceRole::SqliteDatabase));
         assert!(sources.iter().any(|s| s.source_path == wal && s.role == DiscoveredSourceRole::MetadataSidecar && s.required_for_reconstruction));
@@ -192,6 +206,14 @@ mod tests {
         assert!(conversations.iter().any(|c| c.external_id.as_deref() == Some("main/legacy-only")));
         assert_eq!((fs::read(&database)?, fs::read(&wal)?, fs::metadata(&database)?.modified()?, fs::metadata(&wal)?.modified()?), before);
         Ok(())
+    }
+
+    #[test]
+    fn registry_adapter_preserves_other_providers() {
+        fn original() -> Box<dyn Connector + Send> {
+            Box::new(franken_agent_detection::CodexConnector::new())
+        }
+        assert!(std::ptr::fn_addr_eq(with_wal_freshness("codex", original), original as fn() -> Box<dyn Connector + Send>));
     }
 
     #[test]
