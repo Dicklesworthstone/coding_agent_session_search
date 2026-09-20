@@ -431,7 +431,10 @@ fn live_swarm_cli_reads_real_git_and_beads_without_authorizing_claims() {
     assert_eq!(observations["beads"]["source_kind"], "exported-jsonl");
     assert!(observations["beads"]["observed_at_ms"].as_u64().unwrap() > 0);
     let packet = cass(&["swarm", "work-packet", "--json", "--bead", &ready]);
-    assert_eq!(packet["summary"]["bead_id"], ready);
+    assert_eq!(
+        packet["summary"]["bead_id"], ready,
+        "live work packet did not retain the requested fixture bead: {packet:#}"
+    );
     assert_eq!(packet["summary"]["safe_to_start"], false);
     assert_eq!(packet["_meta"]["source_observations"]["git"]["head"], head);
     assert_eq!(
