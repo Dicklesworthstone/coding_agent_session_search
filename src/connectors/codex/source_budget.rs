@@ -6,6 +6,7 @@
 //! entire scan. Any incomplete coverage returns an error, keeping watermarks
 //! conservative. Diagnostics are bounded and source files are never modified.
 
+mod empty_source;
 mod recovery;
 mod snapshot;
 
@@ -82,6 +83,7 @@ struct ScanState {
     snapshot: Option<SourceSnapshot>,
     preflight_error: Option<anyhow::Error>,
     withheld_source: Option<PathBuf>,
+    delivered_conversation: bool,
     incomplete: IncompleteScan,
 }
 
@@ -100,16 +102,20 @@ impl ScanState {
             .validate(path)
     }
 
-    fn finish_pending_source(&self) -> Result<()> {
-        // No conversation means the delivery guard never ran. Validate these
-        // sources when traversal moves on or finishes as well. Stable empty
-        // or metadata-only logs remain valid zero-result scans. A deliberately
-        // budget-rejected source is instead covered by the aggregate error.
+    fn finish_pending_source(&self, progress_tick: Option<&(dyn Fn() + Send + Sync)>) -> Result<()> {
+        // No conversation means enrichment never ran. Metadata stability alone
+        // cannot distinguish valid empty history from a swallowed parse/read
+        // failure in the published dependency. Validate that input separately;
+        // do not invent a conversation or a successful source completion.
         if let Some(path) = self.current_source.as_deref()
             && self.snapshot.is_some()
             && self.withheld_source.as_deref() != Some(path)
         {
             self.validate_current_source(path)?;
+            if !self.delivered_conversation {
+                empty_source::validate(path, progress_tick)?;
+                self.validate_current_source(path)?;
+            }
         }
         Ok(())
     }
@@ -193,13 +199,14 @@ fn scan_with_exclusions(
             if state.preflight_error.is_some() {
                 return false;
             }
-            if let Err(error) = state.finish_pending_source() {
+            if let Err(error) = state.finish_pending_source(ctx.progress_tick.as_deref()) {
                 state.preflight_error = Some(error);
                 return false;
             }
             state.current_source = None;
             state.snapshot = None;
             state.withheld_source = None;
+            state.delivered_conversation = false;
         }
         // GH #486: filter before host hooks, budget rejection, or either parse.
         // Explicit-file roots pass through this hook too. An excluded oversized
@@ -247,6 +254,7 @@ fn scan_with_exclusions(
                 return Ok(());
             }
             state.validate_current_source(&completion.source.source_path)?;
+            state.finish_pending_source(ctx.progress_tick.as_deref())?;
         }
         on_source_complete
             .as_mut()
@@ -282,9 +290,11 @@ fn scan_with_exclusions(
         // must abort even when a caller returns the same concrete error type.
         let source_path = conversation.source_path.clone();
         on_conversation(conversation)?;
+        let mut state = state.borrow_mut();
+        state.delivered_conversation = true;
         // A sink can mutate the source too. Delivery cannot be rolled back
         // here, but the scan must fail and must not certify its fingerprint.
-        state.borrow().validate_current_source(&source_path)
+        state.validate_current_source(&source_path)
     };
     let mut guarded = SourceScanHooks {
         should_scan_source: Some(&mut should_scan),
@@ -295,7 +305,7 @@ fn scan_with_exclusions(
     if let Some(error) = state.preflight_error.take() {
         return Err(error);
     }
-    state.finish_pending_source()?;
+    state.finish_pending_source(ctx.progress_tick.as_deref())?;
     let incomplete = state.incomplete;
     if incomplete.rejected_source_count > 0 {
         return Err(incomplete.into());
