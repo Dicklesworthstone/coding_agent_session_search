@@ -1,6 +1,8 @@
 use super::*;
 use crate::connectors::codex::CodexConnector;
-use franken_agent_detection::{Connector, ScanContext, ScanRoot, SourceCompletion, SourceScanHooks};
+use franken_agent_detection::{
+    Connector, ScanContext, ScanRoot, SourceCompletion, SourceScanHooks,
+};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -11,7 +13,10 @@ fn message(text: &str) -> String {
     )
 }
 
-fn fixture(extension: &str, bytes: &[u8]) -> Result<(tempfile::TempDir, Vec<PathBuf>, ScanContext)> {
+fn fixture(
+    extension: &str,
+    bytes: &[u8],
+) -> Result<(tempfile::TempDir, Vec<PathBuf>, ScanContext)> {
     let temp = tempfile::tempdir()?;
     // FAD sorts discovered paths, even with explicit roots. Keep the failed
     // source in the middle so the ordered assertions prove later-source work.
@@ -37,8 +42,16 @@ fn zero_message_failures_do_not_report_success_or_starve_healthy_sources() -> Re
         ("json", b"", io::ErrorKind::UnexpectedEof),
         ("json", b"{\"items\":[", io::ErrorKind::UnexpectedEof),
         ("json", b"{\"items\":oops}", io::ErrorKind::InvalidData),
-        ("json", b"{\"items\":[]} trailing", io::ErrorKind::InvalidData),
-        ("json", b"{\"items\":[\"\xff\"]}", io::ErrorKind::InvalidData),
+        (
+            "json",
+            b"{\"items\":[]} trailing",
+            io::ErrorKind::InvalidData,
+        ),
+        (
+            "json",
+            b"{\"items\":[\"\xff\"]}",
+            io::ErrorKind::InvalidData,
+        ),
         ("jsonl", b"{\"type\":", io::ErrorKind::UnexpectedEof),
         ("jsonl", b"\xff\n", io::ErrorKind::InvalidData),
         (
@@ -114,18 +127,21 @@ fn valid_empty_sources_and_historical_jsonl_tolerance_are_preserved() -> Result<
 fn host_veto_prevents_validation_of_intentionally_skipped_input() -> Result<()> {
     for extension in ["json", "jsonl"] {
         let (_temp, paths, ctx) = fixture(extension, b"\xff")?;
-        let mut predicate = |source: &franken_agent_detection::DiscoveredSourceFile| {
-            source.source_path != paths[1]
-        };
+        let mut predicate =
+            |source: &franken_agent_detection::DiscoveredSourceFile| source.source_path != paths[1];
         let mut hooks = SourceScanHooks {
             should_scan_source: Some(&mut predicate),
             on_source_complete: None,
         };
         let mut delivered = Vec::new();
-        CodexConnector::new().scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {
-            delivered.push(conversation.source_path);
-            Ok(())
-        })?;
+        CodexConnector::new().scan_with_source_boundaries(
+            &ctx,
+            &mut hooks,
+            &mut |conversation| {
+                delivered.push(conversation.source_path);
+                Ok(())
+            },
+        )?;
         assert_eq!(delivered, [paths[0].clone(), paths[2].clone()]);
     }
     Ok(())
@@ -172,7 +188,10 @@ fn zero_output_validation_is_bounded_and_checks_its_opened_snapshot() -> Result<
     fs::File::create(&paths[1])?.set_len(MAX_AUGMENT_ROLLOUT_BYTES + 1)?;
     let error = validate(&paths[1], None).unwrap_err();
     assert_eq!(
-        error.downcast_ref::<IncompleteScan>().unwrap().rejected_source_count,
+        error
+            .downcast_ref::<IncompleteScan>()
+            .unwrap()
+            .rejected_source_count,
         1
     );
     Ok(())

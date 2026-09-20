@@ -102,7 +102,10 @@ impl ScanState {
             .validate(path)
     }
 
-    fn finish_pending_source(&self, progress_tick: Option<&(dyn Fn() + Send + Sync)>) -> Result<()> {
+    fn finish_pending_source(
+        &self,
+        progress_tick: Option<&(dyn Fn() + Send + Sync)>,
+    ) -> Result<()> {
         // No conversation means enrichment never ran. Metadata stability alone
         // cannot distinguish valid empty history from a swallowed parse/read
         // failure in the published dependency. Validate that input separately;

@@ -16,9 +16,14 @@ use anyhow::{Context, Result};
 
 use super::{IncompleteScan, MAX_AUGMENT_ROLLOUT_BYTES, RejectedSource};
 
-pub(super) fn validate(path: &Path, progress_tick: Option<&(dyn Fn() + Send + Sync)>) -> Result<()> {
+pub(super) fn validate(
+    path: &Path,
+    progress_tick: Option<&(dyn Fn() + Send + Sync)>,
+) -> Result<()> {
     let file = File::open(path).context("open zero-output Codex source")?;
-    let before = file.metadata().context("inspect zero-output Codex source")?;
+    let before = file
+        .metadata()
+        .context("inspect zero-output Codex source")?;
     if !before.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -61,7 +66,9 @@ pub(super) fn validate(path: &Path, progress_tick: Option<&(dyn Fn() + Send + Sy
         )
         .into());
     }
-    let opened = file.metadata().context("recheck zero-output Codex source")?;
+    let opened = file
+        .metadata()
+        .context("recheck zero-output Codex source")?;
     let named = fs::metadata(path).context("recheck zero-output Codex source path")?;
     if !super::super::same_rollout_snapshot(&before, &opened)?
         || !super::super::same_rollout_snapshot(&before, &named)?
