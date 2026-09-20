@@ -309,3 +309,18 @@ fn malformed_and_future_metadata_fail_closed_before_any_deletion() -> Result<()>
     }
     Ok(())
 }
+
+#[test]
+fn lifecycle_boundary_preserves_associated_method_calls() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let indexer = SemanticIndexer::new("hash", None)?.with_batch_size(2)?;
+    assert_eq!(SemanticIndexer::batch_size(&indexer), 2);
+    assert_eq!(SemanticIndexer::embedder_id(&indexer), "fnv1a-384");
+    assert_eq!(SemanticIndexer::embedder_dimension(&indexer), 384);
+    let embedded = SemanticIndexer::embed_messages(&indexer, &rows(1))?;
+    let index = SemanticIndexer::build_and_save_index(&indexer, embedded, temp.path())?;
+    assert_eq!(index.record_count(), 1);
+    Ok(())
+}
+
+mod recovery;

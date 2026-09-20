@@ -9,8 +9,8 @@ use anyhow::{Context, Result, bail, ensure};
 use frankensearch::index::wal_path_for;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use sha2::{Digest, Sha256};
 
+use crate::search::semantic_manifest::selection::SemanticSelectionMetadata;
 use crate::search::semantic_manifest::{
     BuildCheckpoint, MANIFEST_FORMAT_VERSION, SemanticCurrentPointerV1, SemanticGenerationManifestV1,
     SemanticManifest, SemanticShardManifest,
@@ -91,7 +91,7 @@ impl BackfillArtifacts {
     ) -> Result<BackfillArtifactReclaimReport> {
         let root = self.data_dir.join(VECTOR_INDEX_DIR);
         let mut protected = ProtectedPaths::default();
-        if let Some((manifest, _)) =
+        if let Some(manifest) =
             read_durable_json::<SemanticManifest>(&SemanticManifest::path(&self.data_dir))?
         {
             ensure!(
@@ -118,7 +118,7 @@ impl BackfillArtifacts {
         if let Some(output) = output {
             protected.index(output)?;
         }
-        if let Some((shards, _)) =
+        if let Some(shards) =
             read_durable_json::<SemanticShardManifest>(&SemanticShardManifest::path(&self.data_dir))?
         {
             ensure!(
@@ -132,7 +132,7 @@ impl BackfillArtifacts {
                 }
             }
         }
-        protect_selected_generation(&root, &mut protected)?;
+        protect_selected_generation(&self.data_dir, &mut protected)?;
 
         // Plan the complete sweep before the first removal. Never traverse
         // generations/, shards/, quarantine/backup directories, or foreign data.
@@ -383,7 +383,7 @@ fn normalize(path: &Path) -> PathBuf {
     result
 }
 
-fn read_durable_json<T: DeserializeOwned>(path: &Path) -> Result<Option<(T, String)>> {
+fn read_durable_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -414,34 +414,29 @@ fn read_durable_json<T: DeserializeOwned>(path: &Path) -> Result<Option<(T, Stri
     // Pin the selected metadata and directory before deleting superseded data.
     sync_file(path, &file)?;
     sync_directory(path.parent().context("manifest has no directory")?)?;
-    Ok(Some((value, format!("{:x}", Sha256::digest(&bytes)))))
+    Ok(Some(value))
 }
 
-fn protect_selected_generation(root: &Path, protected: &mut ProtectedPaths) -> Result<()> {
-    let Some((pointer, _)) =
-        read_durable_json::<SemanticCurrentPointerV1>(&root.join("current.json"))?
-    else {
+fn protect_selected_generation(data_dir: &Path, protected: &mut ProtectedPaths) -> Result<()> {
+    let pointer_path = SemanticCurrentPointerV1::path(data_dir);
+    let Some(pointer) = read_durable_json::<SemanticCurrentPointerV1>(&pointer_path)? else {
         return Ok(());
     };
+    // Share serving's exact bounded pointer/manifest authentication. This does
+    // not open the potentially multi-GB vector artifacts or invent a second
+    // digest/path contract for garbage collection.
+    let selected = SemanticSelectionMetadata::read(data_dir, None)?;
     ensure!(
-        pointer.schema_version == 1,
-        "unsupported semantic current pointer; refusing reclamation"
+        selected.pointer == pointer,
+        "semantic selection changed during recovery; refusing reclamation"
     );
-    let id = Path::new(&pointer.generation_id);
+    let manifest = read_durable_json::<SemanticGenerationManifestV1>(
+        &selected.generation_dir.join("manifest.json"),
+    )?
+    .context("selected generation manifest missing; refusing artifact reclamation")?;
     ensure!(
-        id.components().count() == 1
-            && matches!(id.components().next(), Some(Component::Normal(_))),
-        "unsafe selected semantic generation id"
-    );
-    let generation = root.join("generations").join(id);
-    let (manifest, digest) =
-        read_durable_json::<SemanticGenerationManifestV1>(&generation.join("manifest.json"))?
-            .context("selected generation manifest missing; refusing artifact reclamation")?;
-    ensure!(
-        matches!(manifest.schema_version, 1 | 2)
-            && manifest.generation_id == pointer.generation_id
-            && digest == pointer.manifest_sha256,
-        "selected generation identity is invalid; refusing artifact reclamation"
+        selected.manifest == manifest,
+        "semantic manifest changed during recovery; refusing reclamation"
     );
     for artifact in manifest.artifacts {
         let relative = Path::new(&artifact.relative_path);
@@ -452,7 +447,7 @@ fn protect_selected_generation(root: &Path, protected: &mut ProtectedPaths) -> R
                     .all(|component| matches!(component, Component::Normal(_))),
             "unsafe selected semantic artifact path"
         );
-        protected.index(&generation.join(relative))?;
+        protected.index(&selected.generation_dir.join(relative))?;
     }
     Ok(())
 }

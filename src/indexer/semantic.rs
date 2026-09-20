@@ -6,12 +6,12 @@
 //! making that rename durable, so it must not authorize retiring older staging.
 
 mod artifacts;
+mod delegate;
 mod engine;
 
 pub use artifacts::{BackfillArtifactReclaimReport, reclaim_backfill_artifacts};
 pub use engine::*;
 
-use std::ops::Deref;
 use std::path::Path;
 
 use anyhow::Result;
@@ -24,14 +24,6 @@ use crate::storage::sqlite::FrankenStorage;
 /// Embedding and non-backfill operations retain the engine's existing API.
 pub struct SemanticIndexer {
     inner: engine::SemanticIndexer,
-}
-
-impl Deref for SemanticIndexer {
-    type Target = engine::SemanticIndexer;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
 }
 
 impl SemanticIndexer {

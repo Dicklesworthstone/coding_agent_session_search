@@ -24,7 +24,7 @@ def main():
     revision = subprocess.check_output(['git','-C',str(upstream),'rev-parse','HEAD'], text=True).strip()
     if revision != helper.FS_REVISION: raise ValueError('Unexpected upstream revision')
     block, function = helper.block, helper.function
-    indexer_path = args.indexer_source or root / 'src/indexer/semantic.rs'
+    indexer_path = args.indexer_source or root / 'src/indexer/semantic/engine.rs'
     indexer = indexer_path.read_text()
     manifest = (root / 'src/search/semantic_manifest.rs').read_text()
     vector = (root / 'src/search/vector_index.rs').read_text()
