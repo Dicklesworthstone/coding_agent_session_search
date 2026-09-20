@@ -452,6 +452,7 @@ fn collect_live_mail(repo: &Path, started: Instant) -> Result<Value, String> {
         .map_err(|_| "cannot identify Mail project")?;
     let project = project.to_str().ok_or("Mail project is not UTF-8")?;
     let encoded: String = project.bytes().map(|byte| format!("%{byte:02X}")).collect();
+    crate::ensure_rustls_crypto_provider();
     let client = reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
