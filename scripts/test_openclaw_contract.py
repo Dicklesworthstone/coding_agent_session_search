@@ -91,6 +91,8 @@ pub fn shutdown_contract_driver() -> bool { franken_sync::shutdown_driver() }
             'name = "coding_agent_search"', 'path = "lib.rs"',
             '[[test]]', 'name = "connector_openclaw_sqlite"',
             'path = ' + json.dumps(test.as_posix(), ensure_ascii=False),
+            '[[test]]', 'name = "connector_openclaw"',
+            'path = ' + json.dumps((root / "tests/connector_openclaw.rs").as_posix(), ensure_ascii=False),
             '[dependencies]', *dependencies, '[profile.dev.package."*"]', 'opt-level = 1',
             '[lints.rust]', 'unsafe_code = "forbid"', '',
         ]), encoding="utf-8")
@@ -99,7 +101,7 @@ pub fn shutdown_contract_driver() -> bool { franken_sync::shutdown_driver() }
                 shutil.copyfile(root / name, work / name)
         env = os.environ.copy()
         env["CARGO_TARGET_DIR"] = str(root / "target/openclaw-contract")
-        env["RUST_MIN_STACK"] = "16777216"
+        env.setdefault("RUST_MIN_STACK", "134217728")
         env["CASS_EXCLUDE_PATHS"] = ""
         metadata = json.loads(subprocess.check_output([
             cargo, "metadata", "--manifest-path", str(project), "--format-version", "1",
@@ -115,7 +117,7 @@ pub fn shutdown_contract_driver() -> bool { franken_sync::shutdown_driver() }
                 print("LOCKED_CONSUMER", key, flush=True)
         for command in [
             [cargo, "test", "--locked", "--manifest-path", str(project), "--lib", "connectors::openclaw::tests"],
-            [cargo, "test", "--locked", "--manifest-path", str(project), "--test", "connector_openclaw_sqlite"],
+            [cargo, "test", "--locked", "--manifest-path", str(project), "--test", "connector_openclaw_sqlite", "--test", "connector_openclaw"],
             [cargo, "clippy", "--locked", "--manifest-path", str(project), "--all-targets", "--", "-D", "warnings"],
         ]:
             print("+", " ".join(command), flush=True)
