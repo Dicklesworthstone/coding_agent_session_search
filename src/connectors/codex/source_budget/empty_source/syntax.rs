@@ -65,8 +65,8 @@ impl<'de> Visitor<'de> for JsonVisitor {
 
 #[cfg(test)]
 mod tests {
+    use super::super::validate_legacy;
     use super::*;
-    use crate::connectors::codex::implementation::source_budget::empty_source::validate_legacy;
     use std::io::{self, BufReader, Cursor, Read};
 
     #[test]
@@ -126,7 +126,10 @@ mod tests {
         impl Read for FailingRead {
             fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
                 if self.0.position() == self.0.get_ref().len() as u64 {
-                    Err(io::Error::new(io::ErrorKind::PermissionDenied, "private reader detail"))
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "private reader detail",
+                    ))
                 } else {
                     self.0.read(buffer)
                 }
@@ -134,7 +137,10 @@ mod tests {
         }
         let mut reader = BufReader::new(FailingRead(Cursor::new(b"{\"items\":[]}".to_vec())));
         let error = validate_legacy(&mut reader).unwrap_err();
-        assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::PermissionDenied
+        );
         assert!(!error.to_string().contains("private reader detail"));
     }
 }

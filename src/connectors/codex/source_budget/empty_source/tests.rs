@@ -13,10 +13,12 @@ fn message(text: &str) -> String {
 
 fn fixture(extension: &str, bytes: &[u8]) -> Result<(tempfile::TempDir, Vec<PathBuf>, ScanContext)> {
     let temp = tempfile::tempdir()?;
+    // FAD sorts discovered paths, even with explicit roots. Keep the failed
+    // source in the middle so the ordered assertions prove later-source work.
     let paths = vec![
-        temp.path().join("rollout-before.jsonl"),
-        temp.path().join(format!("rollout-empty.{extension}")),
-        temp.path().join("rollout-after.jsonl"),
+        temp.path().join("rollout-a-before.jsonl"),
+        temp.path().join(format!("rollout-b-empty.{extension}")),
+        temp.path().join("rollout-c-after.jsonl"),
     ];
     fs::write(&paths[0], message("before"))?;
     fs::write(&paths[1], bytes)?;
@@ -93,7 +95,10 @@ fn valid_empty_sources_and_historical_jsonl_tolerance_are_preserved() -> Result<
         ("jsonl", ""),
         ("jsonl", " \r\n\n"),
         ("jsonl", "{\"type\":\"session_meta\",\"payload\":{}}"),
-        ("jsonl", "\u{feff}{\"type\":\"session_meta\",\"payload\":{}}\r\nnot-json\n"),
+        (
+            "jsonl",
+            "\u{feff}{\"type\":\"session_meta\",\"payload\":{}}\r\nnot-json\n",
+        ),
     ] {
         let (_temp, paths, ctx) = fixture(extension, content.as_bytes())?;
         let conversations = CodexConnector::new().scan(&ctx)?;
@@ -160,9 +165,15 @@ fn zero_output_validation_is_bounded_and_checks_its_opened_snapshot() -> Result<
         }
     };
     let error = validate(&paths[1], Some(&tick)).unwrap_err();
-    assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), io::ErrorKind::Interrupted);
+    assert_eq!(
+        error.downcast_ref::<io::Error>().unwrap().kind(),
+        io::ErrorKind::Interrupted
+    );
     fs::File::create(&paths[1])?.set_len(MAX_AUGMENT_ROLLOUT_BYTES + 1)?;
     let error = validate(&paths[1], None).unwrap_err();
-    assert_eq!(error.downcast_ref::<IncompleteScan>().unwrap().rejected_source_count, 1);
+    assert_eq!(
+        error.downcast_ref::<IncompleteScan>().unwrap().rejected_source_count,
+        1
+    );
     Ok(())
 }
