@@ -5,6 +5,11 @@
 //! continue after source-local failures, but consumer errors still abort the
 //! entire scan. Any incomplete coverage returns an error, keeping watermarks
 //! conservative. Diagnostics are bounded and source files are never modified.
+//!
+//! GH #489: CASS_CODEX_MAX_SOURCE_BYTES explicitly raises the admission budget
+//! for modern .jsonl rollouts, up to 1 GiB (default 100 MiB). Legacy .json keeps
+//! the published parser's 100 MiB ceiling. This is a source-byte admission
+//! limit, not a process RSS limit or a deadline for the upstream primary scan.
 
 mod empty_source;
 mod recovery;
@@ -26,11 +31,79 @@ use super::{
 use snapshot::SourceSnapshot;
 
 const MAX_REJECTION_SAMPLES: usize = 32;
+const SOURCE_LIMIT_ENV: &str = "CASS_CODEX_MAX_SOURCE_BYTES";
+const MAX_CONFIGURED_SOURCE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// One immutable policy for discovery, every source attempt and both passes.
+#[derive(Debug, Clone, Copy)]
+struct ScanLimits {
+    jsonl_bytes: u64,
+}
+
+impl Default for ScanLimits {
+    fn default() -> Self {
+        Self {
+            jsonl_bytes: MAX_AUGMENT_ROLLOUT_BYTES,
+        }
+    }
+}
+
+impl ScanLimits {
+    fn invalid() -> anyhow::Error {
+        anyhow::anyhow!(
+            "{SOURCE_LIMIT_ENV} must be a decimal byte count from 1 through {MAX_CONFIGURED_SOURCE_BYTES}; unset it for the 100 MiB default"
+        )
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        let value = value.trim();
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(Self::invalid());
+        }
+        let jsonl_bytes = value.parse::<u64>().map_err(|_| Self::invalid())?;
+        if !(1..=MAX_CONFIGURED_SOURCE_BYTES).contains(&jsonl_bytes) {
+            return Err(Self::invalid());
+        }
+        Ok(Self { jsonl_bytes })
+    }
+
+    fn from_env() -> Result<Self> {
+        match dotenvy::var(SOURCE_LIMIT_ENV) {
+            Ok(value) => Self::parse(&value),
+            Err(dotenvy::Error::EnvVar(std::env::VarError::NotPresent)) => Ok(Self::default()),
+            // Do not echo malformed configuration or treat non-Unicode as unset.
+            Err(_) => Err(Self::invalid()),
+        }
+    }
+
+    fn for_path(self, path: &Path) -> u64 {
+        // FAD 0.3.0 selects its streaming parser only for lowercase jsonl.
+        // Its other branch uses read_capped; raising that ceiling here would
+        // silently certify skipped legacy data as successfully consumed.
+        if path.extension().is_some_and(|extension| extension == "jsonl") {
+            self.jsonl_bytes
+        } else {
+            self.jsonl_bytes.min(MAX_AUGMENT_ROLLOUT_BYTES)
+        }
+    }
+
+    fn incomplete(self) -> IncompleteScan {
+        IncompleteScan {
+            limit_bytes: self.jsonl_bytes,
+            ..IncompleteScan::default()
+        }
+    }
+}
+
+struct ScanAdmission {
+    exclusions: ScanExclusions,
+    limits: ScanLimits,
+}
 
 /// A precise rejection type; never identify a recoverable error by its text or
 /// by the broad `InvalidData` kind (which also covers corruption/invalid UTF-8).
 #[derive(Debug, thiserror::Error)]
-#[error("Codex enrichment source exceeds the 100 MiB read budget ({observed_bytes} bytes)")]
+#[error("Codex enrichment source exceeds its admitted read budget ({observed_bytes} bytes)")]
 pub(super) struct EnrichmentBudgetExceeded {
     pub(super) observed_bytes: u64,
 }
@@ -39,6 +112,9 @@ pub(super) struct EnrichmentBudgetExceeded {
 struct RejectedSource {
     source_path: String,
     observed_bytes: u64,
+    /// Present only when this format has a lower limit than the scan policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit_bytes: Option<u64>,
 }
 
 /// Bounded, source-specific diagnostics carried by the final scan error. Only
@@ -79,6 +155,7 @@ impl std::error::Error for IncompleteScan {}
 
 #[derive(Default)]
 struct ScanState {
+    limits: ScanLimits,
     current_source: Option<PathBuf>,
     snapshot: Option<SourceSnapshot>,
     preflight_error: Option<anyhow::Error>,
@@ -116,7 +193,7 @@ impl ScanState {
         {
             self.validate_current_source(path)?;
             if !self.delivered_conversation {
-                empty_source::validate(path, progress_tick)?;
+                empty_source::validate_with_limit(path, progress_tick, self.limits.for_path(path))?;
                 self.validate_current_source(path)?;
             }
         }
@@ -131,6 +208,8 @@ impl ScanState {
             self.incomplete.rejected_sources.push(RejectedSource {
                 source_path: source.to_string_lossy().into_owned(),
                 observed_bytes,
+                limit_bytes: (self.limits.for_path(source) != self.incomplete.limit_bytes)
+                    .then_some(self.limits.for_path(source)),
             });
         } else {
             self.incomplete.omitted_source_count =
@@ -139,7 +218,12 @@ impl ScanState {
     }
 }
 
+#[cfg(test)]
 fn observed_over_limit(source: &DiscoveredSourceFile) -> Option<u64> {
+    observed_over_limit_with_limit(source, MAX_AUGMENT_ROLLOUT_BYTES)
+}
+
+fn observed_over_limit_with_limit(source: &DiscoveredSourceFile, limit: u64) -> Option<u64> {
     if source.provider_slug != "codex"
         || source.role != DiscoveredSourceRole::PrimarySessionLog
         || !source
@@ -152,11 +236,9 @@ fn observed_over_limit(source: &DiscoveredSourceFile) -> Option<u64> {
     {
         return None;
     }
-    // Both formats share the same cap. The published legacy parser silently
-    // skips oversized JSON; contain it here so the scan reports incomplete
-    // coverage and continues with later healthy sources, just like JSONL.
+    // Refuse before primary parsing; never emit a truncated prefix as complete.
     let metadata = std::fs::metadata(&source.source_path).ok()?;
-    (metadata.is_file() && metadata.len() > MAX_AUGMENT_ROLLOUT_BYTES).then_some(metadata.len())
+    (metadata.is_file() && metadata.len() > limit).then_some(metadata.len())
 }
 
 pub(super) fn scan(
@@ -177,19 +259,26 @@ fn scan_guarded(
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     enrich: impl FnMut(&mut NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
-    let exclusions = ScanExclusions::from_env();
-    scan_with_exclusions(inner, ctx, hooks, on_conversation, &exclusions, enrich)
+    let admission = ScanAdmission {
+        exclusions: ScanExclusions::from_env(),
+        limits: ScanLimits::default(),
+    };
+    scan_with_admission(inner, ctx, hooks, on_conversation, &admission, enrich)
 }
 
-fn scan_with_exclusions(
+fn scan_with_admission(
     inner: &dyn Connector,
     ctx: &ScanContext,
     hooks: &mut SourceScanHooks<'_>,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
-    exclusions: &ScanExclusions,
+    admission: &ScanAdmission,
     mut enrich: impl FnMut(&mut NormalizedConversation) -> Result<()>,
 ) -> Result<()> {
-    let state = RefCell::new(ScanState::default());
+    let state = RefCell::new(ScanState {
+        limits: admission.limits,
+        incomplete: admission.limits.incomplete(),
+        ..ScanState::default()
+    });
     let SourceScanHooks {
         should_scan_source,
         on_source_complete,
@@ -214,7 +303,7 @@ fn scan_with_exclusions(
         // GH #486: filter before host hooks, budget rejection, or either parse.
         // Explicit-file roots pass through this hook too. An excluded oversized
         // file must not turn an otherwise successful scan into IncompleteScan.
-        if exclusions.excludes(&source.source_path) {
+        if admission.exclusions.excludes(&source.source_path) {
             return false;
         }
         // Preserve durable reuse, operator filters, pending batch flushes and
@@ -227,14 +316,15 @@ fn scan_with_exclusions(
             return false;
         }
         state.borrow_mut().current_source = Some(source.source_path.clone());
-        if let Some(size) = observed_over_limit(source) {
+        let limit = admission.limits.for_path(&source.source_path);
+        if let Some(size) = observed_over_limit_with_limit(source, limit) {
             state.borrow_mut().reject(&source.source_path, size);
             return false;
         }
         // One observation spans BOTH primary parsing and CASS enrichment.
         // Per-pass checks alone allow a rewrite between the two reads to mix
         // old primary messages with new enrichment in the same conversation.
-        match SourceSnapshot::capture(&source.source_path) {
+        match SourceSnapshot::capture_with_limit(&source.source_path, limit) {
             Ok(snapshot) => state.borrow_mut().snapshot = Some(snapshot),
             Err(error) => {
                 let mut state = state.borrow_mut();
@@ -273,7 +363,27 @@ fn scan_with_exclusions(
         state
             .borrow()
             .validate_current_source(&conversation.source_path)?;
-        if let Err(error) = enrich(&mut conversation) {
+        let enriched = enrich(&mut conversation).or_else(|error| {
+            let state = state.borrow();
+            let snapshot = state
+                .snapshot
+                .as_ref()
+                .context("Codex source was not admitted for enrichment")?;
+            // The existing enrichment entry point refuses >100 MiB BEFORE
+            // parsing. Only that precise refusal can use the operator's larger
+            // budget. Reuse its actual parser and our retained source handle,
+            // not a reduced alternate parser or a copied/truncated rollout.
+            if error.is::<EnrichmentBudgetExceeded>()
+                && snapshot.len() > MAX_AUGMENT_ROLLOUT_BYTES
+                && admission.limits.for_path(&conversation.source_path) > MAX_AUGMENT_ROLLOUT_BYTES
+            {
+                state.validate_current_source(&conversation.source_path)?;
+                snapshot.enrich(&mut conversation, ctx.progress_tick.as_deref())
+            } else {
+                Err(error)
+            }
+        });
+        if let Err(error) = enriched {
             // The file may cross the cap after preflight. Contain that specific
             // owned enrichment error only when the enclosing source is known;
             // interpose on completion so FAD cannot certify the discarded data.
@@ -326,3 +436,6 @@ mod tests {
     use super::scan_guarded as scan;
     include!("source_budget/tests.rs");
 }
+
+#[cfg(test)]
+mod limit_tests;

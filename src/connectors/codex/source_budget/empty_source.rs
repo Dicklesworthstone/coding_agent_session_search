@@ -14,11 +14,22 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use super::{IncompleteScan, MAX_AUGMENT_ROLLOUT_BYTES, RejectedSource};
+use super::{IncompleteScan, RejectedSource};
+#[cfg(test)]
+use super::MAX_AUGMENT_ROLLOUT_BYTES;
 
+#[cfg(test)]
 pub(super) fn validate(
     path: &Path,
     progress_tick: Option<&(dyn Fn() + Send + Sync)>,
+) -> Result<()> {
+    validate_with_limit(path, progress_tick, MAX_AUGMENT_ROLLOUT_BYTES)
+}
+
+pub(super) fn validate_with_limit(
+    path: &Path,
+    progress_tick: Option<&(dyn Fn() + Send + Sync)>,
+    limit: u64,
 ) -> Result<()> {
     let file = File::open(path).context("open zero-output Codex source")?;
     let before = file
@@ -31,12 +42,14 @@ pub(super) fn validate(
         )
         .into());
     }
-    if before.len() > MAX_AUGMENT_ROLLOUT_BYTES {
+    if before.len() > limit {
         return Err(IncompleteScan {
+            limit_bytes: limit,
             rejected_source_count: 1,
             rejected_sources: vec![RejectedSource {
                 source_path: path.to_string_lossy().into_owned(),
                 observed_bytes: before.len(),
+                limit_bytes: None,
             }],
             ..IncompleteScan::default()
         }

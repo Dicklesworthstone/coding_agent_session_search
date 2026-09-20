@@ -14,8 +14,8 @@ use serde::Serialize;
 use crate::connectors::codex::archives;
 use super::{
     Connector, DiscoveredSourceFile, DiscoveredSourceRole, IncompleteScan, MAX_REJECTION_SAMPLES,
-    NormalizedConversation, RejectedSource, Result, ScanContext, ScanExclusions, SourceCompletion,
-    SourceScanHooks, scan_with_exclusions,
+    NormalizedConversation, RejectedSource, Result, ScanAdmission, ScanContext, ScanExclusions,
+    ScanLimits, SourceCompletion, SourceScanHooks, scan_with_admission,
 };
 
 #[derive(Debug, Serialize)]
@@ -68,6 +68,7 @@ impl Failures {
                 .rejected_source_count
                 .saturating_add(budget.rejected_source_count);
             let available = MAX_REJECTION_SAMPLES - self.budgets.rejected_sources.len();
+            let configured_limit = self.budgets.limit_bytes;
             self.budgets.rejected_sources.extend(
                 budget
                     .rejected_sources
@@ -76,6 +77,10 @@ impl Failures {
                     .map(|sample| RejectedSource {
                         source_path: sample.source_path.clone(),
                         observed_bytes: sample.observed_bytes,
+                        limit_bytes: {
+                            let actual = sample.limit_bytes.unwrap_or(budget.limit_bytes);
+                            (actual != configured_limit).then_some(actual)
+                        },
                     }),
             );
             self.budgets.omitted_source_count = self
@@ -181,7 +186,7 @@ fn scan_source(
     source: &DiscoveredSourceFile,
     hooks: &mut SourceScanHooks<'_>,
     on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
-    exclusions: &ScanExclusions,
+    admission: &ScanAdmission,
     enrich: &mut dyn FnMut(&mut NormalizedConversation) -> Result<()>,
 ) -> (Result<()>, bool) {
     let consumer_failed = Cell::new(false);
@@ -228,12 +233,12 @@ fn scan_source(
         should_scan_source: Some(&mut before),
         on_source_complete: Some(&mut complete),
     };
-    let result = scan_with_exclusions(
+    let result = scan_with_admission(
         inner,
         &scoped_context(ctx, source),
         &mut guarded,
         &mut deliver,
-        exclusions,
+        admission,
         enrich,
     )
     .and_then(|()| {
@@ -267,11 +272,19 @@ pub(super) fn scan(
         inner.supports_source_boundaries(),
         "Codex recovery requires source boundaries"
     );
-    let exclusions = ScanExclusions::from_env();
+    // Resolve once, before discovery or callbacks can perform any work.
+    let limits = ScanLimits::from_env()?;
+    let admission = ScanAdmission {
+        exclusions: ScanExclusions::from_env(),
+        limits,
+    };
     let sources = archives::discover(inner, ctx)?;
-    let mut failures = Failures::default();
+    let mut failures = Failures {
+        budgets: limits.incomplete(),
+        ..Failures::default()
+    };
     for source in sources {
-        if exclusions.excludes(&source.source_path) {
+        if admission.exclusions.excludes(&source.source_path) {
             continue;
         }
         anyhow::ensure!(
@@ -285,7 +298,7 @@ pub(super) fn scan(
             &source,
             hooks,
             on_conversation,
-            &exclusions,
+            &admission,
             &mut enrich,
         );
         if let Err(error) = result {

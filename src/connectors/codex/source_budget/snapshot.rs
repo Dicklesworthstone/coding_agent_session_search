@@ -4,7 +4,7 @@
 //! protection against in-place edits that preserve all checked metadata.
 
 use std::fs::{self, File, Metadata};
-use std::io;
+use std::io::{self, BufReader, Read, Seek};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -15,7 +15,12 @@ pub(super) struct SourceSnapshot {
 }
 
 impl SourceSnapshot {
+    #[cfg(test)]
     pub(super) fn capture(path: &Path) -> Result<Self> {
+        Self::capture_with_limit(path, super::MAX_AUGMENT_ROLLOUT_BYTES)
+    }
+
+    pub(super) fn capture_with_limit(path: &Path, limit: u64) -> Result<Self> {
         let file =
             File::open(path).with_context(|| format!("open Codex source snapshot {path:?}"))?;
         let before = file.metadata().context("inspect Codex source snapshot")?;
@@ -26,13 +31,44 @@ impl SourceSnapshot {
             )
             .into());
         }
-        if before.len() > super::MAX_AUGMENT_ROLLOUT_BYTES {
+        if before.len() > limit {
             return Err(super::EnrichmentBudgetExceeded {
                 observed_bytes: before.len(),
             }
             .into());
         }
         Ok(Self { file, before })
+    }
+
+    pub(super) fn len(&self) -> u64 {
+        self.before.len()
+    }
+
+    /// Enrich the complete admitted prefix using the existing CASS parser.
+    /// No pathname reopen, temporary source copy, truncation or second model of
+    /// Codex messages. The spanning snapshot guard still surrounds both passes.
+    pub(super) fn enrich(
+        &self,
+        conversation: &mut super::NormalizedConversation,
+        progress_tick: Option<&(dyn Fn() + Send + Sync)>,
+    ) -> Result<()> {
+        self.validate(&conversation.source_path)?;
+        let mut file = &self.file;
+        file.rewind().context("rewind admitted Codex source")?;
+        let mut reader = BufReader::new(file.take(self.before.len()));
+        let consumed = super::super::augment_modern_codex_reader(
+            conversation,
+            progress_tick,
+            &mut reader,
+        )?;
+        if consumed != self.before.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "admitted Codex source was truncated while enriching",
+            )
+            .into());
+        }
+        self.validate(&conversation.source_path)
     }
 
     pub(super) fn validate(&self, path: &Path) -> Result<()> {
