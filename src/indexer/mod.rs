@@ -8917,16 +8917,6 @@ fn index_meta_fingerprint(index_path: &Path) -> Result<Option<String>> {
     crate::search::tantivy::searchable_index_fingerprint(index_path)
 }
 
-fn completed_lexical_rebuild_meta_fingerprint(
-    state: &LexicalRebuildState,
-    index_path: &Path,
-) -> Result<Option<String>> {
-    match &state.committed_meta_fingerprint {
-        Some(fingerprint) => Ok(Some(fingerprint.clone())),
-        None => index_meta_fingerprint(index_path),
-    }
-}
-
 /// GH #457: the post-publish proof that a rebuild's generation serves exactly
 /// the documents it counted. A count that cannot be observed — no manifest
 /// landed, or no reader can open what did — is a FAILED proof, never a
@@ -9172,7 +9162,18 @@ fn reconcile_pending_lexical_commit(
         return Ok(state);
     };
 
-    let current_meta_fingerprint = index_meta_fingerprint(index_path)?;
+    // The checkpoint lives beside the old live generation, but a staged
+    // rebuild commits into its scratch sibling. Comparing the pending commit
+    // with the unrelated live MANIFEST can promote rows that never committed,
+    // or roll back a commit that did. Recovery must observe the same content
+    // directory that commit_lexical_rebuild_progress fingerprinted.
+    let scratch_path = staged_lexical_rebuild_scratch_path(index_path);
+    let content_path = if state.is_incomplete() && scratch_path.is_dir() {
+        scratch_path.as_path()
+    } else {
+        index_path
+    };
+    let current_meta_fingerprint = index_meta_fingerprint(content_path)?;
     if pending_commit_landed(
         pending.base_meta_fingerprint.as_deref(),
         current_meta_fingerprint.as_deref(),
@@ -24449,7 +24450,10 @@ fn rebuild_tantivy_from_db_with_options(
         )
         .run("reuse_completed_generation", || {
             crate::search::tantivy::validate_searchable_index_contract(&index_path)?;
-            verify_published_lexical_doc_count(&index_path, rebuild_state.indexed_docs, "completed")
+            verify_published_lexical_doc_count(&index_path, rebuild_state.indexed_docs, "completed")?;
+            // A crash after the swap may leave the old generation parked.
+            // Retain it without reopening the rebuild or swapping it back.
+            recover_or_finalize_interrupted_lexical_publish_backup(&index_path)
         })?;
         storage.close_without_checkpoint().with_context(|| {
             format!(
@@ -25509,27 +25513,17 @@ fn rebuild_tantivy_from_db_with_options(
         )
     })?;
 
+    // Release the bulk writer before opening a fresh validation reader. Large
+    // archives must not retain both writer and reader working sets here.
+    publication.run("release_writer", || {
+        drop(t_index);
+        Ok(())
+    })?;
     // Refuse an unreadable/hollow candidate before it can replace a usable
     // live generation. Reopen and validate the actual live path again after swap.
     publication.run("validate_candidate", || {
         crate::search::tantivy::validate_searchable_index_contract(&build_path)?;
         verify_published_lexical_doc_count(&build_path, indexed_docs, "candidate")
-    })?;
-    publication.run("release_writer", || {
-        drop(t_index);
-        Ok(())
-    })?;
-    // Swap the freshly built index into the live path. Until this call the live
-    // index is untouched, so a concurrent reader sees the OLD complete corpus
-    // rather than a partially built one.
-    if let Some(staged) = staged_build_path.as_ref() {
-        publication.run("publish_staged_generation", || {
-            publish_staged_lexical_index(staged, &index_path)
-        })?;
-    }
-    publication.run("validate_published_generation", || {
-        crate::search::tantivy::validate_searchable_index_contract(&index_path)?;
-        verify_published_lexical_doc_count(&index_path, indexed_docs, "direct")
     })?;
 
     // GH #440: indexed_docs omits hard-noise messages from the committed
@@ -25572,17 +25566,19 @@ fn rebuild_tantivy_from_db_with_options(
     rebuild_state.committed_conversation_id = last_processed_conversation_id;
     rebuild_state.processed_conversations = processed_conversations;
     rebuild_state.indexed_docs = indexed_docs;
-    // GH #457: the generation manifest is durable BEFORE the checkpoint is
-    // marked completed (the staged path's ordering). A crash between the two
-    // used to leave `completed: true` over a generation with no manifest, so
-    // every readiness surface reported ready with nothing to read the doc
-    // count from.
+    // GH #494: prepare the complete generation in its CONTENT directory before
+    // swapping. Keeping the completed checkpoint only on the old live path
+    // loses it during the swap; a crash then exposes new documents without
+    // their publication receipt and every search can start rebuilding again.
+    // GH #457 still requires the manifest BEFORE the completed checkpoint.
+    // Before publication, the old live checkpoint remains incomplete and can
+    // resume the candidate if any certification or rename operation fails.
     let lexical_rebuild_duration = lexical_rebuild_started.elapsed();
     let publish_started = Instant::now();
     let equivalence_evidence = equivalence_accumulator.finalize();
     let generation_manifest = publication.run("persist_generation_manifest", || {
         persist_lexical_rebuild_generation_artifacts(
-            &index_path,
+            &build_path,
             &rebuild_state.db.storage_fingerprint,
             rebuild_state.processed_conversations,
             final_total_conversations,
@@ -25591,14 +25587,33 @@ fn rebuild_tantivy_from_db_with_options(
             &equivalence_evidence,
         )
     })?;
-    log_lexical_generation_manifest_published(&generation_manifest, &equivalence_evidence);
     let completed_fingerprint = publication.run("completed_generation_fingerprint", || {
-        completed_lexical_rebuild_meta_fingerprint(&rebuild_state, &index_path)
+        // Bind the receipt to the immutable generation after writer release,
+        // not a cached fingerprint taken before the writer was dropped.
+        index_meta_fingerprint(&build_path)
     })?;
     rebuild_state.mark_completed(completed_fingerprint);
     publication.run("persist_completed_checkpoint", || {
-        persist_lexical_rebuild_state(&index_path, &rebuild_state)
+        persist_lexical_rebuild_state(&build_path, &rebuild_state)
     })?;
+    publication.run("sync_certified_candidate", || {
+        sync_parent_directory(&lexical_rebuild_state_path(&build_path))
+    })?;
+
+    // The atomic swap now publishes documents, generation manifest, and the
+    // completed checkpoint together. A post-swap failure is still reported,
+    // but a subsequent invocation can validate/reuse the generation instead
+    // of discarding its ingestion progress or adopting the prior-live scratch.
+    if let Some(staged) = staged_build_path.as_ref() {
+        publication.run("publish_staged_generation", || {
+            publish_staged_lexical_index(staged, &index_path)
+        })?;
+    }
+    publication.run("validate_published_generation", || {
+        crate::search::tantivy::validate_searchable_index_contract(&index_path)?;
+        verify_published_lexical_doc_count(&index_path, indexed_docs, "direct")
+    })?;
+    log_lexical_generation_manifest_published(&generation_manifest, &equivalence_evidence);
 
     if let Some(p) = &progress {
         p.current

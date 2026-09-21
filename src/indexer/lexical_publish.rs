@@ -263,7 +263,10 @@ mod tests {
             })
             .unwrap_err();
         assert!(error.to_string().contains("initial publish refused"));
-        assert!(!live.exists(), "diagnostics must not manufacture a live tree");
+        assert!(
+            !live.exists(),
+            "diagnostics must not manufacture a live tree"
+        );
     }
 
     #[test]
