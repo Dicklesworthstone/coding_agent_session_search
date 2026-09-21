@@ -18,11 +18,12 @@ const MAX_CANDIDATES: usize = 4096;
 /// Read-only endpoint check. The reader is opened once by the caller after
 /// publication and is never refreshed during verification. Missing evidence
 /// returns false; engine/read errors and exhausted work budgets remain errors.
+/// A text token narrows discovery, but its absence never waives verification.
 pub(super) fn verify(
     reader: &QuillSearchIndex,
     document: &CassDocument,
     token: Option<&str>,
-) -> Result<Option<bool>> {
+) -> Result<bool> {
     verify_with_budget(reader, document, token, MAX_CANDIDATES)
 }
 
@@ -31,11 +32,17 @@ fn verify_with_budget(
     document: &CassDocument,
     token: Option<&str>,
     max_candidates: usize,
-) -> Result<Option<bool>> {
-    let Some(token) = token else { return Ok(None); };
-    let parser = CassQueryParser::new(CASS_SEMANTIC_SCHEMA)?;
-    let parsed = parser.parse(token, &CassQueryFilters::default());
-    let mut clauses = vec![BooleanClause::new(Occur::Must, parsed.query)];
+) -> Result<bool> {
+    let mut clauses = Vec::new();
+    if let Some(token) = token {
+        let parser = CassQueryParser::new(CASS_SEMANTIC_SCHEMA)?;
+        let parsed = parser.parse(token, &CassQueryFilters::default());
+        clauses.push(BooleanClause::new(Occur::Must, parsed.query));
+    }
+    // Numeric output, short code and short non-Latin words may have no canary
+    // token. They still project to real documents. Discover those candidates
+    // through the indexed source/agent/workspace keywords, then apply exactly
+    // the same identity and stored-column checks as for a lexical canary.
     for (field, value) in [
         (field::SOURCE_ID, QueryValue::Str(document.source_id.clone())),
         (field::AGENT, QueryValue::Str(document.agent.clone())),
@@ -77,7 +84,7 @@ fn verify_with_budget(
             // A match elsewhere in the conversation cannot certify this exact
             // prefix/tail message. Stored-content preview is an endpoint check,
             // not a claim of a full engine content-witness comparison.
-            return Ok(Some(
+            return Ok(
                 stored_i64(reader, field::CONVERSATION_ID, hit.global_docid)? == document.conversation_id
                 && stored_text(reader, field::SOURCE_PATH, hit.global_docid)?.as_deref() == Some(document.source_path.as_str())
                 && stored_text(reader, field::SOURCE_ID, hit.global_docid)?.as_deref() == Some(document.source_id.as_str())
@@ -86,9 +93,9 @@ fn verify_with_budget(
                 && stored_text(reader, field::AGENT, hit.global_docid)?.as_deref() == Some(document.agent.as_str())
                 && stored_text(reader, field::WORKSPACE, hit.global_docid)?.as_deref() == document.workspace.as_deref()
                 && stored_text(reader, field::PREVIEW, hit.global_docid)?.as_deref() == Some(preview.as_str())
-            ));
+            );
         }
-        if page.hits.len() < limit { return Ok(Some(false)); }
+        if page.hits.len() < limit { return Ok(false); }
         offset += page.hits.len();
     }
 }
@@ -125,9 +132,9 @@ mod tests {
         assert_eq!(old_page.hits.len(), 25);
         assert!(old_page.hits.iter().all(|hit| hit.document_id != identity),
             "fixture must reproduce the old top-25 blind spot");
-        assert_eq!(verify(&reader, &target, Some("common"))?, Some(true));
+        assert!(verify(&reader, &target, Some("common"))?);
         let mut foreign = target.clone(); foreign.source_path = "/wrong-source".into();
-        assert_eq!(verify(&reader, &foreign, Some("common"))?, Some(false));
+        assert!(!verify(&reader, &foreign, Some("common"))?);
         let error = verify_with_budget(&reader, &target, Some("common"), 64).unwrap_err();
         assert!(error.to_string().contains("candidate budget"));
         Ok(())
@@ -142,12 +149,12 @@ mod tests {
         index.add_prebuilt_documents_slice(&[suffix])?;
         index.commit()?;
         let reader = index.reader()?;
-        assert_eq!(verify(&reader, &expected, Some("common"))?, Some(false));
-        assert_eq!(verify(&reader, &expected, None)?, None);
+        assert!(!verify(&reader, &expected, Some("common"))?);
+        assert!(!verify(&reader, &expected, None)?);
         drop(reader);
         index.upsert_prebuilt_documents_slice(std::slice::from_ref(&expected))?;
         index.commit()?;
-        assert_eq!(verify(&index.reader()?, &expected, Some("common"))?, Some(true));
+        assert!(verify(&index.reader()?, &expected, Some("common"))?);
         Ok(())
     }
 
@@ -159,7 +166,7 @@ mod tests {
         let actual = document(42, "/same", "common different");
         index.add_prebuilt_documents_slice(&[actual])?;
         index.commit()?;
-        assert_eq!(verify(&index.reader()?, &expected, Some("common"))?, Some(false));
+        assert!(!verify(&index.reader()?, &expected, Some("common"))?);
         Ok(())
     }
 
@@ -184,14 +191,14 @@ mod tests {
             index.commit()?;
             assert_eq!(index.doc_count()?, 3);
             let current = index.reader()?;
-            assert_eq!(verify(&current, &replacement, Some("common"))?, Some(true));
-            assert_eq!(verify(&current, &sibling, Some("common"))?, Some(true));
-            assert_eq!(verify(&current, &other, Some("common"))?, Some(true));
-            assert_eq!(verify(&current, &original, Some("common"))?, Some(false));
+            assert!(verify(&current, &replacement, Some("common"))?);
+            assert!(verify(&current, &sibling, Some("common"))?);
+            assert!(verify(&current, &other, Some("common"))?);
+            assert!(!verify(&current, &original, Some("common"))?);
         }
         // Verification may not reopen the latest generation for hydration.
-        assert_eq!(verify(&before, &original, Some("common"))?, Some(true));
-        assert_eq!(verify(&before, &replacement, Some("common"))?, Some(false));
+        assert!(verify(&before, &original, Some("common"))?);
+        assert!(!verify(&before, &replacement, Some("common"))?);
         Ok(())
     }
 
@@ -203,7 +210,7 @@ mod tests {
         index.add_prebuilt_documents_slice(std::slice::from_ref(&expected))?;
         index.commit()?;
         let reader = index.reader()?;
-        assert_eq!(verify(&reader, &expected, Some("common"))?, Some(true));
+        assert!(verify(&reader, &expected, Some("common"))?);
 
         let mut wrong_time = expected.clone();
         wrong_time.created_at = Some(1_700_000_000_001);
@@ -214,7 +221,7 @@ mod tests {
         let mut wrong_index = expected.clone();
         wrong_index.msg_idx = 1;
         for wrong in [wrong_time, absent_time, absent_workspace, wrong_index] {
-            assert_eq!(verify(&reader, &wrong, Some("common"))?, Some(false));
+            assert!(!verify(&reader, &wrong, Some("common"))?);
         }
 
         let mut sparse = document(43, "/sparse", "common sparse");
@@ -223,10 +230,82 @@ mod tests {
         index.upsert_prebuilt_documents_slice(std::slice::from_ref(&sparse))?;
         index.commit()?;
         let reader = index.reader()?;
-        assert_eq!(verify(&reader, &sparse, Some("common"))?, Some(true));
+        assert!(verify(&reader, &sparse, Some("common"))?);
         let mut invented_time = sparse.clone();
         invented_time.created_at = Some(1_700_000_000_000);
-        assert_eq!(verify(&reader, &invented_time, Some("common"))?, Some(false));
+        assert!(!verify(&reader, &invented_time, Some("common"))?);
+        Ok(())
+    }
+
+    #[test]
+    fn tokenless_endpoints_require_exact_published_evidence() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut index = TantivyIndex::open_or_create(&temp.path().join("index"))?;
+        let expected = document(42, "/numeric", "1234 5678");
+        let mut sibling = expected.clone();
+        sibling.msg_idx = 1;
+        index.add_prebuilt_documents_slice(&[sibling])?;
+        index.commit()?;
+        let before = index.reader()?;
+        assert!(!verify(&before, &expected, None)?);
+
+        index.upsert_prebuilt_documents_slice(std::slice::from_ref(&expected))?;
+        index.commit()?;
+        let reader = index.reader()?;
+        assert!(verify(&reader, &expected, None)?);
+        assert!(!verify(&before, &expected, None)?, "do not reopen the snapshot");
+        let mut wrong_content = expected.clone();
+        wrong_content.content = "1234 9999".into();
+        let mut wrong_path = expected.clone();
+        wrong_path.source_path = "/different".into();
+        let mut wrong_source = expected.clone();
+        wrong_source.source_id = "remote".into();
+        let mut wrong_time = expected.clone();
+        wrong_time.created_at = None;
+        for wrong in [wrong_content, wrong_path, wrong_source, wrong_time] {
+            assert!(!verify(&reader, &wrong, None)?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tokenless_verification_handles_short_code_unicode_and_replay() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut index = TantivyIndex::open_or_create(&temp.path().join("index"))?;
+        let docs = vec![
+            document(1, "/code", "x=1; y=2;"),
+            document(2, "/unicode", "你好 世界"),
+        ];
+        index.add_prebuilt_documents_slice(&docs)?;
+        index.commit()?;
+        // Exercise tombstoned sealed rows as well as first publication.
+        for _ in 0..2 {
+            index.upsert_prebuilt_documents_slice(&docs)?;
+            index.commit()?;
+            let reader = index.reader()?;
+            for doc in &docs {
+                assert!(verify(&reader, doc, None)?);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tokenless_candidate_exhaustion_is_an_error_not_a_success() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut index = TantivyIndex::open_or_create(&temp.path().join("index"))?;
+        index.add_prebuilt_documents_slice(&[
+            document(1, "/one", "1234"),
+            document(2, "/two", "5678"),
+        ])?;
+        index.commit()?;
+        let reader = index.reader()?;
+        let missing = document(3, "/missing", "9999");
+        for budget in [0, 1] {
+            let error = verify_with_budget(&reader, &missing, None, budget).unwrap_err();
+            assert!(error.to_string().contains("candidate budget"));
+        }
+        assert!(!verify(&reader, &missing, None)?);
         Ok(())
     }
 }

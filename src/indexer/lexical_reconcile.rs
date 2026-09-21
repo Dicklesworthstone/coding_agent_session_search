@@ -71,9 +71,10 @@ pub(crate) struct LexicalReconcileReport {
     /// True when a second upsert of the identical set left the live-doc count
     /// unchanged. This is a replay invariant, not a full content-witness audit.
     pub converged: bool,
-    /// Early/late content canaries observed at the exact source/message identity
-    /// with a matching stored preview. `None` when the message carried no
-    /// usable search token (vacuously accepted).
+    /// Early/late endpoints observed at the exact source/message identity with
+    /// matching stored previews. New runs always emit Some(bool), using bounded
+    /// keyword discovery when no text token is available. The optional shape
+    /// is retained for compatibility with older reports, not a success bypass.
     pub early_canary_ok: Option<bool>,
     pub late_canary_ok: Option<bool>,
     pub checkpoint_cleared: bool,
@@ -231,11 +232,12 @@ pub(crate) fn run_lexical_conversation_reconcile(
     let doc_count_after = reader.doc_count()?;
     let converged = doc_count_after.cmp(&doc_count_after_first).is_eq();
 
-    // 5. Early/late canaries against the published snapshot.
+    // 5. Early/late endpoints against the published snapshot. Tokenless
+    // messages must be verified too; unknown evidence cannot clear recovery.
     let early_canary_ok = canary::verify(&reader, &docs[0], early_token.as_deref())?;
     let late_canary_ok = canary::verify(&reader, &docs[docs.len() - 1], late_token.as_deref())?;
 
-    let canaries_ok = early_canary_ok.unwrap_or(true) && late_canary_ok.unwrap_or(true);
+    let canaries_ok = early_canary_ok && late_canary_ok;
     let checkpoint_cleared = if converged && canaries_ok {
         clear_checkpoint(&checkpoint_path)?;
         true
@@ -254,8 +256,8 @@ pub(crate) fn run_lexical_conversation_reconcile(
         doc_count_before,
         doc_count_after,
         converged,
-        early_canary_ok,
-        late_canary_ok,
+        early_canary_ok: Some(early_canary_ok),
+        late_canary_ok: Some(late_canary_ok),
         checkpoint_cleared,
     };
     if !checkpoint_cleared {
@@ -351,12 +353,12 @@ mod tests {
         let early = canary_token(&docs[0].content);
         let late = canary_token(&docs[9].content);
         let reader = index.reader()?;
-        assert_eq!(canary::verify(&reader, &docs[0], early.as_deref())?, Some(true));
-        assert_eq!(canary::verify(&reader, &docs[9], late.as_deref())?, Some(true));
+        assert!(canary::verify(&reader, &docs[0], early.as_deref())?);
+        assert!(canary::verify(&reader, &docs[9], late.as_deref())?);
         // A wrong conversation id must not satisfy the canary.
         let mut wrong = docs[0].clone();
         wrong.conversation_id = Some(43);
-        assert_eq!(canary::verify(&reader, &wrong, early.as_deref())?, Some(false));
+        assert!(!canary::verify(&reader, &wrong, early.as_deref())?);
         Ok(())
     }
 
