@@ -9,18 +9,22 @@ on:
       - src/followup_coordinates.rs
       - src/search/query.rs
       - tests/gh493_message_coordinates.rs
-      - tests/message_coordinates.rs
+      - tests/cli_robot.rs
+      - tests/cli_dispatch_coverage.rs
+      - tests/spec_view_expand_error_envelopes.rs
+      - tests/golden/robot/capabilities.json.golden
       - Cargo.toml
       - Cargo.lock
       - rust-toolchain.toml
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: cass-message-coordinates-${{ github.ref }}
-  cancel-in-progress: false
+  group: cass-message-coordinates-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   verify:
@@ -38,10 +42,23 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          components: rustfmt, clippy
       - name: Record exact source and compiler identity
         run: git rev-parse HEAD && rustc --version && cargo --version
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
       - name: Check coordinate implementation formatting
-        run: rustfmt --edition 2024 --config skip_children=true --check src/lib.rs src/search/query.rs src/followup_coordinates.rs tests/gh493_message_coordinates.rs
+        run: rustfmt --edition 2024 --config skip_children=true --check src/lib.rs src/search/query.rs src/followup_coordinates.rs tests/gh493_message_coordinates.rs tests/cli_robot.rs tests/cli_dispatch_coverage.rs
       - name: Run search-to-follow-up regressions
         run: cargo test --locked --test gh493_message_coordinates -- --nocapture
+      - name: Check existing dispatch and error envelopes
+        run: |
+          cargo test --locked --test cli_dispatch_coverage parse_expand_with_context
+          cargo test --locked --test spec_view_expand_error_envelopes
+      - name: Check raw-line compatibility and robot discovery
+        run: |
+          cargo test --locked --test cli_robot view_
+          cargo test --locked --test cli_robot capabilities_matches_golden_contract
+      - name: Lint the regression target and production dependency
+        run: cargo clippy --locked --test gh493_message_coordinates -- -D warnings

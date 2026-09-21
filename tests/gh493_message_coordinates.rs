@@ -112,6 +112,12 @@ impl Fixture {
             .arg("--db")
             .arg(&self.db)
             .arg(subcommand)
+            .env("HOME", self._root.path())
+            .env("XDG_CONFIG_HOME", self._root.path().join("config"))
+            .env("XDG_DATA_HOME", self._root.path().join("data"))
+            .env("XDG_CACHE_HOME", self._root.path().join("cache"))
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
             .env_remove("CASS_OUTPUT_FORMAT")
             .env_remove("TOON_DEFAULT_FORMAT")
             .env_remove("CASS_TEST_VIEW_SLOW_MS")
@@ -152,6 +158,7 @@ fn assert_target(payload: &Value, command: &str, number: usize, cid: i64) {
     assert_eq!(rows[0]["conversation_id"], cid);
     assert_eq!(rows[0]["source_id"], "local");
     assert_eq!(rows[0]["coordinate_space"], "message_index");
+    assert_eq!(rows[0]["content_source"], "archive");
     assert!(rows[0]["message_id"].as_i64().unwrap() > 0);
 }
 
@@ -217,6 +224,10 @@ fn actual_search_hit_round_trips_through_both_followup_commands() {
         .expect("canonical hit");
     let index = hit["line_number"].as_u64().unwrap() as usize;
     assert_eq!(index, 2);
+    let hit_conversation_id = hit["conversation_id"]
+        .as_i64()
+        .expect("search conversation id");
+    assert_eq!(hit_conversation_id, fixture.conversation_id);
     assert_eq!(hit["source_path"], fixture.path.to_string_lossy().as_ref());
     for command in ["expand", "view"] {
         let output = fixture.follow(
@@ -226,7 +237,7 @@ fn actual_search_hit_round_trips_through_both_followup_commands() {
                 "--source",
                 hit["source_id"].as_str().unwrap(),
                 "--conversation-id",
-                &fixture.conversation_id.to_string(),
+                &hit_conversation_id.to_string(),
             ],
         );
         assert_target(&decode(output), command, index, fixture.conversation_id);
@@ -387,5 +398,147 @@ fn conflicting_selectors_are_rejected_and_huge_context_does_not_overflow() {
             rows.iter().filter(|row| row["is_target"] == true).count(),
             1
         );
+    }
+}
+
+#[test]
+fn pasted_search_fields_and_snake_case_selectors_use_canonical_messages() {
+    let fixture = Fixture::new(&[0, 7, 12]);
+    for subcommand in ["expand", "view"] {
+        for selector in [
+            "line_number=8",
+            "line-number=8",
+            "message_index=8",
+            "message-index=8",
+        ] {
+            let payload = decode(
+                fixture
+                    .command(subcommand)
+                    .arg(format!("source_path={}", fixture.path.display()))
+                    .arg("source_id=local")
+                    .arg(format!("conversation_id={}", fixture.conversation_id))
+                    .args([selector, "context=0", "--json"])
+                    .output()
+                    .unwrap(),
+            );
+            assert_target(&payload, subcommand, 8, fixture.conversation_id);
+        }
+        let payload = decode(
+            fixture
+                .command(subcommand)
+                .arg(&fixture.path)
+                .args(["--message_index", "8", "-C", "0", "--json"])
+                .output()
+                .unwrap(),
+        );
+        assert_target(&payload, subcommand, 8, fixture.conversation_id);
+    }
+}
+
+#[test]
+fn pasted_search_coordinates_cannot_override_explicit_raw_coordinates() {
+    let fixture = Fixture::new(&[0, 1]);
+    for subcommand in ["expand", "view"] {
+        let output = fixture
+            .command(subcommand)
+            .arg(&fixture.path)
+            .args(["--line", "2", "line_number=2", "--json"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn missing_source_still_resolves_the_archived_message_without_mutation() {
+    let fixture = Fixture::new(&[0, 1]);
+    let moved = fixture.path.with_extension("saved-jsonl");
+    std::fs::rename(&fixture.path, &moved).unwrap();
+    let db_before = std::fs::read(&fixture.db).unwrap();
+    let source_before = std::fs::read(&moved).unwrap();
+    for subcommand in ["expand", "view"] {
+        let payload = decode(fixture.follow(subcommand, 2, &["--source", "LOCAL"]));
+        assert_target(&payload, subcommand, 2, fixture.conversation_id);
+        if subcommand == "view" {
+            assert_eq!(payload["archive_only"], true);
+            assert_eq!(payload["source_exists"], false);
+        }
+    }
+    assert_eq!(std::fs::read(&fixture.db).unwrap(), db_before);
+    assert_eq!(std::fs::read(&moved).unwrap(), source_before);
+    assert!(!fixture.path.exists());
+}
+
+#[test]
+fn an_empty_conversation_cannot_hide_shared_path_ambiguity() {
+    let fixture = Fixture::new(&[0, 1]);
+    let storage = FrankenStorage::open(&fixture.db).unwrap();
+    seed(&storage, &fixture.path, "codex", &[]);
+    drop(storage);
+    for subcommand in ["expand", "view"] {
+        let output = fixture.follow(subcommand, 2, &[]);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["kind"], "ambiguous-source");
+    }
+}
+
+#[test]
+fn canonical_indices_are_discoverable_as_integers() {
+    let fixture = Fixture::new(&[0, 1]);
+    let capabilities = decode(
+        fixture
+            .command("capabilities")
+            .arg("--json")
+            .output()
+            .unwrap(),
+    );
+    for name in ["expand", "view"] {
+        let command = capabilities["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|command| command["name"] == name)
+            .unwrap();
+        let index = command["arguments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|arg| arg["name"] == "message-index")
+            .unwrap();
+        assert_eq!(index["value_type"], "integer");
+        assert!(
+            command["description"]
+                .as_str()
+                .unwrap()
+                .contains("--message-index")
+        );
+    }
+}
+
+#[test]
+fn malformed_archive_is_not_repaired_or_replaced_with_a_live_file() {
+    let fixture = Fixture::new(&[0, 1]);
+    let broken = fixture.data.join("broken.db");
+    let bytes = b"not an SQLite database";
+    std::fs::write(&broken, bytes).unwrap();
+    for subcommand in ["expand", "view"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_cass"))
+            .env_remove("CASS_OUTPUT_FORMAT")
+            .env_remove("TOON_DEFAULT_FORMAT")
+            .arg("--db")
+            .arg(&broken)
+            .arg(subcommand)
+            .arg(&fixture.path)
+            .args(["--message-index", "2", "--json"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert_eq!(std::fs::read(&broken).unwrap(), bytes);
+        assert!(!fixture.data.join("broken.db-wal").exists());
+        assert!(!fixture.data.join("broken.db-shm").exists());
     }
 }

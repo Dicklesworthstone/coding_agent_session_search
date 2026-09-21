@@ -1,115 +1,13 @@
 name: GH493 canonical anchor candidate
 
+# The reviewed candidate is now production code. Keep this manual entry point
+# as a read-only alias for the permanent regression suite, not a blob publisher.
 on:
-  push:
-    branches: [main]
-    paths: [.github/workflows/gh493-coordinate-candidate.yml]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: gh493-canonical-candidate-${{ github.sha }}
-  cancel-in-progress: false
-
 jobs:
-  prepare:
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 15
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Prepare exact-source candidate without changing commits or refs
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import base64, json, os, pathlib, subprocess, urllib.request
-          repo = os.environ['GITHUB_REPOSITORY']
-          def read_blob(sha):
-              request = urllib.request.Request(
-                  f'https://api.github.com/repos/{repo}/git/blobs/{sha}',
-                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
-                           'Accept': 'application/vnd.github+json'})
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  payload = json.load(response)
-              assert payload['encoding'] == 'base64'
-              return base64.b64decode(payload['content'])
-          expected = {
-              'src/lib.rs': 'af673c4047476904411afb1726508cd46b88fa5b',
-              'src/search/query.rs': 'edab70e109120591fb01f1f67248283fc0452301',
-              'src/followup_coordinates.rs': '55a1e41301e16f6d5914ac7bc9f9d5199471880f',
-              'tests/gh493_message_coordinates.rs': 'ddfd83037ae7c2332464eb85dd2a30d996f1afaf',
-              'tests/cli_robot.rs': '7ebd2ae976fc8e9a4318a619ae325cc3f6bbe9aa',
-              'tests/cli_dispatch_coverage.rs': 'e8869bdbf544345cf25a549cc35b7bd33e9478c7',
-              'tests/golden/robot/capabilities.json.golden': 'b90988cc01db0e5fd9ebee8d32a6b49f434fd6de',
-          }
-          for path, sha in expected.items():
-              actual = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
-              if actual != sha:
-                  raise SystemExit(f'Refusing to overwrite concurrent changes: {path}: {actual}')
-          script = pathlib.Path(os.environ['RUNNER_TEMP']) / 'review-gh493.py'
-          for sha in ['08eb596d0743abb14dfcfbc11db3d6c28362141b', '92f160f038616b4e244ad65208ecad26012d4589']:
-              script.write_bytes(read_blob(sha))
-              subprocess.run(['python3', str(script)], check=True)
-          PY
-      - name: Install formatter
-        uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
-        with:
-          components: rustfmt
-      - name: Format and inspect only changed Rust files
-        shell: bash
-        run: |
-          set -euo pipefail
-          rustfmt --edition 2024 --config skip_children=true src/lib.rs src/search/query.rs src/followup_coordinates.rs tests/gh493_message_coordinates.rs tests/cli_robot.rs tests/cli_dispatch_coverage.rs
-          git diff --check
-          git diff --stat
-          python3 - <<'PY'
-          import subprocess
-          diff = subprocess.check_output(['git', 'diff', '--numstat', '--', 'src/lib.rs', 'src/search/query.rs', 'tests/cli_robot.rs', 'tests/cli_dispatch_coverage.rs'], text=True)
-          changed = sum(int(value) for line in diff.splitlines() for value in line.split('\t')[:2])
-          if changed > 600:
-              raise SystemExit(f'Refusing broad unrelated formatting changes: {changed} lines')
-          PY
-      - name: Publish candidate Git blobs only (never commits or refs)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import json, os, pathlib, shutil, subprocess, urllib.request
-          repo = os.environ['GITHUB_REPOSITORY']
-          files = ['src/lib.rs', 'src/search/query.rs', 'src/followup_coordinates.rs', 'tests/gh493_message_coordinates.rs', 'tests/cli_robot.rs', 'tests/cli_dispatch_coverage.rs', 'tests/golden/robot/capabilities.json.golden']
-          manifest = {'base_commit': os.environ['GITHUB_SHA'], 'base_blobs': {}, 'candidate_blobs': {}}
-          for path in files:
-              original = subprocess.run(['git', 'rev-parse', f'HEAD:{path}'], text=True, capture_output=True)
-              manifest['base_blobs'][path] = original.stdout.strip() if original.returncode == 0 else None
-              content = pathlib.Path(path).read_text()
-              request = urllib.request.Request(
-                  f'https://api.github.com/repos/{repo}/git/blobs',
-                  data=json.dumps({'content': content, 'encoding': 'utf-8'}).encode(),
-                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
-                           'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'},
-                  method='POST')
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  manifest['candidate_blobs'][path] = json.load(response)['sha']
-              target = pathlib.Path('candidate') / path
-              target.parent.mkdir(parents=True, exist_ok=True)
-              shutil.copyfile(path, target)
-          encoded = json.dumps(manifest, indent=2)
-          pathlib.Path('candidate/manifest.json').write_text(encoded + '\n')
-          pathlib.Path('candidate/review.patch').write_bytes(subprocess.check_output(['git', 'diff', '--', *files]))
-          print('GH493_CANDIDATE_MANIFEST\n' + encoded)
-          PY
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: gh493-canonical-candidate
-          path: candidate/
-          retention-days: 3
+  verify:
+    uses: ./.github/workflows/message-coordinate-regression.yml
