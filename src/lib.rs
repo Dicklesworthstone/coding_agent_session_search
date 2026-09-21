@@ -7000,13 +7000,12 @@ pub async fn run_with_parsed(parsed: ParsedCli) -> CliResult<()> {
         .flatten()
         .collect();
 
-    // Teaching notes go to stderr for humans AND robots: README promises that
-    // agents learn the canonical syntax from a stderr note, and stdout stays
-    // data-only in robot mode so the note can never corrupt a JSON payload.
-    // Only the robot-docs/--robot-help surfaces stay quiet, because their
-    // stderr is part of the documented docs stream.
-    if !all_notes.is_empty() && !is_doc_mode {
-        emit_correction_notes(&all_notes, is_robot_mode);
+    // Human teaching notes can precede execution. For robots, defer notes
+    // until success: on failure stderr must remain one structured error
+    // envelope, not plaintext followed by JSON. Successful recovery retains
+    // its documented teaching note without contaminating stdout.
+    if !all_notes.is_empty() && !is_doc_mode && !is_robot_mode {
+        emit_correction_notes(&all_notes, false);
     }
 
     let result = execute_cli(
@@ -7017,6 +7016,10 @@ pub async fn run_with_parsed(parsed: ParsedCli) -> CliResult<()> {
         stderr_is_tty,
     )
     .await;
+
+    if result.is_ok() && !all_notes.is_empty() && !is_doc_mode && is_robot_mode {
+        emit_correction_notes(&all_notes, true);
+    }
 
     if let Some(path) = &cli.trace_file {
         let duration_ms = start_instant.elapsed().as_millis();
@@ -7101,8 +7104,8 @@ pub fn try_run_with_parsed_fast(parsed: ParsedCli) -> Result<CliResult<()>, Box<
         .flatten()
         .collect();
 
-    if !all_notes.is_empty() {
-        emit_correction_notes(&all_notes, is_robot_mode);
+    if !all_notes.is_empty() && !is_robot_mode {
+        emit_correction_notes(&all_notes, false);
     }
 
     let result = match command.expect("fast command was matched above") {
@@ -7129,6 +7132,10 @@ pub fn try_run_with_parsed_fast(parsed: ParsedCli) -> Result<CliResult<()>, Box<
         }
         _ => unreachable!("non-fast command passed the fast-command guard"),
     };
+
+    if result.is_ok() && !all_notes.is_empty() && is_robot_mode {
+        emit_correction_notes(&all_notes, true);
+    }
 
     if let Some(path) = &cli.trace_file {
         let duration_ms = start_instant.elapsed().as_millis();
