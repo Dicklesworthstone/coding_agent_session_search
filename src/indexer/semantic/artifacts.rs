@@ -23,6 +23,8 @@ mod inspection;
 mod checkpoint_tests;
 #[cfg(test)]
 mod storage_tests;
+#[cfg(test)]
+mod lease_tests;
 
 pub use inspection::{
     BackfillArtifactCandidate, BackfillArtifactReclaimPlan, apply_backfill_artifact_plan,
@@ -54,6 +56,13 @@ pub fn reclaim_backfill_artifacts(data_dir: &Path) -> Result<BackfillArtifactRec
     artifacts.sweep(None, None)
 }
 
+/// A caller prepared a backfill against ownership/cursor state that is no
+/// longer current. Reload the durable manifest AND recompute the batch before
+/// retrying; silently replacing the input could skip or replay selected rows.
+#[derive(Debug, thiserror::Error)]
+#[error("semantic backfill manifest changed; reload the durable manifest and recompute the batch before retrying")]
+pub struct BackfillManifestChanged;
+
 pub(super) struct BackfillArtifacts {
     data_dir: PathBuf,
     // Keep the same inode locked through discovery, engine execution and GC.
@@ -81,11 +90,38 @@ impl BackfillArtifacts {
 
     pub(super) fn begin(data_dir: &Path, input: &SemanticManifest) -> Result<Self> {
         let artifacts = Self::lock(data_dir)?;
-        // The caller may have loaded its manifest before acquiring this lease.
-        // Retain that input's references as well as the current durable ones.
-        // Corrupt/future metadata is an error, never an empty protection set.
+        // Serialization alone does not make a manifest loaded before the
+        // lease current. Reject stale ownership/cursors BEFORE the sweep or
+        // engine can mutate anything, including after a failed prior save.
+        artifacts.validate_input(input)?;
         artifacts.sweep(Some(input), None)?;
         Ok(artifacts)
+    }
+
+    fn validate_input(&self, input: &SemanticManifest) -> Result<()> {
+        let current = RecoveryMetadata::new(false)
+            .read::<SemanticManifest>(&SemanticManifest::path(&self.data_dir))?
+            .unwrap_or_default();
+        ensure!(
+            current.manifest_version <= MANIFEST_FORMAT_VERSION
+                && input.manifest_version <= MANIFEST_FORMAT_VERSION,
+            "unsupported semantic manifest version; refusing backfill"
+        );
+        // Backlog estimates may be recomputed by the caller before a pass.
+        // They are not artifact/cursor authority. Everything identifying a
+        // saved revision, selected tier, accelerator or checkpoint must match,
+        // including the complete checkpoint even when its pathname is stable.
+        // Compare records, not just timestamps: saves can share a millisecond.
+        if current.updated_at_ms != input.updated_at_ms
+            || current.manifest_version != input.manifest_version
+            || current.fast_tier != input.fast_tier
+            || current.quality_tier != input.quality_tier
+            || current.hnsw != input.hnsw
+            || current.checkpoint != input.checkpoint
+        {
+            return Err(BackfillManifestChanged.into());
+        }
+        Ok(())
     }
 
     pub(super) fn after_success(&self, manifest: &SemanticManifest, output: &Path) {

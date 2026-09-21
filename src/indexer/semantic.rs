@@ -11,7 +11,8 @@ mod engine;
 
 pub use artifacts::{
     BackfillArtifactCandidate, BackfillArtifactReclaimPlan, BackfillArtifactReclaimReport,
-    apply_backfill_artifact_plan, plan_backfill_artifacts, reclaim_backfill_artifacts,
+    BackfillManifestChanged, apply_backfill_artifact_plan, plan_backfill_artifacts,
+    reclaim_backfill_artifacts,
 };
 pub use engine::*;
 

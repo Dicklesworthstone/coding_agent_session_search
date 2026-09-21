@@ -69,6 +69,7 @@ jobs:
               raise SystemExit('Expected recovery tests did not run; zero tests is not success')
           PY
           }
+          run_suite lease --lib indexer::semantic::artifacts::lease_tests
           run_suite lifecycle --lib indexer::semantic::artifact_lifecycle_tests
           run_suite approval --lib indexer::semantic::artifacts::inspection::tests
           run_suite checkpoint --lib indexer::semantic::artifacts::checkpoint_tests
