@@ -54,6 +54,24 @@ fn gh494_publish_failure_at_eof_is_finalized_on_retry_instead_of_returning_succe
     let scratch = staged_lexical_rebuild_scratch_path(&index_path);
     verify_published_lexical_doc_count(&scratch, 4, "gh494 retained candidate").unwrap();
 
+    // A real refused swap must also leave a diagnostic after the process exits,
+    // without certifying the checkpoint or replacing the original OS error.
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(index_path.join(".lexical-rebuild-last-failure.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(report["phase"], "publish_staged_generation");
+    assert_eq!(report["expected_docs"], 4);
+    assert_eq!(report["processed_conversations"], 2);
+    assert_eq!(report["build_path"], serde_json::json!(scratch));
+    assert_eq!(report["live_path"], serde_json::json!(index_path));
+    assert!(
+        report["error_chain"]
+            .as_str()
+            .unwrap()
+            .contains(&std::io::Error::from_raw_os_error(ENOSPC_RAW_OS_ERROR).to_string())
+    );
+
     // Before the fix, reconciliation advanced the cursor to EOF and
     // returned Ok here without swapping or completing the checkpoint.
     let resumed = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();

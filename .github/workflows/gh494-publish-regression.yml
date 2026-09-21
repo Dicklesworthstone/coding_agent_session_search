@@ -7,6 +7,8 @@ on:
       - 'src/indexer/**'
       - 'src/search/tantivy.rs'
       - 'src/search/quill_bridge.rs'
+      - 'tests/gh494_publish_resume.rs'
+      - 'tests/util/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
@@ -30,7 +32,7 @@ jobs:
       CARGO_BUILD_JOBS: '2'
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
-      RUST_MIN_STACK: '67108864'
+      RUST_MIN_STACK: '134217728'
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
@@ -56,11 +58,12 @@ jobs:
           mkdir -p "$RUNNER_TEMP/gh494-results"
           {
             git rev-parse HEAD
-            git hash-object src/indexer/mod.rs src/indexer/lexical_publish.rs src/indexer/gh494_tests.rs
+            git hash-object src/indexer/mod.rs src/indexer/lexical_publish.rs src/indexer/gh494_tests.rs tests/gh494_publish_resume.rs
             rustc --version --verbose
             cargo --version
           } | tee "$RUNNER_TEMP/gh494-results/source-and-compiler.txt"
           rustfmt --edition 2024 --check src/indexer/lexical_publish.rs src/indexer/gh494_tests.rs
+          rustfmt --edition 2024 --config skip_children=true --check tests/gh494_publish_resume.rs
       - name: Execute the exact diagnostic helper independently of the monolithic test build
         shell: bash
         run: |
@@ -69,7 +72,7 @@ jobs:
           root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'gh494-phase-harness'
           (root / 'src').mkdir(parents=True)
           packages = tomllib.loads(pathlib.Path('Cargo.lock').read_text())['package']
-          deps = {name: next(p['version'] for p in packages if p['name'] == name) for name in ('anyhow', 'tracing')}
+          deps = {name: next(p['version'] for p in packages if p['name'] == name) for name in ('anyhow', 'tracing', 'serde_json', 'tempfile')}
           manifest = '[package]\nname = "gh494-phase-harness"\nversion = "0.0.0"\nedition = "2024"\n[dependencies]\n'
           manifest += ''.join(f'{name} = "={version}"\n' for name, version in deps.items())
           (root / 'Cargo.toml').write_text(manifest)
@@ -93,6 +96,10 @@ jobs:
         shell: bash
         run: |
           cargo test --locked --lib gh494_ -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/gh494-results/rebuild-regressions.log"
+      - name: Execute CLI EOF resume and repeated read-only searches
+        shell: bash
+        run: |
+          cargo test --locked --test gh494_publish_resume -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/gh494-results/cli-resume-regressions.log"
       - name: Retain hollow-generation and publication rollback coverage
         shell: bash
         run: |
