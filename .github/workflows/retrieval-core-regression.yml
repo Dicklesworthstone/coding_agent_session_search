@@ -6,6 +6,11 @@ on:
     paths:
       - .github/workflows/retrieval-core-regression.yml
       - src/search/**
+      - src/connectors/codex.rs
+      - src/connectors/codex/**
+      - src/raw_mirror.rs
+      - src/raw_mirror/**
+      - scripts/test_raw_mirror_exclusions.py
       - tests/retrieval_core_*.rs
   workflow_dispatch:
 
@@ -45,6 +50,26 @@ jobs:
           name: retrieval-source-${{ github.sha }}
           path: retrieval-source.tar.gz
           retention-days: 3
+  source-policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '134217728'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
+      - name: Test real source exclusion and capture boundaries
+        run: python3 scripts/test_raw_mirror_exclusions.py
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 45
