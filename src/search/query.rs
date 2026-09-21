@@ -1675,7 +1675,7 @@ pub struct SearchHit {
     pub content: String,
     #[serde(skip_serializing)]
     pub content_hash: u64,
-    #[serde(skip_serializing)]
+    /// Canonical archive identity for unambiguous view/expand follow-up.
     pub conversation_id: Option<i64>,
     pub score: f32,
     pub source_path: String,

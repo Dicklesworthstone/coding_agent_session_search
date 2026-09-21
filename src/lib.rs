@@ -601,7 +601,7 @@ pub enum Commands {
         /// Use approximate nearest neighbor (ANN) search with HNSW for faster semantic/hybrid queries.
         /// Trades slight accuracy loss for O(log n) search complexity instead of O(n).
         /// Only affects semantic and hybrid modes; ignored for lexical search.
-        /// Requires an HNSW index built with `cass index --semantic --approximate`.
+        /// Requires an HNSW index built with `cass index --semantic --build-hnsw`.
         #[arg(long, default_value_t = false)]
         approximate: bool,
 
@@ -1909,7 +1909,7 @@ pub enum MirrorCommand {
         #[arg(long, default_value_t = false, conflicts_with = "apply")]
         dry_run: bool,
 
-        /// Apply the prune plan. Without this flag, cass only writes a dry-run audit record.
+        /// Apply the prune plan. Without this flag, cass returns a preview without appending audit records.
         #[arg(long, default_value_t = false)]
         apply: bool,
 
@@ -6158,7 +6158,12 @@ fn format_friendly_parse_error(err: clap::Error, raw: &[String], normalized: &[S
 
 /// Detect the likely command intent from the raw argument string.
 fn detect_command_intent(raw_str: &str) -> String {
-    if raw_str.contains("search")
+    if matches!(
+        raw_str.split_whitespace().next(),
+        Some("index" | "rebuild" | "reindex")
+    ) {
+        "rebuild or manage the search index".to_string()
+    } else if raw_str.contains("search")
         || raw_str.contains("find")
         || raw_str.contains("query")
         || raw_str.contains("grep")
@@ -6192,7 +6197,14 @@ fn detect_command_intent(raw_str: &str) -> String {
 
 /// Get context-aware examples based on detected intent.
 fn get_contextual_examples(intent: &str) -> Vec<&'static str> {
-    if intent.contains("search") {
+    if intent.contains("index") {
+        vec![
+            "cass index --robot",
+            "cass index --full --robot",
+            "cass index --semantic --build-hnsw --robot",
+            "cass index --robot --data-dir /custom/path",
+        ]
+    } else if intent.contains("search") {
         vec![
             "cass search \"error handling\" --robot --limit 10",
             "cass search \"authentication\" --robot --agent claude",
@@ -6222,12 +6234,6 @@ fn get_contextual_examples(intent: &str) -> Vec<&'static str> {
             "cass stats --robot",
             "cass stats --robot --source local",
             "cass stats --robot --by-source",
-        ]
-    } else if intent.contains("index") {
-        vec![
-            "cass index --robot",
-            "cass index --robot --force",
-            "cass index --robot --data-dir /custom/path",
         ]
     } else if intent.contains("capabilities") {
         vec!["cass capabilities --json", "cass introspect --json"]
@@ -6273,7 +6279,15 @@ fn get_contextual_hints(intent: &str, raw_str: &str) -> Vec<String> {
     }
 
     // Intent-specific hints
-    if intent.contains("search") && !raw_str.contains("search") {
+    if intent.contains("index") {
+        hints.push("For indexing options, run: cass index --help".to_string());
+        if raw_str.split_whitespace().any(|arg| arg == "--approximate") {
+            hints.push(
+                "Build ANN with: cass index --semantic --build-hnsw; use --approximate only when searching"
+                    .to_string(),
+            );
+        }
+    } else if intent.contains("search") && !raw_str.contains("search") {
         hints.push(
             "Use the 'search' subcommand explicitly: cass search \"your query\" --robot"
                 .to_string(),
@@ -6293,7 +6307,12 @@ fn get_contextual_hints(intent: &str, raw_str: &str) -> Vec<String> {
 /// Commands that get auto-corrected and succeed (like `cass ls --robot` → `cass stats --robot`)
 /// should NOT be listed here since the user would never see this error message.
 fn get_common_mistakes(intent: &str) -> Option<serde_json::Value> {
-    let mistakes = if intent.contains("search") {
+    let mistakes = if intent.contains("index") {
+        vec![(
+            "cass index --semantic --approximate",
+            "cass index --semantic --build-hnsw",
+        )]
+    } else if intent.contains("search") {
         vec![
             // query="foo" without subcommand - normalization adds "search" but the syntax is wrong
             ("cass query=\"foo\" --robot", "cass search \"foo\" --robot"),
@@ -6410,6 +6429,73 @@ fn closest_top_level_command(arg: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod canonical_top_level_command_tests {
     use super::*;
+
+    #[test]
+    fn ann_setup_help_names_a_parseable_index_command() {
+        let command = Cli::command();
+        let search = command.find_subcommand("search").expect("search command");
+        let approximate = search
+            .get_arguments()
+            .find(|argument| argument.get_id() == "approximate")
+            .expect("approximate flag");
+        let help = approximate
+            .get_long_help()
+            .or_else(|| approximate.get_help())
+            .expect("ANN setup help")
+            .to_string();
+        let recipe = help.split('`').nth(1).expect("documented setup command");
+        let parsed = Cli::try_parse_from(recipe.split_whitespace()).expect("setup parses");
+        assert!(matches!(
+            parsed.command,
+            Some(Commands::Index {
+                semantic: true,
+                build_hnsw: true,
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from(["cass", "index", "--semantic", "--approximate"]).is_err());
+        let query = Cli::try_parse_from(["cass", "search", "example", "--approximate"])
+            .expect("ANN remains a search option");
+        assert!(matches!(
+            query.command,
+            Some(Commands::Search {
+                approximate: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn ann_index_parse_error_explains_the_index_command() {
+        for format in ["--json", "--robot"] {
+            let args = ["cass", "index", "--semantic", "--approximate", format].map(str::to_string);
+            let error = Cli::try_parse_from(&args).expect_err("query-only flag rejected");
+            let output = format_friendly_parse_error(error, &args, &args);
+            let payload: serde_json::Value = serde_json::from_str(&output).expect("error JSON");
+            assert_eq!(payload["kind"], "argument_parsing");
+            let examples = payload["examples"].as_array().expect("examples");
+            assert!(!examples.is_empty());
+            for example in examples {
+                let example = example.as_str().expect("example command");
+                assert!(example.starts_with("cass index "), "{example}");
+                assert!(Cli::try_parse_from(example.split_whitespace()).is_ok());
+            }
+            let hints = payload["hints"].as_array().expect("hints");
+            assert!(hints.iter().any(|hint| {
+                hint.as_str()
+                    .is_some_and(|text| text.contains("--semantic --build-hnsw"))
+            }));
+            assert!(!output.contains("Use the 'search' subcommand explicitly"));
+            let mistakes = payload["common_mistakes"]
+                .as_array()
+                .expect("index mistakes");
+            for mistake in mistakes {
+                let correct = mistake["correct"].as_str().expect("corrected command");
+                assert!(correct.starts_with("cass index "), "{correct}");
+                assert!(Cli::try_parse_from(correct.split_whitespace()).is_ok());
+            }
+        }
+    }
 
     /// GH #367: `cass forget --source-glob <pat> --robot` was rewritten to
     /// `search forget ...` because the implicit-robot-query recovery consults
@@ -26375,7 +26461,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  Pack warnings: inspect health, freshness, privacy, and warnings for semantic_fallback_lexical, privacy_redactions_applied, and no_evidence_found before copying output; stale evidence is structural via freshness.stale_evidence_count.".to_string(),
             "  Pack budgets: tune --max-tokens, --max-evidence, --max-sessions, --max-excerpt-chars, and --fields summary/minimal to fit the recipient context.".to_string(),
             "  Default search: hybrid-preferred. With --robot-meta, inspect requested_search_mode, search_mode, semantic_refinement, fallback_tier, and fallback_reason.".to_string(),
-            "  Quick history (0.8.0 flags): use --workspace PATH --days 7 --mode lexical --no-maintenance --robot --robot-meta --fields minimal --limit 5 --max-tokens 2000 --timeout 2000.".to_string(),
+            "  Quick history: use --workspace PATH --days 7 --mode lexical --no-maintenance --robot --robot-meta --fields source_path,line_number,agent,source_id,conversation_id --limit 5 --max-tokens 2000 --timeout 2000.".to_string(),
             "  Budget: --timeout is milliseconds; --max-tokens bounds approximate output, not scan work. Also set a caller-side deadline; inspect budget.timed_out even after exit 0.".to_string(),
             "  Retrieval refusal: maintenance-required ends this attempt; do not rebuild, install models, or run broad aggregates to answer a quick history question. Check older-version help; never silently drop --no-maintenance.".to_string(),
             "  Evidence: expand useful source_path/line_number hits with `cass view PATH --message-index LINE_NUMBER --source SOURCE_ID --conversation-id CONVERSATION_ID -C 3 --json --timeout 2000`; preserve citations. Broaden scope or choose semantic refinement deliberately.".to_string(),
@@ -26414,7 +26500,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "examples:".to_string(),
             String::new(),
             "# Quick project history (0.8.0 flags; check older-version help once)".to_string(),
-            "  cass search \"performance regression\" --workspace /path/to/project --days 7 --mode lexical --no-maintenance --robot --robot-meta --fields minimal --limit 5 --max-tokens 2000 --timeout 2000".to_string(),
+            "  cass search \"performance regression\" --workspace /path/to/project --days 7 --mode lexical --no-maintenance --robot --robot-meta --fields source_path,line_number,agent,source_id,conversation_id --limit 5 --max-tokens 2000 --timeout 2000".to_string(),
             "  # Also set a caller-side deadline. Read budget.timed_out even after exit 0; maintenance-required is a blocker, not permission to rebuild.".to_string(),
             "  cass view /path/to/session.jsonl -n 42 -C 3 --json --timeout 2000".to_string(),
             String::new(),
@@ -33673,6 +33759,7 @@ fn projected_hit_field_value(
         "content" => Some(serde_json::Value::String(hit.content.clone())),
         "title" => Some(serde_json::Value::String(hit.title.clone())),
         "created_at" => serde_json::to_value(hit.created_at).ok(),
+        "conversation_id" => serde_json::to_value(hit.conversation_id).ok(),
         "line_number" => serde_json::to_value(hit.line_number).ok(),
         "match_type" => serde_json::to_value(hit.match_type).ok(),
         // Provenance fields (P3.4)
@@ -33715,6 +33802,7 @@ fn filter_hit_fields(
                 "content",
                 "title",
                 "created_at",
+                "conversation_id",
                 "line_number",
                 "match_type",
                 // Provenance fields (P3.4)
@@ -34698,7 +34786,7 @@ fn output_robot_results(
                 let hit = self.0;
                 let normalized_source_id = normalized_robot_hit_source_id(hit);
                 let normalized_origin_host = normalized_robot_hit_origin_host(hit);
-                let mut fields = 12usize;
+                let mut fields = 13usize;
                 if hit.workspace_original.is_some() {
                     fields += 1;
                 }
@@ -34718,6 +34806,7 @@ fn output_robot_results(
                     map.serialize_entry("workspace_original", workspace_original)?;
                 }
                 map.serialize_entry("created_at", &hit.created_at)?;
+                map.serialize_entry("conversation_id", &hit.conversation_id)?;
                 map.serialize_entry("line_number", &hit.line_number)?;
                 map.serialize_entry("match_type", &hit.match_type)?;
                 let normalized_origin_kind = normalized_robot_hit_origin_kind(hit);
@@ -98058,6 +98147,14 @@ fn response_schema_search_hit() -> serde_json::Value {
     response_schema_object([
         ("source_path", serde_json::json!({ "type": "string" })),
         (
+            "conversation_id",
+            serde_json::json!({
+                "type": ["integer", "null"],
+                "minimum": 1,
+                "description": "Canonical archive conversation identity. Pass to view/expand --conversation-id with source_id and line_number."
+            }),
+        ),
+        (
             "line_number",
             serde_json::json!({
                 "type": ["integer", "null"],
@@ -113709,6 +113806,20 @@ mod robot_output_score_tests {
                 "workspace_original": "/remote/workspace"
             })
         );
+    }
+
+    #[test]
+    fn full_and_projected_hits_preserve_nullable_conversation_identity() {
+        for identity in [None, Some(23)] {
+            let mut hit = test_hit(1.0);
+            hit.conversation_id = identity;
+            let expected = serde_json::json!(identity);
+            for fields in [None, Some(vec!["conversation_id".to_string()])] {
+                let output = filter_hit_fields(&hit, &fields);
+                assert_eq!(output.get("conversation_id"), Some(&expected));
+                assert!(output.get("content_hash").is_none());
+            }
+        }
     }
 
     #[test]

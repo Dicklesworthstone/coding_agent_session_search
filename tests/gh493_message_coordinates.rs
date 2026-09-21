@@ -201,46 +201,58 @@ fn actual_search_hit_round_trips_through_both_followup_commands() {
         "{}",
         String::from_utf8_lossy(&indexed.stderr)
     );
-    let found = decode(
-        fixture
-            .command("search")
-            .args([
-                "ANCHOR493TARGET",
-                "--mode",
-                "lexical",
-                "--json",
-                "--limit",
-                "5",
-            ])
-            .arg("--data-dir")
-            .arg(&fixture.data)
-            .output()
-            .unwrap(),
-    );
-    let hits = found["hits"].as_array().expect("search hits");
-    let hit = hits
-        .iter()
-        .find(|hit| hit["content"] == "ANCHOR493TARGET")
-        .expect("canonical hit");
-    let index = hit["line_number"].as_u64().unwrap() as usize;
-    assert_eq!(index, 2);
-    let hit_conversation_id = hit["conversation_id"]
-        .as_i64()
-        .expect("search conversation id");
-    assert_eq!(hit_conversation_id, fixture.conversation_id);
-    assert_eq!(hit["source_path"], fixture.path.to_string_lossy().as_ref());
-    for command in ["expand", "view"] {
-        let output = fixture.follow(
-            command,
-            index,
-            &[
-                "--source",
-                hit["source_id"].as_str().unwrap(),
-                "--conversation-id",
-                &hit_conversation_id.to_string(),
-            ],
+    // Exercise the optimized full JSON serializer, general metadata path,
+    // and explicit field projection: all must carry the same archive key.
+    for extra in [
+        vec![],
+        vec!["--robot-meta"],
+        vec![
+            "--fields",
+            "conversation_id,line_number,source_id,source_path,content",
+        ],
+    ] {
+        let found = decode(
+            fixture
+                .command("search")
+                .args([
+                    "ANCHOR493TARGET",
+                    "--mode",
+                    "lexical",
+                    "--json",
+                    "--limit",
+                    "5",
+                ])
+                .args(extra)
+                .arg("--data-dir")
+                .arg(&fixture.data)
+                .output()
+                .unwrap(),
         );
-        assert_target(&decode(output), command, index, fixture.conversation_id);
+        let hits = found["hits"].as_array().expect("search hits");
+        let hit = hits
+            .iter()
+            .find(|hit| hit["content"] == "ANCHOR493TARGET")
+            .expect("canonical hit");
+        let index = hit["line_number"].as_u64().unwrap() as usize;
+        assert_eq!(index, 2);
+        let hit_conversation_id = hit["conversation_id"]
+            .as_i64()
+            .expect("search conversation id");
+        assert_eq!(hit_conversation_id, fixture.conversation_id);
+        assert_eq!(hit["source_path"], fixture.path.to_string_lossy().as_ref());
+        for command in ["expand", "view"] {
+            let output = fixture.follow(
+                command,
+                index,
+                &[
+                    "--source",
+                    hit["source_id"].as_str().unwrap(),
+                    "--conversation-id",
+                    &hit_conversation_id.to_string(),
+                ],
+            );
+            assert_target(&decode(output), command, index, fixture.conversation_id);
+        }
     }
 }
 

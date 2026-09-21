@@ -523,7 +523,7 @@
         },
         {
           "name": "approximate",
-          "description": "Use approximate nearest neighbor (ANN) search with HNSW for faster semantic/hybrid queries. Trades slight accuracy loss for O(log n) search complexity instead of O(n). Only affects semantic and hybrid modes; ignored for lexical search. Requires an HNSW index built with `cass index --semantic --approximate`",
+          "description": "Use approximate nearest neighbor (ANN) search with HNSW for faster semantic/hybrid queries. Trades slight accuracy loss for O(log n) search complexity instead of O(n). Only affects semantic and hybrid modes; ignored for lexical search. Requires an HNSW index built with `cass index --semantic --build-hnsw`",
           "arg_type": "flag",
           "required": false,
           "default": "false",

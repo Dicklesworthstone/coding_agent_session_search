@@ -14,6 +14,7 @@
 //! `--json`/`--robot` paths produce a parseable JSON envelope.
 
 use assert_cmd::Command;
+use coding_agent_search::raw_mirror::{RawMirrorCaptureInput, capture_source_file};
 use predicates::str::contains;
 use std::path::Path;
 use tempfile::TempDir;
@@ -103,6 +104,75 @@ fn mirror_prune_json_emits_envelope_with_prune_payload() {
         prune.get("manifest_count").is_some(),
         "payload missing manifest_count: {prune}"
     );
+}
+
+/// GH488: populated previews return candidates without adding persistent audit
+/// records. Exercise both an absent ledger and retained historical evidence.
+#[test]
+fn mirror_prune_repeated_previews_do_not_grow_the_archive() {
+    let temp = TempDir::new().expect("tempdir");
+    let data_dir = temp.path().join("data");
+    for index in 0..32 {
+        let source_path = temp.path().join(format!("session-{index}.jsonl"));
+        std::fs::write(&source_path, format!("{{\"text\":\"session {index}\"}}\n"))
+            .expect("write source");
+        capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("capture real source");
+    }
+    let root = data_dir.join("raw-mirror/v1");
+    let audit_path = root.join("pruned.jsonl");
+    let snapshot = || {
+        walkdir::WalkDir::new(&root)
+            .into_iter()
+            .map(|entry| entry.expect("mirror entry"))
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| {
+                let bytes = std::fs::read(entry.path()).expect("mirror bytes");
+                (entry.into_path(), bytes)
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    for preview in 0..4 {
+        if preview == 1 {
+            std::fs::write(&audit_path, b"{\"mode\":\"apply\",\"applied\":true}\n")
+                .expect("seed historical audit");
+        }
+        let before = snapshot();
+        let mut cmd = cmd_in(temp.path());
+        cmd.args([
+            "mirror",
+            "prune",
+            "--max-size",
+            "0",
+            "--safety-hold-down",
+            "0s",
+            "--dry-run",
+            "--json",
+        ]);
+        let output = cmd.assert().success();
+        let value: serde_json::Value =
+            serde_json::from_slice(&output.get_output().stdout).expect("prune JSON");
+        let prune = &value["prune"];
+        assert_eq!(value["success"], true);
+        assert_eq!(prune["mode"], "dry-run");
+        assert_eq!(prune["planned_manifest_count"], 32);
+        assert_eq!(prune["planned_blob_count"], 32);
+        assert_eq!(prune["entries"].as_array().expect("candidates").len(), 64);
+        assert_eq!(prune["applied_reclaim_bytes"], 0);
+        assert!(prune["audit_log_path"].is_null());
+        assert_eq!(snapshot(), before, "preview {preview} changed mirror files");
+        if preview == 0 {
+            assert!(!audit_path.exists());
+        }
+    }
 }
 
 /// `--apply` on an empty data dir must still produce an "apply" summary

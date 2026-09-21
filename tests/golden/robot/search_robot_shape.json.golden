@@ -45,6 +45,9 @@
           "created_at": {
             "type": "integer"
           },
+          "conversation_id": {
+            "type": "integer"
+          },
           "line_number": {
             "type": "integer"
           },

@@ -1117,7 +1117,7 @@
         },
         {
           "name": "approximate",
-          "description": "Use approximate nearest neighbor (ANN) search with HNSW for faster semantic/hybrid queries. Trades slight accuracy loss for O(log n) search complexity instead of O(n). Only affects semantic and hybrid modes; ignored for lexical search. Requires an HNSW index built with `cass index --semantic --approximate`",
+          "description": "Use approximate nearest neighbor (ANN) search with HNSW for faster semantic/hybrid queries. Trades slight accuracy loss for O(log n) search complexity instead of O(n). Only affects semantic and hybrid modes; ignored for lexical search. Requires an HNSW index built with `cass index --semantic --build-hnsw`",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -2062,7 +2062,7 @@
     },
     {
       "name": "view",
-      "description": "View a source file at a specific line (follow up on search results)",
+      "description": "Inspect file lines, or follow a search hit with --message-index",
       "arguments": [
         {
           "name": "path",
@@ -2088,7 +2088,14 @@
         {
           "name": "line",
           "short": "n",
-          "description": "Line number to show (1-indexed)",
+          "description": "Physical file line (1-based), NOT search's line_number; use --message-index for hits",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
+          "name": "message-index",
+          "description": "Canonical message ordinal: pass search's line_number unchanged (1-based). Reads the archive only; never substitutes a physical file line",
           "arg_type": "option",
           "value_type": "integer",
           "required": false
@@ -3039,7 +3046,7 @@
     },
     {
       "name": "expand",
-      "description": "Show messages around a specific line in a session file",
+      "description": "Expand a search hit with --message-index, or inspect raw JSONL with --line",
       "arguments": [
         {
           "name": "path",
@@ -3058,10 +3065,24 @@
         {
           "name": "line",
           "short": "n",
-          "description": "Line number to show context around",
+          "description": "Physical file line, NOT search's line_number; use --message-index for hits",
           "arg_type": "option",
           "value_type": "integer",
-          "required": true
+          "required": false
+        },
+        {
+          "name": "message-index",
+          "description": "Canonical message ordinal: pass search's line_number unchanged (1-based). Reads the archive only; never substitutes a physical file line",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
+          "name": "conversation-id",
+          "description": "Exact conversation_id from search (disambiguates shared source paths)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
         },
         {
           "name": "context",
@@ -31382,11 +31403,21 @@
               "source_path": {
                 "type": "string"
               },
+              "conversation_id": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 1,
+                "description": "Canonical archive conversation identity. Pass to view/expand --conversation-id with source_id and line_number."
+              },
               "line_number": {
                 "type": [
                   "integer",
                   "null"
-                ]
+                ],
+                "minimum": 1,
+                "description": "Canonical message index (messages.idx + 1), not a physical file line. Pass unchanged to view/expand --message-index with source_id and conversation_id."
               },
               "agent": {
                 "type": "string"

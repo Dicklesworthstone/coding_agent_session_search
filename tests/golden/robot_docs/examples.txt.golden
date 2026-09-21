@@ -1,7 +1,7 @@
 examples:
 
 # Quick project history (0.8.0 flags; check older-version help once)
-  cass search "performance regression" --workspace /path/to/project --days 7 --mode lexical --no-maintenance --robot --robot-meta --fields minimal --limit 5 --max-tokens 2000 --timeout 2000
+  cass search "performance regression" --workspace /path/to/project --days 7 --mode lexical --no-maintenance --robot --robot-meta --fields source_path,line_number,agent,source_id,conversation_id --limit 5 --max-tokens 2000 --timeout 2000
   # Also set a caller-side deadline. Read budget.timed_out even after exit 0; maintenance-required is a blocker, not permission to rebuild.
   cass view /path/to/session.jsonl -n 42 -C 3 --json --timeout 2000
 
@@ -93,7 +93,7 @@ examples:
   cass index --full                        # index all sessions
   cass index --full --json --robot-trace-ingest 2>/tmp/cass-ingest-trace.jsonl
   cass search "cma-es" --robot             # search
-  cass view <source_path> -n <line>        # examine result
+  cass view <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id>  # examine indexed result
 
 # TUI drill-in quick reference
   cass tui                                 # interactive mode

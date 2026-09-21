@@ -59093,6 +59093,23 @@
                                 }
                               }
                             },
+                            "conversation_id": {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string"
+                                  }
+                                },
+                                "minimum": {
+                                  "type": "integer"
+                                },
+                                "description": {
+                                  "type": "string"
+                                }
+                              }
+                            },
                             "line_number": {
                               "type": "object",
                               "properties": {
@@ -59101,6 +59118,12 @@
                                   "items": {
                                     "type": "string"
                                   }
+                                },
+                                "minimum": {
+                                  "type": "integer"
+                                },
+                                "description": {
+                                  "type": "string"
                                 }
                               }
                             },

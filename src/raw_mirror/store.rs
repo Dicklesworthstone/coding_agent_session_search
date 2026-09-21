@@ -395,8 +395,8 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         );
     }
     report.initialized = true;
-    // Dry-runs append the same audit stream as applied prunes, so both modes
-    // need one stable manifest/blob view and serialized audit writes.
+    // Both modes need one stable manifest/blob view. Applied prunes also
+    // serialize their durable audit writes under this lock.
     let _mutation_lock = acquire_raw_mirror_mutation_lock(&root)?;
     let _index_run_lock = options
         .apply
@@ -781,11 +781,10 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         if let Some((audit_path, audit_file)) = audit.as_mut() {
             append_prune_audit_records(audit_file, audit_path, &report, "result")?;
         }
-    } else if !report.entries.is_empty() {
-        let (audit_path, mut audit_file) = open_prune_audit_log(&root)?;
-        append_prune_audit_records(&mut audit_file, &audit_path, &report, "result")?;
-        report.audit_log_path = Some(audit_path.display().to_string());
     }
+    // A preview returns its plan to the caller without writing one audit row
+    // per candidate. Only applied operations need durable intent/result records;
+    // repeated previews must not grow the archive they are meant to inspect.
     Ok(report)
 }
 
@@ -5194,7 +5193,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_dry_run_audits_without_removing_manifest_or_blob() {
+    fn prune_dry_run_preserves_mirror_and_existing_audit_bytes() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
         let source_path = temp.path().join("source.jsonl");
@@ -5211,33 +5210,46 @@ mod tests {
         })
         .expect("capture source");
 
-        let report = prune(
-            &data_dir,
-            RawMirrorPruneOptions {
-                older_than_ms: Some(0),
-                max_size_bytes: None,
-                keep_tags: Vec::new(),
-                safety_hold_down_ms: 0,
-                apply: false,
-                ..RawMirrorPruneOptions::default()
-            },
-        )
-        .expect("dry-run prune");
-
-        assert!(report.initialized);
-        assert_eq!(report.mode, "dry-run");
-        assert_eq!(report.planned_manifest_count, 1);
-        assert_eq!(report.planned_blob_count, 1);
-        assert_eq!(report.applied_reclaim_bytes, 0);
         let root = data_dir
             .join(RAW_MIRROR_ROOT_DIR)
             .join(RAW_MIRROR_VERSION_DIR);
-        assert!(root.join(&captured.manifest_relative_path).exists());
-        assert!(root.join(&captured.blob_relative_path).exists());
         let audit_path = root.join("pruned.jsonl");
-        let audit = fs::read_to_string(audit_path).expect("read audit");
-        assert!(audit.contains("\"mode\":\"dry-run\""));
-        assert!(audit.contains("\"applied\":false"));
+        let manifest_path = root.join(&captured.manifest_relative_path);
+        let blob_path = root.join(&captured.blob_relative_path);
+        let manifest_before = fs::read(&manifest_path).expect("manifest bytes");
+        let blob_before = fs::read(&blob_path).expect("blob bytes");
+        let historical_audit = b"{\"mode\":\"apply\",\"applied\":true}\n";
+
+        for preview in 0..4 {
+            if preview == 1 {
+                fs::write(&audit_path, historical_audit).expect("seed existing audit");
+            }
+            let report = prune(
+                &data_dir,
+                RawMirrorPruneOptions {
+                    older_than_ms: Some(0),
+                    safety_hold_down_ms: 0,
+                    apply: false,
+                    ..RawMirrorPruneOptions::default()
+                },
+            )
+            .expect("dry-run prune");
+
+            assert!(report.initialized);
+            assert_eq!(report.mode, "dry-run");
+            assert_eq!(report.planned_manifest_count, 1);
+            assert_eq!(report.planned_blob_count, 1);
+            assert!(report.planned_reclaim_bytes > 0);
+            assert_eq!(report.applied_reclaim_bytes, 0);
+            assert!(report.audit_log_path.is_none());
+            assert_eq!(fs::read(&manifest_path).expect("manifest"), manifest_before);
+            assert_eq!(fs::read(&blob_path).expect("blob"), blob_before);
+            if preview == 0 {
+                assert!(!audit_path.exists(), "preview created a persistent audit");
+            } else {
+                assert_eq!(fs::read(&audit_path).expect("audit"), historical_audit);
+            }
+        }
     }
 
     #[test]

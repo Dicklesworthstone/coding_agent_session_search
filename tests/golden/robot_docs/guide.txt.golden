@@ -10,10 +10,10 @@ guide:
   Pack warnings: inspect health, freshness, privacy, and warnings for semantic_fallback_lexical, privacy_redactions_applied, and no_evidence_found before copying output; stale evidence is structural via freshness.stale_evidence_count.
   Pack budgets: tune --max-tokens, --max-evidence, --max-sessions, --max-excerpt-chars, and --fields summary/minimal to fit the recipient context.
   Default search: hybrid-preferred. With --robot-meta, inspect requested_search_mode, search_mode, semantic_refinement, fallback_tier, and fallback_reason.
-  Quick history (0.8.0 flags): use --workspace PATH --days 7 --mode lexical --no-maintenance --robot --robot-meta --fields minimal --limit 5 --max-tokens 2000 --timeout 2000.
+  Quick history: use --workspace PATH --days 7 --mode lexical --no-maintenance --robot --robot-meta --fields source_path,line_number,agent,source_id,conversation_id --limit 5 --max-tokens 2000 --timeout 2000.
   Budget: --timeout is milliseconds; --max-tokens bounds approximate output, not scan work. Also set a caller-side deadline; inspect budget.timed_out even after exit 0.
   Retrieval refusal: maintenance-required ends this attempt; do not rebuild, install models, or run broad aggregates to answer a quick history question. Check older-version help; never silently drop --no-maintenance.
-  Evidence: expand useful source_path/line_number hits with `cass view PATH -n LINE -C 3 --json --timeout 2000`; preserve citations. Broaden scope or choose semantic refinement deliberately.
+  Evidence: expand useful source_path/line_number hits with `cass view PATH --message-index LINE_NUMBER --source SOURCE_ID --conversation-id CONVERSATION_ID -C 3 --json --timeout 2000`; preserve citations. Broaden scope or choose semantic refinement deliberately.
   Readiness: use `cass triage --json` for diagnosis, not as a prerequisite to every query. Review recommended mutations separately; cass health/status JSON remains the narrower readiness truth surface.
   Doctor outcomes: branch on doctor.operation_outcome.kind (kebab-case) before prose; exit_code_kind says whether the outcome is success, health-failure, usage-error, lock-busy, or repair-failure.
   Doctor v2 schemas: use introspect.response_schemas doctor-* keys. First branch on err.kind/status/operation_outcome.kind/outcome_kind/asset_class/risk_level/fallback_mode; never scrape diagnostic prose.

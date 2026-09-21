@@ -29,7 +29,7 @@ WORKFLOW:
   2. cass search "query" --robot  # Search with JSON output
   3. cass pack "query" --robot --max-tokens 12000  # Cited handoff evidence
   4. cass swarm status --json  # Inspect shared-work safety before claiming repo work
-  5. cass view <source_path> -n <line> --json  # Follow up on a cited result
+  5. cass view <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> --json  # Follow the exact indexed hit
   Pack warnings expose freshness, semantic fallback, and privacy redactions.
 
 OUTPUT:

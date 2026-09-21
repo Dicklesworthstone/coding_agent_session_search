@@ -69,12 +69,32 @@ fn native_databases_are_discovered_and_scanned_by_the_cass_connector() -> Result
     seed(&conn, "native-session", "native question")?;
     conn.close()?;
     let before = snapshot(&path)?;
+    let mut wal_name = path.as_os_str().to_os_string();
+    wal_name.push("-wal");
+    let wal = PathBuf::from(wal_name);
+    let wal_before = wal.is_file().then(|| snapshot(&wal)).transpose()?;
     let connector = OpenClawConnector::new();
     let ctx = context(temp.path(), None);
     let sources = connector.discover_source_files(&ctx)?;
-    assert_eq!(sources.len(), 1, "normal CASS build must enable openclaw-sqlite");
-    assert_eq!(sources[0].source_path, path);
-    assert_eq!(sources[0].role, DiscoveredSourceRole::SqliteDatabase);
+    assert_eq!(
+        sources
+            .iter()
+            .filter(|source| source.role == DiscoveredSourceRole::SqliteDatabase)
+            .count(),
+        1,
+        "normal CASS build must discover exactly one native database"
+    );
+    assert!(sources.iter().any(|source| {
+        source.source_path == path && source.role == DiscoveredSourceRole::SqliteDatabase
+    }));
+    assert_eq!(sources.len(), 1 + usize::from(wal_before.is_some()));
+    if wal_before.is_some() {
+        assert!(sources.iter().any(|source| {
+            source.source_path == wal
+                && source.role == DiscoveredSourceRole::MetadataSidecar
+                && source.required_for_reconstruction
+        }));
+    }
     let conversations = connector.scan(&ctx)?;
     assert_eq!(conversations.len(), 1);
     let conversation = &conversations[0];
@@ -94,6 +114,10 @@ fn native_databases_are_discovered_and_scanned_by_the_cass_connector() -> Result
     connector.scan_with_callback(&ctx, &mut |conversation| { streamed.push(conversation); Ok(()) })?;
     assert_eq!(by_id(&streamed), by_id(&conversations));
     assert_eq!(snapshot(&path)?, before, "scanning must not rewrite the source database");
+    assert_eq!(
+        wal.is_file().then(|| snapshot(&wal)).transpose()?,
+        wal_before
+    );
     Ok(())
 }
 
