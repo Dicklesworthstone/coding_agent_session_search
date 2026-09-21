@@ -8,10 +8,13 @@
 mod artifacts;
 mod delegate;
 mod engine;
+#[cfg(unix)]
+mod unchanged;
 
 pub use artifacts::{
     BackfillArtifactCandidate, BackfillArtifactReclaimPlan, BackfillArtifactReclaimReport,
-    apply_backfill_artifact_plan, plan_backfill_artifacts, reclaim_backfill_artifacts,
+    BackfillManifestChanged, apply_backfill_artifact_plan, plan_backfill_artifacts,
+    reclaim_backfill_artifacts,
 };
 pub use engine::*;
 
@@ -53,8 +56,9 @@ impl SemanticIndexer {
         let artifacts = artifacts::BackfillArtifacts::begin(data_dir, manifest)?;
         let result = run(&self.inner, manifest);
         if let Ok(outcome) = &result {
-            // The engine has returned only after manifest.save's file and
-            // directory fsync, and its temporary snapshots/readers have closed.
+            // A writer returns after manifest.save's file/directory fsync;
+            // a proved no-op retains the already durable publication. Temporary
+            // snapshots/readers have closed in either case.
             // Never do this in Drop: an error or unwind is not a durable commit.
             artifacts.after_success(manifest, &outcome.index_path);
         }
@@ -119,6 +123,12 @@ impl SemanticIndexer {
         sink: &SemanticProgressSink,
     ) -> Result<SemanticBackfillBatchOutcome> {
         self.with_backfill_artifacts(data_dir, manifest, |engine, manifest| {
+            #[cfg(unix)]
+            if let Some(outcome) = unchanged::try_retain_completed(
+                engine, storage, data_dir, manifest, &plan, sink,
+            )? {
+                return Ok(outcome);
+            }
             engine.run_backfill_from_storage_with_sink(storage, data_dir, manifest, plan, sink)
         })
     }
@@ -132,6 +142,12 @@ impl SemanticIndexer {
         sink: &SemanticProgressSink,
     ) -> Result<SemanticBackfillBatchOutcome> {
         self.with_backfill_artifacts(data_dir, manifest, |engine, manifest| {
+            #[cfg(unix)]
+            if let Some(outcome) = unchanged::try_retain_completed(
+                engine, storage, data_dir, manifest, &plan, sink,
+            )? {
+                return Ok(outcome);
+            }
             engine.run_capped_backfill_from_storage_with_sink(storage, data_dir, manifest, plan, sink)
         })
     }

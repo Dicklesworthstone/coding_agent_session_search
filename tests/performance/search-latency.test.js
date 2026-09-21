@@ -1,6 +1,6 @@
 async function runSearchLatency(page, queries) {
   const results = await page.evaluate(async (qs) => {
-    const { queryAll } = await import('./database.js');
+    const { queryAll } = await import("./database.js");
     const rows = [];
     for (const query of qs) {
       const start = performance.now();
@@ -12,7 +12,7 @@ async function runSearchLatency(page, queries) {
          WHERE messages_fts MATCH ?
          ORDER BY rank
          LIMIT 100`,
-        [query]
+        [query],
       );
       const elapsed = performance.now() - start;
       rows.push({ query, elapsed_ms: elapsed, count: res.length, ok: elapsed < 100 });

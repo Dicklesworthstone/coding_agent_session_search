@@ -1,4 +1,4 @@
-import { test, expect, gotoFile, waitForPageReady } from '../setup/test-utils';
+import { expect, gotoFile, test, waitForPageReady } from "../setup/test-utils";
 
 /**
  * Mobile device E2E tests - Performance under constraints
@@ -7,15 +7,17 @@ import { test, expect, gotoFile, waitForPageReady } from '../setup/test-utils';
  * with CPU throttling to simulate real mobile performance.
  */
 
-test.describe('Mobile Performance', () => {
+test.describe("Mobile Performance", () => {
   test.beforeEach(async ({ page }) => {
     const viewport = page.viewportSize();
     const isMobile = (viewport?.width || 0) < 768;
-    console.log(`[device-context] viewport: ${viewport?.width}x${viewport?.height}, mobile: ${isMobile}`);
+    console.log(
+      `[device-context] viewport: ${viewport?.width}x${viewport?.height}, mobile: ${isMobile}`,
+    );
   });
 
-  test('page loads within acceptable time', async ({ page, exportPath }, testInfo) => {
-    test.skip(!exportPath, 'Export path not available');
+  test("page loads within acceptable time", async ({ page, exportPath }, testInfo) => {
+    test.skip(!exportPath, "Export path not available");
 
     const startTime = Date.now();
 
@@ -28,21 +30,23 @@ test.describe('Mobile Performance', () => {
     console.log(`[perf] Page load time: ${loadTime}ms`);
 
     // Report metrics via attachment for JSONL reporter
-    await testInfo.attach('metrics', {
-      body: Buffer.from(JSON.stringify({
-        name: 'page_load_mobile',
-        duration_ms: loadTime,
-      })),
-      contentType: 'application/json',
+    await testInfo.attach("metrics", {
+      body: Buffer.from(
+        JSON.stringify({
+          name: "page_load_mobile",
+          duration_ms: loadTime,
+        }),
+      ),
+      contentType: "application/json",
     });
 
     // Should load within 5 seconds even on mobile
     expect(loadTime).toBeLessThan(5000);
   });
 
-  test('page renders without blocking main thread', async ({ page, exportPath, browserName }) => {
-    test.skip(browserName === 'webkit', 'WebKit mobile interaction timing is noisy on CI');
-    test.skip(!exportPath, 'Export path not available');
+  test("page renders without blocking main thread", async ({ page, exportPath, browserName }) => {
+    test.skip(browserName === "webkit", "WebKit mobile interaction timing is noisy on CI");
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
@@ -59,9 +63,9 @@ test.describe('Mobile Performance', () => {
     expect(interactTime).toBeLessThan(100);
   });
 
-  test('scrolling is smooth', async ({ page, exportPath, browserName }) => {
-    test.skip(browserName === 'webkit', 'WebKit mobile frame timing is noisy on CI');
-    test.skip(!exportPath, 'Export path not available');
+  test("scrolling is smooth", async ({ page, exportPath, browserName }) => {
+    test.skip(browserName === "webkit", "WebKit mobile frame timing is noisy on CI");
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
@@ -73,7 +77,7 @@ test.describe('Mobile Performance', () => {
       for (let i = 0; i < 10; i++) {
         const start = performance.now();
         window.scrollBy(0, 50);
-        await new Promise(r => requestAnimationFrame(r));
+        await new Promise((r) => requestAnimationFrame(r));
         measurements.push(performance.now() - start);
       }
 
@@ -84,23 +88,26 @@ test.describe('Mobile Performance', () => {
       };
     });
 
-    console.log(`[perf] Scroll metrics - avg: ${scrollMetrics.avg.toFixed(2)}ms, max: ${scrollMetrics.max.toFixed(2)}ms`);
+    console.log(
+      `[perf] Scroll metrics - avg: ${scrollMetrics.avg.toFixed(2)}ms, max: ${scrollMetrics.max.toFixed(2)}ms`,
+    );
 
     // Average scroll frame should be under 16ms (60fps)
     // Allow some slack for test overhead
     expect(scrollMetrics.avg).toBeLessThan(50);
   });
 
-  test('memory usage stays reasonable', async ({ page, exportPath }, testInfo) => {
-    test.skip(!exportPath, 'Export path not available');
+  test("memory usage stays reasonable", async ({ page, exportPath }, testInfo) => {
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     // Check initial memory
     const initialMemory = await page.evaluate(() => {
-      if ('memory' in performance) {
-        return (performance as unknown as { memory: { usedJSHeapSize: number } }).memory.usedJSHeapSize;
+      if ("memory" in performance) {
+        return (performance as unknown as { memory: { usedJSHeapSize: number } }).memory
+          .usedJSHeapSize;
       }
       return null;
     });
@@ -113,8 +120,9 @@ test.describe('Mobile Performance', () => {
 
     // Check final memory
     const finalMemory = await page.evaluate(() => {
-      if ('memory' in performance) {
-        return (performance as unknown as { memory: { usedJSHeapSize: number } }).memory.usedJSHeapSize;
+      if ("memory" in performance) {
+        return (performance as unknown as { memory: { usedJSHeapSize: number } }).memory
+          .usedJSHeapSize;
       }
       return null;
     });
@@ -126,14 +134,16 @@ test.describe('Mobile Performance', () => {
       console.log(`[perf] Memory growth: ${growthMB.toFixed(2)}MB`);
 
       // Report metrics via attachment for JSONL reporter
-      await testInfo.attach('metrics', {
-        body: Buffer.from(JSON.stringify({
-          name: 'memory_usage_mobile',
-          memory_bytes: memoryGrowth,
-          initial_memory_bytes: initialMemory,
-          final_memory_bytes: finalMemory,
-        })),
-        contentType: 'application/json',
+      await testInfo.attach("metrics", {
+        body: Buffer.from(
+          JSON.stringify({
+            name: "memory_usage_mobile",
+            memory_bytes: memoryGrowth,
+            initial_memory_bytes: initialMemory,
+            final_memory_bytes: finalMemory,
+          }),
+        ),
+        contentType: "application/json",
       });
 
       // Should not grow more than 50MB during normal use
@@ -141,9 +151,9 @@ test.describe('Mobile Performance', () => {
     }
   });
 
-  test('animations do not cause jank', async ({ page, exportPath, browserName }) => {
-    test.skip(browserName === 'webkit', 'WebKit mobile frame timing is noisy on CI');
-    test.skip(!exportPath, 'Export path not available');
+  test("animations do not cause jank", async ({ page, exportPath, browserName }) => {
+    test.skip(browserName === "webkit", "WebKit mobile frame timing is noisy on CI");
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
@@ -173,7 +183,7 @@ test.describe('Mobile Performance', () => {
       });
 
       // Calculate metrics
-      const droppedFrames = frameTimes.filter(t => t > 33).length; // > 30fps threshold
+      const droppedFrames = frameTimes.filter((t) => t > 33).length; // > 30fps threshold
       const avgFrameTime = frameTimes.reduce((a, b) => a + b, 0) / frameTimes.length;
 
       return {
@@ -183,7 +193,9 @@ test.describe('Mobile Performance', () => {
       };
     });
 
-    console.log(`[perf] Frame metrics - avg: ${frameMetrics.avgFrameTime.toFixed(2)}ms, dropped: ${frameMetrics.droppedFrames}/${frameMetrics.totalFrames}`);
+    console.log(
+      `[perf] Frame metrics - avg: ${frameMetrics.avgFrameTime.toFixed(2)}ms, dropped: ${frameMetrics.droppedFrames}/${frameMetrics.totalFrames}`,
+    );
 
     // Should not drop more than 20% of frames
     const dropRate = frameMetrics.droppedFrames / frameMetrics.totalFrames;
@@ -191,84 +203,94 @@ test.describe('Mobile Performance', () => {
   });
 });
 
-test.describe('Decryption Performance', () => {
-  test('encrypted page decrypts within acceptable time', async ({ page, encryptedExportPath, password }, testInfo) => {
-    test.skip(!encryptedExportPath, 'Encrypted export path not available');
+test.describe("Decryption Performance", () => {
+  test("encrypted page decrypts within acceptable time", async ({
+    page,
+    encryptedExportPath,
+    password,
+  }, testInfo) => {
+    test.skip(!encryptedExportPath, "Encrypted export path not available");
 
     await gotoFile(page, encryptedExportPath);
     await waitForPageReady(page);
 
     // Find password input
     const passwordInput = page.locator('#password, input[type="password"]');
-    if (await passwordInput.count() === 0) {
-      test.skip(true, 'Password input not found - may not be encrypted');
+    if ((await passwordInput.count()) === 0) {
+      test.skip(true, "Password input not found - may not be encrypted");
       return;
     }
 
     const startDecrypt = Date.now();
 
     await passwordInput.fill(password);
-    await page.keyboard.press('Enter');
+    await page.keyboard.press("Enter");
 
     // Wait for content to appear
-    await page.waitForSelector('.message, .content, main', { timeout: 30000 });
+    await page.waitForSelector(".message, .content, main", { timeout: 30000 });
 
     const decryptTime = Date.now() - startDecrypt;
 
     console.log(`[perf] Decryption time: ${decryptTime}ms`);
 
     // Report metrics via attachment for JSONL reporter
-    await testInfo.attach('metrics', {
-      body: Buffer.from(JSON.stringify({
-        name: 'decryption_mobile',
-        duration_ms: decryptTime,
-      })),
-      contentType: 'application/json',
+    await testInfo.attach("metrics", {
+      body: Buffer.from(
+        JSON.stringify({
+          name: "decryption_mobile",
+          duration_ms: decryptTime,
+        }),
+      ),
+      contentType: "application/json",
     });
 
     // Decryption should complete within 10 seconds on mobile
     expect(decryptTime).toBeLessThan(10000);
   });
 
-  test('decryption progress is shown', async ({ page, encryptedExportPath, password }) => {
-    test.skip(!encryptedExportPath, 'Encrypted export path not available');
+  test("decryption progress is shown", async ({ page, encryptedExportPath, password }) => {
+    test.skip(!encryptedExportPath, "Encrypted export path not available");
 
     await gotoFile(page, encryptedExportPath);
     await waitForPageReady(page);
 
     const passwordInput = page.locator('#password, input[type="password"]');
-    if (await passwordInput.count() === 0) {
-      test.skip(true, 'Password input not found');
+    if ((await passwordInput.count()) === 0) {
+      test.skip(true, "Password input not found");
       return;
     }
 
     await passwordInput.fill(password);
-    await page.keyboard.press('Enter');
+    await page.keyboard.press("Enter");
 
     // Look for progress indicator
     const progressIndicator = page.locator(
-      '.decrypting, .progress, .loading, [data-decrypting="true"], .spinner'
+      '.decrypting, .progress, .loading, [data-decrypting="true"], .spinner',
     );
 
     // Either progress is shown, or decryption is so fast it doesn't need it
-    const hasProgress = await progressIndicator.count() > 0;
+    const hasProgress = (await progressIndicator.count()) > 0;
 
     // Wait for completion
-    await page.waitForSelector('.message, .content, main', { timeout: 30000 });
+    await page.waitForSelector(".message, .content, main", { timeout: 30000 });
 
     // Log whether progress was shown
     console.log(`[perf] Decryption progress indicator shown: ${hasProgress}`);
   });
 
-  test('UI remains responsive during decryption', async ({ page, encryptedExportPath, password }) => {
-    test.skip(!encryptedExportPath, 'Encrypted export path not available');
+  test("UI remains responsive during decryption", async ({
+    page,
+    encryptedExportPath,
+    password,
+  }) => {
+    test.skip(!encryptedExportPath, "Encrypted export path not available");
 
     await gotoFile(page, encryptedExportPath);
     await waitForPageReady(page);
 
     const passwordInput = page.locator('#password, input[type="password"]');
-    if (await passwordInput.count() === 0) {
-      test.skip(true, 'Password input not found');
+    if ((await passwordInput.count()) === 0) {
+      test.skip(true, "Password input not found");
       return;
     }
 
@@ -279,11 +301,11 @@ test.describe('Decryption Performance', () => {
 
     // Try to interact while decrypting
     const interactionPromise = (async () => {
-      await page.keyboard.press('Enter');
+      await page.keyboard.press("Enter");
 
       // Try to type during decryption
       const startType = Date.now();
-      await page.keyboard.press('Tab');
+      await page.keyboard.press("Tab");
       const typeTime = Date.now() - startType;
 
       // Should respond within 500ms even during decryption
@@ -291,20 +313,24 @@ test.describe('Decryption Performance', () => {
     })();
 
     await interactionPromise;
-    await page.waitForSelector('.message, .content, main', { timeout: 30000 });
+    await page.waitForSelector(".message, .content, main", { timeout: 30000 });
 
     expect(inputResponsive).toBe(true);
   });
 });
 
-test.describe('CPU Throttled Performance', () => {
-  test('page functions with 4x CPU slowdown', async ({ page, exportPath, browserName }, testInfo) => {
-    test.skip(browserName !== 'chromium', 'CDP CPU throttling is Chromium-only');
-    test.skip(!exportPath, 'Export path not available');
+test.describe("CPU Throttled Performance", () => {
+  test("page functions with 4x CPU slowdown", async ({
+    page,
+    exportPath,
+    browserName,
+  }, testInfo) => {
+    test.skip(browserName !== "chromium", "CDP CPU throttling is Chromium-only");
+    test.skip(!exportPath, "Export path not available");
 
     // Enable CPU throttling via CDP (Chrome DevTools Protocol)
     const client = await page.context().newCDPSession(page);
-    await client.send('Emulation.setCPUThrottlingRate', { rate: 4 });
+    await client.send("Emulation.setCPUThrottlingRate", { rate: 4 });
 
     try {
       const startTime = Date.now();
@@ -316,44 +342,46 @@ test.describe('CPU Throttled Performance', () => {
       console.log(`[perf] Load time with 4x CPU throttling: ${loadTime}ms`);
 
       // Report metrics via attachment for JSONL reporter
-      await testInfo.attach('metrics', {
-        body: Buffer.from(JSON.stringify({
-          name: 'page_load_throttled_4x',
-          duration_ms: loadTime,
-          cpu_throttle_rate: 4,
-        })),
-        contentType: 'application/json',
+      await testInfo.attach("metrics", {
+        body: Buffer.from(
+          JSON.stringify({
+            name: "page_load_throttled_4x",
+            duration_ms: loadTime,
+            cpu_throttle_rate: 4,
+          }),
+        ),
+        contentType: "application/json",
       });
 
       // Should still load within 15 seconds
       expect(loadTime).toBeLessThan(15000);
 
       // Basic functionality should work
-      const messages = await page.locator('.message').count();
+      const messages = await page.locator(".message").count();
       expect(messages).toBeGreaterThan(0);
     } finally {
       // Reset throttling
-      await client.send('Emulation.setCPUThrottlingRate', { rate: 1 });
+      await client.send("Emulation.setCPUThrottlingRate", { rate: 1 });
     }
   });
 
-  test('search works with CPU throttling', async ({ page, exportPath, browserName }) => {
-    test.skip(browserName !== 'chromium', 'CDP CPU throttling is Chromium-only');
-    test.skip(!exportPath, 'Export path not available');
+  test("search works with CPU throttling", async ({ page, exportPath, browserName }) => {
+    test.skip(browserName !== "chromium", "CDP CPU throttling is Chromium-only");
+    test.skip(!exportPath, "Export path not available");
 
     const client = await page.context().newCDPSession(page);
-    await client.send('Emulation.setCPUThrottlingRate', { rate: 4 });
+    await client.send("Emulation.setCPUThrottlingRate", { rate: 4 });
 
     try {
       await gotoFile(page, exportPath);
       await waitForPageReady(page);
 
       const searchInput = page.locator('#search-input, input[type="search"]');
-      if (await searchInput.count() > 0) {
+      if ((await searchInput.count()) > 0) {
         const startSearch = Date.now();
 
-        await searchInput.first().fill('test');
-        await page.keyboard.press('Enter');
+        await searchInput.first().fill("test");
+        await page.keyboard.press("Enter");
         await page.waitForTimeout(1000);
 
         const searchTime = Date.now() - startSearch;
@@ -363,7 +391,7 @@ test.describe('CPU Throttled Performance', () => {
         expect(searchTime).toBeLessThan(5000);
       }
     } finally {
-      await client.send('Emulation.setCPUThrottlingRate', { rate: 1 });
+      await client.send("Emulation.setCPUThrottlingRate", { rate: 1 });
     }
   });
 });

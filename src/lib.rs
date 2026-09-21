@@ -35,6 +35,7 @@ pub mod fleet_platform_compat;
 pub mod fleet_probe;
 pub mod fleet_upgrade_rehearsal;
 pub mod fleet_version_skew;
+mod followup_coordinates;
 pub mod franken_sync;
 pub mod ftui_harness;
 pub mod guide_planner;
@@ -914,7 +915,7 @@ pub enum Commands {
         #[arg(long, visible_alias = "robot")]
         json: bool,
     },
-    /// View a source file at a specific line (follow up on search results)
+    /// Inspect file lines, or follow a search hit with --message-index
     View {
         /// Path to the source file
         path: PathBuf,
@@ -924,9 +925,19 @@ pub enum Commands {
         /// Exact canonical archive conversation row id
         #[arg(long, alias = "conversation_id", value_parser = clap::value_parser!(i64).range(1..))]
         conversation_id: Option<i64>,
-        /// Line number to show (1-indexed)
-        #[arg(long, short = 'n', alias = "line-number", alias = "line_number")]
+        /// Physical file line (1-based), NOT search's line_number; use --message-index for hits.
+        #[arg(
+            long,
+            short = 'n',
+            alias = "line-number",
+            alias = "line_number",
+            conflicts_with = "message_index"
+        )]
         line: Option<usize>,
+        /// Canonical message ordinal: pass search's line_number unchanged (1-based).
+        /// Reads the archive only; never substitutes a physical file line.
+        #[arg(long, conflicts_with = "line")]
+        message_index: Option<usize>,
         /// Number of context lines before/after
         #[arg(long, short = 'C', default_value_t = 5)]
         context: usize,
@@ -1428,16 +1439,30 @@ pub enum Commands {
         #[arg(long, visible_alias = "robot")]
         json: bool,
     },
-    /// Show messages around a specific line in a session file
+    /// Expand a search hit with --message-index, or inspect raw JSONL with --line
     Expand {
         /// Path to session file
         path: PathBuf,
         /// Exact source_id from search output (e.g. 'local', 'work-laptop')
         #[arg(long, alias = "source-id", alias = "source_id")]
         source: Option<String>,
-        /// Line number to show context around
-        #[arg(long, short = 'n', alias = "line-number", alias = "line_number")]
-        line: usize,
+        /// Physical file line, NOT search's line_number; use --message-index for hits.
+        #[arg(
+            long,
+            short = 'n',
+            alias = "line-number",
+            alias = "line_number",
+            conflicts_with = "message_index",
+            required_unless_present = "message_index"
+        )]
+        line: Option<usize>,
+        /// Canonical message ordinal: pass search's line_number unchanged (1-based).
+        /// Reads the archive only; never substitutes a physical file line.
+        #[arg(long, conflicts_with = "line")]
+        message_index: Option<usize>,
+        /// Exact conversation_id from search (disambiguates shared source paths).
+        #[arg(long, alias = "conversation_id", requires = "message_index", value_parser = clap::value_parser!(i64).range(1..))]
+        conversation_id: Option<i64>,
         /// Number of messages before/after (default: 3)
         #[arg(long, short = 'C', default_value_t = 3)]
         context: usize,
@@ -3987,11 +4012,18 @@ fn split_path_line_assignment(arg: &str) -> Option<(String, usize)> {
 }
 
 fn has_line_arg(rest: &[String]) -> bool {
-    rest.iter().any(|arg| {
-        matches!(arg.as_str(), "--line" | "-n" | "--line-number")
-            || arg.starts_with("--line=")
-            || arg.starts_with("--line-number=")
-    })
+    // An explicit canonical selector must also suppress path:line recovery.
+    has_option_alias(
+        rest,
+        &[
+            "--line",
+            "-n",
+            "--line-number",
+            "--line_number",
+            "--message-index",
+            "--message_index",
+        ],
+    )
 }
 
 fn has_option_alias(rest: &[String], aliases: &[&str]) -> bool {
@@ -4792,9 +4824,18 @@ fn drilldown_assignment_flag(
     }
 
     match key {
-        "line" | "line-number" | "line_number" | "n" => {
-            Some(("--line", &["--line", "--line-number", "-n"]))
+        "line" | "n" => Some((
+            "--line",
+            &["--line", "--line-number", "--line_number", "-n"],
+        )),
+        // Pasted search fields are canonical ordinals, never raw file lines.
+        "line-number" | "line_number" | "message-index" | "message_index" => {
+            Some(("--message-index", &["--message-index", "--message_index"]))
         }
+        "conversation-id" | "conversation_id" => Some((
+            "--conversation-id",
+            &["--conversation-id", "--conversation_id"],
+        )),
         "context" | "c" => Some(("--context", &["--context", "-C"])),
         _ => None,
     }
@@ -5205,7 +5246,7 @@ fn recover_multiword_query_positionals(rest: &mut Vec<String>, corrections: &mut
 /// 16. **Leading-filter query recovery**: `search --agent codex foo bar` → `search "foo bar" --agent codex`
 /// 17. **Implicit robot search recovery**: `foo bar --json` → `search "foo bar" --json`
 /// 18. **Drill-down option recovery**: `view file line=42` → `view file --line 42`
-/// 19. **Search-result field aliases**: `view file --line-number 42` → `view file --line 42`
+/// 19. **Search-result field assignments**: `view file line_number=42` → `view file --message-index 42`
 /// 20. **Search-result source aliases**: `view source_path=file source_id=local` → `view file --source local`
 /// 21. **Robot-docs topic shorthand**: `commands --json` → `robot-docs commands`
 /// 22. **Current-session shorthand**: `current --json` → `sessions --current --json`
@@ -5303,6 +5344,8 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "source-path",
         "source-id",
         "line-number",
+        "message-index",
+        "conversation-id",
         "file",
         "session",
         "line",
@@ -7664,13 +7707,14 @@ async fn execute_cli(
                     path,
                     source,
                     conversation_id,
+                    message_index,
                     line,
                     context,
                     json,
                     timeout,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
-                    run_view(
+                    followup_coordinates::run_view(
                         &path,
                         cli.db.clone(),
                         source.as_deref(),
@@ -7678,6 +7722,7 @@ async fn execute_cli(
                         ViewWindow { line, context },
                         structured_format,
                         timeout,
+                        message_index,
                     )?;
                 }
                 Commands::Pages {
@@ -8832,18 +8877,22 @@ async fn execute_cli(
                 Commands::Expand {
                     path,
                     source,
+                    message_index,
+                    conversation_id,
                     line,
                     context,
                     json,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
-                    run_expand(
+                    followup_coordinates::run_expand(
                         &path,
                         cli.db.clone(),
                         source.as_deref(),
                         line,
                         context,
                         structured_format,
+                        message_index,
+                        conversation_id,
                     )?;
                 }
                 Commands::Timeline {
@@ -26066,7 +26115,7 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
         "  2. cass search \"query\" --robot  # Search with JSON output",
         "  3. cass pack \"query\" --robot --max-tokens 12000  # Cited handoff evidence",
         "  4. cass swarm status --json  # Inspect shared-work safety before claiming repo work",
-        "  5. cass view <source_path> -n <line> --json  # Follow up on a cited result",
+        "  5. cass view <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> --json  # Follow the exact indexed hit",
         "  Pack warnings expose freshness, semantic fallback, and privacy redactions.",
         "",
         "OUTPUT:",
@@ -26210,7 +26259,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass models check-update [--model NAME] [--json]  Compare an explicit installed revision against its pin.".to_string(),
             "  cass models backfill             Re-embed conversations against a newly acquired model.".to_string(),
             "  cass models build-hnsw [--tier fast|quality] [--check] [--force] [--json]  Build/verify the HNSW accelerator for a published semantic artifact (no archive open, no embedding).".to_string(),
-            "  cass expand <path> --line N [-C CONTEXT] [--json]  Show messages around a specific line in a session.".to_string(),
+            "  cass expand <path> --message-index N [--source ID] [--conversation-id ID] [-C CONTEXT] [--json]  Follow search line_number; --line is for raw JSONL.".to_string(),
             "  cass resume <path> [--shell]     Resolve a session path into its native-harness resume command.".to_string(),
             "  cass timeline [--since DATE] [--until DATE] [--json]  Activity timeline over a time range.".to_string(),
             "  cass mirror prune [--older-than 90d] [--max-size 100GB] [--keep-tag important] [--apply] [--json]  Plan or apply raw-mirror retention with an audit log.".to_string(),
@@ -26329,7 +26378,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  Quick history (0.8.0 flags): use --workspace PATH --days 7 --mode lexical --no-maintenance --robot --robot-meta --fields minimal --limit 5 --max-tokens 2000 --timeout 2000.".to_string(),
             "  Budget: --timeout is milliseconds; --max-tokens bounds approximate output, not scan work. Also set a caller-side deadline; inspect budget.timed_out even after exit 0.".to_string(),
             "  Retrieval refusal: maintenance-required ends this attempt; do not rebuild, install models, or run broad aggregates to answer a quick history question. Check older-version help; never silently drop --no-maintenance.".to_string(),
-            "  Evidence: expand useful source_path/line_number hits with `cass view PATH -n LINE -C 3 --json --timeout 2000`; preserve citations. Broaden scope or choose semantic refinement deliberately.".to_string(),
+            "  Evidence: expand useful source_path/line_number hits with `cass view PATH --message-index LINE_NUMBER --source SOURCE_ID --conversation-id CONVERSATION_ID -C 3 --json --timeout 2000`; preserve citations. Broaden scope or choose semantic refinement deliberately.".to_string(),
             "  Readiness: use `cass triage --json` for diagnosis, not as a prerequisite to every query. Review recommended mutations separately; cass health/status JSON remains the narrower readiness truth surface.".to_string(),
             "  Doctor outcomes: branch on doctor.operation_outcome.kind (kebab-case) before prose; exit_code_kind says whether the outcome is success, health-failure, usage-error, lock-busy, or repair-failure.".to_string(),
             "  Doctor v2 schemas: use introspect.response_schemas doctor-* keys. First branch on err.kind/status/operation_outcome.kind/outcome_kind/asset_class/risk_level/fallback_mode; never scrape diagnostic prose.".to_string(),
@@ -26457,7 +26506,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass index --full                        # index all sessions".to_string(),
             "  cass index --full --json --robot-trace-ingest 2>/tmp/cass-ingest-trace.jsonl".to_string(),
             "  cass search \"cma-es\" --robot             # search".to_string(),
-            "  cass view <source_path> -n <line>        # examine result".to_string(),
+            "  cass view <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id>  # examine indexed result".to_string(),
             String::new(),
             "# TUI drill-in quick reference".to_string(),
             "  cass tui                                 # interactive mode".to_string(),
@@ -93770,10 +93819,10 @@ fn build_workflow_capabilities() -> Vec<WorkflowCapability> {
         workflow_capability(
             "bounded-search",
             "Search sessions without flooding the caller's token budget.",
-            "cass search \"<query>\" --robot --limit 10 --fields summary --max-content-length 800 --robot-meta",
+            "cass search \"<query>\" --robot --limit 10 --fields summary,provenance,conversation_id --max-content-length 800 --robot-meta",
             &[
-                "cass view <source_path> -n <line_number> --json",
-                "cass expand <source_path> --line <line_number> -C 3 --json",
+                "cass view <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> --json",
+                "cass expand <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> -C 3 --json",
                 "cass pack \"<query>\" --robot --max-tokens 4000 --limit 10",
             ],
             "Parse hits[], _meta.realized_mode, _meta.fallback_mode, cursor, and *_truncated flags.",
@@ -93784,8 +93833,8 @@ fn build_workflow_capabilities() -> Vec<WorkflowCapability> {
             "Build a deterministic cited handoff bundle for another agent.",
             "cass pack \"<question>\" --robot --max-tokens 4000 --max-evidence 8 --max-sessions 3 --require-evidence",
             &[
-                "cass search \"<question>\" --robot --limit 10 --fields provenance --robot-meta",
-                "cass view <source_path> -n <line_number> --json",
+                "cass search \"<question>\" --robot --limit 10 --fields summary,provenance,conversation_id --robot-meta",
+                "cass view <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> --json",
             ],
             "Parse evidence[], warnings[], privacy, freshness, health, and omitted[].",
             "Use pack when the downstream consumer needs citations rather than raw search hits.",
@@ -93793,14 +93842,14 @@ fn build_workflow_capabilities() -> Vec<WorkflowCapability> {
         workflow_capability(
             "session-drilldown",
             "Move from a hit to surrounding conversation context.",
-            "cass view <source_path> -n <line_number> --json",
+            "cass view <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> --json",
             &[
-                "cass expand <source_path> --line <line_number> -C 5 --json",
+                "cass expand <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> -C 5 --json",
                 "cass context <source_path> --json",
                 "cass resume <source_path> --shell",
             ],
-            "Parse path, line_number, message, surrounding messages, and resume command output.",
-            "Use source_path and line_number from search hits; do not infer file formats by hand.",
+            "Parse coordinate_space, message_index, conversation_id, source_id, content, and is_target in the returned messages.",
+            "Pass source_path, source_id, conversation_id, and line_number from the same hit; line_number belongs to --message-index, not raw --line.",
         ),
         workflow_capability(
             "semantic-models",
@@ -94030,13 +94079,13 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
             "cass view session.jsonl --line-number 42 --json",
             "cass view session.jsonl --line 42 --json",
             true,
-            "Search-result field names such as line_number/line-number are accepted as drill-down line aliases.",
+            "Legacy --line-number/--line_number flags still inspect raw lines; use --message-index for search hits.",
         ),
         mistake_recovery_capability(
             "cass view source_path=session.jsonl source_id=local line_number=42 --json",
-            "cass view session.jsonl --source local --line 42 --json",
+            "cass view session.jsonl --source local --message-index 42 --json",
             true,
-            "Search-result field bundles can be pasted directly into follow-up drill-down commands.",
+            "Pasted line_number fields select canonical messages, not raw lines; include conversation_id when a source path contains multiple conversations.",
         ),
         mistake_recovery_capability(
             "cass search auth --format json",
@@ -95159,6 +95208,7 @@ const INTEGER_ARG_NAMES: &[&str] = &[
     "freshness-window-seconds",
     "days",
     "line",
+    "message-index",
     "context",
     "stale-threshold",
     "timeout",
@@ -98009,7 +98059,11 @@ fn response_schema_search_hit() -> serde_json::Value {
         ("source_path", serde_json::json!({ "type": "string" })),
         (
             "line_number",
-            serde_json::json!({ "type": ["integer", "null"] }),
+            serde_json::json!({
+                "type": ["integer", "null"],
+                "minimum": 1,
+                "description": "Canonical message index (messages.idx + 1), not a physical file line. Pass unchanged to view/expand --message-index with source_id and conversation_id."
+            }),
         ),
         ("agent", serde_json::json!({ "type": "string" })),
         (
@@ -114817,22 +114871,12 @@ fn run_expand(
         }
     }
 
-    if target_msg_idx.is_none() && line > 0 {
-        for (idx, (msg_line, _)) in messages.iter().enumerate() {
-            if *msg_line >= line {
-                target_msg_idx = Some(idx);
-                break;
-            }
-        }
-        if target_msg_idx.is_none() && !messages.is_empty() {
-            target_msg_idx = Some(messages.len() - 1);
-        }
-    }
+    // GH493: only an exact raw-line match can be marked as the target.
 
     let target_idx = target_msg_idx.ok_or_else(|| CliError {
         code: 2,
         kind: CliErrorKind::LineNotFound.kind_str(),
-        message: format!("No message found at or near line {}", line),
+        message: format!("No message found at exact line {}", line),
         hint: Some(format!("File has {} messages", messages.len())),
         retryable: false,
     })?;

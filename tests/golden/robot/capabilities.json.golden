@@ -1688,7 +1688,7 @@
     },
     {
       "name": "view",
-      "description": "View a source file at a specific line (follow up on search results)",
+      "description": "Inspect file lines, or follow a search hit with --message-index",
       "arguments": [
         {
           "name": "path",
@@ -1714,7 +1714,14 @@
         {
           "name": "line",
           "short": "n",
-          "description": "Line number to show (1-indexed)",
+          "description": "Physical file line (1-based), NOT search's line_number; use --message-index for hits",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
+          "name": "message-index",
+          "description": "Canonical message ordinal: pass search's line_number unchanged (1-based). Reads the archive only; never substitutes a physical file line",
           "arg_type": "option",
           "value_type": "integer",
           "required": false
@@ -2665,7 +2672,7 @@
     },
     {
       "name": "expand",
-      "description": "Show messages around a specific line in a session file",
+      "description": "Expand a search hit with --message-index, or inspect raw JSONL with --line",
       "arguments": [
         {
           "name": "path",
@@ -2684,10 +2691,24 @@
         {
           "name": "line",
           "short": "n",
-          "description": "Line number to show context around",
+          "description": "Physical file line, NOT search's line_number; use --message-index for hits",
           "arg_type": "option",
           "value_type": "integer",
-          "required": true
+          "required": false
+        },
+        {
+          "name": "message-index",
+          "description": "Canonical message ordinal: pass search's line_number unchanged (1-based). Reads the archive only; never substitutes a physical file line",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
+          "name": "conversation-id",
+          "description": "Exact conversation_id from search (disambiguates shared source paths)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
         },
         {
           "name": "context",
@@ -3923,10 +3944,10 @@
     {
       "name": "bounded-search",
       "intent": "Search sessions without flooding the caller's token budget.",
-      "first_command": "cass search \"<query>\" --robot --limit 10 --fields summary --max-content-length 800 --robot-meta",
+      "first_command": "cass search \"<query>\" --robot --limit 10 --fields summary,provenance,conversation_id --max-content-length 800 --robot-meta",
       "follow_up_commands": [
-        "cass view <source_path> -n <line_number> --json",
-        "cass expand <source_path> --line <line_number> -C 3 --json",
+        "cass view <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> --json",
+        "cass expand <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> -C 3 --json",
         "cass pack \"<query>\" --robot --max-tokens 4000 --limit 10"
       ],
       "parse_contract": "Parse hits[], _meta.realized_mode, _meta.fallback_mode, cursor, and *_truncated flags.",
@@ -3937,8 +3958,8 @@
       "intent": "Build a deterministic cited handoff bundle for another agent.",
       "first_command": "cass pack \"<question>\" --robot --max-tokens 4000 --max-evidence 8 --max-sessions 3 --require-evidence",
       "follow_up_commands": [
-        "cass search \"<question>\" --robot --limit 10 --fields provenance --robot-meta",
-        "cass view <source_path> -n <line_number> --json"
+        "cass search \"<question>\" --robot --limit 10 --fields summary,provenance,conversation_id --robot-meta",
+        "cass view <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> --json"
       ],
       "parse_contract": "Parse evidence[], warnings[], privacy, freshness, health, and omitted[].",
       "note": "Use pack when the downstream consumer needs citations rather than raw search hits."
@@ -3946,14 +3967,14 @@
     {
       "name": "session-drilldown",
       "intent": "Move from a hit to surrounding conversation context.",
-      "first_command": "cass view <source_path> -n <line_number> --json",
+      "first_command": "cass view <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> --json",
       "follow_up_commands": [
-        "cass expand <source_path> --line <line_number> -C 5 --json",
+        "cass expand <source_path> --message-index <line_number> --source <source_id> --conversation-id <conversation_id> -C 5 --json",
         "cass context <source_path> --json",
         "cass resume <source_path> --shell"
       ],
-      "parse_contract": "Parse path, line_number, message, surrounding messages, and resume command output.",
-      "note": "Use source_path and line_number from search hits; do not infer file formats by hand."
+      "parse_contract": "Parse coordinate_space, message_index, conversation_id, source_id, content, and is_target in the returned messages.",
+      "note": "Pass source_path, source_id, conversation_id, and line_number from the same hit; line_number belongs to --message-index, not raw --line."
     },
     {
       "name": "semantic-models",
@@ -4166,13 +4187,13 @@
       "wrong": "cass view session.jsonl --line-number 42 --json",
       "canonical": "cass view session.jsonl --line 42 --json",
       "accepted": true,
-      "behavior": "Search-result field names such as line_number/line-number are accepted as drill-down line aliases."
+      "behavior": "Legacy --line-number/--line_number flags still inspect raw lines; use --message-index for search hits."
     },
     {
       "wrong": "cass view source_path=session.jsonl source_id=local line_number=42 --json",
-      "canonical": "cass view session.jsonl --source local --line 42 --json",
+      "canonical": "cass view session.jsonl --source local --message-index 42 --json",
       "accepted": true,
-      "behavior": "Search-result field bundles can be pasted directly into follow-up drill-down commands."
+      "behavior": "Pasted line_number fields select canonical messages, not raw lines; include conversation_id when a source path contains multiple conversations."
     },
     {
       "wrong": "cass search auth --format json",

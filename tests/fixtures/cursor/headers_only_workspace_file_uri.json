@@ -4,9 +4,7 @@
     "name": "Cursor File URI Fixture",
     "createdAt": 1700000100000,
     "lastUpdatedAt": 1700000101000,
-    "fullConversationHeadersOnly": [
-      { "bubbleId": "bubble-file-uri" }
-    ]
+    "fullConversationHeadersOnly": [{ "bubbleId": "bubble-file-uri" }]
   },
   "bubble_rows": [
     {
@@ -15,9 +13,7 @@
         "type": 1,
         "text": "Workspace from file URI",
         "timestamp": 1700000100000,
-        "workspaceUris": [
-          "file:///home/tester/cursor%20project"
-        ]
+        "workspaceUris": ["file:///home/tester/cursor%20project"]
       }
     }
   ],

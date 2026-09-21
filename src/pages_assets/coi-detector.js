@@ -14,33 +14,33 @@
 
 // COI States
 export const COI_STATE = {
-    SW_INSTALLING: 'SW_INSTALLING',
-    NEEDS_RELOAD: 'NEEDS_RELOAD',
-    READY: 'READY',
-    DEGRADED: 'DEGRADED',
+  SW_INSTALLING: "SW_INSTALLING",
+  NEEDS_RELOAD: "NEEDS_RELOAD",
+  READY: "READY",
+  DEGRADED: "DEGRADED",
 };
 
 let activeReloadController = null;
 const serviceWorkerActivationCallbacks = new Set();
 let serviceWorkerActivationListenersInstalled = false;
 let serviceWorkerActivationDispatchScheduled = false;
-const ARCHIVE_SCOPE_URL = new URL('./', import.meta.url).href;
+const ARCHIVE_SCOPE_URL = new URL("./", import.meta.url).href;
 
 function hashScopeId(input) {
-    let hash = 0x811c9dc5;
-    for (let i = 0; i < input.length; i++) {
-        hash ^= input.charCodeAt(i);
-        hash = Math.imul(hash, 0x01000193) >>> 0;
-    }
-    return hash.toString(16).padStart(8, '0');
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
 }
 
 function getSetupCompleteKey() {
-    return `cass-coi-setup-complete-${hashScopeId(getArchiveScopeUrl())}`;
+  return `cass-coi-setup-complete-${hashScopeId(getArchiveScopeUrl())}`;
 }
 
 function getArchiveScopeUrl() {
-    return ARCHIVE_SCOPE_URL;
+  return ARCHIVE_SCOPE_URL;
 }
 
 /**
@@ -48,97 +48,96 @@ function getArchiveScopeUrl() {
  * @returns {boolean}
  */
 export function isSetupComplete() {
-    try {
-        return localStorage.getItem(getSetupCompleteKey()) === 'true';
-    } catch {
-        return false;
-    }
+  try {
+    return localStorage.getItem(getSetupCompleteKey()) === "true";
+  } catch {
+    return false;
+  }
 }
 
 /**
  * Mark COI setup as complete
  */
 export function markSetupComplete() {
-    try {
-        localStorage.setItem(getSetupCompleteKey(), 'true');
-    } catch {
-        // localStorage not available
-    }
+  try {
+    localStorage.setItem(getSetupCompleteKey(), "true");
+  } catch {
+    // localStorage not available
+  }
 }
 
 /**
  * Clear setup complete flag (for testing)
  */
 export function clearSetupComplete() {
-    try {
-        localStorage.removeItem(getSetupCompleteKey());
-    } catch {
-        // localStorage not available
-    }
+  try {
+    localStorage.removeItem(getSetupCompleteKey());
+  } catch {
+    // localStorage not available
+  }
 }
 
 async function getCurrentServiceWorkerRegistration() {
-    if (!('serviceWorker' in navigator)) {
-        return null;
-    }
+  if (!("serviceWorker" in navigator)) {
+    return null;
+  }
 
-    try {
-        const expectedScope = getArchiveScopeUrl();
-        const registrations = await navigator.serviceWorker.getRegistrations();
-        return registrations.find((registration) => registration.scope === expectedScope) ?? null;
-    } catch {
-        return null;
-    }
+  try {
+    const expectedScope = getArchiveScopeUrl();
+    const registrations = await navigator.serviceWorker.getRegistrations();
+    return registrations.find((registration) => registration.scope === expectedScope) ?? null;
+  } catch {
+    return null;
+  }
 }
 
 async function waitForExactServiceWorkerActivation(timeoutMs) {
-    if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
-        throw new RangeError('Service worker activation timeout must be non-negative');
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+    throw new RangeError("Service worker activation timeout must be non-negative");
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    const registration = await getCurrentServiceWorkerRegistration();
+    if (registration?.active?.state === "activated") {
+      return true;
     }
 
-    const deadline = Date.now() + timeoutMs;
-    while (true) {
-        const registration = await getCurrentServiceWorkerRegistration();
-        if (registration?.active?.state === 'activated') {
-            return true;
-        }
-
-        const candidateWorker = registration?.installing
-            || registration?.waiting
-            || registration?.active;
-        if (candidateWorker?.state === 'redundant') {
-            return false;
-        }
-
-        const remainingMs = deadline - Date.now();
-        if (remainingMs <= 0) {
-            return false;
-        }
-
-        // Registration is started independently by auth.js and may not have
-        // appeared yet. Poll at a bounded cadence, but also wake immediately
-        // for state/controller changes once an exact worker is observable.
-        await new Promise((resolve) => {
-            let settled = false;
-            let timerId = null;
-            const finish = () => {
-                if (settled) {
-                    return;
-                }
-                settled = true;
-                if (timerId !== null) {
-                    clearTimeout(timerId);
-                }
-                candidateWorker?.removeEventListener('statechange', finish);
-                navigator.serviceWorker.removeEventListener('controllerchange', finish);
-                resolve();
-            };
-
-            candidateWorker?.addEventListener('statechange', finish);
-            navigator.serviceWorker.addEventListener('controllerchange', finish);
-            timerId = setTimeout(finish, Math.min(100, remainingMs));
-        });
+    const candidateWorker =
+      registration?.installing || registration?.waiting || registration?.active;
+    if (candidateWorker?.state === "redundant") {
+      return false;
     }
+
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      return false;
+    }
+
+    // Registration is started independently by auth.js and may not have
+    // appeared yet. Poll at a bounded cadence, but also wake immediately
+    // for state/controller changes once an exact worker is observable.
+    await new Promise((resolve) => {
+      let settled = false;
+      let timerId = null;
+      const finish = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (timerId !== null) {
+          clearTimeout(timerId);
+        }
+        candidateWorker?.removeEventListener("statechange", finish);
+        navigator.serviceWorker.removeEventListener("controllerchange", finish);
+        resolve();
+      };
+
+      candidateWorker?.addEventListener("statechange", finish);
+      navigator.serviceWorker.addEventListener("controllerchange", finish);
+      timerId = setTimeout(finish, Math.min(100, remainingMs));
+    });
+  }
 }
 
 /**
@@ -146,7 +145,7 @@ async function waitForExactServiceWorkerActivation(timeoutMs) {
  * @returns {boolean}
  */
 export function isCrossOriginIsolated() {
-    return window.crossOriginIsolated === true;
+  return window.crossOriginIsolated === true;
 }
 
 /**
@@ -154,8 +153,8 @@ export function isCrossOriginIsolated() {
  * @returns {Promise<boolean>}
  */
 export async function isServiceWorkerActive() {
-    const registration = await getCurrentServiceWorkerRegistration();
-    return registration?.active?.state === 'activated';
+  const registration = await getCurrentServiceWorkerRegistration();
+  return registration?.active?.state === "activated";
 }
 
 /**
@@ -163,8 +162,8 @@ export async function isServiceWorkerActive() {
  * @returns {Promise<boolean>}
  */
 export async function hasServiceWorkerRegistration() {
-    const registration = await getCurrentServiceWorkerRegistration();
-    return Boolean(registration?.active || registration?.installing || registration?.waiting);
+  const registration = await getCurrentServiceWorkerRegistration();
+  return Boolean(registration?.active || registration?.installing || registration?.waiting);
 }
 
 /**
@@ -172,7 +171,7 @@ export async function hasServiceWorkerRegistration() {
  * @returns {boolean}
  */
 export function isServiceWorkerSupported() {
-    return 'serviceWorker' in navigator;
+  return "serviceWorker" in navigator;
 }
 
 /**
@@ -180,12 +179,12 @@ export function isServiceWorkerSupported() {
  * @returns {boolean}
  */
 export function isSharedArrayBufferAvailable() {
-    try {
-        new SharedArrayBuffer(1);
-        return true;
-    } catch {
-        return false;
-    }
+  try {
+    new SharedArrayBuffer(1);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -193,30 +192,30 @@ export function isSharedArrayBufferAvailable() {
  * @returns {Promise<string>} One of COI_STATE values
  */
 export async function getCOIState() {
-    // If SW not supported, we're in degraded mode
-    if (!isServiceWorkerSupported()) {
-        console.log('[COI] Service Workers not supported - degraded mode');
-        return COI_STATE.DEGRADED;
-    }
+  // If SW not supported, we're in degraded mode
+  if (!isServiceWorkerSupported()) {
+    console.log("[COI] Service Workers not supported - degraded mode");
+    return COI_STATE.DEGRADED;
+  }
 
-    const swActive = await isServiceWorkerActive();
-    const coiEnabled = isCrossOriginIsolated();
-    const sabAvailable = isSharedArrayBufferAvailable();
+  const swActive = await isServiceWorkerActive();
+  const coiEnabled = isCrossOriginIsolated();
+  const sabAvailable = isSharedArrayBufferAvailable();
 
-    console.log('[COI] State check:', { swActive, coiEnabled, sabAvailable });
+  console.log("[COI] State check:", { swActive, coiEnabled, sabAvailable });
 
-    if (!swActive) {
-        // SW not yet active - still installing
-        return COI_STATE.SW_INSTALLING;
-    }
+  if (!swActive) {
+    // SW not yet active - still installing
+    return COI_STATE.SW_INSTALLING;
+  }
 
-    if (!coiEnabled || !sabAvailable) {
-        // SW active but COI not yet enabled - needs reload
-        return COI_STATE.NEEDS_RELOAD;
-    }
+  if (!coiEnabled || !sabAvailable) {
+    // SW active but COI not yet enabled - needs reload
+    return COI_STATE.NEEDS_RELOAD;
+  }
 
-    // Fully ready
-    return COI_STATE.READY;
+  // Fully ready
+  return COI_STATE.READY;
 }
 
 /**
@@ -224,19 +223,19 @@ export async function getCOIState() {
  * @returns {Object} Configuration object
  */
 export function getArgon2Config() {
-    if (isSharedArrayBufferAvailable()) {
-        return {
-            parallelism: 4,   // Use all lanes for multi-threaded
-            mode: 'wasm-mt',  // Multi-threaded WASM
-            expectedTime: '1-3s',
-        };
-    } else {
-        return {
-            parallelism: 1,   // Single-threaded fallback
-            mode: 'wasm-st',  // Single-threaded WASM
-            expectedTime: '3-9s',
-        };
-    }
+  if (isSharedArrayBufferAvailable()) {
+    return {
+      parallelism: 4, // Use all lanes for multi-threaded
+      mode: "wasm-mt", // Multi-threaded WASM
+      expectedTime: "1-3s",
+    };
+  } else {
+    return {
+      parallelism: 1, // Single-threaded fallback
+      mode: "wasm-st", // Single-threaded WASM
+      expectedTime: "3-9s",
+    };
+  }
 }
 
 /**
@@ -244,7 +243,7 @@ export function getArgon2Config() {
  * @param {HTMLElement} container - Container to render into
  */
 export function showInstallingUI(container) {
-    container.innerHTML = `
+  container.innerHTML = `
         <div class="coi-status installing">
             <div class="coi-header">
                 <span class="coi-logo" aria-hidden="true">&#x1F510;</span>
@@ -264,7 +263,7 @@ export function showInstallingUI(container) {
             </div>
         </div>
     `;
-    container.classList.remove('hidden');
+  container.classList.remove("hidden");
 }
 
 /**
@@ -273,26 +272,26 @@ export function showInstallingUI(container) {
  * @param {'pending'|'loading'|'complete'|'error'} status - New status
  */
 export function updateProgressStep(stepId, status) {
-    const step = document.getElementById(stepId);
-    if (!step) return;
+  const step = document.getElementById(stepId);
+  if (!step) return;
 
-    step.dataset.status = status;
-    const icon = step.querySelector('.coi-step-icon');
-    if (icon) {
-        switch (status) {
-            case 'loading':
-                icon.innerHTML = '&#x23F3;'; // Hourglass
-                break;
-            case 'complete':
-                icon.innerHTML = '&#x2705;'; // Check mark
-                break;
-            case 'error':
-                icon.innerHTML = '&#x274C;'; // X mark
-                break;
-            default:
-                icon.innerHTML = '&#x25CB;'; // Circle
-        }
+  step.dataset.status = status;
+  const icon = step.querySelector(".coi-step-icon");
+  if (icon) {
+    switch (status) {
+      case "loading":
+        icon.innerHTML = "&#x23F3;"; // Hourglass
+        break;
+      case "complete":
+        icon.innerHTML = "&#x2705;"; // Check mark
+        break;
+      case "error":
+        icon.innerHTML = "&#x274C;"; // X mark
+        break;
+      default:
+        icon.innerHTML = "&#x25CB;"; // Circle
     }
+  }
 }
 
 /**
@@ -304,14 +303,14 @@ export function updateProgressStep(stepId, status) {
  * @param {boolean} [options.autoReload=true] - Whether to auto-reload
  */
 export function showReloadRequiredUI(container, options = {}) {
-    const { onReload = null, countdownSeconds = 3, autoReload = true } = options;
+  const { onReload = null, countdownSeconds = 3, autoReload = true } = options;
 
-    if (activeReloadController) {
-        activeReloadController.cancel();
-        activeReloadController = null;
-    }
+  if (activeReloadController) {
+    activeReloadController.cancel();
+    activeReloadController = null;
+  }
 
-    container.innerHTML = `
+  container.innerHTML = `
         <div class="coi-status needs-reload">
             <div class="coi-header">
                 <span class="coi-logo" aria-hidden="true">&#x1F510;</span>
@@ -332,7 +331,7 @@ export function showReloadRequiredUI(container, options = {}) {
             <div class="coi-reload-section">
                 <p class="coi-reload-message">One-time page reload required to enable optimal performance.</p>
 
-                <div id="coi-countdown-wrapper" class="coi-countdown-wrapper ${autoReload ? '' : 'hidden'}">
+                <div id="coi-countdown-wrapper" class="coi-countdown-wrapper ${autoReload ? "" : "hidden"}">
                     <span class="coi-countdown-text">Reloading in </span>
                     <span id="coi-countdown-number" class="coi-countdown-number">${countdownSeconds}</span>
                     <span class="coi-countdown-text">...</span>
@@ -342,7 +341,7 @@ export function showReloadRequiredUI(container, options = {}) {
                     <button id="coi-reload-btn" class="btn btn-primary coi-reload-btn">
                         Reload Now
                     </button>
-                    <button id="coi-cancel-btn" class="btn btn-secondary coi-cancel-btn ${autoReload ? '' : 'hidden'}">
+                    <button id="coi-cancel-btn" class="btn btn-secondary coi-cancel-btn ${autoReload ? "" : "hidden"}">
                         Cancel
                     </button>
                 </div>
@@ -364,73 +363,73 @@ export function showReloadRequiredUI(container, options = {}) {
             </details>
         </div>
     `;
-    container.classList.remove('hidden');
+  container.classList.remove("hidden");
 
-    const reloadBtn = document.getElementById('coi-reload-btn');
-    const cancelBtn = document.getElementById('coi-cancel-btn');
-    const countdownWrapper = document.getElementById('coi-countdown-wrapper');
-    const countdownNumber = document.getElementById('coi-countdown-number');
+  const reloadBtn = document.getElementById("coi-reload-btn");
+  const cancelBtn = document.getElementById("coi-cancel-btn");
+  const countdownWrapper = document.getElementById("coi-countdown-wrapper");
+  const countdownNumber = document.getElementById("coi-countdown-number");
 
-    let countdown = countdownSeconds;
-    let timerId = null;
+  let countdown = countdownSeconds;
+  let timerId = null;
 
-    const doReload = () => {
-        if (timerId) {
-            clearInterval(timerId);
-            timerId = null;
-        }
-        if (activeReloadController === control) {
-            activeReloadController = null;
-        }
-        if (onReload) {
-            onReload();
-        }
-        window.location.reload();
-    };
+  const doReload = () => {
+    if (timerId) {
+      clearInterval(timerId);
+      timerId = null;
+    }
+    if (activeReloadController === control) {
+      activeReloadController = null;
+    }
+    if (onReload) {
+      onReload();
+    }
+    window.location.reload();
+  };
 
-    const cancelCountdown = () => {
-        if (timerId) {
-            clearInterval(timerId);
-            timerId = null;
-        }
-        if (countdownWrapper) {
-            countdownWrapper.classList.add('hidden');
-        }
-        if (cancelBtn) {
-            cancelBtn.classList.add('hidden');
-        }
-        if (activeReloadController === control) {
-            activeReloadController = null;
-        }
-    };
-
-    // Set up event listeners
-    if (reloadBtn) {
-        reloadBtn.addEventListener('click', doReload);
+  const cancelCountdown = () => {
+    if (timerId) {
+      clearInterval(timerId);
+      timerId = null;
+    }
+    if (countdownWrapper) {
+      countdownWrapper.classList.add("hidden");
     }
     if (cancelBtn) {
-        cancelBtn.addEventListener('click', cancelCountdown);
+      cancelBtn.classList.add("hidden");
     }
-
-    // Start countdown if auto-reload is enabled
-    if (autoReload && countdownNumber) {
-        timerId = setInterval(() => {
-            countdown--;
-            if (countdown <= 0) {
-                doReload();
-            } else {
-                countdownNumber.textContent = countdown.toString();
-            }
-        }, 1000);
+    if (activeReloadController === control) {
+      activeReloadController = null;
     }
+  };
 
-    // Return control object for external management
-    const control = {
-        cancel: cancelCountdown,
-        reload: doReload,
-    };
-    activeReloadController = control;
-    return control;
+  // Set up event listeners
+  if (reloadBtn) {
+    reloadBtn.addEventListener("click", doReload);
+  }
+  if (cancelBtn) {
+    cancelBtn.addEventListener("click", cancelCountdown);
+  }
+
+  // Start countdown if auto-reload is enabled
+  if (autoReload && countdownNumber) {
+    timerId = setInterval(() => {
+      countdown--;
+      if (countdown <= 0) {
+        doReload();
+      } else {
+        countdownNumber.textContent = countdown.toString();
+      }
+    }, 1000);
+  }
+
+  // Return control object for external management
+  const control = {
+    cancel: cancelCountdown,
+    reload: doReload,
+  };
+  activeReloadController = control;
+  return control;
 }
 
 /**
@@ -438,25 +437,25 @@ export function showReloadRequiredUI(container, options = {}) {
  * Displayed when COI is not available but app can still function
  */
 export function showDegradedModeWarning() {
-    // Check if banner already exists
-    if (document.querySelector('.coi-degraded-banner')) return;
+  // Check if banner already exists
+  if (document.querySelector(".coi-degraded-banner")) return;
 
-    const banner = document.createElement('div');
-    banner.className = 'coi-degraded-banner';
-    banner.innerHTML = `
+  const banner = document.createElement("div");
+  banner.className = "coi-degraded-banner";
+  banner.innerHTML = `
         <span class="coi-warning-icon">&#x26A0;&#xFE0F;</span>
         <span class="coi-warning-text">Running in compatibility mode - unlock may take longer</span>
         <button class="coi-dismiss-btn" aria-label="Dismiss">&#x2715;</button>
     `;
 
-    const dismissBtn = banner.querySelector('.coi-dismiss-btn');
-    if (dismissBtn) {
-        dismissBtn.addEventListener('click', () => {
-            banner.remove();
-        });
-    }
+  const dismissBtn = banner.querySelector(".coi-dismiss-btn");
+  if (dismissBtn) {
+    dismissBtn.addEventListener("click", () => {
+      banner.remove();
+    });
+  }
 
-    document.body.prepend(banner);
+  document.body.prepend(banner);
 }
 
 /**
@@ -464,12 +463,12 @@ export function showDegradedModeWarning() {
  * @param {HTMLElement} container - Container to hide
  */
 export function hideStatusUI(container) {
-    if (activeReloadController) {
-        activeReloadController.cancel();
-        activeReloadController = null;
-    }
-    container.classList.add('hidden');
-    container.innerHTML = '';
+  if (activeReloadController) {
+    activeReloadController.cancel();
+    activeReloadController = null;
+  }
+  container.classList.add("hidden");
+  container.innerHTML = "";
 }
 
 /**
@@ -483,91 +482,91 @@ export function hideStatusUI(container) {
  * @param {number} [options.countdownSeconds=3] - Countdown duration before auto-reload
  */
 export async function initCOIDetection({
-    statusContainer,
-    authContainer,
-    onReady,
-    maxWaitMs = 5000,
-    autoReload = true,
-    countdownSeconds = 3,
+  statusContainer,
+  authContainer,
+  onReady,
+  maxWaitMs = 5000,
+  autoReload = true,
+  countdownSeconds = 3,
 }) {
-    let state = await getCOIState();
+  let state = await getCOIState();
 
-    console.log('[COI] Initial state:', state);
+  console.log("[COI] Initial state:", state);
 
-    // If already set up and ready, skip the setup flow
-    if (state === COI_STATE.READY && isSetupComplete()) {
-        console.log('[COI] Setup already complete - fast path');
-        hideStatusUI(statusContainer);
-        if (onReady) onReady();
-        return state;
-    }
-
-    // Handle SW_INSTALLING state with timeout
-    if (state === COI_STATE.SW_INSTALLING) {
-        showInstallingUI(statusContainer);
-
-        // Wait for this archive's exact registration to become active. The
-        // origin-global ready promise can resolve for a broader parent worker.
-        if ('serviceWorker' in navigator) {
-            try {
-                const activated = await waitForExactServiceWorkerActivation(maxWaitMs);
-                if (activated) {
-                    updateProgressStep('coi-step-sw', 'complete');
-                    updateProgressStep('coi-step-headers', 'loading');
-                } else {
-                    console.warn('[COI] Exact archive service worker did not activate before timeout');
-                }
-                state = await getCOIState();
-                console.log('[COI] State after exact worker wait:', state);
-            } catch (error) {
-                console.warn('[COI] Exact service worker wait failed:', error.message);
-                state = await getCOIState();
-            }
-        }
-    }
-
-    // Handle final state
-    switch (state) {
-        case COI_STATE.READY:
-            console.log('[COI] Ready - proceeding to auth');
-            markSetupComplete();
-            hideStatusUI(statusContainer);
-            if (onReady) onReady();
-            break;
-
-        case COI_STATE.NEEDS_RELOAD:
-            console.log('[COI] Needs reload - showing prompt');
-            showReloadRequiredUI(statusContainer, {
-                autoReload,
-                countdownSeconds,
-                onReload: () => console.log('[COI] Reloading...'),
-            });
-            // Hide auth screen while showing reload prompt
-            if (authContainer) {
-                authContainer.classList.add('hidden');
-            }
-            break;
-
-        case COI_STATE.DEGRADED:
-            console.log('[COI] Degraded mode - showing warning and proceeding');
-            markSetupComplete(); // Still mark complete so we don't keep showing setup
-            hideStatusUI(statusContainer);
-            showDegradedModeWarning();
-            if (onReady) onReady();
-            break;
-
-        case COI_STATE.SW_INSTALLING:
-            // Reloading cannot activate a worker that failed or remained stuck
-            // during the bounded wait. Proceed without COI; the background
-            // registration may still make a later page load fully ready.
-            console.warn('[COI] Archive service worker is not active - degrading');
-            hideStatusUI(statusContainer);
-            showDegradedModeWarning();
-            if (onReady) onReady();
-            return COI_STATE.DEGRADED;
-    }
-
+  // If already set up and ready, skip the setup flow
+  if (state === COI_STATE.READY && isSetupComplete()) {
+    console.log("[COI] Setup already complete - fast path");
+    hideStatusUI(statusContainer);
+    if (onReady) onReady();
     return state;
+  }
+
+  // Handle SW_INSTALLING state with timeout
+  if (state === COI_STATE.SW_INSTALLING) {
+    showInstallingUI(statusContainer);
+
+    // Wait for this archive's exact registration to become active. The
+    // origin-global ready promise can resolve for a broader parent worker.
+    if ("serviceWorker" in navigator) {
+      try {
+        const activated = await waitForExactServiceWorkerActivation(maxWaitMs);
+        if (activated) {
+          updateProgressStep("coi-step-sw", "complete");
+          updateProgressStep("coi-step-headers", "loading");
+        } else {
+          console.warn("[COI] Exact archive service worker did not activate before timeout");
+        }
+        state = await getCOIState();
+        console.log("[COI] State after exact worker wait:", state);
+      } catch (error) {
+        console.warn("[COI] Exact service worker wait failed:", error.message);
+        state = await getCOIState();
+      }
+    }
+  }
+
+  // Handle final state
+  switch (state) {
+    case COI_STATE.READY:
+      console.log("[COI] Ready - proceeding to auth");
+      markSetupComplete();
+      hideStatusUI(statusContainer);
+      if (onReady) onReady();
+      break;
+
+    case COI_STATE.NEEDS_RELOAD:
+      console.log("[COI] Needs reload - showing prompt");
+      showReloadRequiredUI(statusContainer, {
+        autoReload,
+        countdownSeconds,
+        onReload: () => console.log("[COI] Reloading..."),
+      });
+      // Hide auth screen while showing reload prompt
+      if (authContainer) {
+        authContainer.classList.add("hidden");
+      }
+      break;
+
+    case COI_STATE.DEGRADED:
+      console.log("[COI] Degraded mode - showing warning and proceeding");
+      markSetupComplete(); // Still mark complete so we don't keep showing setup
+      hideStatusUI(statusContainer);
+      showDegradedModeWarning();
+      if (onReady) onReady();
+      break;
+
+    case COI_STATE.SW_INSTALLING:
+      // Reloading cannot activate a worker that failed or remained stuck
+      // during the bounded wait. Proceed without COI; the background
+      // registration may still make a later page load fully ready.
+      console.warn("[COI] Archive service worker is not active - degrading");
+      hideStatusUI(statusContainer);
+      showDegradedModeWarning();
+      if (onReady) onReady();
+      return COI_STATE.DEGRADED;
+  }
+
+  return state;
 }
 
 /**
@@ -575,70 +574,70 @@ export async function initCOIDetection({
  * @param {Function} callback - Called when SW activates
  */
 export function onServiceWorkerActivated(callback) {
-    if (!('serviceWorker' in navigator) || typeof callback !== 'function') {
-        return () => {};
-    }
+  if (!("serviceWorker" in navigator) || typeof callback !== "function") {
+    return () => {};
+  }
 
-    serviceWorkerActivationCallbacks.add(callback);
+  serviceWorkerActivationCallbacks.add(callback);
 
-    if (!serviceWorkerActivationListenersInstalled) {
-        const notifyActivation = (reason) => {
-            if (serviceWorkerActivationDispatchScheduled) {
-                return;
-            }
+  if (!serviceWorkerActivationListenersInstalled) {
+    const notifyActivation = (reason) => {
+      if (serviceWorkerActivationDispatchScheduled) {
+        return;
+      }
 
-            serviceWorkerActivationDispatchScheduled = true;
-            queueMicrotask(() => {
-                serviceWorkerActivationDispatchScheduled = false;
-                console.log('[COI] Service worker activation detected:', reason);
-                [...serviceWorkerActivationCallbacks].forEach((registeredCallback) => {
-                    try {
-                        Promise.resolve(registeredCallback()).catch((error) => {
-                            console.error('[COI] Activation callback failed:', error);
-                        });
-                    } catch (error) {
-                        console.error('[COI] Activation callback failed:', error);
-                    }
-                });
+      serviceWorkerActivationDispatchScheduled = true;
+      queueMicrotask(() => {
+        serviceWorkerActivationDispatchScheduled = false;
+        console.log("[COI] Service worker activation detected:", reason);
+        [...serviceWorkerActivationCallbacks].forEach((registeredCallback) => {
+          try {
+            Promise.resolve(registeredCallback()).catch((error) => {
+              console.error("[COI] Activation callback failed:", error);
             });
-        };
-
-        navigator.serviceWorker.addEventListener('message', (event) => {
-            if (event.data?.type === 'SW_ACTIVATED') {
-                notifyActivation('message');
-            }
+          } catch (error) {
+            console.error("[COI] Activation callback failed:", error);
+          }
         });
-
-        navigator.serviceWorker.addEventListener('controllerchange', () => {
-            notifyActivation('controllerchange');
-        });
-
-        serviceWorkerActivationListenersInstalled = true;
-    }
-
-    return () => {
-        serviceWorkerActivationCallbacks.delete(callback);
+      });
     };
+
+    navigator.serviceWorker.addEventListener("message", (event) => {
+      if (event.data?.type === "SW_ACTIVATED") {
+        notifyActivation("message");
+      }
+    });
+
+    navigator.serviceWorker.addEventListener("controllerchange", () => {
+      notifyActivation("controllerchange");
+    });
+
+    serviceWorkerActivationListenersInstalled = true;
+  }
+
+  return () => {
+    serviceWorkerActivationCallbacks.delete(callback);
+  };
 }
 
 // Export default
 export default {
-    COI_STATE,
-    isCrossOriginIsolated,
-    isServiceWorkerActive,
-    hasServiceWorkerRegistration,
-    isServiceWorkerSupported,
-    isSharedArrayBufferAvailable,
-    getCOIState,
-    getArgon2Config,
-    showInstallingUI,
-    showReloadRequiredUI,
-    showDegradedModeWarning,
-    hideStatusUI,
-    initCOIDetection,
-    onServiceWorkerActivated,
-    updateProgressStep,
-    isSetupComplete,
-    markSetupComplete,
-    clearSetupComplete,
+  COI_STATE,
+  isCrossOriginIsolated,
+  isServiceWorkerActive,
+  hasServiceWorkerRegistration,
+  isServiceWorkerSupported,
+  isSharedArrayBufferAvailable,
+  getCOIState,
+  getArgon2Config,
+  showInstallingUI,
+  showReloadRequiredUI,
+  showDegradedModeWarning,
+  hideStatusUI,
+  initCOIDetection,
+  onServiceWorkerActivated,
+  updateProgressStep,
+  isSetupComplete,
+  markSetupComplete,
+  clearSetupComplete,
 };

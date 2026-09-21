@@ -10,13 +10,13 @@
  *   #/stats -> analytics dashboard
  */
 
-import { queryAll, queryOne, queryValue, isDatabaseReady } from './database.js';
+import { isDatabaseReady, queryAll, queryOne, queryValue } from "./database.js";
 
 // State
 let analyticsData = null;
 let container = null;
 let isLoading = false;
-let currentTimelineView = 'monthly'; // 'daily' | 'weekly' | 'monthly'
+let currentTimelineView = "monthly"; // 'daily' | 'weekly' | 'monthly'
 let analyticsEpoch = 0;
 
 // Cache for computed analytics (when using database fallback)
@@ -25,7 +25,7 @@ let computedAnalytics = null;
 const ANALYTICS_FETCH_TIMEOUT_MS = 10000;
 
 function isCurrentAnalyticsEpoch(epoch) {
-    return epoch === analyticsEpoch;
+  return epoch === analyticsEpoch;
 }
 
 /**
@@ -33,7 +33,7 @@ function isCurrentAnalyticsEpoch(epoch) {
  * @param {HTMLElement} containerElement - Container to render into
  */
 export function initStats(containerElement) {
-    container = containerElement;
+  container = containerElement;
 }
 
 /**
@@ -41,43 +41,46 @@ export function initStats(containerElement) {
  * @returns {Promise<Object>} Analytics data
  */
 export async function loadAnalytics() {
-    const epoch = analyticsEpoch;
+  const epoch = analyticsEpoch;
 
-    if (analyticsData) {
-        return analyticsData;
-    }
-
-    isLoading = true;
-    renderLoadingState();
-
-    try {
-        // Try to load precomputed JSON files
-        const loadedAnalytics = await loadPrecomputedAnalytics();
-        if (!isCurrentAnalyticsEpoch(epoch)) {
-            return null;
-        }
-        analyticsData = loadedAnalytics;
-    } catch (error) {
-        console.warn('[Stats] Precomputed analytics not available, using database fallback:', error.message);
-
-        // Fall back to database queries
-        if (isDatabaseReady()) {
-            const computed = computeAnalyticsFromDatabase();
-            if (!isCurrentAnalyticsEpoch(epoch)) {
-                return null;
-            }
-            analyticsData = computed;
-        } else {
-            throw new Error('Database not ready and precomputed analytics not available');
-        }
-    }
-
-    if (!isCurrentAnalyticsEpoch(epoch)) {
-        return null;
-    }
-
-    isLoading = false;
+  if (analyticsData) {
     return analyticsData;
+  }
+
+  isLoading = true;
+  renderLoadingState();
+
+  try {
+    // Try to load precomputed JSON files
+    const loadedAnalytics = await loadPrecomputedAnalytics();
+    if (!isCurrentAnalyticsEpoch(epoch)) {
+      return null;
+    }
+    analyticsData = loadedAnalytics;
+  } catch (error) {
+    console.warn(
+      "[Stats] Precomputed analytics not available, using database fallback:",
+      error.message,
+    );
+
+    // Fall back to database queries
+    if (isDatabaseReady()) {
+      const computed = computeAnalyticsFromDatabase();
+      if (!isCurrentAnalyticsEpoch(epoch)) {
+        return null;
+      }
+      analyticsData = computed;
+    } else {
+      throw new Error("Database not ready and precomputed analytics not available");
+    }
+  }
+
+  if (!isCurrentAnalyticsEpoch(epoch)) {
+    return null;
+  }
+
+  isLoading = false;
+  return analyticsData;
 }
 
 /**
@@ -85,102 +88,102 @@ export async function loadAnalytics() {
  * @returns {Promise<Object>} Analytics bundle
  */
 async function loadPrecomputedAnalytics() {
-    const files = [
-        'statistics.json',
-        'timeline.json',
-        'agent_summary.json',
-        'workspace_summary.json',
-        'top_terms.json'
-    ];
+  const files = [
+    "statistics.json",
+    "timeline.json",
+    "agent_summary.json",
+    "workspace_summary.json",
+    "top_terms.json",
+  ];
 
-    const results = {};
+  const results = {};
 
-    for (const file of files) {
-        try {
-            const response = await fetchWithTimeout(`./data/${file}`);
-            if (!response.ok) {
-                throw new Error(`Failed to load ${file}: ${response.status}`);
-            }
-            const key = file.replace('.json', '').replace(/_/g, '_');
-            results[key] = await response.json();
-        } catch (error) {
-            // Try alternate path (root level)
-            const response = await fetchWithTimeout(`./${file}`);
-            if (!response.ok) {
-                throw new Error(`Analytics file not found: ${file}`);
-            }
-            const key = file.replace('.json', '').replace(/_/g, '_');
-            results[key] = await response.json();
-        }
+  for (const file of files) {
+    try {
+      const response = await fetchWithTimeout(`./data/${file}`);
+      if (!response.ok) {
+        throw new Error(`Failed to load ${file}: ${response.status}`);
+      }
+      const key = file.replace(".json", "").replace(/_/g, "_");
+      results[key] = await response.json();
+    } catch (error) {
+      // Try alternate path (root level)
+      const response = await fetchWithTimeout(`./${file}`);
+      if (!response.ok) {
+        throw new Error(`Analytics file not found: ${file}`);
+      }
+      const key = file.replace(".json", "").replace(/_/g, "_");
+      results[key] = await response.json();
     }
+  }
 
-    // zqre2: this file is generated from the same Rust query/projection used by
-    // `cass analytics status --json`. Older exports do not have it, so keep
-    // loading them while reporting an explicit unavailable state rather than
-    // manufacturing a healthy status from archive counters.
-    const analyticsStatus = await loadOptionalAnalyticsStatus();
+  // zqre2: this file is generated from the same Rust query/projection used by
+  // `cass analytics status --json`. Older exports do not have it, so keep
+  // loading them while reporting an explicit unavailable state rather than
+  // manufacturing a healthy status from archive counters.
+  const analyticsStatus = await loadOptionalAnalyticsStatus();
 
-    return {
-        statistics: results.statistics,
-        timeline: results.timeline,
-        agentSummary: results.agent_summary,
-        workspaceSummary: results.workspace_summary,
-        topTerms: results.top_terms,
-        analyticsStatus
-    };
+  return {
+    statistics: results.statistics,
+    timeline: results.timeline,
+    agentSummary: results.agent_summary,
+    workspaceSummary: results.workspace_summary,
+    topTerms: results.top_terms,
+    analyticsStatus,
+  };
 }
 
 async function loadOptionalAnalyticsStatus() {
-    for (const path of ['./data/analytics_status.json', './analytics_status.json']) {
-        try {
-            const response = await fetchWithTimeout(path);
-            if (response.ok) {
-                return await response.json();
-            }
-        } catch {
-            // Try the alternate export layout below.
-        }
+  for (const path of ["./data/analytics_status.json", "./analytics_status.json"]) {
+    try {
+      const response = await fetchWithTimeout(path);
+      if (response.ok) {
+        return await response.json();
+      }
+    } catch {
+      // Try the alternate export layout below.
     }
+  }
 
-    return {
-        coverage: {},
-        recommended_action: 'regenerate the Pages export to include analytics readiness',
-        pages_projection_status: 'not-available'
-    };
+  return {
+    coverage: {},
+    recommended_action: "regenerate the Pages export to include analytics readiness",
+    pages_projection_status: "not-available",
+  };
 }
 
 function createFetchTimeoutSignal(timeoutMs) {
-    if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
-        return {
-            signal: AbortSignal.timeout(timeoutMs),
-            cancel() {},
-        };
-    }
-
-    if (typeof AbortController === 'undefined') {
-        return {
-            signal: undefined,
-            cancel() {},
-        };
-    }
-
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
     return {
-        signal: controller.signal,
-        cancel() {
-            clearTimeout(timeoutId);
-        },
+      signal: AbortSignal.timeout(timeoutMs),
+      cancel() {},
     };
+  }
+
+  if (typeof AbortController === "undefined") {
+    return {
+      signal: undefined,
+      cancel() {},
+    };
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  return {
+    signal: controller.signal,
+    cancel() {
+      clearTimeout(timeoutId);
+    },
+  };
 }
 
 async function fetchWithTimeout(url) {
-    const { signal, cancel } = createFetchTimeoutSignal(ANALYTICS_FETCH_TIMEOUT_MS);
-    try {
-        return await fetch(url, signal ? { signal } : undefined);
-    } finally {
-        cancel();
-    }
+  const { signal, cancel } = createFetchTimeoutSignal(ANALYTICS_FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(url, signal ? { signal } : undefined);
+  } finally {
+    cancel();
+  }
 }
 
 /**
@@ -188,20 +191,22 @@ async function fetchWithTimeout(url) {
  * @returns {Object} Analytics data
  */
 function computeAnalyticsFromDatabase() {
-    if (computedAnalytics) {
-        return computedAnalytics;
-    }
+  if (computedAnalytics) {
+    return computedAnalytics;
+  }
 
-    // Statistics
-    const totalConversations = queryValue('SELECT COUNT(*) FROM conversations') || 0;
-    const totalMessages = queryValue('SELECT COUNT(*) FROM messages') || 0;
-    const totalCharacters = queryValue('SELECT COALESCE(SUM(LENGTH(content)), 0) FROM messages') || 0;
+  // Statistics
+  const totalConversations = queryValue("SELECT COUNT(*) FROM conversations") || 0;
+  const totalMessages = queryValue("SELECT COUNT(*) FROM messages") || 0;
+  const totalCharacters = queryValue("SELECT COALESCE(SUM(LENGTH(content)), 0) FROM messages") || 0;
 
-    // Time range
-    const timeRange = queryOne('SELECT MIN(started_at) as earliest, MAX(started_at) as latest FROM conversations');
+  // Time range
+  const timeRange = queryOne(
+    "SELECT MIN(started_at) as earliest, MAX(started_at) as latest FROM conversations",
+  );
 
-    // Agent stats
-    const agentRows = queryAll(`
+  // Agent stats
+  const agentRows = queryAll(`
         SELECT c.agent, COUNT(DISTINCT c.id) as conversations, COUNT(m.id) as messages
         FROM conversations c
         LEFT JOIN messages m ON c.id = m.conversation_id
@@ -209,36 +214,36 @@ function computeAnalyticsFromDatabase() {
         ORDER BY conversations DESC
     `);
 
-    const agents = {};
-    agentRows.forEach(row => {
-        agents[row.agent] = {
-            conversations: row.conversations,
-            messages: row.messages
-        };
-    });
-
-    // Role counts
-    const roleRows = queryAll('SELECT role, COUNT(*) as count FROM messages GROUP BY role');
-    const roles = {};
-    roleRows.forEach(row => {
-        roles[row.role] = row.count;
-    });
-
-    const statistics = {
-        total_conversations: totalConversations,
-        total_messages: totalMessages,
-        total_characters: totalCharacters,
-        agents: agents,
-        roles: roles,
-        time_range: {
-            earliest: timeRange?.earliest ? new Date(timeRange.earliest).toISOString() : null,
-            latest: timeRange?.latest ? new Date(timeRange.latest).toISOString() : null
-        },
-        computed_at: new Date().toISOString()
+  const agents = {};
+  agentRows.forEach((row) => {
+    agents[row.agent] = {
+      conversations: row.conversations,
+      messages: row.messages,
     };
+  });
 
-    // Timeline (monthly aggregation for performance)
-    const monthlyRows = queryAll(`
+  // Role counts
+  const roleRows = queryAll("SELECT role, COUNT(*) as count FROM messages GROUP BY role");
+  const roles = {};
+  roleRows.forEach((row) => {
+    roles[row.role] = row.count;
+  });
+
+  const statistics = {
+    total_conversations: totalConversations,
+    total_messages: totalMessages,
+    total_characters: totalCharacters,
+    agents: agents,
+    roles: roles,
+    time_range: {
+      earliest: timeRange?.earliest ? new Date(timeRange.earliest).toISOString() : null,
+      latest: timeRange?.latest ? new Date(timeRange.latest).toISOString() : null,
+    },
+    computed_at: new Date().toISOString(),
+  };
+
+  // Timeline (monthly aggregation for performance)
+  const monthlyRows = queryAll(`
         SELECT strftime('%Y-%m', datetime(m.created_at/1000, 'unixepoch')) as month,
                COUNT(*) as messages,
                COUNT(DISTINCT m.conversation_id) as conversations
@@ -248,19 +253,19 @@ function computeAnalyticsFromDatabase() {
         ORDER BY month
     `);
 
-    const timeline = {
-        daily: [],
-        weekly: [],
-        monthly: monthlyRows.map(row => ({
-            month: row.month,
-            messages: row.messages,
-            conversations: row.conversations
-        })),
-        by_agent: {}
-    };
+  const timeline = {
+    daily: [],
+    weekly: [],
+    monthly: monthlyRows.map((row) => ({
+      month: row.month,
+      messages: row.messages,
+      conversations: row.conversations,
+    })),
+    by_agent: {},
+  };
 
-    // Agent summary
-    const agentSummaryRows = queryAll(`
+  // Agent summary
+  const agentSummaryRows = queryAll(`
         SELECT c.agent as name,
                COUNT(DISTINCT c.id) as conversations,
                COUNT(m.id) as messages,
@@ -272,22 +277,22 @@ function computeAnalyticsFromDatabase() {
         ORDER BY conversations DESC
     `);
 
-    const agentSummary = {
-        agents: agentSummaryRows.map(row => ({
-            name: row.name,
-            conversations: row.conversations,
-            messages: row.messages,
-            workspaces: [],
-            date_range: {
-                earliest: row.earliest ? new Date(row.earliest).toISOString() : null,
-                latest: row.latest ? new Date(row.latest).toISOString() : null
-            },
-            avg_messages_per_conversation: row.conversations > 0 ? row.messages / row.conversations : 0
-        }))
-    };
+  const agentSummary = {
+    agents: agentSummaryRows.map((row) => ({
+      name: row.name,
+      conversations: row.conversations,
+      messages: row.messages,
+      workspaces: [],
+      date_range: {
+        earliest: row.earliest ? new Date(row.earliest).toISOString() : null,
+        latest: row.latest ? new Date(row.latest).toISOString() : null,
+      },
+      avg_messages_per_conversation: row.conversations > 0 ? row.messages / row.conversations : 0,
+    })),
+  };
 
-    // Workspace summary
-    const workspaceRows = queryAll(`
+  // Workspace summary
+  const workspaceRows = queryAll(`
         SELECT c.workspace as path,
                COUNT(DISTINCT c.id) as conversations,
                COUNT(m.id) as messages,
@@ -301,105 +306,154 @@ function computeAnalyticsFromDatabase() {
         LIMIT 50
     `);
 
-    const workspaceSummary = {
-        workspaces: workspaceRows.map(row => ({
-            path: row.path,
-            display_name: row.path ? row.path.split('/').pop() || row.path : 'Unknown',
-            conversations: row.conversations,
-            messages: row.messages,
-            agents: [],
-            date_range: {
-                earliest: row.earliest ? new Date(row.earliest).toISOString() : null,
-                latest: row.latest ? new Date(row.latest).toISOString() : null
-            },
-            recent_titles: []
-        }))
-    };
+  const workspaceSummary = {
+    workspaces: workspaceRows.map((row) => ({
+      path: row.path,
+      display_name: row.path ? row.path.split("/").pop() || row.path : "Unknown",
+      conversations: row.conversations,
+      messages: row.messages,
+      agents: [],
+      date_range: {
+        earliest: row.earliest ? new Date(row.earliest).toISOString() : null,
+        latest: row.latest ? new Date(row.latest).toISOString() : null,
+      },
+      recent_titles: [],
+    })),
+  };
 
-    // Top terms (simplified - extract from titles)
-    const topTerms = {
-        terms: []
-    };
+  // Top terms (simplified - extract from titles)
+  const topTerms = {
+    terms: [],
+  };
 
-    try {
-        const titleRows = queryAll('SELECT title FROM conversations WHERE title IS NOT NULL LIMIT 500');
-        const termCounts = {};
-        const stopWords = new Set(['the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'from', 'is', 'it', 'as', 'was', 'be', 'are', 'been', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'this', 'that', 'these', 'those', 'i', 'you', 'we', 'they', 'what', 'which', 'who', 'when', 'where', 'why', 'how']);
+  try {
+    const titleRows = queryAll("SELECT title FROM conversations WHERE title IS NOT NULL LIMIT 500");
+    const termCounts = {};
+    const stopWords = new Set([
+      "the",
+      "a",
+      "an",
+      "and",
+      "or",
+      "but",
+      "in",
+      "on",
+      "at",
+      "to",
+      "for",
+      "of",
+      "with",
+      "by",
+      "from",
+      "is",
+      "it",
+      "as",
+      "was",
+      "be",
+      "are",
+      "been",
+      "have",
+      "has",
+      "had",
+      "do",
+      "does",
+      "did",
+      "will",
+      "would",
+      "could",
+      "should",
+      "this",
+      "that",
+      "these",
+      "those",
+      "i",
+      "you",
+      "we",
+      "they",
+      "what",
+      "which",
+      "who",
+      "when",
+      "where",
+      "why",
+      "how",
+    ]);
 
-        titleRows.forEach(row => {
-            const title = typeof row.title === 'string'
-                ? row.title
-                : row.title === undefined || row.title === null
-                    ? ''
-                    : String(row.title);
+    titleRows.forEach((row) => {
+      const title =
+        typeof row.title === "string"
+          ? row.title
+          : row.title === undefined || row.title === null
+            ? ""
+            : String(row.title);
 
-            if (title) {
-                const words = title.toLowerCase().split(/\s+/);
-                words.forEach(word => {
-                    const cleaned = word.replace(/[^a-z0-9_-]/g, '');
-                    if (cleaned.length >= 3 && !stopWords.has(cleaned)) {
-                        termCounts[cleaned] = (termCounts[cleaned] || 0) + 1;
-                    }
-                });
-            }
+      if (title) {
+        const words = title.toLowerCase().split(/\s+/);
+        words.forEach((word) => {
+          const cleaned = word.replace(/[^a-z0-9_-]/g, "");
+          if (cleaned.length >= 3 && !stopWords.has(cleaned)) {
+            termCounts[cleaned] = (termCounts[cleaned] || 0) + 1;
+          }
         });
+      }
+    });
 
-        topTerms.terms = Object.entries(termCounts)
-            .sort((a, b) => (b[1] - a[1]) || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
-            .slice(0, 50);
-    } catch (error) {
-        console.warn('[Stats] Failed to compute top terms:', error);
-    }
+    topTerms.terms = Object.entries(termCounts)
+      .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+      .slice(0, 50);
+  } catch (error) {
+    console.warn("[Stats] Failed to compute top terms:", error);
+  }
 
-    computedAnalytics = {
-        statistics,
-        timeline,
-        agentSummary,
-        workspaceSummary,
-        topTerms,
-        analyticsStatus: {
-            coverage: {},
-            recommended_action: 'regenerate the Pages export to include analytics readiness',
-            pages_projection_status: 'not-available'
-        }
-    };
+  computedAnalytics = {
+    statistics,
+    timeline,
+    agentSummary,
+    workspaceSummary,
+    topTerms,
+    analyticsStatus: {
+      coverage: {},
+      recommended_action: "regenerate the Pages export to include analytics readiness",
+      pages_projection_status: "not-available",
+    },
+  };
 
-    return computedAnalytics;
+  return computedAnalytics;
 }
 
 /**
  * Render the stats dashboard
  */
 export async function renderStatsDashboard() {
-    if (!container) {
-        console.error('[Stats] Container not set');
-        return;
-    }
+  if (!container) {
+    console.error("[Stats] Container not set");
+    return;
+  }
 
-    const epoch = analyticsEpoch;
+  const epoch = analyticsEpoch;
 
-    try {
-        const data = await loadAnalytics();
-        if (!data || !isCurrentAnalyticsEpoch(epoch)) {
-            return;
-        }
-        renderDashboard(data);
-    } catch (error) {
-        if (!isCurrentAnalyticsEpoch(epoch)) {
-            return;
-        }
-        console.error('[Stats] Failed to load analytics:', error);
-        renderErrorState(error.message);
+  try {
+    const data = await loadAnalytics();
+    if (!data || !isCurrentAnalyticsEpoch(epoch)) {
+      return;
     }
+    renderDashboard(data);
+  } catch (error) {
+    if (!isCurrentAnalyticsEpoch(epoch)) {
+      return;
+    }
+    console.error("[Stats] Failed to load analytics:", error);
+    renderErrorState(error.message);
+  }
 }
 
 /**
  * Render loading state
  */
 function renderLoadingState() {
-    if (!container) return;
+  if (!container) return;
 
-    container.innerHTML = `
+  container.innerHTML = `
         <div class="panel stats-panel">
             <header class="panel-header">
                 <h2>Archive Statistics</h2>
@@ -417,9 +471,9 @@ function renderLoadingState() {
  * @param {string} message - Error message
  */
 function renderErrorState(message) {
-    if (!container) return;
+  if (!container) return;
 
-    container.innerHTML = `
+  container.innerHTML = `
         <div class="panel stats-panel">
             <header class="panel-header">
                 <h2>Archive Statistics</h2>
@@ -435,11 +489,11 @@ function renderErrorState(message) {
         </div>
     `;
 
-    document.getElementById('stats-retry-btn')?.addEventListener('click', () => {
-        analyticsData = null;
-        computedAnalytics = null;
-        renderStatsDashboard();
-    });
+  document.getElementById("stats-retry-btn")?.addEventListener("click", () => {
+    analyticsData = null;
+    computedAnalytics = null;
+    renderStatsDashboard();
+  });
 }
 
 /**
@@ -447,23 +501,30 @@ function renderErrorState(message) {
  * @param {Object} data - Analytics data
  */
 function renderDashboard(data) {
-    if (!container) return;
+  if (!container) return;
 
-    const { statistics = {}, timeline = {}, agentSummary, workspaceSummary, topTerms, analyticsStatus } = data || {};
-    const statisticsAgents = isPlainObject(statistics.agents) ? statistics.agents : {};
-    const statisticsRoles = isPlainObject(statistics.roles) ? statistics.roles : {};
-    const agents = Array.isArray(agentSummary?.agents) ? agentSummary.agents : [];
-    const workspaces = Array.isArray(workspaceSummary?.workspaces) ? workspaceSummary.workspaces : [];
-    const terms = Array.isArray(topTerms?.terms) ? topTerms.terms : [];
-    const availableTimelineViews = getAvailableTimelineViews(timeline);
-    const selectedTimelineView = getSelectedTimelineView(timeline);
-    currentTimelineView = selectedTimelineView;
+  const {
+    statistics = {},
+    timeline = {},
+    agentSummary,
+    workspaceSummary,
+    topTerms,
+    analyticsStatus,
+  } = data || {};
+  const statisticsAgents = isPlainObject(statistics.agents) ? statistics.agents : {};
+  const statisticsRoles = isPlainObject(statistics.roles) ? statistics.roles : {};
+  const agents = Array.isArray(agentSummary?.agents) ? agentSummary.agents : [];
+  const workspaces = Array.isArray(workspaceSummary?.workspaces) ? workspaceSummary.workspaces : [];
+  const terms = Array.isArray(topTerms?.terms) ? topTerms.terms : [];
+  const availableTimelineViews = getAvailableTimelineViews(timeline);
+  const selectedTimelineView = getSelectedTimelineView(timeline);
+  currentTimelineView = selectedTimelineView;
 
-    container.innerHTML = `
+  container.innerHTML = `
         <div class="panel stats-panel">
             <header class="panel-header">
                 <h2>Archive Statistics</h2>
-                ${statistics.computed_at ? `<span class="stats-timestamp">Updated ${formatRelativeTime(statistics.computed_at)}</span>` : ''}
+                ${statistics.computed_at ? `<span class="stats-timestamp">Updated ${formatRelativeTime(statistics.computed_at)}</span>` : ""}
             </header>
             <div class="panel-content">
                 ${renderAnalyticsReadiness(analyticsStatus)}
@@ -471,15 +532,17 @@ function renderDashboard(data) {
                 <section class="stats-section" aria-labelledby="overview-heading">
                     <h3 id="overview-heading" class="visually-hidden">Overview</h3>
                     <div class="stats-grid" role="list">
-                        ${renderOverviewCard('Conversations', statistics.total_conversations, 'conversation-count')}
-                        ${renderOverviewCard('Messages', statistics.total_messages, 'message-count')}
-                        ${renderOverviewCard('Characters', formatNumber(statistics.total_characters), 'character-count')}
-                        ${renderOverviewCard('Agents', Object.keys(statisticsAgents).length, 'agent-count')}
+                        ${renderOverviewCard("Conversations", statistics.total_conversations, "conversation-count")}
+                        ${renderOverviewCard("Messages", statistics.total_messages, "message-count")}
+                        ${renderOverviewCard("Characters", formatNumber(statistics.total_characters), "character-count")}
+                        ${renderOverviewCard("Agents", Object.keys(statisticsAgents).length, "agent-count")}
                     </div>
                 </section>
 
                 <!-- Time Range -->
-                ${statistics.time_range?.earliest ? `
+                ${
+                  statistics.time_range?.earliest
+                    ? `
                     <section class="stats-section stats-time-range" aria-labelledby="timerange-heading">
                         <h3 id="timerange-heading">Time Range</h3>
                         <div class="time-range-display">
@@ -495,28 +558,44 @@ function renderDashboard(data) {
                             ${renderTimeSpan(statistics.time_range)}
                         </div>
                     </section>
-                ` : ''}
+                `
+                    : ""
+                }
 
                 <!-- Timeline Sparkline -->
-                ${availableTimelineViews.length > 0 ? `
+                ${
+                  availableTimelineViews.length > 0
+                    ? `
                     <section class="stats-section stats-timeline" aria-labelledby="timeline-heading">
                         <h3 id="timeline-heading">Activity Timeline</h3>
-                        ${availableTimelineViews.length > 1 ? `
+                        ${
+                          availableTimelineViews.length > 1
+                            ? `
                             <div class="timeline-controls" role="tablist" aria-label="Timeline view">
-                                ${availableTimelineViews.map((view) => `
-                                    <button type="button" role="tab" class="timeline-tab ${selectedTimelineView === view ? 'active' : ''}"
+                                ${availableTimelineViews
+                                  .map(
+                                    (view) => `
+                                    <button type="button" role="tab" class="timeline-tab ${selectedTimelineView === view ? "active" : ""}"
                                             data-view="${view}" aria-selected="${selectedTimelineView === view}">${formatTimelineViewLabel(view)}</button>
-                                `).join('')}
+                                `,
+                                  )
+                                  .join("")}
                             </div>
-                        ` : ''}
+                        `
+                            : ""
+                        }
                         <div id="timeline-chart" class="timeline-chart" role="img" aria-label="Activity timeline chart">
                             ${renderTimelineChart(timeline, selectedTimelineView)}
                         </div>
                     </section>
-                ` : ''}
+                `
+                    : ""
+                }
 
                 <!-- Agent Breakdown -->
-                ${agents.length > 0 ? `
+                ${
+                  agents.length > 0
+                    ? `
                     <section class="stats-section stats-agents" aria-labelledby="agents-heading">
                         <h3 id="agents-heading">Agents</h3>
                         <div class="stats-table-wrapper">
@@ -530,7 +609,9 @@ function renderDashboard(data) {
                                     </tr>
                                 </thead>
                                 <tbody>
-                                    ${agents.map(agent => `
+                                    ${agents
+                                      .map(
+                                        (agent) => `
                                         <tr>
                                             <td>
                                                 <span class="agent-badge agent-${toCssSlug(agent.name)}">
@@ -539,17 +620,23 @@ function renderDashboard(data) {
                                             </td>
                                             <td class="numeric">${formatNumber(agent.conversations)}</td>
                                             <td class="numeric">${formatNumber(agent.messages)}</td>
-                                            <td class="numeric">${formatDecimal(agent.avg_messages_per_conversation, 1, '-')}</td>
+                                            <td class="numeric">${formatDecimal(agent.avg_messages_per_conversation, 1, "-")}</td>
                                         </tr>
-                                    `).join('')}
+                                    `,
+                                      )
+                                      .join("")}
                                 </tbody>
                             </table>
                         </div>
                     </section>
-                ` : ''}
+                `
+                    : ""
+                }
 
                 <!-- Workspace Breakdown -->
-                ${workspaces.length > 0 ? `
+                ${
+                  workspaces.length > 0
+                    ? `
                     <section class="stats-section stats-workspaces" aria-labelledby="workspaces-heading">
                         <h3 id="workspaces-heading">Top Workspaces</h3>
                         <div class="stats-table-wrapper">
@@ -562,7 +649,10 @@ function renderDashboard(data) {
                                     </tr>
                                 </thead>
                                 <tbody>
-                                    ${workspaces.slice(0, 10).map(ws => `
+                                    ${workspaces
+                                      .slice(0, 10)
+                                      .map(
+                                        (ws) => `
                                         <tr>
                                             <td>
                                                 <span class="workspace-name" title="${escapeAttribute(ws.path)}">
@@ -572,43 +662,59 @@ function renderDashboard(data) {
                                             <td class="numeric">${formatNumber(ws.conversations)}</td>
                                             <td class="numeric">${formatNumber(ws.messages)}</td>
                                         </tr>
-                                    `).join('')}
+                                    `,
+                                      )
+                                      .join("")}
                                 </tbody>
                             </table>
-                            ${workspaces.length > 10 ? `
+                            ${
+                              workspaces.length > 10
+                                ? `
                                 <p class="stats-more">... and ${workspaces.length - 10} more workspaces</p>
-                            ` : ''}
+                            `
+                                : ""
+                            }
                         </div>
                     </section>
-                ` : ''}
+                `
+                    : ""
+                }
 
                 <!-- Top Terms -->
-                ${terms.length > 0 ? `
+                ${
+                  terms.length > 0
+                    ? `
                     <section class="stats-section stats-terms" aria-labelledby="terms-heading">
                         <h3 id="terms-heading">Top Topics</h3>
                         <div class="terms-cloud" role="list" aria-label="Topic frequency">
                             ${renderTermsCloud(terms)}
                         </div>
                     </section>
-                ` : ''}
+                `
+                    : ""
+                }
 
                 <!-- Role Distribution -->
-                ${Object.keys(statisticsRoles).length > 0 ? `
+                ${
+                  Object.keys(statisticsRoles).length > 0
+                    ? `
                     <section class="stats-section stats-roles" aria-labelledby="roles-heading">
                         <h3 id="roles-heading">Message Roles</h3>
                         <div class="role-bars">
                             ${renderRoleBars(statisticsRoles)}
                         </div>
                     </section>
-                ` : ''}
+                `
+                    : ""
+                }
             </div>
         </div>
     `;
 
-    applyDynamicStatsStyles();
+  applyDynamicStatsStyles();
 
-    // Set up timeline tab handlers
-    setupTimelineControls(timeline);
+  // Set up timeline tab handlers
+  setupTimelineControls(timeline);
 }
 
 /**
@@ -617,15 +723,16 @@ function renderDashboard(data) {
  * so the human warning has an inspectable machine-readable equivalent.
  */
 function renderAnalyticsReadiness(status) {
-    const action = typeof status?.recommended_action === 'string'
-        ? status.recommended_action
-        : 'regenerate the Pages export to include analytics readiness';
-    if (action === 'none') {
-        return '';
-    }
+  const action =
+    typeof status?.recommended_action === "string"
+      ? status.recommended_action
+      : "regenerate the Pages export to include analytics readiness";
+  if (action === "none") {
+    return "";
+  }
 
-    console.warn('[Stats] Analytics readiness requires action:', action, status);
-    return `
+  console.warn("[Stats] Analytics readiness requires action:", action, status);
+  return `
         <section class="stats-section stats-readiness" aria-labelledby="analytics-readiness-heading">
             <h3 id="analytics-readiness-heading">Analytics readiness</h3>
             <p>${escapeHtml(action)}</p>
@@ -641,10 +748,8 @@ function renderAnalyticsReadiness(status) {
  * @returns {string} HTML string
  */
 function renderOverviewCard(label, value, id) {
-    const displayValue = typeof value === 'number'
-        ? formatNumber(value)
-        : escapeHtml(value);
-    return `
+  const displayValue = typeof value === "number" ? formatNumber(value) : escapeHtml(value);
+  return `
         <div class="stat-card" role="listitem">
             <div class="stat-card-value" id="${escapeAttribute(id)}">${displayValue}</div>
             <div class="stat-card-label">${escapeHtml(label)}</div>
@@ -658,19 +763,19 @@ function renderOverviewCard(label, value, id) {
  * @returns {string} HTML string
  */
 function renderTimeSpan(timeRange) {
-    if (!timeRange.earliest || !timeRange.latest) return '';
+  if (!timeRange.earliest || !timeRange.latest) return "";
 
-    const earliest = parseValidDate(timeRange.earliest);
-    const latest = parseValidDate(timeRange.latest);
-    if (!earliest || !latest) return '';
+  const earliest = parseValidDate(timeRange.earliest);
+  const latest = parseValidDate(timeRange.latest);
+  if (!earliest || !latest) return "";
 
-    const days = Math.ceil((latest - earliest) / (1000 * 60 * 60 * 24));
+  const days = Math.ceil((latest - earliest) / (1000 * 60 * 60 * 24));
 
-    if (days === 0) return '<span class="time-span-badge">Same day</span>';
-    if (days === 1) return '<span class="time-span-badge">1 day</span>';
-    if (days < 30) return `<span class="time-span-badge">${days} days</span>`;
-    if (days < 365) return `<span class="time-span-badge">${Math.round(days / 30)} months</span>`;
-    return `<span class="time-span-badge">${(days / 365).toFixed(1)} years</span>`;
+  if (days === 0) return '<span class="time-span-badge">Same day</span>';
+  if (days === 1) return '<span class="time-span-badge">1 day</span>';
+  if (days < 30) return `<span class="time-span-badge">${days} days</span>`;
+  if (days < 365) return `<span class="time-span-badge">${Math.round(days / 30)} months</span>`;
+  return `<span class="time-span-badge">${(days / 365).toFixed(1)} years</span>`;
 }
 
 /**
@@ -680,29 +785,31 @@ function renderTimeSpan(timeRange) {
  * @returns {Array} Timeline entries
  */
 function getTimelineEntries(timeline, view) {
-    if (!timeline || !Array.isArray(timeline[view])) {
-        return [];
-    }
-    return timeline[view];
+  if (!timeline || !Array.isArray(timeline[view])) {
+    return [];
+  }
+  return timeline[view];
 }
 
 function getAvailableTimelineViews(timeline) {
-    return ['daily', 'weekly', 'monthly'].filter((view) => getTimelineEntries(timeline, view).length > 0);
+  return ["daily", "weekly", "monthly"].filter(
+    (view) => getTimelineEntries(timeline, view).length > 0,
+  );
 }
 
 function getSelectedTimelineView(timeline) {
-    const availableViews = getAvailableTimelineViews(timeline);
-    if (availableViews.includes(currentTimelineView)) {
-        return currentTimelineView;
-    }
-    return availableViews[0] || 'monthly';
+  const availableViews = getAvailableTimelineViews(timeline);
+  if (availableViews.includes(currentTimelineView)) {
+    return currentTimelineView;
+  }
+  return availableViews[0] || "monthly";
 }
 
 function formatTimelineViewLabel(view) {
-    if (typeof view !== 'string' || view.length === 0) {
-        return 'Timeline';
-    }
-    return view.charAt(0).toUpperCase() + view.slice(1);
+  if (typeof view !== "string" || view.length === 0) {
+    return "Timeline";
+  }
+  return view.charAt(0).toUpperCase() + view.slice(1);
 }
 
 /**
@@ -712,65 +819,77 @@ function formatTimelineViewLabel(view) {
  * @returns {string} SVG HTML string
  */
 function renderTimelineChart(timeline, view = currentTimelineView) {
-    const data = getTimelineEntries(timeline, view).map((entry) => ({
-        ...entry,
-        messages: toNonNegativeNumber(entry?.messages),
-        conversations: toNonNegativeNumber(entry?.conversations),
-    }));
-    if (data.length === 0) {
-        return '<p class="no-data">No timeline data available</p>';
-    }
+  const data = getTimelineEntries(timeline, view).map((entry) => ({
+    ...entry,
+    messages: toNonNegativeNumber(entry?.messages),
+    conversations: toNonNegativeNumber(entry?.conversations),
+  }));
+  if (data.length === 0) {
+    return '<p class="no-data">No timeline data available</p>';
+  }
 
-    const width = 600;
-    const height = 120;
-    const padding = 20;
-    const chartWidth = width - padding * 2;
-    const chartHeight = height - padding * 2;
+  const width = 600;
+  const height = 120;
+  const padding = 20;
+  const chartWidth = width - padding * 2;
+  const chartHeight = height - padding * 2;
 
-    const maxMessages = Math.max(...data.map(d => d.messages));
-    if (maxMessages === 0) {
-        return '<p class="no-data">No activity data</p>';
-    }
+  const maxMessages = Math.max(...data.map((d) => d.messages));
+  if (maxMessages === 0) {
+    return '<p class="no-data">No activity data</p>';
+  }
 
-    const barWidth = Math.max(2, Math.min(20, chartWidth / data.length - 2));
-    const barSpacing = (chartWidth - barWidth * data.length) / (data.length - 1 || 1);
+  const barWidth = Math.max(2, Math.min(20, chartWidth / data.length - 2));
+  const barSpacing = (chartWidth - barWidth * data.length) / (data.length - 1 || 1);
 
-    const bars = data.map((d, i) => {
-        const barHeight = (d.messages / maxMessages) * chartHeight;
-        const x = padding + i * (barWidth + barSpacing);
-        const y = padding + chartHeight - barHeight;
+  const bars = data
+    .map((d, i) => {
+      const barHeight = (d.messages / maxMessages) * chartHeight;
+      const x = padding + i * (barWidth + barSpacing);
+      const y = padding + chartHeight - barHeight;
 
-        const label = getTimelineLabel(d);
-        const ariaLabel = `${label}: ${formatNumber(d.messages)} messages`;
-        const title = `${label}: ${formatNumber(d.messages)} messages, ${formatNumber(d.conversations)} conversations`;
+      const label = getTimelineLabel(d);
+      const ariaLabel = `${label}: ${formatNumber(d.messages)} messages`;
+      const title = `${label}: ${formatNumber(d.messages)} messages, ${formatNumber(d.conversations)} conversations`;
 
-        return `
+      return `
             <rect x="${x}" y="${y}" width="${barWidth}" height="${barHeight}"
                   class="timeline-bar" data-messages="${d.messages}" data-conversations="${d.conversations}"
                   aria-label="${escapeAttribute(ariaLabel)}">
                 <title>${escapeHtml(title)}</title>
             </rect>
         `;
-    }).join('');
+    })
+    .join("");
 
-    // X-axis labels (first, middle, last)
-    const labels = [];
-    if (data.length > 0) {
-        labels.push({ x: padding, label: getTimelineLabel(data[0]) });
-        if (data.length > 2) {
-            const midIdx = Math.floor(data.length / 2);
-            labels.push({ x: padding + midIdx * (barWidth + barSpacing), label: getTimelineLabel(data[midIdx]) });
-        }
-        if (data.length > 1) {
-            labels.push({ x: padding + (data.length - 1) * (barWidth + barSpacing), label: getTimelineLabel(data[data.length - 1]) });
-        }
+  // X-axis labels (first, middle, last)
+  const labels = [];
+  if (data.length > 0) {
+    labels.push({ x: padding, label: getTimelineLabel(data[0]) });
+    if (data.length > 2) {
+      const midIdx = Math.floor(data.length / 2);
+      labels.push({
+        x: padding + midIdx * (barWidth + barSpacing),
+        label: getTimelineLabel(data[midIdx]),
+      });
     }
+    if (data.length > 1) {
+      labels.push({
+        x: padding + (data.length - 1) * (barWidth + barSpacing),
+        label: getTimelineLabel(data[data.length - 1]),
+      });
+    }
+  }
 
-    const axisLabels = labels.map(l => `
+  const axisLabels = labels
+    .map(
+      (l) => `
         <text x="${l.x}" y="${height - 2}" class="timeline-label">${escapeHtml(l.label)}</text>
-    `).join('');
+    `,
+    )
+    .join("");
 
-    return `
+  return `
         <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="xMidYMid meet" class="timeline-svg"
              role="img" aria-label="Activity over time">
             ${bars}
@@ -785,10 +904,10 @@ function renderTimelineChart(timeline, view = currentTimelineView) {
  * @returns {string} Label
  */
 function getTimelineLabel(d) {
-    if (d?.date !== undefined && d.date !== null) return String(d.date);
-    if (d?.week !== undefined && d.week !== null) return String(d.week);
-    if (d?.month !== undefined && d.month !== null) return String(d.month);
-    return '';
+  if (d?.date !== undefined && d.date !== null) return String(d.date);
+  if (d?.week !== undefined && d.week !== null) return String(d.week);
+  if (d?.month !== undefined && d.month !== null) return String(d.month);
+  return "";
 }
 
 /**
@@ -797,29 +916,30 @@ function getTimelineLabel(d) {
  * @returns {string} HTML string
  */
 function renderTermsCloud(terms) {
-    const normalizedTerms = terms
-        .slice(0, 30)
-        .map((termEntry) => {
-            if (Array.isArray(termEntry)) {
-                return [termEntry[0], toNonNegativeNumber(termEntry[1])];
-            }
-            return [termEntry, 0];
-        })
-        .filter(([term]) => term !== undefined && term !== null && String(term).length > 0);
+  const normalizedTerms = terms
+    .slice(0, 30)
+    .map((termEntry) => {
+      if (Array.isArray(termEntry)) {
+        return [termEntry[0], toNonNegativeNumber(termEntry[1])];
+      }
+      return [termEntry, 0];
+    })
+    .filter(([term]) => term !== undefined && term !== null && String(term).length > 0);
 
-    if (normalizedTerms.length === 0) {
-        return '';
-    }
+  if (normalizedTerms.length === 0) {
+    return "";
+  }
 
-    const maxCount = Math.max(...normalizedTerms.map(t => t[1]));
-    const minCount = Math.min(...normalizedTerms.map(t => t[1]));
-    const range = maxCount - minCount || 1;
+  const maxCount = Math.max(...normalizedTerms.map((t) => t[1]));
+  const minCount = Math.min(...normalizedTerms.map((t) => t[1]));
+  const range = maxCount - minCount || 1;
 
-    return normalizedTerms.map(([term, count]) => {
-        const size = 0.8 + ((count - minCount) / range) * 0.6; // 0.8em to 1.4em
-        const opacity = 0.6 + ((count - minCount) / range) * 0.4; // 0.6 to 1.0
+  return normalizedTerms
+    .map(([term, count]) => {
+      const size = 0.8 + ((count - minCount) / range) * 0.6; // 0.8em to 1.4em
+      const opacity = 0.6 + ((count - minCount) / range) * 0.4; // 0.6 to 1.0
 
-        return `
+      return `
             <span class="term-tag" role="listitem"
                   data-term-size="${size.toFixed(3)}"
                   data-term-opacity="${opacity.toFixed(3)}"
@@ -827,7 +947,8 @@ function renderTermsCloud(terms) {
                 ${escapeHtml(term)}
             </span>
         `;
-    }).join('');
+    })
+    .join("");
 }
 
 /**
@@ -836,16 +957,18 @@ function renderTermsCloud(terms) {
  * @returns {string} HTML string
  */
 function renderRoleBars(roles) {
-    const roleEntries = Object.entries(roles)
-        .map(([role, count]) => [role, toNonNegativeNumber(count)]);
-    const total = roleEntries.reduce((sum, [, count]) => sum + count, 0);
-    if (total === 0) return '';
+  const roleEntries = Object.entries(roles).map(([role, count]) => [
+    role,
+    toNonNegativeNumber(count),
+  ]);
+  const total = roleEntries.reduce((sum, [, count]) => sum + count, 0);
+  if (total === 0) return "";
 
-    return roleEntries
-        .sort((a, b) => b[1] - a[1])
-        .map(([role, count]) => {
-            const percent = (count / total * 100).toFixed(1);
-            return `
+  return roleEntries
+    .sort((a, b) => b[1] - a[1])
+    .map(([role, count]) => {
+      const percent = ((count / total) * 100).toFixed(1);
+      return `
                 <div class="role-bar-item">
                     <span class="role-name">${escapeHtml(role)}</span>
                     <div class="role-bar-container">
@@ -855,32 +978,33 @@ function renderRoleBars(roles) {
                     <span class="role-count">${formatNumber(count)} (${percent}%)</span>
                 </div>
             `;
-        }).join('');
+    })
+    .join("");
 }
 
 function applyDynamicStatsStyles() {
-    if (!container) {
-        return;
+  if (!container) {
+    return;
+  }
+
+  container.querySelectorAll("[data-term-size]").forEach((term) => {
+    const fontSize = Number.parseFloat(term.dataset.termSize || "");
+    const opacity = Number.parseFloat(term.dataset.termOpacity || "");
+
+    if (Number.isFinite(fontSize)) {
+      term.style.fontSize = `${Math.min(Math.max(fontSize, 0.8), 1.4)}em`;
     }
+    if (Number.isFinite(opacity)) {
+      term.style.opacity = String(Math.min(Math.max(opacity, 0.6), 1));
+    }
+  });
 
-    container.querySelectorAll('[data-term-size]').forEach(term => {
-        const fontSize = Number.parseFloat(term.dataset.termSize || '');
-        const opacity = Number.parseFloat(term.dataset.termOpacity || '');
-
-        if (Number.isFinite(fontSize)) {
-            term.style.fontSize = `${Math.min(Math.max(fontSize, 0.8), 1.4)}em`;
-        }
-        if (Number.isFinite(opacity)) {
-            term.style.opacity = String(Math.min(Math.max(opacity, 0.6), 1));
-        }
-    });
-
-    container.querySelectorAll('[data-role-width]').forEach(roleBar => {
-        const width = Number.parseFloat(roleBar.dataset.roleWidth || '');
-        if (Number.isFinite(width)) {
-            roleBar.style.width = `${Math.min(Math.max(width, 0), 100)}%`;
-        }
-    });
+  container.querySelectorAll("[data-role-width]").forEach((roleBar) => {
+    const width = Number.parseFloat(roleBar.dataset.roleWidth || "");
+    if (Number.isFinite(width)) {
+      roleBar.style.width = `${Math.min(Math.max(width, 0), 100)}%`;
+    }
+  });
 }
 
 /**
@@ -888,28 +1012,28 @@ function applyDynamicStatsStyles() {
  * @param {Object} timeline - Timeline data
  */
 function setupTimelineControls(timeline) {
-    const tabs = container.querySelectorAll('.timeline-tab');
-    const availableViews = new Set(getAvailableTimelineViews(timeline));
-    tabs.forEach(tab => {
-        tab.addEventListener('click', () => {
-            const view = tab.dataset.view;
-            if (view && availableViews.has(view)) {
-                currentTimelineView = view;
+  const tabs = container.querySelectorAll(".timeline-tab");
+  const availableViews = new Set(getAvailableTimelineViews(timeline));
+  tabs.forEach((tab) => {
+    tab.addEventListener("click", () => {
+      const view = tab.dataset.view;
+      if (view && availableViews.has(view)) {
+        currentTimelineView = view;
 
-                // Update tab states
-                tabs.forEach(t => {
-                    t.classList.toggle('active', t.dataset.view === view);
-                    t.setAttribute('aria-selected', t.dataset.view === view);
-                });
-
-                // Re-render chart
-                const chartContainer = container?.querySelector('#timeline-chart');
-                if (chartContainer) {
-                    chartContainer.innerHTML = renderTimelineChart(timeline, view);
-                }
-            }
+        // Update tab states
+        tabs.forEach((t) => {
+          t.classList.toggle("active", t.dataset.view === view);
+          t.setAttribute("aria-selected", t.dataset.view === view);
         });
+
+        // Re-render chart
+        const chartContainer = container?.querySelector("#timeline-chart");
+        if (chartContainer) {
+          chartContainer.innerHTML = renderTimelineChart(timeline, view);
+        }
+      }
     });
+  });
 }
 
 /**
@@ -918,18 +1042,21 @@ function setupTimelineControls(timeline) {
  * @returns {string} Formatted name
  */
 function formatAgentName(agent) {
-    if (agent === undefined || agent === null || agent === '') return 'Unknown';
-    const value = String(agent);
-    return value.charAt(0).toUpperCase() + value.slice(1).replace(/[-_]/g, ' ');
+  if (agent === undefined || agent === null || agent === "") return "Unknown";
+  const value = String(agent);
+  return value.charAt(0).toUpperCase() + value.slice(1).replace(/[-_]/g, " ");
 }
 
-function toCssSlug(value, fallback = 'unknown') {
-    if (value === undefined || value === null || value === '') {
-        return fallback;
-    }
+function toCssSlug(value, fallback = "unknown") {
+  if (value === undefined || value === null || value === "") {
+    return fallback;
+  }
 
-    const slug = String(value).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
-    return slug || fallback;
+  const slug = String(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug || fallback;
 }
 
 /**
@@ -938,16 +1065,16 @@ function toCssSlug(value, fallback = 'unknown') {
  * @returns {string} Formatted date
  */
 function formatDate(timestamp) {
-    if (!timestamp) return 'Unknown';
+  if (!timestamp) return "Unknown";
 
-    const date = parseValidDate(timestamp);
-    if (!date) return 'Unknown';
+  const date = parseValidDate(timestamp);
+  if (!date) return "Unknown";
 
-    return date.toLocaleDateString(undefined, {
-        year: 'numeric',
-        month: 'short',
-        day: 'numeric'
-    });
+  return date.toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
 }
 
 /**
@@ -956,25 +1083,25 @@ function formatDate(timestamp) {
  * @returns {string} Relative time string
  */
 function formatRelativeTime(timestamp) {
-    if (!timestamp) return '';
+  if (!timestamp) return "";
 
-    const date = parseValidDate(timestamp);
-    if (!date) return '';
+  const date = parseValidDate(timestamp);
+  if (!date) return "";
 
-    const now = new Date();
-    const diff = now - date;
+  const now = new Date();
+  const diff = now - date;
 
-    const minutes = Math.floor(diff / 60000);
-    if (minutes < 1) return 'just now';
-    if (minutes < 60) return `${minutes}m ago`;
+  const minutes = Math.floor(diff / 60000);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes}m ago`;
 
-    const hours = Math.floor(minutes / 60);
-    if (hours < 24) return `${hours}h ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
 
-    const days = Math.floor(hours / 24);
-    if (days < 7) return `${days}d ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days}d ago`;
 
-    return formatDate(timestamp);
+  return formatDate(timestamp);
 }
 
 /**
@@ -983,33 +1110,33 @@ function formatRelativeTime(timestamp) {
  * @returns {string} Formatted number
  */
 function formatNumber(num) {
-    return toFiniteNumber(num).toLocaleString();
+  return toFiniteNumber(num).toLocaleString();
 }
 
-function formatDecimal(value, digits = 1, fallback = '-') {
-    const number = Number(value);
-    if (!Number.isFinite(number)) {
-        return fallback;
-    }
-    return number.toFixed(digits);
+function formatDecimal(value, digits = 1, fallback = "-") {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return fallback;
+  }
+  return number.toFixed(digits);
 }
 
 function toFiniteNumber(value, fallback = 0) {
-    const number = Number(value);
-    return Number.isFinite(number) ? number : fallback;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
 }
 
 function toNonNegativeNumber(value, fallback = 0) {
-    return Math.max(0, toFiniteNumber(value, fallback));
+  return Math.max(0, toFiniteNumber(value, fallback));
 }
 
 function isPlainObject(value) {
-    return value !== null && typeof value === 'object' && !Array.isArray(value);
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function parseValidDate(timestamp) {
-    const date = new Date(timestamp);
-    return Number.isFinite(date.getTime()) ? date : null;
+  const date = new Date(timestamp);
+  return Number.isFinite(date.getTime()) ? date : null;
 }
 
 /**
@@ -1018,30 +1145,28 @@ function parseValidDate(timestamp) {
  * @returns {string} Escaped text
  */
 function escapeHtml(text) {
-    if (text === undefined || text === null) return '';
-    const div = document.createElement('div');
-    div.textContent = String(text);
-    return div.innerHTML;
+  if (text === undefined || text === null) return "";
+  const div = document.createElement("div");
+  div.textContent = String(text);
+  return div.innerHTML;
 }
 
 function escapeAttribute(text) {
-    return escapeHtml(text)
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
+  return escapeHtml(text).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
 /**
  * Clear cached analytics data
  */
 export function clearStatsCache() {
-    analyticsEpoch += 1;
-    analyticsData = null;
-    computedAnalytics = null;
-    isLoading = false;
-    currentTimelineView = 'monthly';
-    if (container) {
-        container.innerHTML = '';
-    }
+  analyticsEpoch += 1;
+  analyticsData = null;
+  computedAnalytics = null;
+  isLoading = false;
+  currentTimelineView = "monthly";
+  if (container) {
+    container.innerHTML = "";
+  }
 }
 
 /**
@@ -1049,14 +1174,14 @@ export function clearStatsCache() {
  * @returns {Object|null} Analytics data or null
  */
 export function getAnalyticsData() {
-    return analyticsData;
+  return analyticsData;
 }
 
 // Export default
 export default {
-    initStats,
-    loadAnalytics,
-    renderStatsDashboard,
-    clearStatsCache,
-    getAnalyticsData
+  initStats,
+  loadAnalytics,
+  renderStatsDashboard,
+  clearStatsCache,
+  getAnalyticsData,
 };

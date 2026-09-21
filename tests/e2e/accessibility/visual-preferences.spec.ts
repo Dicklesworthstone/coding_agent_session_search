@@ -1,11 +1,11 @@
 import {
-  test,
-  expect,
-  gotoFile,
-  waitForPageReady,
   countMessages,
+  expect,
   focusFirstKeyboardReachableElement,
-} from '../setup/test-utils';
+  gotoFile,
+  test,
+  waitForPageReady,
+} from "../setup/test-utils";
 
 /**
  * Accessibility E2E tests - Visual preferences
@@ -14,12 +14,12 @@ import {
  * high contrast mode, reduced motion, and font scaling.
  */
 
-test.describe('High Contrast Mode', () => {
-  test('page is readable in forced-colors mode', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+test.describe("High Contrast Mode", () => {
+  test("page is readable in forced-colors mode", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
     // Emulate forced-colors media feature
-    await page.emulateMedia({ forcedColors: 'active' });
+    await page.emulateMedia({ forcedColors: "active" });
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
@@ -30,7 +30,7 @@ test.describe('High Contrast Mode', () => {
 
     // Text should be visible (not transparent or same as background)
     const textVisibility = await page.evaluate(() => {
-      const elements = document.querySelectorAll('p, span, div, h1, h2, h3');
+      const elements = document.querySelectorAll("p, span, div, h1, h2, h3");
       let visibleCount = 0;
 
       for (const el of elements) {
@@ -48,15 +48,15 @@ test.describe('High Contrast Mode', () => {
     expect(textVisibility).toBeGreaterThan(0);
   });
 
-  test('links are distinguishable in high contrast', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+  test("links are distinguishable in high contrast", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
-    await page.emulateMedia({ forcedColors: 'active' });
+    await page.emulateMedia({ forcedColors: "active" });
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
-    const links = page.locator('a');
+    const links = page.locator("a");
     const linkCount = await links.count();
 
     if (linkCount > 0) {
@@ -64,21 +64,21 @@ test.describe('High Contrast Mode', () => {
       const linkStyles = await links.first().evaluate((el) => {
         const style = window.getComputedStyle(el);
         return {
-          hasUnderline: style.textDecoration.includes('underline'),
+          hasUnderline: style.textDecoration.includes("underline"),
           display: style.display,
           visibility: style.visibility,
         };
       });
 
       // Link should be visible
-      expect(linkStyles.visibility).not.toBe('hidden');
+      expect(linkStyles.visibility).not.toBe("hidden");
     }
   });
 
-  test('focus indicators work in high contrast', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+  test("focus indicators work in high contrast", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
-    await page.emulateMedia({ forcedColors: 'active' });
+    await page.emulateMedia({ forcedColors: "active" });
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
@@ -92,22 +92,22 @@ test.describe('High Contrast Mode', () => {
 
       // In forced-colors, system focus indicators should appear
       const style = window.getComputedStyle(el);
-      const outlineWidth = parseFloat(style.outlineWidth || '0');
-      return (style.outlineStyle !== 'none' && outlineWidth > 0) || el.matches(':focus-visible');
+      const outlineWidth = parseFloat(style.outlineWidth || "0");
+      return (style.outlineStyle !== "none" && outlineWidth > 0) || el.matches(":focus-visible");
     });
 
     expect(hasFocus).toBe(true);
   });
 
-  test('buttons are visible in high contrast', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+  test("buttons are visible in high contrast", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
-    await page.emulateMedia({ forcedColors: 'active' });
+    await page.emulateMedia({ forcedColors: "active" });
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
-    const buttons = page.locator('button');
+    const buttons = page.locator("button");
     const buttonCount = await buttons.count();
 
     if (buttonCount > 0) {
@@ -124,12 +124,12 @@ test.describe('High Contrast Mode', () => {
   });
 });
 
-test.describe('Reduced Motion Preference', () => {
-  test('page respects prefers-reduced-motion', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+test.describe("Reduced Motion Preference", () => {
+  test("page respects prefers-reduced-motion", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
     // Emulate reduced motion preference
-    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await page.emulateMedia({ reducedMotion: "reduce" });
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
@@ -143,13 +143,13 @@ test.describe('Reduced Motion Preference', () => {
       const checkElements = [
         ...Array.from(animated),
         document.body,
-        ...Array.from(document.querySelectorAll('.message, button, details')),
+        ...Array.from(document.querySelectorAll(".message, button, details")),
       ];
 
       for (const el of checkElements.slice(0, 10)) {
         const style = window.getComputedStyle(el);
         results.push({
-          hasAnimation: style.animationName !== 'none' && style.animationDuration !== '0s',
+          hasAnimation: style.animationName !== "none" && style.animationDuration !== "0s",
           hasDuration: parseFloat(style.transitionDuration) > 0,
         });
       }
@@ -158,33 +158,36 @@ test.describe('Reduced Motion Preference', () => {
     });
 
     // In reduced motion mode, animations should be disabled or instant
-    const hasLongAnimations = animationStyles.some(
-      (s) => s.hasAnimation
-    );
+    const hasLongAnimations = animationStyles.some((s) => s.hasAnimation);
 
     // Log findings
-    console.log(`[a11y] Reduced motion - found ${animationStyles.filter(s => s.hasAnimation).length} animated elements`);
+    console.log(
+      `[a11y] Reduced motion - found ${animationStyles.filter((s) => s.hasAnimation).length} animated elements`,
+    );
 
     // Ideally no animations, but just verify page works
     const messageCount = await countMessages(page);
     expect(messageCount).toBeGreaterThan(0);
   });
 
-  test('collapsible sections work without animation in reduced motion', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+  test("collapsible sections work without animation in reduced motion", async ({
+    page,
+    exportPath,
+  }) => {
+    test.skip(!exportPath, "Export path not available");
 
-    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await page.emulateMedia({ reducedMotion: "reduce" });
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
-    const details = page.locator('details');
-    if (await details.count() > 0) {
+    const details = page.locator("details");
+    if ((await details.count()) > 0) {
       const firstDetails = details.first();
 
       // Toggle should work instantly
       const startTime = Date.now();
-      await firstDetails.locator('summary').click({ force: true });
+      await firstDetails.locator("summary").click({ force: true });
       await page.waitForTimeout(50); // Minimal wait
       const toggleTime = Date.now() - startTime;
 
@@ -196,10 +199,10 @@ test.describe('Reduced Motion Preference', () => {
     }
   });
 
-  test('page scroll is instant in reduced motion', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+  test("page scroll is instant in reduced motion", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
-    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await page.emulateMedia({ reducedMotion: "reduce" });
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
@@ -223,16 +226,16 @@ test.describe('Reduced Motion Preference', () => {
   });
 });
 
-test.describe('Font Scaling', () => {
-  test('page is usable at 200% font scaling', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+test.describe("Font Scaling", () => {
+  test("page is usable at 200% font scaling", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     // Simulate 200% font scaling by setting root font-size
     await page.evaluate(() => {
-      document.documentElement.style.fontSize = '200%';
+      document.documentElement.style.fontSize = "200%";
     });
 
     await page.waitForTimeout(200);
@@ -254,19 +257,19 @@ test.describe('Font Scaling', () => {
     }
   });
 
-  test('text remains readable at 200% scaling', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+  test("text remains readable at 200% scaling", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     await page.evaluate(() => {
-      document.documentElement.style.fontSize = '200%';
+      document.documentElement.style.fontSize = "200%";
     });
 
     // Check that text elements are properly sized
     const textSizes = await page.evaluate(() => {
-      const elements = document.querySelectorAll('p, .message-content, .content');
+      const elements = document.querySelectorAll("p, .message-content, .content");
       const sizes: number[] = [];
 
       for (const el of elements) {
@@ -285,18 +288,18 @@ test.describe('Font Scaling', () => {
     expect(avgSize).toBeGreaterThanOrEqual(28);
   });
 
-  test('buttons remain tappable at 200% scaling', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+  test("buttons remain tappable at 200% scaling", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     await page.evaluate(() => {
-      document.documentElement.style.fontSize = '200%';
+      document.documentElement.style.fontSize = "200%";
     });
 
-    const buttons = page.locator('button');
-    if (await buttons.count() > 0) {
+    const buttons = page.locator("button");
+    if ((await buttons.count()) > 0) {
       const firstButton = buttons.first();
       const box = await firstButton.boundingBox();
 
@@ -308,44 +311,44 @@ test.describe('Font Scaling', () => {
     }
   });
 
-  test('navigation is usable at 200% scaling', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+  test("navigation is usable at 200% scaling", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     await page.evaluate(() => {
-      document.documentElement.style.fontSize = '200%';
+      document.documentElement.style.fontSize = "200%";
     });
 
     // Tab through elements - should still work
     const focusedTags: string[] = [];
     for (let i = 0; i < 10; i++) {
-      await page.keyboard.press('Tab');
+      await page.keyboard.press("Tab");
       const tag = await page.evaluate(() => document.activeElement?.tagName);
       if (tag) focusedTags.push(tag);
     }
 
     // Should be able to focus interactive elements
-    const interactiveCount = focusedTags.filter(
-      (t) => ['BUTTON', 'INPUT', 'A', 'SUMMARY'].includes(t)
+    const interactiveCount = focusedTags.filter((t) =>
+      ["BUTTON", "INPUT", "A", "SUMMARY"].includes(t),
     ).length;
 
     expect(interactiveCount).toBeGreaterThan(0);
   });
 
-  test('line height is adequate at 200% scaling', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+  test("line height is adequate at 200% scaling", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     await page.evaluate(() => {
-      document.documentElement.style.fontSize = '200%';
+      document.documentElement.style.fontSize = "200%";
     });
 
     const lineHeights = await page.evaluate(() => {
-      const elements = document.querySelectorAll('p, .message-content');
+      const elements = document.querySelectorAll("p, .message-content");
       const heights: { fontSize: number; lineHeight: number; ratio: number }[] = [];
 
       for (const el of elements) {

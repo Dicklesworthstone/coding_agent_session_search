@@ -727,7 +727,8 @@ fn capabilities_are_self_describing_for_agents() {
     assert!(
         recoveries.iter().any(|recovery| recovery["wrong"]
             == "cass view source_path=session.jsonl source_id=local line_number=42 --json"
-            && recovery["canonical"] == "cass view session.jsonl --source local --line 42 --json"
+            && recovery["canonical"]
+                == "cass view session.jsonl --source local --message-index 42 --json"
             && recovery["accepted"] == true),
         "capabilities should advertise search-hit field bundle recovery"
     );
@@ -1387,7 +1388,7 @@ fn view_line_and_context_assignments_attach_to_options() {
 }
 
 #[test]
-fn view_accepts_search_result_line_number_aliases() {
+fn view_preserves_legacy_raw_line_number_aliases() {
     for line_arg in ["--line-number", "--line_number"] {
         let mut cmd = base_cmd();
         cmd.args([
@@ -1409,44 +1410,33 @@ fn view_accepts_search_result_line_number_aliases() {
 }
 
 #[test]
-fn view_line_number_assignment_attaches_to_line_option() {
-    let mut cmd = base_cmd();
-    cmd.args(["view", "README.md", "line_number=1", "context=0", "--json"]);
-    let output = cmd.assert().success().get_output().clone();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: Value = serde_json::from_str(stdout.trim()).expect("valid view JSON");
-
-    assert_eq!(json["path"], "README.md");
-    assert_eq!(json["target_line"].as_u64(), Some(1));
-    assert_eq!(
-        json["lines"].as_array().map(Vec::len),
-        Some(1),
-        "context=0 should produce only the target line"
-    );
-}
-
-#[test]
-fn view_search_hit_assignments_attach_to_path_source_and_line() {
-    let mut cmd = base_cmd();
-    cmd.args([
-        "view",
-        "source_path=README.md",
-        "source_id=local",
-        "line_number=1",
-        "context=0",
-        "--json",
-    ]);
-    let output = cmd.assert().success().get_output().clone();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: Value = serde_json::from_str(stdout.trim()).expect("valid view JSON");
-
-    assert_eq!(json["path"], "README.md");
-    assert_eq!(json["target_line"].as_u64(), Some(1));
-    assert_eq!(
-        json["lines"].as_array().map(Vec::len),
-        Some(1),
-        "context=0 should produce only the target line"
-    );
+fn view_search_hit_assignments_require_an_archive_instead_of_reading_raw_lines() {
+    let tmp = TempDir::new().unwrap();
+    let missing = tmp.path().join("missing.db");
+    for fields in [
+        vec!["README.md", "line_number=1", "context=0"],
+        vec![
+            "source_path=README.md",
+            "source_id=local",
+            "line_number=1",
+            "context=0",
+        ],
+    ] {
+        let mut cmd = base_cmd();
+        cmd.arg("--db")
+            .arg(&missing)
+            .arg("view")
+            .args(fields)
+            .arg("--json");
+        let output = cmd.assert().failure().get_output().clone();
+        assert!(output.stdout.is_empty(), "must not emit a raw-line target");
+        let error: Value = serde_json::from_slice(&output.stderr).expect("structured error");
+        assert_eq!(error["error"]["kind"], "indexed-session-required");
+        assert!(
+            !missing.exists(),
+            "read-only lookup must not create an archive"
+        );
+    }
 }
 
 #[test]

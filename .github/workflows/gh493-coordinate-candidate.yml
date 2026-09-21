@@ -1,0 +1,13 @@
+name: GH493 canonical anchor candidate
+
+# The reviewed candidate is now production code. Keep this manual entry point
+# as a read-only alias for the permanent regression suite, not a blob publisher.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    uses: ./.github/workflows/message-coordinate-regression.yml

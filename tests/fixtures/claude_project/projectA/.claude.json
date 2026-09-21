@@ -2,7 +2,7 @@
   "projectId": "proj-1",
   "title": "Claude Project A",
   "messages": [
-    {"role": "user", "text": "Hi Claude", "timestamp": 1700000000000},
-    {"role": "assistant", "text": "Hello!", "timestamp": 1700000003000}
+    { "role": "user", "text": "Hi Claude", "timestamp": 1700000000000 },
+    { "role": "assistant", "text": "Hello!", "timestamp": 1700000003000 }
   ]
 }

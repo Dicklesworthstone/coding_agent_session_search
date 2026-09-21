@@ -1,12 +1,5 @@
 {
   "detected": true,
-  "evidence": [
-    "Found ~/.claude directory",
-    "Contains 15 session files",
-    "Active since 2025-01-01"
-  ],
-  "root_paths": [
-    "/home/user/.claude",
-    "/home/user/.claude/projects/myproject"
-  ]
+  "evidence": ["Found ~/.claude directory", "Contains 15 session files", "Active since 2025-01-01"],
+  "root_paths": ["/home/user/.claude", "/home/user/.claude/projects/myproject"]
 }

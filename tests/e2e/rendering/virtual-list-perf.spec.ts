@@ -5,70 +5,71 @@
 // inject the module into about:blank so the perf path is exercised directly
 // without requiring a full export render.
 
-import { test, expect } from '@playwright/test';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import fs from 'fs';
+import { expect, test } from "@playwright/test";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const VIRTUAL_LIST_SRC = path.resolve(
   __dirname,
-  '..',
-  '..',
-  '..',
-  'src',
-  'pages_assets',
-  'virtual-list.js',
+  "..",
+  "..",
+  "..",
+  "src",
+  "pages_assets",
+  "virtual-list.js",
 );
 
-async function loadVirtualList(page: import('@playwright/test').Page) {
-  const moduleSource = fs.readFileSync(VIRTUAL_LIST_SRC, 'utf-8');
+async function loadVirtualList(page: import("@playwright/test").Page) {
+  const moduleSource = fs.readFileSync(VIRTUAL_LIST_SRC, "utf-8");
   // The module uses `export class VirtualList` — strip the `export` keywords
   // so we can inline-eval as a classic script and stick the classes onto
   // window. Also strip `export default {...}` (would syntax-error in classic
   // script context) by replacing it with a no-op assignment.
   const stripped = moduleSource
-    .replace(/^export class /gm, 'class ')
-    .replace(/^export function /gm, 'function ')
-    .replace(/^export const /gm, 'const ')
-    .replace(/^export default /gm, 'const __vl_default__ = ');
-  await page.goto('about:blank');
+    .replace(/^export class /gm, "class ")
+    .replace(/^export function /gm, "function ")
+    .replace(/^export const /gm, "const ")
+    .replace(/^export default /gm, "const __vl_default__ = ");
+  await page.goto("about:blank");
   await page.evaluate((src: string) => {
-    const script = document.createElement('script');
+    const script = document.createElement("script");
     script.textContent =
-      src + '\nwindow.VirtualList = VirtualList;\nif (typeof VariableHeightVirtualList !== "undefined") window.VariableHeightVirtualList = VariableHeightVirtualList;';
+      src +
+      '\nwindow.VirtualList = VirtualList;\nif (typeof VariableHeightVirtualList !== "undefined") window.VariableHeightVirtualList = VariableHeightVirtualList;';
     document.head.appendChild(script);
     // Add a container.
-    const container = document.createElement('div');
-    container.id = 'vl-container';
-    container.style.height = '600px';
-    container.style.overflow = 'auto';
-    container.style.position = 'relative';
+    const container = document.createElement("div");
+    container.id = "vl-container";
+    container.style.height = "600px";
+    container.style.overflow = "auto";
+    container.style.position = "relative";
     document.body.appendChild(container);
   }, stripped);
 }
 
-test.describe('Virtual list (vz9t8.8)', () => {
+test.describe("Virtual list (vz9t8.8)", () => {
   test.beforeEach(async ({ page }) => {
     await loadVirtualList(page);
   });
 
-  test('10K items render p95 ≤ 16ms', async ({ page }) => {
+  test("10K items render p95 ≤ 16ms", async ({ page }) => {
     // eslint-disable-next-line no-console
-    console.info(JSON.stringify({ event: 'perf_test_start', test: '10k_p95' }));
+    console.info(JSON.stringify({ event: "perf_test_start", test: "10k_p95" }));
     const stats = await page.evaluate(() => {
       // @ts-expect-error injected
       const VirtualList = window.VirtualList;
-      const container = document.getElementById('vl-container')!;
+      const container = document.getElementById("vl-container")!;
       const list = new VirtualList({
         container,
         itemHeight: 40,
         totalCount: 10000,
         renderItem: (idx: number) => {
-          const el = document.createElement('div');
+          const el = document.createElement("div");
           el.textContent = `Item ${idx}`;
-          el.style.height = '40px';
+          el.style.height = "40px";
           return el;
         },
         overscan: 3,
@@ -82,7 +83,7 @@ test.describe('Virtual list (vz9t8.8)', () => {
         const t0 = performance.now();
         container.scrollTop = pos;
         // Force a synchronous render call if available.
-        if (typeof list.render === 'function') {
+        if (typeof list.render === "function") {
           list.render();
         }
         // Layout flush.
@@ -98,30 +99,30 @@ test.describe('Virtual list (vz9t8.8)', () => {
       return { p50, p95, p99, samples_count: samples.length };
     });
     // eslint-disable-next-line no-console
-    console.info(JSON.stringify({ event: 'perf_test_result', ...stats }));
+    console.info(JSON.stringify({ event: "perf_test_result", ...stats }));
 
     // Soft gate: log p95 to stdout so CI dashboards can track. Hard fail only
     // when p95 exceeds 50ms (3× the documented 16ms ceiling) to avoid CI
     // flakiness on shared runners. Tighten via CI_PERF_STRICT=1.
-    const ceilingMs = process.env.CI_PERF_STRICT === '1' ? 16 : 50;
+    const ceilingMs = process.env.CI_PERF_STRICT === "1" ? 16 : 50;
     expect(stats.p95).toBeLessThan(ceilingMs);
   });
 
-  test('scroll position preserved across data-set churn', async ({ page }) => {
+  test("scroll position preserved across data-set churn", async ({ page }) => {
     // eslint-disable-next-line no-console
-    console.info(JSON.stringify({ event: 'scroll_preserve_test_start' }));
+    console.info(JSON.stringify({ event: "scroll_preserve_test_start" }));
     const result = await page.evaluate(() => {
       // @ts-expect-error injected
       const VirtualList = window.VirtualList;
-      const container = document.getElementById('vl-container')!;
+      const container = document.getElementById("vl-container")!;
       const list = new VirtualList({
         container,
         itemHeight: 40,
         totalCount: 1000,
         renderItem: (idx: number) => {
-          const el = document.createElement('div');
+          const el = document.createElement("div");
           el.textContent = `Item ${idx}`;
-          el.style.height = '40px';
+          el.style.height = "40px";
           return el;
         },
       });
@@ -139,13 +140,13 @@ test.describe('Virtual list (vz9t8.8)', () => {
     expect(result.scrollAfter).toBeGreaterThanOrEqual(0);
   });
 
-  test('empty list renders without errors', async ({ page }) => {
+  test("empty list renders without errors", async ({ page }) => {
     // eslint-disable-next-line no-console
-    console.info(JSON.stringify({ event: 'empty_list_test_start' }));
+    console.info(JSON.stringify({ event: "empty_list_test_start" }));
     const result = await page.evaluate(() => {
       // @ts-expect-error injected
       const VirtualList = window.VirtualList;
-      const container = document.getElementById('vl-container')!;
+      const container = document.getElementById("vl-container")!;
       let errored = false;
       try {
         const list = new VirtualList({
@@ -153,12 +154,12 @@ test.describe('Virtual list (vz9t8.8)', () => {
           itemHeight: 40,
           totalCount: 0,
           renderItem: (idx: number) => {
-            const el = document.createElement('div');
+            const el = document.createElement("div");
             el.textContent = `Item ${idx}`;
             return el;
           },
         });
-        if (typeof list.render === 'function') list.render();
+        if (typeof list.render === "function") list.render();
         // Trigger a scroll on the empty list.
         container.scrollTop = 100;
       } catch (e) {
@@ -169,58 +170,58 @@ test.describe('Virtual list (vz9t8.8)', () => {
     expect(result.errored).toBe(false);
   });
 
-  test('single-item list renders exactly one item', async ({ page }) => {
+  test("single-item list renders exactly one item", async ({ page }) => {
     // eslint-disable-next-line no-console
-    console.info(JSON.stringify({ event: 'single_item_test_start' }));
+    console.info(JSON.stringify({ event: "single_item_test_start" }));
     const result = await page.evaluate(() => {
       // @ts-expect-error injected
       const VirtualList = window.VirtualList;
-      const container = document.getElementById('vl-container')!;
+      const container = document.getElementById("vl-container")!;
       const list = new VirtualList({
         container,
         itemHeight: 40,
         totalCount: 1,
         renderItem: (idx: number) => {
-          const el = document.createElement('div');
+          const el = document.createElement("div");
           el.textContent = `Solo Item ${idx}`;
-          el.className = 'vl-item';
+          el.className = "vl-item";
           return el;
         },
       });
-      if (typeof list.render === 'function') list.render();
-      const items = document.querySelectorAll('.vl-item');
+      if (typeof list.render === "function") list.render();
+      const items = document.querySelectorAll(".vl-item");
       return { itemCount: items.length };
     });
     expect(result.itemCount).toBe(1);
   });
 
-  test('100K items: viewport child count stays bounded', async ({ page }) => {
+  test("100K items: viewport child count stays bounded", async ({ page }) => {
     // eslint-disable-next-line no-console
-    console.info(JSON.stringify({ event: 'stress_100k_test_start' }));
+    console.info(JSON.stringify({ event: "stress_100k_test_start" }));
     const stats = await page.evaluate(() => {
       // @ts-expect-error injected
       const VirtualList = window.VirtualList;
-      const container = document.getElementById('vl-container')!;
+      const container = document.getElementById("vl-container")!;
       const t0 = performance.now();
       const list = new VirtualList({
         container,
         itemHeight: 30,
         totalCount: 100000,
         renderItem: (idx: number) => {
-          const el = document.createElement('div');
-          el.className = 'vl-stress-item';
+          const el = document.createElement("div");
+          el.className = "vl-stress-item";
           el.textContent = `${idx}`;
-          el.style.height = '30px';
+          el.style.height = "30px";
           return el;
         },
       });
-      if (typeof list.render === 'function') list.render();
+      if (typeof list.render === "function") list.render();
       const initialPaintMs = performance.now() - t0;
-      const itemCount = document.querySelectorAll('.vl-stress-item').length;
+      const itemCount = document.querySelectorAll(".vl-stress-item").length;
       return { initialPaintMs, itemCount };
     });
     // eslint-disable-next-line no-console
-    console.info(JSON.stringify({ event: 'stress_100k_result', ...stats }));
+    console.info(JSON.stringify({ event: "stress_100k_result", ...stats }));
     // Initial paint should be near-constant; viewport (600px / 30px = 20)
     // plus overscan should keep DOM children well below 100.
     expect(stats.itemCount).toBeLessThan(200);
@@ -228,21 +229,21 @@ test.describe('Virtual list (vz9t8.8)', () => {
     expect(stats.initialPaintMs).toBeLessThan(500);
   });
 
-  test('missing height-cache entry recovers gracefully', async ({ page }) => {
+  test("missing height-cache entry recovers gracefully", async ({ page }) => {
     // eslint-disable-next-line no-console
-    console.info(JSON.stringify({ event: 'missing_height_test_start' }));
+    console.info(JSON.stringify({ event: "missing_height_test_start" }));
     const result = await page.evaluate(() => {
       // @ts-expect-error injected
       const VHVL = window.VariableHeightVirtualList;
       if (!VHVL) {
-        return { skipped: true, reason: 'VariableHeightVirtualList not available in module' };
+        return { skipped: true, reason: "VariableHeightVirtualList not available in module" };
       }
-      const container = document.getElementById('vl-container')!;
+      const container = document.getElementById("vl-container")!;
       let errored = false;
       const warnings: string[] = [];
       const origWarn = console.warn;
       console.warn = (...args: unknown[]) => {
-        warnings.push(args.map((a) => String(a)).join(' '));
+        warnings.push(args.map((a) => String(a)).join(" "));
       };
       try {
         const list = new VHVL({
@@ -250,9 +251,9 @@ test.describe('Virtual list (vz9t8.8)', () => {
           totalCount: 100,
           estimatedItemHeight: 32,
           renderItem: (idx: number) => {
-            const el = document.createElement('div');
+            const el = document.createElement("div");
             el.textContent = `var ${idx}`;
-            el.style.height = '32px';
+            el.style.height = "32px";
             return el;
           },
         });
@@ -260,7 +261,7 @@ test.describe('Virtual list (vz9t8.8)', () => {
         if (list.heightCache && Array.isArray(list.heightCache)) {
           list.heightCache[42] = NaN;
         }
-        if (typeof list.render === 'function') list.render();
+        if (typeof list.render === "function") list.render();
       } catch (e) {
         errored = true;
       } finally {
@@ -270,7 +271,7 @@ test.describe('Virtual list (vz9t8.8)', () => {
     });
     if (result.skipped) {
       // eslint-disable-next-line no-console
-      console.info(JSON.stringify({ event: 'missing_height_skipped', reason: result.reason }));
+      console.info(JSON.stringify({ event: "missing_height_skipped", reason: result.reason }));
       return;
     }
     expect(result.errored).toBe(false);
