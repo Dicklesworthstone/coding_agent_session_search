@@ -527,8 +527,8 @@ pub enum Commands {
         /// Include extended metadata in robot output (`elapsed_ms`, `wildcard_fallback`, `cache_stats`)
         #[arg(long)]
         robot_meta: bool,
-        /// Select specific fields in JSON output (comma-separated). Use 'minimal' for `source_path,line_number,agent`
-        /// or 'summary' for `source_path,line_number,agent,title,score`. Example: --fields `source_path,line_number`
+        /// Select specific fields in JSON output (comma-separated). Use 'minimal' for `source_path,line_number,agent,source_id,conversation_id`
+        /// or 'summary' for `source_path,line_number,agent,title,score,source_id,conversation_id`. Example: --fields `source_path,line_number`
         #[arg(long, value_delimiter = ',')]
         fields: Option<Vec<String>>,
         /// Truncate content/snippet fields to max N characters (UTF-8 safe, adds '...' and _truncated indicator)
@@ -6454,8 +6454,7 @@ mod canonical_top_level_command_tests {
     #[test]
     fn ann_index_parse_error_explains_the_index_command() {
         for format in ["--json", "--robot"] {
-            let args = ["cass", "index", "--semantic", "--approximate", format]
-                .map(str::to_string);
+            let args = ["cass", "index", "--semantic", "--approximate", format].map(str::to_string);
             let error = Cli::try_parse_from(&args).expect_err("query-only flag rejected");
             let output = format_friendly_parse_error(error, &args, &args);
             let payload: serde_json::Value = serde_json::from_str(&output).expect("error JSON");
@@ -31622,10 +31621,10 @@ fn run_cli_search(
     if let Some(format) = effective_robot {
         let expanded_trust_fields = expand_field_presets(&fields);
         let minimal_trust_projection = expanded_trust_fields.as_ref().is_some_and(|fields| {
-            fields.len() == 3
-                && fields[0] == "source_path"
-                && fields[1] == "line_number"
-                && fields[2] == "agent"
+            fields
+                .iter()
+                .map(String::as_str)
+                .eq(SEARCH_MINIMAL_FIELDS.iter().copied())
         });
         let trust_projection_requested =
             robot_meta && !minimal_trust_projection && !display_result.hits.is_empty();
@@ -33473,23 +33472,38 @@ fn output_display_results(
     Ok(())
 }
 
+// Named presets retain the complete canonical follow-up anchor even when
+// message bodies are omitted. Custom field masks remain caller-controlled.
+const SEARCH_MINIMAL_FIELDS: &[&str] = &[
+    "source_path",
+    "line_number",
+    "agent",
+    "source_id",
+    "conversation_id",
+];
+const SEARCH_SUMMARY_FIELDS: &[&str] = &[
+    "source_path",
+    "line_number",
+    "agent",
+    "title",
+    "score",
+    "source_id",
+    "conversation_id",
+];
+
 /// Expand field presets and return the resolved field list
 fn expand_field_presets(fields: &Option<Vec<String>>) -> Option<Vec<String>> {
     fields.as_ref().map(|f| {
         f.iter()
             .flat_map(|field| match field.as_str() {
-                "minimal" => vec![
-                    "source_path".to_string(),
-                    "line_number".to_string(),
-                    "agent".to_string(),
-                ],
-                "summary" => vec![
-                    "source_path".to_string(),
-                    "line_number".to_string(),
-                    "agent".to_string(),
-                    "title".to_string(),
-                    "score".to_string(),
-                ],
+                "minimal" => SEARCH_MINIMAL_FIELDS
+                    .iter()
+                    .map(|field| (*field).to_string())
+                    .collect(),
+                "summary" => SEARCH_SUMMARY_FIELDS
+                    .iter()
+                    .map(|field| (*field).to_string())
+                    .collect(),
                 // Provenance preset (P3.4) - add source origin info to results
                 "provenance" => vec![
                     "source_id".to_string(),
@@ -33739,6 +33753,7 @@ fn projected_hit_field_value(
         "title" => Some(serde_json::Value::String(hit.title.clone())),
         "created_at" => serde_json::to_value(hit.created_at).ok(),
         "line_number" => serde_json::to_value(hit.line_number).ok(),
+        "conversation_id" => serde_json::to_value(hit.conversation_id).ok(),
         "match_type" => serde_json::to_value(hit.match_type).ok(),
         // Provenance fields (P3.4)
         "source_id" => Some(serde_json::Value::String(normalized_robot_hit_source_id(
@@ -33781,6 +33796,7 @@ fn filter_hit_fields(
                 "title",
                 "created_at",
                 "line_number",
+                "conversation_id",
                 "match_type",
                 // Provenance fields (P3.4)
                 "source_id",
@@ -34601,18 +34617,16 @@ fn output_robot_results(
         .as_ref()
         .is_none_or(|fields| fields.is_empty());
     let minimal_projection = resolved_fields.as_ref().is_some_and(|fields| {
-        fields.len() == 3
-            && fields[0] == "source_path"
-            && fields[1] == "line_number"
-            && fields[2] == "agent"
+        fields
+            .iter()
+            .map(String::as_str)
+            .eq(SEARCH_MINIMAL_FIELDS.iter().copied())
     });
     let summary_projection = resolved_fields.as_ref().is_some_and(|fields| {
-        fields.len() == 5
-            && fields[0] == "source_path"
-            && fields[1] == "line_number"
-            && fields[2] == "agent"
-            && fields[3] == "title"
-            && fields[4] == "score"
+        fields
+            .iter()
+            .map(String::as_str)
+            .eq(SEARCH_SUMMARY_FIELDS.iter().copied())
     });
     let needs_truncation = truncation_budgets.has_any_limit();
     let passthrough_all_fields = all_fields_requested;
@@ -34653,11 +34667,13 @@ fn output_robot_results(
                 S: Serializer,
             {
                 let hit = self.0;
-                let mut map = serializer.serialize_map(Some(5))?;
+                let mut map = serializer.serialize_map(Some(SEARCH_SUMMARY_FIELDS.len()))?;
                 map.serialize_entry("source_path", &hit.source_path)?;
                 map.serialize_entry("line_number", &hit.line_number)?;
+                map.serialize_entry("conversation_id", &hit.conversation_id)?;
                 map.serialize_entry("agent", &hit.agent)?;
                 map.serialize_entry("title", &hit.title)?;
+                map.serialize_entry("source_id", &normalized_robot_hit_source_id(hit))?;
                 let safe_score = safe_robot_score_value(hit.score);
                 map.serialize_entry("score", &safe_score)?;
                 map.end()
@@ -34763,7 +34779,7 @@ fn output_robot_results(
                 let hit = self.0;
                 let normalized_source_id = normalized_robot_hit_source_id(hit);
                 let normalized_origin_host = normalized_robot_hit_origin_host(hit);
-                let mut fields = 12usize;
+                let mut fields = 13usize;
                 if hit.workspace_original.is_some() {
                     fields += 1;
                 }
@@ -34784,6 +34800,7 @@ fn output_robot_results(
                 }
                 map.serialize_entry("created_at", &hit.created_at)?;
                 map.serialize_entry("line_number", &hit.line_number)?;
+                map.serialize_entry("conversation_id", &hit.conversation_id)?;
                 map.serialize_entry("match_type", &hit.match_type)?;
                 let normalized_origin_kind = normalized_robot_hit_origin_kind(hit);
                 map.serialize_entry("source_id", &normalized_source_id)?;
@@ -34873,6 +34890,8 @@ fn output_robot_results(
                     "source_path": hit.source_path.as_str(),
                     "line_number": hit.line_number,
                     "agent": hit.agent.as_str(),
+                    "source_id": normalized_robot_hit_source_id(hit),
+                    "conversation_id": hit.conversation_id,
                 })
             })
             .collect()
@@ -34881,7 +34900,7 @@ fn output_robot_results(
             .hits
             .iter()
             .map(|hit| {
-                let mut map = serde_json::Map::with_capacity(5);
+                let mut map = serde_json::Map::with_capacity(SEARCH_SUMMARY_FIELDS.len());
                 map.insert(
                     "source_path".to_string(),
                     serde_json::Value::String(hit.source_path.clone()),
@@ -34899,6 +34918,14 @@ fn output_robot_results(
                     serde_json::Value::String(hit.title.clone()),
                 );
                 map.insert("score".to_string(), safe_robot_score_value(hit.score));
+                map.insert(
+                    "source_id".to_string(),
+                    serde_json::Value::String(normalized_robot_hit_source_id(hit)),
+                );
+                map.insert(
+                    "conversation_id".to_string(),
+                    serde_json::to_value(hit.conversation_id).unwrap_or_default(),
+                );
                 serde_json::Value::Object(map)
             })
             .collect()
@@ -98122,6 +98149,13 @@ fn response_schema_doctor_source_authority() -> serde_json::Value {
 fn response_schema_search_hit() -> serde_json::Value {
     response_schema_object([
         ("source_path", serde_json::json!({ "type": "string" })),
+        (
+            "conversation_id",
+            serde_json::json!({
+                "type": ["integer", "null"],
+                "description": "Canonical conversation identity in the archive used by search. Pass with source_id, source_path and line_number to view/expand --message-index. Null means no canonical identity is available."
+            }),
+        ),
         (
             "line_number",
             serde_json::json!({

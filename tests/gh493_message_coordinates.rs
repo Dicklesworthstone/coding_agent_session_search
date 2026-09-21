@@ -757,7 +757,10 @@ fn physical_context_keeps_file_numbers_while_expand_skips_non_records() {
                 vec![1, 4, 7]
             }
         );
-        assert_eq!(rows.iter().filter(|row| row["is_target"] == true).count(), 1);
+        assert_eq!(
+            rows.iter().filter(|row| row["is_target"] == true).count(),
+            1
+        );
         assert_eq!(rows[1]["line"], 4);
         for row in rows {
             assert_eq!(row["coordinate_space"], "file_line");
@@ -795,4 +798,178 @@ fn unanchored_archive_browsing_remains_available_without_a_physical_target() {
         rows.iter()
             .all(|row| row["highlighted"] != true && row["is_target"] != true)
     );
+}
+
+#[test]
+fn search_hit_serialization_preserves_available_identity_without_inventing_one() {
+    use coding_agent_search::search::query::{MatchType, SearchHit};
+    let mut hit = SearchHit {
+        title: "identity".into(),
+        snippet: "anchor".into(),
+        content: "anchor".into(),
+        content_hash: 123,
+        conversation_id: Some(42),
+        score: 1.0,
+        source_path: "/shared/provider.db".into(),
+        agent: "codex".into(),
+        workspace: "/work".into(),
+        workspace_original: None,
+        created_at: None,
+        line_number: Some(8),
+        match_type: MatchType::Exact,
+        source_id: "local".into(),
+        origin_kind: "local".into(),
+        origin_host: None,
+    };
+    let value = serde_json::to_value(&hit).unwrap();
+    assert_eq!(value["conversation_id"], 42);
+    assert_eq!(value["line_number"], 8);
+    assert!(value.get("content_hash").is_none());
+    hit.conversation_id = None;
+    let value = serde_json::to_value(&hit).unwrap();
+    assert_eq!(value.get("conversation_id"), Some(&Value::Null));
+}
+
+#[test]
+fn shared_path_search_hits_round_trip_in_every_robot_projection() {
+    let fixture = Fixture::new(&[0, 7, 12]);
+    let storage = FrankenStorage::open(&fixture.db).unwrap();
+    let other = seed(&storage, &fixture.path, "codex", &[0, 7, 12]);
+    drop(storage);
+    assert_ne!(fixture.conversation_id, other);
+    for conversation_id in [fixture.conversation_id, other] {
+        let indexed = fixture
+            .command("index")
+            .arg("--data-dir")
+            .arg(&fixture.data)
+            .arg("--reconcile-conversation")
+            .arg(conversation_id.to_string())
+            .arg("--json")
+            .output()
+            .unwrap();
+        decode(indexed);
+    }
+    let db_before = std::fs::read(&fixture.db).unwrap();
+    let source_before = std::fs::read(&fixture.path).unwrap();
+    let expected: std::collections::BTreeSet<_> =
+        [fixture.conversation_id, other].into_iter().collect();
+    for format in ["json", "compact", "jsonl"] {
+        for fields in [
+            None,
+            Some("minimal"),
+            Some("summary"),
+            Some("all"),
+            Some("source_path,line_number,source_id,conversation_id"),
+        ] {
+            // Plain JSON exercises the handwritten fast serializers. Truncation
+            // forces the general projection; JSONL and compact use that path too.
+            for truncate in [false, true] {
+                let mut command = fixture.command("search");
+                command
+                    .args([
+                        "ANCHOR493TARGET",
+                        "--mode",
+                        "lexical",
+                        "--robot-format",
+                        format,
+                        "--limit",
+                        "5",
+                        "--no-maintenance",
+                    ])
+                    .arg("--data-dir")
+                    .arg(&fixture.data);
+                if let Some(fields) = fields {
+                    command.args(["--fields", fields]);
+                }
+                if truncate {
+                    command.args(["--max-content-length", "8"]);
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "format={format} fields={fields:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let hits: Vec<Value> = if format == "jsonl" {
+                    String::from_utf8(output.stdout)
+                        .unwrap()
+                        .lines()
+                        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                        .filter(|value| value.get("source_path").is_some())
+                        .collect()
+                } else {
+                    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+                    payload["hits"].as_array().expect("search hits").clone()
+                };
+                assert_eq!(hits.len(), 2, "format={format} fields={fields:?}: {hits:?}");
+                let mut seen = std::collections::BTreeSet::new();
+                for hit in hits {
+                    let cid = hit["conversation_id"]
+                        .as_i64()
+                        .expect("canonical identity must survive output");
+                    assert!(
+                        seen.insert(cid),
+                        "shared paths must not collapse distinct conversations"
+                    );
+                    assert_eq!(hit["source_id"], "local");
+                    assert_eq!(hit["source_path"], fixture.path.to_string_lossy().as_ref());
+                    assert_eq!(hit["line_number"], 8);
+                    if fields == Some("minimal") {
+                        assert_eq!(hit.as_object().unwrap().len(), 5);
+                        assert!(hit.get("content").is_none());
+                    } else if fields == Some("summary") {
+                        assert_eq!(
+                            hit.as_object().unwrap().len(),
+                            7 + usize::from(hit.get("title_truncated").is_some())
+                        );
+                        assert!(hit.get("content").is_none());
+                    } else if fields == Some("source_path,line_number,source_id,conversation_id") {
+                        assert_eq!(hit.as_object().unwrap().len(), 4);
+                    }
+                    for subcommand in ["view", "expand"] {
+                        let payload = decode(fixture.follow(
+                            subcommand,
+                            8,
+                            &[
+                                "--source",
+                                hit["source_id"].as_str().unwrap(),
+                                "--conversation-id",
+                                &cid.to_string(),
+                            ],
+                        ));
+                        assert_target(&payload, subcommand, 8, cid);
+                    }
+                }
+                assert_eq!(seen, expected);
+            }
+        }
+    }
+    // Caller-selected masks may deliberately omit identity; do not silently
+    // expand them or invent a conversation id to make the follow-up succeed.
+    let payload = decode(
+        fixture
+            .command("search")
+            .args([
+                "ANCHOR493TARGET",
+                "--mode",
+                "lexical",
+                "--json",
+                "--fields",
+                "source_path,line_number",
+                "--limit",
+                "5",
+                "--no-maintenance",
+            ])
+            .arg("--data-dir")
+            .arg(&fixture.data)
+            .output()
+            .unwrap(),
+    );
+    let hits = payload["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 2);
+    for hit in hits {
+        assert_eq!(hit.as_object().unwrap().len(), 2);
+    }
+    assert_eq!(std::fs::read(&fixture.db).unwrap(), db_before);
+    assert_eq!(std::fs::read(&fixture.path).unwrap(), source_before);
 }

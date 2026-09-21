@@ -566,7 +566,7 @@
         },
         {
           "name": "fields",
-          "description": "Select specific fields in JSON output (comma-separated). Use 'minimal' for `source_path,line_number,agent` or 'summary' for `source_path,line_number,agent,title,score`. Example: --fields `source_path,line_number`",
+          "description": "Select specific fields in JSON output (comma-separated). Use 'minimal' for `source_path,line_number,agent,source_id,conversation_id` or 'summary' for `source_path,line_number,agent,title,score,source_id,conversation_id`. Example: --fields `source_path,line_number`",
           "arg_type": "option",
           "value_type": "string",
           "required": false,
@@ -743,7 +743,7 @@
         },
         {
           "name": "approximate",
-          "description": "Use approximate nearest neighbor (ANN) search with HNSW for faster semantic/hybrid queries. Trades slight accuracy loss for O(log n) search complexity instead of O(n). Only affects semantic and hybrid modes; ignored for lexical search. Requires an HNSW index built with `cass index --semantic --approximate`",
+          "description": "Use approximate nearest neighbor (ANN) search with HNSW for faster semantic/hybrid queries. Trades slight accuracy loss for O(log n) search complexity instead of O(n). Only affects semantic and hybrid modes; ignored for lexical search. Requires an HNSW index built with `cass index --semantic --build-hnsw`",
           "arg_type": "flag",
           "required": false,
           "default": "false",

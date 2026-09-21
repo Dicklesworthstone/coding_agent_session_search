@@ -1675,7 +1675,9 @@ pub struct SearchHit {
     pub content: String,
     #[serde(skip_serializing)]
     pub content_hash: u64,
-    #[serde(skip_serializing)]
+    /// Canonical conversation identity in the archive used by search.
+    /// Keep this with source_id, source_path and line_number for exact follow-ups.
+    /// Null means no canonical conversation identity is available; never invent one.
     pub conversation_id: Option<i64>,
     pub score: f32,
     pub source_path: String,

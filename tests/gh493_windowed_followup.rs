@@ -31,38 +31,62 @@ impl Fixture {
             version: None,
             kind: AgentKind::Cli,
         })?;
-        let outcome = storage.insert_conversation_tree(agent_id, None, &Conversation {
-            id: None,
-            agent_slug: "codex".into(),
-            workspace: None,
-            external_id: Some("windowed-followup".into()),
-            title: Some("Windowed follow-up".into()),
-            source_path: source.clone(),
-            started_at: None,
-            ended_at: None,
-            approx_tokens: None,
-            metadata_json: json!({}),
-            messages: [0, 7, 12, 99, 1000].into_iter().map(|idx| Message {
+        let outcome = storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &Conversation {
                 id: None,
-                idx,
-                role: MessageRole::Agent,
-                author: None,
-                created_at: None,
-                content: format!("canonical message idx {idx}"),
-                extra_json: json!({}),
-                snippets: Vec::new(),
-            }).collect(),
-            source_id: "local".into(),
-            origin_host: None,
-        })?;
+                agent_slug: "codex".into(),
+                workspace: None,
+                external_id: Some("windowed-followup".into()),
+                title: Some("Windowed follow-up".into()),
+                source_path: source.clone(),
+                started_at: None,
+                ended_at: None,
+                approx_tokens: None,
+                metadata_json: json!({}),
+                messages: [0, 7, 12, 99, 1000]
+                    .into_iter()
+                    .map(|idx| Message {
+                        id: None,
+                        idx,
+                        role: MessageRole::Agent,
+                        author: None,
+                        created_at: None,
+                        content: format!("canonical message idx {idx}"),
+                        extra_json: json!({}),
+                        snippets: Vec::new(),
+                    })
+                    .collect(),
+                source_id: "local".into(),
+                origin_host: None,
+            },
+        )?;
         drop(storage);
-        Ok(Self { root, db, source, conversation_id: outcome.conversation_id })
+        Ok(Self {
+            root,
+            db,
+            source,
+            conversation_id: outcome.conversation_id,
+        })
     }
 
     fn command(&self, subcommand: &str, number: usize, context: usize) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_cass"));
-        command.arg("--db").arg(&self.db).arg(subcommand).arg(&self.source)
-            .args(["--message-index", &number.to_string(), "-C", &context.to_string(), "--source", "local", "--json"])
+        command
+            .arg("--db")
+            .arg(&self.db)
+            .arg(subcommand)
+            .arg(&self.source)
+            .args([
+                "--message-index",
+                &number.to_string(),
+                "-C",
+                &context.to_string(),
+                "--source",
+                "local",
+                "--json",
+            ])
             .env("HOME", self.root.path())
             .env("XDG_CONFIG_HOME", self.root.path().join("config"))
             .env("XDG_DATA_HOME", self.root.path().join("data"))
@@ -89,7 +113,11 @@ impl Fixture {
 }
 
 fn decode(output: Output) -> Value {
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
@@ -99,11 +127,23 @@ fn sparse_context_counts_messages_and_preserves_complete_identity() -> anyhow::R
     let before = std::fs::read(&fixture.db)?;
     for command in ["view", "expand"] {
         let payload = decode(fixture.command(command, 13, 1).output()?);
-        let rows = if command == "view" { &payload["lines"] } else { &payload };
+        let rows = if command == "view" {
+            &payload["lines"]
+        } else {
+            &payload
+        };
         let rows = rows.as_array().unwrap();
-        assert_eq!(rows.iter().map(|row| row["message_index"].as_u64().unwrap()).collect::<Vec<_>>(), [8, 13, 100]);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row["message_index"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [8, 13, 100]
+        );
         assert_eq!(rows[1]["content"], "canonical message idx 12");
-        assert_eq!(rows.iter().filter(|row| row["is_target"] == true).count(), 1);
+        assert_eq!(
+            rows.iter().filter(|row| row["is_target"] == true).count(),
+            1
+        );
         for row in rows {
             assert_eq!(row["conversation_id"], fixture.conversation_id);
             assert_eq!(row["source_id"], "local");
@@ -127,7 +167,11 @@ fn excluded_payloads_are_skipped_but_requested_errors_fail_closed() -> anyhow::R
     for command in ["view", "expand"] {
         for context in [0, 1] {
             let payload = decode(fixture.command(command, 13, context).output()?);
-            let rows = if command == "view" { &payload["lines"] } else { &payload };
+            let rows = if command == "view" {
+                &payload["lines"]
+            } else {
+                &payload
+            };
             let rows = rows.as_array().unwrap();
             assert_eq!(rows.len(), context * 2 + 1);
             assert_eq!(rows[context]["content"], "canonical message idx 12");
@@ -135,7 +179,10 @@ fn excluded_payloads_are_skipped_but_requested_errors_fail_closed() -> anyhow::R
         // The same poison must be an error once it enters the requested window.
         let output = fixture.command(command, 13, 2).output()?;
         assert!(!output.status.success());
-        assert!(output.stdout.is_empty(), "no partially certified target on error");
+        assert!(
+            output.stdout.is_empty(),
+            "no partially certified target on error"
+        );
         let output = fixture.command(command, 1001, 0).output()?;
         assert!(!output.status.success());
         assert!(output.stdout.is_empty());
@@ -160,9 +207,18 @@ fn ambiguous_identity_is_refused_before_payload_hydration() -> anyhow::Result<()
         assert!(!output.status.success());
         assert!(output.stdout.is_empty());
         assert!(String::from_utf8_lossy(&output.stderr).contains("ambiguous-source"));
-        let payload = decode(fixture.command(command, 13, 1)
-            .arg("--conversation-id").arg(fixture.conversation_id.to_string()).output()?);
-        let rows = if command == "view" { &payload["lines"] } else { &payload };
+        let payload = decode(
+            fixture
+                .command(command, 13, 1)
+                .arg("--conversation-id")
+                .arg(fixture.conversation_id.to_string())
+                .output()?,
+        );
+        let rows = if command == "view" {
+            &payload["lines"]
+        } else {
+            &payload
+        };
         assert_eq!(rows[1]["content"], "canonical message idx 12");
     }
     Ok(())

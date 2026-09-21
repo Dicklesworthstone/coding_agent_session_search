@@ -85,14 +85,14 @@ mod tests {
                         .saturating_add(context)
                         .saturating_add(1)
                         .min(indices.len());
-                    let selected: Vec<_> = selection
-                        .anchors
-                        .iter()
-                        .map(|anchor| anchor.idx)
-                        .collect();
+                    let selected: Vec<_> =
+                        selection.anchors.iter().map(|anchor| anchor.idx).collect();
                     assert_eq!(selected, indices[start..end]);
                     let ids: Vec<_> = selection.anchors.iter().map(|anchor| anchor.id).collect();
-                    assert_eq!(ids, (start..end).map(|idx| idx as i64 + 1).collect::<Vec<_>>());
+                    assert_eq!(
+                        ids,
+                        (start..end).map(|idx| idx as i64 + 1).collect::<Vec<_>>()
+                    );
                     assert_eq!(
                         selection
                             .anchors

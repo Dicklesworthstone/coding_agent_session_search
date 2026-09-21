@@ -1,132 +1,13 @@
 name: GH493 canonical anchor candidate
 
+# The reviewed candidate is now production code. Keep this manual entry point
+# as a read-only alias for the permanent regression suite, not a blob publisher.
 on:
-  push:
-    branches: [main]
-    paths: [.github/workflows/gh493-coordinate-candidate.yml]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  prepare:
-    if: github.repository == 'Dicklesworthstone/coding_agent_session_search'
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 60
-    permissions:
-      contents: write
-    env:
-      CARGO_BUILD_JOBS: '2'
-      CARGO_PROFILE_TEST_DEBUG: '0'
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_TERM_COLOR: never
-      RUST_MIN_STACK: '134217728'
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
-        with:
-          shared-key: gh493-identity
-          cache-on-failure: true
-      - name: Prepare exact production repair and regression additions
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import base64, json, os, pathlib, subprocess, urllib.request
-          expected = {
-              'src/lib.rs': '7df7b9b62dad120e25baed463a85b082de7015ef',
-              'src/search/query.rs': 'edab70e109120591fb01f1f67248283fc0452301',
-              'tests/gh493_message_coordinates.rs': '42cdc22e7be6a2a853a7e534ea2912292b231631',
-              'tests/golden/robot/capabilities.json.golden': 'b9e1ebf88ef17678eb041e500aa9c9d78ef04b36',
-          }
-          for path, sha in expected.items():
-              actual = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
-              if actual != sha:
-                  raise SystemExit(f'Refusing changed source: {path}: {actual} != {sha}')
-          def blob(sha):
-              request = urllib.request.Request(
-                  f'https://api.github.com/repos/{os.environ["GITHUB_REPOSITORY"]}/git/blobs/{sha}',
-                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  result = json.load(response)
-              assert result['encoding'] == 'base64'
-              return base64.b64decode(result['content'])
-          patch = blob('3d2174d61925f1d46733119d109e6bcc5b9b0358')
-          subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
-          subprocess.run(['git', 'apply', '-'], input=patch, check=True)
-          tests = blob('8f4fae6c9b4628cd8886de43a3b3375fc048bd5a').decode()
-          tests = tests.replace('assert_eq!(hit.as_object().unwrap().len(), 7);',
-              'assert_eq!(hit.as_object().unwrap().len(), 7 + usize::from(hit.get("title_truncated").is_some()));')
-          with open('tests/gh493_message_coordinates.rs', 'a') as output:
-              output.write(tests)
-          path = pathlib.Path('tests/golden/robot/capabilities.json.golden')
-          text = path.read_text()
-          for old, new in [
-              ('source_path,line_number,agent`', 'source_path,line_number,agent,source_id,conversation_id`'),
-              ('source_path,line_number,agent,title,score`', 'source_path,line_number,agent,title,score,source_id,conversation_id`'),
-              ('cass index --semantic --approximate', 'cass index --semantic --build-hnsw'),
-          ]:
-              text = text.replace(old, new)
-          json.loads(text)
-          path.write_text(text)
-          PY
-      - name: Format the changed identity and previously landed coordinate implementation
-        run: |
-          rustfmt --edition 2024 --config skip_children=true src/lib.rs src/search/query.rs src/followup_coordinates.rs src/followup_coordinates/window.rs tests/gh493_message_coordinates.rs tests/gh493_reported_coordinates.rs tests/gh493_windowed_followup.rs
-          git diff --check
-          git diff --stat
-      - name: Publish reviewed blobs only, never commits or refs
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 - <<'PY'
-          import json, os, pathlib, shutil, subprocess, urllib.request
-          allowed = {'src/lib.rs', 'src/search/query.rs', 'src/followup_coordinates.rs', 'src/followup_coordinates/window.rs', 'tests/gh493_message_coordinates.rs', 'tests/gh493_reported_coordinates.rs', 'tests/gh493_windowed_followup.rs', 'tests/golden/robot/capabilities.json.golden'}
-          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
-          assert set(changed) <= allowed
-          manifest = {'base_commit': os.environ['GITHUB_SHA'], 'base_blobs': {}, 'candidate_blobs': {}}
-          for path in changed:
-              manifest['base_blobs'][path] = subprocess.check_output(['git', 'rev-parse', f'HEAD:{path}'], text=True).strip()
-              request = urllib.request.Request(
-                  f'https://api.github.com/repos/{os.environ["GITHUB_REPOSITORY"]}/git/blobs',
-                  data=json.dumps({'content': pathlib.Path(path).read_text(), 'encoding': 'utf-8'}).encode(),
-                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'},
-                  method='POST')
-              with urllib.request.urlopen(request, timeout=60) as response:
-                  sha = json.load(response)['sha']
-              assert sha == subprocess.check_output(['git', 'hash-object', path], text=True).strip()
-              manifest['candidate_blobs'][path] = sha
-              dest = pathlib.Path('candidate') / path
-              dest.parent.mkdir(parents=True, exist_ok=True)
-              shutil.copyfile(path, dest)
-          pathlib.Path('candidate/manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
-          pathlib.Path('candidate/review.patch').write_bytes(subprocess.check_output(['git', 'diff']))
-          print('GH493_IDENTITY_CANDIDATE\n' + json.dumps(manifest, indent=2))
-          PY
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: gh493-search-identity-candidate
-          path: candidate/
-          retention-days: 3
-      - name: Native coordinate and reconciliation regressions
-        run: cargo test --locked --no-fail-fast --test gh493_message_coordinates --test gh493_reported_coordinates --test gh493_windowed_followup --test lexical_reconcile_canary -- --nocapture
-      - name: Existing dispatch, physical view and error contracts
-        if: ${{ !cancelled() }}
-        run: |
-          cargo test --locked --test cli_dispatch_coverage parse_expand_with_context
-          cargo test --locked --test spec_view_expand_error_envelopes
-          cargo test --locked --test cli_robot view_
-          cargo test --locked --test cli_robot fields_
-          cargo test --locked --test cli_robot capabilities_matches_golden_contract
-      - name: Strict lint of production dependency and coordinate regressions
-        if: ${{ !cancelled() }}
-        run: cargo clippy --locked --test gh493_message_coordinates --test gh493_reported_coordinates --test gh493_windowed_followup --test lexical_reconcile_canary -- -D warnings
+  verify:
+    uses: ./.github/workflows/message-coordinate-regression.yml

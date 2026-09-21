@@ -59,7 +59,10 @@ fn resolve(request: &Request, expand: bool) -> CliResult<Value> {
     let storage = FrankenStorage::open_strict_readonly(&request.db).map_err(lookup_error)?;
     // Pin identity selection, index validation and content hydration to one
     // read transaction. Never choose against one snapshot and render another.
-    storage.raw().execute("BEGIN DEFERRED").map_err(lookup_error)?;
+    storage
+        .raw()
+        .execute("BEGIN DEFERRED")
+        .map_err(lookup_error)?;
     let result = resolve_snapshot(request, expand, &storage);
     let released = storage.raw().execute("ROLLBACK").map_err(lookup_error);
     match result {
@@ -311,12 +314,14 @@ fn resolve_physical(path: &Path, line: usize, context: usize, expand: bool) -> C
         hint: Some("Use the search hit's source and conversation identity. --line never substitutes archived messages.".into()),
         retryable: false,
     })?;
-    let file_error = |err: std::io::Error| CliError {
+    let file_error = |err: std::io::Error| {
+        CliError {
         code: 9,
         kind: CliErrorKind::FileRead.kind_str(),
         message: format!("Cannot read physical source file {}: {err}", path.display()),
         hint: Some("No archived content was substituted. Use --message-index to inspect an indexed message.".into()),
         retryable: false,
+    }
     };
     if !file.metadata().map_err(file_error)?.is_file() {
         return Err(file_error(std::io::Error::other(
@@ -490,19 +495,16 @@ fn run_physical(
         worker_read_finished.store(true, std::sync::atomic::Ordering::Release);
         crate::maybe_test_search_worker_delay("CASS_TEST_VIEW_PROJECTION_SLOW_MS");
         if !expand {
-            payload["budget"] =
-                serde_json::to_value(crate::robot_budget_envelope::BudgetBlock::from_budget(
-                    &budget,
-                    Vec::new(),
-                    None,
-                ))
-                .map_err(|err| {
-                    error(
-                        CliErrorKind::SerializeMessage.kind_str(),
-                        err.to_string(),
-                        "Retry this physical-file lookup.",
-                    )
-                })?;
+            payload["budget"] = serde_json::to_value(
+                crate::robot_budget_envelope::BudgetBlock::from_budget(&budget, Vec::new(), None),
+            )
+            .map_err(|err| {
+                error(
+                    CliErrorKind::SerializeMessage.kind_str(),
+                    err.to_string(),
+                    "Retry this physical-file lookup.",
+                )
+            })?;
         }
         if let Some(format) = format {
             return crate::encode_structured_value(payload, format);
@@ -518,7 +520,11 @@ fn run_physical(
             };
             output.push_str(&format!(
                 "{} L{} {}\n{}\n\n",
-                if entry["is_target"] == true { ">>>" } else { "   " },
+                if entry["is_target"] == true {
+                    ">>>"
+                } else {
+                    "   "
+                },
                 entry["line"],
                 entry["role"].as_str().unwrap_or_default(),
                 display,
@@ -530,9 +536,7 @@ fn run_physical(
         println!("{encoded}");
         return Ok(());
     }
-    if !expand
-        && let Some(format) = format
-    {
+    if !expand && let Some(format) = format {
         let mut skipped = vec!["view_content".into(), "source_provenance".into()];
         if read_finished.load(std::sync::atomic::Ordering::Acquire) {
             skipped.push("output_projection".into());
@@ -554,7 +558,10 @@ fn run_physical(
         code: 9,
         kind: "file-lookup-timeout",
         message: format!("Physical file lookup exceeded its {budget_ms}ms budget"),
-        hint: Some("Retry with a larger view --timeout or CASS_VIEW_BUDGET_MS. No target was emitted.".into()),
+        hint: Some(
+            "Retry with a larger view --timeout or CASS_VIEW_BUDGET_MS. No target was emitted."
+                .into(),
+        ),
         retryable: true,
     })
 }
