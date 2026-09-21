@@ -19,6 +19,9 @@ use crate::search::vector_index::VECTOR_INDEX_DIR;
 
 mod inspection;
 
+#[cfg(test)]
+mod checkpoint_tests;
+
 pub use inspection::{
     BackfillArtifactCandidate, BackfillArtifactReclaimPlan, apply_backfill_artifact_plan,
     plan_backfill_artifacts,
@@ -119,6 +122,7 @@ impl BackfillArtifacts {
         let root = self.data_dir.join(VECTOR_INDEX_DIR);
         let mut metadata = RecoveryMetadata::new(durable);
         let mut protected = ProtectedPaths::default();
+        let mut resumable_checkpoint = None;
         if let Some(manifest) =
             metadata.read::<SemanticManifest>(&SemanticManifest::path(&self.data_dir))?
         {
@@ -140,6 +144,7 @@ impl BackfillArtifacts {
                         checkpoint_missing: true,
                     });
                 }
+                resumable_checkpoint = Some((path, checkpoint.clone()));
             }
         }
         if let Some(manifest) = input {
@@ -199,6 +204,15 @@ impl BackfillArtifacts {
                 candidates.insert(path);
             }
             // Symlinks are never candidates, including dangling ones.
+        }
+
+        if !candidates.is_empty()
+            && let Some((path, checkpoint)) = resumable_checkpoint
+        {
+            // Existence and fsync alone cannot vouch for the replacement: a
+            // zero-length/truncated file can survive an interrupted writer.
+            // Check the current checkpoint before deleting any fallback copy.
+            validate_reclaim_checkpoint(&path, &checkpoint)?;
         }
 
         Ok(Discovery {
@@ -568,6 +582,41 @@ fn inspect_checkpoint(path: &Path, durable: bool) -> Result<bool> {
         sync_directory(path.parent().context("checkpoint has no directory")?)?;
     }
     Ok(true)
+}
+
+/// Reuse the engine's read-only FSVI admission rather than a second header
+/// parser. This rejects an unreadable/truncated checkpoint or the wrong
+/// producer before a sweep; it is not a full vector-content/coverage audit.
+/// Do not compact or repair the checkpoint/WAL as a side effect of inspection.
+fn validate_reclaim_checkpoint(path: &Path, checkpoint: &BuildCheckpoint) -> Result<()> {
+    let index = frankensearch::index::VectorIndex::open_read_only(path).with_context(|| {
+        format!(
+            "resumable semantic checkpoint {} cannot be opened; retaining fallback artifacts",
+            path.display()
+        )
+    })?;
+    ensure!(
+        index.embedder_id() == checkpoint.embedder_id,
+        "resumable semantic checkpoint {} has producer {}, expected {}; retaining fallback artifacts",
+        path.display(),
+        index.embedder_id(),
+        checkpoint.embedder_id
+    );
+    // Read-only recovery can ignore an incomplete or stale WAL batch. Even
+    // this upper bound (physical main slots + replayable WAL records) must
+    // cover the durable checkpoint's acknowledged count before retiring a
+    // fallback. Extra records are allowed: a killed writer may have durably
+    // appended its next batch without advancing the checkpoint yet.
+    let available = u64::try_from(index.record_count()).unwrap_or(u64::MAX)
+        .saturating_add(u64::try_from(index.wal_record_count()).unwrap_or(u64::MAX));
+    ensure!(
+        available >= checkpoint.docs_embedded,
+        "resumable semantic checkpoint {} has at most {} records, below its recorded {}; retaining fallback artifacts",
+        path.display(),
+        available,
+        checkpoint.docs_embedded
+    );
+    Ok(())
 }
 
 fn open_checkpoint_file(path: &Path) -> Result<Option<File>> {

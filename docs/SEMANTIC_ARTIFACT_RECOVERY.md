@@ -80,11 +80,26 @@ are treated as leaves, never as permission to traverse their targets. Corrupt,
 unsupported, or unreadable authority metadata prevents reclamation; missing
 checkpoint data retains potential fallback artifacts.
 
+When candidates exist and the manifest names a resumable checkpoint, recovery
+also requires that checkpoint to open through the engine's read-only FSVI reader
+with the recorded producer ID. Its physical main slots plus replayable WAL
+records must also cover the checkpoint's recorded document count. This rejects
+lost acknowledged WAL records without rejecting a valid append ahead of the last
+checkpoint. An empty, truncated, unreadable, underfilled, or wrong-producer
+checkpoint cannot authorize deleting older copies. Preview, apply, and automatic
+startup cleanup share this check. Inspection never compacts or repairs its WAL,
+and does not select an orphan as a replacement. Resolve the checkpoint problem
+before requesting a new cleanup approval; a failed check retains the candidates.
+This is structural reader admission, not a full vector-content or corpus-coverage
+audit. Existing published indexes remain protected regardless of readiness.
+
 Counts describe fully removed top-level staging files/WALs and reuse
 directories. Byte figures are logical regular-file lengths, not allocated disk
 blocks or a guarantee of immediately freed physical space. A failed partial
 removal is not included in the reclaimed-byte total. Inspection walks scratch
-metadata with an entry budget; it does not hash multi-gigabyte vector payloads.
+metadata with an entry budget; approval fingerprints do not hash vector payloads.
+The separate checkpoint-reader admission above may read the checkpoint's WAL;
+it is skipped when there are no candidate deletions or no active checkpoint.
 
 The locks serialize cooperating CASS writers. This is not a sandbox against an
 uncooperative same-user process changing the filesystem during recovery. The
@@ -97,7 +112,7 @@ rewrite whose mtime was restored; other platforms use their available metadata.
 | Exit | Meaning |
 | --- | --- |
 | 0 | Preview is ready, apply completed, or help/version was displayed. |
-| 1 | Recovery or output failed, including a busy lock, stale approval, or invalid metadata. Inspect the diagnostic; an I/O failure may follow partial removal. |
+| 1 | Recovery or output failed, including a busy lock, stale approval, invalid metadata, or an unusable checkpoint. Inspect the diagnostic; an I/O failure may follow partial removal. |
 | 2 | Invalid command-line arguments; recovery was not started. |
 | 3 | Preview is blocked by a missing checkpoint, or apply reports incomplete removals. |
 
@@ -113,12 +128,14 @@ indexes. They require no model download. Run them in a Rust-enabled checkout:
 ```sh
 cargo test --locked --lib indexer::semantic::artifacts::inspection::tests
 cargo test --locked --lib indexer::semantic::artifact_lifecycle_tests
+cargo test --locked --lib indexer::semantic::artifacts::checkpoint_tests
 cargo test --locked --bin cass-semantic-reclaim
 cargo test --locked --test semantic_artifact_reclaim_cli
 ```
 
 Coverage includes stale approvals, ownership changes, active locks, malformed
-metadata, missing checkpoints, changed scratch, symlink targets, live-index
+metadata, missing/damaged checkpoints, wrong producers, WAL-backed resume,
+changed scratch, symlink targets, live-index
 bytes and fresh search reopen, plus separate-process command execution with an
 invalid canonical database. These are qualification commands, not a claim that
 the full CASS dependency graph or platform matrix has passed.
