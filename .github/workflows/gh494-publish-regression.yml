@@ -58,6 +58,11 @@ jobs:
           test "$(git hash-object "$RUNNER_TEMP/reviewed.patch")" = 028f6f48a3e64795982ac1f6d44f102a5ee103e2
           git apply --check --whitespace=error "$RUNNER_TEMP/reviewed.patch"
           git apply --whitespace=error "$RUNNER_TEMP/reviewed.patch"
+          gh api repos/${{ github.repository }}/git/blobs/62f7bd5db66c0e67aa7015301b6d7538692f65bc --jq .content | base64 --decode > "$RUNNER_TEMP/remove-cached-fingerprint.patch"
+          test "$(git hash-object "$RUNNER_TEMP/remove-cached-fingerprint.patch")" = 62f7bd5db66c0e67aa7015301b6d7538692f65bc
+          git apply --check --whitespace=error "$RUNNER_TEMP/remove-cached-fingerprint.patch"
+          git apply --whitespace=error "$RUNNER_TEMP/remove-cached-fingerprint.patch"
+          test "$(git hash-object src/indexer/mod.rs)" = f3796db5eb3b6a2a72222b9a7bc3a09ad283a752
           rustfmt --edition 2024 --config skip_children=true src/indexer/lexical_publish.rs src/indexer/gh494_tests.rs tests/gh494_publish_resume.rs
           rustfmt --edition 2024 --config skip_children=true --check src/indexer/lexical_publish.rs src/indexer/gh494_tests.rs tests/gh494_publish_resume.rs
           rustfmt --edition 2024 --config skip_children=true --emit stdout src/indexer/mod.rs > "$RUNNER_TEMP/mod.parsed.rs"
@@ -90,7 +95,7 @@ jobs:
           python3 - <<'PY'
           import base64, hashlib, json, os, pathlib, subprocess
           paths = ['src/indexer/mod.rs', 'src/indexer/lexical_publish.rs', 'src/indexer/gh494_tests.rs', 'tests/gh494_publish_resume.rs']
-          report = {'base_commit': os.environ['GITHUB_SHA'], 'patch_blob': 'd88d7587ebbcad8f7c7adc86efc7ce2429a087f9', 'blobs': {}}
+          report = {'base_commit': os.environ['GITHUB_SHA'], 'patch_blob': 'd88d7587ebbcad8f7c7adc86efc7ce2429a087f9', 'followup_patch_blob': '62f7bd5db66c0e67aa7015301b6d7538692f65bc', 'blobs': {}}
           for path in paths:
               data = pathlib.Path(path).read_bytes()
               expected = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
