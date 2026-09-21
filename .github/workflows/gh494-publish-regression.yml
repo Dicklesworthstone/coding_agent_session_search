@@ -3,427 +3,68 @@ name: Lexical publication regression
 on:
   push:
     branches: [main]
-    paths: ['.github/workflows/gh494-publish-regression.yml']
+    paths:
+      - 'src/indexer/**'
+      - 'src/search/tantivy.rs'
+      - 'src/search/quill_bridge.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/gh494-publish-regression.yml'
   workflow_dispatch:
 
+# The reviewed edit is now on main. This workflow only reads and tests code;
+# it cannot commit, push, or replay the one-time source transformation.
 permissions:
   contents: read
 
 concurrency:
-  group: gh494-reviewed-publish-fix
-  cancel-in-progress: false
+  group: gh494-regressions-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  apply-reviewed-fix:
+  publication-regressions:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    permissions:
-      contents: write
-    outputs:
-      source_sha: ${{ steps.commit.outputs.source_sha }}
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      RUST_MIN_STACK: '67108864'
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Read the repository's dated toolchain
+        id: toolchain
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, tomllib
+          name = tomllib.loads(pathlib.Path('rust-toolchain.toml').read_text())['toolchain']['channel']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              print(f'name={name}', file=output)
+          PY
       - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
         with:
-          toolchain: nightly-2026-08-31
-          components: rustfmt
-      - name: Apply the exact reviewed GH494 edit
+          toolchain: ${{ steps.toolchain.outputs.name }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
+      - name: Record exact source and compiler
         shell: bash
         run: |
-          python3 - <<'PYCODE'
-          # One-time transport for a narrow edit to the oversized indexer.
-          # Refuse changed input and never push over concurrent main.
-          from pathlib import Path
-          import hashlib
-          path = Path('src/indexer/mod.rs')
-          original = path.read_bytes()
-          expected = '9ef4d50ed35791e9eb99d59335009f831d86b3c9'
-          actual = hashlib.sha1(b'blob ' + str(len(original)).encode() + b'\0' + original).hexdigest()
-          if actual != expected:
-              raise SystemExit(f'Refusing concurrent indexer change: expected {expected}, found {actual}')
-          for new in ('src/indexer/lexical_publish.rs', 'src/indexer/gh494_tests.rs'):
-              if Path(new).exists():
-                  raise SystemExit(f'Refusing to overwrite existing helper: {new}')
-          text = original.decode('utf-8')
-          def once(value, old, new):
-              if value.count(old) != 1:
-                  raise SystemExit(f'Expected one edit anchor, found {value.count(old)}: {old[:120]!r}')
-              return value.replace(old, new, 1)
-          text = once(text, 'pub(crate) mod lexical_generation;\n',
-                      'pub(crate) mod lexical_generation;\nmod lexical_publish;\n')
-          text = once(text, '    include!("gh473_tests.rs");\n',
-                      '    include!("gh473_tests.rs");\n    include!("gh494_tests.rs");\n')
-          start = text.index('fn rebuild_tantivy_from_db_with_options(')
-          end = text.index('\n#[cfg(test)]\nfn ingest_batch(', start)
-          prefix, body, suffix = text[:start], text[start:end], text[end:]
-          body = once(body, '''    if rebuild_state.completed
-                  || (!options.defer_initial_content_fingerprint
-                      && rebuild_state.processed_conversations >= total_conversations)
-              {
-          ''', '''    // GH #494: EOF is an ingest cursor, NOT a publication receipt. An
-              // interrupted/refused terminal publish leaves all rows committed in the
-              // scratch generation but completed=false. It must pass through finalization
-              // below, including the swap and completed checkpoint, even with no rows left.
-              // This also lets a genuinely empty archive publish its first readable index.
-              if rebuild_state.completed {
-                  lexical_publish::Finalization::new(
-                      &index_path,
-                      &index_path,
-                      rebuild_state.indexed_docs,
-                      rebuild_state.processed_conversations,
-                  )
-                  .run("reuse_completed_generation", || {
-                      crate::search::tantivy::validate_searchable_index_contract(&index_path)?;
-                      verify_published_lexical_doc_count(&index_path, rebuild_state.indexed_docs, "completed")
-                  })?;
-          ''')
-          body = once(body, '    let resumed_from_checkpoint = rebuild_state.processed_conversations > 0;\n', '''    if !options.defer_initial_content_fingerprint
-                  && rebuild_state.processed_conversations >= total_conversations
-              {
-                  tracing::info!(
-                      processed_conversations = rebuild_state.processed_conversations,
-                      total_conversations,
-                      indexed_docs = rebuild_state.indexed_docs,
-                      index_path = %index_path.display(),
-                      "lexical rebuild cursor reached EOF but publication is incomplete; resuming finalization"
-                  );
-              }
-              let resumed_from_checkpoint = rebuild_state.processed_conversations > 0;
-          ''')
-          tail_start = body.index('    // #441: publish everything staged, then fold')
-          head, tail = body[:tail_start], body[tail_start:]
-          tail = once(tail, '    t_index.commit()?;\n', '''    let publication = lexical_publish::Finalization::new(
-                  &index_path,
-                  &build_path,
-                  indexed_docs,
-                  processed_conversations,
-              );
-              publication.run("commit_candidate", || t_index.commit())?;
-          ''')
-          def wrap(value, begin, ending, phase):
-              a = value.index(begin)
-              b = value.index(ending, a) + len(ending)
-              statement = value[a:b]
-              if not statement.endswith('?;'):
-                  raise SystemExit(f'Expected fallible statement for {phase}')
-              wrapped = '    publication.run("' + phase + '", || {\n'
-              wrapped += '\n'.join('    ' + line for line in statement[:-2].splitlines())
-              wrapped += '\n    })?;'
-              return value[:a] + wrapped + value[b:]
-          tail = wrap(tail, '    commit_lexical_rebuild_progress(\n', '\n    )?;', 'checkpoint_after_fold')
-          tail = once(tail, '    drop(t_index);\n', '''    // Refuse an unreadable/hollow candidate before it can replace a usable
-              // live generation. Reopen and validate the actual live path again after swap.
-              publication.run("validate_candidate", || {
-                  crate::search::tantivy::validate_searchable_index_contract(&build_path)?;
-                  verify_published_lexical_doc_count(&build_path, indexed_docs, "candidate")
-              })?;
-              publication.run("release_writer", || {
-                  drop(t_index);
-                  Ok(())
-              })?;
-          ''')
-          tail = once(tail, '''        publish_staged_lexical_index(staged, &index_path).with_context(|| {
-                      format!(
-                          "publishing staged lexical rebuild into {}",
-                          index_path.display()
-                      )
-                  })?;
-          ''', '''        publication.run("publish_staged_generation", || {
-                      publish_staged_lexical_index(staged, &index_path)
-                  })?;
-          ''')
-          tail = once(tail, '''    crate::search::tantivy::validate_searchable_index_contract(&index_path).with_context(|| {
-                  format!(
-                      "validating lexical rebuild after commit: {}",
-                      index_path.display()
-                  )
-              })?;
-              verify_published_lexical_doc_count(&index_path, indexed_docs, "direct")?;
-          ''', '''    publication.run("validate_published_generation", || {
-                  crate::search::tantivy::validate_searchable_index_contract(&index_path)?;
-                  verify_published_lexical_doc_count(&index_path, indexed_docs, "direct")
-              })?;
-          ''')
-          tail = once(tail, '        count_total_messages_exact(&storage)?\n',
-                      '        publication.run("count_canonical_messages", || count_total_messages_exact(&storage))?\n')
-          tail = wrap(tail, '    storage.close_without_checkpoint().with_context(|| {\n', '\n    })?;', 'close_canonical_reader')
-          a = tail.index('    let generation_manifest = persist_lexical_rebuild_generation_artifacts(')
-          b = tail.index('\n    )?;', a) + len('\n    )?;')
-          statement = tail[a:b]
-          call = statement.removeprefix('    let generation_manifest = ').removesuffix('?;')
-          tail = tail[:a] + ('    let generation_manifest = publication.run("persist_generation_manifest", || {\n'
-                  + '\n'.join('        ' + line.lstrip() if i == 0 else '    ' + line
-                              for i, line in enumerate(call.splitlines()))
-                  + '\n    })?;') + tail[b:]
-          tail = once(tail, '''    rebuild_state.mark_completed(completed_lexical_rebuild_meta_fingerprint(
-                  &rebuild_state,
-                  &index_path,
-              )?);
-              persist_lexical_rebuild_state(&index_path, &rebuild_state)?;
-          ''', '''    let completed_fingerprint = publication.run("completed_generation_fingerprint", || {
-                  completed_lexical_rebuild_meta_fingerprint(&rebuild_state, &index_path)
-              })?;
-              rebuild_state.mark_completed(completed_fingerprint);
-              publication.run("persist_completed_checkpoint", || {
-                  persist_lexical_rebuild_state(&index_path, &rebuild_state)
-              })?;
-          ''')
-          tail = once(tail, '    persist_lexical_refresh_ledger(&index_path, &refresh_ledger)?;\n', '''    publication.run("persist_refresh_ledger", || {
-                  persist_lexical_refresh_ledger(&index_path, &refresh_ledger)
-              })?;
-          ''')
-          patched = prefix + head + tail + suffix
-          if len(patched) < len(text) or patched.count('include!("gh494_tests.rs")') != 1:
-              raise SystemExit('Unexpected patch size or regression include count')
-          path.write_text(patched, encoding='utf-8', newline='\n')
-          print(f'Applied narrow GH494 edit over exact Git blob {actual}')
-          Path('src/indexer/lexical_publish.rs').write_text(r'''//! Phase-specific diagnostics for rebuild finalization (GH #494).
-          //!
-          //! Consuming the canonical cursor and publishing a generation are different
-          //! milestones. Never turn a failed finalization step into a successful outcome.
-
-          use anyhow::Result;
-          use std::path::Path;
-          use std::time::Instant;
-
-          pub(super) struct Finalization<'a> {
-              live: &'a Path,
-              candidate: &'a Path,
-              indexed_docs: usize,
-              processed_conversations: usize,
-          }
-
-          impl<'a> Finalization<'a> {
-              pub(super) fn new(
-                  live: &'a Path,
-                  candidate: &'a Path,
-                  indexed_docs: usize,
-                  processed_conversations: usize,
-              ) -> Self {
-                  Self { live, candidate, indexed_docs, processed_conversations }
-              }
-
-              pub(super) fn run<T>(
-                  &self,
-                  phase: &'static str,
-                  operation: impl FnOnce() -> Result<T>,
-              ) -> Result<T> {
-                  let started = Instant::now();
-                  tracing::info!(
-                      phase,
-                      live_index_path = %self.live.display(),
-                      candidate_index_path = %self.candidate.display(),
-                      indexed_docs = self.indexed_docs,
-                      processed_conversations = self.processed_conversations,
-                      "lexical rebuild finalization step started"
-                  );
-                  match operation() {
-                      Ok(value) => {
-                          tracing::info!(
-                              phase,
-                              elapsed_ms = started.elapsed().as_millis() as u64,
-                              "lexical rebuild finalization step completed"
-                          );
-                          Ok(value)
-                      }
-                      Err(error) => {
-                          let cause = format!("{error:#}");
-                          tracing::error!(
-                              phase,
-                              elapsed_ms = started.elapsed().as_millis() as u64,
-                              live_index_path = %self.live.display(),
-                              candidate_index_path = %self.candidate.display(),
-                              indexed_docs = self.indexed_docs,
-                              processed_conversations = self.processed_conversations,
-                              error = %cause,
-                              "lexical rebuild finalization failed"
-                          );
-                          // Some CLI consumers display only the outer error. Keep
-                          // the full cause there AND retain its typed source chain.
-                          // Do not say "not published": a late failure can occur
-                          // after the directory swap changed the live generation.
-                          let diagnostic = format!(
-                              "lexical rebuild finalization failed during {phase} \
-                               (live={}, candidate={}, indexed_docs={}, processed_conversations={}): {cause}",
-                              self.live.display(), self.candidate.display(),
-                              self.indexed_docs, self.processed_conversations,
-                          );
-                          Err(error.context(diagnostic))
-                      }
-                  }
-              }
-          }
-
-          #[cfg(test)]
-          mod tests {
-              use super::*;
-              use std::cell::Cell;
-
-              #[test]
-              fn gh494_finalization_preserves_the_success_value_and_runs_once() {
-                  let calls = Cell::new(0);
-                  let context = Finalization::new(Path::new("live"), Path::new("candidate"), 4, 2);
-                  let value = context.run("commit_candidate", || {
-                      calls.set(calls.get() + 1);
-                      Ok(42)
-                  }).unwrap();
-                  assert_eq!(value, 42);
-                  assert_eq!(calls.get(), 1);
-              }
-
-              #[test]
-              fn gh494_finalization_display_includes_phase_paths_counts_and_original_cause() {
-                  let context = Finalization::new(Path::new("live"), Path::new("candidate"), 4, 2);
-                  let error = context.run::<()>("publish_staged_generation", || {
-                      Err(anyhow::Error::new(std::io::Error::from_raw_os_error(13))
-                          .context("rename of validated candidate refused"))
-                  }).unwrap_err();
-                  let message = error.to_string();
-                  for expected in ["publish_staged_generation", "live=live", "candidate=candidate",
-                                   "indexed_docs=4", "processed_conversations=2", "rename of validated candidate refused"] {
-                      assert!(message.contains(expected), "missing {expected}: {message}");
-                  }
-                  assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().raw_os_error(), Some(13));
-              }
-
-              #[test]
-              fn gh494_late_failure_does_not_claim_the_live_generation_was_unchanged() {
-                  let context = Finalization::new(Path::new("live"), Path::new("candidate"), 4, 2);
-                  let error = context.run::<()>("persist_completed_checkpoint", || {
-                      anyhow::bail!("checkpoint directory is not writable")
-                  }).unwrap_err();
-                  assert!(error.to_string().contains("checkpoint directory is not writable"));
-                  assert!(!error.to_string().contains("not published"));
-                  assert!(!error.to_string().contains("unchanged"));
-              }
-          }
-          ''', encoding='utf-8', newline='\n')
-          Path('src/indexer/gh494_tests.rs').write_text(r'''// Included by indexer::tests; exercises the production rebuild and real
-          // filesystem fault seam, not a model of the state machine.
-
-          #[test]
-          #[serial_test::serial]
-          fn gh494_publish_failure_at_eof_is_finalized_on_retry_instead_of_returning_success() {
-              let tmp = TempDir::new().unwrap();
-              let data_dir = tmp.path().join("data");
-              fs::create_dir_all(&data_dir).unwrap();
-              let db_path = data_dir.join("db.sqlite");
-              let storage = FrankenStorage::open(&db_path).unwrap();
-              ensure_fts_schema(&storage);
-              seed_lexical_rebuild_fixture(&storage);
-              let index_path = index_dir(&data_dir).unwrap();
-              let mut previous = TantivyIndex::open_or_create(&index_path).unwrap();
-              previous.commit().unwrap();
-              drop(previous);
-              verify_published_lexical_doc_count(&index_path, 0, "gh494 prior live").unwrap();
-
-              // Fail AFTER every row was committed/folded, at the actual swap.
-              // Linux rolls the exchange back; the rename-pair seam restores
-              // the prior live tree. Both retain the complete new candidate.
-              #[cfg(target_os = "linux")]
-              let fault = inject_lexical_publish_rename_failure_once(
-                  LexicalPublishRenameSite::LinuxParkPriorLiveToCanonicalSidecar,
-                  ENOSPC_RAW_OS_ERROR,
-              );
-              #[cfg(not(target_os = "linux"))]
-              let fault = inject_lexical_publish_rename_failure_once(
-                  LexicalPublishRenameSite::NonLinuxPublishStagedLive,
-                  ENOSPC_RAW_OS_ERROR,
-              );
-              let error = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None)
-                  .err().expect("refused publication must fail, not report completion");
-              drop(fault);
-              let message = error.to_string();
-              assert!(message.contains("publish_staged_generation"), "{message}");
-              assert!(message.contains("indexed_docs=4"), "{message}");
-              assert!(message.contains("processed_conversations=2"), "{message}");
-              assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().raw_os_error(), Some(ENOSPC_RAW_OS_ERROR));
-
-              let interrupted = load_lexical_rebuild_state(&index_path).unwrap().unwrap();
-              assert!(!interrupted.completed);
-              assert_eq!(interrupted.reported_processed_conversations(), 2);
-              assert_eq!(interrupted.reported_indexed_docs(), 4);
-              verify_published_lexical_doc_count(&index_path, 0, "gh494 preserved prior live").unwrap();
-              let scratch = staged_lexical_rebuild_scratch_path(&index_path);
-              verify_published_lexical_doc_count(&scratch, 4, "gh494 retained candidate").unwrap();
-
-              // Before the fix, reconciliation advanced the cursor to EOF and
-              // returned Ok here without swapping or completing the checkpoint.
-              let resumed = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
-              assert!(resumed.exact_checkpoint_persisted, "EOF still owes publication");
-              assert_eq!(resumed.indexed_docs, 4);
-              assert_eq!(resumed.observed_messages, Some(4));
-              let completed = load_lexical_rebuild_state(&index_path).unwrap().unwrap();
-              assert!(completed.completed);
-              assert!(completed.pending.is_none());
-              verify_published_lexical_doc_count(&index_path, 4, "gh494 published retry").unwrap();
-              assert!(!scratch.exists(), "finished candidate must leave staging");
-              let manifest_path = index_path.join("lexical-generation-manifest.json");
-              let manifest = fs::read(&manifest_path).unwrap();
-              assert!(!manifest.is_empty());
-
-              // Repeated invocations reuse the completed publication rather
-              // than manufacturing another generation from the EOF cursor.
-              let reused = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
-              assert!(!reused.exact_checkpoint_persisted);
-              assert_eq!(reused.indexed_docs, 4);
-              assert_eq!(fs::read(&manifest_path).unwrap(), manifest);
-              assert_eq!(load_lexical_rebuild_state(&index_path).unwrap().unwrap(), completed);
-              verify_published_lexical_doc_count(&index_path, 4, "gh494 reused publication").unwrap();
-          }
-
-          #[test]
-          #[serial_test::serial]
-          fn gh494_zero_conversations_still_publish_a_readable_completed_generation() {
-              let tmp = TempDir::new().unwrap();
-              let data_dir = tmp.path().join("data");
-              fs::create_dir_all(&data_dir).unwrap();
-              let db_path = data_dir.join("db.sqlite");
-              let storage = FrankenStorage::open(&db_path).unwrap();
-              ensure_fts_schema(&storage);
-              let rebuilt = rebuild_tantivy_from_db(&db_path, &data_dir, 0, None).unwrap();
-              assert!(rebuilt.exact_checkpoint_persisted);
-              assert_eq!(rebuilt.indexed_docs, 0);
-              let index_path = index_dir(&data_dir).unwrap();
-              assert!(load_lexical_rebuild_state(&index_path).unwrap().unwrap().completed);
-              verify_published_lexical_doc_count(&index_path, 0, "gh494 empty publication").unwrap();
-              assert!(index_path.join("lexical-generation-manifest.json").is_file());
-          }
-
-          #[test]
-          #[serial_test::serial]
-          fn gh494_completed_marker_cannot_hide_a_live_document_count_mismatch() {
-              let tmp = TempDir::new().unwrap();
-              let data_dir = tmp.path().join("data");
-              fs::create_dir_all(&data_dir).unwrap();
-              let db_path = data_dir.join("db.sqlite");
-              let storage = FrankenStorage::open(&db_path).unwrap();
-              ensure_fts_schema(&storage);
-              seed_lexical_rebuild_fixture(&storage);
-              rebuild_tantivy_from_db(&db_path, &data_dir, 2, None).unwrap();
-              let index_path = index_dir(&data_dir).unwrap();
-              let mut checkpoint = load_lexical_rebuild_state(&index_path).unwrap().unwrap();
-              checkpoint.indexed_docs += 1;
-              persist_lexical_rebuild_state(&index_path, &checkpoint).unwrap();
-              let error = rebuild_tantivy_from_db(&db_path, &data_dir, 2, None)
-                  .err().expect("completed marker cannot certify a mismatched publication");
-              assert!(error.to_string().contains("reuse_completed_generation"), "{error:#}");
-              verify_published_lexical_doc_count(&index_path, 4, "gh494 mismatch kept live").unwrap();
-          }
-          ''', encoding='utf-8', newline='\n')
-          PYCODE
-      - name: Parse the production edit and format only the new files
+          mkdir -p "$RUNNER_TEMP/gh494-results"
+          {
+            git rev-parse HEAD
+            git hash-object src/indexer/mod.rs src/indexer/lexical_publish.rs src/indexer/gh494_tests.rs
+            rustc --version --verbose
+            cargo --version
+          } | tee "$RUNNER_TEMP/gh494-results/source-and-compiler.txt"
+          rustfmt --edition 2024 --check src/indexer/lexical_publish.rs src/indexer/gh494_tests.rs
+      - name: Execute the exact diagnostic helper independently of the monolithic test build
         shell: bash
         run: |
-          rustfmt --edition 2024 --config skip_children=true --emit stdout src/indexer/mod.rs > "$RUNNER_TEMP/gh494-indexer-formatted.rs"
-          rustfmt --edition 2024 src/indexer/lexical_publish.rs src/indexer/gh494_tests.rs
-          git diff --check
-      - name: Execute the exact diagnostic helper before committing
-        shell: bash
-        run: |
-          python3 - <<'PYCODE'
+          python3 - <<'PY'
           import os, pathlib, shutil, tomllib
           root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'gh494-phase-harness'
           (root / 'src').mkdir(parents=True)
@@ -435,60 +76,33 @@ jobs:
           (root / 'src/lib.rs').write_text('mod lexical_publish;\n')
           shutil.copyfile('src/indexer/lexical_publish.rs', root / 'src/lexical_publish.rs')
           print('Exact diagnostic-helper dependency versions:', deps)
-          PYCODE
-          rustc --version --verbose
-          cargo test --manifest-path "$RUNNER_TEMP/gh494-phase-harness/Cargo.toml" gh494_ -- --nocapture
-      - name: Commit only the reviewed source and regressions directly to main
-        id: commit
-        shell: bash
-        env:
-          EXPECTED_MAIN: ${{ github.sha }}
-        run: |
-          git fetch origin main
-          test "$(git rev-parse FETCH_HEAD)" = "$EXPECTED_MAIN"
-          git add src/indexer/mod.rs src/indexer/lexical_publish.rs src/indexer/gh494_tests.rs
-          python3 - <<'PYCODE'
-          import subprocess
-          expected = {'src/indexer/mod.rs', 'src/indexer/lexical_publish.rs', 'src/indexer/gh494_tests.rs'}
-          actual = set(subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines())
-          assert actual == expected, actual
-          PYCODE
-          git diff --cached --check
-          git diff --cached --stat
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'fix(index): finalize EOF checkpoints and report lexical publish failures (#494)' -m 'An EOF cursor is not a publication receipt. Resume incomplete EOF checkpoints through finalization, validate candidates before swapping, preserve typed causes in phase-specific diagnostics, and revalidate completed-generation reuse. Add real publish-refusal/retry, empty-archive and completed-count mismatch regressions. The diagnostic helper tests and Rust syntax parsing run before this commit; full CASS runtime qualification follows in this workflow. No claim that the original first publish refusal has been reproduced.'
-          git push origin HEAD:main
-          echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-  runtime-regressions:
-    needs: apply-reviewed-fix
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    env:
-      CARGO_BUILD_JOBS: '2'
-      CARGO_PROFILE_TEST_DEBUG: '0'
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      RUST_MIN_STACK: '67108864'
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          ref: ${{ needs.apply-reviewed-fix.outputs.source_sha }}
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
-        with:
-          toolchain: nightly-2026-08-31
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
-      - name: Record tested source and execute the GH494 production regressions
+          PY
+          cargo test --manifest-path "$RUNNER_TEMP/gh494-phase-harness/Cargo.toml" gh494_ -- --nocapture 2>&1 | tee "$RUNNER_TEMP/gh494-results/diagnostics.log"
+      - name: Require all three real rebuild regressions to be present
         shell: bash
         run: |
-          git rev-parse HEAD
-          rustc --version --verbose
-          cargo test --locked --lib gh494_ -- --test-threads=1 --nocapture
+          cargo test --locked --lib gh494_ -- --list 2>&1 | tee "$RUNNER_TEMP/gh494-results/test-list.log"
+          for name in \
+            gh494_publish_failure_at_eof_is_finalized_on_retry_instead_of_returning_success \
+            gh494_zero_conversations_still_publish_a_readable_completed_generation \
+            gh494_completed_marker_cannot_hide_a_live_document_count_mismatch
+          do
+            grep -F "$name: test" "$RUNNER_TEMP/gh494-results/test-list.log"
+          done
+      - name: Execute publication refusal, EOF retry, empty archive, and completion validation
+        shell: bash
+        run: |
+          cargo test --locked --lib gh494_ -- --test-threads=1 --nocapture 2>&1 | tee "$RUNNER_TEMP/gh494-results/rebuild-regressions.log"
       - name: Retain hollow-generation and publication rollback coverage
         shell: bash
         run: |
-          cargo test --locked --lib hollow -- --test-threads=1
-          cargo test --locked --lib publish_staged_lexical_index -- --test-threads=1
+          cargo test --locked --lib hollow -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh494-results/hollow.log"
+          cargo test --locked --lib publish_staged_lexical_index -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/gh494-results/publication-rollback.log"
+      - name: Preserve validation receipts, including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: gh494-publication-results-${{ github.sha }}
+          path: ${{ runner.temp }}/gh494-results/
+          if-no-files-found: warn
+          retention-days: 14
