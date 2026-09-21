@@ -55,7 +55,7 @@ fn resolve(request: &Request, expand: bool) -> CliResult<Value> {
             "Use the same --db as search. --message-index never falls back to file lines.",
         ));
     }
-    let storage = FrankenStorage::open_readonly(&request.db).map_err(|err| {
+    let storage = FrankenStorage::open_strict_readonly(&request.db).map_err(|err| {
         error(
             CliErrorKind::IndexedSessionRequired.kind_str(),
             format!("Cannot read canonical archive: {err}"),
@@ -81,7 +81,11 @@ fn resolve(request: &Request, expand: bool) -> CliResult<Value> {
         .raw()
         .query_map_collect(
             &sql,
-            crate::franken_sync::params![path, request.source.clone(), request.conversation_id],
+            crate::franken_sync::params![
+                path.as_str(),
+                request.source.as_deref(),
+                request.conversation_id
+            ],
             |row| {
                 Ok(Row {
                     conversation_id: row.get_typed(0)?,
@@ -156,6 +160,7 @@ fn resolve(request: &Request, expand: bool) -> CliResult<Value> {
             "line": number,
             "message_index": number,
             "coordinate_space": "message_index",
+            "content_source": "archive",
             "message_id": message_id,
             "conversation_id": conversation_id,
             "source_id": source_id,
