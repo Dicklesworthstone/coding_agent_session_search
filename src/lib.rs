@@ -601,7 +601,7 @@ pub enum Commands {
         /// Use approximate nearest neighbor (ANN) search with HNSW for faster semantic/hybrid queries.
         /// Trades slight accuracy loss for O(log n) search complexity instead of O(n).
         /// Only affects semantic and hybrid modes; ignored for lexical search.
-        /// Requires an HNSW index built with `cass index --semantic --approximate`.
+        /// Requires an HNSW index built with `cass index --semantic --build-hnsw`.
         #[arg(long, default_value_t = false)]
         approximate: bool,
 
@@ -6158,7 +6158,12 @@ fn format_friendly_parse_error(err: clap::Error, raw: &[String], normalized: &[S
 
 /// Detect the likely command intent from the raw argument string.
 fn detect_command_intent(raw_str: &str) -> String {
-    if raw_str.contains("search")
+    if matches!(
+        raw_str.split_whitespace().next(),
+        Some("index" | "rebuild" | "reindex")
+    ) {
+        "rebuild or manage the search index".to_string()
+    } else if raw_str.contains("search")
         || raw_str.contains("find")
         || raw_str.contains("query")
         || raw_str.contains("grep")
@@ -6192,7 +6197,14 @@ fn detect_command_intent(raw_str: &str) -> String {
 
 /// Get context-aware examples based on detected intent.
 fn get_contextual_examples(intent: &str) -> Vec<&'static str> {
-    if intent.contains("search") {
+    if intent.contains("index") {
+        vec![
+            "cass index --robot",
+            "cass index --full --robot",
+            "cass index --semantic --build-hnsw --robot",
+            "cass index --robot --data-dir /custom/path",
+        ]
+    } else if intent.contains("search") {
         vec![
             "cass search \"error handling\" --robot --limit 10",
             "cass search \"authentication\" --robot --agent claude",
@@ -6222,12 +6234,6 @@ fn get_contextual_examples(intent: &str) -> Vec<&'static str> {
             "cass stats --robot",
             "cass stats --robot --source local",
             "cass stats --robot --by-source",
-        ]
-    } else if intent.contains("index") {
-        vec![
-            "cass index --robot",
-            "cass index --robot --force",
-            "cass index --robot --data-dir /custom/path",
         ]
     } else if intent.contains("capabilities") {
         vec!["cass capabilities --json", "cass introspect --json"]
@@ -6273,7 +6279,15 @@ fn get_contextual_hints(intent: &str, raw_str: &str) -> Vec<String> {
     }
 
     // Intent-specific hints
-    if intent.contains("search") && !raw_str.contains("search") {
+    if intent.contains("index") {
+        hints.push("For indexing options, run: cass index --help".to_string());
+        if raw_str.split_whitespace().any(|arg| arg == "--approximate") {
+            hints.push(
+                "Build ANN with: cass index --semantic --build-hnsw; use --approximate only when searching"
+                    .to_string(),
+            );
+        }
+    } else if intent.contains("search") && !raw_str.contains("search") {
         hints.push(
             "Use the 'search' subcommand explicitly: cass search \"your query\" --robot"
                 .to_string(),
@@ -6410,6 +6424,57 @@ fn closest_top_level_command(arg: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod canonical_top_level_command_tests {
     use super::*;
+
+    #[test]
+    fn ann_setup_help_names_a_parseable_index_command() {
+        let command = Cli::command();
+        let search = command.find_subcommand("search").expect("search command");
+        let approximate = search
+            .get_arguments()
+            .find(|argument| argument.get_id() == "approximate")
+            .expect("approximate flag");
+        let help = approximate
+            .get_long_help()
+            .or_else(|| approximate.get_help())
+            .expect("ANN setup help")
+            .to_string();
+        let recipe = help.split('`').nth(1).expect("documented setup command");
+        let parsed = Cli::try_parse_from(recipe.split_whitespace()).expect("setup parses");
+        assert!(matches!(
+            parsed.command,
+            Some(Commands::Index {
+                semantic: true,
+                build_hnsw: true,
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from(["cass", "index", "--semantic", "--approximate"]).is_err());
+    }
+
+    #[test]
+    fn ann_index_parse_error_explains_the_index_command() {
+        for format in ["--json", "--robot"] {
+            let args = ["cass", "index", "--semantic", "--approximate", format]
+                .map(str::to_string);
+            let error = Cli::try_parse_from(&args).expect_err("query-only flag rejected");
+            let output = format_friendly_parse_error(error, &args, &args);
+            let payload: serde_json::Value = serde_json::from_str(&output).expect("error JSON");
+            assert_eq!(payload["kind"], "argument_parsing");
+            let examples = payload["examples"].as_array().expect("examples");
+            assert!(!examples.is_empty());
+            for example in examples {
+                let example = example.as_str().expect("example command");
+                assert!(example.starts_with("cass index "), "{example}");
+                assert!(Cli::try_parse_from(example.split_whitespace()).is_ok());
+            }
+            let hints = payload["hints"].as_array().expect("hints");
+            assert!(hints.iter().any(|hint| {
+                hint.as_str()
+                    .is_some_and(|text| text.contains("--semantic --build-hnsw"))
+            }));
+            assert!(!output.contains("Use the 'search' subcommand explicitly"));
+        }
+    }
 
     /// GH #367: `cass forget --source-glob <pat> --robot` was rewritten to
     /// `search forget ...` because the implicit-robot-query recovery consults
