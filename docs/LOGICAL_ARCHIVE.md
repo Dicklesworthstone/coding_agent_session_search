@@ -37,7 +37,7 @@ controls do not impose a wall-clock deadline on database opening or scanning.
 Import requires `--archive-id` to match the input header and `--include-private`
 to acknowledge the private data it writes. `--output` is a **new database file**
 whose parent already exists, not a live archive to overwrite. Existing database
-files, links and SQLite `-wal`, `-shm` or `-journal` sidecars are refused.
+files, links and SQLite `-wal`, `-shm` or `-journal` sidecars are refused by default.
 
 The importer opens one regular, non-symlink input file and validates the header
 before initializing a private candidate. Only this binary's canonical storage
@@ -69,6 +69,31 @@ untouched. This does not install lexical or semantic search assets: those must
 be rebuilt separately. The receipt reports `omitted_rebuild_required` rather than
 claiming that search indexes are already usable. Inspection and restore do not
 start model acquisition, provider scans or detached maintenance.
+
+## Repeating an import safely
+
+Add `--if-identical` to permit an existing destination **only as a read-only
+no-op**. It is not an overwrite, merge, repair or upgrade flag:
+
+```sh
+cass archive import history.jsonl --archive-id workstation-history \
+  --include-private --output /existing/private/directory/restored.db --if-identical
+```
+
+The complete input must validate before the existing database is opened. Under
+the destination lock, comparison uses one read-only canonical snapshot, hashes
+all logical descriptors and typed rows, checks foreign keys and integrity, and
+requires the opened database's descriptor identity to match the destination
+pathname before and after the comparison. No WAL checkpoint, schema migration,
+import metadata or canonical write occurs on this path. Different content is a
+reported conflict, never an upsert. Symlinks and unprovable file identities fail.
+
+Import receipts add `destination_status: "created"` or `"unchanged"`; existing
+export and verify receipt fields are unchanged. An unchanged receipt describes
+the snapshot examined, not a lease excluding ordinary index writers afterward.
+The source archive identity remains an explicit caller assertion matched against
+the input header; the checksum is not external proof of identity or authenticity.
+A missing destination still goes through the full private-candidate restore.
 
 ## Version 1 wire contract
 
@@ -114,8 +139,9 @@ is an integrity checksum, **not** a signature or proof of source authenticity.
 ## Scope and qualification
 
 Current restoration supports a new database with the exact current canonical
-schema. Merge, existing-destination reimport, cross-schema migration and automatic
-search-index rebuild are not implemented by this slice. It does not close bead
+schema, plus opt-in read-only comparison for an identical existing destination.
+Merge, cross-schema migration and automatic search-index rebuild are not
+implemented by these slices. They do not close bead
 `.34`. The ordinary library command parser, root help, completion generation and
 robot capabilities are not yet extended; `cass archive --help` documents the
 binary's explicit archive frontend. Search and existing commands retain their path.
@@ -123,6 +149,11 @@ binary's explicit archive frontend. Search and existing commands retain their pa
 Rust regressions cover typed rows, cross-table relationships, trigger suspension,
 schema disagreement, bounded batches, provenance, truncation and tampering,
 source preservation, existing-output/sidecar protection and symlink refusal.
+Additional tests cover read-only idempotence, conflicts and descriptor identity;
+real-binary tests exercise JSON receipts, privacy acknowledgement, round-trip
+parity, conflict diagnostics and unknown/truncated inputs. The targeted GitHub
+Actions lane records immutable source/lockfile/binary identities and rejects empty
+test-filter success. A workflow definition alone is not an execution receipt.
 Native compilation, these tests, RCH/Clippy/UBS, large-archive bounds and platform
 acceptance must be executed before release qualification. Source tests are not
 passing-test receipts.

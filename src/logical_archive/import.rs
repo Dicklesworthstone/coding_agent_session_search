@@ -58,7 +58,7 @@ impl<R: BufRead> BufRead for Input<R> {
 
 /// Open one pinned regular file. Do not block on a FIFO, follow a link, or reopen
 /// the pathname between header admission and completion verification.
-fn open_input(path: &Path) -> Result<File> {
+pub(super) fn open_input(path: &Path) -> Result<File> {
     let metadata = fs::symlink_metadata(path).context("cannot inspect logical archive input")?;
     ensure!(metadata.is_file() && !metadata.file_type().is_symlink(), "logical archive input must be a regular, non-symlink file");
     let mut options = OpenOptions::new();
@@ -153,7 +153,7 @@ fn suspend_triggers(connection: &Connection) -> Result<Vec<String>> {
     Ok(statements)
 }
 
-fn verify_database(connection: &Connection) -> Result<()> {
+pub(super) fn verify_database(connection: &Connection) -> Result<()> {
     let mut violated = false;
     let check = connection.query_with_params_for_each("PRAGMA foreign_key_check", &[], |_| {
         violated = true;
@@ -242,6 +242,19 @@ pub fn import_file(
     destination: &Path,
     expected_archive_id: &str,
 ) -> Result<(Header, Completion)> {
+    let (header, completion, _) =
+        import_file_with_policy(input, destination, expected_archive_id, false)?;
+    Ok((header, completion))
+}
+
+/// The boolean receipt is true only when this call publishes a NEW database.
+/// With opt-in, an existing target can succeed solely as a read-only comparison.
+pub fn import_file_with_policy(
+    input: &Path,
+    destination: &Path,
+    expected_archive_id: &str,
+    if_identical: bool,
+) -> Result<(Header, Completion, bool)> {
     let mut input = Input::new(BufReader::new(open_input(input)?));
     let Some(Record::Header { header }) = input.record(1)? else {
         bail!("logical archive must begin with a header");
@@ -249,6 +262,11 @@ pub fn import_file(
     header.validate()?;
     ensure!(header.archive_id == expected_archive_id, "logical archive identity does not match --archive-id");
     let _lock = DestinationLock::acquire(destination)?;
+    if if_identical && fs::symlink_metadata(destination).is_ok() {
+        let (header, completion) =
+            super::reimport::verify_existing(&mut input, header, destination)?;
+        return Ok((header, completion, false));
+    }
     require_new_destination(destination)?;
 
     let staging = tempfile::Builder::new().prefix(".cass-restore-")
@@ -288,7 +306,7 @@ pub fn import_file(
     fs::hard_link(&candidate, destination)
         .context("cannot publish restored archive without replacing existing data; destination must support hard links")?;
     export::sync_parent(destination)?;
-    Ok(result)
+    Ok((result.0, result.1, true))
 }
 
 #[cfg(test)]
