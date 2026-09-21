@@ -22,6 +22,7 @@ pub fn capture_source_file(
     store::capture_source_file(input)
 }
 
+#[cfg(test)]
 pub(crate) fn capture_source_file_with_chunk_policy(
     input: RawMirrorCaptureInput<'_>,
     chunk_threshold_bytes: u64,
@@ -64,7 +65,10 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "{stdout}\n{stderr}");
-        assert!(stdout.contains(&format!("test {TARGET} ... ok")), "{stdout}");
+        assert!(
+            stdout.contains(&format!("test {TARGET} ... ok")),
+            "{stdout}"
+        );
         assert!(stdout.contains("test result: ok. 1 passed"), "{stdout}");
     }
 }

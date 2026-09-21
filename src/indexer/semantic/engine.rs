@@ -3301,6 +3301,7 @@ impl SemanticIndexer {
         }
     }
 
+    #[cfg(test)]
     pub fn run_backfill_batch(
         &self,
         messages: &[EmbeddingInput],
@@ -3318,7 +3319,7 @@ impl SemanticIndexer {
         )
     }
 
-    /// Variant of [`run_backfill_batch`] that emits semantic progress
+    /// Run a backfill batch while emitting semantic progress
     /// events to the given JSONL sink and persists `last_message_id`
     /// into the resumable checkpoint when supplied. The sink is silent
     /// unless `CASS_SEMANTIC_PROGRESS_JSONL` is set, so this path is
@@ -3576,6 +3577,7 @@ impl SemanticIndexer {
         })
     }
 
+    #[cfg(test)]
     pub fn run_backfill_from_storage(
         &self,
         storage: &FrankenStorage,
@@ -3592,7 +3594,7 @@ impl SemanticIndexer {
         )
     }
 
-    /// Variant of [`run_backfill_from_storage`] that emits semantic
+    /// Run storage backfill while emitting semantic
     /// progress events to a JSONL sink and persists `last_message_id`
     /// in the resumable checkpoint. The sink is silent unless
     /// `CASS_SEMANTIC_PROGRESS_JSONL` is set.

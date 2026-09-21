@@ -95,7 +95,10 @@ fn superseded_checkpoints_are_reclaimed_only_after_replacement_and_publication()
         2
     );
     let saved = SemanticManifest::load(data)?.unwrap();
-    assert_eq!(saved.checkpoint.unwrap().db_fingerprint, "content-v1:second");
+    assert_eq!(
+        saved.checkpoint.unwrap().db_fingerprint,
+        "content-v1:second"
+    );
 
     let published = indexer.run_backfill_batch(
         &rows(3)[2..],
@@ -209,8 +212,7 @@ fn failed_checkpoint_save_keeps_old_and_new_staging_until_recovery() -> Result<(
         let bytes = fs::read(&old)?;
         let failure = indexer.with_backfill_artifacts(data, &mut manifest, |_, manifest| {
             fs::copy(&old, &new)?;
-            manifest.checkpoint.as_mut().unwrap().db_fingerprint =
-                "content-v1:replacement".into();
+            manifest.checkpoint.as_mut().unwrap().db_fingerprint = "content-v1:replacement".into();
             if renamed {
                 // Simulate visibility of the new manifest before its directory
                 // fsync succeeds. An error must NOT turn this into a GC commit.
@@ -291,13 +293,18 @@ fn malformed_and_future_metadata_fail_closed_before_any_deletion() -> Result<()>
         ("semantic_shards.json", b"broken JSON".to_vec()),
         ("current.json", b"broken JSON".to_vec()),
         ("semantic_manifest.json", {
-            let mut future = SemanticManifest::default();
-            future.manifest_version = u32::MAX;
+            let future = SemanticManifest {
+                manifest_version: u32::MAX,
+                ..SemanticManifest::default()
+            };
             serde_json::to_vec(&future)?
         }),
-        ("semantic_shards.json", serde_json::to_vec(&serde_json::json!({
-            "manifest_version": 999, "shards": [], "updated_at_ms": 0
-        }))?),
+        (
+            "semantic_shards.json",
+            serde_json::to_vec(&serde_json::json!({
+                "manifest_version": 999, "shards": [], "updated_at_ms": 0
+            }))?,
+        ),
     ] {
         let temp = tempfile::tempdir()?;
         let root = temp.path().join(VECTOR_INDEX_DIR);

@@ -72,16 +72,16 @@ impl SemanticAnnShardSet {
                     };
                     (stats, hits.len(), reason)
                 }
-                Err(error) => match error.downcast::<NativeAnnSearchFailure>() {
-                    Ok(failure) => (
+                Err(error) => {
+                    // Preserve caller/provenance errors instead of treating
+                    // them as failed derived graphs that warrant an exact scan.
+                    let failure = error.downcast::<NativeAnnSearchFailure>()?;
+                    (
                         Some(failure.completed_stats),
                         0,
                         AnnExactFallbackReason::NativeSearchFailed,
-                    ),
-                    // Do not turn a caller/provenance error into an expensive
-                    // exact scan, or mistake it for a failed derived graph.
-                    Err(error) => return Err(error),
-                },
+                    )
+                }
             };
         let started = std::time::Instant::now();
         let (exact, exact_retry) =
@@ -991,7 +991,10 @@ mod tests {
             };
             assert_eq!(ids(&hits), vec![2, 1]);
             assert_eq!(signature(&hits), signature(&expected));
-            assert_eq!(retry.has_more_candidates, expected_retry.has_more_candidates);
+            assert_eq!(
+                retry.has_more_candidates,
+                expected_retry.has_more_candidates
+            );
             assert_eq!(
                 retry.exact_window_may_omit_competitor,
                 expected_retry.exact_window_may_omit_competitor
@@ -1000,7 +1003,10 @@ mod tests {
             assert!(!stats.is_approximate);
             assert_eq!(stats.estimated_recall, 0.0);
             assert_eq!(stats.index_size, failed_shard * 41);
-            assert_eq!(stats.k_requested, failed_shard * 2 * ANN_CANDIDATE_MULTIPLIER);
+            assert_eq!(
+                stats.k_requested,
+                failed_shard * 2 * ANN_CANDIDATE_MULTIPLIER
+            );
             let receipt = stats.exact_fallback.as_ref().unwrap();
             assert_eq!(receipt.reason, AnnExactFallbackReason::NativeSearchFailed);
             assert_eq!(receipt.shard_count, 2);
