@@ -284,3 +284,253 @@ fn wal_winners_fill_pages_larger_than_the_persisted_main_slab() {
     assert!(stats.exact_fallback.is_none());
     assert_eq!(files(temp.path()), before);
 }
+
+#[test]
+fn wal_shadowing_is_local_to_its_retained_source_shard() {
+    let temp = tempfile::tempdir().unwrap();
+    let ctx = context(vec![
+        shard(
+            temp.path(),
+            "shadow-a",
+            &[(doc(1, 3), [1.0, 0.0])],
+            &[(doc(1, 3), [0.0, 1.0])],
+        ),
+        shard(
+            temp.path(),
+            "shadow-b",
+            &[(doc(1, 3), [0.8, 0.6]), (doc(2, 3), [0.6, 0.8])],
+            &[],
+        ),
+    ]);
+    let set = SemanticAnnShardSet::open(Arc::clone(&ctx.artifacts)).unwrap();
+    let before = files(temp.path());
+    let (hits, _, stats) = set
+        .search_with_exact_fallback(&ctx, &[1.0, 0.0], 2, None)
+        .unwrap();
+    assert_eq!(
+        hits.iter().map(|hit| hit.message_id).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(
+        hits[0].score.to_bits(),
+        0.8_f32.to_bits(),
+        "a shard-local replacement must not erase another shard's current score"
+    );
+    assert!(stats.unwrap().exact_fallback.is_none());
+    assert_eq!(files(temp.path()), before);
+}
+
+#[test]
+fn wal_chunk_replacement_keeps_unmodified_chunks_of_the_same_message() {
+    let temp = tempfile::tempdir().unwrap();
+    let other_chunk = SemanticDocId {
+        message_id: 1,
+        chunk_idx: 1,
+        agent_id: 1,
+        workspace_id: 2,
+        source_id: 3,
+        role: 1,
+        created_at_ms: 100,
+        content_hash: None,
+    }
+    .to_doc_id_string();
+    let ctx = context(vec![shard(
+        temp.path(),
+        "chunk-replacement",
+        &[
+            (doc(1, 3), [1.0, 0.0]),
+            (other_chunk, [0.8, 0.6]),
+            (doc(2, 3), [0.6, 0.8]),
+        ],
+        &[(doc(1, 3), [0.0, 1.0])],
+    )]);
+    let set = SemanticAnnShardSet::open(Arc::clone(&ctx.artifacts)).unwrap();
+    let before = files(temp.path());
+    let (hits, _, stats) = set
+        .search_with_exact_fallback(&ctx, &[1.0, 0.0], 2, None)
+        .unwrap();
+    assert_eq!(
+        hits.iter().map(|hit| hit.message_id).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(hits[0].chunk_idx, 1);
+    assert_eq!(hits[0].score.to_bits(), 0.8_f32.to_bits());
+    assert!(stats.unwrap().exact_fallback.is_none());
+    assert_eq!(files(temp.path()), before);
+}
+
+#[test]
+fn native_refills_reuse_the_prepared_wal_instead_of_filtering_it_again() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingSourceFilter {
+        wal_checks: AtomicUsize,
+    }
+
+    impl FsSearchFilter for CountingSourceFilter {
+        fn matches(&self, doc_id: &str, _: Option<&serde_json::Value>) -> bool {
+            let parsed = parse_semantic_doc_id(doc_id).unwrap();
+            if parsed.message_id == 9_999 {
+                self.wal_checks.fetch_add(1, Ordering::Relaxed);
+            }
+            parsed.source_id == 3
+        }
+
+        fn name(&self) -> &str {
+            "counting-wal-source-filter"
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut base = (100..140)
+        .map(|id| (doc(id, 4), [1.0, 0.0]))
+        .collect::<Vec<_>>();
+    base.extend([(doc(1, 3), [0.8, 0.6]), (doc(2, 3), [0.6, 0.8])]);
+    let ctx = context(vec![shard(
+        temp.path(),
+        "refill-cache",
+        &base,
+        &[(doc(9_999, 4), [1.0, 0.0])],
+    )]);
+    let set = SemanticAnnShardSet::open(Arc::clone(&ctx.artifacts)).unwrap();
+    let before = files(temp.path());
+    let filter = CountingSourceFilter {
+        wal_checks: AtomicUsize::new(0),
+    };
+    let (hits, _, stats) = set
+        .search_with_exact_fallback(&ctx, &[1.0, 0.0], 2, Some(&filter))
+        .unwrap();
+    assert_eq!(
+        hits.iter().map(|hit| hit.message_id).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    let stats = stats.unwrap();
+    assert!(
+        stats.k_requested > base.len(),
+        "the fixture must execute multiple native candidate windows"
+    );
+    assert!(stats.exact_fallback.is_none());
+    assert_eq!(
+        filter.wal_checks.load(Ordering::Relaxed),
+        1,
+        "refill passes must reuse one prepared delta"
+    );
+    assert_eq!(files(temp.path()), before);
+}
+
+#[test]
+fn oversized_cohort_wal_recovers_exactly_before_any_native_graph_call() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut artifacts = Vec::new();
+    for (ordinal, count) in [(0_u64, 2_048_usize), (1_u64, 2_049_usize)] {
+        let base = (0..4)
+            .map(|offset| (doc(50_000 + ordinal * 10 + offset, 3), [-1.0, 0.0]))
+            .collect::<Vec<_>>();
+        let original = shard(
+            temp.path(),
+            &format!("budget-{ordinal}"),
+            &base,
+            &[],
+        );
+        let path = original.fsvi_path().to_path_buf();
+        let ann = original.ann_path().unwrap().to_path_buf();
+        drop(original);
+        // One durable batch, not thousands of fsyncs. Each shard individually
+        // fits the row limit, but their combined resident delta does not.
+        let updates = (0..count)
+            .map(|offset| {
+                let score = if offset < 4 {
+                    1.0 - offset as f32 / 8.0 - ordinal as f32 / 16.0
+                } else {
+                    0.0
+                };
+                (
+                    doc(1 + ordinal * 10_000 + offset as u64, 3),
+                    vec![score, (1.0 - score * score).sqrt()],
+                )
+            })
+            .collect::<Vec<_>>();
+        {
+            let mut writer = FsVectorIndex::open_writer(&path).unwrap();
+            writer.append_batch(&updates).unwrap();
+        }
+        artifacts.push(SemanticIndexArtifact::open(&path, Some(ann)).unwrap());
+    }
+    let ctx = context(artifacts);
+    assert_eq!(
+        ctx.artifacts
+            .iter()
+            .map(|artifact| artifact.index().wal_record_count())
+            .sum::<usize>(),
+        4_097
+    );
+    let set = SemanticAnnShardSet::open(Arc::clone(&ctx.artifacts)).unwrap();
+    let before = files(temp.path());
+    let (expected, expected_retry) =
+        SearchClient::search_exact_semantic_indexes(&ctx, &[1.0, 0.0], 1, None).unwrap();
+    let (hits, retry, stats) = set
+        .search_with_exact_fallback(&ctx, &[1.0, 0.0], 1, None)
+        .unwrap();
+    assert_eq!(signature(&hits), signature(&expected));
+    assert_eq!(hits[0].message_id, 1);
+    assert_eq!(retry.has_more_candidates, expected_retry.has_more_candidates);
+    let stats = stats.unwrap();
+    assert_eq!(stats.k_requested, 0);
+    assert_eq!(stats.k_returned, 0);
+    assert!(!stats.is_approximate);
+    let receipt = stats.exact_fallback.unwrap();
+    assert_eq!(receipt.reason, AnnExactFallbackReason::WalDeltaRequiresExact);
+    assert_eq!(receipt.shard_count, 2);
+    assert_eq!(receipt.returned_messages, hits.len());
+    assert_eq!(files(temp.path()), before);
+}
+
+#[test]
+fn later_native_failure_discards_earlier_graph_and_delta_winners() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = shard(
+        temp.path(),
+        "failure-a",
+        &[(doc(1, 3), [0.6, 0.8])],
+        &[(doc(10, 3), [0.8, 0.6])],
+    );
+    let second = shard(
+        temp.path(),
+        "failure-b",
+        &[(doc(2, 3), [0.9, 0.4358899])],
+        &[],
+    );
+    let wrong = shard(
+        temp.path(),
+        "wrong-graph",
+        &[(doc(30, 3), [1.0, 0.0]), (doc(31, 3), [0.0, 1.0])],
+        &[],
+    );
+    let first_graph =
+        open_fs_semantic_ann_index(first.index(), first.ann_path().unwrap()).unwrap();
+    let wrong_graph =
+        open_fs_semantic_ann_index(wrong.index(), wrong.ann_path().unwrap()).unwrap();
+    let ctx = context(vec![first, second]);
+    // Exercise a failed private pairing using a real incompatible graph.
+    // Production admission remains all-or-nothing; no backend is mocked.
+    let set = SemanticAnnShardSet {
+        artifacts: Arc::clone(&ctx.artifacts),
+        graphs: vec![first_graph, wrong_graph],
+    };
+    let before = files(temp.path());
+    let (expected, _) =
+        SearchClient::search_exact_semantic_indexes(&ctx, &[1.0, 0.0], 1, None).unwrap();
+    let (hits, _, stats) = set
+        .search_with_exact_fallback(&ctx, &[1.0, 0.0], 1, None)
+        .unwrap();
+    assert_eq!(signature(&hits), signature(&expected));
+    assert_eq!(hits[0].message_id, 2, "the failed later shard must survive recovery");
+    assert!(hits.iter().all(|hit| ![30, 31].contains(&hit.message_id)));
+    let stats = stats.unwrap();
+    assert_eq!(stats.k_requested, 1, "keep only completed native work");
+    assert!(!stats.is_approximate);
+    let receipt = stats.exact_fallback.unwrap();
+    assert_eq!(receipt.reason, AnnExactFallbackReason::NativeSearchFailed);
+    assert_eq!(receipt.shard_count, 2);
+    assert_eq!(files(temp.path()), before);
+}
