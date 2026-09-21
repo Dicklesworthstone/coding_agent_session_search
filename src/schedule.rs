@@ -15,11 +15,11 @@
 //!   the quality (MiniLM) tier when the model is installed — until the
 //!   backlog drains or the scheduler gates (load, console idle) say stop.
 //!
-//! Priority is delegated to the OS: launchd `ProcessType=Background` +
-//! `Nice` + `LowPriorityIO`, systemd `Nice=19` + `IOSchedulingClass=idle` +
-//! `CPUSchedulingPolicy=idle`. Each job step is a child `cass` process, so the
-//! normal `index-run.lock` / exit-7 `index-busy` contract protects against a
-//! human running `cass index` at the same moment.
+//! Priority is delegated to the OS: launchd uses `Nice=15` without
+//! background I/O throttling, while systemd uses `Nice=19` +
+//! `IOSchedulingClass=idle` + `CPUSchedulingPolicy=idle`. Each job step is a
+//! child `cass` process, so the normal `index-run.lock` / exit-7 `index-busy`
+//! contract protects against a human running `cass index` at the same moment.
 //!
 //! Everything the job does is recorded under `<data_dir>/schedule/`:
 //! `state.json` (last run per job), `runs.jsonl` (append-only history), and
@@ -235,14 +235,8 @@ pub fn render_launchd_plist(spec: &ScheduleSpec, job: ScheduleJob) -> String {
 {trigger}\
     <key>RunAtLoad</key>\n\
     <false/>\n\
-    <key>ProcessType</key>\n\
-    <string>Background</string>\n\
     <key>Nice</key>\n\
     <integer>15</integer>\n\
-    <key>LowPriorityIO</key>\n\
-    <true/>\n\
-    <key>LowPriorityBackgroundIO</key>\n\
-    <true/>\n\
     <key>StandardOutPath</key>\n\
     <string>{log}</string>\n\
     <key>StandardErrorPath</key>\n\
@@ -1378,8 +1372,8 @@ mod tests {
         let inc = render_launchd_plist(&s, ScheduleJob::Incremental);
         assert!(inc.contains("<string>com.dicklesworthstone.cass.incremental</string>"));
         assert!(inc.contains("<key>StartInterval</key>\n    <integer>900</integer>"));
-        assert!(inc.contains("<string>Background</string>"));
-        assert!(inc.contains("<key>LowPriorityIO</key>"));
+        assert!(inc.contains("<key>Nice</key>"));
+        assert!(!inc.contains("<key>LowPriorityIO</key>"));
         assert!(inc.contains("/schedule/incremental.log</string>"));
         assert!(!inc.contains("StartCalendarInterval"));
 
@@ -1388,6 +1382,21 @@ mod tests {
         assert!(night.contains("<key>Hour</key>\n        <integer>3</integer>"));
         assert!(night.contains("<key>Minute</key>\n        <integer>30</integer>"));
         assert!(night.contains("<string>nightly</string>"));
+    }
+
+    #[test]
+    fn launchd_jobs_keep_cpu_niceness_without_background_io_throttling() {
+        for job in [ScheduleJob::Incremental, ScheduleJob::Nightly] {
+            let plist = render_launchd_plist(&spec(), job);
+            assert!(plist.contains("<key>Nice</key>\n    <integer>15</integer>"));
+            for key in ["ProcessType", "LowPriorityIO", "LowPriorityBackgroundIO"] {
+                assert!(
+                    !plist.contains(&format!("<key>{key}</key>")),
+                    "{} must not request {key}: {plist}",
+                    job.as_str()
+                );
+            }
+        }
     }
 
     #[test]
