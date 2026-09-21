@@ -74,6 +74,152 @@ fn unknown_unkeyed_tables_are_not_silently_omitted() {
 }
 
 #[test]
+fn fts5_shadow_names_are_exact_not_prefixes() {
+    for suffix in ["config", "content", "data", "docsize", "idx"] {
+        assert!(is_fts5_shadow_table(
+            &format!("fts_messages_{suffix}"),
+            "fts_messages"
+        ));
+    }
+    for name in [
+        "fts_messages",
+        "fts_messages_",
+        "fts_messages_notes",
+        "fts_messages_data_backup",
+        "fts_messages_datax",
+        "other_fts_messages_data",
+        "fts_messages2_data",
+    ] {
+        assert!(!is_fts5_shadow_table(name, "fts_messages"), "omitted {name}");
+    }
+}
+
+#[test]
+fn similarly_named_logical_tables_survive_export_and_affect_the_digest() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let destination = tempfile::tempdir()?;
+    let database = source.path().join("agent_search.db");
+    fixture(&database);
+    let connection = Connection::open(path_text(&database)?)?;
+    connection.execute_batch(
+        "CREATE VIRTUAL TABLE fts_messages USING fts5(body);
+         INSERT INTO fts_messages(rowid, body) VALUES (7, 'derived transcript');
+         CREATE TABLE fts_messages_notes (id INTEGER PRIMARY KEY, note TEXT NOT NULL);
+         INSERT INTO fts_messages_notes VALUES (1, 'authoritative annotation');
+         CREATE TABLE fts_messages_data_backup (id INTEGER PRIMARY KEY, raw BLOB);
+         INSERT INTO fts_messages_data_backup VALUES (2, X'0001FF');",
+    )?;
+    connection.close()?;
+    let before = contents(source.path());
+    let output = destination.path().join("archive.jsonl");
+    let first = export_file(&database, &output, "shadow-scope".to_owned())?;
+    assert_eq!(first, verify_file(&output)?);
+    assert_eq!(first.1.records, 5);
+    assert_eq!(first.1.tables["fts_messages_notes"], 1);
+    assert_eq!(first.1.tables["fts_messages_data_backup"], 1);
+    for name in [
+        "fts_messages",
+        "fts_messages_config",
+        "fts_messages_content",
+        "fts_messages_data",
+        "fts_messages_docsize",
+        "fts_messages_idx",
+    ] {
+        assert!(
+            !first.1.tables.contains_key(name),
+            "exported derived table {name}"
+        );
+    }
+    let mut reader = BufReader::new(File::open(&output)?);
+    let mut saw_note = false;
+    let mut saw_blob = false;
+    let mut table_name = String::new();
+    let mut line = 1;
+    while let Some(record) = codec::read_record(&mut reader, line)? {
+        match record {
+            Record::Table { table } => table_name = table.name,
+            Record::Row { values } if table_name == "fts_messages_notes" => {
+                assert_eq!(
+                    values,
+                    vec![
+                        Cell::Integer(1),
+                        Cell::Text("authoritative annotation".to_owned())
+                    ]
+                );
+                saw_note = true;
+            }
+            Record::Row { values } if table_name == "fts_messages_data_backup" => {
+                assert_eq!(
+                    values,
+                    vec![Cell::Integer(2), Cell::Blob("AAH/".to_owned())]
+                );
+                saw_blob = true;
+            }
+            _ => {}
+        }
+        line += 1;
+    }
+    assert!(
+        saw_note && saw_blob,
+        "real typed rows, not just descriptors, must survive"
+    );
+    assert_eq!(before, contents(source.path()));
+
+    let connection = Connection::open(path_text(&database)?)?;
+    connection.execute("UPDATE fts_messages_notes SET note = 'changed annotation' WHERE id = 1")?;
+    connection.close()?;
+    let changed = destination.path().join("changed.jsonl");
+    let second = export_file(&database, &changed, "shadow-scope".to_owned())?;
+    assert_eq!(second, verify_file(&changed)?);
+    assert_eq!(first.1.tables, second.1.tables);
+    assert_ne!(first.1.content_sha256, second.1.content_sha256);
+    Ok(())
+}
+
+#[test]
+fn shadow_like_names_without_a_virtual_owner_are_exported() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let destination = tempfile::tempdir()?;
+    let database = source.path().join("agent_search.db");
+    fixture(&database);
+    let connection = Connection::open(path_text(&database)?)?;
+    connection.execute_batch(
+        "CREATE TABLE fts_messages_data (id INTEGER PRIMARY KEY, body TEXT);
+         INSERT INTO fts_messages_data VALUES (1, 'not owned by FTS5');",
+    )?;
+    connection.close()?;
+    let output = destination.path().join("archive.jsonl");
+    let receipt = export_file(&database, &output, "no-virtual-owner".to_owned())?;
+    assert_eq!(receipt, verify_file(&output)?);
+    assert_eq!(receipt.1.tables["fts_messages_data"], 1);
+    assert_eq!(receipt.1.records, 4);
+    Ok(())
+}
+
+#[test]
+fn unkeyed_fts_prefix_table_is_refused_not_silently_omitted() -> Result<()> {
+    let source = tempfile::tempdir()?;
+    let destination = tempfile::tempdir()?;
+    let database = source.path().join("agent_search.db");
+    fixture(&database);
+    let connection = Connection::open(path_text(&database)?)?;
+    connection.execute_batch(
+        "CREATE VIRTUAL TABLE fts_messages USING fts5(body);
+         CREATE TABLE fts_messages_notes (body TEXT);
+         INSERT INTO fts_messages_notes VALUES ('do not silently lose me');",
+    )?;
+    connection.close()?;
+    let before = contents(source.path());
+    let output = destination.path().join("archive.jsonl");
+    let error = export_file(&database, &output, "unkeyed-prefix".to_owned())
+        .expect_err("unsupported authoritative data must refuse the whole export");
+    assert!(error.to_string().contains("fts_messages_notes"), "{error:#}");
+    assert!(!output.exists());
+    assert_eq!(before, contents(source.path()));
+    Ok(())
+}
+
+#[test]
 fn canonical_empty_archive_schema_has_an_exportable_snapshot() {
     let source = tempfile::tempdir().unwrap();
     let destination = tempfile::tempdir().unwrap();
