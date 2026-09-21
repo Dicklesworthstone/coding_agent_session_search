@@ -9,6 +9,8 @@ on:
       - src/followup_coordinates.rs
       - src/search/query.rs
       - tests/gh493_message_coordinates.rs
+      - tests/gh493_reported_coordinates.rs
+      - docs/reference/QUICK_REFERENCE.md
       - tests/cli_robot.rs
       - tests/cli_dispatch_coverage.rs
       - tests/spec_view_expand_error_envelopes.rs
@@ -49,7 +51,9 @@ jobs:
         run: git rev-parse HEAD && rustc --version && cargo --version
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
       - name: Check coordinate implementation formatting
-        run: rustfmt --edition 2024 --config skip_children=true --check src/lib.rs src/search/query.rs src/followup_coordinates.rs tests/gh493_message_coordinates.rs tests/cli_robot.rs tests/cli_dispatch_coverage.rs
+        run: rustfmt --edition 2024 --config skip_children=true --check src/lib.rs src/search/query.rs src/followup_coordinates.rs tests/gh493_message_coordinates.rs tests/gh493_reported_coordinates.rs tests/cli_robot.rs tests/cli_dispatch_coverage.rs
+      - name: Run reported divergence and documentation regressions
+        run: cargo test --locked --test gh493_reported_coordinates -- --nocapture
       - name: Run search-to-follow-up regressions
         run: cargo test --locked --test gh493_message_coordinates -- --nocapture
       - name: Check existing dispatch and error envelopes
@@ -60,5 +64,5 @@ jobs:
         run: |
           cargo test --locked --test cli_robot view_
           cargo test --locked --test cli_robot capabilities_matches_golden_contract
-      - name: Lint the regression target and production dependency
-        run: cargo clippy --locked --test gh493_message_coordinates -- -D warnings
+      - name: Lint the regression targets and production dependency
+        run: cargo clippy --locked --test gh493_message_coordinates --test gh493_reported_coordinates -- -D warnings

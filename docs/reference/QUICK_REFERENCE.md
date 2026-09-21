@@ -8,20 +8,26 @@
 # Health + index
 cass health --json || cass index --full
 
-# Search (minimal payload for LLMs)
-cass search "auth error" --robot --limit 5 --fields minimal
+# Search with an exact follow-up anchor (use the same archive for every command)
+cass --db "$ARCHIVE_DB" search "auth error" --robot --limit 5 --fields source_path,source_id,conversation_id,line_number
 
 # Build a cited handoff pack after search narrows the question
 cass pack "auth error root cause" --robot --max-tokens 12000 --limit 40
 
-# Inspect a hit (use source_path + line_number from search output)
-cass view /path/to/session.jsonl -n 42 --json
-cass expand /path/to/session.jsonl -n 42 -C 3 --json
+# Copy all four variables from ONE hit; LINE_NUMBER is one-based, not a file line
+cass --db "$ARCHIVE_DB" view "$SOURCE_PATH" --source "$SOURCE_ID" --conversation-id "$CONVERSATION_ID" --message-index "$LINE_NUMBER" --json
+cass --db "$ARCHIVE_DB" expand "$SOURCE_PATH" --source "$SOURCE_ID" --conversation-id "$CONVERSATION_ID" --message-index "$LINE_NUMBER" -C 3 --json
 
 # Machine-readable help
 cass robot-docs guide
 cass robot-docs schemas
 ```
+
+Search's `line_number` is `messages.idx + 1`. Pass it unchanged to
+`--message-index`; `-n` / `--line` inspect physical file lines and are not
+search-hit selectors. Minimal field presets may omit disambiguating identity
+fields. See [message addressing](message-addressing.md) for raw-file
+compatibility, missing-target errors, and the meaning of `is_target`.
 
 **Key flags**
 - `--robot` / `--json`: machine-readable output (stdout only)
