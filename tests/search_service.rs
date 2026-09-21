@@ -119,3 +119,45 @@ fn cass_serve_searches_repeatedly_through_the_real_cli() -> anyhow::Result<()> {
     assert_eq!(std::fs::read(temp.path().join("agent_search.db"))?, b"must not be opened");
     Ok(())
 }
+
+#[test]
+fn cass_serve_mcp_dispatches_real_negotiation_without_archive_access() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let absent = temp.path().join("never-opened");
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
+        .args(["serve", "--stdio", "--mcp", "--index"])
+        .arg(&absent)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut input = child.stdin.take().unwrap();
+    for request in [
+        serde_json::json!({"jsonrpc": "2.0", "id": "handshake", "method": "initialize",
+            "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                "clientInfo": {"name": "fixture", "version": "1"}}}),
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        serde_json::json!({"jsonrpc": "2.0", "id": "catalog", "method": "tools/list"}),
+        serde_json::json!({"jsonrpc": "2.0", "id": "status", "method": "tools/call",
+            "params": {"name": "cass_status", "arguments": {}}}),
+    ] {
+        writeln!(input, "{request}")?;
+    }
+    drop(input);
+    if child.wait_timeout(Duration::from_secs(20))?.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        anyhow::bail!("MCP service did not terminate after EOF");
+    }
+    let output = child.wait_with_output()?;
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let replies: Vec<serde_json::Value> = std::str::from_utf8(&output.stdout)?.lines()
+        .map(serde_json::from_str).collect::<Result<_, _>>()?;
+    assert_eq!(replies.len(), 3, "notifications get no response");
+    assert_eq!(replies[0]["result"]["protocolVersion"], "2025-11-25");
+    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 3);
+    assert_eq!(replies[2]["id"], "status");
+    assert_eq!(replies[2]["result"]["structuredContent"]["open_attempts"], 0);
+    assert!(!absent.exists());
+    Ok(())
+}

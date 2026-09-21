@@ -7,6 +7,8 @@
 
 #[path = "search_service/protocol.rs"]
 mod protocol;
+#[path = "search_service/mcp.rs"]
+mod mcp;
 #[cfg(test)]
 #[path = "search_service/tests.rs"]
 mod tests;
@@ -56,6 +58,9 @@ enum ServiceCommand {
         /// Use newline-delimited JSON requests and responses on standard I/O.
         #[arg(long, required = true)]
         stdio: bool,
+        /// Speak MCP instead of the CASS JSON-lines protocol on the same stdio transport.
+        #[arg(long, requires = "stdio")]
+        mcp: bool,
     },
 }
 
@@ -78,7 +83,7 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
             };
         }
     };
-    let ServiceCommand::Serve { index, data_dir, stdio: _ } = cli.command;
+    let ServiceCommand::Serve { index, data_dir, stdio: _, mcp } = cli.command;
     let index = match (index, data_dir) {
         (Some(index), None) => index,
         (None, Some(data_dir)) => {
@@ -98,8 +103,14 @@ pub fn run(args: Vec<String>) -> coding_agent_search::CliResult<()> {
         std::env::current_dir().map_err(cli_io_error)?.join(index)
     };
     let mut session = Session::new(index);
-    serve_io(&mut session, &mut io::stdin().lock(), &mut io::stdout().lock())
-        .map_err(cli_io_error)
+    let mut input = io::stdin().lock();
+    let mut output = io::stdout().lock();
+    if mcp {
+        mcp::serve_io(&mut session, &mut input, &mut output)
+    } else {
+        serve_io(&mut session, &mut input, &mut output)
+    }
+    .map_err(cli_io_error)
 }
 
 fn cli_io_error(error: io::Error) -> coding_agent_search::CliError {

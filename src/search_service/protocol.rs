@@ -189,20 +189,23 @@ impl Write for LimitedBuffer {
     }
 }
 
-pub(super) fn write_reply(output: &mut impl Write, reply: &Reply) -> io::Result<()> {
+/// Encode one complete bounded frame before publishing any bytes to the peer.
+pub(super) fn encode_line(value: &impl Serialize) -> io::Result<Vec<u8>> {
     let mut buffer = LimitedBuffer(Vec::new());
-    if serde_json::to_writer(&mut buffer, reply).is_err() {
-        // No partial result has reached stdout. Do not truncate identity fields
-        // or return a syntactically valid but semantically incomplete success.
-        buffer.0.clear();
-        let failure = Reply::failure(
+    serde_json::to_writer(&mut buffer, value).map_err(io::Error::other)?;
+    buffer.0.push(b'\n');
+    Ok(buffer.0)
+}
+
+pub(super) fn write_reply(output: &mut impl Write, reply: &Reply) -> io::Result<()> {
+    let bytes = encode_line(reply).or_else(|_| {
+        // No partial result has reached stdout. Never truncate identity fields.
+        encode_line(&Reply::failure(
             reply.id,
             "response_too_large",
             "response exceeded the 1 MiB encoded limit; request fewer hits",
-        );
-        serde_json::to_writer(&mut buffer, &failure).map_err(io::Error::other)?;
-    }
-    buffer.0.push(b'\n');
-    output.write_all(&buffer.0)?;
+        ))
+    })?;
+    output.write_all(&bytes)?;
     output.flush()
 }

@@ -59,7 +59,8 @@ line number**. Identity fields are never shortened to fit an output budget.
 Send one UTF-8 JSON object per line; each request gets one JSON response line.
 Flush after sending. There are no unsolicited stdout messages. Requests are
 processed sequentially, so backpressure does not create an in-process request
-queue. This is a CASS JSON-lines protocol, **not MCP or JSON-RPC**.
+queue. Without `--mcp`, this is a CASS JSON-lines protocol, not JSON-RPC.
+The MCP adapter described below uses the same reader and bounds.
 
 Every request requires an unsigned 64-bit `id`. Four operations are supported:
 
@@ -179,3 +180,59 @@ publication isolation, explicit/failed reload, no archive writes, frame bounds,
 invalid-request recovery, pagination uncertainty, and actual binary dispatch.
 Run `cargo test --locked --test search_service -- --test-threads=1` through the repository's normal
 validation environment. Test definitions alone are not execution evidence.
+
+## MCP integration
+
+An MCP host can launch the same read-only worker directly:
+
+```json
+{
+  "mcpServers": {
+    "cass": {
+      "command": "/absolute/path/to/cass",
+      "args": ["serve", "--stdio", "--mcp", "--data-dir", "/path/to/cass-data"]
+    }
+  }
+}
+```
+
+The adapter implements the initialization-based MCP revisions **2025-11-25**
+and **2025-06-18**. Send `initialize`, then `notifications/initialized`, before
+calling `tools/list` or `tools/call`. Unsupported handshake versions are
+counter-offered 2025-11-25. The newer stateless 2026-07-28 protocol is not
+advertised: `server/discover` returns Method Not Found, allowing dual-era MCP
+clients to fall back to the supported handshake. A modern-only client cannot
+use this adapter. Protocol behavior follows the versioned MCP lifecycle and
+stdio specifications, not an assumption that every version uses initialization.
+
+The stable catalog exposes `cass_search`, `cass_status`, and `cass_reload`.
+`cass_search` arguments are the JSON-lines search fields **without** `op` or
+`id`; the other tools accept an empty object. The JSON-RPC ID is preserved
+exactly, including string and signed-integer IDs. There is no arbitrary file
+reader, SQL tool, shell command, indexing tool, or semantic-mode substitution.
+Tool results include both `structuredContent` and its JSON representation in
+a text content block. Retrieval and budget failures are visible to the model
+as `isError: true`; invalid RPC methods/envelopes remain protocol errors.
+
+Initialization, discovery, and status do not load an index. Search and reload
+share the exact same session handler as the CASS protocol; reader reuse,
+release-before-reload, source coordinates, and unchecked-freshness metadata
+are unchanged. All callers using one worker share its reader. An explicit
+`cass_reload` affects that worker's subsequent queries, not another worker.
+At most 120 valid tool invocations are admitted per minute per process; excess
+calls get a nonblocking `rate_limited` tool error instead of a queued operation.
+
+Notifications receive no response and cannot run a tool without a request ID.
+There is no MCP shutdown RPC: close stdin, then terminate the process if its
+external deadline expires. Requests are serial, so cancellation notifications
+received after native work completes are ignored. This adapter does **not**
+provide in-flight native cancellation, a global memory governor, HTTP, or
+authentication over a network. Configure the host to approve access to the
+selected history archive and treat returned session text as untrusted data.
+
+MCP lifecycle, malformed-frame, ID, quota, real-reader/reload, and binary
+handshake regressions run in the same `search_service` integration target.
+Specifications: https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle
+and https://modelcontextprotocol.io/specification/2025-11-25/server/tools.
+The era-fallback contract is documented at
+https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning.
