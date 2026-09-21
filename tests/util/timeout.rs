@@ -269,7 +269,11 @@ where
     })
 }
 
-fn join_pipe_reader(reader: JoinHandle<PipeCapture>, label: &str, stream_name: &str) -> PipeCapture {
+fn join_pipe_reader(
+    reader: JoinHandle<PipeCapture>,
+    label: &str,
+    stream_name: &str,
+) -> PipeCapture {
     match reader.join() {
         Ok(capture) => capture,
         Err(_) => {
@@ -508,7 +512,8 @@ mod tests {
         let mut cmd = Command::new("/bin/sh");
         cmd.args(["-c", "sleep 30 & printf ready; exit 0"]);
         let started = Instant::now();
-        let output = spawn_with_timeout_or_diag(cmd, "orphaned_pipes", None, Duration::from_secs(2));
+        let output =
+            spawn_with_timeout_or_diag(cmd, "orphaned_pipes", None, Duration::from_secs(2));
         assert!(output.status.success());
         assert_eq!(output.stdout, b"ready");
         assert!(
