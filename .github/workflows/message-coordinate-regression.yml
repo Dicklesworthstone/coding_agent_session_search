@@ -16,6 +16,7 @@ on:
       - tests/gh493_windowed_followup.rs
       - docs/reference/QUICK_REFERENCE.md
       - tests/cli_robot.rs
+      - tests/cli_view_budget.rs
       - tests/cli_dispatch_coverage.rs
       - tests/spec_view_expand_error_envelopes.rs
       - tests/golden/robot/capabilities.json.golden
@@ -55,7 +56,7 @@ jobs:
         run: git rev-parse HEAD && rustc --version && cargo --version
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
       - name: Run reconciliation, reported divergence and canonical window regressions
-        run: cargo test --locked --no-fail-fast --test lexical_reconcile_canary --test gh493_message_coordinates --test gh493_reported_coordinates --test gh493_windowed_followup -- --nocapture
+        run: cargo test --locked --no-fail-fast --test lexical_reconcile_canary --test gh493_message_coordinates --test gh493_reported_coordinates --test gh493_windowed_followup --test cli_view_budget -- --nocapture
       - name: Check existing dispatch and error envelopes
         run: |
           cargo test --locked --test cli_dispatch_coverage parse_expand_with_context
