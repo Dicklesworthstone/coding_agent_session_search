@@ -1,0 +1,74 @@
+name: Semantic artifact recovery
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'build.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'src/indexer/semantic.rs'
+      - 'src/indexer/semantic/**'
+      - 'src/search/semantic_manifest.rs'
+      - 'src/search/semantic_manifest/**'
+      - 'src/bin/cass-semantic-reclaim.rs'
+      - 'tests/semantic_artifact_reclaim_cli.rs'
+      - 'scripts/check_dependency_features.py'
+      - 'scripts/tests/test_dependency_features.py'
+      - '.github/workflows/semantic-artifact-recovery.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: semantic-artifact-recovery-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  recovery:
+    name: Locked CASS artifact lifecycle and recovery CLI
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: 134217728
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Check the feature contract before dependency compilation
+        run: |
+          python3 -m unittest discover -s scripts/tests -p test_dependency_features.py -v
+          python3 scripts/check_dependency_features.py
+      - name: Record the exact tested source and toolchain
+        run: |
+          git rev-parse HEAD
+          git hash-object build.rs Cargo.toml Cargo.lock src/indexer/semantic.rs
+          rustc --version
+          cargo --version
+      - name: Run real lifecycle, approval and separate-process CLI regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_suite() {
+            local name="$1"
+            shift
+            cargo test --locked "$@" -- --nocapture 2>&1 | tee "$RUNNER_TEMP/$name.log"
+            python3 - "$RUNNER_TEMP/$name.log" <<'PY'
+          import re, sys
+          from pathlib import Path
+          counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', Path(sys.argv[1]).read_text())
+          if not counts or not any(int(count) > 0 for count in counts):
+              raise SystemExit('Expected recovery tests did not run; zero tests is not success')
+          PY
+          }
+          run_suite lifecycle --lib indexer::semantic::artifact_lifecycle_tests
+          run_suite approval --lib indexer::semantic::artifacts::inspection::tests
+          run_suite command --bin cass-semantic-reclaim
+          run_suite cli --test semantic_artifact_reclaim_cli

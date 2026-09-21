@@ -154,15 +154,19 @@ const CONTRACTS: &[DependencyContract] = &[
         expected_git: "",
         expected_rev: "",
         expected_version: "0.3.0",
+        // Match the always-on SQLite transcript readers in Cargo.toml. Their
+        // features are required even for --no-default-features CASS builds.
         expected_features: &[
             "chatgpt",
             "connectors",
+            "copilot-vscdb",
             "crush",
             "cursor",
             "devin",
             "goose",
             "grok-bot",
             "hermes",
+            "openclaw-sqlite",
             "opencode",
             "shelley",
         ],
