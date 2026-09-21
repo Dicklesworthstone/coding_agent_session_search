@@ -1,0 +1,48 @@
+name: Lexical publication regression
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/lexical-publication-regression.yml'
+      - 'tests/cli_lexical_publication.rs'
+      - 'scripts/repair_lexical_publication.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: lexical-publication-regression-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  source-evidence:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Capture immutable source for publication regression diagnosis
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/lexical-publication-evidence"
+          git rev-parse HEAD | tee "$RUNNER_TEMP/lexical-publication-evidence/source.txt"
+          git archive --format=tar HEAD src tests Cargo.toml Cargo.lock rust-toolchain.toml AGENTS.md .cargo .github/workflows/ci.yml | gzip > "$RUNNER_TEMP/lexical-publication-evidence/source.tar.gz"
+          python3 - <<'PY'
+          from pathlib import Path
+          lines = Path('src/indexer/mod.rs').read_text().splitlines()
+          for index, line in enumerate(lines):
+              if ('folded the rebuilt lexical generation' in line or
+                  'fn publish_staged_lexical_index(' in line or
+                  'fn verify_published_lexical_doc_count(' in line or
+                  'fn rebuild_lexical_index_from_storage_with_pre_publish_hook(' in line):
+                  print(f'\n--- src/indexer/mod.rs:{index + 1} ---')
+                  for offset in range(max(0, index - 12), min(len(lines), index + 110)):
+                      print(f'{offset + 1}: {lines[offset]}')
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: lexical-publication-source-${{ github.sha }}
+          path: ${{ runner.temp }}/lexical-publication-evidence/
+          if-no-files-found: error
+          retention-days: 3
