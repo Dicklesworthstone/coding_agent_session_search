@@ -90,5 +90,10 @@ jobs:
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
       - name: Record exact source and compiler identity
         run: git rev-parse HEAD && rustc --version && cargo --version
+      - name: Run immutable semantic admission regressions
+        run: cargo test --locked --lib search::semantic_manifest::selection::tests -- --nocapture
+      - name: Run retained semantic reader and publication regressions
+        run: |
+          cargo test --locked --lib search::semantic_reader:: -- --nocapture
       - name: Run retrieval query unit regressions
         run: cargo test --locked --lib search::query::tests -- --nocapture

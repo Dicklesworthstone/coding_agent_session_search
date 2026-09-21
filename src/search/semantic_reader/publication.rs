@@ -33,7 +33,7 @@ use super::{
     SemanticReaderResult, SemanticSearchBatch, canonical_document,
 };
 use crate::search::semantic_manifest::selection::{
-    SemanticSelectionMetadata, ValidatedSemanticVectors,
+    SelectedSemanticVectors, SemanticSelectionMetadata,
 };
 use crate::search::semantic_manifest::{
     SemanticArtifactRole, SemanticCorpusSnapshotIdentity, SemanticCurrentPointerV1,
@@ -179,7 +179,7 @@ impl SelectedSemanticGeneration {
         };
         let metadata = SemanticSelectionMetadata::read(&data_dir, Some(expected_corpus))?;
         budget.check(&metadata.manifest)?;
-        let selected = metadata.validate_vectors(&data_dir)?;
+        let selected = metadata.preflight_vectors(&data_dir)?;
 
         let fast = admit_tier(&selected, SemanticArtifactRole::FastVector)?;
         let quality = admit_tier(&selected, SemanticArtifactRole::QualityVector)?;
@@ -217,6 +217,10 @@ impl SelectedSemanticGeneration {
             generation,
             ann: Arc::new(super::ann::AnnSelection::default()),
         };
+        // Authenticate each serving owner exactly once, then close the handoff
+        // against the originally opened file identities before exposing a reader.
+        // Metadata-only selection is never itself a content-validation receipt.
+        selected.verify_paths()?;
         after_admission();
         // All serving bytes are now owned and witness-checked. Revalidate the
         // pointer and manifest through the SAME metadata parser, not every
@@ -457,7 +461,7 @@ impl SelectedSemanticBatch {
 }
 
 fn admit_tier(
-    selected: &ValidatedSemanticVectors,
+    selected: &SelectedSemanticVectors,
     role: SemanticArtifactRole,
 ) -> SemanticSelectionResult<Option<AdmittedTier>> {
     let artifacts: Vec<_> = selected.manifest.artifacts_for(role).collect();
