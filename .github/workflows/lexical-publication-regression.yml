@@ -4,8 +4,6 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/lexical-publication-regression.yml'
-      - 'tests/cli_lexical_publication.rs'
-      - 'scripts/repair_lexical_publication.py'
   workflow_dispatch:
 permissions:
   contents: read
@@ -13,36 +11,99 @@ concurrency:
   group: lexical-publication-regression-${{ github.ref }}
   cancel-in-progress: false
 jobs:
-  source-evidence:
+  prepare-reviewed-repair:
+    if: github.repository == 'Dicklesworthstone/coding_agent_session_search'
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Capture immutable source for publication regression diagnosis
+      - name: Apply exact reviewed patch without moving any branch
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/lexical-publication-evidence"
-          git rev-parse HEAD | tee "$RUNNER_TEMP/lexical-publication-evidence/source.txt"
-          git archive --format=tar HEAD src tests Cargo.toml Cargo.lock rust-toolchain.toml AGENTS.md .cargo .github/workflows/ci.yml | gzip > "$RUNNER_TEMP/lexical-publication-evidence/source.tar.gz"
+          test "$(git hash-object src/indexer/mod.rs)" = 9ef4d50ed35791e9eb99d59335009f831d86b3c9
+          test "$(git hash-object tests/e2e_index_resume.rs)" = e0a5d686a7cd64804b44c5a08c243de8264c1fa8
+          gh api repos/Dicklesworthstone/coding_agent_session_search/git/blobs/84274f1039debdeb3da06e702e16c4fad91da7d3 --jq .content | base64 --decode | gzip --decompress > "$RUNNER_TEMP/lexical-publication-evidence/reviewed.patch"
+          echo "465e559ffa803ffd19de476a42d2adc4529352b7e6cb0f5beeef5310a4ce8411  $RUNNER_TEMP/lexical-publication-evidence/reviewed.patch" | sha256sum --check
+          git apply --check "$RUNNER_TEMP/lexical-publication-evidence/reviewed.patch"
+          git apply "$RUNNER_TEMP/lexical-publication-evidence/reviewed.patch"
+          git diff --check
+      - name: Parse and format only reviewed changed ranges
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustfmt --version
           python3 - <<'PY'
+          import json, os, re, subprocess
           from pathlib import Path
-          lines = Path('src/indexer/mod.rs').read_text().splitlines()
-          for index, line in enumerate(lines):
-              if ('folded the rebuilt lexical generation' in line or
-                  'fn publish_staged_lexical_index(' in line or
-                  'fn verify_published_lexical_doc_count(' in line or
-                  'fn rebuild_lexical_index_from_storage_with_pre_publish_hook(' in line):
-                  print(f'\n--- src/indexer/mod.rs:{index + 1} ---')
-                  for offset in range(max(0, index - 12), min(len(lines), index + 110)):
-                      print(f'{offset + 1}: {lines[offset]}')
+          paths = ['src/indexer/mod.rs', 'tests/e2e_index_resume.rs']
+          diff = subprocess.check_output(['git', 'diff', '--unified=0', '--', *paths], text=True)
+          ranges, path = [], None
+          for line in diff.splitlines():
+              if line.startswith('+++ b/'):
+                  path = line[6:]
+              match = re.match(r'^@@ .* \+(\d+)(?:,(\d+))? @@', line)
+              if match:
+                  start, count = int(match[1]), int(match[2] or '1')
+                  if count:
+                      ranges.append({'file': path, 'range': [start, start + count - 1]})
+          assert ranges and {item['file'] for item in ranges} == set(paths)
+          subprocess.run(['rustfmt', '--edition', '2024', '--config', 'skip_children=true', '--file-lines', json.dumps(ranges), *paths], check=True)
+          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          assert set(changed) == set(paths), changed
+          stats = subprocess.check_output(['git', 'diff', '--numstat'], text=True)
+          assert sum(int(n) for line in stats.splitlines() for n in line.split('\t')[:2]) < 1600, stats
+          print(stats)
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'lexical-publication-evidence'
+          (evidence / 'formatted.patch').write_bytes(subprocess.check_output(['git', 'diff', '--binary', '--', *paths]))
+          PY
+      - name: Store immutable replacement blobs for an explicit GitHub commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, json, os, subprocess, urllib.request
+          from pathlib import Path
+          paths = ['src/indexer/mod.rs', 'tests/e2e_index_resume.rs']
+          receipt = {
+              'base_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+              'base_tree': subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip(),
+              'files': [],
+          }
+          for path in paths:
+              expected = subprocess.check_output(['git', 'hash-object', path], text=True).strip()
+              body = json.dumps({'content': base64.b64encode(Path(path).read_bytes()).decode(), 'encoding': 'base64'}).encode()
+              request = urllib.request.Request(
+                  'https://api.github.com/repos/Dicklesworthstone/coding_agent_session_search/git/blobs',
+                  data=body, method='POST', headers={
+                      'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                      'Accept': 'application/vnd.github+json',
+                      'X-GitHub-Api-Version': '2022-11-28',
+                      'Content-Type': 'application/json',
+                  })
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  result = json.load(response)
+              assert result['sha'] == expected, result
+              receipt['files'].append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': expected})
+          text = json.dumps(receipt, indent=2)
+          print(text)
+          (Path(os.environ['RUNNER_TEMP']) / 'lexical-publication-evidence' / 'receipt.json').write_text(text + '\n')
           PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
         with:
-          name: lexical-publication-source-${{ github.sha }}
+          name: lexical-publication-reviewed-${{ github.sha }}
           path: ${{ runner.temp }}/lexical-publication-evidence/
           if-no-files-found: error
           retention-days: 3
