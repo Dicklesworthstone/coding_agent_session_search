@@ -7,11 +7,13 @@ on:
       - .github/workflows/message-coordinate-regression.yml
       - src/lib.rs
       - src/followup_coordinates.rs
+      - src/followup_coordinates/**
       - src/search/query.rs
       - src/indexer/lexical_reconcile/canary.rs
       - tests/lexical_reconcile_canary.rs
       - tests/gh493_message_coordinates.rs
       - tests/gh493_reported_coordinates.rs
+      - tests/gh493_windowed_followup.rs
       - docs/reference/QUICK_REFERENCE.md
       - tests/cli_robot.rs
       - tests/cli_dispatch_coverage.rs
@@ -33,7 +35,7 @@ concurrency:
 jobs:
   verify:
     if: github.repository == 'Dicklesworthstone/coding_agent_session_search'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     env:
       CARGO_BUILD_JOBS: '2'
@@ -52,14 +54,8 @@ jobs:
       - name: Record exact source and compiler identity
         run: git rev-parse HEAD && rustc --version && cargo --version
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
-      - name: Check coordinate implementation formatting
-        run: rustfmt --edition 2024 --config skip_children=true --check src/lib.rs src/search/query.rs src/followup_coordinates.rs tests/gh493_message_coordinates.rs tests/gh493_reported_coordinates.rs tests/cli_robot.rs tests/cli_dispatch_coverage.rs
-      - name: Run exact reconciliation checks after upserts and tombstones
-        run: cargo test --locked --test lexical_reconcile_canary -- --nocapture
-      - name: Run reported divergence and documentation regressions
-        run: cargo test --locked --test gh493_reported_coordinates -- --nocapture
-      - name: Run search-to-follow-up regressions
-        run: cargo test --locked --test gh493_message_coordinates -- --nocapture
+      - name: Run reconciliation, reported divergence and canonical window regressions
+        run: cargo test --locked --no-fail-fast --test lexical_reconcile_canary --test gh493_message_coordinates --test gh493_reported_coordinates --test gh493_windowed_followup -- --nocapture
       - name: Check existing dispatch and error envelopes
         run: |
           cargo test --locked --test cli_dispatch_coverage parse_expand_with_context
@@ -69,4 +65,8 @@ jobs:
           cargo test --locked --test cli_robot view_
           cargo test --locked --test cli_robot capabilities_matches_golden_contract
       - name: Lint the regression targets and production dependency
-        run: cargo clippy --locked --test gh493_message_coordinates --test gh493_reported_coordinates --test lexical_reconcile_canary -- -D warnings
+        run: cargo clippy --locked --test gh493_message_coordinates --test gh493_reported_coordinates --test gh493_windowed_followup --test lexical_reconcile_canary -- -D warnings
+      # Formatting remains blocking, but cannot hide runtime regression results.
+      - name: Check coordinate implementation formatting
+        if: ${{ !cancelled() }}
+        run: rustfmt --edition 2024 --config skip_children=true --check src/lib.rs src/search/query.rs src/followup_coordinates.rs src/followup_coordinates/window.rs tests/gh493_message_coordinates.rs tests/gh493_reported_coordinates.rs tests/gh493_windowed_followup.rs tests/cli_robot.rs tests/cli_dispatch_coverage.rs
