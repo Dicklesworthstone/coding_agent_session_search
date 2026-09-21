@@ -1,0 +1,69 @@
+name: Retrieval core regressions
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/retrieval-core-regression.yml
+      - src/search/**
+      - tests/retrieval_core_*.rs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cass-retrieval-core-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Record source identity and outstanding retrieval obligations
+        run: |
+          git rev-parse HEAD
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          issues = [json.loads(line) for line in Path('.beads/issues.jsonl').read_text().splitlines() if line.strip()]
+          active = [issue for issue in issues if issue.get('status') not in ('closed', 'tombstone')]
+          active.sort(key=lambda issue: (issue.get('priority', 4), issue['id']))
+          print(f'Active beads: {len(active)} / {len(issues)}')
+          for issue in active:
+              print(json.dumps({key: issue.get(key) for key in ('id', 'title', 'status', 'priority', 'assignee', 'dependencies')}, ensure_ascii=False))
+          PY
+      - name: Package exact tracked source for reproduction
+        run: git archive --format=tar.gz --output=retrieval-source.tar.gz HEAD
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: retrieval-source-${{ github.sha }}
+          path: retrieval-source.tar.gz
+          retention-days: 3
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '134217728'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
+      - name: Record exact source and compiler identity
+        run: git rev-parse HEAD && rustc --version && cargo --version
+      - name: Run retrieval query unit regressions
+        run: cargo test --locked --lib search::query::tests -- --nocapture
