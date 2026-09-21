@@ -1,17 +1,17 @@
 async function runDecryptTiming(page, password) {
   const timings = await page.evaluate((pwd) => {
     return new Promise((resolve, reject) => {
-      const progressEl = document.querySelector('#auth-progress .progress-text');
-      const input = document.getElementById('password');
-      const unlock = document.getElementById('unlock-btn');
+      const progressEl = document.querySelector("#auth-progress .progress-text");
+      const input = document.getElementById("password");
+      const unlock = document.getElementById("unlock-btn");
 
       if (!input || !unlock) {
-        reject(new Error('Auth elements not found'));
+        reject(new Error("Auth elements not found"));
         return;
       }
 
       const marks = {
-        start: performance.now()
+        start: performance.now(),
       };
 
       const record = (key) => {
@@ -22,21 +22,21 @@ async function runDecryptTiming(page, password) {
 
       const observer = progressEl
         ? new MutationObserver(() => {
-            const text = progressEl.textContent || '';
-            if (text.includes('Deriving key')) {
-              record('argon_start');
+            const text = progressEl.textContent || "";
+            if (text.includes("Deriving key")) {
+              record("argon_start");
             }
-            if (text.includes('Unwrapping key')) {
-              record('unwrap_start');
+            if (text.includes("Unwrapping key")) {
+              record("unwrap_start");
             }
-            if (text.startsWith('Decrypting')) {
-              record('decrypt_start');
+            if (text.startsWith("Decrypting")) {
+              record("decrypt_start");
             }
-            if (text.includes('Decompressing')) {
-              record('decompress_start');
+            if (text.includes("Decompressing")) {
+              record("decompress_start");
             }
-            if (text.includes('Loading database')) {
-              record('db_load_start');
+            if (text.includes("Loading database")) {
+              record("db_load_start");
             }
           })
         : null;
@@ -46,15 +46,15 @@ async function runDecryptTiming(page, password) {
       }
 
       window.addEventListener(
-        'cass:db-ready',
+        "cass:db-ready",
         () => {
-          record('db_ready');
+          record("db_ready");
           if (observer) {
             observer.disconnect();
           }
           resolve(marks);
         },
-        { once: true }
+        { once: true },
       );
 
       input.value = pwd;
@@ -65,7 +65,7 @@ async function runDecryptTiming(page, password) {
   const total = timings.db_ready !== undefined ? timings.db_ready - timings.start : null;
   return {
     timings,
-    total_ms: total
+    total_ms: total,
   };
 }
 

@@ -9,9 +9,7 @@
           "role": "user"
         },
         "content": {
-          "parts": [
-            "Use conversation_id as the stable external id."
-          ]
+          "parts": ["Use conversation_id as the stable external id."]
         },
         "create_time": 1701000000.25
       }
@@ -23,10 +21,7 @@
           "role": "assistant"
         },
         "content": {
-          "parts": [
-            "Confirmed.",
-            "The connector should prefer conversation_id when id is absent."
-          ]
+          "parts": ["Confirmed.", "The connector should prefer conversation_id when id is absent."]
         },
         "create_time": 1701000001.75,
         "metadata": {

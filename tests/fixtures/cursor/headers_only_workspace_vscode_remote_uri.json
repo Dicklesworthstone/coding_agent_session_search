@@ -4,9 +4,7 @@
     "name": "Cursor Remote URI Fixture",
     "createdAt": 1700000200000,
     "lastUpdatedAt": 1700000201000,
-    "fullConversationHeadersOnly": [
-      { "bubbleId": "bubble-remote-uri" }
-    ]
+    "fullConversationHeadersOnly": [{ "bubbleId": "bubble-remote-uri" }]
   },
   "bubble_rows": [
     {

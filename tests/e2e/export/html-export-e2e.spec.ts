@@ -13,54 +13,56 @@
  *   npx playwright test e2e/export/html-export-e2e.spec.ts
  */
 
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "fs";
+import path from "path";
 import {
-  test,
+  collectBrowserErrors,
+  countMessages,
   expect,
   gotoFile,
+  test,
   waitForPageReady,
-  countMessages,
-  collectBrowserErrors,
-} from '../setup/test-utils';
-import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
-import path from 'path';
+} from "../setup/test-utils";
 
 // Test artifact directory
-const ARTIFACT_DIR = path.join(process.cwd(), 'test-results', 'e2e', 'html-export');
+const ARTIFACT_DIR = path.join(process.cwd(), "test-results", "e2e", "html-export");
 
 test.beforeAll(async () => {
   mkdirSync(ARTIFACT_DIR, { recursive: true });
 });
 
-test.describe('HTML Export - Plain Mode', () => {
-  test('renders basic export with all messages visible', async ({ page, exportPath }, testInfo) => {
+test.describe("HTML Export - Plain Mode", () => {
+  test("renders basic export with all messages visible", async ({ page, exportPath }, testInfo) => {
     const browserErrors = collectBrowserErrors(page);
-    await test.step('Verify export file exists', async () => {
+    await test.step("Verify export file exists", async () => {
       expect(existsSync(exportPath), `Export file should exist at ${exportPath}`).toBe(true);
     });
 
-    await test.step('Navigate to export file', async () => {
+    await test.step("Navigate to export file", async () => {
       await gotoFile(page, exportPath);
       await waitForPageReady(page);
     });
 
-    await test.step('Verify page structure', async () => {
+    await test.step("Verify page structure", async () => {
       // Should have a main content area
-      await expect(page.locator('main, #conversation, .conversation')).toBeVisible();
+      await expect(page.locator("main, #conversation, .conversation")).toBeVisible();
 
       // Should have at least one message
       const messageCount = await countMessages(page);
       expect(messageCount).toBeGreaterThan(0);
 
       // Log message count for debugging
-      console.log(JSON.stringify({
-        event: 'html_export_render',
-        test: testInfo.title,
-        messages: messageCount,
-        ts: new Date().toISOString(),
-      }));
+      console.log(
+        JSON.stringify({
+          event: "html_export_render",
+          test: testInfo.title,
+          messages: messageCount,
+          ts: new Date().toISOString(),
+        }),
+      );
     });
 
-    await test.step('Verify no JavaScript errors', async () => {
+    await test.step("Verify no JavaScript errors", async () => {
       // Wait for any deferred scripts
       await page.waitForTimeout(500);
 
@@ -69,25 +71,28 @@ test.describe('HTML Export - Plain Mode', () => {
     });
 
     // Capture output HTML as artifact
-    await test.step('Capture output HTML artifact', async () => {
+    await test.step("Capture output HTML artifact", async () => {
       const html = await page.content();
-      const artifactPath = path.join(ARTIFACT_DIR, `${testInfo.title.replace(/\s+/g, '-')}-output.html`);
+      const artifactPath = path.join(
+        ARTIFACT_DIR,
+        `${testInfo.title.replace(/\s+/g, "-")}-output.html`,
+      );
       writeFileSync(artifactPath, html);
 
-      await testInfo.attach('output-html', {
+      await testInfo.attach("output-html", {
         path: artifactPath,
-        contentType: 'text/html',
+        contentType: "text/html",
       });
     });
   });
 
-  test('renders messages with correct role styling', async ({ page, exportPath }, testInfo) => {
-    test.skip(!exportPath, 'Export path not configured');
+  test("renders messages with correct role styling", async ({ page, exportPath }, testInfo) => {
+    test.skip(!exportPath, "Export path not configured");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
-    await test.step('Verify user messages have correct styling', async () => {
+    await test.step("Verify user messages have correct styling", async () => {
       const userMessages = page.locator('.message[data-role="user"], .message.user, .user-message');
       const count = await userMessages.count();
 
@@ -97,8 +102,10 @@ test.describe('HTML Export - Plain Mode', () => {
       }
     });
 
-    await test.step('Verify assistant messages have correct styling', async () => {
-      const assistantMessages = page.locator('.message[data-role="assistant"], .message.assistant, .assistant-message');
+    await test.step("Verify assistant messages have correct styling", async () => {
+      const assistantMessages = page.locator(
+        '.message[data-role="assistant"], .message.assistant, .assistant-message',
+      );
       const count = await assistantMessages.count();
 
       if (count > 0) {
@@ -107,15 +114,20 @@ test.describe('HTML Export - Plain Mode', () => {
     });
   });
 
-  test('code blocks render with syntax highlighting', async ({ page, toolCallsExportPath }, testInfo) => {
-    test.skip(!toolCallsExportPath, 'Tool calls export path not configured');
+  test("code blocks render with syntax highlighting", async ({
+    page,
+    toolCallsExportPath,
+  }, testInfo) => {
+    test.skip(!toolCallsExportPath, "Tool calls export path not configured");
     const browserErrors = collectBrowserErrors(page);
 
     await gotoFile(page, toolCallsExportPath);
     await waitForPageReady(page);
 
-    await test.step('Verify code blocks exist', async () => {
-      const codeBlocks = page.locator('pre code, .hljs, .code-block, .language-javascript, .language-python, .language-rust');
+    await test.step("Verify code blocks exist", async () => {
+      const codeBlocks = page.locator(
+        "pre code, .hljs, .code-block, .language-javascript, .language-python, .language-rust",
+      );
       const count = await codeBlocks.count();
 
       if (count > 0) {
@@ -128,46 +140,50 @@ test.describe('HTML Export - Plain Mode', () => {
     });
   });
 
-  test('theme toggle works correctly', async ({ page, exportPath }, testInfo) => {
-    test.skip(!exportPath, 'Export path not configured');
+  test("theme toggle works correctly", async ({ page, exportPath }, testInfo) => {
+    test.skip(!exportPath, "Export path not configured");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
-    const themeToggle = page.locator('[data-testid="theme-toggle"], .theme-toggle, #theme-toggle, button:has-text("theme")');
+    const themeToggle = page.locator(
+      '[data-testid="theme-toggle"], .theme-toggle, #theme-toggle, button:has-text("theme")',
+    );
 
-    test.skip(await themeToggle.count() === 0, 'No theme toggle found');
+    test.skip((await themeToggle.count()) === 0, "No theme toggle found");
 
-    await test.step('Toggle theme', async () => {
-      const initialTheme = await page.locator('html').getAttribute('data-theme');
+    await test.step("Toggle theme", async () => {
+      const initialTheme = await page.locator("html").getAttribute("data-theme");
       await themeToggle.click();
       await page.waitForTimeout(100);
 
-      const newTheme = await page.locator('html').getAttribute('data-theme');
+      const newTheme = await page.locator("html").getAttribute("data-theme");
       expect(newTheme).not.toBe(initialTheme);
     });
   });
 
-  test('export handles large conversations', async ({ page, largeExportPath }, testInfo) => {
-    test.skip(!largeExportPath, 'Large export path not configured');
+  test("export handles large conversations", async ({ page, largeExportPath }, testInfo) => {
+    test.skip(!largeExportPath, "Large export path not configured");
     const browserErrors = collectBrowserErrors(page);
 
-    await test.step('Navigate to large export', async () => {
+    await test.step("Navigate to large export", async () => {
       await gotoFile(page, largeExportPath);
       await waitForPageReady(page);
     });
 
-    await test.step('Verify performance with large content', async () => {
+    await test.step("Verify performance with large content", async () => {
       const start = Date.now();
       const messageCount = await countMessages(page);
       const loadTime = Date.now() - start;
 
-      console.log(JSON.stringify({
-        event: 'large_export_metrics',
-        messages: messageCount,
-        countTimeMs: loadTime,
-        ts: new Date().toISOString(),
-      }));
+      console.log(
+        JSON.stringify({
+          event: "large_export_metrics",
+          messages: messageCount,
+          countTimeMs: loadTime,
+          ts: new Date().toISOString(),
+        }),
+      );
 
       expect(messageCount).toBeGreaterThan(0);
       // Count operation should be reasonably fast
@@ -178,12 +194,12 @@ test.describe('HTML Export - Plain Mode', () => {
     });
   });
 
-  test('export handles unicode content', async ({ page, unicodeExportPath }, testInfo) => {
-    test.skip(!unicodeExportPath, 'Unicode export path not configured');
+  test("export handles unicode content", async ({ page, unicodeExportPath }, testInfo) => {
+    test.skip(!unicodeExportPath, "Unicode export path not configured");
 
     const browserErrors = collectBrowserErrors(page);
     const dialogs: string[] = [];
-    page.on('dialog', (dialog) => {
+    page.on("dialog", (dialog) => {
       dialogs.push(dialog.message());
       dialog.dismiss().catch((error) => {
         browserErrors.pageErrors.push(`dialog dismissal failed: ${String(error)}`);
@@ -193,12 +209,12 @@ test.describe('HTML Export - Plain Mode', () => {
     await gotoFile(page, unicodeExportPath);
     await waitForPageReady(page);
 
-    await test.step('Verify unicode renders correctly', async () => {
+    await test.step("Verify unicode renders correctly", async () => {
       // Should not have any replacement characters
-      const content = await page.locator('body').textContent();
-      expect(content).not.toContain('\uFFFD');
-      expect(content).toContain('<script>');
-      expect(content).toContain('XSS');
+      const content = await page.locator("body").textContent();
+      expect(content).not.toContain("\uFFFD");
+      expect(content).toContain("<script>");
+      expect(content).toContain("XSS");
       await page.waitForTimeout(500);
       expect(dialogs).toEqual([]);
       expect(browserErrors.pageErrors).toEqual([]);
@@ -207,36 +223,43 @@ test.describe('HTML Export - Plain Mode', () => {
   });
 });
 
-test.describe('HTML Export - Encrypted Mode', () => {
-  test('shows password modal for encrypted export', async ({ page, encryptedExportPath }, testInfo) => {
-    test.skip(!encryptedExportPath, 'Encrypted export path not configured');
+test.describe("HTML Export - Encrypted Mode", () => {
+  test("shows password modal for encrypted export", async ({
+    page,
+    encryptedExportPath,
+  }, testInfo) => {
+    test.skip(!encryptedExportPath, "Encrypted export path not configured");
 
-    await test.step('Navigate to encrypted export', async () => {
+    await test.step("Navigate to encrypted export", async () => {
       await gotoFile(page, encryptedExportPath);
       await waitForPageReady(page);
     });
 
-    await test.step('Verify password modal is visible', async () => {
+    await test.step("Verify password modal is visible", async () => {
       const modal = page.locator('#password-modal, .password-modal, [role="dialog"]');
       await expect(modal).toBeVisible();
     });
 
-    await test.step('Verify password input exists', async () => {
+    await test.step("Verify password input exists", async () => {
       const passwordInput = page.locator('input[type="password"], #password-input');
       await expect(passwordInput).toBeVisible();
     });
   });
 
-  test('decrypts content with correct password', async ({ page, encryptedExportPath, password }, testInfo) => {
-    test.skip(!encryptedExportPath, 'Encrypted export path not configured');
+  test("decrypts content with correct password", async ({
+    page,
+    encryptedExportPath,
+    password,
+  }, testInfo) => {
+    test.skip(!encryptedExportPath, "Encrypted export path not configured");
     const browserErrors = collectBrowserErrors(page);
 
-    await test.step('Navigate to encrypted export', async () => {
+    await test.step("Navigate to encrypted export", async () => {
       await gotoFile(page, encryptedExportPath);
       await waitForPageReady(page);
     });
 
-    await test.step('Enter password and decrypt', async () => {
+    await test.step("Enter password and decrypt", async () => {
       const passwordInput = page.locator('input[type="password"], #password-input');
       await passwordInput.fill(password);
 
@@ -244,54 +267,57 @@ test.describe('HTML Export - Encrypted Mode', () => {
       await submitButton.click();
     });
 
-    await test.step('Verify content is decrypted', async () => {
+    await test.step("Verify content is decrypted", async () => {
       // Modal should be hidden after successful decryption
       const modal = page.locator('#password-modal, .password-modal, [role="dialog"]');
       await expect(modal).toBeHidden({ timeout: 10000 });
 
       // Content should be visible
-      const content = page.locator('.message, .conversation, main');
+      const content = page.locator(".message, .conversation, main");
       await expect(content.first()).toBeVisible();
       expect(browserErrors.pageErrors).toEqual([]);
       expect(browserErrors.consoleErrors).toEqual([]);
     });
 
     // Capture decrypted content as artifact
-    await test.step('Capture decrypted output', async () => {
+    await test.step("Capture decrypted output", async () => {
       const html = await page.content();
-      const artifactPath = path.join(ARTIFACT_DIR, `${testInfo.title.replace(/\s+/g, '-')}-decrypted.html`);
+      const artifactPath = path.join(
+        ARTIFACT_DIR,
+        `${testInfo.title.replace(/\s+/g, "-")}-decrypted.html`,
+      );
       mkdirSync(path.dirname(artifactPath), { recursive: true });
       writeFileSync(artifactPath, html);
 
-      await testInfo.attach('decrypted-output', {
+      await testInfo.attach("decrypted-output", {
         path: artifactPath,
-        contentType: 'text/html',
+        contentType: "text/html",
       });
     });
   });
 
-  test('shows error on wrong password', async ({ page, encryptedExportPath }, testInfo) => {
-    test.skip(!encryptedExportPath, 'Encrypted export path not configured');
+  test("shows error on wrong password", async ({ page, encryptedExportPath }, testInfo) => {
+    test.skip(!encryptedExportPath, "Encrypted export path not configured");
 
     await gotoFile(page, encryptedExportPath);
     await waitForPageReady(page);
 
-    await test.step('Enter wrong password', async () => {
+    await test.step("Enter wrong password", async () => {
       const passwordInput = page.locator('input[type="password"], #password-input');
-      await passwordInput.fill('wrong-password-definitely-wrong');
+      await passwordInput.fill("wrong-password-definitely-wrong");
 
       const submitButton = page.locator('button[type="submit"], .decrypt-button, #decrypt-button');
       await submitButton.click();
     });
 
-    await test.step('Verify error is shown', async () => {
+    await test.step("Verify error is shown", async () => {
       const errorMessage = page.locator('.error, .decrypt-error, #decrypt-error, [role="alert"]');
       await expect(errorMessage).toBeVisible({ timeout: 5000 });
     });
   });
 
-  test('WebCrypto API is available', async ({ page, encryptedExportPath }, testInfo) => {
-    test.skip(!encryptedExportPath, 'Encrypted export path not configured');
+  test("WebCrypto API is available", async ({ page, encryptedExportPath }, testInfo) => {
+    test.skip(!encryptedExportPath, "Encrypted export path not configured");
 
     await gotoFile(page, encryptedExportPath);
 
@@ -303,23 +329,23 @@ test.describe('HTML Export - Encrypted Mode', () => {
   });
 });
 
-test.describe('HTML Export - CDN Fallback', () => {
-  test('works without CDN resources', async ({ page, noCdnExportPath }, testInfo) => {
-    test.skip(!noCdnExportPath, 'No-CDN export path not configured');
+test.describe("HTML Export - CDN Fallback", () => {
+  test("works without CDN resources", async ({ page, noCdnExportPath }, testInfo) => {
+    test.skip(!noCdnExportPath, "No-CDN export path not configured");
 
-    await test.step('Navigate to no-CDN export', async () => {
+    await test.step("Navigate to no-CDN export", async () => {
       await gotoFile(page, noCdnExportPath);
       await waitForPageReady(page);
     });
 
-    await test.step('Verify content renders', async () => {
+    await test.step("Verify content renders", async () => {
       const messageCount = await countMessages(page);
       expect(messageCount).toBeGreaterThanOrEqual(0);
     });
 
-    await test.step('Check for failed resource loads', async () => {
+    await test.step("Check for failed resource loads", async () => {
       const failedRequests: string[] = [];
-      page.on('requestfailed', (request) => {
+      page.on("requestfailed", (request) => {
         failedRequests.push(request.url());
       });
 
@@ -327,29 +353,31 @@ test.describe('HTML Export - CDN Fallback', () => {
 
       // Log any failed requests for debugging
       if (failedRequests.length > 0) {
-        console.log(JSON.stringify({
-          event: 'failed_requests',
-          requests: failedRequests,
-          ts: new Date().toISOString(),
-        }));
+        console.log(
+          JSON.stringify({
+            event: "failed_requests",
+            requests: failedRequests,
+            ts: new Date().toISOString(),
+          }),
+        );
       }
     });
   });
 });
 
-test.describe('HTML Export - Accessibility', () => {
-  test('has proper heading structure', async ({ page, exportPath }, testInfo) => {
-    test.skip(!exportPath, 'Export path not configured');
+test.describe("HTML Export - Accessibility", () => {
+  test("has proper heading structure", async ({ page, exportPath }, testInfo) => {
+    test.skip(!exportPath, "Export path not configured");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
-    await test.step('Verify heading hierarchy', async () => {
-      const h1Count = await page.locator('h1').count();
+    await test.step("Verify heading hierarchy", async () => {
+      const h1Count = await page.locator("h1").count();
       expect(h1Count).toBeGreaterThanOrEqual(0);
 
       // Should not skip heading levels (h1 -> h3 without h2)
-      const headings = await page.locator('h1, h2, h3, h4, h5, h6').all();
+      const headings = await page.locator("h1, h2, h3, h4, h5, h6").all();
       let lastLevel = 0;
 
       for (const heading of headings) {
@@ -364,8 +392,8 @@ test.describe('HTML Export - Accessibility', () => {
     });
   });
 
-  test('messages have proper ARIA attributes', async ({ page, exportPath }, testInfo) => {
-    test.skip(!exportPath, 'Export path not configured');
+  test("messages have proper ARIA attributes", async ({ page, exportPath }, testInfo) => {
+    test.skip(!exportPath, "Export path not configured");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
@@ -376,16 +404,18 @@ test.describe('HTML Export - Accessibility', () => {
     if (count > 0) {
       // At least some messages should have accessibility attributes
       const firstMessage = messages.first();
-      const role = await firstMessage.getAttribute('role');
-      const ariaLabel = await firstMessage.getAttribute('aria-label');
+      const role = await firstMessage.getAttribute("role");
+      const ariaLabel = await firstMessage.getAttribute("aria-label");
 
       // Log for debugging
-      console.log(JSON.stringify({
-        event: 'accessibility_check',
-        role,
-        hasAriaLabel: !!ariaLabel,
-        ts: new Date().toISOString(),
-      }));
+      console.log(
+        JSON.stringify({
+          event: "accessibility_check",
+          role,
+          hasAriaLabel: !!ariaLabel,
+          ts: new Date().toISOString(),
+        }),
+      );
     }
   });
 });

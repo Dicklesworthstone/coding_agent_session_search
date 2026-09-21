@@ -2,7 +2,7 @@
 //!
 //! Search's `line_number` is `messages.idx + 1`, not a physical file line.
 //! Keep this lane independent of raw-file rendering, connector filtering, and
-//! vector positions. One SELECT observes conversation identity and messages
+//! vector positions. One read transaction observes identity and messages
 //! together; it never reparses or mutates the source file or archive.
 
 use crate::franken_sync::compat::{ConnectionExt, RowExt};
@@ -21,14 +21,7 @@ struct Request {
     context: usize,
 }
 
-struct Row {
-    conversation_id: i64,
-    source_id: String,
-    message_id: Option<i64>,
-    idx: Option<i64>,
-    role: Option<String>,
-    content: Option<String>,
-}
+mod window;
 
 fn error(kind: &'static str, message: impl Into<String>, hint: &str) -> CliError {
     CliError {
@@ -38,6 +31,14 @@ fn error(kind: &'static str, message: impl Into<String>, hint: &str) -> CliError
         hint: Some(hint.to_string()),
         retryable: false,
     }
+}
+
+fn lookup_error(err: impl std::fmt::Display) -> CliError {
+    error(
+        CliErrorKind::IndexedSessionRequired.kind_str(),
+        format!("Canonical message lookup failed: {err}"),
+        "Check the archive used by search; no raw-file fallback was attempted.",
+    )
 }
 
 fn resolve(request: &Request, expand: bool) -> CliResult<Value> {
@@ -55,29 +56,31 @@ fn resolve(request: &Request, expand: bool) -> CliResult<Value> {
             "Use the same --db as search. --message-index never falls back to file lines.",
         ));
     }
-    let storage = FrankenStorage::open_strict_readonly(&request.db).map_err(|err| {
-        error(
-            CliErrorKind::IndexedSessionRequired.kind_str(),
-            format!("Cannot read canonical archive: {err}"),
-            "Check the --db used by search; no raw-file fallback was attempted.",
-        )
-    })?;
+    let storage = FrankenStorage::open_strict_readonly(&request.db).map_err(lookup_error)?;
+    // Pin identity selection, index validation and content hydration to one
+    // read transaction. Never choose against one snapshot and render another.
+    storage.raw().execute("BEGIN DEFERRED").map_err(lookup_error)?;
+    let result = resolve_snapshot(request, expand, &storage);
+    let released = storage.raw().execute("ROLLBACK").map_err(lookup_error);
+    match result {
+        Err(err) => Err(err),
+        Ok(payload) => released.map(|_| payload),
+    }
+}
+
+fn resolve_snapshot(request: &Request, expand: bool, storage: &FrankenStorage) -> CliResult<Value> {
     let source_sql = crate::normalized_source_identity_sql_expr("c.source_id", "c.origin_host");
-    // LIMIT 2 is deliberate: an ambiguous path must never select an arbitrary
-    // conversation (including when several sessions share a provider DB).
-    // The LEFT JOIN preserves empty conversations so they cannot hide ambiguity.
+    // Resolve ambiguity before reading ANY message content. Empty conversations
+    // still participate, including multiple sessions stored in one provider DB.
     let sql = format!(
-        "SELECT c.id, {source_sql}, m.id, m.idx, m.role, m.content
-         FROM (SELECT c.id, c.source_id, c.origin_host FROM conversations c
-               WHERE c.source_path = ?1
-                 AND (?2 IS NULL OR {source_sql} = ?2)
-                 AND (?3 IS NULL OR c.id = ?3)
-               ORDER BY c.id LIMIT 2) c
-         LEFT JOIN messages m ON m.conversation_id = c.id
-         ORDER BY c.id, m.idx"
+        "SELECT c.id, {source_sql} FROM conversations c
+         WHERE c.source_path = ?1
+           AND (?2 IS NULL OR {source_sql} = ?2)
+           AND (?3 IS NULL OR c.id = ?3)
+         ORDER BY c.id LIMIT 2"
     );
     let path = request.path.to_string_lossy().into_owned();
-    let rows = storage
+    let conversations = storage
         .raw()
         .query_map_collect(
             &sql,
@@ -86,69 +89,98 @@ fn resolve(request: &Request, expand: bool) -> CliResult<Value> {
                 request.source.as_deref(),
                 request.conversation_id
             ],
-            |row| {
-                Ok(Row {
-                    conversation_id: row.get_typed(0)?,
-                    source_id: row.get_typed(1)?,
-                    message_id: row.get_typed(2)?,
-                    idx: row.get_typed(3)?,
-                    role: row.get_typed(4)?,
-                    content: row.get_typed(5)?,
-                })
-            },
+            |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<String>(1)?)),
         )
-        .map_err(|err| {
-            error(
-                CliErrorKind::IndexedSessionRequired.kind_str(),
-                format!("Canonical message lookup failed: {err}"),
-                "Check the archive used by search; no raw-file fallback was attempted.",
-            )
-        })?;
-    let first = rows.first().ok_or_else(|| {
+        .map_err(lookup_error)?;
+    let (conversation_id, source_id) = conversations.first().ok_or_else(|| {
         error(
             CliErrorKind::IndexedSessionRequired.kind_str(),
             "No archived conversation matches the requested path, source, and conversation id",
             "Copy source_path, source_id, and conversation_id from the same search hit.",
         )
     })?;
-    if rows
-        .iter()
-        .any(|row| row.conversation_id != first.conversation_id)
-    {
+    if conversations.len() != 1 {
         return Err(error(
             CliErrorKind::AmbiguousSource.kind_str(),
             "Multiple archived conversations match this path",
             "Pass both --source and --conversation-id from the search hit.",
         ));
     }
-    let conversation_id = first.conversation_id;
-    let source_id = first.source_id.clone();
-    let mut messages = Vec::new();
-    let mut previous = None;
-    for row in rows {
-        let Some(message_id) = row.message_id else {
-            continue;
-        };
-        let number = row
-            .idx
-            .and_then(|idx| usize::try_from(idx).ok())
-            .and_then(|idx| idx.checked_add(1))
-            .ok_or_else(|| {
-                error(
-                    CliErrorKind::InvalidLine.kind_str(),
-                    "Archive contains an invalid message index",
-                    "Inspect the canonical archive; no target has been selected.",
-                )
-            })?;
-        if previous.is_some_and(|previous| number <= previous) {
-            return Err(error(
-                CliErrorKind::InvalidLine.kind_str(),
-                "Archive contains duplicate or unordered message indices",
-                "Inspect the canonical archive; no target has been selected.",
+    let conversation_id = *conversation_id;
+    let mut selection = window::Selection::new(request.message_index, request.context);
+    let mut invalid_index = None;
+    // The (conversation_id, idx) index can stream this ordered metadata pass.
+    // Context is measured in actual messages, NOT arithmetic on sparse idxs.
+    // Keep only O(context) anchors, but validate/count the whole conversation.
+    let scanned = storage.raw().query_with_params_for_each(
+        "SELECT id, idx FROM messages WHERE conversation_id = ?1 ORDER BY idx",
+        &[crate::franken_sync::SqliteValue::Integer(conversation_id)],
+        |row| {
+            let id = row.get_typed::<i64>(0)?;
+            let idx = row.get_typed::<i64>(1)?;
+            selection.observe(id, idx).map_err(|reason| {
+                invalid_index = Some(reason);
+                crate::franken_sync::FrankenError::Internal(reason.to_string())
+            })
+        },
+    );
+    if let Some(reason) = invalid_index {
+        return Err(error(
+            CliErrorKind::InvalidLine.kind_str(),
+            reason,
+            "Inspect the canonical archive; no target has been selected.",
+        ));
+    }
+    scanned.map_err(lookup_error)?;
+    if !selection.found {
+        return Err(error(
+            CliErrorKind::LineNotFound.kind_str(),
+            format!(
+                "No archived message at message index {}",
+                request.message_index
+            ),
+            "Re-run search for a current anchor. Neighbouring messages are never substituted.",
+        ));
+    }
+    let first = selection
+        .anchors
+        .front()
+        .ok_or_else(|| lookup_error("empty message window"))?;
+    let last = selection
+        .anchors
+        .back()
+        .ok_or_else(|| lookup_error("empty message window"))?;
+    // Hydrate only the exact selected range. Even -C 0 previously decoded and
+    // retained every tool result in the transcript before discarding it.
+    let rows = storage
+        .raw()
+        .query_map_collect(
+            "SELECT id, idx, role, content FROM messages
+             WHERE conversation_id = ?1 AND idx >= ?2 AND idx <= ?3 ORDER BY idx",
+            crate::franken_sync::params![conversation_id, first.idx, last.idx],
+            |row| {
+                Ok((
+                    row.get_typed::<i64>(0)?,
+                    row.get_typed::<i64>(1)?,
+                    row.get_typed::<Option<String>>(2)?,
+                    row.get_typed::<Option<String>>(3)?,
+                ))
+            },
+        )
+        .map_err(lookup_error)?;
+    if rows.len() != selection.anchors.len() {
+        return Err(lookup_error(
+            "message window changed during snapshot hydration",
+        ));
+    }
+    let mut lines = Vec::new();
+    for ((id, idx, role, content), anchor) in rows.into_iter().zip(&selection.anchors) {
+        if id != anchor.id || idx != anchor.idx {
+            return Err(lookup_error(
+                "message identity changed during snapshot hydration",
             ));
         }
-        previous = Some(number);
-        let role = row.role.unwrap_or_else(|| "unknown".to_string());
+        let role = role.unwrap_or_else(|| "unknown".to_string());
         let role = match role.to_ascii_lowercase().as_str() {
             "agent" | "assistant" => "assistant".to_string(),
             "user" => "user".to_string(),
@@ -156,40 +188,20 @@ fn resolve(request: &Request, expand: bool) -> CliResult<Value> {
             "system" => "system".to_string(),
             _ => role,
         };
-        messages.push(json!({
-            "line": number,
-            "message_index": number,
+        lines.push(json!({
+            "line": anchor.number,
+            "message_index": anchor.number,
             "coordinate_space": "message_index",
             "content_source": "archive",
-            "message_id": message_id,
+            "message_id": id,
             "conversation_id": conversation_id,
             "source_id": source_id,
             "role": role,
-            "content": row.content.unwrap_or_default(),
-            "is_target": number == request.message_index,
-            "highlighted": number == request.message_index,
+            "content": content.unwrap_or_default(),
+            "is_target": anchor.number == request.message_index,
+            "highlighted": anchor.number == request.message_index,
         }));
     }
-    let target = messages
-        .iter()
-        .position(|message| message["is_target"] == true)
-        .ok_or_else(|| {
-            error(
-                CliErrorKind::LineNotFound.kind_str(),
-                format!(
-                    "No archived message at message index {}",
-                    request.message_index
-                ),
-                "Re-run search for a current anchor. Neighbouring messages are never substituted.",
-            )
-        })?;
-    let start = target.saturating_sub(request.context);
-    let end = target
-        .saturating_add(request.context)
-        .saturating_add(1)
-        .min(messages.len());
-    let total = messages.len();
-    let lines: Vec<_> = messages.drain(start..end).collect();
     if expand {
         return Ok(Value::Array(lines));
     }
@@ -204,8 +216,8 @@ fn resolve(request: &Request, expand: bool) -> CliResult<Value> {
         "target_message_index": request.message_index,
         "context": request.context,
         "lines": lines,
-        "total_lines": total,
-        "total_messages": total,
+        "total_lines": selection.total,
+        "total_messages": selection.total,
         "source_exists": source_exists,
         "archive_only": !source_exists,
     }))

@@ -9,15 +9,14 @@
  * and validates client-side WebCrypto decryption behavior with rich logging.
  */
 
-import { test, expect } from '@playwright/test';
-import crypto from 'crypto';
-import http from 'http';
-import { TextEncoder } from 'util';
+import { expect, test } from "@playwright/test";
+import crypto from "crypto";
+import http from "http";
+import { TextEncoder } from "util";
 
-const TEST_PASSWORD = 'correct-horse-battery-staple';
-const WRONG_PASSWORD = 'totally-wrong-password';
-const PLAINTEXT_HTML =
-  '<div class="message-content">Hello from encrypted export ✅</div>';
+const TEST_PASSWORD = "correct-horse-battery-staple";
+const WRONG_PASSWORD = "totally-wrong-password";
+const PLAINTEXT_HTML = '<div class="message-content">Hello from encrypted export ✅</div>';
 const ITERATIONS = 1000; // Lower for test speed; payload carries this value.
 
 let server;
@@ -28,53 +27,48 @@ function logEvent(event) {
 }
 
 function escapeHtml(value) {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 function toBase64(bytes) {
-  return Buffer.from(bytes).toString('base64');
+  return Buffer.from(bytes).toString("base64");
 }
 
 async function encryptPayload() {
   const encoder = new TextEncoder();
-  const salt = Uint8Array.from([
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-  ]);
+  const salt = Uint8Array.from([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
   const iv = Uint8Array.from([15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4]);
 
   const webcrypto = crypto.webcrypto;
   if (!webcrypto?.subtle) {
-    throw new Error('WebCrypto subtle API not available in Node');
+    throw new Error("WebCrypto subtle API not available in Node");
   }
 
   const keyMaterial = await webcrypto.subtle.importKey(
-    'raw',
+    "raw",
     encoder.encode(TEST_PASSWORD),
-    'PBKDF2',
+    "PBKDF2",
     false,
-    ['deriveKey']
+    ["deriveKey"],
   );
 
   const key = await webcrypto.subtle.deriveKey(
     {
-      name: 'PBKDF2',
+      name: "PBKDF2",
       salt,
       iterations: ITERATIONS,
-      hash: 'SHA-256',
+      hash: "SHA-256",
     },
     keyMaterial,
-    { name: 'AES-GCM', length: 256 },
+    { name: "AES-GCM", length: 256 },
     false,
-    ['encrypt']
+    ["encrypt"],
   );
 
   const ciphertext = await webcrypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
+    { name: "AES-GCM", iv },
     key,
-    encoder.encode(PLAINTEXT_HTML)
+    encoder.encode(PLAINTEXT_HTML),
   );
 
   return {
@@ -223,23 +217,23 @@ function buildHtml(payload) {
 test.beforeAll(async () => {
   const start = Date.now();
   const payload = await encryptPayload();
-  logEvent({ phase: 'payload_generated', ms: Date.now() - start });
+  logEvent({ phase: "payload_generated", ms: Date.now() - start });
 
   const html = buildHtml(payload);
 
   server = http.createServer((req, res) => {
     res.writeHead(200, {
-      'Content-Type': 'text/html; charset=utf-8',
-      'Cache-Control': 'no-store',
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
     });
     res.end(html);
   });
 
   await new Promise((resolve) => {
-    server.listen(0, '127.0.0.1', () => {
+    server.listen(0, "127.0.0.1", () => {
       const { port } = server.address();
       baseURL = `http://127.0.0.1:${port}/`;
-      logEvent({ phase: 'server_listening', port });
+      logEvent({ phase: "server_listening", port });
       resolve();
     });
   });
@@ -248,17 +242,17 @@ test.beforeAll(async () => {
 test.afterAll(async () => {
   if (!server) return;
   await new Promise((resolve) => server.close(resolve));
-  logEvent({ phase: 'server_closed' });
+  logEvent({ phase: "server_closed" });
 });
 
 test.beforeEach(async ({ page }, testInfo) => {
-  const browser = testInfo.project.name || 'default';
-  page.on('pageerror', (err) => {
-    logEvent({ phase: 'page_error', browser, message: err.message });
+  const browser = testInfo.project.name || "default";
+  page.on("pageerror", (err) => {
+    logEvent({ phase: "page_error", browser, message: err.message });
   });
-  page.on('console', (msg) => {
+  page.on("console", (msg) => {
     logEvent({
-      phase: 'browser_console',
+      phase: "browser_console",
       browser,
       level: msg.type(),
       text: msg.text().slice(0, 300),
@@ -266,33 +260,33 @@ test.beforeEach(async ({ page }, testInfo) => {
   });
 });
 
-test('decrypts with correct password', async ({ page }, testInfo) => {
+test("decrypts with correct password", async ({ page }, testInfo) => {
   const navStart = Date.now();
-  await page.goto(baseURL, { waitUntil: 'domcontentloaded' });
+  await page.goto(baseURL, { waitUntil: "domcontentloaded" });
   logEvent({
-    phase: 'page_loaded',
-    browser: testInfo.project.name || 'default',
+    phase: "page_loaded",
+    browser: testInfo.project.name || "default",
     ms: Date.now() - navStart,
   });
 
   const webcryptoAvailable = await page.evaluate(() => !!crypto?.subtle);
   expect(webcryptoAvailable).toBe(true);
 
-  await page.fill('#password-input', TEST_PASSWORD);
+  await page.fill("#password-input", TEST_PASSWORD);
   await page.click('#password-form button[type="submit"]');
 
-  await expect(page.locator('#conversation .message-content')).toHaveText(
-    'Hello from encrypted export ✅'
+  await expect(page.locator("#conversation .message-content")).toHaveText(
+    "Hello from encrypted export ✅",
   );
-  await expect(page.locator('#password-modal')).toBeHidden();
+  await expect(page.locator("#password-modal")).toBeHidden();
 });
 
-test('shows error on wrong password', async ({ page }) => {
-  await page.goto(baseURL, { waitUntil: 'domcontentloaded' });
+test("shows error on wrong password", async ({ page }) => {
+  await page.goto(baseURL, { waitUntil: "domcontentloaded" });
 
-  await page.fill('#password-input', WRONG_PASSWORD);
+  await page.fill("#password-input", WRONG_PASSWORD);
   await page.click('#password-form button[type="submit"]');
 
-  await expect(page.locator('#decrypt-error')).toBeVisible();
-  await expect(page.locator('#decrypt-error')).toContainText('Decryption failed');
+  await expect(page.locator("#decrypt-error")).toBeVisible();
+  await expect(page.locator("#decrypt-error")).toContainText("Decryption failed");
 });

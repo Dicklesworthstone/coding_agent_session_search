@@ -3,6 +3,8 @@
 mod archives;
 #[path = "codex/implementation.rs"]
 mod implementation;
+// Also consumed by raw-mirror admission, including the legacy fallback route.
+pub(crate) mod path_policy;
 
 use anyhow::Result;
 
@@ -34,6 +36,7 @@ impl Connector for CodexConnector {
     }
 
     fn scan(&self, ctx: &ScanContext) -> Result<Vec<NormalizedConversation>> {
+        path_policy::ScanExclusions::from_env().validate()?;
         self.inner.scan(ctx)
     }
 
@@ -42,6 +45,7 @@ impl Connector for CodexConnector {
     }
 
     fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+        path_policy::ScanExclusions::from_env().validate()?;
         archives::discover(&self.inner, ctx)
     }
 
@@ -50,6 +54,7 @@ impl Connector for CodexConnector {
         ctx: &ScanContext,
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
+        path_policy::ScanExclusions::from_env().validate()?;
         self.inner.scan_with_callback(ctx, on_conversation)
     }
 
@@ -63,6 +68,7 @@ impl Connector for CodexConnector {
         hooks: &mut franken_agent_detection::SourceScanHooks<'_>,
         on_conversation: &mut dyn FnMut(NormalizedConversation) -> Result<()>,
     ) -> Result<()> {
+        path_policy::ScanExclusions::from_env().validate()?;
         self.inner
             .scan_with_source_boundaries(ctx, hooks, on_conversation)
     }

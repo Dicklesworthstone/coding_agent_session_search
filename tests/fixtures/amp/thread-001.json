@@ -2,7 +2,7 @@
   "id": "thread-001",
   "title": "Amp sample thread",
   "messages": [
-    {"role": "user", "text": "Hello", "createdAt": 1700000000000},
-    {"role": "assistant", "text": "Hi there", "createdAt": 1700000005000}
+    { "role": "user", "text": "Hello", "createdAt": 1700000000000 },
+    { "role": "assistant", "text": "Hi there", "createdAt": 1700000005000 }
   ]
 }

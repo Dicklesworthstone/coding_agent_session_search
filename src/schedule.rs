@@ -15,11 +15,11 @@
 //!   the quality (MiniLM) tier when the model is installed — until the
 //!   backlog drains or the scheduler gates (load, console idle) say stop.
 //!
-//! Priority is delegated to the OS: launchd `ProcessType=Background` +
-//! `Nice` + `LowPriorityIO`, systemd `Nice=19` + `IOSchedulingClass=idle` +
-//! `CPUSchedulingPolicy=idle`. Each job step is a child `cass` process, so the
-//! normal `index-run.lock` / exit-7 `index-busy` contract protects against a
-//! human running `cass index` at the same moment.
+//! Priority is delegated to the OS: launchd uses `Nice=15` without
+//! background I/O throttling, while systemd uses `Nice=19` +
+//! `IOSchedulingClass=idle` + `CPUSchedulingPolicy=idle`. Each job step is a
+//! child `cass` process, so the normal `index-run.lock` / exit-7 `index-busy`
+//! contract protects against a human running `cass index` at the same moment.
 //!
 //! Everything the job does is recorded under `<data_dir>/schedule/`:
 //! `state.json` (last run per job), `runs.jsonl` (append-only history), and
@@ -42,6 +42,8 @@ use tracing::{info, warn};
 
 use crate::indexer::background_refresh::background_index_args;
 use crate::indexer::responsiveness;
+
+mod outcomes;
 
 pub const DEFAULT_INTERVAL_MINS: u32 = 15;
 pub const DEFAULT_NIGHTLY_HOUR: u8 = 3;
@@ -235,14 +237,8 @@ pub fn render_launchd_plist(spec: &ScheduleSpec, job: ScheduleJob) -> String {
 {trigger}\
     <key>RunAtLoad</key>\n\
     <false/>\n\
-    <key>ProcessType</key>\n\
-    <string>Background</string>\n\
     <key>Nice</key>\n\
     <integer>15</integer>\n\
-    <key>LowPriorityIO</key>\n\
-    <true/>\n\
-    <key>LowPriorityBackgroundIO</key>\n\
-    <true/>\n\
     <key>StandardOutPath</key>\n\
     <string>{log}</string>\n\
     <key>StandardErrorPath</key>\n\
@@ -765,10 +761,11 @@ pub struct ScheduleState {
 }
 
 pub fn load_state(data_dir: &Path) -> ScheduleState {
-    std::fs::read_to_string(state_path(data_dir))
+    let state = std::fs::read_to_string(state_path(data_dir))
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    outcomes::normalize_state(state)
 }
 
 fn save_state(data_dir: &Path, state: &ScheduleState) -> std::io::Result<()> {
@@ -1008,9 +1005,10 @@ fn run_job_with_gate(
             }
         }
 
-        // 2. Index. Exit 7 (`index-busy`: a human or another job holds the
-        // index lock) is an expected outcome for a scheduled run, not a
-        // failure — the next timer firing simply tries again.
+        // 2. Index. Exit 7 is an expected lock-contention deferral, but no
+        // indexing completed. Preserve the non-success outcome so repeated
+        // contention cannot masquerade as refreshed history; the next timer
+        // firing still retries normally.
         let full = matches!(job, ScheduleJob::Nightly);
         // Retain the full source census: timestamp-only connectors can miss
         // restored historical files. The indexer may reconcile a verified
@@ -1034,6 +1032,7 @@ fn run_job_with_gate(
         );
         let index_busy = soften_busy_index_step(&mut index_step);
         steps.push(index_step);
+        let prerequisites_ok = steps.iter().all(|step| step.ok);
 
         // 3. Semantic backfill (nightly only). Two tiers: the fast (hash)
         // tier needs no model files; the quality (MiniLM) tier only runs
@@ -1050,6 +1049,11 @@ fn run_job_with_gate(
                 steps.push(skipped_step(
                     "semantic-backfill",
                     "index run was busy; leaving semantic backfill for the next night",
+                ));
+            } else if !prerequisites_ok {
+                steps.push(skipped_step(
+                    "semantic-backfill",
+                    "source sync or indexing failed; semantic backfill requires a successful run",
                 ));
             } else {
                 let (probe, model_installed) =
@@ -1178,13 +1182,14 @@ pub fn soften_model_unavailable_backfill_step(step: &mut StepReport) -> bool {
     true
 }
 
-/// Convert an exit-7 (`index-busy`) index step into a skipped step: a
-/// scheduled run losing the lock race to a human `cass index` is routine.
+/// Annotate exit-7 (`index-busy`) as a deferred step without claiming that
+/// indexing succeeded. The next timer firing retries, but callers and saved
+/// receipts must distinguish that retryable deferral from completed work.
 pub fn soften_busy_index_step(step: &mut StepReport) -> bool {
     if step.exit_code != Some(7) {
         return false;
     }
-    step.ok = true;
+    step.ok = false;
     step.skipped_reason =
         Some("another index run already holds the index lock; skipped this cycle".to_string());
     true
@@ -1252,6 +1257,7 @@ pub struct UnitStatus {
     pub installed: bool,
     /// Scheduler-reported state, when the platform tool answered.
     pub loaded: Option<bool>,
+    /// Last persisted run outcome, followed by explicitly labeled probe status.
     pub detail: Option<String>,
 }
 
@@ -1270,6 +1276,7 @@ pub fn status(data_dir: &Path) -> StatusReport {
     let unit_dir = home_dir()
         .ok()
         .and_then(|home| unit_dir(platform, &home, xdg_config_home().as_deref()));
+    let state = load_state(data_dir);
     let mut units = Vec::new();
     if let Some(dir) = &unit_dir {
         let uid = current_uid();
@@ -1317,7 +1324,7 @@ pub fn status(data_dir: &Path) -> StatusReport {
                 unit_files: files,
                 installed,
                 loaded,
-                detail,
+                detail: outcomes::unit_detail(job, &state, detail),
             });
         }
     }
@@ -1325,7 +1332,7 @@ pub fn status(data_dir: &Path) -> StatusReport {
         platform,
         unit_dir,
         units,
-        state: load_state(data_dir),
+        state,
         auto_refresh: crate::indexer::background_refresh::load_state(data_dir),
         log_dir: schedule_dir(data_dir),
     }
@@ -1378,8 +1385,8 @@ mod tests {
         let inc = render_launchd_plist(&s, ScheduleJob::Incremental);
         assert!(inc.contains("<string>com.dicklesworthstone.cass.incremental</string>"));
         assert!(inc.contains("<key>StartInterval</key>\n    <integer>900</integer>"));
-        assert!(inc.contains("<string>Background</string>"));
-        assert!(inc.contains("<key>LowPriorityIO</key>"));
+        assert!(inc.contains("<key>Nice</key>"));
+        assert!(!inc.contains("<key>LowPriorityIO</key>"));
         assert!(inc.contains("/schedule/incremental.log</string>"));
         assert!(!inc.contains("StartCalendarInterval"));
 
@@ -1388,6 +1395,21 @@ mod tests {
         assert!(night.contains("<key>Hour</key>\n        <integer>3</integer>"));
         assert!(night.contains("<key>Minute</key>\n        <integer>30</integer>"));
         assert!(night.contains("<string>nightly</string>"));
+    }
+
+    #[test]
+    fn launchd_jobs_keep_cpu_niceness_without_background_io_throttling() {
+        for job in [ScheduleJob::Incremental, ScheduleJob::Nightly] {
+            let plist = render_launchd_plist(&spec(), job);
+            assert!(plist.contains("<key>Nice</key>\n    <integer>15</integer>"));
+            for key in ["ProcessType", "LowPriorityIO", "LowPriorityBackgroundIO"] {
+                assert!(
+                    !plist.contains(&format!("<key>{key}</key>")),
+                    "{} must not request {key}: {plist}",
+                    job.as_str()
+                );
+            }
+        }
     }
 
     #[test]
@@ -1556,7 +1578,7 @@ mod tests {
     }
 
     #[test]
-    fn busy_index_step_softens_to_skip() {
+    fn busy_index_step_is_deferred_without_claiming_success() {
         let step = |exit: Option<i32>, ok: bool| StepReport {
             name: "index".into(),
             argv: vec![],
@@ -1569,7 +1591,7 @@ mod tests {
         };
         let mut busy = step(Some(7), false);
         assert!(soften_busy_index_step(&mut busy));
-        assert!(busy.ok);
+        assert!(!busy.ok);
         assert!(busy.skipped_reason.is_some());
         let mut fine = step(Some(0), true);
         assert!(!soften_busy_index_step(&mut fine));

@@ -1,4 +1,4 @@
 [
-  {"role": "user", "timestamp": 1700000000000, "content": "Hello Cline"},
-  {"role": "assistant", "timestamp": 1700000001000, "content": "Hi from Cline"}
+  { "role": "user", "timestamp": 1700000000000, "content": "Hello Cline" },
+  { "role": "assistant", "timestamp": 1700000001000, "content": "Hi from Cline" }
 ]

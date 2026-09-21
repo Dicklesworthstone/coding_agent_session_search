@@ -1,8 +1,6 @@
 {
   "_name_or_path": "sentence-transformers/paraphrase-MiniLM-L3-v2",
-  "architectures": [
-    "BertModel"
-  ],
+  "architectures": ["BertModel"],
   "attention_probs_dropout_prob": 0.1,
   "classifier_dropout": null,
   "gradient_checkpointing": false,

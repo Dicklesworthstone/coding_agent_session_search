@@ -16,22 +16,16 @@
           "name": "codex",
           "source_class": "local-session-history",
           "enabled": true,
-          "roots": [
-            "/home/private-user/.codex/sessions"
-          ],
+          "roots": ["/home/private-user/.codex/sessions"],
           "file_count": 7,
           "total_bytes": 4096,
           "unreadable_count": 1,
           "symlink_count": 0,
           "secret_sample_count": 1,
-          "secret_samples": [
-            "private-user@example.invalid"
-          ]
+          "secret_samples": ["private-user@example.invalid"]
         }
       ],
-      "excluded_agents": [
-        "private-agent"
-      ],
+      "excluded_agents": ["private-agent"],
       "raw_mirror": {
         "enabled": false,
         "manifest_count": 0,
@@ -107,9 +101,7 @@
         "index_present": false,
         "path": "/home/private-user/.local/share/cass/index"
       },
-      "evidence_refs": [
-        "/home/private-user/work/session.jsonl:42"
-      ],
+      "evidence_refs": ["/home/private-user/work/session.jsonl:42"],
       "expected": "shared fixture reproduction succeeds",
       "actual": "failed command observed",
       "private_session_text": "PRIVATE_SESSION_MARKER_NEVER_EMIT private-user@example.invalid",
@@ -130,9 +122,7 @@
               "status": "unmet"
             }
           ],
-          "required_proof_gates": [
-            "guided-ops-golden"
-          ]
+          "required_proof_gates": ["guided-ops-golden"]
         }
       },
       "workflow_macros": {
@@ -142,9 +132,7 @@
             "title": "Diagnose CI safely",
             "readiness": "blocked",
             "privacy_tier": "redacted",
-            "missing_preflight_facts": [
-              "privacy_review_complete"
-            ]
+            "missing_preflight_facts": ["privacy_review_complete"]
           }
         ]
       },
@@ -201,9 +189,7 @@
               "confidence": "medium",
               "stale_reason": "aged_out",
               "recommended_followup": "inspect private-user@example.invalid",
-              "provenance_refs": [
-                "commit:abcdef123456"
-              ]
+              "provenance_refs": ["commit:abcdef123456"]
             }
           }
         ]

@@ -1,30 +1,30 @@
 import {
+  type BrowserContext,
   test as base,
+  type ConsoleMessage,
   expect,
-  Page,
-  ConsoleMessage,
-  Request,
-  BrowserContext,
-} from '@playwright/test';
-import { readFileSync, existsSync } from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+  type Page,
+  type Request,
+} from "@playwright/test";
+import { existsSync, readFileSync } from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Load environment variables from .env.test
-const envPath = path.resolve(__dirname, '../.env.test');
+const envPath = path.resolve(__dirname, "../.env.test");
 if (existsSync(envPath)) {
-  const envContent = readFileSync(envPath, 'utf-8');
-  for (const rawLine of envContent.split('\n')) {
+  const envContent = readFileSync(envPath, "utf-8");
+  for (const rawLine of envContent.split("\n")) {
     const line = rawLine.trim();
-    if (!line || line.startsWith('#')) {
+    if (!line || line.startsWith("#")) {
       continue;
     }
-    const [key, ...valueParts] = line.split('=');
+    const [key, ...valueParts] = line.split("=");
     if (key && valueParts.length > 0) {
-      process.env[key] = valueParts.join('=');
+      process.env[key] = valueParts.join("=");
     }
   }
 }
@@ -60,14 +60,14 @@ function readJsonIfExists(filePath?: string): unknown | null {
     return null;
   }
   try {
-    return JSON.parse(readFileSync(filePath, 'utf-8'));
+    return JSON.parse(readFileSync(filePath, "utf-8"));
   } catch (err) {
-    return { error: 'Failed to parse JSON log', details: String(err) };
+    return { error: "Failed to parse JSON log", details: String(err) };
   }
 }
 
 function shouldAttachLogs(status: string | undefined, expected: string | undefined): boolean {
-  const always = process.env.E2E_LOG_ALWAYS === '1' || process.env.E2E_LOG_ALWAYS === 'true';
+  const always = process.env.E2E_LOG_ALWAYS === "1" || process.env.E2E_LOG_ALWAYS === "true";
   return always || status !== expected;
 }
 
@@ -122,15 +122,15 @@ export const test = base.extend<TestFixtures>({
       });
     };
 
-    page.on('console', onConsole);
-    page.on('pageerror', onPageError);
-    page.on('requestfailed', onRequestFailed);
+    page.on("console", onConsole);
+    page.on("pageerror", onPageError);
+    page.on("requestfailed", onRequestFailed);
 
     await use(page);
 
-    page.off('console', onConsole);
-    page.off('pageerror', onPageError);
-    page.off('requestfailed', onRequestFailed);
+    page.off("console", onConsole);
+    page.off("pageerror", onPageError);
+    page.off("requestfailed", onRequestFailed);
 
     if (shouldAttachLogs(testInfo.status, testInfo.expectedStatus)) {
       let pageUrl: string | null = null;
@@ -181,50 +181,50 @@ export const test = base.extend<TestFixtures>({
         },
       };
 
-      await testInfo.attach(`browser-logs-${testInfo.project?.name ?? 'default'}`, {
+      await testInfo.attach(`browser-logs-${testInfo.project?.name ?? "default"}`, {
         body: Buffer.from(JSON.stringify(logPayload, null, 2)),
-        contentType: 'application/json',
+        contentType: "application/json",
       });
     }
   },
 
   exportPath: async ({}, use) => {
-    const exportPath = process.env.TEST_EXPORT_TEST_BASIC || '';
+    const exportPath = process.env.TEST_EXPORT_TEST_BASIC || "";
     await use(exportPath);
   },
 
   encryptedExportPath: async ({}, use) => {
-    const exportPath = process.env.TEST_EXPORT_TEST_ENCRYPTED || '';
+    const exportPath = process.env.TEST_EXPORT_TEST_ENCRYPTED || "";
     await use(exportPath);
   },
 
   toolCallsExportPath: async ({}, use) => {
-    const exportPath = process.env.TEST_EXPORT_TEST_TOOL_CALLS || '';
+    const exportPath = process.env.TEST_EXPORT_TEST_TOOL_CALLS || "";
     await use(exportPath);
   },
 
   largeExportPath: async ({}, use) => {
-    const exportPath = process.env.TEST_EXPORT_TEST_LARGE || '';
+    const exportPath = process.env.TEST_EXPORT_TEST_LARGE || "";
     await use(exportPath);
   },
 
   unicodeExportPath: async ({}, use) => {
-    const exportPath = process.env.TEST_EXPORT_TEST_UNICODE || '';
+    const exportPath = process.env.TEST_EXPORT_TEST_UNICODE || "";
     await use(exportPath);
   },
 
   noCdnExportPath: async ({}, use) => {
-    const exportPath = process.env.TEST_EXPORT_TEST_NO_CDN || '';
+    const exportPath = process.env.TEST_EXPORT_TEST_NO_CDN || "";
     await use(exportPath);
   },
 
   previewUrl: async ({}, use) => {
-    const previewUrl = process.env.TEST_PAGES_PREVIEW_URL || '';
+    const previewUrl = process.env.TEST_PAGES_PREVIEW_URL || "";
     await use(previewUrl);
   },
 
   password: async ({}, use) => {
-    await use(process.env.TEST_EXPORT_PASSWORD || 'test-password-123');
+    await use(process.env.TEST_EXPORT_PASSWORD || "test-password-123");
   },
 });
 
@@ -235,15 +235,15 @@ export { expect };
  * Uses domcontentloaded for faster, more reliable navigation.
  */
 export async function gotoFile(page: Page, filePath: string): Promise<void> {
-  await page.goto(`file://${filePath}`, { waitUntil: 'domcontentloaded' });
+  await page.goto(`file://${filePath}`, { waitUntil: "domcontentloaded" });
 }
 
 export async function grantClipboardPermissionsIfSupported(
   context: BrowserContext,
   browserName: string,
-  permissions: Array<'clipboard-read' | 'clipboard-write'> = ['clipboard-read', 'clipboard-write']
+  permissions: Array<"clipboard-read" | "clipboard-write"> = ["clipboard-read", "clipboard-write"],
 ): Promise<boolean> {
-  if (browserName !== 'chromium') {
+  if (browserName !== "chromium") {
     return false;
   }
 
@@ -258,10 +258,10 @@ export async function grantClipboardPermissionsIfSupported(
 
 export async function focusFirstKeyboardReachableElement(
   page: Page,
-  maxTabs = 8
+  maxTabs = 8,
 ): Promise<boolean> {
   for (let i = 0; i < maxTabs; i++) {
-    await page.keyboard.press('Tab');
+    await page.keyboard.press("Tab");
     const hasFocus = await page.evaluate(() => {
       const el = document.activeElement;
       return !!el && el !== document.body && el !== document.documentElement;
@@ -278,8 +278,8 @@ export async function focusFirstKeyboardReachableElement(
  */
 export async function collectConsoleErrors(page: Page): Promise<string[]> {
   const errors: string[] = [];
-  page.on('console', (msg) => {
-    if (msg.type() === 'error') {
+  page.on("console", (msg) => {
+    if (msg.type() === "error") {
       errors.push(msg.text());
     }
   });
@@ -298,12 +298,12 @@ export function collectBrowserErrors(page: Page): {
 } {
   const consoleErrors: string[] = [];
   const pageErrors: string[] = [];
-  page.on('console', (message) => {
-    if (message.type() === 'error') {
+  page.on("console", (message) => {
+    if (message.type() === "error") {
       consoleErrors.push(message.text());
     }
   });
-  page.on('pageerror', (error) => {
+  page.on("pageerror", (error) => {
     pageErrors.push(error.message);
   });
   return { consoleErrors, pageErrors };
@@ -315,7 +315,7 @@ export function collectBrowserErrors(page: Page): {
  */
 export async function waitForPageReady(page: Page): Promise<void> {
   // For local file URLs, domcontentloaded is sufficient and more reliable
-  await page.waitForLoadState('domcontentloaded');
+  await page.waitForLoadState("domcontentloaded");
   // Stabilize animations/transitions to avoid flake from entrance effects
   await page.addStyleTag({
     content: `
@@ -342,12 +342,12 @@ export async function waitForPageReady(page: Page): Promise<void> {
  * Count messages in the rendered HTML.
  */
 export async function countMessages(page: Page): Promise<number> {
-  return page.locator('.message').count();
+  return page.locator(".message").count();
 }
 
 /**
  * Get the current theme from the page.
  */
 export async function getCurrentTheme(page: Page): Promise<string> {
-  return (await page.locator('html').getAttribute('data-theme')) || 'unknown';
+  return (await page.locator("html").getAttribute("data-theme")) || "unknown";
 }

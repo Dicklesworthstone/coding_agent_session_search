@@ -9,17 +9,17 @@
 
 async function runScrollPerformance(page, options = {}) {
   const {
-    scrollContainer = '#results-container',
+    scrollContainer = "#results-container",
     scrollSteps = 100,
     stepDelay = 16, // ~60fps timing
-    bufferScroll = true
+    bufferScroll = true,
   } = options;
 
   const result = await page.evaluate(
     async ({ container, steps, delay, buffer }) => {
       const el = document.querySelector(container);
       if (!el) {
-        return { error: 'Scroll container not found', selector: container };
+        return { error: "Scroll container not found", selector: container };
       }
 
       const scrollHeight = el.scrollHeight;
@@ -28,9 +28,9 @@ async function runScrollPerformance(page, options = {}) {
 
       if (scrollableDistance <= 0) {
         return {
-          error: 'No scrollable content',
+          error: "No scrollable content",
           scrollHeight,
-          clientHeight
+          clientHeight,
         };
       }
 
@@ -44,13 +44,13 @@ async function runScrollPerformance(page, options = {}) {
           longTasks.push({
             name: entry.name,
             duration: entry.duration,
-            startTime: entry.startTime
+            startTime: entry.startTime,
           });
         }
       });
 
       try {
-        taskObserver.observe({ entryTypes: ['longtask'] });
+        taskObserver.observe({ entryTypes: ["longtask"] });
       } catch (e) {
         // longtask not supported in all browsers
       }
@@ -60,7 +60,7 @@ async function runScrollPerformance(page, options = {}) {
         const targetScroll = (scrollableDistance / steps) * i;
 
         if (buffer) {
-          el.scrollTo({ top: targetScroll, behavior: 'instant' });
+          el.scrollTo({ top: targetScroll, behavior: "instant" });
         } else {
           el.scrollTop = targetScroll;
         }
@@ -82,9 +82,7 @@ async function runScrollPerformance(page, options = {}) {
       // Calculate metrics
       const validFrames = frameTimes.filter((t) => t > 0);
       const avgFrameTime =
-        validFrames.length > 0
-          ? validFrames.reduce((a, b) => a + b, 0) / validFrames.length
-          : 0;
+        validFrames.length > 0 ? validFrames.reduce((a, b) => a + b, 0) / validFrames.length : 0;
       const maxFrameTime = validFrames.length > 0 ? Math.max(...validFrames) : 0;
       const minFrameTime = validFrames.length > 0 ? Math.min(...validFrames) : 0;
 
@@ -114,15 +112,15 @@ async function runScrollPerformance(page, options = {}) {
         scrollableDistance,
         // Thresholds
         ok: effectiveFps >= 55 && verySlowFrames === 0, // Allow slight variance
-        smooth: effectiveFps >= 58 && slowFrames < validFrames.length * 0.05
+        smooth: effectiveFps >= 58 && slowFrames < validFrames.length * 0.05,
       };
     },
     {
       container: scrollContainer,
       steps: scrollSteps,
       delay: stepDelay,
-      buffer: bufferScroll
-    }
+      buffer: bufferScroll,
+    },
   );
 
   return result;
@@ -142,7 +140,7 @@ async function runBidirectionalScroll(page, options = {}) {
   const upResult = await page.evaluate(
     async ({ container, steps, delay }) => {
       const el = document.querySelector(container);
-      if (!el) return { error: 'Container not found' };
+      if (!el) return { error: "Container not found" };
 
       const scrollHeight = el.scrollHeight;
       const clientHeight = el.clientHeight;
@@ -154,7 +152,7 @@ async function runBidirectionalScroll(page, options = {}) {
       // Scroll up
       for (let i = steps; i >= 0; i--) {
         const targetScroll = (scrollableDistance / steps) * i;
-        el.scrollTo({ top: targetScroll, behavior: 'instant' });
+        el.scrollTo({ top: targetScroll, behavior: "instant" });
 
         await new Promise((resolve) => {
           requestAnimationFrame(() => {
@@ -168,32 +166,29 @@ async function runBidirectionalScroll(page, options = {}) {
 
       const validFrames = frameTimes.filter((t) => t > 0);
       const avgFrameTime =
-        validFrames.length > 0
-          ? validFrames.reduce((a, b) => a + b, 0) / validFrames.length
-          : 0;
+        validFrames.length > 0 ? validFrames.reduce((a, b) => a + b, 0) / validFrames.length : 0;
       const effectiveFps = avgFrameTime > 0 ? 1000 / avgFrameTime : 0;
 
       return {
         totalFrames: validFrames.length,
         avgFrameTime: Math.round(avgFrameTime * 100) / 100,
         effectiveFps: Math.round(effectiveFps * 10) / 10,
-        ok: effectiveFps >= 55
+        ok: effectiveFps >= 55,
       };
     },
     {
-      container: options.scrollContainer || '#results-container',
+      container: options.scrollContainer || "#results-container",
       steps: options.scrollSteps || 100,
-      delay: options.stepDelay || 16
-    }
+      delay: options.stepDelay || 16,
+    },
   );
 
   // Combined metrics
-  const combinedFps =
-    (downResult.effectiveFps + (upResult.effectiveFps || 0)) / 2;
+  const combinedFps = (downResult.effectiveFps + (upResult.effectiveFps || 0)) / 2;
   const combined = {
     avgFps: Math.round(combinedFps * 10) / 10,
     ok: downResult.ok && (upResult.ok || upResult.error),
-    totalLongTasks: downResult.longTaskCount
+    totalLongTasks: downResult.longTaskCount,
   };
 
   return { down: downResult, up: upResult, combined };

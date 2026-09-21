@@ -1,14 +1,14 @@
 import {
-  test,
   expect,
-  gotoFile,
-  waitForPageReady,
   focusFirstKeyboardReachableElement,
-} from '../setup/test-utils';
+  gotoFile,
+  test,
+  waitForPageReady,
+} from "../setup/test-utils";
 
-test.describe('Keyboard Accessibility', () => {
-  test('can tab through interactive elements', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+test.describe("Keyboard Accessibility", () => {
+  test("can tab through interactive elements", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
@@ -17,21 +17,21 @@ test.describe('Keyboard Accessibility', () => {
     const focusedElements: string[] = [];
 
     for (let i = 0; i < 20; i++) {
-      await page.keyboard.press('Tab');
-      const tagName = await page.evaluate(() => document.activeElement?.tagName || 'NONE');
+      await page.keyboard.press("Tab");
+      const tagName = await page.evaluate(() => document.activeElement?.tagName || "NONE");
       focusedElements.push(tagName);
     }
 
     // Should have visited some interactive elements
-    const interactiveElements = focusedElements.filter(
-      (tag) => ['BUTTON', 'INPUT', 'A', 'DETAILS', 'SUMMARY'].includes(tag)
+    const interactiveElements = focusedElements.filter((tag) =>
+      ["BUTTON", "INPUT", "A", "DETAILS", "SUMMARY"].includes(tag),
     );
 
     expect(interactiveElements.length).toBeGreaterThan(0);
   });
 
-  test('focus is visible on interactive elements', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+  test("focus is visible on interactive elements", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
@@ -47,22 +47,25 @@ test.describe('Keyboard Accessibility', () => {
       const styles = window.getComputedStyle(el);
       const outline = styles.outline;
       const outlineStyle = styles.outlineStyle;
-      const outlineWidth = parseFloat(styles.outlineWidth || '0');
+      const outlineWidth = parseFloat(styles.outlineWidth || "0");
       const boxShadow = styles.boxShadow;
 
       // Should have visible focus indicator
       return (
-        (outline !== 'none' && outline !== '0px none' && outlineStyle !== 'none' && outlineWidth > 0) ||
-        el.matches(':focus-visible') ||
-        (boxShadow !== 'none' && boxShadow.includes('rgb'))
+        (outline !== "none" &&
+          outline !== "0px none" &&
+          outlineStyle !== "none" &&
+          outlineWidth > 0) ||
+        el.matches(":focus-visible") ||
+        (boxShadow !== "none" && boxShadow.includes("rgb"))
       );
     });
 
     expect(hasFocusStyles).toBe(true);
   });
 
-  test('Escape closes modals/popups', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+  test("Escape closes modals/popups", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
@@ -71,27 +74,27 @@ test.describe('Keyboard Accessibility', () => {
     const searchInput = page.locator('#search-input, input[type="search"]');
     if ((await searchInput.count()) > 0) {
       await searchInput.first().focus();
-      await searchInput.first().fill('test');
+      await searchInput.first().fill("test");
 
       // Press Escape
-      await page.keyboard.press('Escape');
+      await page.keyboard.press("Escape");
 
       const value = await searchInput.first().inputValue();
       const stillFocused = await searchInput
         .first()
         .evaluate((el) => el === document.activeElement);
-      expect(value === '' || !stillFocused).toBe(true);
+      expect(value === "" || !stillFocused).toBe(true);
     }
   });
 
-  test('Enter/Space activates buttons', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+  test("Enter/Space activates buttons", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     // Find a button
-    const button = page.locator('button').first();
+    const button = page.locator("button").first();
     const buttonExists = (await button.count()) > 0;
 
     if (buttonExists) {
@@ -101,59 +104,59 @@ test.describe('Keyboard Accessibility', () => {
       await button.evaluate((el) => {
         (el as HTMLElement & { __cassActivationCount?: number }).__cassActivationCount = 0;
         el.addEventListener(
-          'click',
+          "click",
           () => {
             (el as HTMLElement & { __cassActivationCount?: number }).__cassActivationCount =
-              ((el as HTMLElement & { __cassActivationCount?: number }).__cassActivationCount ?? 0) +
-              1;
+              ((el as HTMLElement & { __cassActivationCount?: number }).__cassActivationCount ??
+                0) + 1;
           },
-          { once: false }
+          { once: false },
         );
       });
 
       // Press Enter
-      await page.keyboard.press('Enter');
+      await page.keyboard.press("Enter");
       await page.waitForTimeout(200);
 
       const activationCount = await button.evaluate(
-        (el) => (el as HTMLElement & { __cassActivationCount?: number }).__cassActivationCount ?? 0
+        (el) => (el as HTMLElement & { __cassActivationCount?: number }).__cassActivationCount ?? 0,
       );
       expect(activationCount).toBeGreaterThan(0);
     }
   });
 
-  test('arrow keys work in appropriate contexts', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+  test("arrow keys work in appropriate contexts", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     // This tests that arrow keys don't break anything
-    await page.keyboard.press('ArrowDown');
-    await page.keyboard.press('ArrowUp');
-    await page.keyboard.press('ArrowLeft');
-    await page.keyboard.press('ArrowRight');
+    await page.keyboard.press("ArrowDown");
+    await page.keyboard.press("ArrowUp");
+    await page.keyboard.press("ArrowLeft");
+    await page.keyboard.press("ArrowRight");
 
     // Page should still be functional
-    const messageCount = await page.locator('.message').count();
+    const messageCount = await page.locator(".message").count();
     expect(messageCount).toBeGreaterThan(0);
   });
 });
 
-test.describe('Screen Reader Accessibility', () => {
-  test('page has proper heading structure', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+test.describe("Screen Reader Accessibility", () => {
+  test("page has proper heading structure", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     // Should have at least one h1
-    const h1Count = await page.locator('h1').count();
+    const h1Count = await page.locator("h1").count();
     expect(h1Count).toBeGreaterThanOrEqual(1);
 
     // Heading levels should not skip (h1 -> h3 without h2)
     const headings = await page.evaluate(() => {
-      const headingEls = document.querySelectorAll('h1, h2, h3, h4, h5, h6');
+      const headingEls = document.querySelectorAll("h1, h2, h3, h4, h5, h6");
       return Array.from(headingEls).map((el) => parseInt(el.tagName[1]));
     });
 
@@ -166,29 +169,29 @@ test.describe('Screen Reader Accessibility', () => {
     }
   });
 
-  test('images have alt text', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+  test("images have alt text", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
-    const images = page.locator('img');
+    const images = page.locator("img");
     const imageCount = await images.count();
 
     for (let i = 0; i < imageCount; i++) {
-      const alt = await images.nth(i).getAttribute('alt');
+      const alt = await images.nth(i).getAttribute("alt");
       // Should have alt attribute (can be empty for decorative)
       expect(alt !== null).toBe(true);
     }
   });
 
-  test('interactive elements have accessible names', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+  test("interactive elements have accessible names", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
-    const buttons = page.locator('button');
+    const buttons = page.locator("button");
     const buttonCount = await buttons.count();
 
     for (let i = 0; i < Math.min(buttonCount, 10); i++) {
@@ -197,10 +200,7 @@ test.describe('Screen Reader Accessibility', () => {
       // Get accessible name
       const accessibleName = await button.evaluate((el) => {
         return (
-          el.getAttribute('aria-label') ||
-          el.getAttribute('title') ||
-          el.textContent?.trim() ||
-          ''
+          el.getAttribute("aria-label") || el.getAttribute("title") || el.textContent?.trim() || ""
         );
       });
 
@@ -209,8 +209,8 @@ test.describe('Screen Reader Accessibility', () => {
     }
   });
 
-  test('main content has proper landmark', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+  test("main content has proper landmark", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
@@ -221,9 +221,9 @@ test.describe('Screen Reader Accessibility', () => {
   });
 });
 
-test.describe('Color Contrast', () => {
-  test('text has sufficient contrast', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+test.describe("Color Contrast", () => {
+  test("text has sufficient contrast", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
@@ -245,15 +245,15 @@ test.describe('Color Contrast', () => {
     console.log(`Text: ${colors.textColor}, Background: ${colors.bgColor}`);
   });
 
-  test('both themes have readable text', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+  test("both themes have readable text", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     // Check current theme
     const theme1Colors = await page.evaluate(() => ({
-      theme: document.documentElement.getAttribute('data-theme'),
+      theme: document.documentElement.getAttribute("data-theme"),
       text: window.getComputedStyle(document.body).color,
       bg: window.getComputedStyle(document.body).backgroundColor,
     }));
@@ -265,7 +265,7 @@ test.describe('Color Contrast', () => {
       await page.waitForTimeout(300);
 
       const theme2Colors = await page.evaluate(() => ({
-        theme: document.documentElement.getAttribute('data-theme'),
+        theme: document.documentElement.getAttribute("data-theme"),
         text: window.getComputedStyle(document.body).color,
         bg: window.getComputedStyle(document.body).backgroundColor,
       }));

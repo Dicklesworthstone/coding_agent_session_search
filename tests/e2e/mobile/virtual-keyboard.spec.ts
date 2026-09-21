@@ -1,4 +1,4 @@
-import { test, expect, gotoFile, waitForPageReady } from '../setup/test-utils';
+import { expect, gotoFile, test, waitForPageReady } from "../setup/test-utils";
 
 /**
  * Mobile device E2E tests - Virtual keyboard interactions
@@ -7,19 +7,23 @@ import { test, expect, gotoFile, waitForPageReady } from '../setup/test-utils';
  * behavior typical of mobile devices.
  */
 
-test.describe('Virtual Keyboard Behavior', () => {
+test.describe("Virtual Keyboard Behavior", () => {
   test.beforeEach(async ({ page }) => {
     const viewport = page.viewportSize();
-    console.log(`[device-context] Testing keyboard behavior at ${viewport?.width}x${viewport?.height}`);
+    console.log(
+      `[device-context] Testing keyboard behavior at ${viewport?.width}x${viewport?.height}`,
+    );
   });
 
-  test('input fields respond to focus tap', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+  test("input fields respond to focus tap", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
-    const inputs = page.locator('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])');
+    const inputs = page.locator(
+      'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])',
+    );
     const inputCount = await inputs.count();
 
     if (inputCount > 0) {
@@ -35,15 +39,15 @@ test.describe('Virtual Keyboard Behavior', () => {
     }
   });
 
-  test('viewport adjusts for keyboard', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+  test("viewport adjusts for keyboard", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     const searchInput = page.locator('#search-input, input[type="search"]');
-    if (await searchInput.count() === 0) {
-      test.skip(true, 'Search input not found');
+    if ((await searchInput.count()) === 0) {
+      test.skip(true, "Search input not found");
       return;
     }
 
@@ -89,126 +93,130 @@ test.describe('Virtual Keyboard Behavior', () => {
     }
   });
 
-  test('form submission works with enter key', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+  test("form submission works with enter key", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     const searchInput = page.locator('#search-input, input[type="search"]');
-    if (await searchInput.count() === 0) {
-      test.skip(true, 'Search input not found');
+    if ((await searchInput.count()) === 0) {
+      test.skip(true, "Search input not found");
       return;
     }
 
     await searchInput.first().tap();
-    await page.keyboard.type('token', { delay: 50 });
+    await page.keyboard.type("token", { delay: 50 });
 
     // Press Enter (simulates virtual keyboard "Go"/"Search" button)
-    await page.keyboard.press('Enter');
+    await page.keyboard.press("Enter");
     await page.waitForTimeout(500);
 
     // Verify search was triggered (look for results or state change)
     const searchTriggered = await page.evaluate(() => {
       // Check URL for search param
       const url = new URL(window.location.href);
-      if (url.searchParams.has('q') || url.searchParams.has('search')) {
+      if (url.searchParams.has("q") || url.searchParams.has("search")) {
         return true;
       }
 
       // Check for highlights
-      const highlights = document.querySelectorAll('mark, .highlight, .search-highlight, .search-match, .message.search-hit');
+      const highlights = document.querySelectorAll(
+        "mark, .highlight, .search-highlight, .search-match, .message.search-hit",
+      );
       return highlights.length > 0;
     });
 
     expect(searchTriggered).toBe(true);
   });
 
-  test('password input masks characters', async ({ page, encryptedExportPath }) => {
-    test.skip(!encryptedExportPath, 'Encrypted export not available');
+  test("password input masks characters", async ({ page, encryptedExportPath }) => {
+    test.skip(!encryptedExportPath, "Encrypted export not available");
 
     await gotoFile(page, encryptedExportPath);
     await waitForPageReady(page);
 
     const passwordInput = page.locator('input[type="password"]');
-    if (await passwordInput.count() === 0) {
-      test.skip(true, 'Password input not found');
+    if ((await passwordInput.count()) === 0) {
+      test.skip(true, "Password input not found");
       return;
     }
 
     // Type password
     await passwordInput.first().tap();
-    await page.keyboard.type('secretpass123', { delay: 30 });
+    await page.keyboard.type("secretpass123", { delay: 30 });
 
     // Check that value is masked (can't actually verify masking visually,
     // but we can verify the input type is still password)
-    const inputType = await passwordInput.first().getAttribute('type');
-    expect(inputType).toBe('password');
+    const inputType = await passwordInput.first().getAttribute("type");
+    expect(inputType).toBe("password");
 
     // Value should be stored
     const value = await passwordInput.first().inputValue();
-    expect(value).toBe('secretpass123');
+    expect(value).toBe("secretpass123");
   });
 
-  test('input clear button works', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+  test("input clear button works", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     const searchInput = page.locator('#search-input, input[type="search"]');
-    if (await searchInput.count() === 0) {
-      test.skip(true, 'Search input not found');
+    if ((await searchInput.count()) === 0) {
+      test.skip(true, "Search input not found");
       return;
     }
 
     // Type some text
     await searchInput.first().tap();
-    await page.keyboard.type('test');
+    await page.keyboard.type("test");
     await page.waitForTimeout(100);
 
     // Look for clear button
-    const clearButton = page.locator('[data-action="clear"], .clear-btn, .search-clear, input[type="search"]::-webkit-search-cancel-button');
+    const clearButton = page.locator(
+      '[data-action="clear"], .clear-btn, .search-clear, input[type="search"]::-webkit-search-cancel-button',
+    );
 
     // Try to find a clickable clear button
     const clearBtnVisible = page.locator('button:near(#search-input), [aria-label*="clear" i]');
-    if (await clearBtnVisible.count() > 0) {
+    if ((await clearBtnVisible.count()) > 0) {
       await clearBtnVisible.first().tap();
       await page.waitForTimeout(100);
 
       const value = await searchInput.first().inputValue();
       const searchStateReset = await page.evaluate(() => {
         const url = new URL(window.location.href);
-        const hasQueryParam = url.searchParams.has('q') || url.searchParams.has('search');
-        const highlights = document.querySelectorAll('mark, .highlight, .search-match');
+        const hasQueryParam = url.searchParams.has("q") || url.searchParams.has("search");
+        const highlights = document.querySelectorAll("mark, .highlight, .search-match");
         return !hasQueryParam && highlights.length === 0;
       });
-      expect(value === '' || searchStateReset).toBe(true);
+      expect(value === "" || searchStateReset).toBe(true);
     }
   });
 
-  test('autocomplete suggestions are tappable', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+  test("autocomplete suggestions are tappable", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     const searchInput = page.locator('#search-input, input[type="search"]');
-    if (await searchInput.count() === 0) {
-      test.skip(true, 'Search input not found');
+    if ((await searchInput.count()) === 0) {
+      test.skip(true, "Search input not found");
       return;
     }
 
     await searchInput.first().tap();
-    await page.keyboard.type('fu', { delay: 100 });
+    await page.keyboard.type("fu", { delay: 100 });
     await page.waitForTimeout(300);
 
     // Look for autocomplete suggestions
     const suggestions = page.locator(
-      '[role="listbox"] [role="option"], .autocomplete-item, .suggestion, .search-suggestion'
+      '[role="listbox"] [role="option"], .autocomplete-item, .suggestion, .search-suggestion',
     );
 
-    if (await suggestions.count() > 0) {
+    if ((await suggestions.count()) > 0) {
       const firstSuggestion = suggestions.first();
 
       // Should be visible and tappable
@@ -231,16 +239,16 @@ test.describe('Virtual Keyboard Behavior', () => {
   });
 });
 
-test.describe('Form Field Navigation', () => {
-  test('tab navigation works between fields', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+test.describe("Form Field Navigation", () => {
+  test("tab navigation works between fields", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     // Find all focusable elements
     const focusable = page.locator(
-      'input:not([type="hidden"]), button, a[href], textarea, select, [tabindex]:not([tabindex="-1"])'
+      'input:not([type="hidden"]), button, a[href], textarea, select, [tabindex]:not([tabindex="-1"])',
     );
     const count = await focusable.count();
 
@@ -250,7 +258,7 @@ test.describe('Form Field Navigation', () => {
       await page.waitForTimeout(100);
 
       // Tab to next
-      await page.keyboard.press('Tab');
+      await page.keyboard.press("Tab");
       await page.waitForTimeout(100);
 
       // Something should be focused
@@ -262,66 +270,62 @@ test.describe('Form Field Navigation', () => {
     }
   });
 
-  test('shift+tab navigates backwards', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+  test("shift+tab navigates backwards", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
-    const focusable = page.locator(
-      'input:not([type="hidden"]), button, a[href], textarea'
-    );
+    const focusable = page.locator('input:not([type="hidden"]), button, a[href], textarea');
     const count = await focusable.count();
 
     if (count > 2) {
       // Focus second element
       await focusable.nth(1).focus();
       const beforeIndex = await focusable.evaluateAll((els) =>
-        els.findIndex((el) => el === document.activeElement)
+        els.findIndex((el) => el === document.activeElement),
       );
 
       // Shift+Tab to go back
-      await page.keyboard.press('Shift+Tab');
+      await page.keyboard.press("Shift+Tab");
       await page.waitForTimeout(100);
 
       const afterIndex = await focusable.evaluateAll((els) =>
-        els.findIndex((el) => el === document.activeElement)
+        els.findIndex((el) => el === document.activeElement),
       );
       expect(afterIndex).toBeGreaterThanOrEqual(0);
       expect(afterIndex).not.toBe(beforeIndex);
     }
   });
 
-  test('escape closes dropdown/autocomplete', async ({ page, exportPath }) => {
-    test.skip(!exportPath, 'Export path not available');
+  test("escape closes dropdown/autocomplete", async ({ page, exportPath }) => {
+    test.skip(!exportPath, "Export path not available");
 
     await gotoFile(page, exportPath);
     await waitForPageReady(page);
 
     const searchInput = page.locator('#search-input, input[type="search"]');
-    if (await searchInput.count() === 0) {
-      test.skip(true, 'Search input not found');
+    if ((await searchInput.count()) === 0) {
+      test.skip(true, "Search input not found");
       return;
     }
 
     await searchInput.first().tap();
-    await page.keyboard.type('test');
+    await page.keyboard.type("test");
     await page.waitForTimeout(200);
 
     // Look for any open dropdown/autocomplete
-    const dropdown = page.locator(
-      '[role="listbox"], .dropdown-menu, .autocomplete-list'
-    );
+    const dropdown = page.locator('[role="listbox"], .dropdown-menu, .autocomplete-list');
 
-    if (await dropdown.count() > 0) {
+    if ((await dropdown.count()) > 0) {
       // Press Escape
-      await page.keyboard.press('Escape');
+      await page.keyboard.press("Escape");
       await page.waitForTimeout(200);
 
       // Dropdown should be closed or hidden
       const isHidden = await dropdown.first().evaluate((el) => {
         const style = window.getComputedStyle(el);
-        return style.display === 'none' || style.visibility === 'hidden';
+        return style.display === "none" || style.visibility === "hidden";
       });
 
       expect(isHidden).toBe(true);
