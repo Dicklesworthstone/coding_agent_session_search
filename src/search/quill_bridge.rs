@@ -1042,7 +1042,12 @@ impl QuillCassIndex {
                 async move { index.index_schema_documents(&cx, projected).await }
             })
         })
-        .map_err(|error| anyhow!("indexing CASS documents into Quill: {error}"))?;
+        .map_err(|error| {
+            // Preserve the engine cause for retry classification without changing
+            // the operator-facing diagnostic.
+            let diagnostic = format!("indexing CASS documents into Quill: {error}");
+            anyhow::Error::new(error).context(diagnostic)
+        })?;
         self.tick_heartbeat();
         Ok(())
     }
@@ -1075,7 +1080,10 @@ impl QuillCassIndex {
                 async move { index.upsert_schema_documents(&cx, projected).await }
             })
         })
-        .map_err(|error| anyhow!("upserting CASS documents into Quill: {error}"))?;
+        .map_err(|error| {
+            let diagnostic = format!("upserting CASS documents into Quill: {error}");
+            anyhow::Error::new(error).context(diagnostic)
+        })?;
         self.tick_heartbeat();
         Ok(())
     }
@@ -2374,6 +2382,16 @@ mod tests {
                 .is_err_and(|error| error.to_string().contains("duplicate live document id")),
             "a plain re-add of a live identity must be refused: {duplicate:?}"
         );
+        assert!(
+            duplicate.as_ref().is_err_and(|error| {
+                error
+                    .downcast_ref::<frankensearch::quill::QuillIndexError>()
+                    .is_some()
+            }),
+            "ingest errors must retain the typed engine cause: {duplicate:?}"
+        );
+
+        assert_eq!(index.doc_count().expect("unchanged published count"), 2);
 
         let replay = [
             published[0].clone(),
