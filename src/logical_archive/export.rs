@@ -250,7 +250,10 @@ pub fn sync_parent(destination: &Path) -> Result<()> {
 }
 
 pub fn verify_file(path: &Path) -> Result<(Header, Completion)> {
-    codec::verify(&mut BufReader::new(File::open(path).context("cannot open logical archive")?))
+    // Apply the same regular-file admission as import before any blocking read.
+    // File::open alone can wait forever on a FIFO before framing limits apply.
+    let input = super::import::open_input(path)?;
+    codec::verify(&mut BufReader::new(input))
 }
 
 #[cfg(test)]

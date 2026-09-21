@@ -250,3 +250,23 @@ fn symlink_sources_and_destination_locks_are_refused() {
     symlink(&database, root.path().join(".archive.jsonl.logical-archive.lock")).unwrap();
     assert!(DestinationLock::acquire(&output).is_err());
 }
+
+#[cfg(unix)]
+#[test]
+fn verification_refuses_nonregular_inputs_before_decoding() -> Result<()> {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir()?;
+    let target = root.path().join("private.jsonl");
+    fs::write(&target, "PRIVATE-NOT-JSON\n")?;
+    let linked = root.path().join("linked.jsonl");
+    symlink(&target, &linked)?;
+    for input in [root.path(), linked.as_path(), Path::new("/dev/null")] {
+        let error = verify_file(input).expect_err("nonregular input must be refused");
+        let message = format!("{error:#}");
+        assert!(message.contains("regular, non-symlink"), "{message}");
+        assert!(!message.contains("PRIVATE-NOT-JSON"));
+    }
+    assert_eq!(fs::read(&target)?, b"PRIVATE-NOT-JSON\n");
+    assert_eq!(fs::read_link(&linked)?, target);
+    Ok(())
+}
