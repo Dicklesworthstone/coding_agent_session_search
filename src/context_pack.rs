@@ -18,8 +18,9 @@
 //!   wall-clock or float-comparison dependent. Freshness uses the fixture's
 //!   `now_ms`, not the system clock.
 //! * Privacy-first: high privacy-risk candidates are excluded before selection
-//!   and never contribute an excerpt to the output. Every emitted excerpt and
-//!   path is passed through the strict swarm-evidence redactor.
+//!   and never contribute an excerpt to the output. Unknown explicit privacy
+//!   labels are excluded too. The entire emitted payload, including identifiers
+//!   and omitted/degraded metadata, passes through the swarm-evidence redactor.
 
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -118,8 +119,14 @@ fn render_payload(fixture_id: &str, source_kind: &str, facts: PackFacts) -> Valu
     let mut degraded = Vec::new();
     let mut scorable = Vec::new();
     for candidate in &facts.candidates {
-        if candidate.privacy_risk.eq_ignore_ascii_case("high") {
-            excluded_high_risk.push(render_excluded(candidate, "high-privacy-risk"));
+        let risk = candidate.privacy_risk.trim();
+        if !risk.eq_ignore_ascii_case("low") && !risk.eq_ignore_ascii_case("medium") {
+            let reason = if risk.eq_ignore_ascii_case("high") {
+                "high-privacy-risk"
+            } else {
+                "unknown-privacy-risk"
+            };
+            excluded_high_risk.push(render_excluded(candidate, reason));
             continue;
         }
         if candidate.semantic_only && !facts.semantic_available {
@@ -167,7 +174,10 @@ fn render_payload(fixture_id: &str, source_kind: &str, facts: PackFacts) -> Valu
         .and_then(Value::as_str)
         .unwrap_or("partial");
 
-    json!({
+    // Identifiers and omission metadata are untrusted evidence too. Apply the
+    // shared structured redactor at the final boundary so no rendering branch
+    // can accidentally bypass it by adding another string field.
+    crate::pages::redact::redact_swarm_json_value(&json!({
         "schema_version": SCHEMA_VERSION,
         "status": status,
         "_meta": {
@@ -224,7 +234,7 @@ fn render_payload(fixture_id: &str, source_kind: &str, facts: PackFacts) -> Valu
             "apply_mode_available": false,
             "next_step": summary.get("recommended_action").cloned().unwrap_or_else(|| json!("review-selected-refs"))
         }
-    })
+    }))
 }
 
 fn score_candidate(candidate: &Candidate, facts: &PackFacts) -> Scored {
@@ -236,7 +246,10 @@ fn score_candidate(candidate: &Candidate, facts: &PackFacts) -> Scored {
         + WEIGHT_FRESHNESS * freshness
         + WEIGHT_AUTHORITY * (authority * 1000.0) as u64)
         / 100;
-    let token_cost = estimated_tokens(&candidate.excerpt).saturating_add(REF_METADATA_TOKENS);
+    // Redaction can expand a short secret into a longer marker. Charge the
+    // rendered excerpt, not the original bytes; metadata remains an estimate.
+    let token_cost = estimated_tokens(&redact(&candidate.excerpt))
+        .saturating_add(REF_METADATA_TOKENS);
     Scored {
         candidate: candidate.clone(),
         score,
@@ -272,8 +285,8 @@ fn render_selected(scored: &Scored, rank: usize) -> Value {
         "rank": rank,
         "id": scored.candidate.id,
         "kind": scored.candidate.kind,
-        "path": redact(&scored.candidate.path),
-        "excerpt": redact(&scored.candidate.excerpt),
+        "path": scored.candidate.path,
+        "excerpt": scored.candidate.excerpt,
         "token_cost": scored.token_cost,
         "score": scored.score,
         "freshness_score": scored.freshness_score,
@@ -287,7 +300,7 @@ fn render_omitted(scored: &Scored, reason: &str) -> Value {
     json!({
         "id": scored.candidate.id,
         "kind": scored.candidate.kind,
-        "path": redact(&scored.candidate.path),
+        "path": scored.candidate.path,
         "token_cost": scored.token_cost,
         "score": scored.score,
         "reason": reason
@@ -298,7 +311,7 @@ fn render_excluded(candidate: &Candidate, reason: &str) -> Value {
     json!({
         "id": candidate.id,
         "kind": candidate.kind,
-        "path": redact(&candidate.path),
+        "path": candidate.path,
         "privacy_risk": candidate.privacy_risk,
         "reason": reason
     })
@@ -337,6 +350,8 @@ fn summarize(
         "supply-context-pack-fixture"
     } else if candidate_count == 0 {
         "no-candidates-available"
+    } else if excluded_high_risk == candidate_count {
+        "review-privacy-classification"
     } else if selected == 0 {
         "increase-token-budget"
     } else if omitted > 0 {
@@ -481,11 +496,13 @@ fn parse_candidate(value: &Value) -> Candidate {
             .get("authority")
             .and_then(Value::as_f64)
             .unwrap_or(0.0),
-        privacy_risk: value
-            .get("privacy_risk")
-            .and_then(Value::as_str)
-            .unwrap_or("low")
-            .to_string(),
+        // Preserve the historical default only for an absent field. An
+        // explicitly malformed label must not silently become low risk.
+        privacy_risk: match value.get("privacy_risk") {
+            None => "low".to_string(),
+            Some(Value::String(risk)) => risk.clone(),
+            Some(_) => "unknown".to_string(),
+        },
         semantic_only: value
             .get("semantic_only")
             .and_then(Value::as_bool)
@@ -623,5 +640,98 @@ mod tests {
             json!("metadata-only-no-semantic")
         );
         assert_eq!(out["mutation_contract"]["touches_network"], json!(false));
+    }
+
+    #[test]
+    fn metadata_is_redacted_in_every_selection_route_and_envelope() {
+        for route in ["selected", "omitted", "excluded_high_risk", "degraded"] {
+            let mut src = json!({
+                "bead_id": "/home/private-bead/task",
+                "token_budget": 2_000,
+                "semantic_available": false,
+                "candidates": [{
+                    "id": "/home/private-id/evidence",
+                    "kind": "token=sk-ant-supersecretvalue1234567890",
+                    "path": "/home/private-path/session",
+                    "excerpt": "safe context",
+                    "privacy_risk": "low"
+                }]
+            });
+            match route {
+                "omitted" => src["token_budget"] = json!(0),
+                "excluded_high_risk" => src["candidates"][0]["privacy_risk"] = json!("high"),
+                "degraded" => src["candidates"][0]["semantic_only"] = json!(true),
+                _ => {}
+            }
+            let out = render_context_pack_fixture("/home/private-fixture/input", Some(&src));
+            assert_eq!(out[route].as_array().unwrap().len(), 1, "route: {route}");
+            assert_no_secret_leak(&out);
+            assert_eq!(out["budget"]["token_budget"], src["token_budget"]);
+            assert_eq!(out["schema_version"], json!(SCHEMA_VERSION));
+            assert_eq!(out["mutation_contract"]["read_only"], json!(true));
+            assert_ne!(out["bead_id"], src["bead_id"]);
+            assert_ne!(out["_meta"]["fixture_id"], json!("/home/private-fixture/input"));
+        }
+        // Missing-source and live-shaped envelopes must share the same boundary.
+        assert_no_secret_leak(&render_context_pack_fixture("/home/private-fixture/input", None));
+        assert_no_secret_leak(&render_payload("/home/private-fixture/input", "live", live_facts()));
+    }
+
+    #[test]
+    fn explicit_unknown_or_padded_high_risk_cannot_spend_budget_or_emit_excerpt() {
+        for risk in [json!(" HIGH \t"), json!(""), json!("classified"), json!(null), json!(17), json!([])] {
+            let src = json!({
+                "candidates": [{
+                    "id": "excluded",
+                    "excerpt": "NEVER_EMIT_EXCLUDED_CONTEXT",
+                    "privacy_risk": risk
+                }]
+            });
+            let out = render_context_pack_fixture("risk", Some(&src));
+            assert!(out["selected"].as_array().unwrap().is_empty());
+            assert_eq!(out["excluded_high_risk"].as_array().unwrap().len(), 1);
+            assert_eq!(out["budget"]["used_tokens"], json!(0));
+            assert_eq!(out["summary"]["recommended_action"], json!("review-privacy-classification"));
+            assert!(!out.to_string().contains("NEVER_EMIT_EXCLUDED_CONTEXT"));
+        }
+        for risk in [Some(json!(" LOW ")), Some(json!("Medium")), None] {
+            let mut candidate = json!({"id": "safe", "excerpt": "safe context"});
+            if let Some(risk) = risk {
+                candidate["privacy_risk"] = risk;
+            }
+            let src = json!({"candidates": [candidate]});
+            let out = render_context_pack_fixture("risk", Some(&src));
+            assert_eq!(out["selected"].as_array().unwrap().len(), 1);
+            assert!(out["excluded_high_risk"].as_array().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn excerpt_budget_is_charged_after_redaction_at_the_admission_boundary() {
+        for excerpt in [
+            "PASSWORD=x",
+            "read /home/alice/private/context/source/session/notes.txt",
+            "export TOKEN=sk-ant-supersecretvalue1234567890",
+        ] {
+            let rendered = redact(excerpt);
+            assert_ne!(rendered, excerpt, "fixture must exercise redaction");
+            let cost = estimated_tokens(&rendered) + REF_METADATA_TOKENS;
+            let mut src = json!({
+                "token_budget": RESERVED_ENVELOPE_TOKENS + cost,
+                "candidates": [{"id": "budgeted", "excerpt": excerpt}]
+            });
+            let out = render_context_pack_fixture("budget", Some(&src));
+            assert_eq!(out["selected"].as_array().unwrap().len(), 1);
+            assert_eq!(out["selected"][0]["excerpt"], json!(rendered));
+            assert_eq!(out["selected"][0]["token_cost"], json!(cost));
+            assert_eq!(out["budget"]["used_tokens"], json!(cost));
+            assert_eq!(out["budget"]["remaining_tokens"], json!(0));
+            assert_no_secret_leak(&out);
+            src["token_budget"] = json!(RESERVED_ENVELOPE_TOKENS + cost - 1);
+            let out = render_context_pack_fixture("budget", Some(&src));
+            assert!(out["selected"].as_array().unwrap().is_empty());
+            assert_eq!(out["omitted"].as_array().unwrap().len(), 1);
+            assert_eq!(out["budget"]["used_tokens"], json!(0));
+        }
     }
 }
