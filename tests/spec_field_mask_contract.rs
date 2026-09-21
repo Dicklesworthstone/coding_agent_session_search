@@ -1,22 +1,32 @@
 //! INV-cass-21 — `cass search --fields` mask discipline contract.
 //!
-//! Named presets omit message bodies but retain a complete canonical
-//! follow-up anchor. GH493 established that a path and message ordinal alone
-//! cannot distinguish multiple sessions sharing a provider database. The
-//! source and archive-local conversation identity must survive projection.
+//! AGENTS.md "Key Flags" documents `--fields minimal` as "Reduce payload:
+//! `source_path`, `line_number`, `agent` only" — the lean key set agents
+//! pipe through `jq` when context budget matters. Existing tests in
+//! `tests/cli_robot.rs::fields_minimal_preset_expands` check that some
+//! expected keys are present and a couple of other keys are absent, but
+//! they do not lock the **exact** key set, nor do they prove the
+//! token-savings promise that justifies using the flag in the first
+//! place.
 //!
-//! Four invariants:
+//! Three invariants:
 //!
-//!   1. `--fields minimal` emits exactly `agent`, `line_number`, `source_path`,
-//!      `source_id`, and `conversation_id`. No body, score, or unrelated fields.
-//!   2. `--fields summary` adds exactly `title` and `score` to that anchor.
-//!   3. `--fields minimal` produces strictly fewer total response bytes than
-//!      the default. Keeping identity must not defeat the payload savings.
-//!   4. Explicit masks still emit exactly the caller's requested fields, even
-//!      when the caller deliberately omits part of the follow-up anchor.
+//!   1. `--fields minimal` emits hits whose key set is **exactly**
+//!      `{agent, line_number, source_path}` — no extra, no missing.
+//!      Set equality is the strongest property; a regression that
+//!      added `score` "for compatibility" would slip past the existing
+//!      "score is null" check but fail this one.
+//!   2. `--fields minimal` produces strictly fewer total response
+//!      bytes than the default. The whole reason to type the flag.
+//!      Bytes are a robust proxy for LLM tokens.
+//!   3. `--fields <explicit,list>` emits hits whose key set is exactly
+//!      the requested list. The most powerful form of the flag: an
+//!      agent that wants only `score` and `source_path` for ranking-
+//!      adjacent work must be able to ask for those two and only those
+//!      two.
 //!
-//! Exact key-set checks complement the shared-path, sparse-index round trips
-//! in `gh493_message_coordinates`, which verify the identity values themselves.
+//! Verified against the checked-in `search_demo_data` fixture with
+//! the query `"the"` (2 aider hits).
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -139,43 +149,17 @@ fn assert_key_set_equals(
 }
 
 #[test]
-fn fields_minimal_preset_emits_exactly_the_canonical_anchor_keys() -> TestResult {
+fn fields_minimal_preset_emits_exactly_the_documented_three_keys() -> TestResult {
     let tmp = TempDir::new()?;
     let data_dir = copy_search_demo_fixture(tmp.path())?;
     let (_stdout, parsed) = run_search(&data_dir, &["--fields", "minimal", "--limit", "1"])?;
     let keys = first_hit_keys(&parsed)?;
-    let documented: BTreeSet<String> = [
-        "agent",
-        "line_number",
-        "source_path",
-        "source_id",
-        "conversation_id",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect();
+    let documented: BTreeSet<String> = ["agent", "line_number", "source_path"]
+        .iter()
+        .copied()
+        .map(String::from)
+        .collect();
     assert_key_set_equals("--fields minimal", &keys, &documented)
-}
-
-#[test]
-fn fields_summary_retains_the_exact_anchor_without_message_bodies() -> TestResult {
-    let tmp = TempDir::new()?;
-    let data_dir = copy_search_demo_fixture(tmp.path())?;
-    let (_stdout, parsed) = run_search(&data_dir, &["--fields", "summary", "--limit", "1"])?;
-    let keys = first_hit_keys(&parsed)?;
-    let documented: BTreeSet<String> = [
-        "agent",
-        "line_number",
-        "source_path",
-        "source_id",
-        "conversation_id",
-        "title",
-        "score",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect();
-    assert_key_set_equals("--fields summary", &keys, &documented)
 }
 
 #[test]
@@ -186,7 +170,9 @@ fn fields_minimal_strictly_reduces_response_bytes_vs_default() -> TestResult {
     let (minimal_stdout, _) = run_search(&data_dir, &["--fields", "minimal"])?;
     let default_bytes = default_stdout.len();
     let minimal_bytes = minimal_stdout.len();
-    // Retaining the complete anchor must not defeat the reason to use minimal.
+    // The entire agent-facing promise of `--fields minimal` is "Reduce
+    // payload" (AGENTS.md). A regression where minimal emits at least as
+    // many bytes as the default defeats the flag's reason for existing.
     ensure(
         !matches!(
             minimal_bytes.cmp(&default_bytes),

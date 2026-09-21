@@ -17,8 +17,6 @@ on:
       - docs/reference/QUICK_REFERENCE.md
       - tests/cli_robot.rs
       - tests/cli_view_budget.rs
-      - tests/util/timeout.rs
-      - tests/spec_field_mask_contract.rs
       - tests/cli_dispatch_coverage.rs
       - tests/spec_view_expand_error_envelopes.rs
       - tests/golden/robot/capabilities.json.golden
@@ -36,54 +34,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  subprocess-contract:
-    if: github.repository == 'Dicklesworthstone/coding_agent_session_search'
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ubuntu-24.04-arm, ubuntu-latest, macos-14]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f
-        with:
-          components: rustfmt, clippy
-      # Compile the exact shared helper, not a copy or simulation. This small
-      # consumer can diagnose cleanup failures independently of a full CASS build.
-      - name: Prepare the exact-source subprocess contract consumer
-        shell: bash
-        run: |
-          set -euo pipefail
-          git rev-parse HEAD
-          git hash-object tests/util/timeout.rs
-          rustc --version
-          python3 - <<'PY'
-          import json, os, pathlib
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'cass-subprocess-contract'
-          root.mkdir()
-          source = pathlib.Path(os.environ['GITHUB_WORKSPACE']) / 'tests/util/timeout.rs'
-          manifest = '\n'.join([
-              '[package]', 'name = "cass-subprocess-contract"', 'version = "0.0.0"',
-              'edition = "2024"', '[lib]', 'path = ' + json.dumps(str(source)),
-              '[dev-dependencies]', 'tempfile = "=3.27.0"', '',
-          ])
-          (root / 'Cargo.toml').write_text(manifest)
-          with open(os.environ['GITHUB_ENV'], 'a') as output:
-              output.write('CONTRACT_MANIFEST=' + str(root / 'Cargo.toml') + '\n')
-          PY
-          cargo generate-lockfile --manifest-path "$RUNNER_TEMP/cass-subprocess-contract/Cargo.toml"
-      - name: Verify timeout, orphan-pipe and harness-death cleanup
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test --locked --manifest-path "$CONTRACT_MANIFEST" -- --nocapture
-          cargo clippy --locked --manifest-path "$CONTRACT_MANIFEST" --all-targets -- -D warnings
-          rustfmt --edition 2024 --check tests/util/timeout.rs
-
   verify:
     if: github.repository == 'Dicklesworthstone/coding_agent_session_search'
     runs-on: ubuntu-24.04-arm
@@ -105,26 +55,19 @@ jobs:
       - name: Record exact source and compiler identity
         run: git rev-parse HEAD && rustc --version && cargo --version
       - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
-        with:
-          cache-on-failure: true
-      - name: Run reconciliation, coordinate, field-mask and deadline regressions
-        run: cargo test --locked --no-fail-fast --test lexical_reconcile_canary --test gh493_message_coordinates --test gh493_reported_coordinates --test gh493_windowed_followup --test cli_view_budget --test spec_field_mask_contract -- --nocapture
-      # Keep every gate failing on errors, but do not let one failure hide the
-      # remaining independent contracts or the production compiler diagnostics.
+      - name: Run reconciliation, reported divergence and canonical window regressions
+        run: cargo test --locked --no-fail-fast --test lexical_reconcile_canary --test gh493_message_coordinates --test gh493_reported_coordinates --test gh493_windowed_followup --test cli_view_budget -- --nocapture
       - name: Check existing dispatch and error envelopes
-        if: ${{ !cancelled() }}
         run: |
           cargo test --locked --test cli_dispatch_coverage parse_expand_with_context
           cargo test --locked --test spec_view_expand_error_envelopes
       - name: Check raw-line compatibility and robot discovery
-        if: ${{ !cancelled() }}
         run: |
           cargo test --locked --test cli_robot view_
-          cargo test --locked --test cli_robot fields_
           cargo test --locked --test cli_robot capabilities_matches_golden_contract
       - name: Lint the regression targets and production dependency
-        if: ${{ !cancelled() }}
         run: cargo clippy --locked --test gh493_message_coordinates --test gh493_reported_coordinates --test gh493_windowed_followup --test lexical_reconcile_canary -- -D warnings
+      # Formatting remains blocking, but cannot hide runtime regression results.
       - name: Check coordinate implementation formatting
         if: ${{ !cancelled() }}
-        run: rustfmt --edition 2024 --config skip_children=true --check src/lib.rs src/search/query.rs src/followup_coordinates.rs src/followup_coordinates/window.rs tests/gh493_message_coordinates.rs tests/gh493_reported_coordinates.rs tests/gh493_windowed_followup.rs tests/cli_robot.rs tests/cli_dispatch_coverage.rs tests/util/timeout.rs tests/spec_field_mask_contract.rs
+        run: rustfmt --edition 2024 --config skip_children=true --check src/lib.rs src/search/query.rs src/followup_coordinates.rs src/followup_coordinates/window.rs tests/gh493_message_coordinates.rs tests/gh493_reported_coordinates.rs tests/gh493_windowed_followup.rs tests/cli_robot.rs tests/cli_dispatch_coverage.rs

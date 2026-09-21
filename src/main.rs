@@ -3,7 +3,6 @@
 #![cfg_attr(not(test), deny(unsafe_code))]
 
 mod logical_archive;
-mod search_service;
 
 fn env_requests_robot_output() -> bool {
     let cass_output_format = dotenvy::var("CASS_OUTPUT_FORMAT")
@@ -279,16 +278,6 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("{payload}");
                 std::process::exit(2);
             }
-        };
-    }
-    if raw_command_name(&raw_args) == Some("serve") {
-        let result = search_service::run(raw_args);
-        if !coding_agent_search::shutdown_thread_local_bridge_runtimes() {
-            tracing::warn!("search service bridge teardown exceeded its deadline");
-        }
-        return match result {
-            Ok(()) => Ok(()),
-            Err(err) => handle_fatal_error(err),
         };
     }
     let parsed = match coding_agent_search::parse_cli(raw_args) {

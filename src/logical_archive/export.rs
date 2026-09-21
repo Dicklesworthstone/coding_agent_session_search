@@ -97,15 +97,6 @@ pub fn schema_version(connection: &Connection) -> Result<String> {
         .map_err(|_| anyhow!("source does not contain a supported canonical schema version"))
 }
 
-/// FTS5 owns a closed set of shadow names, not the entire `<root>_` namespace.
-/// Call only for a discovered virtual root: without that owner even an exact
-/// shadow-like name is ordinary data and must be exported or explicitly refused.
-fn is_fts5_shadow_table(name: &str, root: &str) -> bool {
-    name.strip_prefix(root).is_some_and(|suffix| {
-        matches!(suffix, "_config" | "_content" | "_data" | "_docsize" | "_idx")
-    })
-}
-
 /// Metadata is bounded independently of the number of canonical rows. Never
 /// execute stored CREATE statements: only inspect a short virtual-table prefix.
 pub fn tables(connection: &Connection) -> Result<Vec<Table>> {
@@ -131,9 +122,7 @@ pub fn tables(connection: &Connection) -> Result<Vec<Table>> {
     let mut output = Vec::new();
     for name in physical {
         if name.starts_with("sqlite_")
-            || virtual_roots
-                .iter()
-                .any(|root| is_fts5_shadow_table(&name, root))
+            || virtual_roots.iter().any(|root| name == *root || name.starts_with(&format!("{root}_")))
         {
             continue;
         }
@@ -250,10 +239,7 @@ pub fn sync_parent(destination: &Path) -> Result<()> {
 }
 
 pub fn verify_file(path: &Path) -> Result<(Header, Completion)> {
-    // Apply the same regular-file admission as import before any blocking read.
-    // File::open alone can wait forever on a FIFO before framing limits apply.
-    let input = super::import::open_input(path)?;
-    codec::verify(&mut BufReader::new(input))
+    codec::verify(&mut BufReader::new(File::open(path).context("cannot open logical archive")?))
 }
 
 #[cfg(test)]

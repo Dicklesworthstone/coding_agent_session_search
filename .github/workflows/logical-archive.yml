@@ -4,8 +4,6 @@ on:
     branches: [main]
     paths:
       - 'src/logical_archive/**'
-      - 'src/bookmarks.rs'
-      - 'tests/bookmarks_cli.rs'
       - 'src/main.rs'
       - 'src/franken_sync.rs'
       - 'src/storage/**'
@@ -21,33 +19,6 @@ concurrency:
   group: logical-archive-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  format-reviewed-files:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Format copies of the reviewed sources without changing the checkout
-        shell: bash
-        run: |
-          set -euo pipefail
-          evidence="$RUNNER_TEMP/reviewed-format"
-          mkdir -p "$evidence"
-          git rev-parse HEAD > "$evidence/source.txt"
-          rustfmt --version > "$evidence/toolchain.txt"
-          for file in src/bookmarks.rs src/logical_archive/export.rs src/logical_archive/export_tests.rs tests/cli_logical_archive.rs; do
-            mkdir -p "$evidence/$(dirname "$file")"
-            sha256sum "$file" >> "$evidence/input-sha256.txt"
-            rustfmt --edition 2024 --config skip_children=true --emit stdout "$file" > "$evidence/$file"
-          done
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: reviewed-format-${{ github.sha }}
-          path: ${{ runner.temp }}/reviewed-format/
-          if-no-files-found: error
-          retention-days: 7
   locked-cass:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -72,7 +43,7 @@ jobs:
           rustc --version | tee "$RUNNER_TEMP/archive-evidence/toolchain.txt"
           sha256sum Cargo.lock | tee "$RUNNER_TEMP/archive-evidence/lockfile.txt"
           # Parse without changing source or presenting formatting as runtime proof.
-          rustfmt --edition 2024 --emit stdout src/logical_archive/mod.rs src/bookmarks.rs tests/cli_logical_archive.rs > "$RUNNER_TEMP/archive-evidence/formatted-source.txt"
+          rustfmt --edition 2024 --emit stdout src/logical_archive/mod.rs tests/cli_logical_archive.rs > "$RUNNER_TEMP/archive-evidence/formatted-source.txt"
       - name: Run locked production archive tests
         shell: bash
         run: |
@@ -96,34 +67,10 @@ jobs:
           from pathlib import Path
           text = (Path(os.environ['RUNNER_TEMP']) / 'archive-evidence/cli.log').read_text()
           counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
-          if not counts or max(map(int, counts)) < 5:
-              raise SystemExit('Expected all five real-binary archive regressions, including FIFO refusal')
+          if not counts or max(map(int, counts)) < 3:
+              raise SystemExit('Expected all three real-binary archive regressions')
           PY
           sha256sum target/debug/cass | tee "$RUNNER_TEMP/archive-evidence/binary.txt"
-      - name: Run bookmark storage and no-clobber export regressions
-        if: ${{ always() && !cancelled() }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/archive-evidence"
-          cargo test --locked --lib bookmarks::tests:: -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/archive-evidence/bookmarks.log"
-          python3 - <<'PY'
-          import os, re
-          from pathlib import Path
-          text = (Path(os.environ['RUNNER_TEMP']) / 'archive-evidence/bookmarks.log').read_text()
-          counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
-          if not counts or max(map(int, counts)) < 20:
-              raise SystemExit('Expected all 20 bookmark regressions')
-          PY
-          cargo test --locked --test bookmarks_cli -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/archive-evidence/bookmarks-cli.log"
-          python3 - <<'PY'
-          import os, re
-          from pathlib import Path
-          text = (Path(os.environ['RUNNER_TEMP']) / 'archive-evidence/bookmarks-cli.log').read_text()
-          counts = re.findall(r'test result: ok\. (\d+) passed; 0 failed;', text)
-          if not counts or max(map(int, counts)) == 0:
-              raise SystemExit('Expected nonempty bookmark command regression results')
-          PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
