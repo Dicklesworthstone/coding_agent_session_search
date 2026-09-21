@@ -1685,7 +1685,8 @@ pub struct SearchHit {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_original: Option<String>,
     pub created_at: Option<i64>,
-    /// Line number in the source file where the matched message starts (1-indexed)
+    /// Canonical message ordinal (`messages.idx + 1`), NOT a physical file line.
+    /// Pass unchanged to view/expand --message-index, with source_id and conversation_id.
     pub line_number: Option<usize>,
     /// How this result matched the query (exact, prefix wildcard, etc.)
     #[serde(default)]

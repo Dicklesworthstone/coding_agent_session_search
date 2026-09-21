@@ -6,9 +6,13 @@ on:
     paths:
       - .github/workflows/message-coordinate-regression.yml
       - src/lib.rs
-      - src/message_coordinates.rs
+      - src/followup_coordinates.rs
       - src/search/query.rs
+      - tests/gh493_message_coordinates.rs
       - tests/message_coordinates.rs
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
   workflow_dispatch:
 
 permissions:
@@ -30,27 +34,14 @@ jobs:
       CARGO_TERM_COLOR: never
       RUST_MIN_STACK: '134217728'
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Preserve exact source identity for regression investigation
-        shell: bash
-        run: |
-          set -euo pipefail
-          git rev-parse HEAD | tee "$RUNNER_TEMP/message-coordinates-source.txt"
-          git archive --format=tar HEAD src tests Cargo.toml Cargo.lock rust-toolchain.toml build.rs .cargo > "$RUNNER_TEMP/message-coordinates-source.tar"
-          sha256sum "$RUNNER_TEMP/message-coordinates-source.tar"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: message-coordinates-source
-          path: |
-            ${{ runner.temp }}/message-coordinates-source.tar
-            ${{ runner.temp }}/message-coordinates-source.txt
-          retention-days: 3
-      - name: Record compiler identity
-        run: rustc --version && cargo --version
-      - name: Check formatting
-        run: cargo fmt --all --check
+      - name: Record exact source and compiler identity
+        run: git rev-parse HEAD && rustc --version && cargo --version
+      - uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
+      - name: Check coordinate implementation formatting
+        run: rustfmt --edition 2024 --config skip_children=true --check src/lib.rs src/search/query.rs src/followup_coordinates.rs tests/gh493_message_coordinates.rs
       - name: Run search-to-follow-up regressions
-        run: cargo test --locked --test message_coordinates -- --nocapture
+        run: cargo test --locked --test gh493_message_coordinates -- --nocapture
